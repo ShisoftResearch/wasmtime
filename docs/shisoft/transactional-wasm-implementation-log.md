@@ -524,3 +524,31 @@ tracks per-granule read and write ownership by transaction id:
 
 The name is intentionally `LockBased`; Wizard remains the behavior reference,
 not the type or enum name.
+
+## Workstream B: Milestone-1 Opcode Bridge
+
+Added an internal `wasmtime-environ` transaction opcode table for the
+milestone-1 `0xfa` operator subset. This is a bridge for generated binary
+fixtures and later parser integration; it does not yet patch external
+`wasmparser` or make Wasmtime accept transaction opcodes in normal module
+compilation.
+
+The bridge currently covers:
+
+- `ttry`
+- `tfail`
+- `tglobal.get`
+- `tglobal.set`
+- scalar and packed integer `*.tload`
+- scalar and packed integer `*.tstore`
+- `tmemory.size`
+- `tmemory.grow`
+
+It also validates raw prefixed opcode bytes beginning with `0xfa`.
+
+Verification:
+
+```text
+cargo test -p wasmtime-environ --lib transaction
+test result: ok. 4 passed; 0 failed; 0 ignored
+```

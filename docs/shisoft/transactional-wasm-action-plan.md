@@ -146,6 +146,14 @@ Tasks:
 - [ ] Add module metadata for transactional memories and globals.
 - [ ] Add validation rules separating ordinary and transactional object spaces.
 
+Current bridge:
+
+- [x] Add milestone-1 `0xfa` opcode constants and an internal
+  `TransactionOperator` decoder in `wasmtime-environ`.
+- [x] Add raw prefixed opcode-byte decoding for generated binary fixtures.
+- [ ] Patch or fork `wasmparser` so these decode as first-class
+  `wasmparser::Operator` variants.
+
 Milestone-1 operators:
 
 - `TTry`
