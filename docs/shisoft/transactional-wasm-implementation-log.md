@@ -558,9 +558,18 @@ the Wasm magic/version, walks section ids and sizes, extracts code-section
 function bodies, and reports each transaction operator with its function index
 and body offset.
 
+Added research fixture metadata and validation:
+
+- transaction feature enabled/disabled
+- transactional memory count
+- transactional global count
+- validation for all parsed operators in a generated fixture
+- rejection of transactional memory operators without `tmemory`
+- rejection of transactional global operators without `tglobal`
+
 Verification:
 
 ```text
 cargo test -p wasmtime-environ --lib transaction
-test result: ok. 8 passed; 0 failed; 0 ignored
+test result: ok. 12 passed; 0 failed; 0 ignored
 ```

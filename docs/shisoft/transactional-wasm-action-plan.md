@@ -155,6 +155,8 @@ Current bridge:
   from research fixture function-body bytes.
 - [x] Add local parser bridge that extracts milestone-1 transaction operators
   from generated research module fixtures.
+- [x] Add research fixture metadata and validation for feature gating,
+  transactional memories, and transactional globals.
 - [ ] Patch or fork `wasmparser` so these decode as first-class
   `wasmparser::Operator` variants.
 

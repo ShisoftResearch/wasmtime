@@ -100,6 +100,17 @@ pub struct ResearchTransactionModuleOperator {
     pub bytes_read: usize,
 }
 
+/// Research fixture metadata used by the local transaction parser bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResearchTransactionFixtureMetadata {
+    /// Whether transaction operators are enabled for this fixture.
+    pub transactions_enabled: bool,
+    /// Number of transactional memories modeled by this fixture.
+    pub tmemory_count: u32,
+    /// Number of transactional globals modeled by this fixture.
+    pub tglobal_count: u32,
+}
+
 impl TransactionOperator {
     /// Returns this operator's Wizard/proposal `0xfa` subopcode.
     pub const fn subopcode(self) -> u32 {
@@ -252,6 +263,75 @@ pub fn parse_research_transaction_operators_from_module(
         offset = section_end;
     }
     Ok(operators)
+}
+
+/// Validate a research fixture transaction operator against fixture metadata.
+pub fn validate_research_transaction_operator(
+    operator: ResearchTransactionModuleOperator,
+    metadata: ResearchTransactionFixtureMetadata,
+) -> WasmResult<()> {
+    if !metadata.transactions_enabled {
+        return Err(WasmError::Unsupported(
+            "transaction feature is disabled for research fixture".into(),
+        ));
+    }
+
+    match operator.operator {
+        TransactionOperator::TGlobalGet | TransactionOperator::TGlobalSet => {
+            if metadata.tglobal_count == 0 {
+                return Err(WasmError::InvalidWebAssembly {
+                    message: "transactional global operator requires a transactional global".into(),
+                    offset: operator.body_offset,
+                });
+            }
+        }
+        TransactionOperator::I32TLoad
+        | TransactionOperator::I64TLoad
+        | TransactionOperator::F32TLoad
+        | TransactionOperator::F64TLoad
+        | TransactionOperator::I32TLoad8S
+        | TransactionOperator::I32TLoad8U
+        | TransactionOperator::I32TLoad16S
+        | TransactionOperator::I32TLoad16U
+        | TransactionOperator::I64TLoad8S
+        | TransactionOperator::I64TLoad8U
+        | TransactionOperator::I64TLoad16S
+        | TransactionOperator::I64TLoad16U
+        | TransactionOperator::I64TLoad32S
+        | TransactionOperator::I64TLoad32U
+        | TransactionOperator::I32TStore
+        | TransactionOperator::I64TStore
+        | TransactionOperator::F32TStore
+        | TransactionOperator::F64TStore
+        | TransactionOperator::I32TStore8
+        | TransactionOperator::I32TStore16
+        | TransactionOperator::I64TStore8
+        | TransactionOperator::I64TStore16
+        | TransactionOperator::I64TStore32
+        | TransactionOperator::TMemorySize
+        | TransactionOperator::TMemoryGrow => {
+            if metadata.tmemory_count == 0 {
+                return Err(WasmError::InvalidWebAssembly {
+                    message: "transactional memory operator requires a transactional memory".into(),
+                    offset: operator.body_offset,
+                });
+            }
+        }
+        TransactionOperator::TTry | TransactionOperator::TFail => {}
+    }
+
+    Ok(())
+}
+
+/// Validate all parsed transaction operators for a generated research fixture.
+pub fn validate_research_transaction_fixture(
+    operators: &[ResearchTransactionModuleOperator],
+    metadata: ResearchTransactionFixtureMetadata,
+) -> WasmResult<()> {
+    for operator in operators {
+        validate_research_transaction_operator(*operator, metadata)?;
+    }
+    Ok(())
 }
 
 fn parse_research_code_section(
@@ -495,6 +575,135 @@ mod tests {
             WasmError::Unsupported(message) => {
                 assert!(message.contains("function 0"));
                 assert!(message.contains("0xfa 0x25"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_rejects_transaction_operator_when_feature_disabled() {
+        let operator = ResearchTransactionModuleOperator {
+            function_index: 0,
+            body_offset: 1,
+            operator: TransactionOperator::TFail,
+            bytes_read: 2,
+        };
+        let metadata = ResearchTransactionFixtureMetadata {
+            transactions_enabled: false,
+            tmemory_count: 0,
+            tglobal_count: 0,
+        };
+
+        let error = validate_research_transaction_operator(operator, metadata).unwrap_err();
+
+        match error {
+            WasmError::Unsupported(message) => {
+                assert!(message.contains("transaction feature is disabled"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_requires_tmemory_for_transactional_memory_ops() {
+        let operator = ResearchTransactionModuleOperator {
+            function_index: 0,
+            body_offset: 1,
+            operator: TransactionOperator::I32TLoad,
+            bytes_read: 2,
+        };
+        let metadata = ResearchTransactionFixtureMetadata {
+            transactions_enabled: true,
+            tmemory_count: 0,
+            tglobal_count: 0,
+        };
+
+        let error = validate_research_transaction_operator(operator, metadata).unwrap_err();
+        match error {
+            WasmError::InvalidWebAssembly { message, .. } => {
+                assert!(message.contains("transactional memory"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        validate_research_transaction_operator(
+            operator,
+            ResearchTransactionFixtureMetadata {
+                transactions_enabled: true,
+                tmemory_count: 1,
+                tglobal_count: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_requires_tglobal_for_transactional_global_ops() {
+        let operator = ResearchTransactionModuleOperator {
+            function_index: 0,
+            body_offset: 1,
+            operator: TransactionOperator::TGlobalGet,
+            bytes_read: 2,
+        };
+        let metadata = ResearchTransactionFixtureMetadata {
+            transactions_enabled: true,
+            tmemory_count: 0,
+            tglobal_count: 0,
+        };
+
+        let error = validate_research_transaction_operator(operator, metadata).unwrap_err();
+        match error {
+            WasmError::InvalidWebAssembly { message, .. } => {
+                assert!(message.contains("transactional global"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        validate_research_transaction_operator(
+            operator,
+            ResearchTransactionFixtureMetadata {
+                transactions_enabled: true,
+                tmemory_count: 0,
+                tglobal_count: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_checks_all_operators_in_generated_fixture() {
+        let module = generated_module_with_body(&[
+            0x00,
+            TRANSACTION_OPCODE_PREFIX,
+            0x28,
+            TRANSACTION_OPCODE_PREFIX,
+            0x3f,
+            0x0b,
+        ]);
+        let operators = parse_research_transaction_operators_from_module(&module).unwrap();
+
+        validate_research_transaction_fixture(
+            &operators,
+            ResearchTransactionFixtureMetadata {
+                transactions_enabled: true,
+                tmemory_count: 1,
+                tglobal_count: 0,
+            },
+        )
+        .unwrap();
+
+        let error = validate_research_transaction_fixture(
+            &operators,
+            ResearchTransactionFixtureMetadata {
+                transactions_enabled: true,
+                tmemory_count: 0,
+                tglobal_count: 0,
+            },
+        )
+        .unwrap_err();
+        match error {
+            WasmError::InvalidWebAssembly { message, .. } => {
+                assert!(message.contains("transactional memory"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
