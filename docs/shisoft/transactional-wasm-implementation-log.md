@@ -873,3 +873,31 @@ test result: ok. 11 passed; 0 failed; 0 ignored
 cargo check -p wasmtime
 Finished `dev` profile
 ```
+
+## Workstream B/G: Real Transaction Text Syntax
+
+Patched the local `wasm-tools-transaction` fork so the `wast` text parser
+accepts milestone-1 transaction instruction spellings and emits the same
+`0xfa`-prefixed binary encodings used by the binary parser:
+
+- `ttry` and `tfail`
+- `tglobal.get/set`
+- scalar and packed integer `*.tload/*.tstore`
+- `tmemory.size/grow`
+
+Fork commit:
+
+- `dec8e21 Add transaction text instruction syntax`
+
+Verification:
+
+```text
+cargo test -p wast transaction_text
+test result: ok. 3 passed; 0 failed
+
+cargo test -p wasmparser transaction
+test result: ok. 2 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 23 passed; 0 failed
+```
