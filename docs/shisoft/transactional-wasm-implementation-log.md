@@ -426,8 +426,8 @@ Remaining Wave 7 blocker:
 
 ## Wave 2: `tmemory` Storage Scaffold
 
-Added storage-only volatile mmap support for Wizard-style transactional memory
-under `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`.
+Added storage-only `VMemory` support for Wizard-style transactional memory under
+`crates/wasmtime/src/runtime/vm/memory/tmemory.rs`.
 
 This is intentionally not wired into Wasm module instantiation yet. It provides
 the storage boundary that later parser/lowering work will call into:
@@ -444,9 +444,83 @@ Verification:
 
 ```text
 cargo test -p wasmtime tmemory
-test result: ok. 8 passed; 0 failed; 0 ignored
+test result: ok. 9 passed; 0 failed; 0 ignored
 ```
 
 The scaffold keeps ordinary `memory` untouched. Later Wave 2 tasks still need
 parser/lowering/runtime integration before `tmemory.*`, `*.tload`, and
 `*.tstore` WAST files can be unignored.
+
+## Workstream C/D: Minimal Runtime Configuration And `TMemory`
+
+Added an internal transaction configuration module under
+`crates/wasmtime/src/runtime/transaction.rs`.
+
+Milestone 1 configuration now has explicit defaults:
+
+- `TMemoryBackend::VMemory`
+- `ConcurrencyControl::LockBased`
+- `DurabilityPolicy::VolatileRollbackOnly`
+- `ConflictPolicy::AbortOrWizardDefault`
+
+`FileBackedMemory` and `NVMemory` are represented as future `tmemory` backends
+but are rejected if selected. This keeps the first executable runtime small
+while preserving the dynamic backend shape needed for later thesis experiments.
+
+Added a `TMemory` storage wrapper that dispatches to the configured backend.
+For milestone 1 it constructs only `VMemory`; ordinary Wasmtime memory
+allocation remains outside this transaction configuration.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib transaction
+test result: ok. 2 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib tmemory
+test result: ok. 9 passed; 0 failed; 0 ignored
+```
+
+## Workstream E: Minimal Transaction State
+
+Added single-active-transaction runtime state under
+`crates/wasmtime/src/runtime/transaction.rs` and attached it to `StoreOpaque`.
+
+The current state model supports the first Wizard-style runtime slice:
+
+- zero or one active transaction per store
+- monotonic transaction ids
+- `begin`
+- `commit`
+- `abort`
+- `fail` as an explicit abort path
+- undo records for memory granule snapshots
+- undo records for memory size restore
+- undo records for numeric global restore
+- reverse-order undo traversal on abort/fail
+- duplicate memory-granule writes record only one snapshot
+- duplicate global writes record only one restore snapshot
+- read/write memory granule acquisition helpers
+- per-transaction memory granule read and write ownership sets
+
+This is still runtime-only. It does not yet wire the lock-based
+concurrency-control strategy into compiled Wasm lowering or concrete global
+value integration.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib transaction
+test result: ok. 13 passed; 0 failed; 0 ignored
+```
+
+Added the milestone-1 `LockBased` concurrency-control strategy. The strategy
+tracks per-granule read and write ownership by transaction id:
+
+- multiple transactions may hold read ownership for the same granule
+- a writer excludes other readers and writers
+- a transaction can upgrade from its own read ownership to write ownership
+- releasing a transaction clears its read and write ownership
+
+The name is intentionally `LockBased`; Wizard remains the behavior reference,
+not the type or enum name.

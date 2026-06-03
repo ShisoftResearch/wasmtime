@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
+use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
 use crate::runtime::vm::{HostAlignedByteCount, Mmap, mmap::AlignedLength};
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
@@ -22,6 +23,54 @@ pub(crate) struct TMemoryGranuleInfo {
     owner: u64,
     version: u64,
     hash: u64,
+}
+
+/// Transactional memory storage selected by transaction configuration.
+#[derive(Debug)]
+pub(crate) struct TMemory {
+    storage: TMemoryStorage,
+}
+
+#[derive(Debug)]
+enum TMemoryStorage {
+    VMemory(VMemory),
+}
+
+impl TMemory {
+    pub(crate) fn new(
+        config: TransactionConfig,
+        min_pages: u64,
+        max_pages: Option<u64>,
+    ) -> Result<Self> {
+        let storage = match config.tmemory_backend() {
+            TMemoryBackend::VMemory => TMemoryStorage::VMemory(VMemory::new(min_pages, max_pages)?),
+            TMemoryBackend::FileBackedMemory | TMemoryBackend::NVMemory => {
+                bail!(
+                    "tmemory backend is not implemented: {:?}",
+                    config.tmemory_backend()
+                )
+            }
+        };
+        Ok(Self { storage })
+    }
+
+    pub(crate) fn backend(&self) -> TMemoryBackend {
+        match self.storage {
+            TMemoryStorage::VMemory(_) => TMemoryBackend::VMemory,
+        }
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        match &self.storage {
+            TMemoryStorage::VMemory(memory) => memory.byte_len(),
+        }
+    }
+
+    pub(crate) fn granule_len(&self) -> usize {
+        match &self.storage {
+            TMemoryStorage::VMemory(memory) => memory.granule_len(),
+        }
+    }
 }
 
 /// Volatile anonymous-mmap transactional memory storage.
@@ -258,6 +307,15 @@ fn read_granule_info(bytes: &[u8]) -> TMemoryGranuleInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmemory_uses_configured_vmemory_backend() {
+        let memory = TMemory::new(TransactionConfig::default(), 1, Some(1)).unwrap();
+
+        assert_eq!(memory.backend(), TMemoryBackend::VMemory);
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(memory.granule_len(), 256);
+    }
 
     #[test]
     fn one_wasm_page_has_wizard_granules() {

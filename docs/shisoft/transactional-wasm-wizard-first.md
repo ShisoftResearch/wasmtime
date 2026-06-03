@@ -213,7 +213,7 @@ Selectable parts should include:
   - `FileBackedMemory`: file-backed mmap
   - `NVMemory`: PMEM/DAX-style mmap when available
 - transaction concurrency control:
-  - Wizard-style lock-based control
+  - lock-based control, matching Wizard's current behavior first
   - optimistic read validation with pessimistic write ownership
   - later MVCC-style experiments
 - durability policy:
@@ -456,8 +456,8 @@ When migrating proposal tests:
 
 1. Add an experimental transaction feature flag.
 2. Add an internal transaction configuration object with default selections for
-   `VMemory`, Wizard-style lock-based concurrency control, and volatile
-   rollback-only durability.
+   `VMemory`, lock-based concurrency control matching Wizard's current
+   behavior, and volatile rollback-only durability.
    This configuration selects only `tmemory` behavior and must leave ordinary
    Wasmtime memory behavior unchanged.
 3. Add or patch parser support for the milestone-1 binary operators.

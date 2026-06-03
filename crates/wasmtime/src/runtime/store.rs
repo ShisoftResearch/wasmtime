@@ -82,6 +82,7 @@ use crate::error::OutOfMemory;
 use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
+use crate::runtime::transaction::TransactionState;
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
 #[cfg(feature = "stack-switching")]
@@ -475,6 +476,8 @@ pub struct StoreOpaque {
     modules: ModuleRegistry,
     func_refs: FuncRefs,
     host_globals: TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
+    #[allow(dead_code)]
+    transaction_state: TransactionState,
     // GC-related fields.
     gc_store: Option<GcStore>,
     gc_roots: RootSet,
@@ -763,6 +766,7 @@ impl<T> Store<T> {
             modules: ModuleRegistry::default(),
             func_refs: FuncRefs::default(),
             host_globals: TryPrimaryMap::new(),
+            transaction_state: TransactionState::default(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
             memory_count: 0,
@@ -844,6 +848,16 @@ impl<T> Store<T> {
         Ok(Self {
             inner: ManuallyDrop::new(inner),
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_state(&self) -> &TransactionState {
+        self.inner.transaction_state()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_state_mut(&mut self) -> &mut TransactionState {
+        self.inner.transaction_state_mut()
     }
 
     /// Access the underlying `T` data owned by this `Store`.
@@ -1572,6 +1586,16 @@ impl StoreOpaque {
 
     pub fn store_data_mut_and_registry(&mut self) -> (&mut StoreData, &ModuleRegistry) {
         (&mut self.store_data, &self.modules)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_state(&self) -> &TransactionState {
+        &self.transaction_state
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_state_mut(&mut self) -> &mut TransactionState {
+        &mut self.transaction_state
     }
 
     #[cfg(feature = "debug")]
@@ -2725,6 +2749,16 @@ mod tests {
         tank.set_fuel(25);
         assert_eq!(tank.consumed_fuel, -10);
         assert_eq!(tank.reserve_fuel, 15);
+    }
+
+    #[test]
+    fn new_store_has_inactive_transaction_state() {
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        assert_eq!(store.transaction_state().active_transaction(), None);
+        store.transaction_state_mut().begin().unwrap();
+        assert!(store.transaction_state().active_transaction().is_some());
     }
 
     #[test]

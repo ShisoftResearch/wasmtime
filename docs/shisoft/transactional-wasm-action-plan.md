@@ -48,7 +48,7 @@ Wasmtime's existing memory configuration and allocation paths.
 Initial selections:
 
 - `TMemoryBackend::VMemory`
-- `ConcurrencyControl::WizardLockBased`
+- `ConcurrencyControl::LockBased`
 - `DurabilityPolicy::VolatileRollbackOnly`
 - `ConflictPolicy::AbortOrWizardDefault`
 
@@ -193,17 +193,17 @@ Likely files:
 
 Tasks:
 
-- [ ] Define internal transaction configuration.
-- [ ] Add default selections:
+- [x] Define internal transaction configuration.
+- [x] Add default selections:
   - `TMemoryBackend::VMemory`
-  - `ConcurrencyControl::WizardLockBased`
+  - `ConcurrencyControl::LockBased`
   - `DurabilityPolicy::VolatileRollbackOnly`
   - `ConflictPolicy::AbortOrWizardDefault`
-- [ ] Decide whether research selections live on `Config`, `Engine`, or
+- [x] Decide whether research selections live on `Config`, `Engine`, or
   `Store`.
-- [ ] Reject unimplemented selections, including `FileBackedMemory` and
+- [x] Reject unimplemented selections, including `FileBackedMemory` and
   `NVMemory`.
-- [ ] Pass selected configuration to transaction runtime and `tmemory` storage
+- [x] Pass selected configuration to transaction runtime and `tmemory` storage
   creation.
 
 Checkpoint:
@@ -233,14 +233,14 @@ Likely files:
 
 Tasks:
 
-- [ ] Define the `tmemory` backend interface.
-- [ ] Implement `VMemory` backend.
-- [ ] Add `TMemory` storage type that dispatches to the configured backend.
-- [ ] Add side metadata reservation for 256-byte granules.
-- [ ] Add metadata initialization for newly live granules.
-- [ ] Add snapshot and restore helpers.
-- [ ] Add grow and shrink helpers that update both data and metadata ranges.
-- [ ] Add storage-only tests.
+- [x] Define the `tmemory` backend interface.
+- [x] Implement `VMemory` backend.
+- [x] Add `TMemory` storage type that dispatches to the configured backend.
+- [x] Add side metadata reservation for 256-byte granules.
+- [x] Add metadata initialization for newly live granules.
+- [x] Add snapshot and restore helpers.
+- [x] Add grow and shrink helpers that update both data and metadata ranges.
+- [x] Add storage-only tests.
 
 Required helpers:
 
@@ -284,13 +284,13 @@ Likely files:
 
 Tasks:
 
-- [ ] Define concurrency-control interface.
-- [ ] Implement `WizardLockBased` strategy.
-- [ ] Add transaction state to the store boundary.
-- [ ] Add undo record types.
-- [ ] Add begin, commit, abort, and fail operations.
-- [ ] Add read/write acquisition helpers for globals and memory granules.
-- [ ] Add transaction-state tests.
+- [x] Define concurrency-control interface.
+- [x] Implement `LockBased` strategy.
+- [x] Add transaction state to the store boundary.
+- [x] Add undo record types.
+- [x] Add begin, commit, abort, and fail operations.
+- [x] Add read/write acquisition helpers for globals and memory granules.
+- [x] Add transaction-state tests.
 
 Required state:
 
