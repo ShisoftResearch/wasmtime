@@ -207,10 +207,16 @@ pub fn translate_operator(
             let val = environ.stacks.pop1();
             environ.translate_transaction_tglobal_set(builder, global_index, val)?;
         }
-        Operator::TMemorySize { .. } | Operator::TMemoryGrow { .. } => {
-            return Err(wasm_unsupported!(
-                "transaction data operators are parsed but not lowered yet"
-            ));
+        Operator::TMemorySize { mem } => {
+            let mem = MemoryIndex::from_u32(*mem);
+            let result = environ.translate_transaction_tmemory_size(builder, mem)?;
+            environ.stacks.push1(result);
+        }
+        Operator::TMemoryGrow { mem } => {
+            let mem = MemoryIndex::from_u32(*mem);
+            let val = environ.stacks.pop1();
+            let result = environ.translate_transaction_tmemory_grow(builder, mem, val)?;
+            environ.stacks.push1(result);
         }
         /********************************* Stack misc ***************************************
          *  `drop`, `nop`, `unreachable` and `select`.

@@ -376,7 +376,7 @@ Tasks:
 - [x] Lower `tglobal.get/set` to runtime helper ABI stubs.
 - [x] Lower scalar and packed `*.tload/*.tstore` to runtime helper ABI
   stubs.
-- [ ] Lower `tmemory.size/grow`.
+- [x] Lower `tmemory.size/grow` to runtime helper ABI stubs.
 - [ ] Ensure traps inside active transactions abort before returning to host.
 - [ ] Add focused integration tests for each operator family.
 
@@ -412,8 +412,8 @@ Current lifecycle bridge status:
   that currently trap at runtime.
 - Cranelift lowers scalar and packed integer `*.tload/*.tstore` through
   transaction memory helper builtins that currently trap at runtime.
-- Cranelift intentionally rejects parsed `tmemory.size/grow` operators until
-  object-space lowering is implemented.
+- Cranelift lowers `tmemory.size/grow` through transaction memory helper
+  builtins that currently trap at runtime.
 - Runtime helper ABI declarations now exist for transaction data operators, but
   their libcall implementations are trapping stubs until `tglobal` and
   `tmemory` object access is wired.

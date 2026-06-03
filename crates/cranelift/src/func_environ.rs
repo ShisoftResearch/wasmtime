@@ -3705,6 +3705,73 @@ impl FuncEnvironment<'_> {
         Ok(ptr)
     }
 
+    pub fn translate_transaction_tmemory_size(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        memory: MemoryIndex,
+    ) -> WasmResult<ir::Value> {
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_size(),
+        );
+        let index_type = self.memory(memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let memory_arg = pos
+            .ins()
+            .iconst(I32, i64::try_from(memory.index()).unwrap());
+        let call = pos.ins().call(callee, &[vmctx, memory_arg]);
+        let pages = pos.func.dfg.inst_results(call)[0];
+        self.compiler.raise_if_host_trapped(builder, vmctx, pages);
+        let single_byte_pages = match self.memory(memory).page_size_log2 {
+            16 => false,
+            0 => true,
+            _ => unreachable!("only page sizes 2**0 and 2**16 are currently valid"),
+        };
+        Ok(self.convert_pointer_to_index_type(
+            builder.cursor(),
+            pages,
+            index_type,
+            single_byte_pages,
+        ))
+    }
+
+    pub fn translate_transaction_tmemory_grow(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        memory: MemoryIndex,
+        delta: ir::Value,
+    ) -> WasmResult<ir::Value> {
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_grow(),
+        );
+        let index_type = self.memory(memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let memory_arg = pos
+            .ins()
+            .iconst(I32, i64::try_from(memory.index()).unwrap());
+        let delta = self.cast_index_to_i64(&mut pos, delta, index_type);
+        let call = pos.ins().call(callee, &[vmctx, memory_arg, delta]);
+        let previous_pages = pos.func.dfg.inst_results(call)[0];
+        self.compiler
+            .raise_if_host_trapped(builder, vmctx, previous_pages);
+        let single_byte_pages = match self.memory(memory).page_size_log2 {
+            16 => false,
+            0 => true,
+            _ => unreachable!("only page sizes 2**0 and 2**16 are currently valid"),
+        };
+        Ok(self.convert_pointer_to_index_type(
+            builder.cursor(),
+            previous_pages,
+            index_type,
+            single_byte_pages,
+        ))
+    }
+
     fn translate_transaction_lifecycle_builtin(
         &mut self,
         builder: &mut FunctionBuilder<'_>,

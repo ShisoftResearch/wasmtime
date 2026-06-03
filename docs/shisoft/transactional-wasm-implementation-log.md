@@ -831,3 +831,45 @@ test result: ok. 11 passed; 0 failed; 0 ignored
 cargo check -p wasmtime
 Finished `dev` profile
 ```
+
+## Workstream F: Transaction Memory Size/Grow Helper Lowering
+
+Lowered `tmemory.size/grow` through the normal validated module path. Cranelift
+now dispatches both operators to transaction memory helper builtins and returns
+the result in the memory index type.
+
+This finishes ABI-stub lowering for the milestone-1 operator families:
+
+- `ttry` and `tfail`
+- `tglobal.get/set`
+- scalar and packed integer `*.tload/*.tstore`
+- `tmemory.size/grow`
+
+The runtime helper implementations still trap. Passing full proposal WASTs now
+depends on the next semantic layer: concrete transactional object access,
+copy-on-write staged memory granules, transactional global staging through real
+module globals, and commit-time writeback.
+
+Red check before lowering:
+
+```text
+cargo test -p wasmtime --lib module_compilation_accepts_transaction_memory_
+test result: FAILED. 0 passed; 2 failed
+Unsupported feature: transaction data operators are parsed but not lowered yet
+```
+
+Verification after lowering:
+
+```text
+cargo test -p wasmtime --lib module_compilation_accepts_transaction_memory_
+test result: ok. 2 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 23 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime-environ --lib transaction_
+test result: ok. 11 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile
+```

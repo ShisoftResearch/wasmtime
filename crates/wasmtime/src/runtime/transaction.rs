@@ -800,4 +800,39 @@ mod tests {
 
         crate::Module::new(&engine, wasm).unwrap();
     }
+
+    #[test]
+    fn module_compilation_accepts_transaction_memory_size_helper_lowering() {
+        let engine = crate::Engine::default();
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x05, 0x03, 0x01, 0x00, 0x01, // memory section
+            0x0a, 0x07, 0x01, 0x05, 0x00, // code section/function body
+            0xfa, 0x3f, 0x00, // tmemory.size 0
+            0x0b, // end
+        ];
+
+        crate::Module::new(&engine, wasm).unwrap();
+    }
+
+    #[test]
+    fn module_compilation_accepts_transaction_memory_grow_helper_lowering() {
+        let engine = crate::Engine::default();
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x05, 0x03, 0x01, 0x00, 0x01, // memory section
+            0x0a, 0x09, 0x01, 0x07, 0x00, // code section/function body
+            0x41, 0x01, // i32.const 1
+            0xfa, 0x40, 0x00, // tmemory.grow 0
+            0x0b, // end
+        ];
+
+        crate::Module::new(&engine, wasm).unwrap();
+    }
 }
