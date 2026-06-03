@@ -711,4 +711,44 @@ mod tests {
 
         assert_eq!(state.active_transaction(), None);
     }
+
+    #[test]
+    fn module_compilation_accepts_lifecycle_transaction_opcodes() {
+        let engine = crate::Engine::default();
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x0a, 0x08, 0x01, 0x06, 0x00, // code section/function body
+            0xfa, 0x04, // ttry
+            0xfa, 0x0f, // tfail
+            0x0b, // end
+        ];
+
+        crate::Module::new(&engine, wasm).unwrap();
+    }
+
+    #[test]
+    fn module_compilation_rejects_unlowered_transaction_data_opcodes() {
+        let engine = crate::Engine::default();
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x05, 0x03, 0x01, 0x00, 0x01, // memory section
+            0x0a, 0x0a, 0x01, 0x08, 0x00, // code section/function body
+            0x41, 0x00, // i32.const 0
+            0xfa, 0x28, 0x02, 0x00, // i32.tload align=2 offset=0
+            0x0b, // end
+        ];
+
+        let error = crate::Module::new(&engine, wasm).unwrap_err();
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("transaction data operators are parsed but not lowered yet"),
+            "{error}"
+        );
+    }
 }

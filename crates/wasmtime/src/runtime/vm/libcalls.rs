@@ -263,6 +263,19 @@ fn memory_grow(
     })?
 }
 
+fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+    store.store_opaque_mut().transaction_state_mut().begin()?;
+    Ok(())
+}
+
+fn transaction_commit(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+    store.store_opaque_mut().transaction_state_mut().commit()
+}
+
+fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+    store.store_opaque_mut().transaction_state_mut().fail()
+}
+
 /// A helper structure to represent the return value of a memory or table growth
 /// call.
 ///

@@ -197,6 +197,37 @@ pub fn translate_operator(
             }
             environ.translate_global_set(builder, global_index, val)?;
         }
+        Operator::TGlobalGet { .. }
+        | Operator::TGlobalSet { .. }
+        | Operator::I32TLoad { .. }
+        | Operator::I64TLoad { .. }
+        | Operator::F32TLoad { .. }
+        | Operator::F64TLoad { .. }
+        | Operator::I32TLoad8S { .. }
+        | Operator::I32TLoad8U { .. }
+        | Operator::I32TLoad16S { .. }
+        | Operator::I32TLoad16U { .. }
+        | Operator::I64TLoad8S { .. }
+        | Operator::I64TLoad8U { .. }
+        | Operator::I64TLoad16S { .. }
+        | Operator::I64TLoad16U { .. }
+        | Operator::I64TLoad32S { .. }
+        | Operator::I64TLoad32U { .. }
+        | Operator::I32TStore { .. }
+        | Operator::I64TStore { .. }
+        | Operator::F32TStore { .. }
+        | Operator::F64TStore { .. }
+        | Operator::I32TStore8 { .. }
+        | Operator::I32TStore16 { .. }
+        | Operator::I64TStore8 { .. }
+        | Operator::I64TStore16 { .. }
+        | Operator::I64TStore32 { .. }
+        | Operator::TMemorySize { .. }
+        | Operator::TMemoryGrow { .. } => {
+            return Err(wasm_unsupported!(
+                "transaction data operators are parsed but not lowered yet"
+            ));
+        }
         /********************************* Stack misc ***************************************
          *  `drop`, `nop`, `unreachable` and `select`.
          ***********************************************************************************/
@@ -205,6 +236,12 @@ pub fn translate_operator(
         }
         Operator::Nop => {
             // We do nothing
+        }
+        Operator::TTry => {
+            environ.translate_transaction_begin(builder)?;
+        }
+        Operator::TFail => {
+            environ.translate_transaction_fail(builder)?;
         }
         Operator::Select
         | Operator::TypedSelect {

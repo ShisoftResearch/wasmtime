@@ -148,6 +148,11 @@ windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true, features = ["param"] }
 
+[patch.crates-io]
+wasm-encoder = { path = "../wasm-tools-transaction/crates/wasm-encoder" }
+wasmparser = { path = "../wasm-tools-transaction/crates/wasmparser" }
+wasmprinter = { path = "../wasm-tools-transaction/crates/wasmprinter" }
+
 [profile.release.build-override]
 opt-level = 0
 

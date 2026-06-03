@@ -100,11 +100,12 @@ git -C ../wizard-engine rev-parse HEAD
 git -C ../wasm-persistence rev-parse HEAD
 ```
 
-- [ ] Choose parser strategy.
+- [x] Choose parser strategy.
 
 Preferred order:
 
-1. Local `[patch.crates-io]` fork of `wasmparser` and `wast`.
+1. Local `[patch.crates-io]` fork of `wasmparser` plus any wasm-tools crates
+   required by its exported operator macros.
 2. Vendored minimal parser support for research-only binary tests.
 3. Generated binary modules only, with text `.wast` migration deferred.
 
@@ -141,8 +142,10 @@ Likely files:
 Tasks:
 
 - [ ] Add an experimental transaction feature gate.
-- [ ] Add milestone-1 `wasmparser::Operator` variants.
-- [ ] Add binary parsing for `0xfa` prefixed milestone-1 operators.
+- [x] Add lifecycle `wasmparser::Operator` variants for `ttry` and `tfail`.
+- [x] Add binary parsing for lifecycle `0xfa` prefixed operators.
+- [x] Add the remaining milestone-1 `wasmparser::Operator` variants.
+- [x] Add binary parsing for remaining `0xfa` prefixed milestone-1 operators.
 - [ ] Add minimal text support or generated binary-module fixtures.
 - [ ] Add module metadata for transactional memories and globals.
 - [ ] Add validation rules separating ordinary and transactional object spaces.
@@ -160,8 +163,9 @@ Current bridge:
   transactional memories, and transactional globals.
 - [x] Add runtime fixture executor bridge for milestone-1 `ttry`/`tfail`
   control behavior.
-- [ ] Patch or fork `wasmparser` so these decode as first-class
-  `wasmparser::Operator` variants.
+- [x] Patch local `wasmparser` fork so lifecycle opcodes decode as
+  first-class `wasmparser::Operator` variants.
+- [x] Extend the local parser fork to the remaining milestone-1 operators.
 
 Milestone-1 operators:
 
@@ -361,8 +365,14 @@ Likely files:
 
 Tasks:
 
-- [ ] Add runtime helper declarations.
-- [ ] Lower `ttry` and `tfail`.
+- [x] Add runtime helper declarations for `ttry`/`tfail` lifecycle.
+- [ ] Add runtime helper declarations for `tglobal.*`, `*.tload`,
+  `*.tstore`, and `tmemory.*`.
+- [x] Add temporary Cranelift-local parser/lowering bridge for lifecycle `0xfa`
+  operators.
+- [x] Replace the temporary bridge with a local `wasmparser` fork so normal
+  `Module::new` accepts lifecycle `0xfa` operators.
+- [x] Lower `ttry` and `tfail` through the full validated module path.
 - [ ] Lower `tglobal.get/set`.
 - [ ] Lower scalar and packed `*.tload/*.tstore`.
 - [ ] Lower `tmemory.size/grow`.
@@ -387,6 +397,20 @@ Required behavior:
 Checkpoint:
 
 - Generated binary tests can run the full milestone-1 operator set.
+
+Current lifecycle bridge status:
+
+- Wasmtime uses a local `[patch.crates-io]` wasm-tools fork for `wasmparser`,
+  `wasm-encoder`, and `wasmprinter`.
+- `wasmparser` decodes `0xfa 0x04` as `Operator::TTry` and `0xfa 0x0f` as
+  `Operator::TFail`.
+- `wasmparser` also decodes the remaining milestone-1 `tglobal.*`,
+  `*.tload`, `*.tstore`, and `tmemory.*` binary operators.
+- Cranelift lowers those operators through transaction begin/fail builtins.
+- Cranelift intentionally rejects parsed transaction data operators until
+  runtime helpers and object-space lowering are implemented.
+- A binary `Module::new` regression now proves the normal validated module path
+  accepts lifecycle transaction opcodes.
 
 ## Workstream G: Test Migration And Verification
 
@@ -533,11 +557,11 @@ B + D + E + F
 
 ## Open Decisions
 
-- Whether to patch external `wasmparser`/`wast` or use generated binary tests
-  first.
-- Whether milestone-1 `ttry` should be implemented before `tglobal/tmemory`
-  lowering or simulated with host-side begin/abort in the earliest runtime
-  tests.
+- Whether to add text `.wast` support in `wast` now or keep using generated
+  binary modules until the remaining milestone-1 binary operators lower.
+- Whether normal transaction exit should be represented by an explicit
+  lifecycle opcode in the current proposal fixtures or by structured `ttry`
+  block exit semantics.
 - Exact representation of transaction ownership metadata in Rust.
 - Exact shape and public/private visibility of the transaction configuration
   object.

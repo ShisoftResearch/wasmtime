@@ -515,6 +515,142 @@ cargo test -p wasmtime --lib transaction
 test result: ok. 16 passed; 0 failed; 0 ignored
 ```
 
+## Workstream F: Transaction Lifecycle Runtime Helpers
+
+Started the runtime-helper layer for executable operators.
+
+Added builtin helper declarations for:
+
+- `transaction_begin`
+- `transaction_commit`
+- `transaction_fail`
+
+These helpers use Wasmtime's existing bool-returning builtin ABI where `false`
+is the trap/unwind sentinel. The runtime implementations delegate to
+`StoreOpaque::transaction_state_mut()` and therefore use the current COW
+transaction semantics:
+
+- begin creates the active transaction
+- commit writes staged records through the transaction commit path
+- fail aborts and drops staged records
+
+This is only the lifecycle helper slice. Runtime helper declarations for
+transactional globals, `tmemory` loads/stores, and `tmemory.size/grow` are still
+pending.
+
+Verification:
+
+```text
+cargo test -p wasmtime-environ --lib transaction_lifecycle_builtins_use_falsy_trap_sentinel
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 17 passed; 0 failed; 0 ignored
+```
+
+## Workstream F: Forked Parser Lifecycle Lowering
+
+Replaced the temporary Cranelift-local lifecycle parser bridge with a local
+wasm-tools fork at `../wasm-tools-transaction`.
+
+Wasmtime now patches these crates through `[patch.crates-io]`:
+
+- `wasmparser`
+- `wasm-encoder`
+- `wasmprinter`
+
+The parser fork adds first-class lifecycle operator variants:
+
+- `0xfa 0x04` -> `wasmparser::Operator::TTry`
+- `0xfa 0x0f` -> `wasmparser::Operator::TFail`
+
+The fork keeps the milestone-1 lifecycle validation stack-neutral for now. This
+is enough for executable research binaries, but it is not the full structured
+transaction semantics yet.
+
+Wasmtime Cranelift translation now stays on the ordinary `OperatorsReader`
+path. `crates/cranelift/src/translate/code_translator.rs` lowers:
+
+- `Operator::TTry` through `transaction_begin`
+- `Operator::TFail` through `transaction_fail`
+
+The local fork also teaches `wasm-encoder` and `wasmprinter` about the two
+lifecycle opcodes because those crates consume `wasmparser`'s exported operator
+macros during Wasmtime builds.
+
+Verification:
+
+```text
+cargo test -p wasmparser transaction_lifecycle_operators_decode
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime-environ --lib transaction_lifecycle_builtins_use_falsy_trap_sentinel
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib module_compilation_accepts_lifecycle_transaction_opcodes
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 17 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile
+```
+
+## Workstream B/F: Milestone-1 Binary Parser Extension
+
+Extended the local wasm-tools fork beyond lifecycle opcodes. `wasmparser` now
+decodes the full milestone-1 binary opcode set carried in
+`wasmtime-environ::TransactionOperator`:
+
+- `tglobal.get`
+- `tglobal.set`
+- scalar and packed integer `*.tload`
+- scalar and packed integer `*.tstore`
+- `tmemory.size`
+- `tmemory.grow`
+
+The parser extension reuses ordinary Wasm payload shapes:
+
+- `tglobal.*` carries a global index
+- transactional loads/stores carry `MemArg`
+- `tmemory.size/grow` carry a memory index
+
+The fork keeps validation conservative and incomplete: transaction data
+operators currently reuse ordinary global/memory stack effects so binary
+fixtures can parse and validate, but proper transaction object-space validation
+is still pending.
+
+Updated compatibility in the same fork:
+
+- `wasm-encoder` can encode/reencode the new transaction operators.
+- `wasmprinter` can print their names and payloads.
+
+Wasmtime lowering status:
+
+- `ttry` and `tfail` lower through runtime lifecycle builtins.
+- `tglobal.*`, `*.tload`, `*.tstore`, and `tmemory.*` are parsed but
+  intentionally return an unsupported-lowering error in Cranelift.
+
+Verification:
+
+```text
+cargo test -p wasmparser transaction_
+test result: ok. 2 passed; 0 failed; 0 ignored
+
+cargo check -p wasm-encoder
+Finished `dev` profile
+
+cargo check -p wasmprinter
+Finished `dev` profile
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 18 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile
+```
+
 Added the milestone-1 `LockBased` concurrency-control strategy. The strategy
 tracks per-granule read and write ownership by transaction id:
 

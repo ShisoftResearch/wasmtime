@@ -5,6 +5,12 @@ macro_rules! foreach_builtin_function {
         $mac! {
             // Returns an index for wasm's `memory.grow` builtin function.
             memory_grow(vmctx: vmctx, delta: u64, index: u32) -> pointer;
+            // Begins a transactional WebAssembly transaction.
+            transaction_begin(vmctx: vmctx) -> bool;
+            // Commits a transactional WebAssembly transaction.
+            transaction_commit(vmctx: vmctx) -> bool;
+            // Fails and aborts a transactional WebAssembly transaction.
+            transaction_fail(vmctx: vmctx) -> bool;
             // Returns an index for wasm's `memory.copy`
             memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
             // Returns an index for wasm's `memory.fill` instruction.
@@ -408,5 +414,21 @@ impl BuiltinFunctionIndex {
         }
 
         foreach_builtin_function!(trap_sentinel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BuiltinFunctionIndex, TrapSentinel};
+
+    #[test]
+    fn transaction_lifecycle_builtins_use_falsy_trap_sentinel() {
+        for builtin in [
+            BuiltinFunctionIndex::transaction_begin(),
+            BuiltinFunctionIndex::transaction_commit(),
+            BuiltinFunctionIndex::transaction_fail(),
+        ] {
+            assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));
+        }
     }
 }

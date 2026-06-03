@@ -3537,6 +3537,40 @@ impl FuncEnvironment<'_> {
         ))
     }
 
+    pub fn translate_transaction_begin(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        self.translate_transaction_lifecycle_builtin(
+            builder,
+            BuiltinFunctionIndex::transaction_begin(),
+        )
+    }
+
+    pub fn translate_transaction_fail(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        self.translate_transaction_lifecycle_builtin(
+            builder,
+            BuiltinFunctionIndex::transaction_fail(),
+        )
+    }
+
+    fn translate_transaction_lifecycle_builtin(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        builtin: BuiltinFunctionIndex,
+    ) -> WasmResult<()> {
+        let callee = self.builtin_functions.load_builtin(builder.func, builtin);
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let call = builder.ins().call(callee, &[vmctx]);
+        let succeeded = builder.func.dfg.inst_results(call)[0];
+        self.compiler
+            .raise_if_host_trapped(builder, vmctx, succeeded);
+        Ok(())
+    }
+
     /// Loads the size, in bytes, of the memory `index` specified.
     ///
     /// Returns the `ir::Value`, typed as a pointer-width integer, that is the
