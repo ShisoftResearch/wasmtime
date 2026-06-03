@@ -432,6 +432,25 @@ pub(crate) fn execute_research_transaction_fixture(
 mod tests {
     use super::*;
 
+    fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
+        with_transaction_object_metadata(wasm, &[1, 1, 0, 0])
+    }
+
+    fn with_transaction_global_metadata(wasm: &[u8]) -> Vec<u8> {
+        with_transaction_object_metadata(wasm, &[1, 0, 1, 0])
+    }
+
+    fn with_transaction_object_metadata(wasm: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut wasm = wasm.to_vec();
+        wasm.extend_from_slice(&[
+            0x00, 0x20, 0x1b, b's', b'h', b'i', b's', b'o', b'f', b't', b'.', b't', b'r', b'a',
+            b'n', b's', b'a', b'c', b't', b'i', b'o', b'n', b'.', b'o', b'b', b'j', b'e', b'c',
+            b't', b's',
+        ]);
+        wasm.extend_from_slice(payload);
+        wasm
+    }
+
     #[test]
     fn default_transaction_config_uses_minimal_vmemory_runtime() {
         let config = TransactionConfig::default();
@@ -732,7 +751,7 @@ mod tests {
     #[test]
     fn module_compilation_accepts_transaction_data_helper_lowering() {
         let engine = crate::Engine::default();
-        let wasm = [
+        let wasm = with_transaction_memory_metadata(&[
             0x00, 0x61, 0x73, 0x6d, // magic
             0x01, 0x00, 0x00, 0x00, // version
             0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
@@ -742,15 +761,38 @@ mod tests {
             0x41, 0x00, // i32.const 0
             0xfa, 0x28, 0x02, 0x00, // i32.tload align=2 offset=0
             0x0b, // end
-        ];
+        ]);
 
         crate::Module::new(&engine, wasm).unwrap();
     }
 
     #[test]
-    fn module_compilation_accepts_transaction_store_helper_lowering() {
+    fn module_compilation_rejects_transaction_load_on_ordinary_memory() {
         let engine = crate::Engine::default();
         let wasm = [
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x05, 0x03, 0x01, 0x00, 0x01, // ordinary memory section
+            0x0a, 0x0a, 0x01, 0x08, 0x00, // code section/function body
+            0x41, 0x00, // i32.const 0
+            0xfa, 0x28, 0x02, 0x00, // i32.tload align=2 offset=0
+            0x0b, // end
+        ];
+
+        let error = crate::Module::new(&engine, wasm).unwrap_err();
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("transactional memory operator requires tmemory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn module_compilation_accepts_transaction_store_helper_lowering() {
+        let engine = crate::Engine::default();
+        let wasm = with_transaction_memory_metadata(&[
             0x00, 0x61, 0x73, 0x6d, // magic
             0x01, 0x00, 0x00, 0x00, // version
             0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section
@@ -761,7 +803,7 @@ mod tests {
             0x41, 0x2a, // i32.const 42
             0xfa, 0x36, 0x02, 0x00, // i32.tstore align=2 offset=0
             0x0b, // end
-        ];
+        ]);
 
         crate::Module::new(&engine, wasm).unwrap();
     }
@@ -769,7 +811,7 @@ mod tests {
     #[test]
     fn module_compilation_accepts_transaction_global_get_helper_lowering() {
         let engine = crate::Engine::default();
-        let wasm = [
+        let wasm = with_transaction_global_metadata(&[
             0x00, 0x61, 0x73, 0x6d, // magic
             0x01, 0x00, 0x00, 0x00, // version
             0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
@@ -778,15 +820,37 @@ mod tests {
             0x0a, 0x07, 0x01, 0x05, 0x00, // code section/function body
             0xfa, 0x23, 0x00, // tglobal.get 0
             0x0b, // end
-        ];
+        ]);
 
         crate::Module::new(&engine, wasm).unwrap();
     }
 
     #[test]
-    fn module_compilation_accepts_transaction_global_set_helper_lowering() {
+    fn module_compilation_rejects_transaction_global_get_on_ordinary_global() {
         let engine = crate::Engine::default();
         let wasm = [
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b, // ordinary global section
+            0x0a, 0x07, 0x01, 0x05, 0x00, // code section/function body
+            0xfa, 0x23, 0x00, // tglobal.get 0
+            0x0b, // end
+        ];
+
+        let error = crate::Module::new(&engine, wasm).unwrap_err();
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("transactional global operator requires tglobal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn module_compilation_accepts_transaction_global_set_helper_lowering() {
+        let engine = crate::Engine::default();
+        let wasm = with_transaction_global_metadata(&[
             0x00, 0x61, 0x73, 0x6d, // magic
             0x01, 0x00, 0x00, 0x00, // version
             0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section
@@ -796,7 +860,7 @@ mod tests {
             0x41, 0x2a, // i32.const 42
             0xfa, 0x24, 0x00, // tglobal.set 0
             0x0b, // end
-        ];
+        ]);
 
         crate::Module::new(&engine, wasm).unwrap();
     }
@@ -804,7 +868,7 @@ mod tests {
     #[test]
     fn module_compilation_accepts_transaction_memory_size_helper_lowering() {
         let engine = crate::Engine::default();
-        let wasm = [
+        let wasm = with_transaction_memory_metadata(&[
             0x00, 0x61, 0x73, 0x6d, // magic
             0x01, 0x00, 0x00, 0x00, // version
             0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
@@ -813,7 +877,7 @@ mod tests {
             0x0a, 0x07, 0x01, 0x05, 0x00, // code section/function body
             0xfa, 0x3f, 0x00, // tmemory.size 0
             0x0b, // end
-        ];
+        ]);
 
         crate::Module::new(&engine, wasm).unwrap();
     }
@@ -821,7 +885,7 @@ mod tests {
     #[test]
     fn module_compilation_accepts_transaction_memory_grow_helper_lowering() {
         let engine = crate::Engine::default();
-        let wasm = [
+        let wasm = with_transaction_memory_metadata(&[
             0x00, 0x61, 0x73, 0x6d, // magic
             0x01, 0x00, 0x00, 0x00, // version
             0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
@@ -831,7 +895,7 @@ mod tests {
             0x41, 0x01, // i32.const 1
             0xfa, 0x40, 0x00, // tmemory.grow 0
             0x0b, // end
-        ];
+        ]);
 
         crate::Module::new(&engine, wasm).unwrap();
     }

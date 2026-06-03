@@ -3562,6 +3562,7 @@ impl FuncEnvironment<'_> {
         builder: &mut FunctionBuilder<'_>,
         global: GlobalIndex,
     ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_global(global)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
         let result_ty = self.transaction_global_value_type(wasm_ty)?;
         let callee = self.builtin_functions.load_builtin(
@@ -3588,6 +3589,7 @@ impl FuncEnvironment<'_> {
         global: GlobalIndex,
         val: ir::Value,
     ) -> WasmResult<()> {
+        self.ensure_transaction_global(global)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
         let expected_ty = self.transaction_global_value_type(wasm_ty)?;
         debug_assert_eq!(expected_ty, builder.func.dfg.value_type(val));
@@ -3657,6 +3659,7 @@ impl FuncEnvironment<'_> {
         offset: u64,
         len: u32,
     ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_memory(memory)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_load(),
@@ -3685,6 +3688,7 @@ impl FuncEnvironment<'_> {
         offset: u64,
         len: u32,
     ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_memory(memory)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_store(),
@@ -3710,6 +3714,7 @@ impl FuncEnvironment<'_> {
         builder: &mut FunctionBuilder<'_>,
         memory: MemoryIndex,
     ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_memory(memory)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_size(),
@@ -3743,6 +3748,7 @@ impl FuncEnvironment<'_> {
         memory: MemoryIndex,
         delta: ir::Value,
     ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_memory(memory)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_grow(),
@@ -3770,6 +3776,26 @@ impl FuncEnvironment<'_> {
             index_type,
             single_byte_pages,
         ))
+    }
+
+    fn ensure_transaction_memory(&self, memory: MemoryIndex) -> WasmResult<()> {
+        if self.module.transaction_objects.is_tmemory(memory) {
+            return Ok(());
+        }
+        Err(wasmtime_environ::WasmError::InvalidWebAssembly {
+            message: "transactional memory operator requires tmemory".into(),
+            offset: self.func_body_offset,
+        })
+    }
+
+    fn ensure_transaction_global(&self, global: GlobalIndex) -> WasmResult<()> {
+        if self.module.transaction_objects.is_tglobal(global) {
+            return Ok(());
+        }
+        Err(wasmtime_environ::WasmError::InvalidWebAssembly {
+            message: "transactional global operator requires tglobal".into(),
+            offset: self.func_body_offset,
+        })
     }
 
     fn translate_transaction_lifecycle_builtin(
