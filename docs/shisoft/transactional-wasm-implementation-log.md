@@ -888,16 +888,32 @@ accepts milestone-1 transaction instruction spellings and emits the same
 Fork commit:
 
 - `dec8e21 Add transaction text instruction syntax`
+- `606112b Add transaction module text aliases`
 
 Verification:
 
 ```text
 cargo test -p wast transaction_text
-test result: ok. 3 passed; 0 failed
+test result: ok. 5 passed; 0 failed
 
 cargo test -p wasmparser transaction
 test result: ok. 2 passed; 0 failed
 
 cargo test -p wasmtime --lib transaction
 test result: ok. 23 passed; 0 failed
+```
+
+Added a Wasmtime proposal-harness real-text-parser tranche for
+`tmemory_size.wast` and `tmemory_grow.wast`. These files now bypass the
+normalization adapter but remain ignored until runtime helper semantics stop
+trapping.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast transaction_proposal
+test result: ok. 8 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 117 passed; 0 failed; 56 ignored
 ```

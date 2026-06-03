@@ -161,7 +161,9 @@ fn add_tests(tests: &mut Vec<WastTest>, path: &Path, config: &FindConfig) -> Res
             FindConfig::TransactionProposal(suite) => Some(*suite),
             _ => None,
         };
-        if transaction_proposal.is_some() {
+        let transaction_real_text_parser = transaction_proposal
+            .is_some_and(|suite| transaction_proposal_uses_real_text_parser(suite, &path));
+        if transaction_proposal.is_some() && !transaction_real_text_parser {
             contents = normalize_transaction_proposal_wast(&contents);
         }
         tests.push(WastTest {
@@ -169,6 +171,7 @@ fn add_tests(tests: &mut Vec<WastTest>, path: &Path, config: &FindConfig) -> Res
             contents,
             config: test_config,
             transaction_proposal,
+            transaction_real_text_parser,
         })
     }
     Ok(())
@@ -655,6 +658,7 @@ pub struct WastTest {
     pub contents: String,
     pub config: TestConfig,
     pub transaction_proposal: Option<TransactionProposalSuite>,
+    pub transaction_real_text_parser: bool,
 }
 
 impl fmt::Debug for WastTest {
@@ -664,6 +668,10 @@ impl fmt::Debug for WastTest {
             .field("contents", &"...")
             .field("config", &self.config)
             .field("transaction_proposal", &self.transaction_proposal)
+            .field(
+                "transaction_real_text_parser",
+                &self.transaction_real_text_parser,
+            )
             .finish()
     }
 }
@@ -882,8 +890,17 @@ impl WastTest {
         self.transaction_proposal
     }
 
+    /// Returns whether this proposal test uses the real transaction text parser
+    /// instead of the research normalization adapter.
+    pub fn transaction_real_text_parser(&self) -> bool {
+        self.transaction_real_text_parser
+    }
+
     /// Returns whether this transactional proposal test can currently run.
     pub fn transaction_proposal_enabled(&self) -> bool {
+        if self.transaction_real_text_parser {
+            return false;
+        }
         let Some(suite) = self.transaction_proposal else {
             return false;
         };
@@ -1257,6 +1274,22 @@ fn simple_transaction_proposal_enabled(name: &str) -> bool {
     )
 }
 
+fn transaction_proposal_uses_real_text_parser(
+    suite: TransactionProposalSuite,
+    path: &Path,
+) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    match suite {
+        TransactionProposalSuite::SimpleTransactions => {
+            matches!(name, "tmemory_size.wast" | "tmemory_grow.wast")
+        }
+        TransactionProposalSuite::Tsimd => false,
+    }
+}
+
 fn tsimd_transaction_proposal_enabled(name: &str) -> bool {
     matches!(
         name,
@@ -1572,6 +1605,7 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: false,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
@@ -1587,9 +1621,7 @@ mod tests {
             "tendianness.wast",
             "tload.wast",
             "tmemory.wast",
-            "tmemory_grow.wast",
             "tmemory_redundancy.wast",
-            "tmemory_size.wast",
             "tmemory_trap.wast",
             "tskip-stack-guard-page.wast",
             "tstore.wast",
@@ -1599,9 +1631,30 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: false,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
+        }
+    }
+
+    #[test]
+    fn real_text_parser_transaction_proposal_tranche_is_not_normalized_or_run_yet() {
+        for name in ["tmemory_size.wast", "tmemory_grow.wast"] {
+            let test = WastTest {
+                path: PathBuf::from(name),
+                contents: String::new(),
+                config: TestConfig::default(),
+                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: true,
+            };
+
+            assert!(test.transaction_real_text_parser(), "{name}");
+            assert!(!test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
         }
     }
 
@@ -1617,6 +1670,7 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: false,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
@@ -1631,6 +1685,7 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: false,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
@@ -1653,6 +1708,7 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: false,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
@@ -1667,6 +1723,7 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: false,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
@@ -1738,6 +1795,7 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::Tsimd),
+                transaction_real_text_parser: false,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
