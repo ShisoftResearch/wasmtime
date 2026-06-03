@@ -373,7 +373,7 @@ Tasks:
 - [x] Replace the temporary bridge with a local `wasmparser` fork so normal
   `Module::new` accepts lifecycle `0xfa` operators.
 - [x] Lower `ttry` and `tfail` through the full validated module path.
-- [ ] Lower `tglobal.get/set`.
+- [x] Lower `tglobal.get/set` to runtime helper ABI stubs.
 - [x] Lower scalar and packed `*.tload/*.tstore` to runtime helper ABI
   stubs.
 - [ ] Lower `tmemory.size/grow`.
@@ -408,10 +408,12 @@ Current lifecycle bridge status:
 - `wasmparser` also decodes the remaining milestone-1 `tglobal.*`,
   `*.tload`, `*.tstore`, and `tmemory.*` binary operators.
 - Cranelift lowers lifecycle operators through transaction begin/fail builtins.
+- Cranelift lowers `tglobal.get/set` through transaction global helper builtins
+  that currently trap at runtime.
 - Cranelift lowers scalar and packed integer `*.tload/*.tstore` through
   transaction memory helper builtins that currently trap at runtime.
-- Cranelift intentionally rejects parsed `tglobal.*` and `tmemory.size/grow`
-  operators until object-space lowering is implemented.
+- Cranelift intentionally rejects parsed `tmemory.size/grow` operators until
+  object-space lowering is implemented.
 - Runtime helper ABI declarations now exist for transaction data operators, but
   their libcall implementations are trapping stubs until `tglobal` and
   `tmemory` object access is wired.

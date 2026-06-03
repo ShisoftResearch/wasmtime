@@ -792,3 +792,42 @@ test result: ok. 19 passed; 0 failed; 0 ignored
 cargo check -p wasmtime
 Finished `dev` profile
 ```
+
+## Workstream F: Transaction Global Helper Lowering
+
+Lowered numeric `tglobal.get/set` through the normal validated module path.
+Cranelift now dispatches these operators to the transaction global helper ABI:
+
+- `transaction_tglobal_get` returns a pointer to a readable transactional
+  global cell.
+- `transaction_tglobal_set` receives a simple numeric type tag plus a `u64`
+  payload for the staged value.
+
+The current lowering supports `i32`, `i64`, `f32`, and `f64` global values for
+the ABI-stub milestone. `v128` and reference-typed transactional globals remain
+unsupported. The runtime helpers still trap until concrete transactional global
+object access is wired.
+
+Red check before lowering:
+
+```text
+cargo test -p wasmtime --lib module_compilation_accepts_transaction_global
+test result: FAILED. 0 passed; 2 failed
+Unsupported feature: transaction data operators are parsed but not lowered yet
+```
+
+Verification after lowering:
+
+```text
+cargo test -p wasmtime --lib module_compilation_accepts_transaction_global
+test result: ok. 2 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 21 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime-environ --lib transaction_
+test result: ok. 11 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile
+```

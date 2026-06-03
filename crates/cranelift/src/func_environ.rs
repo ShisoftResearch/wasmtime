@@ -3557,6 +3557,98 @@ impl FuncEnvironment<'_> {
         )
     }
 
+    pub fn translate_transaction_tglobal_get(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        global: GlobalIndex,
+    ) -> WasmResult<ir::Value> {
+        let wasm_ty = self.module.globals[global].wasm_ty;
+        let result_ty = self.transaction_global_value_type(wasm_ty)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tglobal_get(),
+        );
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let global = pos
+            .ins()
+            .iconst(I32, i64::try_from(global.index()).unwrap());
+        let call = pos.ins().call(callee, &[vmctx, global]);
+        let ptr = pos.func.dfg.inst_results(call)[0];
+        self.compiler.raise_if_host_trapped(builder, vmctx, ptr);
+
+        let flags = MemFlagsData::trusted();
+        Ok(builder.ins().load(result_ty, flags, ptr, Offset32::new(0)))
+    }
+
+    pub fn translate_transaction_tglobal_set(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        global: GlobalIndex,
+        val: ir::Value,
+    ) -> WasmResult<()> {
+        let wasm_ty = self.module.globals[global].wasm_ty;
+        let expected_ty = self.transaction_global_value_type(wasm_ty)?;
+        debug_assert_eq!(expected_ty, builder.func.dfg.value_type(val));
+
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tglobal_set(),
+        );
+        let (tag, value) = self.transaction_global_value_payload(builder, wasm_ty, val)?;
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let global = pos
+            .ins()
+            .iconst(I32, i64::try_from(global.index()).unwrap());
+        let tag = pos.ins().iconst(I32, i64::from(tag));
+        let call = pos.ins().call(callee, &[vmctx, global, tag, value]);
+        let succeeded = pos.func.dfg.inst_results(call)[0];
+        self.compiler
+            .raise_if_host_trapped(builder, vmctx, succeeded);
+        Ok(())
+    }
+
+    fn transaction_global_value_type(&self, ty: WasmValType) -> WasmResult<ir::Type> {
+        match ty {
+            WasmValType::I32 | WasmValType::I64 | WasmValType::F32 | WasmValType::F64 => {
+                Ok(super::value_type(self.isa, ty))
+            }
+            WasmValType::V128 | WasmValType::Ref(_) => {
+                Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional global type is not implemented yet".into(),
+                ))
+            }
+        }
+    }
+
+    fn transaction_global_value_payload(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        ty: WasmValType,
+        val: ir::Value,
+    ) -> WasmResult<(u32, ir::Value)> {
+        match ty {
+            WasmValType::I32 => Ok((0, builder.ins().uextend(I64, val))),
+            WasmValType::I64 => Ok((1, val)),
+            WasmValType::F32 => {
+                let bits = builder.ins().bitcast(I32, MemFlagsData::new(), val);
+                Ok((2, builder.ins().uextend(I64, bits)))
+            }
+            WasmValType::F64 => {
+                let bits = builder.ins().bitcast(I64, MemFlagsData::new(), val);
+                Ok((3, bits))
+            }
+            WasmValType::V128 | WasmValType::Ref(_) => {
+                Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional global type is not implemented yet".into(),
+                ))
+            }
+        }
+    }
+
     pub fn translate_transaction_tmemory_load(
         &mut self,
         builder: &mut FunctionBuilder<'_>,

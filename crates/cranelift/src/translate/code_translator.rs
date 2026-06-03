@@ -197,10 +197,17 @@ pub fn translate_operator(
             }
             environ.translate_global_set(builder, global_index, val)?;
         }
-        Operator::TGlobalGet { .. }
-        | Operator::TGlobalSet { .. }
-        | Operator::TMemorySize { .. }
-        | Operator::TMemoryGrow { .. } => {
+        Operator::TGlobalGet { global_index } => {
+            let global_index = GlobalIndex::from_u32(*global_index);
+            let val = environ.translate_transaction_tglobal_get(builder, global_index)?;
+            environ.stacks.push1(val);
+        }
+        Operator::TGlobalSet { global_index } => {
+            let global_index = GlobalIndex::from_u32(*global_index);
+            let val = environ.stacks.pop1();
+            environ.translate_transaction_tglobal_set(builder, global_index, val)?;
+        }
+        Operator::TMemorySize { .. } | Operator::TMemoryGrow { .. } => {
             return Err(wasm_unsupported!(
                 "transaction data operators are parsed but not lowered yet"
             ));
