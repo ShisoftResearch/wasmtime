@@ -276,6 +276,63 @@ fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()
     store.store_opaque_mut().transaction_state_mut().fail()
 }
 
+fn transaction_tglobal_get(
+    _store: &mut dyn VMStore,
+    _instance: InstanceId,
+    _global: u32,
+) -> Result<*mut u8> {
+    bail!("transactional global get helper is not implemented")
+}
+
+fn transaction_tglobal_set(
+    _store: &mut dyn VMStore,
+    _instance: InstanceId,
+    _global: u32,
+    _tag: u32,
+    _value: u64,
+) -> Result<()> {
+    bail!("transactional global set helper is not implemented")
+}
+
+fn transaction_tmemory_load(
+    _store: &mut dyn VMStore,
+    _instance: InstanceId,
+    _memory: u32,
+    _addr: u64,
+    _offset: u64,
+    _len: u32,
+) -> Result<*mut u8> {
+    bail!("transactional memory load helper is not implemented")
+}
+
+fn transaction_tmemory_store(
+    _store: &mut dyn VMStore,
+    _instance: InstanceId,
+    _memory: u32,
+    _addr: u64,
+    _offset: u64,
+    _len: u32,
+) -> Result<*mut u8> {
+    bail!("transactional memory store helper is not implemented")
+}
+
+fn transaction_tmemory_size(
+    _store: &mut dyn VMStore,
+    _instance: InstanceId,
+    _memory: u32,
+) -> Result<*mut u8> {
+    bail!("transactional memory size helper is not implemented")
+}
+
+fn transaction_tmemory_grow(
+    _store: &mut dyn VMStore,
+    _instance: InstanceId,
+    _memory: u32,
+    _delta: u64,
+) -> Result<Option<AllocationSize>> {
+    bail!("transactional memory grow helper is not implemented")
+}
+
 /// A helper structure to represent the return value of a memory or table growth
 /// call.
 ///

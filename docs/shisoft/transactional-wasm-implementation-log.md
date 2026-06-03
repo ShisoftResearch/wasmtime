@@ -651,6 +651,44 @@ cargo check -p wasmtime
 Finished `dev` profile
 ```
 
+## Workstream F: Transaction Data Helper ABI
+
+Added runtime helper declarations for transaction data operators. These are ABI
+entry points only; their runtime implementations intentionally trap until the
+`tglobal` and `tmemory` object access paths are implemented.
+
+New helper declarations:
+
+- `transaction_tglobal_get`
+- `transaction_tglobal_set`
+- `transaction_tmemory_load`
+- `transaction_tmemory_store`
+- `transaction_tmemory_size`
+- `transaction_tmemory_grow`
+
+The helper ABI is shaped for future COW lowering:
+
+- `transaction_tglobal_get` returns a pointer to a staged global cell.
+- `transaction_tglobal_set` is a bool-returning mutating helper.
+- `transaction_tmemory_load` returns a pointer to readable transactional bytes.
+- `transaction_tmemory_store` returns a pointer to writable staged bytes.
+- `transaction_tmemory_size` returns a pointer-sized visible size value.
+- `transaction_tmemory_grow` follows ordinary growth semantics and returns the
+  previous visible size using the growth-style sentinel.
+
+Verification:
+
+```text
+cargo test -p wasmtime-environ --lib transaction_
+test result: ok. 11 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 18 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile
+```
+
 Added the milestone-1 `LockBased` concurrency-control strategy. The strategy
 tracks per-granule read and write ownership by transaction id:
 

@@ -366,7 +366,7 @@ Likely files:
 Tasks:
 
 - [x] Add runtime helper declarations for `ttry`/`tfail` lifecycle.
-- [ ] Add runtime helper declarations for `tglobal.*`, `*.tload`,
+- [x] Add runtime helper declarations for `tglobal.*`, `*.tload`,
   `*.tstore`, and `tmemory.*`.
 - [x] Add temporary Cranelift-local parser/lowering bridge for lifecycle `0xfa`
   operators.
@@ -409,6 +409,9 @@ Current lifecycle bridge status:
 - Cranelift lowers those operators through transaction begin/fail builtins.
 - Cranelift intentionally rejects parsed transaction data operators until
   runtime helpers and object-space lowering are implemented.
+- Runtime helper ABI declarations now exist for transaction data operators, but
+  their libcall implementations are trapping stubs until `tglobal` and
+  `tmemory` object access is wired.
 - A binary `Module::new` regression now proves the normal validated module path
   accepts lifecycle transaction opcodes.
 

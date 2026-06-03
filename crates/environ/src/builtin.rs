@@ -11,6 +11,18 @@ macro_rules! foreach_builtin_function {
             transaction_commit(vmctx: vmctx) -> bool;
             // Fails and aborts a transactional WebAssembly transaction.
             transaction_fail(vmctx: vmctx) -> bool;
+            // Returns a pointer to a staged transactional global cell.
+            transaction_tglobal_get(vmctx: vmctx, global: u32) -> pointer;
+            // Stages a transactional global write. `tag` identifies the value type.
+            transaction_tglobal_set(vmctx: vmctx, global: u32, tag: u32, value: u64) -> bool;
+            // Returns a pointer to readable transactional memory bytes.
+            transaction_tmemory_load(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
+            // Returns a pointer to writable staged transactional memory bytes.
+            transaction_tmemory_store(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
+            // Returns the visible transactional memory size.
+            transaction_tmemory_size(vmctx: vmctx, memory: u32) -> pointer;
+            // Stages a transactional memory grow and returns the previous visible size.
+            transaction_tmemory_grow(vmctx: vmctx, memory: u32, delta: u64) -> pointer;
             // Returns an index for wasm's `memory.copy`
             memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
             // Returns an index for wasm's `memory.fill` instruction.
@@ -362,6 +374,7 @@ impl BuiltinFunctionIndex {
             // Growth-related functions return -2 as a sentinel.
             (@get memory_grow pointer) => (TrapSentinel::NegativeTwo);
             (@get table_grow pointer) => (TrapSentinel::NegativeTwo);
+            (@get transaction_tmemory_grow pointer) => (TrapSentinel::NegativeTwo);
 
             // Atomics-related functions return a negative value to indicate a trap.
             (@get memory_atomic_notify u64) => (TrapSentinel::Negative);
@@ -379,6 +392,10 @@ impl BuiltinFunctionIndex {
 
             // Failure here indicates GC heap corruption.
             (@get get_interned_func_ref pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_tglobal_get pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_tmemory_load pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_tmemory_store pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_tmemory_size pointer) => (TrapSentinel::NegativeOne);
 
             // These libcalls can't trap
             (@get ref_func pointer) => (return None);
@@ -429,6 +446,27 @@ mod tests {
             BuiltinFunctionIndex::transaction_fail(),
         ] {
             assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));
+        }
+    }
+
+    #[test]
+    fn transaction_data_builtins_use_expected_trap_sentinels() {
+        for builtin in [BuiltinFunctionIndex::transaction_tglobal_set()] {
+            assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));
+        }
+
+        assert!(matches!(
+            BuiltinFunctionIndex::transaction_tmemory_grow().trap_sentinel(),
+            Some(TrapSentinel::NegativeTwo)
+        ));
+
+        for builtin in [
+            BuiltinFunctionIndex::transaction_tglobal_get(),
+            BuiltinFunctionIndex::transaction_tmemory_load(),
+            BuiltinFunctionIndex::transaction_tmemory_store(),
+            BuiltinFunctionIndex::transaction_tmemory_size(),
+        ] {
+            assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::NegativeOne)));
         }
     }
 }
