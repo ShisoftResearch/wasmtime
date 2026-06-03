@@ -24,17 +24,24 @@ fn main() {
         .map(|s| s.split(" ").map(|s| s.to_string()).collect::<Vec<_>>());
 
     let mut add_trial = |test: &WastTest, config: WastConfig| {
-        let name = format!(
-            "{:?}/{}{}{}",
-            config.compiler,
-            if config.pooling { "pooling/" } else { "" },
-            if config.collector != Collector::Auto {
-                format!("{:?}/", config.collector)
-            } else {
-                String::new()
-            },
-            test.path.to_str().unwrap()
-        );
+        let name = match test.transaction_proposal() {
+            Some(suite) => format!(
+                "transaction-proposal/{}/{}",
+                suite.name(),
+                test.path.file_name().unwrap().to_str().unwrap()
+            ),
+            None => format!(
+                "{:?}/{}{}{}",
+                config.compiler,
+                if config.pooling { "pooling/" } else { "" },
+                if config.collector != Collector::Auto {
+                    format!("{:?}/", config.collector)
+                } else {
+                    String::new()
+                },
+                test.path.to_str().unwrap()
+            ),
+        };
 
         // Don't add this trial if we are only running GC-related tests and it
         // doesn't look like a GC-related test.
@@ -47,7 +54,10 @@ fn main() {
         let trial = Trial::test(name, {
             let test = test.clone();
             move || run_wast(&test, config).map_err(|e| format!("{e:?}").into())
-        });
+        })
+        .with_ignored_flag(
+            test.transaction_proposal().is_some() && !test.transaction_proposal_enabled(),
+        );
 
         trials.push(trial);
     };
@@ -70,6 +80,18 @@ fn main() {
     // leave the full combinatorial matrix and such to fuzz testing which
     // configures many more settings than those configured here.
     for test in tests {
+        if test.transaction_proposal().is_some() {
+            add_trial(
+                &test,
+                WastConfig {
+                    compiler: Compiler::CraneliftNative,
+                    pooling: false,
+                    collector: Collector::Auto,
+                },
+            );
+            continue;
+        }
+
         let collector = if test.test_uses_gc_types() {
             Collector::DeferredReferenceCounting
         } else {

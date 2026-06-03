@@ -1,0 +1,386 @@
+//! Storage-only prototype for Wizard-style transactional memories.
+//!
+//! This module is intentionally not wired into instance allocation yet. It
+//! establishes the mmap-backed storage boundary and granule helpers that
+//! transactional lowering will need once parser/runtime support exists.
+
+#![allow(dead_code)]
+
+use crate::prelude::*;
+use crate::runtime::vm::{HostAlignedByteCount, Mmap, mmap::AlignedLength};
+
+pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
+
+/// Wizard-compatible transactional memory granule shift.
+pub const TMEMORY_GRANULE_SHIFT: usize = 8;
+
+/// Wizard-compatible transactional memory granule size in bytes.
+pub const TMEMORY_GRANULE_SIZE: usize = 1 << TMEMORY_GRANULE_SHIFT;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TMemoryGranuleInfo {
+    owner: u64,
+    version: u64,
+    hash: u64,
+}
+
+/// Volatile anonymous-mmap transactional memory storage.
+#[derive(Debug)]
+pub(crate) struct VMemory {
+    data: Mmap<AlignedLength>,
+    granules: Mmap<AlignedLength>,
+    byte_len: usize,
+    byte_capacity: usize,
+    granule_capacity: usize,
+}
+
+impl VMemory {
+    pub(crate) fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
+        let byte_len = pages_to_bytes(min_pages)?;
+        let byte_capacity = pages_to_bytes(max_pages.unwrap_or(min_pages))?;
+        ensure!(byte_len <= byte_capacity, "tmemory minimum exceeds maximum");
+
+        let granule_capacity = granules_for_bytes(byte_capacity);
+        let granule_len = granules_for_bytes(byte_len);
+
+        let data_mapping_size = HostAlignedByteCount::new_rounded_up(byte_capacity)?;
+        let data_accessible = HostAlignedByteCount::new_rounded_up(byte_len)?;
+        let data = Mmap::accessible_reserved(data_accessible, data_mapping_size)?;
+
+        let granule_mapping_bytes = granule_capacity
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata size overflow")?;
+        let granule_accessible_bytes = granule_len
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata size overflow")?;
+        let granules = Mmap::accessible_reserved(
+            HostAlignedByteCount::new_rounded_up(granule_accessible_bytes)?,
+            HostAlignedByteCount::new_rounded_up(granule_mapping_bytes)?,
+        )?;
+
+        Ok(Self {
+            data,
+            granules,
+            byte_len,
+            byte_capacity,
+            granule_capacity,
+        })
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub(crate) fn granule_len(&self) -> usize {
+        granules_for_bytes(self.byte_len)
+    }
+
+    pub(crate) fn granule_capacity(&self) -> usize {
+        self.granule_capacity
+    }
+
+    pub(crate) fn granule_index(addr: u64) -> Result<usize> {
+        let index = addr >> TMEMORY_GRANULE_SHIFT;
+        usize::try_from(index).context("tmemory address does not fit host usize")
+    }
+
+    pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        let new_byte_len = pages_to_bytes(new_pages)?;
+        ensure!(
+            new_byte_len <= self.byte_capacity,
+            "tmemory growth exceeds reserved capacity"
+        );
+        if new_byte_len < self.byte_len {
+            bail!("tmemory grow cannot shrink");
+        }
+        if new_byte_len == self.byte_len {
+            return Ok(());
+        }
+
+        let old_accessible = HostAlignedByteCount::new_rounded_up(self.byte_len)?;
+        let new_accessible = HostAlignedByteCount::new_rounded_up(new_byte_len)?;
+        let data_delta = new_accessible
+            .checked_sub(old_accessible)
+            .context("tmemory accessible data underflow")?;
+        // SAFETY: this is newly live memory that has not been handed out.
+        unsafe {
+            self.data.make_accessible(old_accessible, data_delta)?;
+        }
+
+        let old_granule_bytes = self
+            .granule_len()
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata size overflow")?;
+        let new_granule_bytes = granules_for_bytes(new_byte_len)
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata size overflow")?;
+        let old_granule_accessible = HostAlignedByteCount::new_rounded_up(old_granule_bytes)?;
+        let new_granule_accessible = HostAlignedByteCount::new_rounded_up(new_granule_bytes)?;
+        let granule_delta = new_granule_accessible
+            .checked_sub(old_granule_accessible)
+            .context("tmemory accessible granule metadata underflow")?;
+        // SAFETY: this is newly live metadata that has not been handed out.
+        unsafe {
+            self.granules
+                .make_accessible(old_granule_accessible, granule_delta)?;
+        }
+
+        self.byte_len = new_byte_len;
+        Ok(())
+    }
+
+    pub(crate) fn shrink_to_pages(&mut self, pages: u64) -> Result<()> {
+        let new_byte_len = pages_to_bytes(pages)?;
+        ensure!(new_byte_len <= self.byte_len, "tmemory shrink cannot grow");
+        let old_byte_len = self.byte_len;
+        let old_granule_len = self.granule_len();
+        let new_granule_len = granules_for_bytes(new_byte_len);
+
+        if new_byte_len < old_byte_len {
+            // SAFETY: the truncated byte range is currently accessible and we
+            // have exclusive access to the storage.
+            unsafe {
+                self.data.slice_mut(new_byte_len..old_byte_len).fill(0);
+            }
+        }
+
+        if new_granule_len < old_granule_len {
+            let start = new_granule_len
+                .checked_mul(size_of::<TMemoryGranuleInfo>())
+                .context("tmemory granule metadata offset overflow")?;
+            let end = old_granule_len
+                .checked_mul(size_of::<TMemoryGranuleInfo>())
+                .context("tmemory granule metadata offset overflow")?;
+            // SAFETY: the truncated metadata range is currently accessible and
+            // we have exclusive access to the storage.
+            unsafe {
+                self.granules.slice_mut(start..end).fill(0);
+            }
+        }
+
+        self.byte_len = new_byte_len;
+        Ok(())
+    }
+
+    pub(crate) fn txn_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        let start = granule
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata offset overflow")?;
+        let end = start + size_of::<TMemoryGranuleInfo>();
+        // SAFETY: bounds are checked above and the metadata range is live.
+        let bytes = unsafe { self.granules.slice(start..end) };
+        Ok(read_granule_info(bytes))
+    }
+
+    pub(crate) fn snapshot_granule(&self, granule: usize) -> Result<Vec<u8>> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        let range = self.granule_range(granule)?;
+        // SAFETY: bounds are checked by `granule_range`.
+        Ok(unsafe { self.data.slice(range) }.to_vec())
+    }
+
+    pub(crate) fn restore_granule(&mut self, granule: usize, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        let range = self.granule_range(granule)?;
+        ensure!(
+            bytes.len() == range.end - range.start,
+            "tmemory granule restore length mismatch"
+        );
+        // SAFETY: bounds are checked by `granule_range` and we have `&mut self`.
+        unsafe {
+            self.data.slice_mut(range).copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fill(&mut self, range: core::ops::Range<usize>, byte: u8) -> Result<()> {
+        ensure!(range.start <= range.end, "tmemory write invalid range");
+        ensure!(range.end <= self.byte_len, "tmemory write out of bounds");
+        // SAFETY: bounds are checked above and we have `&mut self`.
+        unsafe {
+            self.data.slice_mut(range).fill(byte);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        ensure!(range.start <= range.end, "tmemory read invalid range");
+        ensure!(range.end <= self.byte_len, "tmemory read out of bounds");
+        // SAFETY: bounds are checked above.
+        Ok(unsafe { self.data.slice(range) }.to_vec())
+    }
+
+    fn granule_range(&self, granule: usize) -> Result<core::ops::Range<usize>> {
+        let start = granule
+            .checked_mul(TMEMORY_GRANULE_SIZE)
+            .context("tmemory granule byte offset overflow")?;
+        ensure!(start < self.byte_len, "tmemory granule out of bounds");
+        let end = start
+            .saturating_add(TMEMORY_GRANULE_SIZE)
+            .min(self.byte_len);
+        Ok(start..end)
+    }
+}
+
+fn pages_to_bytes(pages: u64) -> Result<usize> {
+    let pages = usize::try_from(pages).context("tmemory page count does not fit host usize")?;
+    pages
+        .checked_mul(WASM_PAGE_SIZE)
+        .context("tmemory byte length overflow")
+}
+
+fn granules_for_bytes(bytes: usize) -> usize {
+    bytes.div_ceil(TMEMORY_GRANULE_SIZE)
+}
+
+fn read_granule_info(bytes: &[u8]) -> TMemoryGranuleInfo {
+    debug_assert_eq!(bytes.len(), size_of::<TMemoryGranuleInfo>());
+    let owner = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+    let version = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+    let hash = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
+    TMemoryGranuleInfo {
+        owner,
+        version,
+        hash,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_wasm_page_has_wizard_granules() {
+        let memory = VMemory::new(1, Some(1)).unwrap();
+
+        assert_eq!(TMEMORY_GRANULE_SIZE, 256);
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(memory.granule_len(), 256);
+        assert_eq!(memory.granule_capacity(), 256);
+        assert_eq!(VMemory::granule_index(0).unwrap(), 0);
+        assert_eq!(VMemory::granule_index(255).unwrap(), 0);
+        assert_eq!(VMemory::granule_index(256).unwrap(), 1);
+    }
+
+    #[test]
+    fn growing_one_page_adds_granule_metadata() {
+        let mut memory = VMemory::new(1, Some(2)).unwrap();
+
+        assert_eq!(memory.granule_len(), 256);
+        assert_eq!(memory.granule_capacity(), 512);
+
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+        assert_eq!(memory.granule_len(), 512);
+        assert_eq!(memory.txn_info(511).unwrap(), TMemoryGranuleInfo::default());
+    }
+
+    #[test]
+    fn snapshot_and_restore_one_granule() {
+        let mut memory = VMemory::new(1, Some(1)).unwrap();
+        memory.fill(0..TMEMORY_GRANULE_SIZE, 0x11).unwrap();
+        let snapshot = memory.snapshot_granule(0).unwrap();
+
+        memory.fill(0..TMEMORY_GRANULE_SIZE, 0x22).unwrap();
+        memory.restore_granule(0, &snapshot).unwrap();
+
+        assert_eq!(
+            memory.read(0..TMEMORY_GRANULE_SIZE).unwrap(),
+            vec![0x11; TMEMORY_GRANULE_SIZE]
+        );
+    }
+
+    #[test]
+    fn restoring_one_granule_preserves_neighbors() {
+        let mut memory = VMemory::new(1, Some(1)).unwrap();
+        memory.fill(0..TMEMORY_GRANULE_SIZE, 0x11).unwrap();
+        memory
+            .fill(TMEMORY_GRANULE_SIZE..TMEMORY_GRANULE_SIZE * 2, 0x33)
+            .unwrap();
+        let snapshot = memory.snapshot_granule(0).unwrap();
+
+        memory.fill(0..TMEMORY_GRANULE_SIZE * 2, 0x22).unwrap();
+        memory.restore_granule(0, &snapshot).unwrap();
+
+        assert_eq!(
+            memory.read(0..TMEMORY_GRANULE_SIZE).unwrap(),
+            vec![0x11; TMEMORY_GRANULE_SIZE]
+        );
+        assert_eq!(
+            memory
+                .read(TMEMORY_GRANULE_SIZE..TMEMORY_GRANULE_SIZE * 2)
+                .unwrap(),
+            vec![0x22; TMEMORY_GRANULE_SIZE]
+        );
+    }
+
+    #[test]
+    fn shrinking_restores_visible_byte_length() {
+        let mut memory = VMemory::new(1, Some(2)).unwrap();
+
+        memory.grow_to_pages(2).unwrap();
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+
+        memory.shrink_to_pages(1).unwrap();
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert!(memory.read(WASM_PAGE_SIZE..WASM_PAGE_SIZE + 1).is_err());
+    }
+
+    #[test]
+    fn grow_to_pages_rejects_shrinking() {
+        let mut memory = VMemory::new(2, Some(2)).unwrap();
+
+        assert!(memory.grow_to_pages(1).is_err());
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn read_and_fill_reject_invalid_ranges() {
+        let mut memory = VMemory::new(1, Some(1)).unwrap();
+
+        assert!(memory.read(10..0).is_err());
+        assert!(memory.fill(10..0, 0x11).is_err());
+    }
+
+    #[test]
+    fn shrink_then_grow_does_not_expose_stale_data_or_metadata() {
+        let mut memory = VMemory::new(1, Some(2)).unwrap();
+
+        memory.grow_to_pages(2).unwrap();
+        memory
+            .fill(WASM_PAGE_SIZE..WASM_PAGE_SIZE + 8, 0x44)
+            .unwrap();
+
+        let second_page_metadata = 256 * size_of::<TMemoryGranuleInfo>();
+        let second_page_metadata_end = second_page_metadata + size_of::<TMemoryGranuleInfo>();
+        // SAFETY: the second page's metadata is live after growing to two
+        // pages, and tests have exclusive access to the storage.
+        unsafe {
+            memory
+                .granules
+                .slice_mut(second_page_metadata..second_page_metadata_end)
+                .fill(0xff);
+        }
+        assert_ne!(memory.txn_info(256).unwrap(), TMemoryGranuleInfo::default());
+
+        memory.shrink_to_pages(1).unwrap();
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(
+            memory.read(WASM_PAGE_SIZE..WASM_PAGE_SIZE + 8).unwrap(),
+            [0; 8]
+        );
+        assert_eq!(memory.txn_info(256).unwrap(), TMemoryGranuleInfo::default());
+    }
+}

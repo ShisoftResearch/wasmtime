@@ -93,6 +93,9 @@ mod mmap;
 #[cfg(has_virtual_memory)]
 pub use self::mmap::MmapMemory;
 
+#[cfg(has_virtual_memory)]
+mod tmemory;
+
 mod malloc;
 pub use self::malloc::MallocMemory;
 

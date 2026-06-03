@@ -1,0 +1,522 @@
+# Transactional WebAssembly Roadmap
+
+This roadmap turns `docs/shisoft/transactional-wasm-wizard-first.md` into
+parallel workstreams for the first Wizard-compatible Wasmtime milestone.
+
+This is research-fork work. Do not open, comment on, or review Wasmtime pull
+requests with automation. Keep the work local until a human decides how to
+publish or integrate it.
+
+## Target
+
+Make Wasmtime execute a Wizard-style transactional WebAssembly slice:
+
+- `ttry`
+- `tfail`
+- `tglobal.get`
+- `tglobal.set`
+- scalar and packed `*.tload`
+- scalar and packed `*.tstore`
+- `tmemory.size`
+- `tmemory.grow`
+
+Milestone 1 is complete when `tmemory` has a distinct volatile mmap-backed
+storage path with 256-byte granule metadata, transaction abort restores globals
+and memory granules, and migrated tests document Wizard-first behavior.
+
+## Fixed Choices
+
+- Wizard semantics are the source of truth.
+- `TMEMORY_GRANULE_SHIFT = 8`.
+- `TTABLE_GRANULE_SHIFT = 4`.
+- Ordinary `memory` stays on Wasmtime's normal volatile linear-memory path.
+- Do not retrofit ordinary Wasmtime memory into transactional memory.
+- `tmemory` is the future persistence boundary.
+- `tmemory` chooses its storage backend from transaction configuration.
+- Milestone 1 implements only `VMemory`, the volatile anonymous mmap backend
+  for `tmemory`.
+- `FileBackedMemory`, `NVMemory`, object-table durability, tables, GC objects,
+  refs, SIMD, and conflict-heavy concurrency are later milestones.
+
+## Dynamic Architecture
+
+The runtime should be configurable even when milestone 1 only ships one
+implemented option per category. The configuration applies to `tmemory` and
+transaction runtime components; ordinary WebAssembly `memory` continues through
+Wasmtime's existing memory configuration and allocation paths.
+
+Initial selections:
+
+- `TMemoryBackend::VMemory`
+- `ConcurrencyControl::WizardLockBased`
+- `DurabilityPolicy::VolatileRollbackOnly`
+- `ConflictPolicy::AbortOrWizardDefault`
+
+Future selections:
+
+- `TMemoryBackend::FileBackedMemory`
+- `TMemoryBackend::NVMemory`
+- `ConcurrencyControl::Optimistic`
+- `ConcurrencyControl::WaitDie`
+- `ConcurrencyControl::WoundWait`
+- `ConcurrencyControl::Mvcc`
+- `DurabilityPolicy::PersistentData`
+- `DurabilityPolicy::PersistentDataAndMetadata`
+
+Design rule: transactional instruction lowering calls through selected runtime
+components. It should not hard-code storage, durability, or concurrency-control
+policy into every lowered operation. For milestone 1, unimplemented selections
+must be represented but rejected if requested, so the executable runtime stays
+minimal and uses only `TMemoryBackend::VMemory`.
+
+## Workstream A: Baseline And Dependency Strategy
+
+Purpose: make the research branch reproducible and choose how transaction
+syntax enters Wasmtime.
+
+Primary owner: implementation lead.
+
+Inputs:
+
+- `../wizard-engine`, branch `transactions`
+- `../wasm-persistence`
+- `docs/shisoft/transactional-wasm-wizard-first.md`
+
+Tasks:
+
+- [ ] Record current branch and working tree.
+
+```bash
+git branch --show-current
+git status --short
+```
+
+- [ ] Record reference revisions.
+
+```bash
+git -C ../wizard-engine branch --show-current
+git -C ../wizard-engine rev-parse HEAD
+git -C ../wasm-persistence rev-parse HEAD
+```
+
+- [ ] Choose parser strategy.
+
+Preferred order:
+
+1. Local `[patch.crates-io]` fork of `wasmparser` and `wast`.
+2. Vendored minimal parser support for research-only binary tests.
+3. Generated binary modules only, with text `.wast` migration deferred.
+
+Deliverable:
+
+- A short note in `docs/shisoft/transactional-wasm-implementation-log.md`
+  recording branch, reference hashes, and parser strategy.
+
+Checkpoint:
+
+- The branch state and parser strategy are known before runtime code starts.
+
+## Workstream B: Opcode, Parser, And Validation
+
+Purpose: make Wasmtime understand milestone-1 transaction syntax and reject it
+unless the transaction feature is enabled.
+
+Primary owner: parser/validation implementer.
+
+Dependencies:
+
+- Workstream A parser strategy decision.
+
+Likely files:
+
+- `crates/wasmtime/src/config.rs`
+- `crates/wasmtime/src/engine.rs`
+- `crates/environ/src/module.rs`
+- `crates/environ/src/types.rs`
+- `crates/environ/src/compile/module_environ.rs`
+- patched or forked `wasmparser`
+- patched or forked `wast`
+
+Tasks:
+
+- [ ] Add an experimental transaction feature gate.
+- [ ] Add milestone-1 `wasmparser::Operator` variants.
+- [ ] Add binary parsing for `0xfa` prefixed milestone-1 operators.
+- [ ] Add minimal text support or generated binary-module fixtures.
+- [ ] Add module metadata for transactional memories and globals.
+- [ ] Add validation rules separating ordinary and transactional object spaces.
+
+Milestone-1 operators:
+
+- `TTry`
+- `TFail`
+- `TGlobalGet`
+- `TGlobalSet`
+- `I32TLoad`, `I64TLoad`, `F32TLoad`, `F64TLoad`
+- packed integer transactional loads
+- `I32TStore`, `I64TStore`, `F32TStore`, `F64TStore`
+- packed integer transactional stores
+- `TMemorySize`
+- `TMemoryGrow`
+
+Validation rules:
+
+- `tglobal.get` reads only transactional globals.
+- `tglobal.set` writes only mutable transactional globals.
+- `*.tload` and `*.tstore` access only transactional memories.
+- `tmemory.size/grow` access only transactional memories.
+- ordinary ops cannot resolve transactional objects.
+- transactional ops cannot resolve ordinary objects.
+
+Checkpoint:
+
+- A binary module containing one milestone-1 operator parses into the expected
+  operator variant.
+- Validation rejects mixed ordinary/transactional object access.
+
+## Workstream C: Dynamic Runtime Configuration
+
+Purpose: establish the component-selection seams before transaction operations
+are lowered.
+
+Primary owner: runtime architecture implementer.
+
+Dependencies:
+
+- Can start after Workstream A.
+
+Likely files:
+
+- `crates/wasmtime/src/config.rs`
+- `crates/wasmtime/src/engine.rs`
+- new transaction module under `crates/wasmtime/src/runtime/`
+
+Tasks:
+
+- [ ] Define internal transaction configuration.
+- [ ] Add default selections:
+  - `TMemoryBackend::VMemory`
+  - `ConcurrencyControl::WizardLockBased`
+  - `DurabilityPolicy::VolatileRollbackOnly`
+  - `ConflictPolicy::AbortOrWizardDefault`
+- [ ] Decide whether research selections live on `Config`, `Engine`, or
+  `Store`.
+- [ ] Reject unimplemented selections, including `FileBackedMemory` and
+  `NVMemory`.
+- [ ] Pass selected configuration to transaction runtime and `tmemory` storage
+  creation.
+
+Checkpoint:
+
+- Runtime code can query selected transaction backend and concurrency-control
+  strategy without direct knowledge of CLI or embedder configuration.
+- Ordinary Wasmtime memory allocation is unchanged by transaction
+  configuration.
+
+## Workstream D: `tmemory` Storage
+
+Purpose: instantiate transactional memories through a dedicated storage path
+with side metadata for 256-byte granules.
+
+Primary owner: memory/storage implementer.
+
+Dependencies:
+
+- Workstream C configuration shape.
+
+Likely files:
+
+- `crates/wasmtime/src/runtime/vm/memory.rs`
+- `crates/wasmtime/src/runtime/vm/memory/mmap.rs`
+- new file under `crates/wasmtime/src/runtime/vm/memory/`
+- `crates/wasmtime/src/runtime/memory.rs`
+
+Tasks:
+
+- [ ] Define the `tmemory` backend interface.
+- [ ] Implement `VMemory` backend.
+- [ ] Add `TMemory` storage type that dispatches to the configured backend.
+- [ ] Add side metadata reservation for 256-byte granules.
+- [ ] Add metadata initialization for newly live granules.
+- [ ] Add snapshot and restore helpers.
+- [ ] Add grow and shrink helpers that update both data and metadata ranges.
+- [ ] Add storage-only tests.
+
+Required helpers:
+
+- `granule_index(addr: u64) -> u64`
+- `txn_info(granule_index) -> ...`
+- `snapshot_granule(granule_index) -> Vec<u8>`
+- `restore_granule(granule_index, bytes)`
+- `grow_to(new_size)`
+- `shrink_to(old_size)`
+
+Storage-only tests:
+
+- one Wasm page has `65536 / 256` granules
+- growing by one Wasm page adds 256 metadata records
+- snapshot and restore one 256-byte granule
+- restoring one granule does not modify neighboring granules
+- shrinking returns visible byte length to the old size
+
+Checkpoint:
+
+- `tmemory` storage tests pass without Wasm instruction lowering.
+- No ordinary `memory` tests require behavior changes.
+
+## Workstream E: Transaction Runtime And Concurrency Control
+
+Purpose: make the store own active transaction state and provide commit/abort
+semantics for milestone-1 undo records.
+
+Primary owner: transaction-runtime implementer.
+
+Dependencies:
+
+- Workstream C configuration shape.
+- Workstream D metadata API for memory granules.
+
+Likely files:
+
+- `crates/wasmtime/src/runtime/store.rs`
+- `crates/wasmtime/src/runtime/store/data.rs`
+- new transaction module under `crates/wasmtime/src/runtime/`
+
+Tasks:
+
+- [ ] Define concurrency-control interface.
+- [ ] Implement `WizardLockBased` strategy.
+- [ ] Add transaction state to the store boundary.
+- [ ] Add undo record types.
+- [ ] Add begin, commit, abort, and fail operations.
+- [ ] Add read/write acquisition helpers for globals and memory granules.
+- [ ] Add transaction-state tests.
+
+Required state:
+
+- active transaction id
+- next transaction id
+- owned/write granule set
+- undo log
+- simple ownership/version table for milestone 1
+
+Undo records:
+
+- global restore
+- memory granule restore
+- memory size restore
+
+Transaction-state tests:
+
+- begin then commit clears active transaction
+- begin then abort clears active transaction
+- abort runs undo records in reverse insertion order
+- duplicate granule write records one snapshot
+
+Checkpoint:
+
+- Transaction state and undo behavior are testable without compiled Wasm.
+
+## Workstream F: Runtime Helpers And Lowering
+
+Purpose: execute milestone-1 transaction operators by dispatching through the
+selected storage and concurrency-control components.
+
+Primary owner: compiler/runtime integration implementer.
+
+Dependencies:
+
+- Workstream B parser/operator variants.
+- Workstream C configuration.
+- Workstream D `tmemory` storage.
+- Workstream E transaction runtime.
+
+Likely files:
+
+- `crates/environ/src/builtin.rs`
+- `crates/cranelift/src/translate/code_translator.rs`
+- `crates/cranelift/src/func_environ.rs`
+- `crates/wasmtime/src/runtime/vm/`
+- `crates/wasmtime/src/runtime/`
+
+Tasks:
+
+- [ ] Add runtime helper declarations.
+- [ ] Lower `ttry` and `tfail`.
+- [ ] Lower `tglobal.get/set`.
+- [ ] Lower scalar and packed `*.tload/*.tstore`.
+- [ ] Lower `tmemory.size/grow`.
+- [ ] Ensure traps inside active transactions abort before returning to host.
+- [ ] Add focused integration tests for each operator family.
+
+Required behavior:
+
+- `ttry` starts a transaction when no transaction is active.
+- normal transaction exit commits.
+- `tfail` aborts.
+- `tglobal.set` records undo before first mutation.
+- `*.tstore` snapshots every touched 256-byte granule before mutation.
+- stores crossing a granule boundary snapshot both granules.
+- `tmemory.grow` records old size before successful growth.
+- abort after successful grow shrinks back to old size.
+
+Checkpoint:
+
+- Generated binary tests can run the full milestone-1 operator set.
+
+## Workstream G: Test Migration And Verification
+
+Purpose: capture Wizard-first behavior in Wasmtime tests and keep the partial
+implementation verifiable.
+
+Primary owner: test/harness implementer.
+
+Dependencies:
+
+- Workstream B fixture strategy.
+- Workstream D storage tests.
+- Workstream E runtime tests.
+- Workstream F integration path.
+
+Proposal files to mine:
+
+- `../wasm-persistence/test/core/simple-transactions/ttry-basic.wast`
+- `../wasm-persistence/test/core/simple-transactions/ttry-abort-commit.wast`
+- `../wasm-persistence/test/core/simple-transactions/tglobal.wast`
+- `../wasm-persistence/test/core/simple-transactions/tload.wast`
+- `../wasm-persistence/test/core/simple-transactions/tstore.wast`
+- `../wasm-persistence/test/core/simple-transactions/tmemory.wast`
+- `../wasm-persistence/test/core/simple-transactions/tmemory_size.wast`
+- `../wasm-persistence/test/core/simple-transactions/tmemory_grow.wast`
+
+Tasks:
+
+- [ ] Add storage-only tests for `tmemory`.
+- [ ] Add transaction-runtime unit tests.
+- [ ] Add generated binary or `.wast` tests for milestone-1 operators.
+- [ ] Split out cases requiring tables, refs, GC, SIMD, or conflict behavior.
+- [ ] Annotate expectations that depend on 256-byte Wizard granules.
+- [ ] Maintain exact verification commands as test names stabilize.
+
+Initial verification commands:
+
+```bash
+cargo test -p wasmtime --lib transaction
+cargo test -p wasmtime --test all transaction
+cargo test -p wasmtime-wast
+cargo test --test wast simple-transactions
+```
+
+Checkpoint:
+
+- One focused command runs only milestone-1 transaction tests and gives
+  actionable failures.
+
+## Milestone Map
+
+### M0: Research Baseline
+
+Workstreams:
+
+- A
+
+Exit:
+
+- branch and reference hashes recorded
+- parser strategy selected
+
+### M1a: Parse And Model
+
+Workstreams:
+
+- B
+- C
+
+Exit:
+
+- transaction feature gate exists
+- milestone-1 operators parse
+- transactional memory/global index spaces are represented
+- runtime configuration has default selectable components
+
+### M1b: Storage And Transaction Core
+
+Workstreams:
+
+- D
+- E
+
+Exit:
+
+- volatile mmap-backed `tmemory` works under storage tests
+- transaction state can commit and abort undo records
+- duplicate granule writes snapshot once
+
+### M1c: Executable Operators
+
+Workstreams:
+
+- F
+- G
+
+Exit:
+
+- milestone-1 operators execute
+- abort restores transactional globals
+- abort restores touched 256-byte memory granules
+- abort after `tmemory.grow` restores old size
+- commit preserves writes
+
+### M1d: Test Migration
+
+Workstreams:
+
+- G
+
+Exit:
+
+- first migrated proposal/Wizard tests run in Wasmtime
+- later-scope tests are split or skipped with clear notes
+
+## First Week Cut
+
+The smallest useful first-week target:
+
+- Workstream A complete
+- parser strategy selected
+- milestone-1 opcode constants and encodings documented in one place
+- Workstream C transaction config sketched
+- Workstream D `tmemory` backend interface sketched
+- first storage-only tests for granule metadata and snapshot/restore written
+
+This gets the special `tmemory` decision into code before broader transaction
+control-flow work starts.
+
+## Dependency Graph
+
+```text
+A Baseline
+  -> B Parser and Validation
+  -> C Dynamic Config
+C Dynamic Config
+  -> D TMemory Storage
+  -> E Transaction Runtime
+B + C + D + E
+  -> F Runtime Helpers and Lowering
+B + D + E + F
+  -> G Test Migration and Verification
+```
+
+## Open Decisions
+
+- Whether to patch external `wasmparser`/`wast` or use generated binary tests
+  first.
+- Whether milestone-1 `ttry` should be implemented before `tglobal/tmemory`
+  lowering or simulated with host-side begin/abort in the earliest runtime
+  tests.
+- Exact representation of transaction ownership metadata in Rust.
+- Exact shape and public/private visibility of the transaction configuration
+  object.
+- Whether selectable transaction components are configured on `Config`,
+  `Engine`, or `Store` for the research prototype.
+- Exact location for transaction tests once the module boundaries are clearer.
