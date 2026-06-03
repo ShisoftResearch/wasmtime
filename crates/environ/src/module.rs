@@ -262,6 +262,9 @@ pub struct Module {
     /// WebAssembly global variables.
     pub globals: TryPrimaryMap<GlobalIndex, Global>,
 
+    /// Transactional memories/globals declared through research text aliases.
+    pub transaction_objects: TransactionObjectMetadata,
+
     /// "Simple" WebAssembly global initializers for locally-defined globals.
     ///
     /// This map does not track initialization of all globals in this module,
@@ -321,6 +324,7 @@ impl Module {
             tables: Default::default(),
             memories: Default::default(),
             globals: Default::default(),
+            transaction_objects: Default::default(),
             global_initializers: Default::default(),
             tags: Default::default(),
         }
@@ -611,6 +615,7 @@ impl TypeTrace for Module {
             tables,
             memories: _,
             globals,
+            transaction_objects: _,
             global_initializers: _,
             tags,
         } = self;
@@ -663,6 +668,7 @@ impl TypeTrace for Module {
             tables,
             memories: _,
             globals,
+            transaction_objects: _,
             global_initializers: _,
             tags,
         } = self;

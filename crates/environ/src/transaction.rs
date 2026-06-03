@@ -1,8 +1,16 @@
-use crate::{WasmError, WasmResult};
+use crate::{GlobalIndex, MemoryIndex, WasmError, WasmResult};
+use serde_derive::{Deserialize, Serialize};
 
 /// Transaction opcode prefix used by Wizard and the simple-transactions
 /// proposal branch.
 pub const TRANSACTION_OPCODE_PREFIX: u8 = 0xfa;
+
+/// Custom section carrying text-level transactional object aliases.
+pub const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
+
+/// Version of [`TRANSACTION_OBJECTS_CUSTOM_SECTION`] emitted by the local
+/// wasm-tools transaction fork.
+pub const TRANSACTION_OBJECTS_VERSION: u8 = 1;
 
 /// Milestone-1 transaction operator decoded from the `0xfa` opcode space.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +117,28 @@ pub struct ResearchTransactionFixtureMetadata {
     pub tmemory_count: u32,
     /// Number of transactional globals modeled by this fixture.
     pub tglobal_count: u32,
+}
+
+/// Transactional object-space metadata decoded from
+/// [`TRANSACTION_OBJECTS_CUSTOM_SECTION`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransactionObjectMetadata {
+    /// Memories declared through the `tmemory` text alias.
+    pub memories: alloc::vec::Vec<MemoryIndex>,
+    /// Globals declared through the `tglobal` text alias.
+    pub globals: alloc::vec::Vec<GlobalIndex>,
+}
+
+impl TransactionObjectMetadata {
+    /// Returns whether `memory` was declared as transactional.
+    pub fn is_tmemory(&self, memory: MemoryIndex) -> bool {
+        self.memories.contains(&memory)
+    }
+
+    /// Returns whether `global` was declared as transactional.
+    pub fn is_tglobal(&self, global: GlobalIndex) -> bool {
+        self.globals.contains(&global)
+    }
 }
 
 impl TransactionOperator {
@@ -332,6 +362,51 @@ pub fn validate_research_transaction_fixture(
         validate_research_transaction_operator(*operator, metadata)?;
     }
     Ok(())
+}
+
+/// Decode transactional object-space metadata from the
+/// [`TRANSACTION_OBJECTS_CUSTOM_SECTION`] payload.
+pub fn decode_transaction_object_metadata(bytes: &[u8]) -> WasmResult<TransactionObjectMetadata> {
+    let Some((&version, rest)) = bytes.split_first() else {
+        return Err(WasmError::InvalidWebAssembly {
+            message: "empty transaction object metadata section".into(),
+            offset: 0,
+        });
+    };
+    if version != TRANSACTION_OBJECTS_VERSION {
+        return Err(WasmError::InvalidWebAssembly {
+            message: crate::__format!("unsupported transaction object metadata version {version}"),
+            offset: 0,
+        });
+    }
+
+    let mut cursor = 1;
+    let (memory_count, memory_count_len) = read_u32_leb(rest, cursor)?;
+    cursor += memory_count_len;
+    let mut memories = alloc::vec::Vec::new();
+    for _ in 0..memory_count {
+        let (index, len) = read_u32_leb(&bytes[cursor..], cursor)?;
+        memories.push(MemoryIndex::from_u32(index));
+        cursor += len;
+    }
+
+    let (global_count, global_count_len) = read_u32_leb(&bytes[cursor..], cursor)?;
+    cursor += global_count_len;
+    let mut globals = alloc::vec::Vec::new();
+    for _ in 0..global_count {
+        let (index, len) = read_u32_leb(&bytes[cursor..], cursor)?;
+        globals.push(GlobalIndex::from_u32(index));
+        cursor += len;
+    }
+
+    if cursor != bytes.len() {
+        return Err(WasmError::InvalidWebAssembly {
+            message: "trailing transaction object metadata bytes".into(),
+            offset: cursor,
+        });
+    }
+
+    Ok(TransactionObjectMetadata { memories, globals })
 }
 
 fn parse_research_code_section(
@@ -704,6 +779,41 @@ mod tests {
         match error {
             WasmError::InvalidWebAssembly { message, .. } => {
                 assert!(message.contains("transactional memory"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transaction_object_metadata_decodes_memory_and_global_indices() {
+        let metadata = decode_transaction_object_metadata(&[1, 2, 0, 3, 1, 2]).unwrap();
+
+        assert!(metadata.is_tmemory(MemoryIndex::from_u32(0)));
+        assert!(metadata.is_tmemory(MemoryIndex::from_u32(3)));
+        assert!(!metadata.is_tmemory(MemoryIndex::from_u32(1)));
+        assert!(metadata.is_tglobal(GlobalIndex::from_u32(2)));
+        assert!(!metadata.is_tglobal(GlobalIndex::from_u32(0)));
+    }
+
+    #[test]
+    fn transaction_object_metadata_rejects_unknown_version() {
+        let error = decode_transaction_object_metadata(&[2, 0, 0]).unwrap_err();
+
+        match error {
+            WasmError::InvalidWebAssembly { message, .. } => {
+                assert!(message.contains("unsupported transaction object metadata version"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transaction_object_metadata_rejects_trailing_bytes() {
+        let error = decode_transaction_object_metadata(&[1, 0, 0, 0]).unwrap_err();
+
+        match error {
+            WasmError::InvalidWebAssembly { message, .. } => {
+                assert!(message.contains("trailing transaction object metadata bytes"));
             }
             other => panic!("unexpected error: {other:?}"),
         }

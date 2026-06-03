@@ -7,9 +7,10 @@ use crate::{
     ConstExpr, ConstOp, DataIndex, DefinedFuncIndex, DefinedGlobalIndex, ElemIndex,
     EngineOrModuleTypeIndex, EntityIndex, EntityType, FuncIndex, FuncKey, GlobalIndex, IndexType,
     MemoryIndex, MemoryInitializer, ModuleInternedTypeIndex, ModuleStartup, ModuleTypesBuilder,
-    PanicOnOom as _, PassiveElemIndex, PrimaryMap, RuntimeDataIndex, StaticModuleIndex, TableIndex,
-    TableInitialValue, TableInitialization, Tag, TagIndex, Tunables, TypeConvert, TypeIndex,
-    WasmHeapTopType, WasmHeapType, WasmResult, WasmValType, WasmparserTypeConverter,
+    PanicOnOom as _, PassiveElemIndex, PrimaryMap, RuntimeDataIndex, StaticModuleIndex,
+    TRANSACTION_OBJECTS_CUSTOM_SECTION, TableIndex, TableInitialValue, TableInitialization, Tag,
+    TagIndex, Tunables, TypeConvert, TypeIndex, WasmHeapTopType, WasmHeapType, WasmResult,
+    WasmValType, WasmparserTypeConverter, decode_transaction_object_metadata,
 };
 use alloc::borrow::Cow;
 use cranelift_entity::SecondaryMap;
@@ -795,7 +796,7 @@ and for re-adding support for interface types you can see this issue:
             }
 
             Payload::CustomSection(s) => {
-                self.register_custom_section(&s);
+                self.register_custom_section(&s)?;
             }
 
             // It's expected that validation will probably reject other
@@ -810,7 +811,13 @@ and for re-adding support for interface types you can see this issue:
         Ok(())
     }
 
-    fn register_custom_section(&mut self, section: &CustomSectionReader<'data>) {
+    fn register_custom_section(&mut self, section: &CustomSectionReader<'data>) -> Result<()> {
+        if section.name() == TRANSACTION_OBJECTS_CUSTOM_SECTION {
+            self.result.module.transaction_objects =
+                decode_transaction_object_metadata(section.data())?;
+            return Ok(());
+        }
+
         match section.as_known() {
             KnownCustom::Name(name) => {
                 let result = self.name_section(name);
@@ -845,6 +852,7 @@ and for re-adding support for interface types you can see this issue:
                 }
             }
         }
+        Ok(())
     }
 
     fn dwarf_section(&mut self, name: &str, section: &CustomSectionReader<'data>) {
@@ -1546,5 +1554,46 @@ impl ModuleTranslation<'_> {
             ModuleStartup::Always(_) | ModuleStartup::IfMemoriesNeedInit(_) => return,
         };
         self.module.startup = ModuleStartup::IfMemoriesNeedInit(ty);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translation_records_transaction_object_metadata_section() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (tmemory 1)
+              (tglobal (mut i32) (i32.const 0)))
+            "#,
+        )
+        .unwrap();
+        let tunables = Tunables::default_u32();
+        let mut validator = Validator::new();
+        let mut types = ModuleTypesBuilder::new(&validator);
+        let translation = ModuleEnvironment::new(
+            &tunables,
+            &mut validator,
+            &mut types,
+            StaticModuleIndex::from_u32(0),
+        )
+        .translate(Parser::new(0), &wasm)
+        .unwrap();
+
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_tmemory(MemoryIndex::from_u32(0))
+        );
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_tglobal(GlobalIndex::from_u32(0))
+        );
     }
 }
