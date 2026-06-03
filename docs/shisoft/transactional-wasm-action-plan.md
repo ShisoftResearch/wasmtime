@@ -151,6 +151,8 @@ Current bridge:
 - [x] Add milestone-1 `0xfa` opcode constants and an internal
   `TransactionOperator` decoder in `wasmtime-environ`.
 - [x] Add raw prefixed opcode-byte decoding for generated binary fixtures.
+- [x] Add local parser bridge that extracts milestone-1 transaction operators
+  from research fixture function-body bytes.
 - [ ] Patch or fork `wasmparser` so these decode as first-class
   `wasmparser::Operator` variants.
 

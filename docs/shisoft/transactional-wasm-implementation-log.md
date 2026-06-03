@@ -546,9 +546,16 @@ The bridge currently covers:
 
 It also validates raw prefixed opcode bytes beginning with `0xfa`.
 
+Added a local research parser bridge for generated fixtures. It scans a core
+function-body byte slice, extracts milestone-1 `0xfa` transaction operators,
+and preserves the byte offset of each transaction prefix. This is intentionally
+not a full WebAssembly parser and does not replace `wasmparser`; it is the
+temporary path for research fixtures while the external parser strategy remains
+open.
+
 Verification:
 
 ```text
 cargo test -p wasmtime-environ --lib transaction
-test result: ok. 4 passed; 0 failed; 0 ignored
+test result: ok. 6 passed; 0 failed; 0 ignored
 ```

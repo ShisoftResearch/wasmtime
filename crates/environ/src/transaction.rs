@@ -76,6 +76,17 @@ pub struct DecodedTransactionOperator {
     pub bytes_read: usize,
 }
 
+/// Transaction operator found by the local research fixture parser bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResearchTransactionOperator {
+    /// Byte offset of the `0xfa` prefix inside the scanned byte slice.
+    pub offset: usize,
+    /// Decoded transaction operator.
+    pub operator: TransactionOperator,
+    /// Number of bytes consumed, including the `0xfa` prefix.
+    pub bytes_read: usize,
+}
+
 impl TransactionOperator {
     /// Returns this operator's Wizard/proposal `0xfa` subopcode.
     pub const fn subopcode(self) -> u32 {
@@ -131,6 +142,51 @@ pub fn decode_prefixed_milestone1_transaction_operator(
         operator: decode_milestone1_transaction_operator(subopcode)?,
         bytes_read: 1 + subopcode_len,
     })
+}
+
+/// Scan research fixture bytes for milestone-1 transaction operators.
+///
+/// This is intentionally a bridge, not a replacement for `wasmparser`. Callers
+/// must pass a core function-body byte slice. The scanner ignores ordinary
+/// operators and decodes only `0xfa` transaction-prefixed operators, preserving
+/// their offsets for later generated-fixture diagnostics.
+pub fn parse_research_transaction_operators(
+    bytes: &[u8],
+) -> WasmResult<alloc::vec::Vec<ResearchTransactionOperator>> {
+    let mut operators = alloc::vec::Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        if bytes[offset] != TRANSACTION_OPCODE_PREFIX {
+            offset += 1;
+            continue;
+        }
+
+        let decoded =
+            decode_prefixed_milestone1_transaction_operator(&bytes[offset..]).map_err(|error| {
+                match error {
+                    WasmError::Unsupported(message) => WasmError::Unsupported(crate::__format!(
+                        "{message} at fixture offset {offset}"
+                    )),
+                    WasmError::InvalidWebAssembly {
+                        message,
+                        offset: inner,
+                    } => WasmError::InvalidWebAssembly {
+                        message,
+                        offset: offset + inner,
+                    },
+                    other => other,
+                }
+            })?;
+        operators.push(ResearchTransactionOperator {
+            offset,
+            operator: decoded.operator,
+            bytes_read: decoded.bytes_read,
+        });
+        offset += decoded.bytes_read;
+    }
+
+    Ok(operators)
 }
 
 /// Decode a milestone-1 transaction operator from a `0xfa` subopcode.
@@ -261,6 +317,40 @@ mod tests {
             WasmError::InvalidWebAssembly { message, offset } => {
                 assert!(message.contains("transaction prefix"));
                 assert_eq!(offset, 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_parser_bridge_extracts_transaction_operators_from_function_body() {
+        let operators = parse_research_transaction_operators(&[
+            0x41,
+            0x00,
+            TRANSACTION_OPCODE_PREFIX,
+            0x28,
+            0x0b,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            operators,
+            [ResearchTransactionOperator {
+                offset: 2,
+                operator: TransactionOperator::I32TLoad,
+                bytes_read: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn local_parser_bridge_reports_transaction_operator_offset() {
+        let error =
+            parse_research_transaction_operators(&[TRANSACTION_OPCODE_PREFIX, 0x25]).unwrap_err();
+
+        match error {
+            WasmError::Unsupported(message) => {
+                assert!(message.contains("0xfa 0x25"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
