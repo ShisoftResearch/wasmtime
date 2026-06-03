@@ -756,3 +756,39 @@ test result: ok. 12 passed; 0 failed; 0 ignored
 cargo test -p wasmtime --lib transaction
 test result: ok. 16 passed; 0 failed; 0 ignored
 ```
+
+## Workstream F: Transaction Memory Load/Store Helper Lowering
+
+Lowered scalar and packed integer `*.tload/*.tstore` through the normal
+validated module path. Cranelift now dispatches these operators to the
+transaction memory helper ABI:
+
+- `transaction_tmemory_load` returns a pointer to readable transactional bytes.
+- `transaction_tmemory_store` returns a pointer to writable staged bytes.
+
+The lowered code then performs the typed Cranelift load/store from the
+helper-returned pointer. Ordinary Wasmtime linear-memory lowering is unchanged.
+
+This is an ABI-stub milestone, not full `tmemory` semantics. The runtime
+helpers still trap until transactional object-space access and COW staged
+granule storage are wired. `tglobal.*` and `tmemory.size/grow` remain parsed
+but intentionally rejected by Cranelift lowering.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib module_compilation_accepts_transaction_store_helper_lowering
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib module_compilation_accepts_transaction_data_helper_lowering
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime-environ --lib transaction_
+test result: ok. 11 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 19 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile
+```

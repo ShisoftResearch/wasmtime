@@ -466,7 +466,10 @@ mod tests {
             BuiltinFunctionIndex::transaction_tmemory_store(),
             BuiltinFunctionIndex::transaction_tmemory_size(),
         ] {
-            assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::NegativeOne)));
+            assert!(matches!(
+                builtin.trap_sentinel(),
+                Some(TrapSentinel::NegativeOne)
+            ));
         }
     }
 }

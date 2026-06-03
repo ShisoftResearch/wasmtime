@@ -3557,6 +3557,62 @@ impl FuncEnvironment<'_> {
         )
     }
 
+    pub fn translate_transaction_tmemory_load(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        memory: MemoryIndex,
+        addr: ir::Value,
+        offset: u64,
+        len: u32,
+    ) -> WasmResult<ir::Value> {
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_load(),
+        );
+        let index_type = self.memory(memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let memory = pos
+            .ins()
+            .iconst(I32, i64::try_from(memory.index()).unwrap());
+        let addr = self.cast_index_to_i64(&mut pos, addr, index_type);
+        let offset = pos.ins().iconst(I64, offset as i64);
+        let len = pos.ins().iconst(I32, i64::from(len));
+        let call = pos.ins().call(callee, &[vmctx, memory, addr, offset, len]);
+        let ptr = pos.func.dfg.inst_results(call)[0];
+        self.compiler.raise_if_host_trapped(builder, vmctx, ptr);
+        Ok(ptr)
+    }
+
+    pub fn translate_transaction_tmemory_store(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        memory: MemoryIndex,
+        addr: ir::Value,
+        offset: u64,
+        len: u32,
+    ) -> WasmResult<ir::Value> {
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_store(),
+        );
+        let index_type = self.memory(memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let memory = pos
+            .ins()
+            .iconst(I32, i64::try_from(memory.index()).unwrap());
+        let addr = self.cast_index_to_i64(&mut pos, addr, index_type);
+        let offset = pos.ins().iconst(I64, offset as i64);
+        let len = pos.ins().iconst(I32, i64::from(len));
+        let call = pos.ins().call(callee, &[vmctx, memory, addr, offset, len]);
+        let ptr = pos.func.dfg.inst_results(call)[0];
+        self.compiler.raise_if_host_trapped(builder, vmctx, ptr);
+        Ok(ptr)
+    }
+
     fn translate_transaction_lifecycle_builtin(
         &mut self,
         builder: &mut FunctionBuilder<'_>,

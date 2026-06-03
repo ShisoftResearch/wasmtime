@@ -199,29 +199,6 @@ pub fn translate_operator(
         }
         Operator::TGlobalGet { .. }
         | Operator::TGlobalSet { .. }
-        | Operator::I32TLoad { .. }
-        | Operator::I64TLoad { .. }
-        | Operator::F32TLoad { .. }
-        | Operator::F64TLoad { .. }
-        | Operator::I32TLoad8S { .. }
-        | Operator::I32TLoad8U { .. }
-        | Operator::I32TLoad16S { .. }
-        | Operator::I32TLoad16U { .. }
-        | Operator::I64TLoad8S { .. }
-        | Operator::I64TLoad8U { .. }
-        | Operator::I64TLoad16S { .. }
-        | Operator::I64TLoad16U { .. }
-        | Operator::I64TLoad32S { .. }
-        | Operator::I64TLoad32U { .. }
-        | Operator::I32TStore { .. }
-        | Operator::I64TStore { .. }
-        | Operator::F32TStore { .. }
-        | Operator::F64TStore { .. }
-        | Operator::I32TStore8 { .. }
-        | Operator::I32TStore16 { .. }
-        | Operator::I64TStore8 { .. }
-        | Operator::I64TStore16 { .. }
-        | Operator::I64TStore32 { .. }
         | Operator::TMemorySize { .. }
         | Operator::TMemoryGrow { .. } => {
             return Err(wasm_unsupported!(
@@ -906,11 +883,17 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Uload8, I32, builder, environ)?
             );
         }
+        Operator::I32TLoad8U { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Uload8, I32, builder, environ)?;
+        }
         Operator::I32Load16U { memarg } => {
             unwrap_or_return_unreachable_state!(
                 environ,
                 translate_load(memarg, ir::Opcode::Uload16, I32, builder, environ)?
             );
+        }
+        Operator::I32TLoad16U { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Uload16, I32, builder, environ)?;
         }
         Operator::I32Load8S { memarg } => {
             unwrap_or_return_unreachable_state!(
@@ -918,11 +901,17 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Sload8, I32, builder, environ)?
             );
         }
+        Operator::I32TLoad8S { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Sload8, I32, builder, environ)?;
+        }
         Operator::I32Load16S { memarg } => {
             unwrap_or_return_unreachable_state!(
                 environ,
                 translate_load(memarg, ir::Opcode::Sload16, I32, builder, environ)?
             );
+        }
+        Operator::I32TLoad16S { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Sload16, I32, builder, environ)?;
         }
         Operator::I64Load8U { memarg } => {
             unwrap_or_return_unreachable_state!(
@@ -930,11 +919,17 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Uload8, I64, builder, environ)?
             );
         }
+        Operator::I64TLoad8U { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Uload8, I64, builder, environ)?;
+        }
         Operator::I64Load16U { memarg } => {
             unwrap_or_return_unreachable_state!(
                 environ,
                 translate_load(memarg, ir::Opcode::Uload16, I64, builder, environ)?
             );
+        }
+        Operator::I64TLoad16U { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Uload16, I64, builder, environ)?;
         }
         Operator::I64Load8S { memarg } => {
             unwrap_or_return_unreachable_state!(
@@ -942,11 +937,17 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Sload8, I64, builder, environ)?
             );
         }
+        Operator::I64TLoad8S { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Sload8, I64, builder, environ)?;
+        }
         Operator::I64Load16S { memarg } => {
             unwrap_or_return_unreachable_state!(
                 environ,
                 translate_load(memarg, ir::Opcode::Sload16, I64, builder, environ)?
             );
+        }
+        Operator::I64TLoad16S { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Sload16, I64, builder, environ)?;
         }
         Operator::I64Load32S { memarg } => {
             unwrap_or_return_unreachable_state!(
@@ -954,11 +955,17 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Sload32, I64, builder, environ)?
             );
         }
+        Operator::I64TLoad32S { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Sload32, I64, builder, environ)?;
+        }
         Operator::I64Load32U { memarg } => {
             unwrap_or_return_unreachable_state!(
                 environ,
                 translate_load(memarg, ir::Opcode::Uload32, I64, builder, environ)?
             );
+        }
+        Operator::I64TLoad32U { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Uload32, I64, builder, environ)?;
         }
         Operator::I32Load { memarg } => {
             unwrap_or_return_unreachable_state!(
@@ -966,11 +973,17 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Load, I32, builder, environ)?
             );
         }
+        Operator::I32TLoad { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Load, I32, builder, environ)?;
+        }
         Operator::F32Load { memarg } => {
             unwrap_or_return_unreachable_state!(
                 environ,
                 translate_load(memarg, ir::Opcode::Load, F32, builder, environ)?
             );
+        }
+        Operator::F32TLoad { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Load, F32, builder, environ)?;
         }
         Operator::I64Load { memarg } => {
             unwrap_or_return_unreachable_state!(
@@ -978,11 +991,17 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Load, I64, builder, environ)?
             );
         }
+        Operator::I64TLoad { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Load, I64, builder, environ)?;
+        }
         Operator::F64Load { memarg } => {
             unwrap_or_return_unreachable_state!(
                 environ,
                 translate_load(memarg, ir::Opcode::Load, F64, builder, environ)?
             );
+        }
+        Operator::F64TLoad { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Load, F64, builder, environ)?;
         }
         Operator::V128Load { memarg } => {
             unwrap_or_return_unreachable_state!(
@@ -1049,14 +1068,29 @@ pub fn translate_operator(
         | Operator::F64Store { memarg } => {
             translate_store(memarg, ir::Opcode::Store, builder, environ)?;
         }
+        Operator::I32TStore { memarg }
+        | Operator::I64TStore { memarg }
+        | Operator::F32TStore { memarg }
+        | Operator::F64TStore { memarg } => {
+            translate_transaction_store(memarg, ir::Opcode::Store, builder, environ)?;
+        }
         Operator::I32Store8 { memarg } | Operator::I64Store8 { memarg } => {
             translate_store(memarg, ir::Opcode::Istore8, builder, environ)?;
+        }
+        Operator::I32TStore8 { memarg } | Operator::I64TStore8 { memarg } => {
+            translate_transaction_store(memarg, ir::Opcode::Istore8, builder, environ)?;
         }
         Operator::I32Store16 { memarg } | Operator::I64Store16 { memarg } => {
             translate_store(memarg, ir::Opcode::Istore16, builder, environ)?;
         }
+        Operator::I32TStore16 { memarg } | Operator::I64TStore16 { memarg } => {
+            translate_transaction_store(memarg, ir::Opcode::Istore16, builder, environ)?;
+        }
         Operator::I64Store32 { memarg } => {
             translate_store(memarg, ir::Opcode::Istore32, builder, environ)?;
+        }
+        Operator::I64TStore32 { memarg } => {
+            translate_transaction_store(memarg, ir::Opcode::Istore32, builder, environ)?;
         }
         Operator::V128Store { memarg } => {
             translate_store(memarg, ir::Opcode::Store, builder, environ)?;
@@ -3782,6 +3816,64 @@ fn translate_load(
         .Load(opcode, result_ty, flags, Offset32::new(0), base);
     environ.stacks.push1(dfg.first_result(load));
     Ok(Reachability::Reachable(()))
+}
+
+fn translate_transaction_load(
+    memarg: &MemArg,
+    opcode: ir::Opcode,
+    result_ty: Type,
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+) -> WasmResult<()> {
+    let addr = environ.stacks.pop1();
+    let mem_op_size = mem_op_size(opcode, result_ty);
+    let base = environ.translate_transaction_tmemory_load(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        addr,
+        memarg.offset,
+        u32::from(mem_op_size),
+    )?;
+    let flags = builder
+        .func
+        .dfg
+        .mem_flags
+        .insert(MemFlagsData::trusted())
+        .unwrap();
+    let (load, dfg) = builder
+        .ins()
+        .Load(opcode, result_ty, flags, Offset32::new(0), base);
+    environ.stacks.push1(dfg.first_result(load));
+    Ok(())
+}
+
+fn translate_transaction_store(
+    memarg: &MemArg,
+    opcode: ir::Opcode,
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+) -> WasmResult<()> {
+    let val = environ.stacks.pop1();
+    let addr = environ.stacks.pop1();
+    let val_ty = builder.func.dfg.value_type(val);
+    let mem_op_size = mem_op_size(opcode, val_ty);
+    let base = environ.translate_transaction_tmemory_store(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        addr,
+        memarg.offset,
+        u32::from(mem_op_size),
+    )?;
+    let flags = builder
+        .func
+        .dfg
+        .mem_flags
+        .insert(MemFlagsData::trusted())
+        .unwrap();
+    builder
+        .ins()
+        .Store(opcode, val_ty, flags, Offset32::new(0), val, base);
+    Ok(())
 }
 
 /// Translate a store instruction.
