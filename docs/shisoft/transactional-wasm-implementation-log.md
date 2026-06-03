@@ -553,9 +553,14 @@ not a full WebAssembly parser and does not replace `wasmparser`; it is the
 temporary path for research fixtures while the external parser strategy remains
 open.
 
+Extended the bridge to generated core-module fixtures. The module bridge checks
+the Wasm magic/version, walks section ids and sizes, extracts code-section
+function bodies, and reports each transaction operator with its function index
+and body offset.
+
 Verification:
 
 ```text
 cargo test -p wasmtime-environ --lib transaction
-test result: ok. 6 passed; 0 failed; 0 ignored
+test result: ok. 8 passed; 0 failed; 0 ignored
 ```

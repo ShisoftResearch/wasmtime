@@ -87,6 +87,19 @@ pub struct ResearchTransactionOperator {
     pub bytes_read: usize,
 }
 
+/// Transaction operator found in a generated research module fixture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResearchTransactionModuleOperator {
+    /// Function index inside the module's code section.
+    pub function_index: u32,
+    /// Byte offset of the `0xfa` prefix inside the function body.
+    pub body_offset: usize,
+    /// Decoded transaction operator.
+    pub operator: TransactionOperator,
+    /// Number of bytes consumed, including the `0xfa` prefix.
+    pub bytes_read: usize,
+}
+
 impl TransactionOperator {
     /// Returns this operator's Wizard/proposal `0xfa` subopcode.
     pub const fn subopcode(self) -> u32 {
@@ -187,6 +200,105 @@ pub fn parse_research_transaction_operators(
     }
 
     Ok(operators)
+}
+
+/// Scan generated research module fixture bytes for transaction operators.
+///
+/// This is a deliberately narrow parser bridge. It validates the core Wasm
+/// magic/version, walks sections by id and size, and scans function bodies in
+/// the code section. It does not validate the full module and should be removed
+/// once transaction operators are first-class `wasmparser::Operator` variants.
+pub fn parse_research_transaction_operators_from_module(
+    bytes: &[u8],
+) -> WasmResult<alloc::vec::Vec<ResearchTransactionModuleOperator>> {
+    if bytes.len() < 8 || bytes[0..4] != [0x00, 0x61, 0x73, 0x6d] {
+        return Err(WasmError::InvalidWebAssembly {
+            message: "research transaction fixture is not a core Wasm module".into(),
+            offset: 0,
+        });
+    }
+    if bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
+        return Err(WasmError::InvalidWebAssembly {
+            message: "research transaction fixture has unsupported Wasm version".into(),
+            offset: 4,
+        });
+    }
+
+    let mut operators = alloc::vec::Vec::new();
+    let mut offset = 8;
+    while offset < bytes.len() {
+        let section_id = bytes[offset];
+        offset += 1;
+        let (section_len, section_len_bytes) = read_u32_leb(&bytes[offset..], offset)?;
+        offset += section_len_bytes;
+        let section_len = usize::try_from(section_len)?;
+        let section_end =
+            offset
+                .checked_add(section_len)
+                .ok_or_else(|| WasmError::InvalidWebAssembly {
+                    message: "research transaction fixture section size overflow".into(),
+                    offset,
+                })?;
+        if section_end > bytes.len() {
+            return Err(WasmError::InvalidWebAssembly {
+                message: "research transaction fixture section is truncated".into(),
+                offset,
+            });
+        }
+
+        if section_id == 10 {
+            parse_research_code_section(&bytes[offset..section_end], &mut operators)?;
+        }
+        offset = section_end;
+    }
+    Ok(operators)
+}
+
+fn parse_research_code_section(
+    bytes: &[u8],
+    operators: &mut alloc::vec::Vec<ResearchTransactionModuleOperator>,
+) -> WasmResult<()> {
+    let mut offset = 0;
+    let (function_count, count_len) = read_u32_leb(bytes, 0)?;
+    offset += count_len;
+
+    for function_index in 0..function_count {
+        let (body_len, body_len_bytes) = read_u32_leb(&bytes[offset..], offset)?;
+        offset += body_len_bytes;
+        let body_len = usize::try_from(body_len)?;
+        let body_end =
+            offset
+                .checked_add(body_len)
+                .ok_or_else(|| WasmError::InvalidWebAssembly {
+                    message: "research transaction fixture body size overflow".into(),
+                    offset,
+                })?;
+        if body_end > bytes.len() {
+            return Err(WasmError::InvalidWebAssembly {
+                message: "research transaction fixture body is truncated".into(),
+                offset,
+            });
+        }
+
+        let body = &bytes[offset..body_end];
+        let body_operators =
+            parse_research_transaction_operators(body).map_err(|error| match error {
+                WasmError::Unsupported(message) => WasmError::Unsupported(crate::__format!(
+                    "{message} in function {function_index}"
+                )),
+                other => other,
+            })?;
+        operators.extend(body_operators.into_iter().map(|operator| {
+            ResearchTransactionModuleOperator {
+                function_index,
+                body_offset: operator.offset,
+                operator: operator.operator,
+                bytes_read: operator.bytes_read,
+            }
+        }));
+        offset = body_end;
+    }
+    Ok(())
 }
 
 /// Decode a milestone-1 transaction operator from a `0xfa` subopcode.
@@ -354,5 +466,53 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn generated_module_fixture_extracts_transaction_operators() {
+        let module = generated_module_with_body(&[0x00, TRANSACTION_OPCODE_PREFIX, 0x28, 0x0b]);
+
+        let operators = parse_research_transaction_operators_from_module(&module).unwrap();
+
+        assert_eq!(
+            operators,
+            [ResearchTransactionModuleOperator {
+                function_index: 0,
+                body_offset: 1,
+                operator: TransactionOperator::I32TLoad,
+                bytes_read: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn generated_module_fixture_reports_function_index_for_bad_transaction_opcode() {
+        let module = generated_module_with_body(&[0x00, TRANSACTION_OPCODE_PREFIX, 0x25, 0x0b]);
+
+        let error = parse_research_transaction_operators_from_module(&module).unwrap_err();
+
+        match error {
+            WasmError::Unsupported(message) => {
+                assert!(message.contains("function 0"));
+                assert!(message.contains("0xfa 0x25"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn generated_module_with_body(body: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut module = alloc::vec![
+            0x00, 0x61, 0x73, 0x6d, // magic
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // one () -> () type
+            0x03, 0x02, 0x01, 0x00, // one function using type 0
+            0x0a, // code section
+        ];
+        let section_size = body.len() + 2;
+        module.push(u8::try_from(section_size).unwrap());
+        module.push(0x01);
+        module.push(u8::try_from(body.len()).unwrap());
+        module.extend_from_slice(body);
+        module
     }
 }
