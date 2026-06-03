@@ -21,8 +21,9 @@ Make Wasmtime execute a Wizard-style transactional WebAssembly slice:
 - `tmemory.grow`
 
 Milestone 1 is complete when `tmemory` has a distinct volatile mmap-backed
-storage path with 256-byte granule metadata, transaction abort restores globals
-and memory granules, and migrated tests document Wizard-first behavior.
+storage path with 256-byte granule metadata, transactional writes use
+copy-on-write staging, commit writes staged values into `tmemory`, abort drops
+staged values, and migrated tests document Wizard-first behavior.
 
 ## Fixed Choices
 
@@ -157,6 +158,8 @@ Current bridge:
   from generated research module fixtures.
 - [x] Add research fixture metadata and validation for feature gating,
   transactional memories, and transactional globals.
+- [x] Add runtime fixture executor bridge for milestone-1 `ttry`/`tfail`
+  control behavior.
 - [ ] Patch or fork `wasmparser` so these decode as first-class
   `wasmparser::Operator` variants.
 
@@ -252,7 +255,7 @@ Tasks:
 - [x] Add `TMemory` storage type that dispatches to the configured backend.
 - [x] Add side metadata reservation for 256-byte granules.
 - [x] Add metadata initialization for newly live granules.
-- [x] Add snapshot and restore helpers.
+- [x] Add copy and writeback helpers.
 - [x] Add grow and shrink helpers that update both data and metadata ranges.
 - [x] Add storage-only tests.
 
@@ -260,8 +263,8 @@ Required helpers:
 
 - `granule_index(addr: u64) -> u64`
 - `txn_info(granule_index) -> ...`
-- `snapshot_granule(granule_index) -> Vec<u8>`
-- `restore_granule(granule_index, bytes)`
+- `copy_granule(granule_index) -> Vec<u8>`
+- `write_granule(granule_index, bytes)`
 - `grow_to(new_size)`
 - `shrink_to(old_size)`
 
@@ -269,8 +272,8 @@ Storage-only tests:
 
 - one Wasm page has `65536 / 256` granules
 - growing by one Wasm page adds 256 metadata records
-- snapshot and restore one 256-byte granule
-- restoring one granule does not modify neighboring granules
+- copy and write back one 256-byte granule
+- writing one granule does not modify neighboring granules
 - shrinking returns visible byte length to the old size
 
 Checkpoint:
@@ -281,7 +284,7 @@ Checkpoint:
 ## Workstream E: Transaction Runtime And Concurrency Control
 
 Purpose: make the store own active transaction state and provide commit/abort
-semantics for milestone-1 undo records.
+semantics for milestone-1 copy-on-write staged records.
 
 Primary owner: transaction-runtime implementer.
 
@@ -301,7 +304,7 @@ Tasks:
 - [x] Define concurrency-control interface.
 - [x] Implement `LockBased` strategy.
 - [x] Add transaction state to the store boundary.
-- [x] Add undo record types.
+- [x] Add staged record types.
 - [x] Add begin, commit, abort, and fail operations.
 - [x] Add read/write acquisition helpers for globals and memory granules.
 - [x] Add transaction-state tests.
@@ -311,25 +314,28 @@ Required state:
 - active transaction id
 - next transaction id
 - owned/write granule set
-- undo log
+- staged global map
+- staged memory granule map
+- staged memory size map
 - simple ownership/version table for milestone 1
 
-Undo records:
+Staged records:
 
-- global restore
-- memory granule restore
-- memory size restore
+- global final value
+- memory granule final bytes
+- memory size final page count
 
 Transaction-state tests:
 
 - begin then commit clears active transaction
 - begin then abort clears active transaction
-- abort runs undo records in reverse insertion order
-- duplicate granule write records one snapshot
+- commit applies only latest staged records
+- abort and fail drop staged records without writeback
+- duplicate granule writes update one staged buffer
 
 Checkpoint:
 
-- Transaction state and undo behavior are testable without compiled Wasm.
+- Transaction state and COW staging behavior are testable without compiled Wasm.
 
 ## Workstream F: Runtime Helpers And Lowering
 
@@ -368,11 +374,15 @@ Required behavior:
 - `ttry` starts a transaction when no transaction is active.
 - normal transaction exit commits.
 - `tfail` aborts.
-- `tglobal.set` records undo before first mutation.
-- `*.tstore` snapshots every touched 256-byte granule before mutation.
-- stores crossing a granule boundary snapshot both granules.
-- `tmemory.grow` records old size before successful growth.
-- abort after successful grow shrinks back to old size.
+- `tglobal.set` stages the final transactional global value.
+- `*.tstore` copies every touched 256-byte granule into the transaction write
+  set before modifying staged bytes.
+- stores crossing a granule boundary stage both granules.
+- `*.tload` reads staged bytes first, then committed `tmemory` bytes.
+- `tmemory.grow` stages the new visible size.
+- commit writes staged globals, staged granules, and staged memory size into
+  the concrete runtime objects.
+- abort after successful staged grow leaves committed `tmemory` size unchanged.
 
 Checkpoint:
 
@@ -463,8 +473,8 @@ Workstreams:
 Exit:
 
 - volatile mmap-backed `tmemory` works under storage tests
-- transaction state can commit and abort undo records
-- duplicate granule writes snapshot once
+- transaction state can commit staged records and abort without writeback
+- duplicate granule writes update one staged buffer
 
 ### M1c: Executable Operators
 
@@ -476,10 +486,10 @@ Workstreams:
 Exit:
 
 - milestone-1 operators execute
-- abort restores transactional globals
-- abort restores touched 256-byte memory granules
-- abort after `tmemory.grow` restores old size
-- commit preserves writes
+- abort drops staged transactional globals
+- abort drops staged 256-byte memory granules
+- abort after `tmemory.grow` drops the staged size
+- commit writes staged values into runtime objects
 
 ### M1d: Test Migration
 
@@ -501,7 +511,7 @@ The smallest useful first-week target:
 - milestone-1 opcode constants and encodings documented in one place
 - Workstream C transaction config sketched
 - Workstream D `tmemory` backend interface sketched
-- first storage-only tests for granule metadata and snapshot/restore written
+- first storage-only tests for granule metadata and copy/writeback written
 
 This gets the special `tmemory` decision into code before broader transaction
 control-flow work starts.

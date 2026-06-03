@@ -96,8 +96,9 @@ pub(crate) struct TransactionId(u64);
 pub(crate) struct TransactionState {
     active: Option<TransactionId>,
     next_id: u64,
-    undo_log: Vec<UndoRecord>,
-    globals: BTreeSet<u32>,
+    staged_globals: BTreeMap<u32, GlobalSnapshot>,
+    staged_memory_granules: BTreeMap<MemoryGranuleKey, Vec<u8>>,
+    staged_memory_sizes: BTreeMap<u32, u64>,
     memory_read_granules: BTreeSet<MemoryGranuleKey>,
     memory_write_granules: BTreeSet<MemoryGranuleKey>,
 }
@@ -107,8 +108,9 @@ impl Default for TransactionState {
         Self {
             active: None,
             next_id: 1,
-            undo_log: Vec::new(),
-            globals: BTreeSet::new(),
+            staged_globals: BTreeMap::new(),
+            staged_memory_granules: BTreeMap::new(),
+            staged_memory_sizes: BTreeMap::new(),
             memory_read_granules: BTreeSet::new(),
             memory_write_granules: BTreeSet::new(),
         }
@@ -116,7 +118,7 @@ impl Default for TransactionState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum UndoRecord {
+pub(crate) enum StagedRecord {
     Global {
         global_index: u32,
         value: GlobalSnapshot,
@@ -128,7 +130,7 @@ pub(crate) enum UndoRecord {
     },
     MemorySize {
         memory_index: u32,
-        old_pages: u64,
+        new_pages: u64,
     },
 }
 
@@ -249,56 +251,65 @@ impl TransactionState {
     }
 
     pub(crate) fn commit(&mut self) -> Result<()> {
-        self.ensure_active()?;
-        self.clear_active();
-        Ok(())
+        self.commit_with(|_| Ok(()))
     }
 
-    pub(crate) fn abort_with<F>(&mut self, mut restore: F) -> Result<()>
+    pub(crate) fn commit_with<F>(&mut self, mut apply: F) -> Result<()>
     where
-        F: FnMut(&UndoRecord) -> Result<()>,
+        F: FnMut(&StagedRecord) -> Result<()>,
     {
         self.ensure_active()?;
-        for record in self.undo_log.iter().rev() {
-            restore(record)?;
+        for (&global_index, &value) in &self.staged_globals {
+            apply(&StagedRecord::Global {
+                global_index,
+                value,
+            })?;
+        }
+        for (key, bytes) in &self.staged_memory_granules {
+            apply(&StagedRecord::MemoryGranule {
+                memory_index: key.memory_index,
+                granule_index: key.granule_index,
+                bytes: bytes.clone(),
+            })?;
+        }
+        for (&memory_index, &new_pages) in &self.staged_memory_sizes {
+            apply(&StagedRecord::MemorySize {
+                memory_index,
+                new_pages,
+            })?;
         }
         self.clear_active();
         Ok(())
     }
 
-    pub(crate) fn fail_with<F>(&mut self, restore: F) -> Result<()>
-    where
-        F: FnMut(&UndoRecord) -> Result<()>,
-    {
-        self.abort_with(restore)
-    }
-
-    pub(crate) fn record_memory_size(&mut self, memory_index: u32, old_pages: u64) -> Result<()> {
+    pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
-        self.undo_log.push(UndoRecord::MemorySize {
-            memory_index,
-            old_pages,
-        });
+        self.clear_active();
         Ok(())
     }
 
-    pub(crate) fn record_global_restore(
+    pub(crate) fn fail(&mut self) -> Result<()> {
+        self.abort()
+    }
+
+    pub(crate) fn stage_memory_size(&mut self, memory_index: u32, new_pages: u64) -> Result<bool> {
+        self.ensure_active()?;
+        Ok(self
+            .staged_memory_sizes
+            .insert(memory_index, new_pages)
+            .is_none())
+    }
+
+    pub(crate) fn stage_global(
         &mut self,
         global_index: u32,
         value: GlobalSnapshot,
     ) -> Result<bool> {
         self.ensure_active()?;
-        if !self.globals.insert(global_index) {
-            return Ok(false);
-        }
-        self.undo_log.push(UndoRecord::Global {
-            global_index,
-            value,
-        });
-        Ok(true)
+        Ok(self.staged_globals.insert(global_index, value).is_none())
     }
 
-    pub(crate) fn record_memory_granule(
+    pub(crate) fn stage_memory_granule(
         &mut self,
         memory_index: u32,
         granule_index: u64,
@@ -309,17 +320,35 @@ impl TransactionState {
             memory_index,
             granule_index,
         };
-        if !self.memory_write_granules.insert(key) {
-            return Ok(false);
-        }
         self.memory_read_granules.insert(key);
+        self.memory_write_granules.insert(key);
+        Ok(self.staged_memory_granules.insert(key, bytes).is_none())
+    }
 
-        self.undo_log.push(UndoRecord::MemoryGranule {
-            memory_index,
-            granule_index,
-            bytes,
-        });
-        Ok(true)
+    pub(crate) fn staged_memory_granule(
+        &self,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> Option<&[u8]> {
+        self.staged_memory_granules
+            .get(&MemoryGranuleKey {
+                memory_index,
+                granule_index,
+            })
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn staged_memory_granule_mut(
+        &mut self,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> Option<&mut [u8]> {
+        self.staged_memory_granules
+            .get_mut(&MemoryGranuleKey {
+                memory_index,
+                granule_index,
+            })
+            .map(Vec::as_mut_slice)
     }
 
     pub(crate) fn acquire_memory_granule_read(
@@ -340,7 +369,7 @@ impl TransactionState {
         granule_index: u64,
         bytes: Vec<u8>,
     ) -> Result<bool> {
-        self.record_memory_granule(memory_index, granule_index, bytes)
+        self.stage_memory_granule(memory_index, granule_index, bytes)
     }
 
     pub(crate) fn owns_memory_granule_read(&self, memory_index: u32, granule_index: u64) -> bool {
@@ -364,11 +393,39 @@ impl TransactionState {
 
     fn clear_active(&mut self) {
         self.active = None;
-        self.undo_log.clear();
-        self.globals.clear();
+        self.staged_globals.clear();
+        self.staged_memory_granules.clear();
+        self.staged_memory_sizes.clear();
         self.memory_read_granules.clear();
         self.memory_write_granules.clear();
     }
+}
+
+pub(crate) fn execute_research_transaction_fixture(
+    state: &mut TransactionState,
+    operators: &[wasmtime_environ::ResearchTransactionModuleOperator],
+) -> Result<()> {
+    for operator in operators {
+        match operator.operator {
+            wasmtime_environ::TransactionOperator::TTry => {
+                state.begin()?;
+            }
+            wasmtime_environ::TransactionOperator::TFail => {
+                state.fail()?;
+            }
+            other => {
+                bail!(
+                    "research transaction fixture executor does not handle {other:?} at function {} offset {}",
+                    operator.function_index,
+                    operator.body_offset
+                );
+            }
+        }
+    }
+    if state.active_transaction().is_some() {
+        state.commit()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -420,53 +477,82 @@ mod tests {
 
         let second = state.begin().unwrap();
         assert_eq!(state.active_transaction(), Some(second));
-        state.abort_with(|_| Ok(())).unwrap();
+        state.abort().unwrap();
         assert_eq!(state.active_transaction(), None);
     }
 
     #[test]
-    fn abort_runs_undo_records_in_reverse_order() {
+    fn commit_applies_only_latest_staged_records() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
-        state
-            .record_memory_size(0, 1)
-            .expect("memory size undo record");
-        state
-            .record_memory_size(0, 2)
-            .expect("memory size undo record");
+        state.stage_memory_size(0, 1).unwrap();
+        state.stage_memory_size(0, 2).unwrap();
+        state.stage_global(3, GlobalSnapshot::I64(11)).unwrap();
+        state.stage_global(3, GlobalSnapshot::I64(22)).unwrap();
+        state.stage_memory_granule(0, 7, vec![0x11; 256]).unwrap();
+        state.stage_memory_granule(0, 7, vec![0x22; 256]).unwrap();
 
-        let mut pages = Vec::new();
+        let mut applied = Vec::new();
         state
-            .abort_with(|record| {
-                if let UndoRecord::MemorySize { old_pages, .. } = record {
-                    pages.push(*old_pages);
-                }
+            .commit_with(|record| {
+                applied.push(record.clone());
                 Ok(())
             })
             .unwrap();
 
-        assert_eq!(pages, [2, 1]);
+        assert_eq!(
+            applied,
+            [
+                StagedRecord::Global {
+                    global_index: 3,
+                    value: GlobalSnapshot::I64(22)
+                },
+                StagedRecord::MemoryGranule {
+                    memory_index: 0,
+                    granule_index: 7,
+                    bytes: vec![0x22; 256]
+                },
+                StagedRecord::MemorySize {
+                    memory_index: 0,
+                    new_pages: 2
+                },
+            ]
+        );
     }
 
     #[test]
-    fn duplicate_granule_write_records_one_snapshot() {
+    fn abort_drops_staged_records_without_apply() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
+        state.stage_memory_size(0, 9).unwrap();
+        state.stage_global(3, GlobalSnapshot::I32(4)).unwrap();
+        state.stage_memory_granule(0, 7, vec![0x11; 256]).unwrap();
 
-        assert!(state.record_memory_granule(0, 7, vec![0x11; 256]).unwrap());
-        assert!(!state.record_memory_granule(0, 7, vec![0x22; 256]).unwrap());
+        state.abort().unwrap();
+        assert_eq!(state.active_transaction(), None);
 
-        let mut snapshots = Vec::new();
+        state.begin().unwrap();
+        let mut applied = Vec::new();
         state
-            .abort_with(|record| {
-                if let UndoRecord::MemoryGranule { bytes, .. } = record {
-                    snapshots.push(bytes[0]);
-                }
+            .commit_with(|record| {
+                applied.push(record.clone());
                 Ok(())
             })
             .unwrap();
 
-        assert_eq!(snapshots, [0x11]);
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn duplicate_granule_write_updates_one_staged_buffer() {
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+
+        assert!(state.stage_memory_granule(0, 7, vec![0x11; 256]).unwrap());
+        assert!(!state.stage_memory_granule(0, 7, vec![0x22; 256]).unwrap());
+
+        let staged = state.staged_memory_granule(0, 7).unwrap();
+        assert_eq!(staged, &[0x22; 256]);
     }
 
     #[test]
@@ -504,72 +590,43 @@ mod tests {
         assert!(state.owns_memory_granule_read(0, 7));
         assert!(state.owns_memory_granule_write(0, 7));
 
-        let mut snapshots = Vec::new();
-        state
-            .abort_with(|record| {
-                if let UndoRecord::MemoryGranule { bytes, .. } = record {
-                    snapshots.push(bytes[0]);
-                }
-                Ok(())
-            })
-            .unwrap();
-
-        assert_eq!(snapshots, [0x11]);
+        assert_eq!(state.staged_memory_granule(0, 7).unwrap(), &[0x22; 256]);
     }
 
     #[test]
-    fn fail_aborts_and_runs_undo_records() {
+    fn fail_drops_staged_records() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
-        state
-            .record_memory_size(0, 9)
-            .expect("memory size undo record");
+        state.stage_memory_size(0, 9).unwrap();
 
-        let mut restored = Vec::new();
-        state
-            .fail_with(|record| {
-                if let UndoRecord::MemorySize { old_pages, .. } = record {
-                    restored.push(*old_pages);
-                }
-                Ok(())
-            })
-            .unwrap();
+        state.fail().unwrap();
 
-        assert_eq!(restored, [9]);
         assert_eq!(state.active_transaction(), None);
     }
 
     #[test]
-    fn duplicate_global_write_records_one_restore_snapshot() {
+    fn duplicate_global_write_updates_latest_staged_value() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
 
-        assert!(
-            state
-                .record_global_restore(3, GlobalSnapshot::I64(11))
-                .unwrap()
-        );
-        assert!(
-            !state
-                .record_global_restore(3, GlobalSnapshot::I64(22))
-                .unwrap()
-        );
+        assert!(state.stage_global(3, GlobalSnapshot::I64(11)).unwrap());
+        assert!(!state.stage_global(3, GlobalSnapshot::I64(22)).unwrap());
 
-        let mut restored = Vec::new();
+        let mut applied = Vec::new();
         state
-            .abort_with(|record| {
-                if let UndoRecord::Global {
-                    global_index,
-                    value,
-                } = record
-                {
-                    restored.push((*global_index, *value));
-                }
+            .commit_with(|record| {
+                applied.push(record.clone());
                 Ok(())
             })
             .unwrap();
 
-        assert_eq!(restored, [(3, GlobalSnapshot::I64(11))]);
+        assert_eq!(
+            applied,
+            [StagedRecord::Global {
+                global_index: 3,
+                value: GlobalSnapshot::I64(22)
+            }]
+        );
     }
 
     #[test]
@@ -615,5 +672,43 @@ mod tests {
         locks.release_transaction(first);
 
         locks.acquire_memory_granule_write(second, 0, 7).unwrap();
+    }
+
+    #[test]
+    fn fixture_executor_begins_and_fails_transaction() {
+        let mut state = TransactionState::default();
+        let operators = [
+            wasmtime_environ::ResearchTransactionModuleOperator {
+                function_index: 0,
+                body_offset: 0,
+                operator: wasmtime_environ::TransactionOperator::TTry,
+                bytes_read: 2,
+            },
+            wasmtime_environ::ResearchTransactionModuleOperator {
+                function_index: 0,
+                body_offset: 2,
+                operator: wasmtime_environ::TransactionOperator::TFail,
+                bytes_read: 2,
+            },
+        ];
+
+        execute_research_transaction_fixture(&mut state, &operators).unwrap();
+
+        assert_eq!(state.active_transaction(), None);
+    }
+
+    #[test]
+    fn fixture_executor_commits_open_transaction_at_end() {
+        let mut state = TransactionState::default();
+        let operators = [wasmtime_environ::ResearchTransactionModuleOperator {
+            function_index: 0,
+            body_offset: 0,
+            operator: wasmtime_environ::TransactionOperator::TTry,
+            bytes_read: 2,
+        }];
+
+        execute_research_transaction_fixture(&mut state, &operators).unwrap();
+
+        assert_eq!(state.active_transaction(), None);
     }
 }

@@ -90,9 +90,10 @@ durable mappings for later.
 ## Wasmtime Architecture Touch Points
 
 Wasmtime's ordinary memory stores are compiled as direct machine stores, so
-rollback cannot be implemented by observing the public `Memory` API. The
-transactional variants must lower to code paths that acquire transactional
-access and record undo data before mutation.
+transactional visibility cannot be implemented by observing the public
+`Memory` API. The transactional variants must lower to code paths that acquire
+transactional access and stage copy-on-write data before any committed
+`tmemory` mutation.
 
 Expected local areas:
 
@@ -182,13 +183,14 @@ Wasmtime should copy this shape before trying a higher-level abstraction:
 - the storage object owns both the byte region and the granule-info region
 - every transaction granule lookup maps `address >> TMEMORY_GRANULE_SHIFT` to
   a metadata slot in the side region
-- `tmemory.grow` makes new data pages accessible and initializes new
-  granule-info records before the operation commits
-- aborting a successful `tmemory.grow` must shrink the visible byte length and
-  hide or invalidate the corresponding granule-info records
+- `tmemory.grow` stages the new visible size in the transaction state
+- committing a staged `tmemory.grow` makes new data pages accessible and
+  initializes new granule-info records
+- aborting a staged `tmemory.grow` leaves the committed visible byte length and
+  granule-info reachability unchanged
 - `tmemory` storage should expose helper methods for transactional lowering,
-  such as `txn_info(granule_index)`, `snapshot_granule(granule_index)`, and
-  `restore_granule(granule_index, bytes)`
+  such as `txn_info(granule_index)`, `copy_granule(granule_index)`, and
+  `write_granule(granule_index, bytes)`
 
 The first implementation implements only `VMemory` and keeps both data and
 metadata volatile. `FileBackedMemory`, `NVMemory`, durable transaction metadata,
@@ -240,9 +242,10 @@ Start with Wizard's single-current-transaction model:
 - A store can have zero or one active transaction for the first slice.
 - `ttry` or a top-level transactional call starts a transaction when no
   transaction is active.
-- Successful completion commits.
-- `tfail`, transactional conflict failure, or a trapping transactional operation
-  aborts and runs undo records in reverse order.
+- Successful completion commits staged transaction state into the concrete
+  runtime objects.
+- `tfail`, transactional conflict failure, or a trapping transactional
+  operation aborts and drops staged values without writing them into `tmemory`.
 - Nested transaction constructs should be treated flatly until a later milestone
   needs stricter nesting behavior.
 
@@ -257,7 +260,7 @@ Initial transaction state should include:
 - transaction table or ownership map
 - read set for validation when optimistic behavior is enabled
 - write set or owned-granule set
-- undo log
+- staged globals, staged memory granules, and staged memory sizes
 
 The default conflict-control strategy should copy Wizard's lock-based behavior
 closely enough to preserve semantics. The implementation should still route
@@ -265,24 +268,35 @@ through a selected concurrency-control component so optimistic validation,
 wait-die, wound-wait, and MVCC-style experiments can be added without changing
 instruction semantics.
 
-## Undo Records
+## Copy-On-Write Staging
 
-The first undo log should support:
+Milestone 1 uses copy-on-write staging for transactional state. The committed
+`tmemory` byte region is not modified by `tstore`; only commit writes staged
+bytes back to the concrete `tmemory` storage.
 
-- transactional global value restore
-- transactional memory granule restore
-- transactional memory size restore
+The first staged record set should support:
+
+- transactional global final values
+- transactional memory granule final bytes
+- transactional memory final size
 
 Milestone 2 adds:
 
-- transactional table granule restore
-- transactional table size restore
+- transactional table granule final values
+- transactional table final size
 - transactional passive data/elem effects if needed by migrated tests
 
-Undo records should capture old state before the first write to a transaction
-granule in a transaction. Multiple writes to the same granule in the same
-transaction should not duplicate full-granule snapshots unless a later
-performance experiment shows a reason to do so.
+The first write to a memory granule copies the committed granule into the
+transaction write set. The `tstore` operation then mutates that staged buffer.
+Later writes to the same granule update the same staged buffer. A `tload`
+checks the staged buffer first and reads committed `tmemory` only when the
+current transaction has not staged the addressed granule.
+
+Commit writes staged globals, memory granules, and memory size changes into the
+concrete runtime objects. Abort/fail drops staged records and releases
+ownership. This keeps rollback-free abort behavior compatible with future
+persistent backends: uncommitted transactional bytes never need to be removed
+from `NVMemory` or a file-backed mmap because they were never written there.
 
 ## Milestone 1: Executable Core
 
@@ -305,16 +319,17 @@ Required behavior:
   the first backend is volatile anonymous mmap
 - non-transactional ops cannot access transactional objects
 - transactional ops cannot access non-transactional objects
-- stores record undo before mutation
-- abort restores all touched globals, memory granules, and memory size
-- commit releases transaction ownership without changing final values
+- stores stage copy-on-write buffers before mutation
+- abort drops all staged globals, memory granules, and memory size changes
+- commit writes staged values into concrete runtime objects and releases
+  transaction ownership
 - ordinary traps inside a transaction abort before control returns to host
 
 Tests to migrate first from the proposal tree:
 
 - `ttry-basic.wast`
 - `ttry-abort-commit.wast`
-- `tglobal.wast`, limited to numeric globals and rollback cases first
+- `tglobal.wast`, limited to numeric globals and abort/commit cases first
 - `tload.wast`
 - `tstore.wast`
 - `tmemory.wast`
@@ -323,12 +338,12 @@ Tests to migrate first from the proposal tree:
 
 Wizard unit semantics to mirror as Rust tests:
 
-- global rollback after `tfail`
-- memory granule rollback after `tfail`
-- memory size rollback after failed `tmemory.grow`
-- multiple writes to one granule create one restore snapshot
-- writes across two 256-byte granules restore both granules
-- commit preserves writes
+- global staging is dropped after `tfail`
+- memory granule staging is dropped after `tfail`
+- memory size staging is dropped after failed `tmemory.grow`
+- multiple writes to one granule update one staged buffer
+- writes across two 256-byte granules stage both granules
+- commit writes staged values
 
 ## Milestone 2: Bulk Memory And Tables
 
@@ -349,13 +364,13 @@ Instruction families:
 
 Required behavior:
 
-- memory bulk operations acquire and snapshot every affected 256-byte memory
-  granule before mutation
-- table operations acquire and snapshot every affected 16-entry table granule
-  before mutation
-- table growth snapshots table size and any initialized granules
-- abort restores table contents and size
-- commit preserves table contents and size
+- memory bulk operations acquire and stage every affected 256-byte memory
+  granule before mutating staged bytes
+- table operations acquire and stage every affected 16-entry table granule
+  before mutating staged entries
+- table growth stages table size and any initialized granules
+- abort drops staged table contents and size
+- commit writes staged table contents and size
 
 Tests to migrate:
 
@@ -372,11 +387,11 @@ Tests to migrate:
 
 Wizard unit semantics to mirror:
 
-- table granule rollback
-- table size rollback
-- table grow/drop rollback
-- bulk memory rollback over one granule
-- bulk memory rollback over multiple granules
+- table granule staging abort
+- table size staging abort
+- table grow/drop staging abort
+- bulk memory staging abort over one granule
+- bulk memory staging abort over multiple granules
 
 ## Milestone 3: Transactional References And GC Objects
 
@@ -401,9 +416,9 @@ Required behavior:
 - transactional references carry Wizard-style permissions
 - read casts acquire read permission
 - write casts acquire write permission
-- transactional structs and arrays snapshot fields before mutation
-- abort restores transactional GC object fields
-- commit preserves object mutations
+- transactional structs and arrays stage fields before mutation
+- abort drops staged transactional GC object fields
+- commit writes staged object mutations
 
 Tests to migrate:
 
@@ -436,7 +451,7 @@ Tests to migrate:
 
 Use three layers of tests:
 
-1. Small Rust tests for runtime transaction state and undo records.
+1. Small Rust tests for runtime transaction state and staged records.
 2. Hand-authored Wasmtime `.wat` or binary tests for the milestone instruction
    subset.
 3. Migrated `.wast` tests from `../wasm-persistence/test/core/simple-transactions`.
@@ -467,11 +482,11 @@ When migrating proposal tests:
 6. Add validation rules that separate transactional and non-transactional object
    spaces.
 7. Add transaction state to the store boundary.
-8. Add undo records for globals, memory granules, and memory size.
+8. Add staged records for globals, memory granules, and memory size.
 9. Lower milestone-1 transactional instructions to runtime helpers or builtins
    that dispatch through the selected storage and concurrency-control
    components.
-10. Add Rust rollback tests.
+10. Add Rust abort/commit staging tests.
 11. Add generated binary or `.wast` milestone-1 tests.
 12. Run targeted tests before expanding to tables.
 
@@ -497,9 +512,9 @@ translation can handle them. A local fork or patch of `wasmparser` may be the
 least surprising path for this research branch.
 
 The second risk is direct memory lowering. Ordinary Wasm stores must remain
-unchanged, while transactional stores must route through snapshotting and access
-control. Accidentally reusing ordinary store lowering for `*.tstore` would make
-rollback impossible.
+unchanged, while transactional stores must route through COW staging and access
+control. Accidentally reusing ordinary store lowering for `*.tstore` would
+write uncommitted data into `tmemory`.
 
 The third risk is scope creep from the proposal tests. The proposal contains
 refs, GC objects, SIMD, tables, bulk operations, and conflict tests. Milestone 1
@@ -512,13 +527,14 @@ Milestone 1 is complete when:
 
 - Wasmtime can compile and run a module containing milestone-1 transactional
   operators.
-- `tfail` aborts and restores transactional globals.
-- `tfail` aborts and restores every touched 256-byte memory granule.
-- failed `tmemory.grow` and aborted successful `tmemory.grow` restore memory
-  size correctly.
+- `tfail` aborts and drops staged transactional globals.
+- `tfail` aborts and drops every staged 256-byte memory granule.
+- failed `tmemory.grow` and aborted successful `tmemory.grow` leave committed
+  memory size unchanged.
 - `tmemory` is allocated through a distinct storage path with side metadata for
   256-byte granules, even if the backend is still volatile.
-- successful transactions commit final global and memory values.
+- successful transactions write staged final global and memory values at
+  commit.
 - transactional and non-transactional object spaces are rejected when mixed.
 - migrated tests for `ttry`, `tglobal`, `tload`, `tstore`, and `tmemory`
   document the Wizard-first behavior.

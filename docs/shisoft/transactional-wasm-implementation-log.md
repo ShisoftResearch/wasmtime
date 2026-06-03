@@ -436,7 +436,7 @@ the storage boundary that later parser/lowering work will call into:
 - Wizard granule size: `TMEMORY_GRANULE_SHIFT = 8`, or 256 bytes
 - one 64 KiB Wasm page maps to 256 transactional memory granules
 - grow and shrink helpers update visible byte length and metadata reachability
-- snapshot and restore helpers operate at one-granule scope
+- copy and writeback helpers operate at one-granule scope
 - shrinking clears truncated byte and metadata ranges before reducing visible
   length, so later growth does not expose stale state
 
@@ -494,12 +494,13 @@ The current state model supports the first Wizard-style runtime slice:
 - `commit`
 - `abort`
 - `fail` as an explicit abort path
-- undo records for memory granule snapshots
-- undo records for memory size restore
-- undo records for numeric global restore
-- reverse-order undo traversal on abort/fail
-- duplicate memory-granule writes record only one snapshot
-- duplicate global writes record only one restore snapshot
+- staged copy-on-write records for memory granules
+- staged memory size changes
+- staged numeric global final values
+- commit-only writeback for staged records
+- abort/fail drops staged records without writing them into `tmemory`
+- duplicate memory-granule writes update one staged buffer
+- duplicate global writes update the latest staged value
 - read/write memory granule acquisition helpers
 - per-transaction memory granule read and write ownership sets
 
@@ -511,7 +512,7 @@ Verification:
 
 ```text
 cargo test -p wasmtime --lib transaction
-test result: ok. 13 passed; 0 failed; 0 ignored
+test result: ok. 16 passed; 0 failed; 0 ignored
 ```
 
 Added the milestone-1 `LockBased` concurrency-control strategy. The strategy
@@ -567,9 +568,17 @@ Added research fixture metadata and validation:
 - rejection of transactional memory operators without `tmemory`
 - rejection of transactional global operators without `tglobal`
 
+Added a runtime fixture executor bridge for milestone-1 control behavior. It
+maps parsed `ttry` fixture operators to `TransactionState::begin`, maps `tfail`
+to abort/fail behavior that drops staged records, and commits an open
+transaction at normal fixture end.
+
 Verification:
 
 ```text
 cargo test -p wasmtime-environ --lib transaction
 test result: ok. 12 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 16 passed; 0 failed; 0 ignored
 ```

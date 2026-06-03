@@ -225,7 +225,7 @@ impl VMemory {
         Ok(read_granule_info(bytes))
     }
 
-    pub(crate) fn snapshot_granule(&self, granule: usize) -> Result<Vec<u8>> {
+    pub(crate) fn copy_granule(&self, granule: usize) -> Result<Vec<u8>> {
         ensure!(
             granule < self.granule_len(),
             "tmemory granule out of bounds"
@@ -235,7 +235,7 @@ impl VMemory {
         Ok(unsafe { self.data.slice(range) }.to_vec())
     }
 
-    pub(crate) fn restore_granule(&mut self, granule: usize, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_granule(&mut self, granule: usize, bytes: &[u8]) -> Result<()> {
         ensure!(
             granule < self.granule_len(),
             "tmemory granule out of bounds"
@@ -243,7 +243,7 @@ impl VMemory {
         let range = self.granule_range(granule)?;
         ensure!(
             bytes.len() == range.end - range.start,
-            "tmemory granule restore length mismatch"
+            "tmemory granule writeback length mismatch"
         );
         // SAFETY: bounds are checked by `granule_range` and we have `&mut self`.
         unsafe {
@@ -345,13 +345,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_restore_one_granule() {
+    fn copy_and_writeback_one_granule() {
         let mut memory = VMemory::new(1, Some(1)).unwrap();
         memory.fill(0..TMEMORY_GRANULE_SIZE, 0x11).unwrap();
-        let snapshot = memory.snapshot_granule(0).unwrap();
+        let staged_copy = memory.copy_granule(0).unwrap();
 
         memory.fill(0..TMEMORY_GRANULE_SIZE, 0x22).unwrap();
-        memory.restore_granule(0, &snapshot).unwrap();
+        memory.write_granule(0, &staged_copy).unwrap();
 
         assert_eq!(
             memory.read(0..TMEMORY_GRANULE_SIZE).unwrap(),
@@ -360,16 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn restoring_one_granule_preserves_neighbors() {
+    fn writing_one_granule_preserves_neighbors() {
         let mut memory = VMemory::new(1, Some(1)).unwrap();
         memory.fill(0..TMEMORY_GRANULE_SIZE, 0x11).unwrap();
         memory
             .fill(TMEMORY_GRANULE_SIZE..TMEMORY_GRANULE_SIZE * 2, 0x33)
             .unwrap();
-        let snapshot = memory.snapshot_granule(0).unwrap();
+        let staged_copy = memory.copy_granule(0).unwrap();
 
         memory.fill(0..TMEMORY_GRANULE_SIZE * 2, 0x22).unwrap();
-        memory.restore_granule(0, &snapshot).unwrap();
+        memory.write_granule(0, &staged_copy).unwrap();
 
         assert_eq!(
             memory.read(0..TMEMORY_GRANULE_SIZE).unwrap(),
