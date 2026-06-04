@@ -458,6 +458,65 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Runtime Core Task 8: Scalar Real-Parser Bridge
+
+Date: 2026-06-04
+
+Expanded the real text-parser path for scalar transactional memory WASTs. These
+files now keep transaction syntax intact and run through the local
+`wasm-tools-transaction` fork plus Wasmtime's real scalar tmemory runtime path:
+
+- `float_tmemory.wast`
+- `taddress.wast`
+- `talign.wast`
+- `tendianness.wast`
+- `tmemory.wast`
+- `tmemory_redundancy.wast`
+- `tmemory_size.wast`
+- `tmemory_grow.wast`
+- `tload.wast`
+- `tstore.wast`
+- `tmemory_trap.wast`
+- `tskip-stack-guard-page.wast`
+
+Parser-fork additions:
+
+- `(tmemory (tdata ...))` inline data is accepted and encoded as active data.
+- `(export "name" (tfunc ...))`, `(export "name" (tmemory ...))`, and
+  `(export "name" (tglobal ...))` parse as aliases for core export kinds while
+  transaction object metadata remains attached to the declarations.
+
+Wasmtime harness changes:
+
+- The real-parser allowlist now includes the scalar tmemory tranche above.
+- Diagnostics-only normalization accepts Wasmtime-style validation wording for
+  `multiple tmemories`, `unknown tmemory`, transactional memory limit errors,
+  and `unknown tglobal` without replacing transaction syntax.
+- Real-parser trap diagnostics keep `out of bounds tmemory access`, matching the
+  current tmemory runtime path.
+
+Still deferred:
+
+- `tglobal.wast` remains outside the real-parser tranche because it mixes
+  scalar globals with transactional references, `tfuncref`, and table/call-ref
+  object-table behavior.
+- Bulk-memory, SIMD memory, transactional refs, tables, GC objects, and
+  `ttry`/`tfail` fixtures still use the existing normalization or path-scoped
+  mocks until their runtime workstreams land.
+
+Verification:
+
+```text
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wast transaction_text_
+test result: ok. 12 passed; 0 failed
+
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wasmparser transaction
+test result: ok. 2 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 69 passed; 0 failed; 47 ignored; 0 measured; 3495 filtered out
+```
+
 ## Runtime Core: tfunc Boundary And VMemory/tdata Fixes
 
 Date: 2026-06-04

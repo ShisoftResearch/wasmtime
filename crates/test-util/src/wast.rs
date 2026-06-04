@@ -1222,8 +1222,15 @@ fn normalize_transaction_real_parser_diagnostic(text: &str) -> String {
             "indirect tcall type mismatch",
             "indirect call type mismatch",
         ),
+        (
+            "memory size must be at most 65536 pages (4GiB)",
+            "memory size must be at most 0x10000 65536-byte pages",
+        ),
+        ("multiple tmemories", "multiple memories"),
+        ("unknown tmemory", "unknown memory"),
         ("inline tfunction type", "inline function type"),
         ("null tfunction", "null function"),
+        ("unknown tglobal", "unknown global"),
     ];
 
     replacements
@@ -1928,11 +1935,18 @@ fn transaction_proposal_uses_real_text_parser(
         TransactionProposalSuite::SimpleTransactions => {
             matches!(
                 name,
-                "tmemory_size.wast"
+                "float_tmemory.wast"
+                    | "taddress.wast"
+                    | "talign.wast"
+                    | "tendianness.wast"
+                    | "tmemory.wast"
+                    | "tmemory_redundancy.wast"
+                    | "tmemory_size.wast"
                     | "tmemory_grow.wast"
                     | "tload.wast"
                     | "tstore.wast"
                     | "tmemory_trap.wast"
+                    | "tskip-stack-guard-page.wast"
             )
         }
         TransactionProposalSuite::Tsimd => false,
@@ -2180,6 +2194,21 @@ mod tests {
 
         assert!(normalized.contains("\"multiple memories\""));
         assert!(normalized.contains("\"memory size must be at most 0x10000 65536-byte pages\""));
+        assert!(normalized.contains("\"multiple tmemories\""));
+    }
+
+    #[test]
+    fn normalizes_real_parser_transaction_memory_diagnostics() {
+        let wast = r#"
+            (assert_invalid (module (tmemory 0) (tmemory 0)) "multiple tmemories")
+            (assert_invalid (module (tfunc (drop (tmemory.size)))) "unknown tmemory")
+            (assert_return (invoke "multiple tmemories"))
+        "#;
+
+        let normalized = super::normalize_transaction_proposal_wast_diagnostics(wast);
+
+        assert!(normalized.contains("\"multiple memories\""));
+        assert!(normalized.contains("\"unknown memory\""));
         assert!(normalized.contains("\"multiple tmemories\""));
     }
 
@@ -2564,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn enables_normalized_memory_transaction_proposal_tranche() {
+    fn enables_real_text_parser_transaction_proposal_tranche() {
         for name in [
             "float_tmemory.wast",
             "taddress.wast",
@@ -2572,28 +2601,12 @@ mod tests {
             "tendianness.wast",
             "tmemory.wast",
             "tmemory_redundancy.wast",
-            "tskip-stack-guard-page.wast",
-        ] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: false,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_transaction_proposal_tranche() {
-        for name in [
             "tmemory_size.wast",
             "tmemory_grow.wast",
             "tload.wast",
             "tstore.wast",
             "tmemory_trap.wast",
+            "tskip-stack-guard-page.wast",
         ] {
             let test = WastTest {
                 path: PathBuf::from(name),
