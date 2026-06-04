@@ -26,15 +26,22 @@ pub(crate) struct TMemoryGranuleInfo {
     hash: u64,
 }
 
+pub(crate) trait TMemoryBackendStorage: core::fmt::Debug + Send + Sync {
+    fn backend_kind(&self) -> TMemoryBackend;
+    fn byte_len(&self) -> usize;
+    fn byte_capacity(&self) -> usize;
+    fn granule_count(&self) -> usize;
+    fn read_committed(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>>;
+    fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()>;
+    fn grow_to_pages(&mut self, new_pages: u64) -> Result<()>;
+    fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo>;
+    fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()>;
+}
+
 /// Transactional memory storage selected by transaction configuration.
 #[derive(Debug)]
 pub(crate) struct TMemory {
-    storage: TMemoryStorage,
-}
-
-#[derive(Debug)]
-enum TMemoryStorage {
-    VMemory(VMemory),
+    storage: Box<dyn TMemoryBackendStorage>,
 }
 
 impl TMemory {
@@ -43,36 +50,77 @@ impl TMemory {
         min_pages: u64,
         max_pages: Option<u64>,
     ) -> Result<Self> {
-        let storage = match config.tmemory_backend() {
-            TMemoryBackend::VMemory => TMemoryStorage::VMemory(VMemory::new(min_pages, max_pages)?),
-            TMemoryBackend::FileBackedMemory | TMemoryBackend::NVMemory => {
-                // SHISOFT-TWASM-MOCK: persistent tmemory backends are named in
-                // the config but not allocated by the runtime yet.
-                bail!(
-                    "tmemory backend is not implemented: {:?}",
-                    config.tmemory_backend()
-                )
-            }
-        };
-        Ok(Self { storage })
+        Self::new_for_backend(config.tmemory_backend(), min_pages, max_pages)
+    }
+
+    pub(crate) fn new_with_backend(backend: TMemoryBackend, min_pages: u64) -> Result<Self> {
+        Self::new_for_backend(backend, min_pages, None)
+    }
+
+    pub(crate) fn new_vmemory(min_pages: u64) -> Result<Self> {
+        Self::new_with_backend(TMemoryBackend::VMemory, min_pages)
     }
 
     pub(crate) fn backend(&self) -> TMemoryBackend {
-        match self.storage {
-            TMemoryStorage::VMemory(_) => TMemoryBackend::VMemory,
-        }
+        self.backend_kind()
+    }
+
+    pub(crate) fn backend_kind(&self) -> TMemoryBackend {
+        self.storage.backend_kind()
     }
 
     pub(crate) fn byte_len(&self) -> usize {
-        match &self.storage {
-            TMemoryStorage::VMemory(memory) => memory.byte_len(),
-        }
+        self.storage.byte_len()
+    }
+
+    pub(crate) fn byte_capacity(&self) -> usize {
+        self.storage.byte_capacity()
     }
 
     pub(crate) fn granule_len(&self) -> usize {
-        match &self.storage {
-            TMemoryStorage::VMemory(memory) => memory.granule_len(),
-        }
+        self.granule_count()
+    }
+
+    pub(crate) fn granule_count(&self) -> usize {
+        self.storage.granule_count()
+    }
+
+    pub(crate) fn read_committed(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        self.storage.read_committed(range)
+    }
+
+    pub(crate) fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
+        self.storage.commit_range(addr, bytes)
+    }
+
+    pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        self.storage.grow_to_pages(new_pages)
+    }
+
+    pub(crate) fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        self.storage.granule_info(granule)
+    }
+
+    pub(crate) fn set_granule_info(
+        &mut self,
+        granule: usize,
+        info: TMemoryGranuleInfo,
+    ) -> Result<()> {
+        self.storage.set_granule_info(granule, info)
+    }
+
+    fn new_for_backend(
+        backend: TMemoryBackend,
+        min_pages: u64,
+        max_pages: Option<u64>,
+    ) -> Result<Self> {
+        let storage: Box<dyn TMemoryBackendStorage> = match backend {
+            TMemoryBackend::VMemory => Box::new(VMemory::new(min_pages, max_pages)?),
+            TMemoryBackend::FileBackedMemory | TMemoryBackend::NVMemory => {
+                return Err(unsupported_backend_error(backend));
+            }
+        };
+        Ok(Self { storage })
     }
 }
 
@@ -255,6 +303,22 @@ impl VMemory {
         Ok(())
     }
 
+    pub(crate) fn set_txn_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        let start = granule
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata offset overflow")?;
+        let end = start + size_of::<TMemoryGranuleInfo>();
+        // SAFETY: bounds are checked above and the metadata range is live.
+        unsafe {
+            write_granule_info(self.granules.slice_mut(start..end), info);
+        }
+        Ok(())
+    }
+
     pub(crate) fn fill(&mut self, range: core::ops::Range<usize>, byte: u8) -> Result<()> {
         ensure!(range.start <= range.end, "tmemory write invalid range");
         ensure!(range.end <= self.byte_len, "tmemory write out of bounds");
@@ -284,6 +348,52 @@ impl VMemory {
     }
 }
 
+impl TMemoryBackendStorage for VMemory {
+    fn backend_kind(&self) -> TMemoryBackend {
+        TMemoryBackend::VMemory
+    }
+
+    fn byte_len(&self) -> usize {
+        self.byte_len()
+    }
+
+    fn byte_capacity(&self) -> usize {
+        self.byte_capacity
+    }
+
+    fn granule_count(&self) -> usize {
+        self.granule_len()
+    }
+
+    fn read_committed(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        self.read(range)
+    }
+
+    fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
+        let end = addr
+            .checked_add(bytes.len())
+            .context("tmemory write address overflow")?;
+        ensure!(end <= self.byte_len, "tmemory write out of bounds");
+        // SAFETY: bounds are checked above and we have `&mut self`.
+        unsafe {
+            self.data.slice_mut(addr..end).copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        VMemory::grow_to_pages(self, new_pages)
+    }
+
+    fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        self.txn_info(granule)
+    }
+
+    fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
+        self.set_txn_info(granule, info)
+    }
+}
+
 fn pages_to_bytes(pages: u64) -> Result<usize> {
     let pages = usize::try_from(pages).context("tmemory page count does not fit host usize")?;
     pages
@@ -307,6 +417,17 @@ fn read_granule_info(bytes: &[u8]) -> TMemoryGranuleInfo {
     }
 }
 
+fn write_granule_info(bytes: &mut [u8], info: TMemoryGranuleInfo) {
+    debug_assert_eq!(bytes.len(), size_of::<TMemoryGranuleInfo>());
+    bytes[0..8].copy_from_slice(&info.owner.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&info.version.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&info.hash.to_ne_bytes());
+}
+
+fn unsupported_backend_error(backend: TMemoryBackend) -> Error {
+    Error::msg(format!("tmemory backend is not implemented: {backend:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +439,54 @@ mod tests {
         assert_eq!(memory.backend(), TMemoryBackend::VMemory);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
         assert_eq!(memory.granule_len(), 256);
+    }
+
+    #[test]
+    fn vmemory_commit_and_read_committed_bytes() {
+        let mut memory = TMemory::new_vmemory(2).unwrap();
+
+        assert_eq!(memory.backend_kind(), TMemoryBackend::VMemory);
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+        assert_eq!(memory.granule_count(), 512);
+
+        memory.commit_range(8, &[0xaa, 0xbb, 0xcc, 0xdd]).unwrap();
+
+        assert_eq!(
+            memory.read_committed(6..14).unwrap(),
+            vec![0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn vmemory_grow_initializes_new_granule_metadata() {
+        let mut memory = TMemory::new(TransactionConfig::default(), 1, Some(2)).unwrap();
+
+        assert_eq!(memory.granule_count(), 256);
+
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+        assert_eq!(memory.granule_count(), 512);
+        assert_eq!(
+            memory.granule_info(256).unwrap(),
+            TMemoryGranuleInfo::default()
+        );
+        assert_eq!(
+            memory.granule_info(511).unwrap(),
+            TMemoryGranuleInfo::default()
+        );
+    }
+
+    #[test]
+    fn file_backed_and_nv_backends_are_explicitly_unsupported() {
+        for backend in [TMemoryBackend::FileBackedMemory, TMemoryBackend::NVMemory] {
+            let error = TMemory::new_with_backend(backend, 1).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("tmemory backend is not implemented")
+            );
+        }
     }
 
     #[test]
