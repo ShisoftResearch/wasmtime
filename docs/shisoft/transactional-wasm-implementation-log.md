@@ -419,6 +419,18 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Mock Runtime: Deterministic Conflict Checks
+
+Date: 2026-06-04
+
+- 2026-06-04: Mock runtime conflict checks are deterministic and unit-tested
+  through `LockBased`. `TransactionState` now acquires `tmemory` granule reads
+  for overlay loads and write ownership when the mock `tmemory.store` scratch
+  buffer is reserved, then releases those locks on commit/abort/fail. Real
+  `tconflict-tmemory.wast` remains deferred until the runtime has an
+  instance-level transaction object table or another way to model conflicts
+  across transaction participants or stores.
+
 ## Mock Runtime: Scalar Real WAST Coverage Follow-Up
 
 Date: 2026-06-04

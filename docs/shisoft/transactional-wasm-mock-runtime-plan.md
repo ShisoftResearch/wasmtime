@@ -541,7 +541,7 @@ git commit -m "Run first transaction WAST files on mock runtime"
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
 - Modify: `crates/wasmtime/src/runtime/vm/libcalls.rs`
 
-- [ ] **Step 1: Add conflict unit tests**
+- [x] **Step 1: Add conflict unit tests**
 
 Add tests that a read lock blocks another transaction's write and a write lock
 blocks another transaction's read using existing `LockBased` directly:
@@ -562,7 +562,7 @@ fn lock_based_conflicts_are_released_on_abort() {
 }
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 ```bash
 cargo test -p wasmtime --lib lock_based_conflicts
@@ -570,7 +570,7 @@ cargo test -p wasmtime --lib lock_based_conflicts
 
 Expected: the new conflict release test passes.
 
-- [ ] **Step 3: Wire conflict checks into memory libcalls**
+- [x] **Step 3: Wire conflict checks into memory libcalls**
 
 For every granule touched by `transaction_tmemory_load`, call
 `LockBased::acquire_memory_granule_read`. For every granule touched by
@@ -579,7 +579,7 @@ If the current store only supports one active transaction at a time, keep the
 checks in `TransactionState` and document that inter-store conflicts are
 outside the mock runtime scope in `docs/shisoft/transactional-wasm-implementation-log.md`.
 
-- [ ] **Step 4: Record conflict WAST scope**
+- [x] **Step 4: Record conflict WAST scope**
 
 Append to `docs/shisoft/transactional-wasm-implementation-log.md`:
 
@@ -590,7 +590,7 @@ Append to `docs/shisoft/transactional-wasm-implementation-log.md`:
   conflicts across transaction participants.
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/vm/libcalls.rs docs/shisoft/transactional-wasm-implementation-log.md

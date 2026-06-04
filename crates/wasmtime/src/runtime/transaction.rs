@@ -97,6 +97,7 @@ pub(crate) struct TransactionId(u64);
 pub(crate) struct TransactionState {
     active: Option<TransactionId>,
     next_id: u64,
+    locks: LockBased,
     staged_globals: BTreeMap<GlobalObjectKey, GlobalSnapshot>,
     staged_memory_granules: BTreeMap<MemoryGranuleKey, Vec<u8>>,
     staged_memory_sizes: BTreeMap<MemoryObjectKey, u64>,
@@ -111,6 +112,7 @@ impl Default for TransactionState {
         Self {
             active: None,
             next_id: 1,
+            locks: LockBased::default(),
             staged_globals: BTreeMap::new(),
             staged_memory_granules: BTreeMap::new(),
             staged_memory_sizes: BTreeMap::new(),
@@ -392,6 +394,7 @@ impl TransactionState {
         bytes: Vec<u8>,
     ) -> Result<bool> {
         self.ensure_active()?;
+        self.lock_memory_granule_write(memory_index, granule_index)?;
         let key = MemoryGranuleKey {
             object: memory_object_key(None, memory_index),
             granule_index,
@@ -469,6 +472,7 @@ impl TransactionState {
                 .checked_add(chunk_len)
                 .context("tmemory write offset overflow")?;
 
+            self.lock_memory_granule_write(memory_index, key.granule_index)?;
             {
                 let staged = self
                     .staged_memory_granules
@@ -554,6 +558,7 @@ impl TransactionState {
                 .checked_add(chunk_len)
                 .context("tmemory granule read offset overflow")?;
 
+            self.lock_memory_granule_read(memory_index, key.granule_index)?;
             if let Some(staged) = self.staged_memory_granules.get(&key) {
                 ensure!(
                     granule_chunk_end <= staged.len(),
@@ -589,6 +594,7 @@ impl TransactionState {
     ) -> Result<*mut u8> {
         self.ensure_active()?;
         let len = bytes.len();
+        self.acquire_memory_write_ownership_range_owned(Some(instance), memory_index, addr, len)?;
         self.scratch = bytes;
         self.pending_memory_store = Some(PendingMemoryStore {
             instance,
@@ -672,9 +678,19 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> Result<bool> {
+        self.acquire_memory_granule_read_owned(None, memory_index, granule_index)
+    }
+
+    pub(crate) fn acquire_memory_granule_read_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> Result<bool> {
         self.ensure_active()?;
+        self.lock_memory_granule_read(memory_index, granule_index)?;
         Ok(self.memory_read_granules.insert(MemoryGranuleKey {
-            object: memory_object_key(None, memory_index),
+            object: memory_object_key(owner_instance, memory_index),
             granule_index,
         }))
     }
@@ -685,19 +701,104 @@ impl TransactionState {
         granule_index: u64,
         bytes: Vec<u8>,
     ) -> Result<bool> {
-        self.stage_memory_granule(memory_index, granule_index, bytes)
+        self.acquire_memory_granule_write_owned(None, memory_index, granule_index, bytes)
+    }
+
+    pub(crate) fn acquire_memory_granule_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        granule_index: u64,
+        bytes: Vec<u8>,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        self.lock_memory_granule_write(memory_index, granule_index)?;
+        let key = MemoryGranuleKey {
+            object: memory_object_key(owner_instance, memory_index),
+            granule_index,
+        };
+        self.memory_read_granules.insert(key);
+        self.memory_write_granules.insert(key);
+        Ok(self.staged_memory_granules.insert(key, bytes).is_none())
+    }
+
+    fn acquire_memory_write_ownership_range_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+    ) -> Result<()> {
+        let start = usize::try_from(addr).context("tmemory address does not fit host usize")?;
+        let end = start
+            .checked_add(len)
+            .context("tmemory pending store range overflow")?;
+        let mut current = start;
+
+        while current < end {
+            let granule_index = current / TMEMORY_GRANULE_SIZE;
+            let granule_end = granule_index
+                .checked_add(1)
+                .and_then(|index| index.checked_mul(TMEMORY_GRANULE_SIZE))
+                .context("tmemory pending store granule overflow")?;
+            let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
+            self.lock_memory_granule_write(memory_index, key.granule_index)?;
+            self.memory_read_granules.insert(key);
+            self.memory_write_granules.insert(key);
+            current = end.min(granule_end);
+        }
+
+        Ok(())
+    }
+
+    fn lock_memory_granule_read(&mut self, memory_index: u32, granule_index: u64) -> Result<()> {
+        let transaction = self
+            .active_transaction()
+            .context("no active transaction in this store")?;
+        self.locks
+            .acquire_memory_granule_read(transaction, memory_index, granule_index)
+    }
+
+    fn lock_memory_granule_write(
+        &mut self,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> Result<()> {
+        let transaction = self
+            .active_transaction()
+            .context("no active transaction in this store")?;
+        self.locks
+            .acquire_memory_granule_write(transaction, memory_index, granule_index)
     }
 
     pub(crate) fn owns_memory_granule_read(&self, memory_index: u32, granule_index: u64) -> bool {
+        self.owns_memory_granule_read_owned(None, memory_index, granule_index)
+    }
+
+    pub(crate) fn owns_memory_granule_read_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> bool {
         self.memory_read_granules.contains(&MemoryGranuleKey {
-            object: memory_object_key(None, memory_index),
+            object: memory_object_key(owner_instance, memory_index),
             granule_index,
         })
     }
 
     pub(crate) fn owns_memory_granule_write(&self, memory_index: u32, granule_index: u64) -> bool {
+        self.owns_memory_granule_write_owned(None, memory_index, granule_index)
+    }
+
+    pub(crate) fn owns_memory_granule_write_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> bool {
         self.memory_write_granules.contains(&MemoryGranuleKey {
-            object: memory_object_key(None, memory_index),
+            object: memory_object_key(owner_instance, memory_index),
             granule_index,
         })
     }
@@ -708,7 +809,9 @@ impl TransactionState {
     }
 
     fn clear_active(&mut self) {
-        self.active = None;
+        if let Some(transaction) = self.active.take() {
+            self.locks.release_transaction(transaction);
+        }
         self.staged_globals.clear();
         self.staged_memory_granules.clear();
         self.staged_memory_sizes.clear();
@@ -1629,6 +1732,34 @@ mod tests {
     }
 
     #[test]
+    fn pending_memory_store_scratch_acquires_write_ownership_for_touched_granules() {
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+        let owner = InstanceId::from_u32(1);
+
+        let addr = u64::try_from(TMEMORY_GRANULE_SIZE - 1).unwrap();
+        state
+            .set_memory_store_scratch(owner, 0, addr, vec![0xaa, 0xbb])
+            .unwrap();
+
+        assert!(state.owns_memory_granule_write_owned(Some(owner), 0, 0));
+        assert!(state.owns_memory_granule_write_owned(Some(owner), 0, 1));
+    }
+
+    #[test]
+    fn commit_releases_lock_based_ownership_for_next_transaction() {
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+        state.acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
+            .unwrap();
+
+        state.commit().unwrap();
+
+        state.begin().unwrap();
+        state.acquire_memory_granule_read(0, 0).unwrap();
+    }
+
+    #[test]
     fn fail_drops_staged_records() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
@@ -1695,6 +1826,20 @@ mod tests {
             .acquire_memory_granule_write(second, 0, 7)
             .unwrap_err();
         assert!(write_error.to_string().contains("tmemory granule conflict"));
+    }
+
+    #[test]
+    fn lock_based_conflicts_are_released_on_abort() {
+        let mut locks = LockBased::default();
+        let first = TransactionId(1);
+        let second = TransactionId(2);
+
+        locks.acquire_memory_granule_write(first, 0, 0).unwrap();
+        assert!(locks.acquire_memory_granule_read(second, 0, 0).is_err());
+
+        locks.release_transaction(first);
+
+        locks.acquire_memory_granule_read(second, 0, 0).unwrap();
     }
 
     #[test]
