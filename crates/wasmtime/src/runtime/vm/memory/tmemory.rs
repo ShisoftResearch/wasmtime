@@ -50,15 +50,27 @@ impl TMemory {
         min_pages: u64,
         max_pages: Option<u64>,
     ) -> Result<Self> {
-        Self::new_for_backend(config.tmemory_backend(), min_pages, max_pages)
+        Self::new_with_backend_limits(config.tmemory_backend(), min_pages, max_pages)
     }
 
     pub(crate) fn new_with_backend(backend: TMemoryBackend, min_pages: u64) -> Result<Self> {
-        Self::new_for_backend(backend, min_pages, None)
+        Self::new_with_backend_limits(backend, min_pages, Some(min_pages))
+    }
+
+    pub(crate) fn new_with_backend_limits(
+        backend: TMemoryBackend,
+        min_pages: u64,
+        max_pages: Option<u64>,
+    ) -> Result<Self> {
+        Self::new_for_backend(backend, min_pages, max_pages)
     }
 
     pub(crate) fn new_vmemory(min_pages: u64) -> Result<Self> {
         Self::new_with_backend(TMemoryBackend::VMemory, min_pages)
+    }
+
+    pub(crate) fn new_vmemory_with_limits(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
+        Self::new_with_backend_limits(TMemoryBackend::VMemory, min_pages, max_pages)
     }
 
     pub(crate) fn backend(&self) -> TMemoryBackend {
@@ -458,6 +470,19 @@ mod tests {
     }
 
     #[test]
+    fn vmemory_direct_constructor_with_limits_reserves_capacity_and_grows() {
+        let mut memory = TMemory::new_vmemory_with_limits(1, Some(2)).unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
+
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
+    }
+
+    #[test]
     fn vmemory_grow_initializes_new_granule_metadata() {
         let mut memory = TMemory::new(TransactionConfig::default(), 1, Some(2)).unwrap();
 
@@ -487,6 +512,56 @@ mod tests {
                     .contains("tmemory backend is not implemented")
             );
         }
+    }
+
+    #[test]
+    fn granule_info_round_trips_through_tmemory_api() {
+        let mut memory = TMemory::new_vmemory(1).unwrap();
+        let info = TMemoryGranuleInfo {
+            owner: 11,
+            version: 22,
+            hash: 33,
+        };
+
+        memory.set_granule_info(0, info).unwrap();
+
+        assert_eq!(memory.granule_info(0).unwrap(), info);
+    }
+
+    #[test]
+    fn read_committed_rejects_out_of_bounds_ranges() {
+        let memory = TMemory::new_vmemory(1).unwrap();
+
+        assert!(
+            memory
+                .read_committed(WASM_PAGE_SIZE - 1..WASM_PAGE_SIZE + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn commit_range_rejects_out_of_bounds_ranges() {
+        let mut memory = TMemory::new_vmemory(1).unwrap();
+
+        assert!(memory.commit_range(WASM_PAGE_SIZE - 1, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn granule_info_rejects_out_of_bounds_granules() {
+        let memory = TMemory::new_vmemory(1).unwrap();
+
+        assert!(memory.granule_info(memory.granule_count()).is_err());
+    }
+
+    #[test]
+    fn set_granule_info_rejects_out_of_bounds_granules() {
+        let mut memory = TMemory::new_vmemory(1).unwrap();
+
+        assert!(
+            memory
+                .set_granule_info(memory.granule_count(), TMemoryGranuleInfo::default())
+                .is_err()
+        );
     }
 
     #[test]
