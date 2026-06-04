@@ -1679,13 +1679,27 @@ mod tests {
 
     #[test]
     fn enables_transaction_proposal_ttry_basic_with_a_path_scoped_adapter_mock() {
+        struct TempDir {
+            path: PathBuf,
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("wasmtime-ttry-basic-{unique}-{}", std::process::id()));
-        let dir = root.join("simple-transactions");
+        let root = TempDir {
+            path: std::env::temp_dir().join(format!(
+                "wasmtime-ttry-basic-{unique}-{}",
+                std::process::id()
+            )),
+        };
+        let dir = root.path.join("simple-transactions");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ttry-basic.wast");
         fs::write(
@@ -1718,16 +1732,28 @@ mod tests {
         let mut tests = Vec::new();
         super::add_tests(
             &mut tests,
-            &root,
+            &root.path,
             &super::FindConfig::TransactionProposal(TransactionProposalSuite::SimpleTransactions),
         )
         .unwrap();
-        let _ = fs::remove_dir_all(&root);
 
         let test = tests.into_iter().next().unwrap();
         assert!(test.transaction_proposal_enabled());
+        assert!(super::transaction_proposal_adapter_mock(&path).is_some());
+        assert!(
+            super::transaction_proposal_adapter_mock(&root.path.join("other/ttry-basic.wast"))
+                .is_none()
+        );
         assert!(test.contents.contains(r#"(func (export "try2")"#));
-        assert!(test.contents.contains(r#"(assert_return (invoke "try2""#));
+        assert!(test.contents.contains(
+            r#"(assert_return (invoke "try2" (i32.const 0) (i32.const 10) (i32.const 0) (i32.const 20)) (i32.const 2))"#
+        ));
+        assert!(test.contents.contains(
+            r#"(assert_return (invoke "try2" (i32.const 1) (i32.const 10) (i32.const 0) (i32.const 20)) (i32.const 10))"#
+        ));
+        assert!(test.contents.contains(
+            r#"(assert_return (invoke "try2" (i32.const 0) (i32.const 10) (i32.const 1) (i32.const 20)) (i32.const 21))"#
+        ));
         assert!(!test.contents.contains("(ttry"));
         assert!(!test.contents.contains("(tfail"));
     }

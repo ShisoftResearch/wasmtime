@@ -449,7 +449,7 @@ Verification:
 
 ```text
 cargo test -p wasmtime-test-util --features wast transaction_proposal
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ttry-basic.wast -- --format terse
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
