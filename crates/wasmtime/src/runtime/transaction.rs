@@ -146,6 +146,9 @@ struct MemoryGranuleKey {
     granule_index: u64,
 }
 
+const TMEMORY_GRANULE_SHIFT: usize = 8;
+const TMEMORY_GRANULE_SIZE: usize = 1 << TMEMORY_GRANULE_SHIFT;
+
 pub(crate) trait TransactionConcurrencyControl {
     fn acquire_memory_granule_read(
         &mut self,
@@ -325,6 +328,95 @@ impl TransactionState {
         Ok(self.staged_memory_granules.insert(key, bytes).is_none())
     }
 
+    pub(crate) fn stage_memory_write(
+        &mut self,
+        memory_index: u32,
+        addr: u64,
+        bytes: &[u8],
+        backing: &[u8],
+    ) -> Result<()> {
+        self.ensure_active()?;
+        let range = checked_tmemory_range(addr, bytes.len(), backing.len())?;
+        let mut offset: usize = 0;
+        let mut current = range.start;
+
+        while current < range.end {
+            let granule_index = current / TMEMORY_GRANULE_SIZE;
+            let granule_range = tmemory_granule_backing_range(granule_index, backing.len())?;
+            let key = memory_granule_key(memory_index, granule_index)?;
+            let granule_offset = current - granule_range.start;
+            let chunk_len = (range.end - current).min(granule_range.end - current);
+            let granule_chunk_end = granule_offset
+                .checked_add(chunk_len)
+                .context("tmemory granule write offset overflow")?;
+            let write_chunk_end = offset
+                .checked_add(chunk_len)
+                .context("tmemory write offset overflow")?;
+
+            {
+                let staged = self
+                    .staged_memory_granules
+                    .entry(key)
+                    .or_insert_with(|| backing[granule_range.clone()].to_vec());
+                ensure!(
+                    granule_chunk_end <= staged.len(),
+                    "staged tmemory granule length mismatch"
+                );
+                staged[granule_offset..granule_chunk_end]
+                    .copy_from_slice(&bytes[offset..write_chunk_end]);
+            }
+
+            self.memory_read_granules.insert(key);
+            self.memory_write_granules.insert(key);
+            current += chunk_len;
+            offset = write_chunk_end;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn read_memory_overlay(
+        &mut self,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+        backing: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.ensure_active()?;
+        let range = checked_tmemory_range(addr, len, backing.len())?;
+        let mut bytes = backing[range.clone()].to_vec();
+        let mut current = range.start;
+
+        while current < range.end {
+            let granule_index = current / TMEMORY_GRANULE_SIZE;
+            let granule_range = tmemory_granule_backing_range(granule_index, backing.len())?;
+            let key = memory_granule_key(memory_index, granule_index)?;
+            let granule_offset = current - granule_range.start;
+            let chunk_len = (range.end - current).min(granule_range.end - current);
+            let granule_chunk_end = granule_offset
+                .checked_add(chunk_len)
+                .context("tmemory granule read offset overflow")?;
+
+            if let Some(staged) = self.staged_memory_granules.get(&key) {
+                ensure!(
+                    granule_chunk_end <= staged.len(),
+                    "staged tmemory granule length mismatch"
+                );
+                let read_offset = current - range.start;
+                let read_chunk_end = read_offset
+                    .checked_add(chunk_len)
+                    .context("tmemory read offset overflow")?;
+                bytes[read_offset..read_chunk_end]
+                    .copy_from_slice(&staged[granule_offset..granule_chunk_end]);
+            }
+
+            self.memory_read_granules.insert(key);
+            current += chunk_len;
+        }
+
+        Ok(bytes)
+    }
+
     pub(crate) fn staged_memory_granule(
         &self,
         memory_index: u32,
@@ -399,6 +491,39 @@ impl TransactionState {
         self.memory_read_granules.clear();
         self.memory_write_granules.clear();
     }
+}
+
+fn checked_tmemory_range(
+    addr: u64,
+    len: usize,
+    backing_len: usize,
+) -> Result<core::ops::Range<usize>> {
+    let start = usize::try_from(addr).context("tmemory address does not fit host usize")?;
+    let end = start.checked_add(len).context("tmemory address overflow")?;
+    ensure!(
+        end <= backing_len,
+        "out of bounds tmemory access: range {start}..{end} exceeds backing length {backing_len}"
+    );
+    Ok(start..end)
+}
+
+fn memory_granule_key(memory_index: u32, granule_index: usize) -> Result<MemoryGranuleKey> {
+    Ok(MemoryGranuleKey {
+        memory_index,
+        granule_index: u64::try_from(granule_index)
+            .context("tmemory granule index does not fit u64")?,
+    })
+}
+
+fn tmemory_granule_backing_range(
+    granule_index: usize,
+    backing_len: usize,
+) -> Result<core::ops::Range<usize>> {
+    let start = granule_index
+        .checked_mul(TMEMORY_GRANULE_SIZE)
+        .context("tmemory granule byte offset overflow")?;
+    let end = start.saturating_add(TMEMORY_GRANULE_SIZE).min(backing_len);
+    Ok(start..end)
 }
 
 pub(crate) fn execute_research_transaction_fixture(
