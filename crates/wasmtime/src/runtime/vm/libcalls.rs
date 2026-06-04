@@ -273,16 +273,16 @@ fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<(
 fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let records = {
+    let (records, memory_owners) = {
         let state = store.store_opaque_mut().transaction_state_mut();
         if state.active_transaction().is_none() {
             return Ok(());
         }
-        state.staged_records()?
+        (state.staged_records()?, state.staged_memory_owners()?)
     };
 
     for record in &records {
-        apply_staged_transaction_record(store, instance, record)?;
+        apply_staged_transaction_record(store, instance, &memory_owners, record)?;
     }
 
     store.store_opaque_mut().transaction_state_mut().commit()
@@ -349,7 +349,7 @@ fn transaction_tmemory_store(
 
     let state = store.store_opaque_mut().transaction_state_mut();
     let bytes = state.read_memory_overlay(memory, effective, len, &backing)?;
-    state.set_memory_store_scratch(memory, effective, bytes)
+    state.set_memory_store_scratch(instance, memory, effective, bytes)
 }
 
 fn transaction_tmemory_size(
@@ -362,11 +362,11 @@ fn transaction_tmemory_size(
     let memory_index = DefinedMemoryIndex::from_u32(memory);
     let pages = {
         let instance_ref = store.instance_mut(instance);
-        let module = instance_ref.env_module();
-        let page_size_log2 = module.memories[module.memory_index(memory_index)].page_size_log2;
         let instance_ref = instance_ref.as_ref();
         let memory = instance_ref.get_defined_memory(memory_index);
-        memory.byte_size() >> page_size_log2
+        let page_size =
+            usize::try_from(memory.page_size()).context("tmemory page size overflow")?;
+        memory.byte_size() / page_size
     };
     Ok(pages as *mut u8)
 }
@@ -445,8 +445,8 @@ fn write_memory_bytes(memory: &mut vm::Memory, addr: u64, bytes: &[u8]) -> Resul
     Ok(())
 }
 
-fn flush_pending_tmemory_store(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
-    let Some((memory, _, _)) = store
+fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+    let Some((owner, memory, _, _)) = store
         .store_opaque_mut()
         .transaction_state_mut()
         .pending_memory_store()
@@ -455,7 +455,7 @@ fn flush_pending_tmemory_store(store: &mut dyn VMStore, instance: InstanceId) ->
     };
 
     let memory_index = DefinedMemoryIndex::from_u32(memory);
-    let backing = read_memory_snapshot(store, instance, memory_index)?;
+    let backing = read_memory_snapshot(store, owner, memory_index)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -466,6 +466,7 @@ fn flush_pending_tmemory_store(store: &mut dyn VMStore, instance: InstanceId) ->
 fn apply_staged_transaction_record(
     store: &mut dyn VMStore,
     instance: InstanceId,
+    memory_owners: &alloc::collections::BTreeMap<u32, InstanceId>,
     record: &StagedRecord,
 ) -> Result<()> {
     match record {
@@ -480,7 +481,11 @@ fn apply_staged_transaction_record(
                 .checked_mul(granule_size)
                 .context("tmemory granule byte offset overflow")?;
             let memory_index = DefinedMemoryIndex::from_u32(*memory_index);
-            let mut instance_ref = store.instance_mut(instance);
+            let owner = memory_owners
+                .get(&memory_index.as_u32())
+                .copied()
+                .unwrap_or(instance);
+            let mut instance_ref = store.instance_mut(owner);
             let memory = instance_ref.as_mut().get_defined_memory_mut(memory_index);
             write_memory_bytes(memory, addr, bytes)?;
         }

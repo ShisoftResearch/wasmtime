@@ -252,6 +252,9 @@ pub struct FuncEnvironment<'module_environment> {
     /// Whether this function has translated a transaction begin and therefore
     /// needs to commit an active transaction before normal returns.
     transaction_may_be_active_on_return: bool,
+
+    /// Function-local flag set by dynamically executed `ttry`.
+    transaction_began_in_function_var: Variable,
 }
 
 impl<'module_environment> FuncEnvironment<'module_environment> {
@@ -328,6 +331,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
             alias_regions: std::collections::HashMap::new(),
             transaction_may_be_active_on_return: false,
+            transaction_began_in_function_var: Variable::reserved_value(),
         }
     }
 
@@ -3550,7 +3554,10 @@ impl FuncEnvironment<'_> {
         self.translate_transaction_lifecycle_builtin(
             builder,
             BuiltinFunctionIndex::transaction_begin(),
-        )
+        )?;
+        let began = builder.ins().iconst(I8, 1);
+        builder.def_var(self.transaction_began_in_function_var, began);
+        Ok(())
     }
 
     pub fn translate_transaction_fail(
@@ -3673,16 +3680,18 @@ impl FuncEnvironment<'_> {
         let index_type = self.memory(memory).idx_type;
 
         let mut pos = builder.cursor();
-        let vmctx = self.vmctx_val(&mut pos);
-        let memory = pos
-            .ins()
-            .iconst(I32, i64::try_from(memory.index()).unwrap());
+        let (memory_vmctx, defined_memory_index) =
+            self.memory_vmctx_and_defined_index(&mut pos, memory);
         let addr = self.cast_index_to_i64(&mut pos, addr, index_type);
         let offset = pos.ins().iconst(I64, offset as i64);
         let len = pos.ins().iconst(I32, i64::from(len));
-        let call = pos.ins().call(callee, &[vmctx, memory, addr, offset, len]);
+        let call = pos.ins().call(
+            callee,
+            &[memory_vmctx, defined_memory_index, addr, offset, len],
+        );
         let ptr = pos.func.dfg.inst_results(call)[0];
-        self.compiler.raise_if_host_trapped(builder, vmctx, ptr);
+        self.compiler
+            .raise_if_host_trapped(builder, memory_vmctx, ptr);
         Ok(ptr)
     }
 
@@ -3702,16 +3711,18 @@ impl FuncEnvironment<'_> {
         let index_type = self.memory(memory).idx_type;
 
         let mut pos = builder.cursor();
-        let vmctx = self.vmctx_val(&mut pos);
-        let memory = pos
-            .ins()
-            .iconst(I32, i64::try_from(memory.index()).unwrap());
+        let (memory_vmctx, defined_memory_index) =
+            self.memory_vmctx_and_defined_index(&mut pos, memory);
         let addr = self.cast_index_to_i64(&mut pos, addr, index_type);
         let offset = pos.ins().iconst(I64, offset as i64);
         let len = pos.ins().iconst(I32, i64::from(len));
-        let call = pos.ins().call(callee, &[vmctx, memory, addr, offset, len]);
+        let call = pos.ins().call(
+            callee,
+            &[memory_vmctx, defined_memory_index, addr, offset, len],
+        );
         let ptr = pos.func.dfg.inst_results(call)[0];
-        self.compiler.raise_if_host_trapped(builder, vmctx, ptr);
+        self.compiler
+            .raise_if_host_trapped(builder, memory_vmctx, ptr);
         Ok(ptr)
     }
 
@@ -3728,13 +3739,14 @@ impl FuncEnvironment<'_> {
         let index_type = self.memory(memory).idx_type;
 
         let mut pos = builder.cursor();
-        let vmctx = self.vmctx_val(&mut pos);
-        let memory_arg = pos
+        let (memory_vmctx, defined_memory_index) =
+            self.memory_vmctx_and_defined_index(&mut pos, memory);
+        let call = pos
             .ins()
-            .iconst(I32, i64::try_from(memory.index()).unwrap());
-        let call = pos.ins().call(callee, &[vmctx, memory_arg]);
+            .call(callee, &[memory_vmctx, defined_memory_index]);
         let pages = pos.func.dfg.inst_results(call)[0];
-        self.compiler.raise_if_host_trapped(builder, vmctx, pages);
+        self.compiler
+            .raise_if_host_trapped(builder, memory_vmctx, pages);
         let single_byte_pages = match self.memory(memory).page_size_log2 {
             16 => false,
             0 => true,
@@ -3762,15 +3774,15 @@ impl FuncEnvironment<'_> {
         let index_type = self.memory(memory).idx_type;
 
         let mut pos = builder.cursor();
-        let vmctx = self.vmctx_val(&mut pos);
-        let memory_arg = pos
-            .ins()
-            .iconst(I32, i64::try_from(memory.index()).unwrap());
+        let (memory_vmctx, defined_memory_index) =
+            self.memory_vmctx_and_defined_index(&mut pos, memory);
         let delta = self.cast_index_to_i64(&mut pos, delta, index_type);
-        let call = pos.ins().call(callee, &[vmctx, memory_arg, delta]);
+        let call = pos
+            .ins()
+            .call(callee, &[memory_vmctx, defined_memory_index, delta]);
         let previous_pages = pos.func.dfg.inst_results(call)[0];
         self.compiler
-            .raise_if_host_trapped(builder, vmctx, previous_pages);
+            .raise_if_host_trapped(builder, memory_vmctx, previous_pages);
         let single_byte_pages = match self.memory(memory).page_size_log2 {
             16 => false,
             0 => true,
@@ -5461,6 +5473,13 @@ impl FuncEnvironment<'_> {
     }
 
     pub fn before_translate_function(&mut self, builder: &mut FunctionBuilder) -> WasmResult<()> {
+        self.transaction_began_in_function_var = builder.declare_var(I8);
+        let did_not_begin_transaction = builder.ins().iconst(I8, 0);
+        builder.def_var(
+            self.transaction_began_in_function_var,
+            did_not_begin_transaction,
+        );
+
         // If an explicit stack limit is requested, emit one here at the start
         // of the function.
         if let Some(gv) = self.stack_limit_at_function_entry {
@@ -5654,6 +5673,15 @@ impl FuncEnvironment<'_> {
             return;
         }
 
+        let began = builder.use_var(self.transaction_began_in_function_var);
+        let should_commit = builder.ins().icmp_imm(IntCC::NotEqual, began, 0);
+        let commit_block = builder.create_block();
+        let continuation_block = builder.create_block();
+        builder
+            .ins()
+            .brif(should_commit, commit_block, &[], continuation_block, &[]);
+
+        builder.switch_to_block(commit_block);
         let callee = self
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_commit());
@@ -5662,6 +5690,11 @@ impl FuncEnvironment<'_> {
         let succeeded = builder.func.dfg.inst_results(call)[0];
         self.compiler
             .raise_if_host_trapped(builder, vmctx, succeeded);
+        builder.ins().jump(continuation_block, &[]);
+
+        builder.seal_block(commit_block);
+        builder.switch_to_block(continuation_block);
+        builder.seal_block(continuation_block);
     }
 
     pub fn before_load(

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
+use crate::runtime::store::InstanceId;
 use alloc::collections::{BTreeMap, BTreeSet};
 
 /// Storage backend selected for transactional memories.
@@ -98,6 +99,7 @@ pub(crate) struct TransactionState {
     next_id: u64,
     staged_globals: BTreeMap<u32, GlobalSnapshot>,
     staged_memory_granules: BTreeMap<MemoryGranuleKey, Vec<u8>>,
+    staged_memory_owners: BTreeMap<u32, InstanceId>,
     staged_memory_sizes: BTreeMap<u32, u64>,
     memory_read_granules: BTreeSet<MemoryGranuleKey>,
     memory_write_granules: BTreeSet<MemoryGranuleKey>,
@@ -112,6 +114,7 @@ impl Default for TransactionState {
             next_id: 1,
             staged_globals: BTreeMap::new(),
             staged_memory_granules: BTreeMap::new(),
+            staged_memory_owners: BTreeMap::new(),
             staged_memory_sizes: BTreeMap::new(),
             memory_read_granules: BTreeSet::new(),
             memory_write_granules: BTreeSet::new(),
@@ -152,6 +155,7 @@ struct MemoryGranuleKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingMemoryStore {
+    instance: InstanceId,
     memory_index: u32,
     addr: u64,
     len: usize,
@@ -305,6 +309,11 @@ impl TransactionState {
         Ok(records)
     }
 
+    pub(crate) fn staged_memory_owners(&self) -> Result<BTreeMap<u32, InstanceId>> {
+        self.ensure_active()?;
+        Ok(self.staged_memory_owners.clone())
+    }
+
     pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
         self.clear_active();
@@ -445,6 +454,7 @@ impl TransactionState {
 
     pub(crate) fn set_memory_store_scratch(
         &mut self,
+        instance: InstanceId,
         memory_index: u32,
         addr: u64,
         bytes: Vec<u8>,
@@ -453,6 +463,7 @@ impl TransactionState {
         let len = bytes.len();
         self.scratch = bytes;
         self.pending_memory_store = Some(PendingMemoryStore {
+            instance,
             memory_index,
             addr,
             len,
@@ -460,9 +471,15 @@ impl TransactionState {
         Ok(self.scratch.as_mut_ptr())
     }
 
-    pub(crate) fn pending_memory_store(&self) -> Option<(u32, u64, usize)> {
-        self.pending_memory_store
-            .map(|pending| (pending.memory_index, pending.addr, pending.len))
+    pub(crate) fn pending_memory_store(&self) -> Option<(InstanceId, u32, u64, usize)> {
+        self.pending_memory_store.map(|pending| {
+            (
+                pending.instance,
+                pending.memory_index,
+                pending.addr,
+                pending.len,
+            )
+        })
     }
 
     pub(crate) fn flush_memory_store_scratch(&mut self, backing: &[u8]) -> Result<bool> {
@@ -476,6 +493,15 @@ impl TransactionState {
         );
         let bytes = self.scratch[..pending.len].to_vec();
         self.stage_memory_write(pending.memory_index, pending.addr, &bytes, backing)?;
+        if let Some(existing) = self
+            .staged_memory_owners
+            .insert(pending.memory_index, pending.instance)
+        {
+            ensure!(
+                existing == pending.instance,
+                "tmemory defined memory index used by multiple instances in one transaction"
+            );
+        }
         Ok(true)
     }
 
@@ -549,6 +575,7 @@ impl TransactionState {
         self.active = None;
         self.staged_globals.clear();
         self.staged_memory_granules.clear();
+        self.staged_memory_owners.clear();
         self.staged_memory_sizes.clear();
         self.memory_read_granules.clear();
         self.memory_write_granules.clear();
@@ -722,6 +749,112 @@ mod tests {
             .unwrap();
 
         assert_eq!(size.call(&mut store, ()).unwrap(), 2);
+    }
+
+    #[test]
+    fn mock_transaction_unexecuted_ttry_does_not_commit_caller_transaction() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (func $maybe_begin (param i32)
+                (local.get 0)
+                (if
+                  (then
+                    (ttry))))
+              (func (export "write_then_fail")
+                (ttry)
+                (i32.tstore (i32.const 0) (i32.const 42))
+                (call $maybe_begin (i32.const 0))
+                (tfail))
+              (func (export "read") (result i32)
+                (i32.load (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write_then_fail = instance
+            .get_typed_func::<(), ()>(&mut store, "write_then_fail")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        write_then_fail.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+    }
+
+    #[test]
+    fn mock_transaction_store_uses_defined_memory_index_after_import() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (import "env" "ordinary" (memory 1))
+              (tmemory $tx 1)
+              (func (export "write")
+                (ttry)
+                (i32.tstore $tx (i32.const 0) (i32.const 55)))
+              (func (export "read_tx") (result i32)
+                (i32.load $tx (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let ordinary = crate::Memory::new(&mut store, crate::MemoryType::new(1, None)).unwrap();
+        let instance = crate::Instance::new(&mut store, &module, &[ordinary.into()]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read_tx = instance
+            .get_typed_func::<(), i32>(&mut store, "read_tx")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read_tx.call(&mut store, ()).unwrap(), 55);
+    }
+
+    #[test]
+    fn mock_transaction_store_uses_imported_tmemory_vmctx() {
+        let engine = crate::Engine::default();
+        let provider = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory $tx 1)
+              (export "tx" (memory $tx)))
+            "#,
+        );
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (import "env" "tx" (tmemory $tx 1))
+              (func (export "write")
+                (ttry)
+                (i32.tstore $tx (i32.const 0) (i32.const 66)))
+              (func (export "read_tx") (result i32)
+                (i32.load $tx (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
+        let tx = provider.get_memory(&mut store, "tx").unwrap();
+        let instance = crate::Instance::new(&mut store, &module, &[tx.into()]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read_tx = instance
+            .get_typed_func::<(), i32>(&mut store, "read_tx")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read_tx.call(&mut store, ()).unwrap(), 66);
     }
 
     #[test]
