@@ -265,6 +265,10 @@ fn memory_grow(
     })?
 }
 
+// SHISOFT-TWASM-MOCK: transaction libcall runtime scaffold.
+// These helpers execute compiled transactional operators against store-local
+// staged overlays and ordinary Wasmtime memory/global backing until tmemory
+// storage, persistent backends, and the transaction object table are wired.
 fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
     store.store_opaque_mut().transaction_state_mut().begin()?;
     Ok(())
@@ -379,6 +383,8 @@ fn defined_transaction_global(
     let module = instance_ref.env_module();
     let wasm_ty = module.globals[global].wasm_ty;
     let Some(index) = module.defined_global_index(global) else {
+        // SHISOFT-TWASM-MOCK: imported tglobals need object-table ownership and
+        // backing writes before they can participate in real transactions.
         bail!("transactional imported globals are not implemented in the mock runtime");
     };
     Ok((index, wasm_ty))
@@ -408,6 +414,7 @@ fn read_global_snapshot(
         WasmValType::F32 => Ok(GlobalSnapshot::F32(unsafe { *global.as_f32_bits() })),
         WasmValType::F64 => Ok(GlobalSnapshot::F64(unsafe { *global.as_f64_bits() })),
         WasmValType::V128 | WasmValType::Ref(_) => {
+            // SHISOFT-TWASM-MOCK: global overlays support scalar snapshots only.
             bail!("transactional global type is not implemented yet")
         }
     }
@@ -473,6 +480,8 @@ fn transaction_tmemory_load_impl(
     let len = usize::try_from(len).context("tmemory access length overflow")?;
     flush_pending_tmemory_store(store, instance)?;
 
+    // SHISOFT-TWASM-MOCK: tmemory loads read ordinary defined memory backing and
+    // then merge staged copy-on-write granules from `TransactionState`.
     let memory_index = DefinedMemoryIndex::from_u32(memory);
     let backing = read_memory_backing_window(store, instance, memory_index, effective, len)?;
 
@@ -514,6 +523,8 @@ fn transaction_tmemory_store_impl(
     let len = usize::try_from(len).context("tmemory access length overflow")?;
     flush_pending_tmemory_store(store, instance)?;
 
+    // SHISOFT-TWASM-MOCK: tmemory stores stage into a scratch buffer and copy-on
+    // write overlay; the real tmemory backend receives bytes only on commit.
     let memory_index = DefinedMemoryIndex::from_u32(memory);
     let backing = read_memory_backing_window(store, instance, memory_index, effective, len)?;
 
@@ -547,6 +558,7 @@ fn transaction_tmemory_size_impl(
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
 
+    // SHISOFT-TWASM-MOCK: tmemory.size reports ordinary Wasmtime memory size.
     let memory_index = DefinedMemoryIndex::from_u32(memory);
     let pages = {
         let instance_ref = store.instance_mut(instance);
@@ -578,6 +590,8 @@ fn transaction_tmemory_grow_impl(
 ) -> Result<Option<AllocationSize>> {
     flush_pending_tmemory_store(store, instance)?;
 
+    // SHISOFT-TWASM-MOCK: tmemory.grow delegates to ordinary memory.grow
+    // immediately; successful grow rollback is recorded but not implemented.
     let result = memory_grow(store, instance, delta, memory)?;
     if let Some(previous) = result.as_ref() {
         let state = store.store_opaque_mut().transaction_state_mut();
@@ -628,6 +642,8 @@ fn read_memory_backing_window(
     addr: u64,
     len: usize,
 ) -> Result<MemoryBackingWindow> {
+    // SHISOFT-TWASM-MOCK: backing windows are sliced from ordinary Wasmtime
+    // `Memory`, not from `runtime::vm::memory::tmemory::TMemory`.
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
     let memory = instance_ref.get_defined_memory(memory_index);
@@ -747,8 +763,8 @@ fn apply_staged_transaction_record(
             write_global_snapshot(global, *value);
         }
         StagedRecord::MemorySize { .. } => {
-            // The mock grow path delegates to ordinary memory.grow immediately;
-            // rollback of successful grows is deferred.
+            // SHISOFT-TWASM-MOCK: the grow path delegates to ordinary
+            // memory.grow immediately; rollback of successful grows is deferred.
         }
     }
     Ok(())

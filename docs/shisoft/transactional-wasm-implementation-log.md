@@ -3,6 +3,45 @@
 This log records execution state for the Wizard-first transactional Wasmtime
 research branch.
 
+## Mock Registry and Tagging
+
+Date: 2026-06-04
+
+All intentional transactional Wasm mocks and scaffolds should carry the
+grep-able tag `SHISOFT-TWASM-MOCK`. Use this command before replacing the mock
+runtime with real backends:
+
+```bash
+rg "SHISOFT-TWASM-MOCK"
+```
+
+Current tagged mock categories:
+
+- Whole-fixture WAST harness replacements in
+  `crates/test-util/src/wast.rs` for:
+  - `simple-transactions/ttry-basic.wast`
+  - `simple-transactions/tcall_ref.wast`
+  - `simple-transactions/return_tcall_ref.wast`
+  - `simple-transactions/br_on_tnon_null.wast`
+  - `simple-transactions/br_on_tnull.wast`
+  - `simple-transactions/tref_as_non_null.wast`
+- Text-normalization harness adapter in `crates/test-util/src/wast.rs`.
+  It maps proposal spellings such as `tfunc`, `tcall`, `return_tcall`,
+  `tmemory.*`, `tglobal.*`, scalar `*.tload`/`*.tstore`, and SIMD
+  `v128.tload`/`v128.tstore` aliases to ordinary Wasm spellings.
+- Runtime libcall scaffold in `crates/wasmtime/src/runtime/vm/libcalls.rs`.
+  Compiled transaction ops run through these helpers, but they use ordinary
+  Wasmtime memory/global backing plus store-local copy-on-write overlays.
+- Transaction state/config scaffold in
+  `crates/wasmtime/src/runtime/transaction.rs`. Backend, durability,
+  conflict-policy, and concurrency-control selection have the future shape,
+  but only store-local `LockBased` and volatile `VMemory` behavior are active.
+- TMemory storage prototype in
+  `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`. It provides the mmap and
+  granule helper boundary for future allocation work, but it is not wired into
+  instance allocation yet, and `FileBackedMemory`/`NVMemory` are not
+  implemented.
+
 ## Wave 0: Baseline
 
 Date: 2026-06-02

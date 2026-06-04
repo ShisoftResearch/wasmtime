@@ -1,8 +1,9 @@
 //! Storage-only prototype for Wizard-style transactional memories.
 //!
-//! This module is intentionally not wired into instance allocation yet. It
-//! establishes the mmap-backed storage boundary and granule helpers that
-//! transactional lowering will need once parser/runtime support exists.
+//! SHISOFT-TWASM-MOCK: storage prototype scaffold. This module is intentionally
+//! not wired into instance allocation yet. It establishes the mmap-backed
+//! storage boundary and granule helpers that transactional lowering will need
+//! once parser/runtime support exists.
 
 #![allow(dead_code)]
 
@@ -45,6 +46,8 @@ impl TMemory {
         let storage = match config.tmemory_backend() {
             TMemoryBackend::VMemory => TMemoryStorage::VMemory(VMemory::new(min_pages, max_pages)?),
             TMemoryBackend::FileBackedMemory | TMemoryBackend::NVMemory => {
+                // SHISOFT-TWASM-MOCK: persistent tmemory backends are named in
+                // the config but not allocated by the runtime yet.
                 bail!(
                     "tmemory backend is not implemented: {:?}",
                     config.tmemory_backend()

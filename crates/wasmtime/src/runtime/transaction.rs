@@ -4,7 +4,15 @@ use crate::prelude::*;
 use crate::runtime::store::InstanceId;
 use alloc::collections::{BTreeMap, BTreeSet};
 
+// SHISOFT-TWASM-MOCK: milestone runtime scaffold for proposal WAST progress.
+// The current runtime uses store-local transaction state, VMemory-only backend
+// selection, and ordinary Wasmtime memory/global backing until the real
+// transactional object table and tmemory allocation path are wired.
+
 /// Storage backend selected for transactional memories.
+///
+/// SHISOFT-TWASM-MOCK: selectable backend shape is present, but only `VMemory`
+/// is currently accepted by `TransactionConfig`.
 ///
 /// Milestone 1 only implements `VMemory`. The other variants are represented
 /// now so transaction configuration has the right shape for later persistence
@@ -16,16 +24,22 @@ pub(crate) enum TMemoryBackend {
     NVMemory,
 }
 
+/// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. `LockBased` is
+/// store-local today and must move behind the future transaction object table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcurrencyControl {
     LockBased,
 }
 
+/// SHISOFT-TWASM-MOCK: durability is volatile rollback-only until tmemory can
+/// select FileBackedMemory or NVMemory storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DurabilityPolicy {
     VolatileRollbackOnly,
 }
 
+/// SHISOFT-TWASM-MOCK: conflict behavior is the current abort/default scaffold;
+/// richer policy selection is deferred to the real concurrency-control layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConflictPolicy {
     AbortOrWizardDefault,
@@ -201,6 +215,7 @@ pub(crate) trait TransactionConcurrencyControl {
 
 #[derive(Debug, Default)]
 pub(crate) struct LockBased {
+    // SHISOFT-TWASM-MOCK: lock ownership is store-local and memory-index based.
     // The milestone mock runtime has one active transaction per store, so the
     // lock table keys only by store-local memory index. Owner-instance scoped
     // conflict keys belong with the future transaction object table.
@@ -762,11 +777,7 @@ impl TransactionState {
             .acquire_memory_granule_read(transaction, memory_index, granule_index)
     }
 
-    fn lock_memory_granule_write(
-        &mut self,
-        memory_index: u32,
-        granule_index: u64,
-    ) -> Result<()> {
+    fn lock_memory_granule_write(&mut self, memory_index: u32, granule_index: u64) -> Result<()> {
         let transaction = self
             .active_transaction()
             .context("no active transaction in this store")?;
@@ -880,6 +891,9 @@ pub(crate) fn execute_research_transaction_fixture(
     state: &mut TransactionState,
     operators: &[wasmtime_environ::ResearchTransactionModuleOperator],
 ) -> Result<()> {
+    // SHISOFT-TWASM-MOCK: research fixture executor for metadata-only tests.
+    // It handles only `ttry` and `tfail`; executable transaction operators
+    // should run through parser/lowering/libcalls instead of this bridge.
     for operator in operators {
         match operator.operator {
             wasmtime_environ::TransactionOperator::TTry => {
@@ -1753,7 +1767,8 @@ mod tests {
     fn commit_releases_lock_based_ownership_for_next_transaction() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
-        state.acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
+        state
+            .acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
             .unwrap();
 
         state.commit().unwrap();
@@ -1766,7 +1781,8 @@ mod tests {
     fn abort_releases_lock_based_ownership_for_next_transaction() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
-        state.acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
+        state
+            .acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
             .unwrap();
 
         state.abort().unwrap();
@@ -1779,7 +1795,8 @@ mod tests {
     fn fail_releases_lock_based_ownership_for_next_transaction() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
-        state.acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
+        state
+            .acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
             .unwrap();
 
         state.fail().unwrap();

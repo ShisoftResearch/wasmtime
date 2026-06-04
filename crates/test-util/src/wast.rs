@@ -303,14 +303,18 @@ fn transaction_proposal_test_config(test: &Path) -> TestConfig {
     ret
 }
 
+// SHISOFT-TWASM-MOCK: path-scoped proposal WAST fixture replacements.
+// Replace these whole-fixture adapters with real parser, validation, and
+// runtime semantics as each transactional feature lands.
 fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
     if path.ends_with("simple-transactions/ttry-basic.wast") {
+        // SHISOFT-TWASM-MOCK: simple-transactions/ttry-basic.wast.
         // Harness-only adapter mock for structured `ttry`/`tfail`/`else`
         // failure-handler semantics. This replaces the whole fixture with an
         // ordinary Wasm module that preserves the assertion outcomes while the
         // real structured control-flow/runtime work stays deferred.
         return Some(
-            r#";; Harness adapter mock for `simple-transactions/ttry-basic.wast`.
+            r#";; SHISOFT-TWASM-MOCK: simple-transactions/ttry-basic.wast
 ;; Preserves the three exported `try2` outcomes without implementing
 ;; structured transactional failure-handler semantics in Wasmtime.
 (module
@@ -331,12 +335,13 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
     }
 
     if path.ends_with("simple-transactions/tcall_ref.wast") {
+        // SHISOFT-TWASM-MOCK: simple-transactions/tcall_ref.wast.
         // Harness-only adapter mock for transactional `tref`/`tcall_ref`
         // fixtures. This preserves the original return/trap/invalid outcomes
         // with ordinary Wasm calls, but does not implement real transactional
         // function references or `call_ref` semantics in Wasmtime.
         return Some(
-            r#";; Harness adapter mock for `simple-transactions/tcall_ref.wast`.
+            r#";; SHISOFT-TWASM-MOCK: simple-transactions/tcall_ref.wast
 ;; Preserves the original assertion outcomes with ordinary Wasm direct calls.
 ;; This does not implement transactional references, `tref.tfunc`, or
 ;; `tcall_ref` semantics in Wasmtime.
@@ -490,12 +495,13 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
     }
 
     if path.ends_with("simple-transactions/return_tcall_ref.wast") {
+        // SHISOFT-TWASM-MOCK: simple-transactions/return_tcall_ref.wast.
         // Harness-only adapter mock for transactional `return_tcall_ref`
         // fixtures. This keeps the fixture running through the ordinary WAST
         // harness, but does not implement real transactional references or
         // `return_call_ref` semantics in Wasmtime.
         return Some(
-            r#";; Harness adapter mock for `simple-transactions/return_tcall_ref.wast`.
+            r#";; SHISOFT-TWASM-MOCK: simple-transactions/return_tcall_ref.wast
 ;; Preserves the original assertion outcomes with ordinary Wasm direct
 ;; calls/returns. This does not implement transactional references or
 ;; `return_tcall_ref` semantics in Wasmtime.
@@ -746,11 +752,12 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
     }
 
     if path.ends_with("simple-transactions/br_on_tnon_null.wast") {
+        // SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnon_null.wast.
         // Harness-only adapter mock for transactional reference branching.
         // This preserves the assertion surface with ordinary Wasm control flow,
         // but does not implement real `br_on_tnon_null` reference semantics.
         return Some(
-            r#";; Harness adapter mock for `simple-transactions/br_on_tnon_null.wast`.
+            r#";; SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnon_null.wast
 ;; Preserves assertion outcomes with ordinary Wasm branches and direct calls.
 ;; This does not implement transactional references or `br_on_tnon_null`.
 (module
@@ -793,11 +800,12 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
     }
 
     if path.ends_with("simple-transactions/br_on_tnull.wast") {
+        // SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnull.wast.
         // Harness-only adapter mock for transactional reference branching.
         // This preserves the assertion surface with ordinary Wasm control flow,
         // but does not implement real `br_on_tnull` reference semantics.
         return Some(
-            r#";; Harness adapter mock for `simple-transactions/br_on_tnull.wast`.
+            r#";; SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnull.wast
 ;; Preserves assertion outcomes with ordinary Wasm branches and direct calls.
 ;; This does not implement transactional references or `br_on_tnull`.
 (module
@@ -840,11 +848,12 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
     }
 
     if path.ends_with("simple-transactions/tref_as_non_null.wast") {
+        // SHISOFT-TWASM-MOCK: simple-transactions/tref_as_non_null.wast.
         // Harness-only adapter mock for transactional non-null reference casts.
         // This preserves the assertion surface with ordinary Wasm traps/calls,
         // but does not implement real `tref.as_non_null` semantics.
         return Some(
-            r#";; Harness adapter mock for `simple-transactions/tref_as_non_null.wast`.
+            r#";; SHISOFT-TWASM-MOCK: simple-transactions/tref_as_non_null.wast
 ;; Preserves assertion outcomes with ordinary Wasm direct calls and traps.
 ;; This does not implement transactional references or `tref.as_non_null`.
 (module
@@ -885,6 +894,9 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
     None
 }
 
+// SHISOFT-TWASM-MOCK: proposal text-normalization adapter.
+// This maps transactional text spellings to ordinary Wasm so early WAST
+// tranches can execute before full text-parser/object-space semantics exist.
 fn normalize_transaction_proposal_wast(wast: &str) -> String {
     normalize_transaction_proposal_wast_with(wast, true)
 }
@@ -1081,6 +1093,8 @@ fn normalize_transaction_import_name(name: &str) -> &str {
     }
 }
 
+// SHISOFT-TWASM-MOCK: token-level semantic substitution for control,
+// reference, table, memory, global, and SIMD transaction proposal spelling.
 fn normalize_transaction_token(token: &str) -> &str {
     match token {
         "return_tcall_indirect" => "return_call_indirect",
@@ -1140,6 +1154,8 @@ fn normalize_transaction_token(token: &str) -> &str {
     }
 }
 
+// SHISOFT-TWASM-MOCK: scalar transactional load/store spelling is lowered to
+// ordinary Wasm load/store spelling by the harness adapter.
 fn normalize_load_store_token(token: &str) -> &str {
     match token {
         "i32.tload" => "i32.load",

@@ -8,6 +8,11 @@
 
 **Tech Stack:** Rust, Wasmtime runtime VM libcalls, `wasmtime-environ` transaction metadata, local patched wasm-tools `wast`/`wat`, existing WAST test harness.
 
+**Mock Tag Policy:** Every intentional mock or scaffold added by this roadmap
+must include the grep-able marker `SHISOFT-TWASM-MOCK` with a short note about
+the future real subsystem that replaces it. Run `rg "SHISOFT-TWASM-MOCK"` to
+audit replacement work.
+
 ---
 
 ## File Map
