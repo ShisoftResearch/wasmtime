@@ -1473,6 +1473,12 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
         return Err(trap);
     }
     let result = crate::runtime::vm::catch_traps(store, &mut previous_runtime_state, closure);
+    if result.is_err() {
+        let transaction = store.0.transaction_state_mut();
+        if transaction.active_transaction().is_some() {
+            let _ = transaction.abort();
+        }
+    }
     #[cfg(feature = "component-model")]
     if result.is_err() {
         store.0.set_trapped();

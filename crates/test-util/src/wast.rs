@@ -163,8 +163,12 @@ fn add_tests(tests: &mut Vec<WastTest>, path: &Path, config: &FindConfig) -> Res
         };
         let transaction_real_text_parser = transaction_proposal
             .is_some_and(|suite| transaction_proposal_uses_real_text_parser(suite, &path));
-        if transaction_proposal.is_some() && !transaction_real_text_parser {
-            contents = normalize_transaction_proposal_wast(&contents);
+        if transaction_proposal.is_some() {
+            contents = if transaction_real_text_parser {
+                normalize_transaction_proposal_wast_diagnostics(&contents)
+            } else {
+                normalize_transaction_proposal_wast(&contents)
+            };
         }
         tests.push(WastTest {
             path,
@@ -298,6 +302,14 @@ fn transaction_proposal_test_config(test: &Path) -> TestConfig {
 }
 
 fn normalize_transaction_proposal_wast(wast: &str) -> String {
+    normalize_transaction_proposal_wast_with(wast, true)
+}
+
+fn normalize_transaction_proposal_wast_diagnostics(wast: &str) -> String {
+    normalize_transaction_proposal_wast_with(wast, false)
+}
+
+fn normalize_transaction_proposal_wast_with(wast: &str, normalize_syntax: bool) -> String {
     let mut out = String::with_capacity(wast.len());
     let mut chars = wast.char_indices().peekable();
     let mut lists: Vec<ListContext> = Vec::new();
@@ -320,6 +332,7 @@ fn normalize_transaction_proposal_wast(wast: &str) -> String {
                     quote_module,
                     import_field_name,
                     diagnostic,
+                    normalize_syntax,
                 ));
                 if let Some(tokens) = lists.last_mut() {
                     if let Some(body) = wast[idx..end]
@@ -362,7 +375,11 @@ fn normalize_transaction_proposal_wast(wast: &str) -> String {
             _ => {
                 let end = token_end(wast, idx);
                 let token = &wast[idx..end];
-                out.push_str(normalize_transaction_token(token));
+                if normalize_syntax {
+                    out.push_str(normalize_transaction_token(token));
+                } else {
+                    out.push_str(token);
+                }
                 if let Some(tokens) = lists.last_mut() {
                     tokens.tokens.push(token.to_string());
                 }
@@ -404,6 +421,7 @@ fn normalize_transaction_string(
     quote_module: bool,
     import_field_name: bool,
     diagnostic: bool,
+    normalize_syntax: bool,
 ) -> String {
     let Some(body) = string.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
         return string.to_string();
@@ -411,11 +429,11 @@ fn normalize_transaction_string(
 
     if quote_module {
         let decoded = decode_module_quote_body(body);
-        let normalized = normalize_transaction_proposal_wast(&decoded);
+        let normalized = normalize_transaction_proposal_wast_with(&decoded, normalize_syntax);
         return format!("\"{}\"", encode_module_quote_body(&normalized));
     }
 
-    if import_field_name {
+    if normalize_syntax && import_field_name {
         let normalized = normalize_transaction_import_name(body);
         if normalized != body {
             return format!("\"{normalized}\"");
@@ -423,7 +441,11 @@ fn normalize_transaction_string(
     }
 
     if diagnostic {
-        let normalized = normalize_transaction_diagnostic(body);
+        let normalized = if normalize_syntax {
+            normalize_transaction_diagnostic(body)
+        } else {
+            normalize_transaction_real_parser_diagnostic(body)
+        };
         if normalized != body {
             return format!("\"{normalized}\"");
         }
@@ -585,6 +607,23 @@ fn normalize_transaction_diagnostic(text: &str) -> String {
         ("null tfunction", "null function"),
         ("unknown tglobal", "unknown global"),
         ("invalid lane index", "SIMD index out of bounds"),
+    ];
+
+    replacements
+        .into_iter()
+        .fold(text.to_string(), |text, (from, to)| text.replace(from, to))
+}
+
+fn normalize_transaction_real_parser_diagnostic(text: &str) -> String {
+    let replacements = [
+        ("undefined telement", "undefined element"),
+        ("uninitialized telement", "uninitialized element"),
+        (
+            "indirect tcall type mismatch",
+            "indirect call type mismatch",
+        ),
+        ("inline tfunction type", "inline function type"),
+        ("null tfunction", "null function"),
     ];
 
     replacements
@@ -898,9 +937,6 @@ impl WastTest {
 
     /// Returns whether this transactional proposal test can currently run.
     pub fn transaction_proposal_enabled(&self) -> bool {
-        if self.transaction_real_text_parser {
-            return false;
-        }
         let Some(suite) = self.transaction_proposal else {
             return false;
         };
@@ -1639,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn real_text_parser_transaction_proposal_tranche_is_not_normalized_or_run_yet() {
+    fn enables_real_text_parser_transaction_proposal_tranche() {
         for name in ["tmemory_size.wast", "tmemory_grow.wast"] {
             let test = WastTest {
                 path: PathBuf::from(name),
@@ -1650,7 +1686,7 @@ mod tests {
             };
 
             assert!(test.transaction_real_text_parser(), "{name}");
-            assert!(!test.transaction_proposal_enabled(), "{name}");
+            assert!(test.transaction_proposal_enabled(), "{name}");
             assert!(super::transaction_proposal_uses_real_text_parser(
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path

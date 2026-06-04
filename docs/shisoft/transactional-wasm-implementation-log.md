@@ -917,3 +917,63 @@ test result: ok. 8 passed; 0 failed
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 test result: ok. 117 passed; 0 failed; 56 ignored
 ```
+
+## Mock Runtime: First Real WAST Tranche
+
+Date: 2026-06-04
+
+Enabled `tmemory_size.wast` and `tmemory_grow.wast` as real-parser,
+real-engine proposal tests against the mock transaction runtime.
+
+Runtime/harness work in this tranche:
+
+- `tmemory.size` and `tmemory.grow` zero-success returns no longer collide with
+  host trap sentinels in Cranelift lowering.
+- Transactional memory/global operations lazily open a mock transaction when a
+  function has no explicit `ttry`, matching the current `tfunc`/`tinvoke` WAST
+  boundary scaffold.
+- Any Wasm trap now aborts an active mock transaction at the Wasm call
+  boundary, so ordinary traps after transactional operations do not leak active
+  transaction state into later invocations.
+- Real-parser WAST files keep transaction syntax intact; only selected
+  proposal diagnostics for call/table aliases are normalized.
+- The local `wasm-tools-transaction` fork now accepts `tcall`,
+  `tcall_indirect`, `return_tcall`, `return_tcall_indirect`, `tcall_ref`,
+  `return_tcall_ref`, and `tfuncref` as text aliases for the mock tranche.
+
+Fork commit:
+
+- `9b69b9b Add transaction call text aliases`
+
+Mocked/deferred:
+
+- `tcall*` and `tfuncref` are text aliases to ordinary call/table behavior;
+  there is no transactional function object table yet.
+- `tfunc` boundaries are approximated by lazy transaction begin on first
+  transactional data operation plus normal-return commit.
+- `tmemory.grow` still grows ordinary backing memory immediately; rollback of
+  successful growth is deferred.
+- Real concurrency control beyond deterministic `LockBased` unit scaffolding
+  remains deferred.
+
+Verification:
+
+```text
+cargo test -p wast transaction_text_
+test result: ok. 8 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 46 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast transaction_proposal
+test result: ok. 8 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tmemory_size.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tmemory_grow.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+```

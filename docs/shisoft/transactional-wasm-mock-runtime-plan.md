@@ -492,7 +492,7 @@ git commit -m "Implement mock transaction global libcalls"
 - Modify: `crates/test-util/src/wast.rs`
 - Modify: `docs/shisoft/transactional-wasm-implementation-log.md`
 
-- [ ] **Step 1: Make `tmemory_size.wast` and `tmemory_grow.wast` real-engine tests**
+- [x] **Step 1: Make `tmemory_size.wast` and `tmemory_grow.wast` real-engine tests**
 
 In `transaction_proposal_uses_real_text_parser`, keep:
 
@@ -505,15 +505,20 @@ files can run once supported instead of being treated as ignored. Update the
 unit test name and assertion from "not normalized or run yet" to "uses real
 parser and runs".
 
-- [ ] **Step 2: Run WAST tests**
+- [x] **Step 2: Run WAST tests**
 
 ```bash
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 ```
 
-Expected: the previous 56 ignored count decreases for the two real-parser files, with no failures.
+Result:
 
-- [ ] **Step 3: Record result**
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+```
+
+- [x] **Step 3: Record result**
 
 Append a dated line to `docs/shisoft/transactional-wasm-implementation-log.md`:
 
@@ -523,7 +528,7 @@ Append a dated line to `docs/shisoft/transactional-wasm-implementation-log.md`:
   `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse`.
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/test-util/src/wast.rs docs/shisoft/transactional-wasm-implementation-log.md

@@ -854,6 +854,34 @@ mod tests {
     }
 
     #[test]
+    fn mock_transaction_store_without_explicit_ttry_commits_on_return() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (func (export "write")
+                (i32.tstore (i32.const 0) (i32.const 42)))
+              (func (export "read") (result i32)
+                (i32.load (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 42);
+    }
+
+    #[test]
     fn mock_transaction_fail_discards_memory_write() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
@@ -1072,6 +1100,34 @@ mod tests {
     }
 
     #[test]
+    fn mock_transaction_zero_memory_size_and_grow_do_not_trap() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 0)
+              (func (export "size") (result i32)
+                (tmemory.size))
+              (func (export "grow") (param i32) (result i32)
+                (tmemory.grow (local.get 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let size = instance
+            .get_typed_func::<(), i32>(&mut store, "size")
+            .unwrap();
+        let grow = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow")
+            .unwrap();
+
+        assert_eq!(size.call(&mut store, ()).unwrap(), 0);
+        assert_eq!(grow.call(&mut store, 1).unwrap(), 0);
+        assert_eq!(size.call(&mut store, ()).unwrap(), 1);
+    }
+
+    #[test]
     fn mock_transaction_read_after_write_uses_pending_store_scratch() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
@@ -1130,6 +1186,39 @@ mod tests {
 
         write.call(&mut store, ()).unwrap();
         assert_eq!(read.call(&mut store, ()).unwrap(), 7);
+    }
+
+    #[test]
+    fn mock_transaction_plain_wasm_trap_clears_active_transaction() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $sig (func))
+              (tmemory 1)
+              (table 0 funcref)
+              (func (export "trap_after_tload")
+                (drop (i32.tload (i32.const 0)))
+                (call_indirect (type $sig) (i32.const 0)))
+              (func (export "recover") (result i32)
+                (i32.tload (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let trap_after_tload = instance
+            .get_typed_func::<(), ()>(&mut store, "trap_after_tload")
+            .unwrap();
+        let recover = instance
+            .get_typed_func::<(), i32>(&mut store, "recover")
+            .unwrap();
+
+        let error = trap_after_tload.call(&mut store, ()).unwrap_err();
+        let error = format!("{error:?}");
+        assert!(error.contains("table access"));
+
+        assert_eq!(recover.call(&mut store, ()).unwrap(), 0);
     }
 
     #[test]

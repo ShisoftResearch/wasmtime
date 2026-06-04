@@ -3570,12 +3570,42 @@ impl FuncEnvironment<'_> {
         )
     }
 
+    fn translate_transaction_begin_if_needed(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        self.transaction_may_be_active_on_return = true;
+
+        let began = builder.use_var(self.transaction_began_in_function_var);
+        let should_begin = builder.ins().icmp_imm(IntCC::Equal, began, 0);
+        let begin_block = builder.create_block();
+        let continuation_block = builder.create_block();
+        builder
+            .ins()
+            .brif(should_begin, begin_block, &[], continuation_block, &[]);
+
+        builder.switch_to_block(begin_block);
+        self.translate_transaction_lifecycle_builtin(
+            builder,
+            BuiltinFunctionIndex::transaction_begin(),
+        )?;
+        let began = builder.ins().iconst(I8, 1);
+        builder.def_var(self.transaction_began_in_function_var, began);
+        builder.ins().jump(continuation_block, &[]);
+
+        builder.seal_block(begin_block);
+        builder.switch_to_block(continuation_block);
+        builder.seal_block(continuation_block);
+        Ok(())
+    }
+
     pub fn translate_transaction_tglobal_get(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         global: GlobalIndex,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_global(global)?;
+        self.translate_transaction_begin_if_needed(builder)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
         let result_ty = self.transaction_global_value_type(wasm_ty)?;
         let callee = self.builtin_functions.load_builtin(
@@ -3590,7 +3620,6 @@ impl FuncEnvironment<'_> {
             .iconst(I32, i64::try_from(global.index()).unwrap());
         let call = pos.ins().call(callee, &[vmctx, global]);
         let ptr = pos.func.dfg.inst_results(call)[0];
-        self.compiler.raise_if_host_trapped(builder, vmctx, ptr);
 
         let flags = MemFlagsData::trusted();
         Ok(builder.ins().load(result_ty, flags, ptr, Offset32::new(0)))
@@ -3603,6 +3632,7 @@ impl FuncEnvironment<'_> {
         val: ir::Value,
     ) -> WasmResult<()> {
         self.ensure_transaction_global(global)?;
+        self.translate_transaction_begin_if_needed(builder)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
         let expected_ty = self.transaction_global_value_type(wasm_ty)?;
         debug_assert_eq!(expected_ty, builder.func.dfg.value_type(val));
@@ -3619,10 +3649,7 @@ impl FuncEnvironment<'_> {
             .ins()
             .iconst(I32, i64::try_from(global.index()).unwrap());
         let tag = pos.ins().iconst(I32, i64::from(tag));
-        let call = pos.ins().call(callee, &[vmctx, global, tag, value]);
-        let succeeded = pos.func.dfg.inst_results(call)[0];
-        self.compiler
-            .raise_if_host_trapped(builder, vmctx, succeeded);
+        pos.ins().call(callee, &[vmctx, global, tag, value]);
         Ok(())
     }
 
@@ -3673,6 +3700,7 @@ impl FuncEnvironment<'_> {
         len: u32,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
+        self.translate_transaction_begin_if_needed(builder)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_load(),
@@ -3690,8 +3718,6 @@ impl FuncEnvironment<'_> {
             &[memory_vmctx, defined_memory_index, addr, offset, len],
         );
         let ptr = pos.func.dfg.inst_results(call)[0];
-        self.compiler
-            .raise_if_host_trapped(builder, memory_vmctx, ptr);
         Ok(ptr)
     }
 
@@ -3704,6 +3730,7 @@ impl FuncEnvironment<'_> {
         len: u32,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
+        self.translate_transaction_begin_if_needed(builder)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_store(),
@@ -3721,8 +3748,6 @@ impl FuncEnvironment<'_> {
             &[memory_vmctx, defined_memory_index, addr, offset, len],
         );
         let ptr = pos.func.dfg.inst_results(call)[0];
-        self.compiler
-            .raise_if_host_trapped(builder, memory_vmctx, ptr);
         Ok(ptr)
     }
 
@@ -3745,8 +3770,6 @@ impl FuncEnvironment<'_> {
             .ins()
             .call(callee, &[memory_vmctx, defined_memory_index]);
         let pages = pos.func.dfg.inst_results(call)[0];
-        self.compiler
-            .raise_if_host_trapped(builder, memory_vmctx, pages);
         let single_byte_pages = match self.memory(memory).page_size_log2 {
             16 => false,
             0 => true,
@@ -3767,6 +3790,7 @@ impl FuncEnvironment<'_> {
         delta: ir::Value,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
+        self.translate_transaction_begin_if_needed(builder)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_grow(),
@@ -3781,8 +3805,6 @@ impl FuncEnvironment<'_> {
             .ins()
             .call(callee, &[memory_vmctx, defined_memory_index, delta]);
         let previous_pages = pos.func.dfg.inst_results(call)[0];
-        self.compiler
-            .raise_if_host_trapped(builder, memory_vmctx, previous_pages);
         let single_byte_pages = match self.memory(memory).page_size_log2 {
             16 => false,
             0 => true,
@@ -3823,10 +3845,7 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<()> {
         let callee = self.builtin_functions.load_builtin(builder.func, builtin);
         let vmctx = self.vmctx_val(&mut builder.cursor());
-        let call = builder.ins().call(callee, &[vmctx]);
-        let succeeded = builder.func.dfg.inst_results(call)[0];
-        self.compiler
-            .raise_if_host_trapped(builder, vmctx, succeeded);
+        builder.ins().call(callee, &[vmctx]);
         Ok(())
     }
 
@@ -5686,10 +5705,7 @@ impl FuncEnvironment<'_> {
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_commit());
         let vmctx = self.vmctx_val(&mut builder.cursor());
-        let call = builder.ins().call(callee, &[vmctx]);
-        let succeeded = builder.func.dfg.inst_results(call)[0];
-        self.compiler
-            .raise_if_host_trapped(builder, vmctx, succeeded);
+        builder.ins().call(callee, &[vmctx]);
         builder.ins().jump(continuation_block, &[]);
 
         builder.seal_block(commit_block);
