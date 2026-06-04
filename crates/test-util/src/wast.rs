@@ -1678,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn enables_ttry_basic_with_a_path_scoped_adapter_mock() {
+    fn enables_transaction_proposal_ttry_basic_with_a_path_scoped_adapter_mock() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
