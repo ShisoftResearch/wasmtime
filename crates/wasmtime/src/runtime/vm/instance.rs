@@ -217,6 +217,9 @@ impl Instance {
             vmctx: OwnedVMContext::new(),
         })?;
 
+        #[cfg(has_virtual_memory)]
+        ret.get_mut().initialize_tmemory_sidecar_static_data()?;
+
         // SAFETY: this vmctx was allocated with the same layout above, so it
         // should be safe to initialize with the same values here.
         unsafe {
@@ -264,6 +267,44 @@ impl Instance {
         }
 
         Ok(sidecar)
+    }
+
+    #[cfg(has_virtual_memory)]
+    fn initialize_tmemory_sidecar_static_data(mut self: Pin<&mut Self>) -> Result<(), OutOfMemory> {
+        let module = self.runtime_info.env_module();
+        let MemoryInitialization::Static { map } = &module.memory_initialization else {
+            return Ok(());
+        };
+
+        let mut initializers = TryVec::new();
+        for (memory_index, init) in map {
+            if !module.transaction_objects.is_tmemory(memory_index) {
+                continue;
+            }
+            let Some((offset, data_index)) = init else {
+                continue;
+            };
+
+            let offset = usize::try_from(*offset).map_err(|_| OutOfMemory::new(usize::MAX))?;
+            let data = self.runtime_data(*data_index);
+            let mut copy = TryVec::with_capacity(data.len())?;
+            for byte in data {
+                copy.push(*byte)?;
+            }
+            initializers.push((memory_index, offset, copy))?;
+        }
+
+        let sidecar = self.as_mut().tmemory_sidecar_mut();
+        for (memory_index, offset, data) in initializers {
+            let Some(tmemory) = sidecar.get_mut(memory_index) else {
+                continue;
+            };
+            tmemory
+                .commit_range(offset, &data)
+                .map_err(|_| OutOfMemory::new(data.len()))?;
+        }
+
+        Ok(())
     }
 
     #[cfg(has_virtual_memory)]

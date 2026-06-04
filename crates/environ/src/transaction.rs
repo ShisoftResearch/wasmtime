@@ -423,6 +423,17 @@ pub fn decode_transaction_object_metadata(bytes: &[u8]) -> WasmResult<Transactio
         cursor += len;
     }
 
+    let mut functions = alloc::vec::Vec::new();
+    if cursor < bytes.len() {
+        let (function_count, function_count_len) = read_u32_leb(&bytes[cursor..], cursor)?;
+        cursor += function_count_len;
+        for _ in 0..function_count {
+            let (index, len) = read_u32_leb(&bytes[cursor..], cursor)?;
+            functions.push(FuncIndex::from_u32(index));
+            cursor += len;
+        }
+    }
+
     if cursor != bytes.len() {
         return Err(WasmError::InvalidWebAssembly {
             message: "trailing transaction object metadata bytes".into(),
@@ -430,13 +441,10 @@ pub fn decode_transaction_object_metadata(bytes: &[u8]) -> WasmResult<Transactio
         });
     }
 
-    // Custom-section metadata version 1 carries only tmemory/tglobal indices.
-    // Transactional-function population stays empty here until the parser
-    // bridge work extends how this metadata is produced in a later task.
     Ok(TransactionObjectMetadata {
         memories,
         globals,
-        functions: alloc::vec::Vec::new(),
+        functions,
     })
 }
 
@@ -827,6 +835,19 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_metadata_decodes_tfunc_indices() {
+        let metadata = decode_transaction_object_metadata(&[1, 1, 0, 0, 2, 1, 3]).unwrap();
+
+        assert!(metadata.is_tmemory(MemoryIndex::from_u32(0)));
+        assert!(metadata.is_tfunc(FuncIndex::from_u32(1)));
+        assert!(metadata.is_tfunc(FuncIndex::from_u32(3)));
+        assert_eq!(
+            metadata.tfuncs().collect::<alloc::vec::Vec<_>>(),
+            vec![FuncIndex::from_u32(1), FuncIndex::from_u32(3)]
+        );
+    }
+
+    #[test]
     fn transaction_object_metadata_tracks_tfuncs() {
         use crate::FuncIndex;
 
@@ -867,12 +888,15 @@ mod tests {
         let decoded = postcard::from_bytes::<TransactionObjectMetadata>(&bytes).unwrap();
 
         assert!(decoded.is_tfunc(function));
-        assert_eq!(decoded.tfuncs().collect::<alloc::vec::Vec<_>>(), vec![function]);
+        assert_eq!(
+            decoded.tfuncs().collect::<alloc::vec::Vec<_>>(),
+            vec![function]
+        );
     }
 
     #[test]
     fn transaction_object_metadata_rejects_trailing_bytes() {
-        let error = decode_transaction_object_metadata(&[1, 0, 0, 0]).unwrap_err();
+        let error = decode_transaction_object_metadata(&[1, 0, 0, 1]).unwrap_err();
 
         match error {
             WasmError::InvalidWebAssembly { message, .. } => {

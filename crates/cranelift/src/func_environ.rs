@@ -253,6 +253,9 @@ pub struct FuncEnvironment<'module_environment> {
     /// needs to commit an active transaction before normal returns.
     transaction_may_be_active_on_return: bool,
 
+    /// Whether the currently translated wasm function was declared as `tfunc`.
+    is_current_tfunc: bool,
+
     /// Function-local flag set by dynamically executed `ttry`.
     transaction_began_in_function_var: Variable,
 }
@@ -275,6 +278,9 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         let branch_hints = func_index
             .and_then(|func_index| translation.branch_hints(func_index))
             .map(|reader| reader.into_iter().peekable());
+        let is_current_tfunc = func_index
+            .map(|func_index| translation.module.transaction_objects.is_tfunc(func_index))
+            .unwrap_or(false);
 
         // This isn't used during translation, so squash the warning about this
         // being unused from the compiler.
@@ -331,6 +337,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
             alias_regions: std::collections::HashMap::new(),
             transaction_may_be_active_on_return: false,
+            is_current_tfunc,
             transaction_began_in_function_var: Variable::reserved_value(),
         }
     }
@@ -3570,32 +3577,20 @@ impl FuncEnvironment<'_> {
         )
     }
 
-    fn translate_transaction_begin_if_needed(
+    fn translate_transaction_enter_tfunc(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
     ) -> WasmResult<()> {
         self.transaction_may_be_active_on_return = true;
-
-        let began = builder.use_var(self.transaction_began_in_function_var);
-        let should_begin = builder.ins().icmp_imm(IntCC::Equal, began, 0);
-        let begin_block = builder.create_block();
-        let continuation_block = builder.create_block();
-        builder
-            .ins()
-            .brif(should_begin, begin_block, &[], continuation_block, &[]);
-
-        builder.switch_to_block(begin_block);
-        self.translate_transaction_lifecycle_builtin(
-            builder,
-            BuiltinFunctionIndex::transaction_begin(),
-        )?;
-        let began = builder.ins().iconst(I8, 1);
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_enter_tfunc(),
+        );
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let call = builder.ins().call(callee, &[vmctx]);
+        let began = builder.func.dfg.inst_results(call)[0];
+        let began = builder.ins().ireduce(I8, began);
         builder.def_var(self.transaction_began_in_function_var, began);
-        builder.ins().jump(continuation_block, &[]);
-
-        builder.seal_block(begin_block);
-        builder.switch_to_block(continuation_block);
-        builder.seal_block(continuation_block);
         Ok(())
     }
 
@@ -3605,7 +3600,6 @@ impl FuncEnvironment<'_> {
         global: GlobalIndex,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_global(global)?;
-        self.translate_transaction_begin_if_needed(builder)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
         let result_ty = self.transaction_global_value_type(wasm_ty)?;
         let callee = self.builtin_functions.load_builtin(
@@ -3632,7 +3626,6 @@ impl FuncEnvironment<'_> {
         val: ir::Value,
     ) -> WasmResult<()> {
         self.ensure_transaction_global(global)?;
-        self.translate_transaction_begin_if_needed(builder)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
         let expected_ty = self.transaction_global_value_type(wasm_ty)?;
         debug_assert_eq!(expected_ty, builder.func.dfg.value_type(val));
@@ -3700,7 +3693,6 @@ impl FuncEnvironment<'_> {
         len: u32,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
-        self.translate_transaction_begin_if_needed(builder)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_load(),
@@ -3730,7 +3722,6 @@ impl FuncEnvironment<'_> {
         len: u32,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
-        self.translate_transaction_begin_if_needed(builder)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_store(),
@@ -3790,7 +3781,6 @@ impl FuncEnvironment<'_> {
         delta: ir::Value,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
-        self.translate_transaction_begin_if_needed(builder)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_grow(),
@@ -5498,6 +5488,9 @@ impl FuncEnvironment<'_> {
             self.transaction_began_in_function_var,
             did_not_begin_transaction,
         );
+        if self.is_current_tfunc {
+            self.translate_transaction_enter_tfunc(builder)?;
+        }
 
         // If an explicit stack limit is requested, emit one here at the start
         // of the function.

@@ -5,6 +5,9 @@ macro_rules! foreach_builtin_function {
         $mac! {
             // Returns an index for wasm's `memory.grow` builtin function.
             memory_grow(vmctx: vmctx, delta: u64, index: u32) -> pointer;
+            // Begins a transactional WebAssembly transaction for `tfunc` entry
+            // if no transaction is already active.
+            transaction_enter_tfunc(vmctx: vmctx) -> u64;
             // Begins a transactional WebAssembly transaction.
             transaction_begin(vmctx: vmctx) -> bool;
             // Commits a transactional WebAssembly transaction.
@@ -392,6 +395,7 @@ impl BuiltinFunctionIndex {
 
             // Failure here indicates GC heap corruption.
             (@get get_interned_func_ref pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_enter_tfunc u64) => (TrapSentinel::NegativeOne);
             (@get transaction_tglobal_get pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_load pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_store pointer) => (TrapSentinel::NegativeOne);
@@ -458,6 +462,11 @@ mod tests {
         assert!(matches!(
             BuiltinFunctionIndex::transaction_tmemory_grow().trap_sentinel(),
             Some(TrapSentinel::NegativeTwo)
+        ));
+
+        assert!(matches!(
+            BuiltinFunctionIndex::transaction_enter_tfunc().trap_sentinel(),
+            Some(TrapSentinel::NegativeOne)
         ));
 
         for builtin in [

@@ -271,6 +271,15 @@ fn memory_grow(
 // These helpers execute compiled transactional operators against store-local
 // staged overlays and ordinary Wasmtime memory/global backing until tmemory
 // storage, persistent backends, and the transaction object table are wired.
+fn transaction_enter_tfunc(store: &mut dyn VMStore, _instance: InstanceId) -> Result<u32> {
+    let state = store.store_opaque_mut().transaction_state_mut();
+    if state.active_transaction().is_some() {
+        return Ok(0);
+    }
+    state.begin()?;
+    Ok(1)
+}
+
 fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
     store.store_opaque_mut().transaction_state_mut().begin()?;
     Ok(())

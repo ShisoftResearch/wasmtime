@@ -458,6 +458,53 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Runtime Core: tfunc Boundary And VMemory/tdata Fixes
+
+Date: 2026-06-04
+
+Implemented the first real Wizard-style transaction boundary for compiled
+transaction functions:
+
+- The transaction object metadata decoder now carries `tfunc` indices through
+  module translation.
+- Cranelift lowers `tfunc` entry to `transaction_enter_tfunc`; the libcall
+  opens a transaction only when the caller has not already entered one.
+- Normal return commits only transactions opened by the current `tfunc`.
+  Nested transactional calls reuse the active transaction and do not commit at
+  the inner return.
+- Scalar transactional memory/global operations no longer lazily open a
+  transaction on each operation; ordinary `func` bodies now require an already
+  active transaction for those operations.
+
+Runtime tmemory fixes in this tranche:
+
+- Unbounded `VMemory` reserves the Wasm32 default maximum of 65536 pages, so
+  `(tmemory 0)` can grow according to the proposal WAST expectations.
+- Static active `tdata` initializers are copied into the per-instance `TMemory`
+  sidecar before ordinary VMContext initialization can null out runtime data
+  pointers for COW memory initialization.
+
+Still deferred:
+
+- `tcall` is not yet a distinct non-transactional-to-transactional boundary;
+  text support still aliases it to ordinary call behavior in the current parser
+  bridge.
+- Dynamic/global-offset `tdata` initialization is not replayed into `TMemory`;
+  the current sidecar replay only handles static active initializers.
+- The remaining ignored WAST groups still require parser cleanup, full
+  validation/object-table work, SIMD transactional memory operations, and
+  later `ttry`/`tfail` semantics.
+
+Verification:
+
+```text
+CARGO_INCREMENTAL=0 cargo test -p wasmtime --lib mock_transaction_static_tdata_initializes_tmemory_sidecar
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 69 passed; 0 failed; 47 ignored; 0 measured; 3495 filtered out
+```
+
 ## Harness Mock: Transactional Function References
 
 Date: 2026-06-04

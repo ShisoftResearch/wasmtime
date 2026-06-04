@@ -13,6 +13,7 @@ use crate::runtime::vm::{HostAlignedByteCount, Mmap, mmap::AlignedLength};
 use wasmtime_environ::MemoryIndex;
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
+const DEFAULT_MAX_WASM_PAGES: u64 = 1 << 16;
 
 /// Wizard-compatible transactional memory granule shift.
 pub const TMEMORY_GRANULE_SHIFT: usize = 8;
@@ -204,7 +205,7 @@ pub(crate) struct VMemory {
 impl VMemory {
     pub(crate) fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
         let byte_len = pages_to_bytes(min_pages)?;
-        let byte_capacity = pages_to_bytes(max_pages.unwrap_or(min_pages))?;
+        let byte_capacity = pages_to_bytes(max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES))?;
         ensure!(byte_len <= byte_capacity, "tmemory minimum exceeds maximum");
 
         let granule_capacity = granules_for_bytes(byte_capacity);
@@ -600,6 +601,18 @@ mod tests {
 
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
         assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn vmemory_unbounded_constructor_reserves_default_wasm_capacity() {
+        let mut memory = TMemory::new_vmemory_with_limits(0, None).unwrap();
+
+        assert_eq!(memory.byte_len(), 0);
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 65536);
+
+        memory.grow_to_pages(1).unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
     }
 
     #[test]

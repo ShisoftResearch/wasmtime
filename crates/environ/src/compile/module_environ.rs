@@ -1567,7 +1567,9 @@ mod tests {
             r#"
             (module
               (tmemory 1)
-              (tglobal (mut i32) (i32.const 0)))
+              (tglobal (mut i32) (i32.const 0))
+              (tfunc (result i32)
+                (tmemory.size)))
             "#,
         )
         .unwrap();
@@ -1594,6 +1596,12 @@ mod tests {
                 .module
                 .transaction_objects
                 .is_tglobal(GlobalIndex::from_u32(0))
+        );
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_tfunc(FuncIndex::from_u32(0))
         );
     }
 }

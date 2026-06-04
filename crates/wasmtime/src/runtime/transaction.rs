@@ -1577,10 +1577,9 @@ mod tests {
             r#"
             (module
               (tmemory 1)
-              (func (export "write")
-                (ttry)
+              (tfunc (export "write")
                 (i32.tstore (i32.const 0) (i32.const 42)))
-              (func (export "read") (result i32)
+              (tfunc (export "read") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
         );
@@ -1599,16 +1598,16 @@ mod tests {
     }
 
     #[test]
-    fn mock_transaction_store_without_explicit_ttry_commits_on_return() {
+    fn mock_transaction_tfunc_store_commits_on_return() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
             &engine,
             r#"
             (module
               (tmemory 1)
-              (func (export "write")
+              (tfunc (export "write")
                 (i32.tstore (i32.const 0) (i32.const 42)))
-              (func (export "read") (result i32)
+              (tfunc (export "read") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
         );
@@ -1624,6 +1623,38 @@ mod tests {
         write.call(&mut store, ()).unwrap();
 
         assert_eq!(read.call(&mut store, ()).unwrap(), 42);
+    }
+
+    #[test]
+    fn mock_transaction_nested_tfunc_reuses_active_transaction_until_outer_return() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (tfunc $inner
+                (i32.tstore (i32.const 0) (i32.const 1)))
+              (tfunc (export "outer_fail")
+                (call $inner)
+                (i32.tstore (i32.const 0) (i32.const 2))
+                (tfail))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let outer_fail = instance
+            .get_typed_func::<(), ()>(&mut store, "outer_fail")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        outer_fail.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 0);
     }
 
     #[test]
@@ -1824,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_transaction_memory_size_requires_active_transaction() {
+    fn mock_transaction_plain_func_memory_size_requires_active_transaction() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
             &engine,
@@ -1832,7 +1863,6 @@ mod tests {
             (module
               (tmemory 2)
               (func (export "size") (result i32)
-                (ttry)
                 (tmemory.size)))
             "#,
         );
@@ -1842,22 +1872,24 @@ mod tests {
             .get_typed_func::<(), i32>(&mut store, "size")
             .unwrap();
 
-        assert_eq!(size.call(&mut store, ()).unwrap(), 2);
+        let error = size.call(&mut store, ()).unwrap_err();
+
+        assert!(
+            format!("{error:?}").contains("transaction operation requires an active transaction")
+        );
     }
 
     #[test]
-    fn mock_transaction_zero_memory_size_and_grow_commit_against_tmemory() {
+    fn mock_transaction_tfunc_size_and_grow_commit_against_tmemory() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
             &engine,
             r#"
             (module
               (tmemory 0 1)
-              (func (export "size") (result i32)
-                (ttry)
+              (tfunc (export "size") (result i32)
                 (tmemory.size))
-              (func (export "grow") (param i32) (result i32)
-                (ttry)
+              (tfunc (export "grow") (param i32) (result i32)
                 (tmemory.grow (local.get 0))))
             "#,
         );
@@ -1873,6 +1905,28 @@ mod tests {
         assert_eq!(size.call(&mut store, ()).unwrap(), 0);
         assert_eq!(grow.call(&mut store, 1).unwrap(), 0);
         assert_eq!(size.call(&mut store, ()).unwrap(), 1);
+    }
+
+    #[test]
+    fn mock_transaction_static_tdata_initializes_tmemory_sidecar() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (tdata (i32.const 0) "abcdefgh")
+              (tfunc (export "read") (result i64)
+                (i64.tload (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let read = instance
+            .get_typed_func::<(), i64>(&mut store, "read")
+            .unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 0x6867_6665_6463_6261);
     }
 
     #[test]
@@ -1906,14 +1960,12 @@ mod tests {
             r#"
             (module
               (tmemory 1)
-              (func (export "trap")
-                (ttry)
+              (tfunc (export "trap")
                 (i32.tstore (i32.const 0) (i32.const 42))
                 (drop (i32.tload (i32.const 65536))))
-              (func (export "write")
-                (ttry)
+              (tfunc (export "write")
                 (i32.tstore (i32.const 0) (i32.const 7)))
-              (func (export "read") (result i32)
+              (tfunc (export "read") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
         );
@@ -1946,10 +1998,10 @@ mod tests {
               (type $sig (func))
               (tmemory 1)
               (table 0 funcref)
-              (func (export "trap_after_tload")
+              (tfunc (export "trap_after_tload")
                 (drop (i32.tload (i32.const 0)))
                 (call_indirect (type $sig) (i32.const 0)))
-              (func (export "recover") (result i32)
+              (tfunc (export "recover") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
         );
@@ -2012,10 +2064,9 @@ mod tests {
             (module
               (import "env" "ordinary" (memory 1))
               (tmemory $tx 1)
-              (func (export "write")
-                (ttry)
+              (tfunc (export "write")
                 (i32.tstore $tx (i32.const 0) (i32.const 55)))
-              (func (export "read_tx") (result i32)
+              (tfunc (export "read_tx") (result i32)
                 (i32.tload $tx (i32.const 0))))
             "#,
         );
@@ -2050,10 +2101,9 @@ mod tests {
             r#"
             (module
               (import "env" "tx" (tmemory $tx 1))
-              (func (export "write")
-                (ttry)
+              (tfunc (export "write")
                 (i32.tstore $tx (i32.const 0) (i32.const 66)))
-              (func (export "read_tx") (result i32)
+              (tfunc (export "read_tx") (result i32)
                 (i32.tload $tx (i32.const 0))))
             "#,
         );
@@ -2090,13 +2140,12 @@ mod tests {
             (module
               (import "env" "tx" (tmemory $imported 1))
               (tmemory $local 1)
-              (func (export "write_both")
-                (ttry)
+              (tfunc (export "write_both")
                 (i32.tstore $imported (i32.const 0) (i32.const 11))
                 (i32.tstore $local (i32.const 0) (i32.const 22)))
-              (func (export "read_imported") (result i32)
+              (tfunc (export "read_imported") (result i32)
                 (i32.tload $imported (i32.const 0)))
-              (func (export "read_local") (result i32)
+              (tfunc (export "read_local") (result i32)
                 (i32.tload $local (i32.const 0))))
             "#,
         );
