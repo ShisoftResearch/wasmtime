@@ -1,5 +1,4 @@
 use crate::{FuncIndex, GlobalIndex, MemoryIndex, WasmError, WasmResult};
-use serde_derive::{Deserialize, Serialize};
 
 /// Transaction opcode prefix used by Wizard and the simple-transactions
 /// proposal branch.
@@ -121,7 +120,7 @@ pub struct ResearchTransactionFixtureMetadata {
 
 /// Transactional object-space metadata decoded from
 /// [`TRANSACTION_OBJECTS_CUSTOM_SECTION`].
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TransactionObjectMetadata {
     /// Memories declared through the `tmemory` text alias.
     pub memories: alloc::vec::Vec<MemoryIndex>,
@@ -157,6 +156,59 @@ impl TransactionObjectMetadata {
     /// Returns whether `global` was declared as transactional.
     pub fn is_tglobal(&self, global: GlobalIndex) -> bool {
         self.globals.contains(&global)
+    }
+}
+
+impl serde::Serialize for TransactionObjectMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            use serde::ser::SerializeStruct;
+
+            let mut state = serializer.serialize_struct("TransactionObjectMetadata", 3)?;
+            state.serialize_field("memories", &self.memories)?;
+            state.serialize_field("globals", &self.globals)?;
+            state.serialize_field("functions", &self.functions)?;
+            state.end()
+        } else {
+            (&self.memories, &self.globals).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TransactionObjectMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            #[derive(serde::Deserialize)]
+            struct ReadableTransactionObjectMetadata {
+                memories: alloc::vec::Vec<MemoryIndex>,
+                globals: alloc::vec::Vec<GlobalIndex>,
+                #[serde(default)]
+                functions: alloc::vec::Vec<FuncIndex>,
+            }
+
+            let metadata = ReadableTransactionObjectMetadata::deserialize(deserializer)?;
+            Ok(TransactionObjectMetadata {
+                memories: metadata.memories,
+                globals: metadata.globals,
+                functions: metadata.functions,
+            })
+        } else {
+            let (memories, globals) = <(
+                alloc::vec::Vec<MemoryIndex>,
+                alloc::vec::Vec<GlobalIndex>,
+            )>::deserialize(deserializer)?;
+            Ok(TransactionObjectMetadata {
+                memories,
+                globals,
+                functions: alloc::vec::Vec::new(),
+            })
+        }
     }
 }
 
@@ -847,6 +899,27 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn transaction_object_metadata_deserializes_missing_functions_as_empty() {
+        #[derive(serde::Serialize)]
+        struct LegacyTransactionObjectMetadata {
+            memories: alloc::vec::Vec<MemoryIndex>,
+            globals: alloc::vec::Vec<GlobalIndex>,
+        }
+
+        let bytes = postcard::to_allocvec(&LegacyTransactionObjectMetadata {
+            memories: alloc::vec![MemoryIndex::from_u32(0)],
+            globals: alloc::vec![GlobalIndex::from_u32(2)],
+        })
+        .unwrap();
+
+        let metadata = postcard::from_bytes::<TransactionObjectMetadata>(&bytes).unwrap();
+
+        assert!(metadata.is_tmemory(MemoryIndex::from_u32(0)));
+        assert!(metadata.is_tglobal(GlobalIndex::from_u32(2)));
+        assert_eq!(metadata.tfuncs().len(), 0);
     }
 
     #[test]
