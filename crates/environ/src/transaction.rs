@@ -1,4 +1,4 @@
-use crate::{GlobalIndex, MemoryIndex, WasmError, WasmResult};
+use crate::{FuncIndex, GlobalIndex, MemoryIndex, WasmError, WasmResult};
 use serde_derive::{Deserialize, Serialize};
 
 /// Transaction opcode prefix used by Wizard and the simple-transactions
@@ -127,9 +127,28 @@ pub struct TransactionObjectMetadata {
     pub memories: alloc::vec::Vec<MemoryIndex>,
     /// Globals declared through the `tglobal` text alias.
     pub globals: alloc::vec::Vec<GlobalIndex>,
+    /// Functions declared through the `tfunc` text alias.
+    pub functions: alloc::vec::Vec<FuncIndex>,
 }
 
 impl TransactionObjectMetadata {
+    /// Records `index` as transactional.
+    pub fn add_tfunc(&mut self, index: FuncIndex) {
+        if !self.functions.contains(&index) {
+            self.functions.push(index);
+        }
+    }
+
+    /// Returns whether `index` was declared as transactional.
+    pub fn is_tfunc(&self, index: FuncIndex) -> bool {
+        self.functions.contains(&index)
+    }
+
+    /// Returns all transactional functions.
+    pub fn tfuncs(&self) -> impl ExactSizeIterator<Item = FuncIndex> + '_ {
+        self.functions.iter().copied()
+    }
+
     /// Returns whether `memory` was declared as transactional.
     pub fn is_tmemory(&self, memory: MemoryIndex) -> bool {
         self.memories.contains(&memory)
@@ -406,7 +425,11 @@ pub fn decode_transaction_object_metadata(bytes: &[u8]) -> WasmResult<Transactio
         });
     }
 
-    Ok(TransactionObjectMetadata { memories, globals })
+    Ok(TransactionObjectMetadata {
+        memories,
+        globals,
+        functions: alloc::vec::Vec::new(),
+    })
 }
 
 fn parse_research_code_section(
@@ -793,6 +816,25 @@ mod tests {
         assert!(!metadata.is_tmemory(MemoryIndex::from_u32(1)));
         assert!(metadata.is_tglobal(GlobalIndex::from_u32(2)));
         assert!(!metadata.is_tglobal(GlobalIndex::from_u32(0)));
+    }
+
+    #[test]
+    fn transaction_metadata_tracks_tfuncs() {
+        use crate::FuncIndex;
+
+        let mut metadata = TransactionObjectMetadata::default();
+        let f0 = FuncIndex::from_u32(0);
+        let f1 = FuncIndex::from_u32(1);
+
+        assert!(!metadata.is_tfunc(f0));
+        assert!(!metadata.is_tfunc(f1));
+
+        metadata.add_tfunc(f0);
+        metadata.add_tfunc(f0);
+
+        assert!(metadata.is_tfunc(f0));
+        assert!(!metadata.is_tfunc(f1));
+        assert_eq!(metadata.tfuncs().collect::<alloc::vec::Vec<_>>(), vec![f0]);
     }
 
     #[test]
