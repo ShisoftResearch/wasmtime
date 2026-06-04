@@ -57,7 +57,7 @@
 use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, InstanceId, StoreOpaque};
-use crate::runtime::transaction::{StagedRecord, TMEMORY_GRANULE_SIZE};
+use crate::runtime::transaction::{GlobalSnapshot, StagedRecord, TMEMORY_GRANULE_SIZE};
 #[cfg(feature = "gc")]
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{self, HostResultHasUnwindSentinel, VMStore, f32x4, f64x2, i8x16};
@@ -68,8 +68,8 @@ use core::ptr::NonNull;
 use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
-    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, PassiveElemIndex, TableIndex,
-    Trap,
+    CompiledTrap, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, FuncIndex,
+    GlobalIndex, PassiveElemIndex, TableIndex, Trap, WasmValType,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::AccessError::{
@@ -299,21 +299,153 @@ fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()
 }
 
 fn transaction_tglobal_get(
-    _store: &mut dyn VMStore,
-    _instance: InstanceId,
-    _global: u32,
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
 ) -> Result<*mut u8> {
-    bail!("transactional global get helper is not implemented")
+    let result = transaction_tglobal_get_impl(store, instance, global);
+    abort_active_transaction_on_error(store, &result);
+    result
 }
 
 fn transaction_tglobal_set(
-    _store: &mut dyn VMStore,
-    _instance: InstanceId,
-    _global: u32,
-    _tag: u32,
-    _value: u64,
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    tag: u32,
+    value: u64,
 ) -> Result<()> {
-    bail!("transactional global set helper is not implemented")
+    let result = transaction_tglobal_set_impl(store, instance, global, tag, value);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tglobal_get_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+) -> Result<*mut u8> {
+    flush_pending_tmemory_store(store, instance)?;
+
+    let (global_index, wasm_ty) = defined_transaction_global(store, instance, global)?;
+    let staged = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        ensure!(
+            state.active_transaction().is_some(),
+            "no active transaction in this store"
+        );
+        state.staged_global_owned(Some(instance), global_index.as_u32())
+    };
+    let snapshot = match staged {
+        Some(snapshot) => snapshot,
+        None => read_global_snapshot(store, instance, global_index, wasm_ty)?,
+    };
+    ensure_global_snapshot_type(snapshot, wasm_ty)?;
+
+    let bytes = global_snapshot_bytes(snapshot);
+    Ok(store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .set_scratch(bytes))
+}
+
+fn transaction_tglobal_set_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    tag: u32,
+    value: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+
+    let (global_index, wasm_ty) = defined_transaction_global(store, instance, global)?;
+    let snapshot = global_snapshot_from_tag(tag, value)?;
+    ensure_global_snapshot_type(snapshot, wasm_ty)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_global_owned(Some(instance), global_index.as_u32(), snapshot)?;
+    Ok(())
+}
+
+fn defined_transaction_global(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+) -> Result<(DefinedGlobalIndex, WasmValType)> {
+    let global = GlobalIndex::from_u32(global);
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let module = instance_ref.env_module();
+    let wasm_ty = module.globals[global].wasm_ty;
+    let Some(index) = module.defined_global_index(global) else {
+        bail!("transactional imported globals are not implemented in the mock runtime");
+    };
+    Ok((index, wasm_ty))
+}
+
+fn global_snapshot_from_tag(tag: u32, value: u64) -> Result<GlobalSnapshot> {
+    match tag {
+        0 => Ok(GlobalSnapshot::I32(value as u32 as i32)),
+        1 => Ok(GlobalSnapshot::I64(value as i64)),
+        2 => Ok(GlobalSnapshot::F32(value as u32)),
+        3 => Ok(GlobalSnapshot::F64(value)),
+        _ => bail!("unknown transactional global value tag: {tag}"),
+    }
+}
+
+fn read_global_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: DefinedGlobalIndex,
+    ty: WasmValType,
+) -> Result<GlobalSnapshot> {
+    let instance_ref = store.instance_mut(instance);
+    let global = unsafe { instance_ref.as_ref().global_ptr(global).as_ref() };
+    match ty {
+        WasmValType::I32 => Ok(GlobalSnapshot::I32(unsafe { *global.as_i32() })),
+        WasmValType::I64 => Ok(GlobalSnapshot::I64(unsafe { *global.as_i64() })),
+        WasmValType::F32 => Ok(GlobalSnapshot::F32(unsafe { *global.as_f32_bits() })),
+        WasmValType::F64 => Ok(GlobalSnapshot::F64(unsafe { *global.as_f64_bits() })),
+        WasmValType::V128 | WasmValType::Ref(_) => {
+            bail!("transactional global type is not implemented yet")
+        }
+    }
+}
+
+fn write_global_snapshot(global: &mut vm::VMGlobalDefinition, value: GlobalSnapshot) {
+    unsafe {
+        match value {
+            GlobalSnapshot::I32(value) => *global.as_i32_mut() = value,
+            GlobalSnapshot::I64(value) => *global.as_i64_mut() = value,
+            GlobalSnapshot::F32(value) => *global.as_f32_bits_mut() = value,
+            GlobalSnapshot::F64(value) => *global.as_f64_bits_mut() = value,
+        }
+    }
+}
+
+fn ensure_global_snapshot_type(value: GlobalSnapshot, ty: WasmValType) -> Result<()> {
+    let matches = matches!(
+        (value, ty),
+        (GlobalSnapshot::I32(_), WasmValType::I32)
+            | (GlobalSnapshot::I64(_), WasmValType::I64)
+            | (GlobalSnapshot::F32(_), WasmValType::F32)
+            | (GlobalSnapshot::F64(_), WasmValType::F64)
+    );
+    ensure!(
+        matches,
+        "transactional global value tag does not match global type"
+    );
+    Ok(())
+}
+
+fn global_snapshot_bytes(value: GlobalSnapshot) -> Vec<u8> {
+    match value {
+        GlobalSnapshot::I32(value) => value.to_ne_bytes().to_vec(),
+        GlobalSnapshot::I64(value) => value.to_ne_bytes().to_vec(),
+        GlobalSnapshot::F32(value) => value.to_ne_bytes().to_vec(),
+        GlobalSnapshot::F64(value) => value.to_ne_bytes().to_vec(),
+    }
 }
 
 fn transaction_tmemory_load(
@@ -603,7 +735,17 @@ fn apply_staged_transaction_record(
             let memory = instance_ref.as_mut().get_defined_memory_mut(memory_index);
             write_memory_bytes(memory, addr, bytes)?;
         }
-        StagedRecord::Global { .. } => {}
+        StagedRecord::Global {
+            owner_instance,
+            global_index,
+            value,
+        } => {
+            let owner = owner_instance.unwrap_or(instance);
+            let global_index = DefinedGlobalIndex::from_u32(*global_index);
+            let mut instance_ref = store.instance_mut(owner);
+            let global = unsafe { instance_ref.as_mut().global_ptr(global_index).as_mut() };
+            write_global_snapshot(global, *value);
+        }
         StagedRecord::MemorySize { .. } => {
             // The mock grow path delegates to ordinary memory.grow immediately;
             // rollback of successful grows is deferred.

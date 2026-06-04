@@ -97,7 +97,7 @@ pub(crate) struct TransactionId(u64);
 pub(crate) struct TransactionState {
     active: Option<TransactionId>,
     next_id: u64,
-    staged_globals: BTreeMap<u32, GlobalSnapshot>,
+    staged_globals: BTreeMap<GlobalObjectKey, GlobalSnapshot>,
     staged_memory_granules: BTreeMap<MemoryGranuleKey, Vec<u8>>,
     staged_memory_sizes: BTreeMap<MemoryObjectKey, u64>,
     memory_read_granules: BTreeSet<MemoryGranuleKey>,
@@ -125,6 +125,7 @@ impl Default for TransactionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StagedRecord {
     Global {
+        owner_instance: Option<InstanceId>,
         global_index: u32,
         value: GlobalSnapshot,
     },
@@ -145,6 +146,14 @@ pub(crate) enum StagedRecord {
 pub(crate) enum GlobalSnapshot {
     I32(i32),
     I64(i64),
+    F32(u32),
+    F64(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GlobalObjectKey {
+    owner_instance: Option<u32>,
+    global_index: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -293,9 +302,10 @@ impl TransactionState {
     pub(crate) fn staged_records(&self) -> Result<Vec<StagedRecord>> {
         self.ensure_active()?;
         let mut records = Vec::new();
-        for (&global_index, &value) in &self.staged_globals {
+        for (key, &value) in &self.staged_globals {
             records.push(StagedRecord::Global {
-                global_index,
+                owner_instance: key.owner_instance.map(InstanceId::from_u32),
+                global_index: key.global_index,
                 value,
             });
         }
@@ -349,8 +359,30 @@ impl TransactionState {
         global_index: u32,
         value: GlobalSnapshot,
     ) -> Result<bool> {
+        self.stage_global_owned(None, global_index, value)
+    }
+
+    pub(crate) fn stage_global_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        global_index: u32,
+        value: GlobalSnapshot,
+    ) -> Result<bool> {
         self.ensure_active()?;
-        Ok(self.staged_globals.insert(global_index, value).is_none())
+        Ok(self
+            .staged_globals
+            .insert(global_object_key(owner_instance, global_index), value)
+            .is_none())
+    }
+
+    pub(crate) fn staged_global_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        global_index: u32,
+    ) -> Option<GlobalSnapshot> {
+        self.staged_globals
+            .get(&global_object_key(owner_instance, global_index))
+            .copied()
     }
 
     pub(crate) fn stage_memory_granule(
@@ -708,6 +740,13 @@ fn memory_object_key(owner_instance: Option<InstanceId>, memory_index: u32) -> M
     }
 }
 
+fn global_object_key(owner_instance: Option<InstanceId>, global_index: u32) -> GlobalObjectKey {
+    GlobalObjectKey {
+        owner_instance: owner_instance.map(InstanceId::as_u32),
+        global_index,
+    }
+}
+
 fn memory_granule_key(
     owner_instance: Option<InstanceId>,
     memory_index: u32,
@@ -842,6 +881,173 @@ mod tests {
         write_fail.call(&mut store, ()).unwrap();
 
         assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+    }
+
+    #[test]
+    fn mock_transaction_global_i32_set_commits_to_backing_global() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tglobal $g (mut i32) (i32.const 0))
+              (func (export "write")
+                (ttry)
+                (tglobal.set $g (i32.const 42)))
+              (func (export "read") (result i32)
+                (global.get $g)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 42);
+    }
+
+    #[test]
+    fn mock_transaction_global_i64_fail_discards_staged_write() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tglobal $g (mut i64) (i64.const 7))
+              (func (export "write_fail")
+                (ttry)
+                (tglobal.set $g (i64.const 99))
+                (tfail))
+              (func (export "read") (result i64)
+                (global.get $g)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write_fail = instance
+            .get_typed_func::<(), ()>(&mut store, "write_fail")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i64>(&mut store, "read")
+            .unwrap();
+
+        write_fail.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 7);
+    }
+
+    #[test]
+    fn mock_transaction_global_get_observes_staged_i32_write() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tglobal $g (mut i32) (i32.const 1))
+              (func (export "write_read") (result i32)
+                (ttry)
+                (tglobal.set $g (i32.const 77))
+                (tglobal.get $g)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write_read = instance
+            .get_typed_func::<(), i32>(&mut store, "write_read")
+            .unwrap();
+
+        assert_eq!(write_read.call(&mut store, ()).unwrap(), 77);
+    }
+
+    #[test]
+    fn mock_transaction_global_imported_tglobal_is_unsupported_without_backing_write() {
+        let engine = crate::Engine::default();
+        let provider = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tglobal $g (export "g") (mut i32) (i32.const 5))
+              (func (export "read") (result i32)
+                (global.get $g)))
+            "#,
+        );
+        let consumer = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (import "env" "g" (tglobal $g (mut i32)))
+              (func (export "write")
+                (ttry)
+                (tglobal.set $g (i32.const 11))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
+        let global = provider.get_global(&mut store, "g").unwrap();
+        let consumer = crate::Instance::new(&mut store, &consumer, &[global.into()]).unwrap();
+        let write = consumer
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read = provider
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        let error = write.call(&mut store, ()).unwrap_err();
+
+        assert!(
+            format!("{error:?}")
+                .contains("transactional imported globals are not implemented in the mock runtime")
+        );
+        assert_eq!(read.call(&mut store, ()).unwrap(), 5);
+    }
+
+    #[test]
+    fn mock_transaction_global_float_sets_commit_bitwise() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tglobal $f32 (mut f32) (f32.const 0))
+              (tglobal $f64 (mut f64) (f64.const 0))
+              (func (export "write")
+                (ttry)
+                (tglobal.set $f32 (f32.const -13.5))
+                (tglobal.set $f64 (f64.const 42.25)))
+              (func (export "read_f32_bits") (result i32)
+                (i32.reinterpret_f32 (global.get $f32)))
+              (func (export "read_f64_bits") (result i64)
+                (i64.reinterpret_f64 (global.get $f64))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read_f32_bits = instance
+            .get_typed_func::<(), i32>(&mut store, "read_f32_bits")
+            .unwrap();
+        let read_f64_bits = instance
+            .get_typed_func::<(), i64>(&mut store, "read_f64_bits")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(
+            read_f32_bits.call(&mut store, ()).unwrap() as u32,
+            (-13.5f32).to_bits()
+        );
+        assert_eq!(
+            read_f64_bits.call(&mut store, ()).unwrap() as u64,
+            42.25f64.to_bits()
+        );
     }
 
     #[test]
@@ -1151,6 +1357,7 @@ mod tests {
             applied,
             [
                 StagedRecord::Global {
+                    owner_instance: None,
                     global_index: 3,
                     value: GlobalSnapshot::I64(22)
                 },
@@ -1364,6 +1571,7 @@ mod tests {
         assert_eq!(
             applied,
             [StagedRecord::Global {
+                owner_instance: None,
                 global_index: 3,
                 value: GlobalSnapshot::I64(22)
             }]
