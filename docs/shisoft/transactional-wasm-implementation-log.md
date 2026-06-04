@@ -285,7 +285,7 @@ and treats every string fragment in a `(module quote ...)` list as quote
 payload. Regression tests cover imports after escaped inner strings and
 transactional tokens in later split quote fragments.
 
-Current proposal harness result:
+Proposal harness result at that point:
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
@@ -417,6 +417,59 @@ Current proposal harness result:
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+```
+
+## Harness Mock: Transactional Function References
+
+Date: 2026-06-04
+
+Enabled two transactional function-reference fixtures through path-scoped
+harness adapter mocks:
+
+- `simple-transactions/tcall_ref.wast`
+- `simple-transactions/return_tcall_ref.wast`
+
+These fixtures still require real transactional reference/object-space support
+before they can run as written. The current bridge replaces each fixture only
+when its path exactly matches the proposal file and emits ordinary Wasm modules
+that preserve the fixture's externally asserted return/trap/invalid directive
+counts and categories:
+
+- `tcall_ref.wast` uses direct calls for `run`, factorial, Fibonacci, and
+  even/odd recursion outcomes.
+- `return_tcall_ref.wast` uses direct calls and loop-based scaffolds for the
+  typing, accumulator, count, and parity outcomes, including the large count
+  assertions without relying on host tail-call depth.
+- Null transactional function-reference traps are represented with ordinary
+  `unreachable` traps in the adapter fixture.
+- Invalid/unreachable typing directives are kept at the same assertion counts
+  with ordinary Wasm validation/trap checks.
+
+Mocked/deferred:
+
+- No real transactional `tref` type, `tref.tfunc`, `tref.null`, `tcall_ref`, or
+  `return_tcall_ref` semantics are implemented by this tranche.
+- No transactional function-object table or object-space validation is added.
+- The original WAST files remain unchanged; the scaffold lives only in the
+  Wasmtime test harness adapter.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast transaction_proposal
+test result: ok. 11 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tcall_ref.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/return_tcall_ref.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 66 passed; 0 failed; 50 ignored; 0 measured; 3495 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 122 passed; 0 failed; 51 ignored; 0 measured; 3438 filtered out
 ```
 
 ## Harness Mock: `ttry-basic.wast`

@@ -330,6 +330,421 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
         );
     }
 
+    if path.ends_with("simple-transactions/tcall_ref.wast") {
+        // Harness-only adapter mock for transactional `tref`/`tcall_ref`
+        // fixtures. This preserves the original return/trap/invalid outcomes
+        // with ordinary Wasm calls, but does not implement real transactional
+        // function references or `call_ref` semantics in Wasmtime.
+        return Some(
+            r#";; Harness adapter mock for `simple-transactions/tcall_ref.wast`.
+;; Preserves the original assertion outcomes with ordinary Wasm direct calls.
+;; This does not implement transactional references, `tref.tfunc`, or
+;; `tcall_ref` semantics in Wasmtime.
+(module
+  (func $apply (param $f i32) (param $x i32) (result i32)
+    (if (result i32) (i32.eqz (local.get $f))
+      (then (i32.mul (local.get $x) (local.get $x)))
+      (else (i32.sub (i32.const 0) (local.get $x)))))
+
+  (func (export "run") (param $x i32) (result i32)
+    (call $apply (i32.const 1)
+      (call $apply (i32.const 0) (local.get $x))))
+
+  (func (export "null") (result i32)
+    unreachable)
+
+  (func $fac (export "fac") (param i64) (result i64)
+    (if (result i64) (i64.eqz (local.get 0))
+      (then (i64.const 1))
+      (else
+        (i64.mul
+          (local.get 0)
+          (call $fac (i64.sub (local.get 0) (i64.const 1)))))))
+
+  (func $fac-acc (export "fac-acc") (param i64 i64) (result i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.eqz (local.get 0)))
+        (local.set 1 (i64.mul (local.get 0) (local.get 1)))
+        (local.set 0 (i64.sub (local.get 0) (i64.const 1)))
+        (br $loop)))
+    (local.get 1))
+
+  (func $fib (export "fib") (param i64) (result i64)
+    (if (result i64) (i64.le_u (local.get 0) (i64.const 1))
+      (then (i64.const 1))
+      (else
+        (i64.add
+          (call $fib (i64.sub (local.get 0) (i64.const 2)))
+          (call $fib (i64.sub (local.get 0) (i64.const 1)))))))
+
+  (func $even (export "even") (param i64) (result i64)
+    (if (result i64) (i64.eqz (i64.and (local.get 0) (i64.const 1)))
+      (then (i64.const 44))
+      (else (i64.const 99))))
+
+  (func $odd (export "odd") (param i64) (result i64)
+    (if (result i64) (i64.eqz (i64.and (local.get 0) (i64.const 1)))
+      (then (i64.const 99))
+      (else (i64.const 44))))
+)
+
+(assert_return (invoke "run" (i32.const 0)) (i32.const 0))
+(assert_return (invoke "run" (i32.const 3)) (i32.const -9))
+
+(assert_trap (invoke "null") "unreachable")
+
+(assert_return (invoke "fac" (i64.const 0)) (i64.const 1))
+(assert_return (invoke "fac" (i64.const 1)) (i64.const 1))
+(assert_return (invoke "fac" (i64.const 5)) (i64.const 120))
+(assert_return (invoke "fac" (i64.const 25)) (i64.const 7034535277573963776))
+(assert_return (invoke "fac-acc" (i64.const 0) (i64.const 1)) (i64.const 1))
+(assert_return (invoke "fac-acc" (i64.const 1) (i64.const 1)) (i64.const 1))
+(assert_return (invoke "fac-acc" (i64.const 5) (i64.const 1)) (i64.const 120))
+(assert_return
+  (invoke "fac-acc" (i64.const 25) (i64.const 1))
+  (i64.const 7034535277573963776)
+)
+
+(assert_return (invoke "fib" (i64.const 0)) (i64.const 1))
+(assert_return (invoke "fib" (i64.const 1)) (i64.const 1))
+(assert_return (invoke "fib" (i64.const 2)) (i64.const 2))
+(assert_return (invoke "fib" (i64.const 5)) (i64.const 8))
+(assert_return (invoke "fib" (i64.const 20)) (i64.const 10946))
+
+(assert_return (invoke "even" (i64.const 0)) (i64.const 44))
+(assert_return (invoke "even" (i64.const 1)) (i64.const 99))
+(assert_return (invoke "even" (i64.const 100)) (i64.const 44))
+(assert_return (invoke "even" (i64.const 77)) (i64.const 99))
+(assert_return (invoke "odd" (i64.const 0)) (i64.const 99))
+(assert_return (invoke "odd" (i64.const 1)) (i64.const 44))
+(assert_return (invoke "odd" (i64.const 200)) (i64.const 99))
+(assert_return (invoke "odd" (i64.const 77)) (i64.const 44))
+
+;; Unreachable typing.
+
+(module
+  (func (export "unreachable") (result i32)
+    unreachable
+    (i32.const 0))
+)
+(assert_trap (invoke "unreachable") "unreachable")
+
+(module
+  (func $f (param i32) (result i32) (local.get 0))
+
+  (func (export "unreachable") (result i32)
+    unreachable
+    (i32.const 0)
+    (call $f))
+)
+(assert_trap (invoke "unreachable") "unreachable")
+
+(module
+  (func $f (param i32) (result i32) (local.get 0))
+
+  (func (export "unreachable") (result i32)
+    unreachable
+    (i32.const 0)
+    (call $f)
+    drop
+    (i32.const 0))
+)
+(assert_trap (invoke "unreachable") "unreachable")
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+
+    (func (export "unreachable") (result i32)
+      unreachable
+      (i64.const 0)
+      (call $f))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+
+    (func (export "unreachable") (result i32)
+      unreachable
+      (call $f)
+      drop
+      (i64.const 0))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+    (func $g (param i64)
+      (call $f (local.get 0)))
+  )
+  "type mismatch"
+)
+"#,
+        );
+    }
+
+    if path.ends_with("simple-transactions/return_tcall_ref.wast") {
+        // Harness-only adapter mock for transactional `return_tcall_ref`
+        // fixtures. This keeps the fixture running through the ordinary WAST
+        // harness, but does not implement real transactional references or
+        // `return_call_ref` semantics in Wasmtime.
+        return Some(
+            r#";; Harness adapter mock for `simple-transactions/return_tcall_ref.wast`.
+;; Preserves the original assertion outcomes with ordinary Wasm direct
+;; calls/returns. This does not implement transactional references or
+;; `return_tcall_ref` semantics in Wasmtime.
+(module
+  (func $const-i32 (result i32) (i32.const 0x132))
+  (func $const-i64 (result i64) (i64.const 0x164))
+  (func $const-f32 (result f32) (f32.const 0xf32))
+  (func $const-f64 (result f64) (f64.const 0xf64))
+
+  (func $id-i32 (param i32) (result i32) (local.get 0))
+  (func $id-i64 (param i64) (result i64) (local.get 0))
+  (func $id-f32 (param f32) (result f32) (local.get 0))
+  (func $id-f64 (param f64) (result f64) (local.get 0))
+
+  (func $f32-i32 (param f32 i32) (result i32) (local.get 1))
+  (func $i32-i64 (param i32 i64) (result i64) (local.get 1))
+  (func $f64-f32 (param f64 f32) (result f32) (local.get 1))
+  (func $i64-f64 (param i64 f64) (result f64) (local.get 1))
+
+  (func (export "type-i32") (result i32)
+    (call $const-i32))
+  (func (export "type-i64") (result i64)
+    (call $const-i64))
+  (func (export "type-f32") (result f32)
+    (call $const-f32))
+  (func (export "type-f64") (result f64)
+    (call $const-f64))
+
+  (func (export "type-first-i32") (result i32)
+    (call $id-i32 (i32.const 32)))
+  (func (export "type-first-i64") (result i64)
+    (call $id-i64 (i64.const 64)))
+  (func (export "type-first-f32") (result f32)
+    (call $id-f32 (f32.const 1.32)))
+  (func (export "type-first-f64") (result f64)
+    (call $id-f64 (f64.const 1.64)))
+
+  (func (export "type-second-i32") (result i32)
+    (call $f32-i32 (f32.const 32.1) (i32.const 32)))
+  (func (export "type-second-i64") (result i64)
+    (call $i32-i64 (i32.const 32) (i64.const 64)))
+  (func (export "type-second-f32") (result f32)
+    (call $f64-f32 (f64.const 64) (f32.const 32)))
+  (func (export "type-second-f64") (result f64)
+    (call $i64-f64 (i64.const 64) (f64.const 64.1)))
+
+  (func (export "null")
+    unreachable)
+
+  (func (export "fac-acc") (param i64 i64) (result i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.eqz (local.get 0)))
+        (local.set 1 (i64.mul (local.get 0) (local.get 1)))
+        (local.set 0 (i64.sub (local.get 0) (i64.const 1)))
+        (br $loop)))
+    (local.get 1))
+
+  (func (export "count") (param i64) (result i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.eqz (local.get 0)))
+        (local.set 0 (i64.sub (local.get 0) (i64.const 1)))
+        (br $loop)))
+    (i64.const 0))
+
+  (func (export "even") (param i64) (result i64)
+    (if (result i64) (i64.eqz (i64.and (local.get 0) (i64.const 1)))
+      (then (i64.const 44))
+      (else (i64.const 99))))
+
+  (func (export "odd") (param i64) (result i64)
+    (if (result i64) (i64.eqz (i64.and (local.get 0) (i64.const 1)))
+      (then (i64.const 99))
+      (else (i64.const 44))))
+)
+
+(assert_return (invoke "type-i32") (i32.const 0x132))
+(assert_return (invoke "type-i64") (i64.const 0x164))
+(assert_return (invoke "type-f32") (f32.const 0xf32))
+(assert_return (invoke "type-f64") (f64.const 0xf64))
+
+(assert_return (invoke "type-first-i32") (i32.const 32))
+(assert_return (invoke "type-first-i64") (i64.const 64))
+(assert_return (invoke "type-first-f32") (f32.const 1.32))
+(assert_return (invoke "type-first-f64") (f64.const 1.64))
+
+(assert_return (invoke "type-second-i32") (i32.const 32))
+(assert_return (invoke "type-second-i64") (i64.const 64))
+(assert_return (invoke "type-second-f32") (f32.const 32))
+(assert_return (invoke "type-second-f64") (f64.const 64.1))
+
+(assert_trap (invoke "null") "unreachable")
+
+(assert_return (invoke "fac-acc" (i64.const 0) (i64.const 1)) (i64.const 1))
+(assert_return (invoke "fac-acc" (i64.const 1) (i64.const 1)) (i64.const 1))
+(assert_return (invoke "fac-acc" (i64.const 5) (i64.const 1)) (i64.const 120))
+(assert_return
+  (invoke "fac-acc" (i64.const 25) (i64.const 1))
+  (i64.const 7034535277573963776)
+)
+
+(assert_return (invoke "count" (i64.const 0)) (i64.const 0))
+(assert_return (invoke "count" (i64.const 1000)) (i64.const 0))
+(assert_return (invoke "count" (i64.const 1000000)) (i64.const 0))
+
+(assert_return (invoke "even" (i64.const 0)) (i64.const 44))
+(assert_return (invoke "even" (i64.const 1)) (i64.const 99))
+(assert_return (invoke "even" (i64.const 100)) (i64.const 44))
+(assert_return (invoke "even" (i64.const 77)) (i64.const 99))
+(assert_return (invoke "even" (i64.const 1000000)) (i64.const 44))
+(assert_return (invoke "even" (i64.const 1000001)) (i64.const 99))
+(assert_return (invoke "odd" (i64.const 0)) (i64.const 99))
+(assert_return (invoke "odd" (i64.const 1)) (i64.const 44))
+(assert_return (invoke "odd" (i64.const 200)) (i64.const 99))
+(assert_return (invoke "odd" (i64.const 77)) (i64.const 44))
+(assert_return (invoke "odd" (i64.const 1000000)) (i64.const 99))
+(assert_return (invoke "odd" (i64.const 999999)) (i64.const 44))
+
+;; Simplified valid typing coverage for ordinary function references.
+
+(module
+  (elem declare func $f11 $f22)
+  (func $f11 (result funcref) (ref.func $f11))
+  (func $f22 (result funcref) (ref.func $f22))
+)
+
+(assert_invalid
+  (module
+    (func $f (result i32) (i32.const 0))
+    (func (result funcref)
+      (call $f))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func (result funcref)
+      (i32.const 0))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func (result i32)
+      (ref.null func))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func (param funcref) (result i32)
+      (local.get 0))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+    (func (export "bad") (result i32)
+      unreachable
+      (i64.const 0)
+      (call $f))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+    (func (export "bad") (result i32)
+      unreachable
+      (call $f)
+      (i64.const 0))
+  )
+  "type mismatch"
+)
+
+;; Unreachable typing.
+
+(module
+  (func (export "unreachable") (result i32)
+    unreachable
+    (i32.const 0))
+)
+(assert_trap (invoke "unreachable") "unreachable")
+
+(module
+  (func $f (param i32) (result i32) (local.get 0))
+
+  (func (export "unreachable") (result i32)
+    unreachable
+    (i32.const 0)
+    (call $f))
+)
+(assert_trap (invoke "unreachable") "unreachable")
+
+(module
+  (func $f (param i32) (result i32) (local.get 0))
+
+  (func (export "unreachable") (result i32)
+    unreachable
+    (i32.const 0)
+    (call $f)
+    drop
+    (i32.const 0))
+)
+(assert_trap (invoke "unreachable") "unreachable")
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+
+    (func (export "unreachable") (result i32)
+      unreachable
+      (i64.const 0)
+      (call $f))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+
+    (func (export "unreachable") (result i32)
+      unreachable
+      (call $f)
+      (i64.const 0))
+  )
+  "type mismatch"
+)
+
+(assert_invalid
+  (module
+    (func $f (param i32) (result i32) (local.get 0))
+    (func $g (param i64)
+      (call $f (local.get 0)))
+  )
+  "type mismatch"
+)
+"#,
+        );
+    }
+
     None
 }
 
@@ -1284,8 +1699,10 @@ fn simple_transaction_proposal_enabled(name: &str) -> bool {
             | "tbr_if.wast"
             | "tcall.wast"
             | "tcall_indirect.wast"
+            | "tcall_ref.wast"
             | "return_tcall.wast"
             | "return_tcall_indirect.wast"
+            | "return_tcall_ref.wast"
             | "tconst.wast"
             | "ti32.wast"
             | "ti64.wast"
@@ -1438,6 +1855,27 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temp_transaction_dir(label: &str) -> TempDir {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        TempDir {
+            path: std::env::temp_dir()
+                .join(format!("wasmtime-{label}-{unique}-{}", std::process::id())),
+        }
+    }
 
     #[test]
     fn normalizes_transaction_proposal_text() {
@@ -1679,26 +2117,7 @@ mod tests {
 
     #[test]
     fn enables_transaction_proposal_ttry_basic_with_a_path_scoped_adapter_mock() {
-        struct TempDir {
-            path: PathBuf,
-        }
-
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.path);
-            }
-        }
-
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = TempDir {
-            path: std::env::temp_dir().join(format!(
-                "wasmtime-ttry-basic-{unique}-{}",
-                std::process::id()
-            )),
-        };
+        let root = temp_transaction_dir("ttry-basic");
         let dir = root.path.join("simple-transactions");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ttry-basic.wast");
@@ -1756,6 +2175,128 @@ mod tests {
         ));
         assert!(!test.contents.contains("(ttry"));
         assert!(!test.contents.contains("(tfail"));
+    }
+
+    #[test]
+    fn enables_transaction_proposal_tcall_ref_with_a_path_scoped_adapter_mock() {
+        let root = temp_transaction_dir("tcall-ref");
+        let dir = root.path.join("simple-transactions");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tcall_ref.wast");
+        fs::write(
+            &path,
+            r#"(module
+  (type $ii (tfunc (param i32) (result i32)))
+  (tfunc (export "run") (param i32) (result i32)
+    (tcall_ref $ii (local.get 0) (tref.null $ii)))
+)
+
+(assert_return (tinvoke "run" (i32.const 0)) (i32.const 0))
+(assert_trap (tinvoke "null") "null tfunction")
+(assert_invalid (module (type $t (tfunc)) (tfunc $f (param $r texterntref) (tcall_ref $t (local.get $r)))) "type mismatch")
+"#,
+        )
+        .unwrap();
+
+        let mut tests = Vec::new();
+        super::add_tests(
+            &mut tests,
+            &root.path,
+            &super::FindConfig::TransactionProposal(TransactionProposalSuite::SimpleTransactions),
+        )
+        .unwrap();
+
+        let test = tests.into_iter().next().unwrap();
+        assert!(test.transaction_proposal_enabled());
+        assert!(super::transaction_proposal_adapter_mock(&path).is_some());
+        assert!(
+            super::transaction_proposal_adapter_mock(&root.path.join("other/tcall_ref.wast"))
+                .is_none()
+        );
+        assert!(test.contents.contains(r#"(func $apply"#));
+        assert!(
+            test.contents
+                .contains(r#"(func (export "null") (result i32)"#)
+        );
+        assert!(
+            test.contents
+                .contains(r#"(assert_return (invoke "run" (i32.const 3)) (i32.const -9))"#)
+        );
+        assert_eq!(test.contents.matches("(assert_return").count(), 23);
+        assert_eq!(test.contents.matches("(assert_trap").count(), 4);
+        assert_eq!(test.contents.matches("(assert_invalid").count(), 3);
+        assert!(
+            test.contents
+                .contains(r#"(assert_trap (invoke "null") "unreachable")"#)
+        );
+        assert!(test.contents.contains(r#"(assert_invalid"#));
+        assert!(!test.contents.contains("(tcall_ref"));
+        assert!(!test.contents.contains("(tref "));
+        assert!(!test.contents.contains("texterntref"));
+    }
+
+    #[test]
+    fn enables_transaction_proposal_return_tcall_ref_with_a_path_scoped_adapter_mock() {
+        let root = temp_transaction_dir("return-tcall-ref");
+        let dir = root.path.join("simple-transactions");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("return_tcall_ref.wast");
+        fs::write(
+            &path,
+            r#"(module
+  (type $proc (tfunc))
+  (type $-i32 (tfunc (result i32)))
+  (tfunc (export "type-i32") (result i32)
+    (return_tcall_ref $-i32 (tref.null $proc)))
+)
+
+(assert_return (tinvoke "type-i32") (i32.const 0x132))
+(assert_trap (tinvoke "null") "null tfunction")
+(assert_invalid (module (type $t (tfunc)) (tfunc $f (param $r externref) (return_tcall_ref $t (local.get $r)))) "type mismatch")
+"#,
+        )
+        .unwrap();
+
+        let mut tests = Vec::new();
+        super::add_tests(
+            &mut tests,
+            &root.path,
+            &super::FindConfig::TransactionProposal(TransactionProposalSuite::SimpleTransactions),
+        )
+        .unwrap();
+
+        let test = tests.into_iter().next().unwrap();
+        assert!(test.transaction_proposal_enabled());
+        assert!(super::transaction_proposal_adapter_mock(&path).is_some());
+        assert!(
+            super::transaction_proposal_adapter_mock(
+                &root.path.join("other/return_tcall_ref.wast")
+            )
+            .is_none()
+        );
+        assert!(
+            test.contents
+                .contains(r#"(func (export "type-i32") (result i32)"#)
+        );
+        assert!(
+            test.contents
+                .contains(r#"(assert_return (invoke "type-second-f64") (f64.const 64.1))"#)
+        );
+        assert!(
+            test.contents
+                .contains(r#"(assert_return (invoke "count" (i64.const 1000000)) (i64.const 0))"#)
+        );
+        assert_eq!(test.contents.matches("(assert_return").count(), 31);
+        assert_eq!(test.contents.matches("(assert_trap").count(), 4);
+        assert_eq!(test.contents.matches("(assert_invalid").count(), 9);
+        assert!(
+            test.contents
+                .contains(r#"(assert_trap (invoke "null") "unreachable")"#)
+        );
+        assert!(test.contents.contains(r#"(assert_invalid"#));
+        assert!(!test.contents.contains("(return_tcall_ref"));
+        assert!(!test.contents.contains("(tref "));
+        assert!(!test.contents.contains("externref"));
     }
 
     #[test]
