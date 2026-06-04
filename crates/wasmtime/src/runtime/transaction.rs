@@ -2,7 +2,10 @@
 
 use crate::prelude::*;
 use crate::runtime::store::InstanceId;
+use crate::runtime::vm::TMemory;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
+use core::ops::Range;
 
 // SHISOFT-TWASM-MOCK: milestone runtime scaffold for proposal WAST progress.
 // The current runtime uses store-local transaction state, VMemory-only backend
@@ -199,6 +202,22 @@ struct PendingMemoryStore {
     memory_index: u32,
     addr: u64,
     len: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TMemoryGranuleSnapshot {
+    granule_index: usize,
+    range: Range<usize>,
+    version: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TMemoryAccessSnapshot {
+    base: u64,
+    bytes: Vec<u8>,
+    byte_len: usize,
+    granules: Vec<TMemoryGranuleSnapshot>,
 }
 
 const TMEMORY_GRANULE_SHIFT: usize = 8;
@@ -464,11 +483,29 @@ impl TransactionState {
     where
         F: FnMut(GranuleId) -> Result<u64>,
     {
-        let transaction = self
-            .active_transaction()
-            .context("no active transaction in this store")?;
+        let transaction = self.active_transaction_required()?;
         self.locks
             .validate_transaction_reads(transaction, current_version_fn)
+    }
+
+    pub(crate) fn active_read_granules(&self) -> Result<Vec<GranuleId>> {
+        let transaction = self.active_transaction_required()?;
+        Ok(self
+            .locks
+            .read_versions
+            .keys()
+            .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect())
+    }
+
+    pub(crate) fn validate_active_read(
+        &self,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        let transaction = self.active_transaction_required()?;
+        self.locks
+            .validate_read(transaction, granule, current_version)
     }
 
     pub(crate) fn complete_commit(&mut self) -> Result<()> {
@@ -695,6 +732,77 @@ impl TransactionState {
         Ok(())
     }
 
+    pub(crate) fn stage_tmemory_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        bytes: &[u8],
+        tmemory: &TMemory,
+    ) -> Result<()> {
+        let snapshot = collect_tmemory_access_snapshot(tmemory, addr, bytes.len())?;
+        self.stage_tmemory_write_owned_from_snapshot(
+            owner_instance,
+            memory_index,
+            addr,
+            bytes,
+            &snapshot,
+        )
+    }
+
+    pub(crate) fn stage_tmemory_write_owned_from_snapshot(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        bytes: &[u8],
+        snapshot: &TMemoryAccessSnapshot,
+    ) -> Result<()> {
+        self.ensure_active()?;
+        let range = checked_tmemory_range(addr, bytes.len(), snapshot.byte_len)?;
+        let transaction = self.active_transaction_required()?;
+        let mut offset: usize = 0;
+        let mut current = range.start;
+
+        for granule in &snapshot.granules {
+            if current >= range.end {
+                break;
+            }
+
+            let key = memory_granule_key(owner_instance, memory_index, granule.granule_index)?;
+            let granule_offset = current - granule.range.start;
+            let chunk_len = (range.end - current).min(granule.range.end - current);
+            let granule_chunk_end = granule_offset
+                .checked_add(chunk_len)
+                .context("tmemory granule write offset overflow")?;
+            let write_chunk_end = offset
+                .checked_add(chunk_len)
+                .context("tmemory write offset overflow")?;
+
+            self.locks
+                .acquire_write(transaction, key, granule.version)?;
+            {
+                let staged = self
+                    .staged_granules
+                    .entry(key)
+                    .or_insert_with(|| granule.bytes.clone());
+                ensure!(
+                    granule_chunk_end <= staged.len(),
+                    "staged tmemory granule length mismatch"
+                );
+                staged[granule_offset..granule_chunk_end]
+                    .copy_from_slice(&bytes[offset..write_chunk_end]);
+            }
+
+            self.memory_read_granules.insert(key);
+            self.memory_write_granules.insert(key);
+            current += chunk_len;
+            offset = write_chunk_end;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn read_memory_overlay(
         &mut self,
         memory_index: u32,
@@ -763,6 +871,56 @@ impl TransactionState {
         Ok(bytes)
     }
 
+    pub(crate) fn read_tmemory_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+        tmemory: &TMemory,
+    ) -> Result<Vec<u8>> {
+        let snapshot = collect_tmemory_access_snapshot(tmemory, addr, len)?;
+        self.read_tmemory_owned_from_snapshot(owner_instance, memory_index, addr, len, &snapshot)
+    }
+
+    pub(crate) fn read_tmemory_owned_from_snapshot(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+        snapshot: &TMemoryAccessSnapshot,
+    ) -> Result<Vec<u8>> {
+        self.ensure_active()?;
+        let range = checked_tmemory_range(addr, len, snapshot.byte_len)?;
+        let transaction = self.active_transaction_required()?;
+        let bytes = self.merge_staged_tmemory_range(
+            granule_instance(owner_instance),
+            memory_index,
+            addr,
+            len,
+            snapshot.base,
+            &snapshot.bytes,
+            snapshot.byte_len,
+        )?;
+        let mut current = range.start;
+
+        for granule in &snapshot.granules {
+            if current >= range.end {
+                break;
+            }
+
+            let key = memory_granule_key(owner_instance, memory_index, granule.granule_index)?;
+            let chunk_len = (range.end - current).min(granule.range.end - current);
+
+            self.locks.record_read(transaction, key, granule.version)?;
+            self.memory_read_granules.insert(key);
+            current += chunk_len;
+        }
+
+        Ok(bytes)
+    }
+
     pub(crate) fn set_scratch(&mut self, bytes: Vec<u8>) -> *mut u8 {
         debug_assert!(self.pending_memory_store.is_none());
         self.scratch = bytes;
@@ -785,6 +943,25 @@ impl TransactionState {
             memory_index,
             addr,
             len,
+        });
+        Ok(self.scratch.as_mut_ptr())
+    }
+
+    pub(crate) fn set_tmemory_store_scratch(
+        &mut self,
+        instance: InstanceId,
+        memory_index: u32,
+        addr: u64,
+        bytes: Vec<u8>,
+    ) -> Result<*mut u8> {
+        self.ensure_active()?;
+        debug_assert!(self.pending_memory_store.is_none());
+        self.scratch = bytes;
+        self.pending_memory_store = Some(PendingMemoryStore {
+            instance,
+            memory_index,
+            addr,
+            len: self.scratch.len(),
         });
         Ok(self.scratch.as_mut_ptr())
     }
@@ -828,6 +1005,52 @@ impl TransactionState {
             backing,
             memory_len,
         )?;
+        Ok(true)
+    }
+
+    pub(crate) fn flush_tmemory_store_scratch_from_snapshot(
+        &mut self,
+        snapshot: &TMemoryAccessSnapshot,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let Some(pending) = self.pending_memory_store.take() else {
+            return Ok(false);
+        };
+        ensure!(
+            self.scratch.len() == pending.len,
+            "pending tmemory store scratch length mismatch"
+        );
+        let bytes = self.scratch[..pending.len].to_vec();
+        self.stage_tmemory_write_owned_from_snapshot(
+            Some(pending.instance),
+            pending.memory_index,
+            pending.addr,
+            &bytes,
+            snapshot,
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn commit_tmemory_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        tmemory: &mut TMemory,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let staged = self.staged_tmemory_granules_owned(owner_instance, memory_index)?;
+        if staged.is_empty() {
+            return Ok(false);
+        }
+
+        for (_, granule_index, bytes) in &staged {
+            let addr = granule_index
+                .checked_mul(TMEMORY_GRANULE_SIZE)
+                .context("tmemory granule byte offset overflow")?;
+            tmemory.commit_range(addr, bytes)?;
+        }
+
+        self.remove_staged_tmemory_granules_owned(owner_instance, memory_index)?;
         Ok(true)
     }
 
@@ -938,17 +1161,13 @@ impl TransactionState {
     }
 
     fn lock_memory_granule_read(&mut self, memory_index: u32, granule_index: u64) -> Result<()> {
-        let transaction = self
-            .active_transaction()
-            .context("no active transaction in this store")?;
+        let transaction = self.active_transaction_required()?;
         self.locks
             .acquire_memory_granule_read(transaction, memory_index, granule_index)
     }
 
     fn lock_memory_granule_write(&mut self, memory_index: u32, granule_index: u64) -> Result<()> {
-        let transaction = self
-            .active_transaction()
-            .context("no active transaction in this store")?;
+        let transaction = self.active_transaction_required()?;
         self.locks
             .acquire_memory_granule_write(transaction, memory_index, granule_index)
     }
@@ -1042,8 +1261,71 @@ impl TransactionState {
         Ok(bytes)
     }
 
+    pub(crate) fn staged_tmemory_granules_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+    ) -> Result<Vec<(GranuleId, usize, Vec<u8>)>> {
+        self.ensure_active()?;
+        let owner = granule_instance(owner_instance);
+        let mut staged = Vec::new();
+        for (key, bytes) in &self.staged_granules {
+            let GranuleId::TMemory {
+                instance,
+                memory_index: staged_memory_index,
+                granule_index,
+            } = *key
+            else {
+                continue;
+            };
+            if instance != owner || staged_memory_index != memory_index {
+                continue;
+            }
+            staged.push((
+                key.to_owned(),
+                usize::try_from(granule_index)
+                    .context("tmemory granule index does not fit host usize")?,
+                bytes.clone(),
+            ));
+        }
+        Ok(staged)
+    }
+
+    pub(crate) fn remove_staged_tmemory_granules_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+    ) -> Result<()> {
+        self.ensure_active()?;
+        let owner = granule_instance(owner_instance);
+        let keys = self
+            .staged_granules
+            .keys()
+            .filter_map(|key| match *key {
+                GranuleId::TMemory {
+                    instance,
+                    memory_index: staged_memory_index,
+                    ..
+                } if instance == owner && staged_memory_index == memory_index => Some(*key),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.staged_granules.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn active_transaction_required(&self) -> Result<TransactionId> {
+        self.active_transaction()
+            .context("transaction operation requires an active transaction")
+    }
+
     fn ensure_active(&self) -> Result<()> {
-        ensure!(self.active.is_some(), "no active transaction in this store");
+        ensure!(
+            self.active.is_some(),
+            "transaction operation requires an active transaction"
+        );
         Ok(())
     }
 
@@ -1093,6 +1375,57 @@ impl TransactionState {
             committed.len(),
         )
     }
+
+    fn stage_tmemory_write_for_test(
+        &mut self,
+        instance: u32,
+        memory_index: u32,
+        addr: u64,
+        bytes: &[u8],
+        tmemory: &TMemory,
+    ) -> Result<()> {
+        self.stage_tmemory_write_owned(
+            Some(InstanceId::from_u32(instance)),
+            memory_index,
+            addr,
+            bytes,
+            tmemory,
+        )
+    }
+
+    fn commit_tmemory_for_test(&mut self, tmemory: &mut TMemory) -> Result<bool> {
+        self.commit_tmemory_owned(Some(InstanceId::from_u32(0)), 0, tmemory)
+    }
+}
+
+pub(crate) fn collect_tmemory_access_snapshot(
+    tmemory: &TMemory,
+    addr: u64,
+    len: usize,
+) -> Result<TMemoryAccessSnapshot> {
+    let range = checked_tmemory_range(addr, len, tmemory.byte_len())?;
+    let bytes = tmemory.read_committed(range.clone())?;
+    let mut granules = Vec::new();
+    let mut current = range.start;
+
+    while current < range.end {
+        let granule_index = current / TMEMORY_GRANULE_SIZE;
+        let granule_range = tmemory_granule_backing_range(granule_index, tmemory.byte_len())?;
+        granules.push(TMemoryGranuleSnapshot {
+            granule_index,
+            range: granule_range.clone(),
+            version: tmemory.granule_version(granule_index)?,
+            bytes: tmemory.read_committed(granule_range)?,
+        });
+        current = range.end.min(granules.last().unwrap().range.end);
+    }
+
+    Ok(TMemoryAccessSnapshot {
+        base: addr,
+        bytes,
+        byte_len: tmemory.byte_len(),
+        granules,
+    })
 }
 
 fn checked_tmemory_range(
@@ -1237,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_transaction_store_commits_to_memory() {
+    fn mock_transaction_store_commits_to_tmemory() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
             &engine,
@@ -1248,7 +1581,7 @@ mod tests {
                 (ttry)
                 (i32.tstore (i32.const 0) (i32.const 42)))
               (func (export "read") (result i32)
-                (i32.load (i32.const 0))))
+                (i32.tload (i32.const 0))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
@@ -1276,7 +1609,7 @@ mod tests {
               (func (export "write")
                 (i32.tstore (i32.const 0) (i32.const 42)))
               (func (export "read") (result i32)
-                (i32.load (i32.const 0))))
+                (i32.tload (i32.const 0))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
@@ -1491,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_transaction_memory_size_returns_backing_memory_pages() {
+    fn mock_transaction_memory_size_requires_active_transaction() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
             &engine,
@@ -1499,6 +1832,7 @@ mod tests {
             (module
               (tmemory 2)
               (func (export "size") (result i32)
+                (ttry)
                 (tmemory.size)))
             "#,
         );
@@ -1512,16 +1846,18 @@ mod tests {
     }
 
     #[test]
-    fn mock_transaction_zero_memory_size_and_grow_do_not_trap() {
+    fn mock_transaction_zero_memory_size_and_grow_commit_against_tmemory() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
             &engine,
             r#"
             (module
-              (tmemory 0)
+              (tmemory 0 1)
               (func (export "size") (result i32)
+                (ttry)
                 (tmemory.size))
               (func (export "grow") (param i32) (result i32)
+                (ttry)
                 (tmemory.grow (local.get 0))))
             "#,
         );
@@ -1578,7 +1914,7 @@ mod tests {
                 (ttry)
                 (i32.tstore (i32.const 0) (i32.const 7)))
               (func (export "read") (result i32)
-                (i32.load (i32.const 0))))
+                (i32.tload (i32.const 0))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
@@ -1680,7 +2016,7 @@ mod tests {
                 (ttry)
                 (i32.tstore $tx (i32.const 0) (i32.const 55)))
               (func (export "read_tx") (result i32)
-                (i32.load $tx (i32.const 0))))
+                (i32.tload $tx (i32.const 0))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
@@ -1718,7 +2054,7 @@ mod tests {
                 (ttry)
                 (i32.tstore $tx (i32.const 0) (i32.const 66)))
               (func (export "read_tx") (result i32)
-                (i32.load $tx (i32.const 0))))
+                (i32.tload $tx (i32.const 0))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
@@ -1759,9 +2095,9 @@ mod tests {
                 (i32.tstore $imported (i32.const 0) (i32.const 11))
                 (i32.tstore $local (i32.const 0) (i32.const 22)))
               (func (export "read_imported") (result i32)
-                (i32.load $imported (i32.const 0)))
+                (i32.tload $imported (i32.const 0)))
               (func (export "read_local") (result i32)
-                (i32.load $local (i32.const 0))))
+                (i32.tload $local (i32.const 0))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
@@ -2078,7 +2414,10 @@ mod tests {
             memory_index: 0,
             granule_index: 0,
         };
-        state.locks.record_read_for_test(transaction, granule, 1).unwrap();
+        state
+            .locks
+            .record_read_for_test(transaction, granule, 1)
+            .unwrap();
 
         let error = state.commit().unwrap_err();
 
@@ -2504,6 +2843,40 @@ mod tests {
         expected.extend_from_slice(&[0xCC; 4]);
 
         assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn transaction_commit_copies_staged_granules_to_tmemory() {
+        let mut tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(7));
+
+        state
+            .stage_tmemory_write_for_test(0, 0, 4, &[9, 8, 7, 6], &tmemory)
+            .expect("stage tmemory");
+        state
+            .commit_tmemory_for_test(&mut tmemory)
+            .expect("commit tmemory");
+
+        assert_eq!(
+            tmemory.read_committed(4..8).expect("read committed"),
+            vec![9, 8, 7, 6]
+        );
+    }
+
+    #[test]
+    fn transaction_abort_discards_staged_tmemory_bytes() {
+        let tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(7));
+
+        state
+            .stage_tmemory_write_for_test(0, 0, 4, &[9, 8, 7, 6], &tmemory)
+            .expect("stage tmemory");
+        state.abort().expect("abort transaction");
+
+        assert_eq!(
+            tmemory.read_committed(4..8).expect("read committed"),
+            vec![0, 0, 0, 0]
+        );
     }
 
     #[test]

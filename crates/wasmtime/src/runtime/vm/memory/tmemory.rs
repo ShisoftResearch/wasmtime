@@ -164,6 +164,10 @@ impl TMemory {
         self.storage.granule_info(granule)
     }
 
+    pub(crate) fn granule_version(&self, granule: usize) -> Result<u64> {
+        Ok(self.storage.granule_info(granule)?.version)
+    }
+
     pub(crate) fn set_granule_info(
         &mut self,
         granule: usize,

@@ -57,19 +57,21 @@
 use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, InstanceId, StoreOpaque};
-use crate::runtime::transaction::{GlobalSnapshot, StagedRecord, TMEMORY_GRANULE_SIZE};
+use crate::runtime::transaction::{
+    GlobalSnapshot, GranuleId, StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,
+    collect_tmemory_access_snapshot,
+};
 #[cfg(feature = "gc")]
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{self, HostResultHasUnwindSentinel, VMStore, f32x4, f64x2, i8x16};
 use core::convert::Infallible;
-use core::ops::Range;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
 use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
     CompiledTrap, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, FuncIndex,
-    GlobalIndex, PassiveElemIndex, TableIndex, Trap, WasmValType,
+    GlobalIndex, MemoryIndex, PassiveElemIndex, TableIndex, Trap, WasmValType,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::AccessError::{
@@ -283,16 +285,21 @@ fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<(
 fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let records = {
+    let (records, read_granules) = {
         let state = store.store_opaque_mut().transaction_state_mut();
         if state.active_transaction().is_none() {
             return Ok(());
         }
-        // SHISOFT-TWASM-MOCK: the real tmemory version source is not wired yet,
-        // so optimistic read validation still uses the placeholder version `0`.
-        state.validate_active_reads_with(|_| Ok(0))?;
-        state.staged_records()?
+        (state.staged_records()?, state.active_read_granules()?)
     };
+
+    for granule in read_granules {
+        let current_version = current_granule_version(store, instance, granule)?;
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .validate_active_read(granule, current_version)?;
+    }
 
     for record in &records {
         apply_staged_transaction_record(store, instance, record)?;
@@ -342,7 +349,7 @@ fn transaction_tglobal_get_impl(
         let state = store.store_opaque_mut().transaction_state_mut();
         ensure!(
             state.active_transaction().is_some(),
-            "no active transaction in this store"
+            "transaction operation requires an active transaction"
         );
         state.staged_global_owned(Some(instance), global_index.as_u32())
     };
@@ -485,21 +492,16 @@ fn transaction_tmemory_load_impl(
     let effective = checked_tmemory_effective_address(addr, offset)?;
     let len = usize::try_from(len).context("tmemory access length overflow")?;
     flush_pending_tmemory_store(store, instance)?;
-
-    // SHISOFT-TWASM-MOCK: tmemory loads read ordinary defined memory backing and
-    // then merge staged copy-on-write granules from `TransactionState`.
-    let memory_index = DefinedMemoryIndex::from_u32(memory);
-    let backing = read_memory_backing_window(store, instance, memory_index, effective, len)?;
+    let (memory_index, snapshot) =
+        collect_defined_tmemory_snapshot(store, instance, memory, effective, len)?;
 
     let state = store.store_opaque_mut().transaction_state_mut();
-    let bytes = state.read_memory_overlay_owned_from_backing(
+    let bytes = state.read_tmemory_owned_from_snapshot(
         Some(instance),
-        memory,
+        memory_index.as_u32(),
         effective,
         len,
-        backing.base,
-        &backing.bytes,
-        backing.memory_len,
+        &snapshot,
     )?;
     Ok(state.set_scratch(bytes))
 }
@@ -528,23 +530,18 @@ fn transaction_tmemory_store_impl(
     let effective = checked_tmemory_effective_address(addr, offset)?;
     let len = usize::try_from(len).context("tmemory access length overflow")?;
     flush_pending_tmemory_store(store, instance)?;
-
-    // SHISOFT-TWASM-MOCK: tmemory stores stage into a scratch buffer and copy-on
-    // write overlay; the real tmemory backend receives bytes only on commit.
-    let memory_index = DefinedMemoryIndex::from_u32(memory);
-    let backing = read_memory_backing_window(store, instance, memory_index, effective, len)?;
+    let (memory_index, snapshot) =
+        collect_defined_tmemory_snapshot(store, instance, memory, effective, len)?;
 
     let state = store.store_opaque_mut().transaction_state_mut();
-    let bytes = state.read_memory_overlay_owned_from_backing(
+    let bytes = state.read_tmemory_owned_from_snapshot(
         Some(instance),
-        memory,
+        memory_index.as_u32(),
         effective,
         len,
-        backing.base,
-        &backing.bytes,
-        backing.memory_len,
+        &snapshot,
     )?;
-    state.set_memory_store_scratch(instance, memory, effective, bytes)
+    state.set_tmemory_store_scratch(instance, memory_index.as_u32(), effective, bytes)
 }
 
 fn transaction_tmemory_size(
@@ -563,16 +560,15 @@ fn transaction_tmemory_size_impl(
     memory: u32,
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
-
-    // SHISOFT-TWASM-MOCK: tmemory.size reports ordinary Wasmtime memory size.
-    let memory_index = DefinedMemoryIndex::from_u32(memory);
+    ensure_active_transaction(store)?;
+    let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
     let pages = {
         let instance_ref = store.instance_mut(instance);
         let instance_ref = instance_ref.as_ref();
-        let memory = instance_ref.get_defined_memory(memory_index);
-        let page_size =
-            usize::try_from(memory.page_size()).context("tmemory page size overflow")?;
-        memory.byte_size() / page_size
+        let tmemory = instance_ref
+            .get_tmemory(memory_index)
+            .context("transactional memory operation targeted non-transactional memory")?;
+        tmemory.byte_len() / crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE
     };
     Ok(pages as *mut u8)
 }
@@ -595,110 +591,38 @@ fn transaction_tmemory_grow_impl(
     delta: u64,
 ) -> Result<Option<AllocationSize>> {
     flush_pending_tmemory_store(store, instance)?;
-
-    // SHISOFT-TWASM-MOCK: tmemory.grow delegates to ordinary memory.grow
-    // immediately; successful grow rollback is recorded but not implemented.
-    let result = memory_grow(store, instance, delta, memory)?;
-    if let Some(previous) = result.as_ref() {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        if state.active_transaction().is_some() {
-            let previous_pages =
-                u64::try_from(previous.0).context("tmemory previous size overflow")?;
-            let new_pages = previous_pages
-                .checked_add(delta)
-                .context("tmemory grown size overflow")?;
-            state.stage_memory_size_owned(Some(instance), memory, new_pages)?;
-        }
+    ensure_active_transaction(store)?;
+    let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
+    let mut instance_ref = store.instance_mut(instance);
+    let previous_pages = {
+        let instance_ref = instance_ref.as_ref();
+        let tmemory = instance_ref
+            .get_tmemory(memory_index)
+            .context("transactional memory operation targeted non-transactional memory")?;
+        u64::try_from(tmemory.byte_len() / crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE)
+            .context("tmemory previous size overflow")?
+    };
+    let Some(new_pages) = previous_pages.checked_add(delta) else {
+        return Ok(None);
+    };
+    let result = {
+        let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory_index) else {
+            bail!("transactional memory operation targeted non-transactional memory");
+        };
+        tmemory.grow_to_pages(new_pages)
+    };
+    if result.is_err() {
+        return Ok(None);
     }
-    Ok(result)
+    Ok(Some(AllocationSize(
+        usize::try_from(previous_pages).context("tmemory previous size overflow")?,
+    )))
 }
 
 fn checked_tmemory_effective_address(addr: u64, offset: u64) -> Result<u64> {
     addr.checked_add(offset).with_context(|| {
         format!("out of bounds tmemory access: address {addr} plus offset {offset} overflows")
     })
-}
-
-fn checked_tmemory_libcall_range(
-    addr: u64,
-    len: usize,
-    backing_len: usize,
-) -> Result<Range<usize>> {
-    let start = usize::try_from(addr).context("tmemory address does not fit host usize")?;
-    let end = start.checked_add(len).with_context(|| {
-        format!("out of bounds tmemory access: range starting at {start} overflows")
-    })?;
-    ensure!(
-        end <= backing_len,
-        "out of bounds tmemory access: range {start}..{end} exceeds backing length {backing_len}"
-    );
-    Ok(start..end)
-}
-
-struct MemoryBackingWindow {
-    base: u64,
-    bytes: Vec<u8>,
-    memory_len: usize,
-}
-
-fn read_memory_backing_window(
-    store: &mut dyn VMStore,
-    instance: InstanceId,
-    memory_index: DefinedMemoryIndex,
-    addr: u64,
-    len: usize,
-) -> Result<MemoryBackingWindow> {
-    // SHISOFT-TWASM-MOCK: backing windows are sliced from ordinary Wasmtime
-    // `Memory`, not from `runtime::vm::memory::tmemory::TMemory`.
-    let instance_ref = store.instance_mut(instance);
-    let instance_ref = instance_ref.as_ref();
-    let memory = instance_ref.get_defined_memory(memory_index);
-    let memory_len = memory.byte_size();
-    let access = checked_tmemory_libcall_range(addr, len, memory_len)?;
-    let window = tmemory_backing_window_range(access, memory_len)?;
-    let base = u64::try_from(window.start).context("tmemory backing window base overflow")?;
-    let bytes = read_memory_bytes(memory, base, window.len())?;
-    Ok(MemoryBackingWindow {
-        base,
-        bytes,
-        memory_len,
-    })
-}
-
-fn tmemory_backing_window_range(access: Range<usize>, memory_len: usize) -> Result<Range<usize>> {
-    if access.is_empty() {
-        return Ok(access.start..access.start);
-    }
-
-    let start = (access.start / TMEMORY_GRANULE_SIZE)
-        .checked_mul(TMEMORY_GRANULE_SIZE)
-        .context("tmemory backing window start overflow")?;
-    let last = access.end - 1;
-    let end_granule = last / TMEMORY_GRANULE_SIZE;
-    let end = end_granule
-        .checked_add(1)
-        .and_then(|granule| granule.checked_mul(TMEMORY_GRANULE_SIZE))
-        .context("tmemory backing window end overflow")?
-        .min(memory_len);
-    Ok(start..end)
-}
-
-fn read_memory_bytes(memory: &vm::Memory, addr: u64, len: usize) -> Result<Vec<u8>> {
-    let range = checked_tmemory_libcall_range(addr, len, memory.byte_size())?;
-    let def = memory.vmmemory();
-    let base = def.base.as_ptr();
-    let bytes = unsafe { core::slice::from_raw_parts(base.add(range.start), range.len()) };
-    Ok(bytes.to_vec())
-}
-
-fn write_memory_bytes(memory: &mut vm::Memory, addr: u64, bytes: &[u8]) -> Result<()> {
-    let range = checked_tmemory_libcall_range(addr, bytes.len(), memory.byte_size())?;
-    let def = memory.vmmemory();
-    let base = def.base.as_ptr();
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(range.start), bytes.len());
-    }
-    Ok(())
 }
 
 fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
@@ -709,17 +633,12 @@ fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -
     else {
         return Ok(());
     };
-
-    let memory_index = DefinedMemoryIndex::from_u32(memory);
-    let backing = read_memory_backing_window(store, owner, memory_index, addr, len)?;
+    let memory_index = MemoryIndex::from_u32(memory);
+    let snapshot = collect_tmemory_snapshot(store, owner, memory_index, addr, len)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
-        .flush_memory_store_scratch_from_backing(
-            backing.base,
-            &backing.bytes,
-            backing.memory_len,
-        )?;
+        .flush_tmemory_store_scratch_from_snapshot(&snapshot)?;
     Ok(())
 }
 
@@ -743,19 +662,35 @@ fn apply_staged_transaction_record(
         StagedRecord::MemoryGranule {
             owner_instance,
             memory_index,
-            granule_index,
-            bytes,
+            ..
         } => {
-            let granule_size =
-                u64::try_from(TMEMORY_GRANULE_SIZE).context("tmemory granule size overflow")?;
-            let addr = granule_index
-                .checked_mul(granule_size)
-                .context("tmemory granule byte offset overflow")?;
-            let memory_index = DefinedMemoryIndex::from_u32(*memory_index);
             let owner = owner_instance.unwrap_or(instance);
-            let mut instance_ref = store.instance_mut(owner);
-            let memory = instance_ref.as_mut().get_defined_memory_mut(memory_index);
-            write_memory_bytes(memory, addr, bytes)?;
+            let memory_index = MemoryIndex::from_u32(*memory_index);
+            let staged = store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .staged_tmemory_granules_owned(Some(owner), memory_index.as_u32())?;
+            if staged.is_empty() {
+                return Ok(());
+            }
+
+            {
+                let mut instance_ref = store.instance_mut(owner);
+                let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory_index) else {
+                    bail!("transactional memory operation targeted non-transactional memory");
+                };
+                for (_, granule_index, bytes) in &staged {
+                    let addr = granule_index
+                        .checked_mul(TMEMORY_GRANULE_SIZE)
+                        .context("tmemory granule byte offset overflow")?;
+                    tmemory.commit_range(addr, bytes)?;
+                }
+            }
+
+            store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .remove_staged_tmemory_granules_owned(Some(owner), memory_index.as_u32())?;
         }
         StagedRecord::Global {
             owner_instance,
@@ -774,6 +709,88 @@ fn apply_staged_transaction_record(
         }
     }
     Ok(())
+}
+
+fn ensure_active_transaction(store: &mut dyn VMStore) -> Result<()> {
+    ensure!(
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .active_transaction()
+            .is_some(),
+        "transaction operation requires an active transaction"
+    );
+    Ok(())
+}
+
+fn resolve_defined_tmemory_index(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+) -> Result<MemoryIndex> {
+    let defined = DefinedMemoryIndex::from_u32(memory);
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let memory_index = instance_ref.env_module().memory_index(defined);
+    ensure!(
+        instance_ref.get_tmemory(memory_index).is_some(),
+        "transactional memory operation targeted non-transactional memory"
+    );
+    Ok(memory_index)
+}
+
+fn collect_defined_tmemory_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    addr: u64,
+    len: usize,
+) -> Result<(MemoryIndex, TMemoryAccessSnapshot)> {
+    let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
+    let snapshot = collect_tmemory_snapshot(store, instance, memory_index, addr, len)?;
+    Ok((memory_index, snapshot))
+}
+
+fn collect_tmemory_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: MemoryIndex,
+    addr: u64,
+    len: usize,
+) -> Result<TMemoryAccessSnapshot> {
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let tmemory = instance_ref
+        .get_tmemory(memory_index)
+        .context("transactional memory operation targeted non-transactional memory")?;
+    collect_tmemory_access_snapshot(tmemory, addr, len)
+}
+
+fn current_granule_version(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    granule: GranuleId,
+) -> Result<u64> {
+    match granule {
+        GranuleId::TMemory {
+            instance: owner_instance,
+            memory_index,
+            granule_index,
+        } => {
+            let owner = owner_instance.map(InstanceId::from_u32).unwrap_or(instance);
+            let memory_index = MemoryIndex::from_u32(memory_index);
+            let instance_ref = store.instance_mut(owner);
+            let instance_ref = instance_ref.as_ref();
+            let tmemory = instance_ref
+                .get_tmemory(memory_index)
+                .context("transactional memory operation targeted non-transactional memory")?;
+            tmemory.granule_version(
+                usize::try_from(granule_index)
+                    .context("tmemory granule index does not fit host usize")?,
+            )
+        }
+        GranuleId::TMemorySize { .. } | GranuleId::TGlobal { .. } => Ok(0),
+    }
 }
 
 /// A helper structure to represent the return value of a memory or table growth

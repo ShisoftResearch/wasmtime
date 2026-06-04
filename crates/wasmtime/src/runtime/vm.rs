@@ -107,6 +107,8 @@ pub use crate::runtime::vm::instance::{
     PoolingInstanceAllocatorConfig,
 };
 pub use crate::runtime::vm::interpreter::*;
+#[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::TMemory;
 pub use crate::runtime::vm::memory::{
     Memory, MemoryBase, RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory,
 };
