@@ -738,6 +738,98 @@ mod tests {
     }
 
     #[test]
+    fn stage_memory_write_splits_cross_granule_write() {
+        let mut backing = vec![0x11; TMEMORY_GRANULE_SIZE * 2];
+        backing[TMEMORY_GRANULE_SIZE..].fill(0x22);
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+
+        let addr = u64::try_from(TMEMORY_GRANULE_SIZE - 2).unwrap();
+        state
+            .stage_memory_write(0, addr, &[0xaa, 0xbb, 0xcc, 0xdd], &backing)
+            .unwrap();
+
+        let first = state.staged_memory_granule(0, 0).unwrap();
+        let second = state.staged_memory_granule(0, 1).unwrap();
+        assert_eq!(
+            &first[..TMEMORY_GRANULE_SIZE - 2],
+            &backing[..TMEMORY_GRANULE_SIZE - 2]
+        );
+        assert_eq!(&first[TMEMORY_GRANULE_SIZE - 2..], &[0xaa, 0xbb]);
+        assert_eq!(&second[..2], &[0xcc, 0xdd]);
+        assert_eq!(&second[2..], &backing[TMEMORY_GRANULE_SIZE + 2..]);
+        assert!(state.owns_memory_granule_read(0, 0));
+        assert!(state.owns_memory_granule_write(0, 0));
+        assert!(state.owns_memory_granule_read(0, 1));
+        assert!(state.owns_memory_granule_write(0, 1));
+    }
+
+    #[test]
+    fn read_memory_overlay_preserves_unwritten_staged_bytes() {
+        let backing = vec![0x10; TMEMORY_GRANULE_SIZE];
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+
+        state
+            .stage_memory_write(0, 10, &[0xaa, 0xbb], &backing)
+            .unwrap();
+        state.stage_memory_write(0, 12, &[0xcc], &backing).unwrap();
+
+        let read = state.read_memory_overlay(0, 8, 6, &backing).unwrap();
+        let mut expected_read = backing[8..14].to_vec();
+        expected_read[2..5].copy_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(read, expected_read);
+
+        let mut expected_granule = backing.clone();
+        expected_granule[10..13].copy_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(
+            state.staged_memory_granule(0, 0).unwrap(),
+            expected_granule.as_slice()
+        );
+    }
+
+    #[test]
+    fn memory_overlay_helpers_reject_out_of_bounds_access() {
+        let backing = vec![0; 8];
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+
+        let write_error = state
+            .stage_memory_write(0, 7, &[0xaa, 0xbb], &backing)
+            .unwrap_err();
+        assert!(
+            write_error
+                .to_string()
+                .contains("out of bounds tmemory access")
+        );
+
+        let read_error = state.read_memory_overlay(0, 7, 2, &backing).unwrap_err();
+        assert!(
+            read_error
+                .to_string()
+                .contains("out of bounds tmemory access")
+        );
+    }
+
+    #[test]
+    fn read_memory_overlay_tracks_read_ownership_for_touched_granules() {
+        let backing = vec![0; TMEMORY_GRANULE_SIZE * 2];
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+
+        let addr = u64::try_from(TMEMORY_GRANULE_SIZE - 1).unwrap();
+        assert_eq!(
+            state.read_memory_overlay(0, addr, 2, &backing).unwrap(),
+            vec![0, 0]
+        );
+
+        assert!(state.owns_memory_granule_read(0, 0));
+        assert!(state.owns_memory_granule_read(0, 1));
+        assert!(!state.owns_memory_granule_write(0, 0));
+        assert!(!state.owns_memory_granule_write(0, 1));
+    }
+
+    #[test]
     fn fail_drops_staged_records() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
