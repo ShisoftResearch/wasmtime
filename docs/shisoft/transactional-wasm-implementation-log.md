@@ -458,6 +458,75 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Runtime Core Scalar TMemory/TGlobal Unlock
+
+Date: 2026-06-04
+
+Moved the scalar `tmemory` and transaction-boundary WAST tranche from
+research-only normalization to the real transaction text parser and compiled
+Wasmtime runtime path.
+
+Runtime path now exercised by unlocked proposal files:
+
+- `tmemory` scalar loads/stores, `tmemory.size`, and `tmemory.grow` use the
+  `VMemory`-backed transactional sidecar.
+- Transaction writes stage bytes in a copy-on-write workspace indexed by
+  `GranuleId`; commit copies staged bytes into committed `tmemory`, and abort
+  discards the workspace.
+- `LockBased` ownership is active for scalar memory granules with optimistic
+  reads and pessimistic writes.
+- Exported `tfunc` and non-transactional-to-transactional `tcall` boundaries
+  start transactions; normal return commits, and traps abort.
+- Scalar `tglobal.get/set` runtime scaffolding is present for numeric globals,
+  but the proposal `tglobal.wast` fixture remains deferred because it mixes
+  scalar global behavior with transactional refs, `tfuncref`, tables, imports,
+  and object-table semantics.
+
+WAST harness state after this unlock:
+
+- Real parser and real runtime path:
+  - scalar `tmemory` WAST files under
+    `transaction-proposal/simple-transactions/`
+  - scalar/control/numeric `tfunc` and `tcall` WAST files under
+    `transaction-proposal/simple-transactions/`
+  - `tconflict-tmemory.wast` only as a scalar `tmemory` declaration and
+    boundary smoke test; it does not cover conflict host functions, concurrent
+    transactions, or conflict detection.
+- Remaining path-scoped fixture replacements:
+  - `ttry-basic.wast`
+  - `tcall_ref.wast`
+  - `return_tcall_ref.wast`
+  - `br_on_tnon_null.wast`
+  - `br_on_tnull.wast`
+  - `tref_as_non_null.wast`
+- Remaining text-normalization categories:
+  - bulk `tmemory.copy/fill/init`
+  - import/export and function-pointer compatibility files
+  - transactional SIMD memory and SIMD numeric aliases
+  - transactional refs, tables, object-table permission cases, and
+    `ttry`/`tfail`
+
+Verification:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 69 passed; 0 failed; 47 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 125 passed; 0 failed; 48 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/tmemory -- --format terse
+test result: ok. 0 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/tglobal -- --format terse
+test result: ok. 0 passed; 0 failed; 0 ignored
+```
+
+The `transaction-proposal/tmemory` and `transaction-proposal/tglobal` filters
+select zero tests because the proposal corpus exposes those as filenames under
+`transaction-proposal/simple-transactions/`, not as separate suite
+directories.
+
 ## Runtime Core Task 8: Scalar Real-Parser Bridge
 
 Date: 2026-06-04
