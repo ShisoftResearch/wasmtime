@@ -604,7 +604,7 @@ git commit -m "Check mock transaction memory conflicts"
 - Modify: `docs/shisoft/transactional-wasm-wast-ledger.md`
 - Modify: `docs/shisoft/transactional-wasm-implementation-log.md`
 
-- [ ] **Step 1: Enable scalar memory files one at a time**
+- [x] **Step 1: Enable scalar memory files one at a time**
 
 Try in order:
 
@@ -616,7 +616,7 @@ Try in order:
 
 Add one file at a time to `transaction_proposal_uses_real_text_parser`.
 
-- [ ] **Step 2: Verify after each file**
+- [x] **Step 2: Verify after each file**
 
 ```bash
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
@@ -624,7 +624,27 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 
 Expected: no failures before enabling the next file.
 
-- [ ] **Step 3: Update ledger**
+Result:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tload.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tstore.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tmemory_trap.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+```
+
+`tmemory_trap.wast` required local `wasm-tools-transaction` fork commit
+`0db14108` so `(tdata ...)` parses as a transaction text alias for ordinary
+active data segments.
+
+- [x] **Step 3: Update ledger**
 
 For each enabled file, update `docs/shisoft/transactional-wasm-wast-ledger.md`
 with:
@@ -635,7 +655,7 @@ with:
 - `tmemory_trap.wast`: real parser + mock runtime, passing as of 2026-06-04.
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/test-util/src/wast.rs docs/shisoft/transactional-wasm-wast-ledger.md docs/shisoft/transactional-wasm-implementation-log.md

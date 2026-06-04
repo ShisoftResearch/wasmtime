@@ -1320,7 +1320,14 @@ fn transaction_proposal_uses_real_text_parser(
 
     match suite {
         TransactionProposalSuite::SimpleTransactions => {
-            matches!(name, "tmemory_size.wast" | "tmemory_grow.wast")
+            matches!(
+                name,
+                "tmemory_size.wast"
+                    | "tmemory_grow.wast"
+                    | "tload.wast"
+                    | "tstore.wast"
+                    | "tmemory_trap.wast"
+            )
         }
         TransactionProposalSuite::Tsimd => false,
     }
@@ -1655,12 +1662,9 @@ mod tests {
             "taddress.wast",
             "talign.wast",
             "tendianness.wast",
-            "tload.wast",
             "tmemory.wast",
             "tmemory_redundancy.wast",
-            "tmemory_trap.wast",
             "tskip-stack-guard-page.wast",
-            "tstore.wast",
         ] {
             let test = WastTest {
                 path: PathBuf::from(name),
@@ -1676,7 +1680,13 @@ mod tests {
 
     #[test]
     fn enables_real_text_parser_transaction_proposal_tranche() {
-        for name in ["tmemory_size.wast", "tmemory_grow.wast"] {
+        for name in [
+            "tmemory_size.wast",
+            "tmemory_grow.wast",
+            "tload.wast",
+            "tstore.wast",
+            "tmemory_trap.wast",
+        ] {
             let test = WastTest {
                 path: PathBuf::from(name),
                 contents: String::new(),

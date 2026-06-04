@@ -419,6 +419,51 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Mock Runtime: Scalar Real WAST Coverage Follow-Up
+
+Date: 2026-06-04
+
+Enabled additional scalar memory proposal files on the real-parser,
+real-engine mock-runtime path:
+
+- `tload.wast`
+- `tstore.wast`
+- `tmemory_trap.wast`
+
+Mocked/deferred:
+
+- These files continue to rely on the existing mock transactional memory
+  runtime; no new Wasmtime runtime semantics were required.
+- `tmemory_trap.wast` initially failed before execution because the local
+  `wast` fork rejected `(tdata ...)` module fields. The local
+  `wasm-tools-transaction` fork commit `0db14108` adds `tdata` as a
+  transaction text alias for ordinary active data segments.
+- The full proposal count is unchanged because these files were already passing
+  through the text-normalization adapter; this tranche moves their parser and
+  engine path from adapter-only to real-parser mock runtime.
+
+Verification:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tload.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tstore.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tmemory_trap.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+
+cargo test -p wasmtime-test-util --features wast transaction_proposal
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out
+```
+
 Remaining Wave 7 blocker:
 
 - `tsimd_const.wast`: embeds a binary module with transactional type encoding;
