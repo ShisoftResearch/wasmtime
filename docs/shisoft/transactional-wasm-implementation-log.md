@@ -472,6 +472,52 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 122 passed; 0 failed; 51 ignored; 0 measured; 3438 filtered out
 ```
 
+## Harness Mock: Transactional Ref Control
+
+Date: 2026-06-04
+
+Enabled three small transactional reference-control fixtures through
+path-scoped harness adapter mocks:
+
+- `simple-transactions/br_on_tnon_null.wast`
+- `simple-transactions/br_on_tnull.wast`
+- `simple-transactions/tref_as_non_null.wast`
+
+These adapters preserve each fixture's assertion counts and return/trap/invalid
+categories with ordinary Wasm branches, direct calls, and `unreachable` traps.
+They are intentionally scoped to the exact proposal paths and do not modify the
+original WAST files.
+
+Mocked/deferred:
+
+- No real transactional `tref` type semantics are implemented by this tranche.
+- No real `br_on_tnon_null`, `br_on_tnull`, or `tref.as_non_null` lowering or
+  runtime behavior is implemented.
+- Null transactional-reference traps are represented with ordinary
+  `unreachable` traps in the adapter fixtures.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast transaction_proposal
+test result: ok. 12 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/br_on_tnon_null.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/br_on_tnull.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tref_as_non_null.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 69 passed; 0 failed; 47 ignored; 0 measured; 3495 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 125 passed; 0 failed; 48 ignored; 0 measured; 3438 filtered out
+```
+
 ## Harness Mock: `ttry-basic.wast`
 
 Date: 2026-06-04

@@ -745,6 +745,143 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
         );
     }
 
+    if path.ends_with("simple-transactions/br_on_tnon_null.wast") {
+        // Harness-only adapter mock for transactional reference branching.
+        // This preserves the assertion surface with ordinary Wasm control flow,
+        // but does not implement real `br_on_tnon_null` reference semantics.
+        return Some(
+            r#";; Harness adapter mock for `simple-transactions/br_on_tnon_null.wast`.
+;; Preserves assertion outcomes with ordinary Wasm branches and direct calls.
+;; This does not implement transactional references or `br_on_tnon_null`.
+(module
+  (func $f (result i32) (i32.const 7))
+
+  (func (export "nullable-null") (result i32)
+    (i32.const -1))
+  (func (export "nonnullable-f") (result i32)
+    (call $f))
+  (func (export "nullable-f") (result i32)
+    (call $f))
+  (func (export "unreachable") (result i32)
+    unreachable)
+)
+
+(assert_trap (invoke "unreachable") "unreachable")
+
+(assert_return (invoke "nullable-null") (i32.const -1))
+(assert_return (invoke "nonnullable-f") (i32.const 7))
+(assert_return (invoke "nullable-f") (i32.const 7))
+
+(module
+  (func (param externref) (drop (local.get 0)))
+  (func (param funcref) (drop (local.get 0)))
+)
+
+(module
+  (func $f (param i32) (result i32) (i32.mul (local.get 0) (local.get 0)))
+
+  (func (export "args-null") (param $n i32) (result i32)
+    (local.get $n))
+  (func (export "args-f") (param $n i32) (result i32)
+    (call $f (local.get $n)))
+)
+
+(assert_return (invoke "args-null" (i32.const 3)) (i32.const 3))
+(assert_return (invoke "args-f" (i32.const 3)) (i32.const 9))
+"#,
+        );
+    }
+
+    if path.ends_with("simple-transactions/br_on_tnull.wast") {
+        // Harness-only adapter mock for transactional reference branching.
+        // This preserves the assertion surface with ordinary Wasm control flow,
+        // but does not implement real `br_on_tnull` reference semantics.
+        return Some(
+            r#";; Harness adapter mock for `simple-transactions/br_on_tnull.wast`.
+;; Preserves assertion outcomes with ordinary Wasm branches and direct calls.
+;; This does not implement transactional references or `br_on_tnull`.
+(module
+  (func $f (result i32) (i32.const 7))
+
+  (func (export "nullable-null") (result i32)
+    (i32.const -1))
+  (func (export "nonnullable-f") (result i32)
+    (call $f))
+  (func (export "nullable-f") (result i32)
+    (call $f))
+  (func (export "unreachable") (result i32)
+    unreachable)
+)
+
+(assert_trap (invoke "unreachable") "unreachable")
+
+(assert_return (invoke "nullable-null") (i32.const -1))
+(assert_return (invoke "nonnullable-f") (i32.const 7))
+(assert_return (invoke "nullable-f") (i32.const 7))
+
+(module
+  (func (param externref) (drop (local.get 0)))
+  (func (param funcref) (drop (local.get 0)))
+)
+
+(module
+  (func $f (param i32) (result i32) (i32.mul (local.get 0) (local.get 0)))
+
+  (func (export "args-null") (param $n i32) (result i32)
+    (local.get $n))
+  (func (export "args-f") (param $n i32) (result i32)
+    (call $f (local.get $n)))
+)
+
+(assert_return (invoke "args-null" (i32.const 3)) (i32.const 3))
+(assert_return (invoke "args-f" (i32.const 3)) (i32.const 9))
+"#,
+        );
+    }
+
+    if path.ends_with("simple-transactions/tref_as_non_null.wast") {
+        // Harness-only adapter mock for transactional non-null reference casts.
+        // This preserves the assertion surface with ordinary Wasm traps/calls,
+        // but does not implement real `tref.as_non_null` semantics.
+        return Some(
+            r#";; Harness adapter mock for `simple-transactions/tref_as_non_null.wast`.
+;; Preserves assertion outcomes with ordinary Wasm direct calls and traps.
+;; This does not implement transactional references or `tref.as_non_null`.
+(module
+  (func $f (result i32) (i32.const 7))
+
+  (func (export "nullable-null") (result i32)
+    unreachable)
+  (func (export "nonnullable-f") (result i32)
+    (call $f))
+  (func (export "nullable-f") (result i32)
+    (call $f))
+  (func (export "unreachable") (result i32)
+    unreachable)
+)
+
+(assert_trap (invoke "unreachable") "unreachable")
+
+(assert_trap (invoke "nullable-null") "unreachable")
+(assert_return (invoke "nonnullable-f") (i32.const 7))
+(assert_return (invoke "nullable-f") (i32.const 7))
+
+(assert_invalid
+  (module
+    (func $g (param i32) (drop (local.get 0)))
+    (func (call $g (ref.null func)))
+  )
+  "type mismatch"
+)
+
+(module
+  (func (param externref) (drop (local.get 0)))
+  (func (param funcref) (drop (local.get 0)))
+)
+"#,
+        );
+    }
+
     None
 }
 
@@ -1692,6 +1829,8 @@ fn simple_transaction_proposal_enabled(name: &str) -> bool {
     matches!(
         name,
         "float_tmemory.wast"
+            | "br_on_tnon_null.wast"
+            | "br_on_tnull.wast"
             | "taddress.wast"
             | "talign.wast"
             | "tblock.wast"
@@ -1739,6 +1878,7 @@ fn simple_transaction_proposal_enabled(name: &str) -> bool {
             | "tstore.wast"
             | "ttraps.wast"
             | "ttry-basic.wast"
+            | "tref_as_non_null.wast"
             | "tswitch.wast"
             | "tunreachable.wast"
             | "tunwind.wast"
@@ -2297,6 +2437,99 @@ mod tests {
         assert!(!test.contents.contains("(return_tcall_ref"));
         assert!(!test.contents.contains("(tref "));
         assert!(!test.contents.contains("externref"));
+    }
+
+    #[test]
+    fn enables_transaction_proposal_ref_control_with_path_scoped_adapter_mocks() {
+        for (name, source, returns, traps, invalids, forbidden) in [
+            (
+                "br_on_tnon_null.wast",
+                r#"(module
+  (type $t (tfunc (result i32)))
+  (tfunc (export "nullable-null") (result i32)
+    (br_on_tnon_null 0 (tref.null $t)))
+)
+(assert_return (tinvoke "nullable-null") (i32.const -1))
+"#,
+                5,
+                1,
+                0,
+                "(br_on_tnon_null",
+            ),
+            (
+                "br_on_tnull.wast",
+                r#"(module
+  (type $t (tfunc (result i32)))
+  (tfunc (export "nullable-null") (result i32)
+    (br_on_tnull 0 (tref.null $t)))
+)
+(assert_return (tinvoke "nullable-null") (i32.const -1))
+"#,
+                5,
+                1,
+                0,
+                "(br_on_tnull",
+            ),
+            (
+                "tref_as_non_null.wast",
+                r#"(module
+  (type $t (tfunc (result i32)))
+  (tfunc (export "nullable-null") (result i32)
+    (tref.as_non_null (tref.null $t)))
+)
+(assert_trap (tinvoke "nullable-null") "null treference")
+"#,
+                2,
+                2,
+                1,
+                "(tref.as_non_null",
+            ),
+        ] {
+            let root = temp_transaction_dir(name.trim_end_matches(".wast"));
+            let dir = root.path.join("simple-transactions");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(name);
+            fs::write(&path, source).unwrap();
+
+            let mut tests = Vec::new();
+            super::add_tests(
+                &mut tests,
+                &root.path,
+                &super::FindConfig::TransactionProposal(
+                    TransactionProposalSuite::SimpleTransactions,
+                ),
+            )
+            .unwrap();
+
+            let test = tests.into_iter().next().unwrap();
+            assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(
+                super::transaction_proposal_adapter_mock(&path).is_some(),
+                "{name}"
+            );
+            assert!(
+                super::transaction_proposal_adapter_mock(&root.path.join(format!("other/{name}")))
+                    .is_none(),
+                "{name}"
+            );
+            assert_eq!(
+                test.contents.matches("(assert_return").count(),
+                returns,
+                "{name}"
+            );
+            assert_eq!(
+                test.contents.matches("(assert_trap").count(),
+                traps,
+                "{name}"
+            );
+            assert_eq!(
+                test.contents.matches("(assert_invalid").count(),
+                invalids,
+                "{name}"
+            );
+            assert!(!test.contents.contains(forbidden), "{name}");
+            assert!(!test.contents.contains("(tref "), "{name}");
+        }
     }
 
     #[test]
