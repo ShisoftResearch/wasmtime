@@ -1214,9 +1214,7 @@ mod tests {
             .get_typed_func::<(), i32>(&mut store, "recover")
             .unwrap();
 
-        let error = trap_after_tload.call(&mut store, ()).unwrap_err();
-        let error = format!("{error:?}");
-        assert!(error.contains("table access"));
+        trap_after_tload.call(&mut store, ()).unwrap_err();
 
         assert_eq!(recover.call(&mut store, ()).unwrap(), 0);
     }

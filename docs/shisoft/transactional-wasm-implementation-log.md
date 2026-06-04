@@ -929,9 +929,10 @@ Runtime/harness work in this tranche:
 
 - `tmemory.size` and `tmemory.grow` zero-success returns no longer collide with
   host trap sentinels in Cranelift lowering.
-- Transactional memory/global operations lazily open a mock transaction when a
-  function has no explicit `ttry`, matching the current `tfunc`/`tinvoke` WAST
-  boundary scaffold.
+- Transactional memory/global operations that can stage or observe transactional
+  state lazily open a mock transaction when a function has no explicit `ttry`,
+  matching the current `tfunc`/`tinvoke` WAST boundary scaffold. `tmemory.size`
+  remains a read-only query that does not open a transaction.
 - Any Wasm trap now aborts an active mock transaction at the Wasm call
   boundary, so ordinary traps after transactional operations do not leak active
   transaction state into later invocations.
