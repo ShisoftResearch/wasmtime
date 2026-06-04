@@ -107,16 +107,26 @@ impl TransactionConfig {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TransactionId(u64);
 
+impl TransactionId {
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TransactionState {
     active: Option<TransactionId>,
     next_id: u64,
     locks: LockBased,
-    staged_globals: BTreeMap<GlobalObjectKey, GlobalSnapshot>,
-    staged_memory_granules: BTreeMap<MemoryGranuleKey, Vec<u8>>,
-    staged_memory_sizes: BTreeMap<MemoryObjectKey, u64>,
-    memory_read_granules: BTreeSet<MemoryGranuleKey>,
-    memory_write_granules: BTreeSet<MemoryGranuleKey>,
+    staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
+    staged_granules: BTreeMap<GranuleId, Vec<u8>>,
+    staged_memory_sizes: BTreeMap<GranuleId, u64>,
+    memory_read_granules: BTreeSet<GranuleId>,
+    memory_write_granules: BTreeSet<GranuleId>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
 }
@@ -128,7 +138,7 @@ impl Default for TransactionState {
             next_id: 1,
             locks: LockBased::default(),
             staged_globals: BTreeMap::new(),
-            staged_memory_granules: BTreeMap::new(),
+            staged_granules: BTreeMap::new(),
             staged_memory_sizes: BTreeMap::new(),
             memory_read_granules: BTreeSet::new(),
             memory_write_granules: BTreeSet::new(),
@@ -166,10 +176,21 @@ pub(crate) enum GlobalSnapshot {
     F64(u64),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct GlobalObjectKey {
-    owner_instance: Option<u32>,
-    global_index: u32,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum GranuleId {
+    TMemory {
+        instance: u32,
+        memory_index: u32,
+        granule_index: u64,
+    },
+    TMemorySize {
+        instance: u32,
+        memory_index: u32,
+    },
+    TGlobal {
+        instance: u32,
+        global_index: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -235,10 +256,7 @@ impl TransactionConcurrencyControl for LockBased {
         memory_index: u32,
         granule_index: u64,
     ) -> Result<()> {
-        let key = MemoryGranuleKey {
-            object: memory_object_key(None, memory_index),
-            granule_index,
-        };
+        let key = lock_memory_granule_key(memory_index, granule_index);
         let ownership = self.memory_granules.entry(key).or_default();
         if ownership.writer.is_some_and(|writer| writer != transaction) {
             bail!("tmemory granule conflict: write owner blocks read");
@@ -253,10 +271,7 @@ impl TransactionConcurrencyControl for LockBased {
         memory_index: u32,
         granule_index: u64,
     ) -> Result<()> {
-        let key = MemoryGranuleKey {
-            object: memory_object_key(None, memory_index),
-            granule_index,
-        };
+        let key = lock_memory_granule_key(memory_index, granule_index);
         let ownership = self.memory_granules.entry(key).or_default();
         if ownership.writer.is_some_and(|writer| writer != transaction) {
             bail!("tmemory granule conflict: write owner blocks write");
@@ -290,7 +305,7 @@ impl TransactionState {
             self.active.is_none(),
             "transaction is already active in this store"
         );
-        let id = TransactionId(self.next_id);
+        let id = TransactionId::from_raw(self.next_id);
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -323,24 +338,46 @@ impl TransactionState {
         self.ensure_active()?;
         let mut records = Vec::new();
         for (key, &value) in &self.staged_globals {
+            let GranuleId::TGlobal {
+                instance,
+                global_index,
+            } = *key
+            else {
+                bail!("staged global map contains non-global key");
+            };
             records.push(StagedRecord::Global {
-                owner_instance: key.owner_instance.map(InstanceId::from_u32),
-                global_index: key.global_index,
+                owner_instance: granule_owner_instance(instance),
+                global_index,
                 value,
             });
         }
-        for (key, bytes) in &self.staged_memory_granules {
+        for (key, bytes) in &self.staged_granules {
+            let GranuleId::TMemory {
+                instance,
+                memory_index,
+                granule_index,
+            } = *key
+            else {
+                bail!("staged granule map contains non-memory key");
+            };
             records.push(StagedRecord::MemoryGranule {
-                owner_instance: key.object.owner_instance.map(InstanceId::from_u32),
-                memory_index: key.object.memory_index,
-                granule_index: key.granule_index,
+                owner_instance: granule_owner_instance(instance),
+                memory_index,
+                granule_index,
                 bytes: bytes.clone(),
             });
         }
         for (key, &new_pages) in &self.staged_memory_sizes {
+            let GranuleId::TMemorySize {
+                instance,
+                memory_index,
+            } = *key
+            else {
+                bail!("staged memory size map contains non-size key");
+            };
             records.push(StagedRecord::MemorySize {
-                owner_instance: key.owner_instance.map(InstanceId::from_u32),
-                memory_index: key.memory_index,
+                owner_instance: granule_owner_instance(instance),
+                memory_index,
                 new_pages,
             });
         }
@@ -370,7 +407,7 @@ impl TransactionState {
         self.ensure_active()?;
         Ok(self
             .staged_memory_sizes
-            .insert(memory_object_key(owner_instance, memory_index), new_pages)
+            .insert(memory_size_granule_id(owner_instance, memory_index), new_pages)
             .is_none())
     }
 
@@ -391,7 +428,7 @@ impl TransactionState {
         self.ensure_active()?;
         Ok(self
             .staged_globals
-            .insert(global_object_key(owner_instance, global_index), value)
+            .insert(global_granule_id(owner_instance, global_index), value)
             .is_none())
     }
 
@@ -401,7 +438,7 @@ impl TransactionState {
         global_index: u32,
     ) -> Option<GlobalSnapshot> {
         self.staged_globals
-            .get(&global_object_key(owner_instance, global_index))
+            .get(&global_granule_id(owner_instance, global_index))
             .copied()
     }
 
@@ -413,13 +450,10 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         self.lock_memory_granule_write(memory_index, granule_index)?;
-        let key = MemoryGranuleKey {
-            object: memory_object_key(None, memory_index),
-            granule_index,
-        };
+        let key = memory_granule_id_from_u64(None, memory_index, granule_index);
         self.memory_read_granules.insert(key);
         self.memory_write_granules.insert(key);
-        Ok(self.staged_memory_granules.insert(key, bytes).is_none())
+        Ok(self.staged_granules.insert(key, bytes).is_none())
     }
 
     pub(crate) fn stage_memory_write(
@@ -481,6 +515,8 @@ impl TransactionState {
             let local_granule_range =
                 (granule_range.start - backing_base)..(granule_range.end - backing_base);
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
+            let granule_index = u64::try_from(granule_index)
+                .context("tmemory granule index does not fit u64")?;
             let granule_offset = current - granule_range.start;
             let chunk_len = (range.end - current).min(granule_range.end - current);
             let granule_chunk_end = granule_offset
@@ -490,10 +526,10 @@ impl TransactionState {
                 .checked_add(chunk_len)
                 .context("tmemory write offset overflow")?;
 
-            self.lock_memory_granule_write(memory_index, key.granule_index)?;
+            self.lock_memory_granule_write(memory_index, granule_index)?;
             {
                 let staged = self
-                    .staged_memory_granules
+                    .staged_granules
                     .entry(key)
                     .or_insert_with(|| backing[local_granule_range.clone()].to_vec());
                 ensure!(
@@ -554,42 +590,26 @@ impl TransactionState {
     ) -> Result<Vec<u8>> {
         self.ensure_active()?;
         let range = checked_tmemory_range(addr, len, memory_len)?;
-        let backing_base = usize::try_from(backing_base)
-            .context("tmemory backing base does not fit host usize")?;
-        let backing_end = backing_base
-            .checked_add(backing.len())
-            .context("tmemory backing window overflow")?;
-        ensure!(
-            range.start >= backing_base && range.end <= backing_end,
-            "tmemory backing window does not cover read range"
-        );
-        let mut bytes = backing[range.start - backing_base..range.end - backing_base].to_vec();
+        let bytes = self.merge_staged_tmemory_range(
+            granule_instance(owner_instance),
+            memory_index,
+            addr,
+            len,
+            backing_base,
+            backing,
+            memory_len,
+        )?;
         let mut current = range.start;
 
         while current < range.end {
             let granule_index = current / TMEMORY_GRANULE_SIZE;
             let granule_range = tmemory_granule_backing_range(granule_index, memory_len)?;
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            let granule_offset = current - granule_range.start;
+            let granule_index = u64::try_from(granule_index)
+                .context("tmemory granule index does not fit u64")?;
             let chunk_len = (range.end - current).min(granule_range.end - current);
-            let granule_chunk_end = granule_offset
-                .checked_add(chunk_len)
-                .context("tmemory granule read offset overflow")?;
 
-            self.lock_memory_granule_read(memory_index, key.granule_index)?;
-            if let Some(staged) = self.staged_memory_granules.get(&key) {
-                ensure!(
-                    granule_chunk_end <= staged.len(),
-                    "staged tmemory granule length mismatch"
-                );
-                let read_offset = current - range.start;
-                let read_chunk_end = read_offset
-                    .checked_add(chunk_len)
-                    .context("tmemory read offset overflow")?;
-                bytes[read_offset..read_chunk_end]
-                    .copy_from_slice(&staged[granule_offset..granule_chunk_end]);
-            }
-
+            self.lock_memory_granule_read(memory_index, granule_index)?;
             self.memory_read_granules.insert(key);
             current += chunk_len;
         }
@@ -670,11 +690,8 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> Option<&[u8]> {
-        self.staged_memory_granules
-            .get(&MemoryGranuleKey {
-                object: memory_object_key(None, memory_index),
-                granule_index,
-            })
+        self.staged_granules
+            .get(&memory_granule_id_from_u64(None, memory_index, granule_index))
             .map(Vec::as_slice)
     }
 
@@ -683,11 +700,8 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> Option<&mut [u8]> {
-        self.staged_memory_granules
-            .get_mut(&MemoryGranuleKey {
-                object: memory_object_key(None, memory_index),
-                granule_index,
-            })
+        self.staged_granules
+            .get_mut(&memory_granule_id_from_u64(None, memory_index, granule_index))
             .map(Vec::as_mut_slice)
     }
 
@@ -707,10 +721,11 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         self.lock_memory_granule_read(memory_index, granule_index)?;
-        Ok(self.memory_read_granules.insert(MemoryGranuleKey {
-            object: memory_object_key(owner_instance, memory_index),
+        Ok(self.memory_read_granules.insert(memory_granule_id_from_u64(
+            owner_instance,
+            memory_index,
             granule_index,
-        }))
+        )))
     }
 
     pub(crate) fn acquire_memory_granule_write(
@@ -731,13 +746,10 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         self.lock_memory_granule_write(memory_index, granule_index)?;
-        let key = MemoryGranuleKey {
-            object: memory_object_key(owner_instance, memory_index),
-            granule_index,
-        };
+        let key = memory_granule_id_from_u64(owner_instance, memory_index, granule_index);
         self.memory_read_granules.insert(key);
         self.memory_write_granules.insert(key);
-        Ok(self.staged_memory_granules.insert(key, bytes).is_none())
+        Ok(self.staged_granules.insert(key, bytes).is_none())
     }
 
     fn acquire_memory_write_ownership_range_owned(
@@ -760,7 +772,9 @@ impl TransactionState {
                 .and_then(|index| index.checked_mul(TMEMORY_GRANULE_SIZE))
                 .context("tmemory pending store granule overflow")?;
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            self.lock_memory_granule_write(memory_index, key.granule_index)?;
+            let granule_index = u64::try_from(granule_index)
+                .context("tmemory granule index does not fit u64")?;
+            self.lock_memory_granule_write(memory_index, granule_index)?;
             self.memory_read_granules.insert(key);
             self.memory_write_granules.insert(key);
             current = end.min(granule_end);
@@ -795,10 +809,11 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.memory_read_granules.contains(&MemoryGranuleKey {
-            object: memory_object_key(owner_instance, memory_index),
+        self.memory_read_granules.contains(&memory_granule_id_from_u64(
+            owner_instance,
+            memory_index,
             granule_index,
-        })
+        ))
     }
 
     pub(crate) fn owns_memory_granule_write(&self, memory_index: u32, granule_index: u64) -> bool {
@@ -811,10 +826,64 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.memory_write_granules.contains(&MemoryGranuleKey {
-            object: memory_object_key(owner_instance, memory_index),
+        self.memory_write_granules.contains(&memory_granule_id_from_u64(
+            owner_instance,
+            memory_index,
             granule_index,
-        })
+        ))
+    }
+
+    fn merge_staged_tmemory_range(
+        &self,
+        instance: u32,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+        backing_base: u64,
+        backing: &[u8],
+        memory_len: usize,
+    ) -> Result<Vec<u8>> {
+        let range = checked_tmemory_range(addr, len, memory_len)?;
+        let backing_base = usize::try_from(backing_base)
+            .context("tmemory backing base does not fit host usize")?;
+        let backing_end = backing_base
+            .checked_add(backing.len())
+            .context("tmemory backing window overflow")?;
+        ensure!(
+            range.start >= backing_base && range.end <= backing_end,
+            "tmemory backing window does not cover read range"
+        );
+
+        let mut bytes = backing[range.start - backing_base..range.end - backing_base].to_vec();
+        let mut current = range.start;
+
+        while current < range.end {
+            let granule_index = current / TMEMORY_GRANULE_SIZE;
+            let granule_range = tmemory_granule_backing_range(granule_index, memory_len)?;
+            let key = memory_granule_id_for_instance(instance, memory_index, granule_index)?;
+            let granule_offset = current - granule_range.start;
+            let chunk_len = (range.end - current).min(granule_range.end - current);
+            let granule_chunk_end = granule_offset
+                .checked_add(chunk_len)
+                .context("tmemory granule read offset overflow")?;
+
+            if let Some(staged) = self.staged_granules.get(&key) {
+                ensure!(
+                    granule_chunk_end <= staged.len(),
+                    "staged tmemory granule length mismatch"
+                );
+                let read_offset = current - range.start;
+                let read_chunk_end = read_offset
+                    .checked_add(chunk_len)
+                    .context("tmemory read offset overflow")?;
+                bytes[read_offset..read_chunk_end]
+                    .copy_from_slice(&staged[granule_offset..granule_chunk_end]);
+            }
+
+            current += chunk_len;
+        }
+
+        Ok(bytes)
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -827,12 +896,38 @@ impl TransactionState {
             self.locks.release_transaction(transaction);
         }
         self.staged_globals.clear();
-        self.staged_memory_granules.clear();
+        self.staged_granules.clear();
         self.staged_memory_sizes.clear();
         self.memory_read_granules.clear();
         self.memory_write_granules.clear();
         self.scratch.clear();
         self.pending_memory_store = None;
+    }
+}
+
+#[cfg(test)]
+impl TransactionState {
+    fn new_for_test(transaction: TransactionId) -> Self {
+        Self {
+            active: Some(transaction),
+            next_id: transaction.as_raw().saturating_add(1),
+            ..Self::default()
+        }
+    }
+
+    fn stage_granule_for_test(&mut self, granule: GranuleId, bytes: Vec<u8>) {
+        self.staged_granules.insert(granule, bytes);
+    }
+
+    fn read_tmemory_range_for_test(
+        &self,
+        instance: u32,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+        committed: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.merge_staged_tmemory_range(instance, memory_index, addr, len, 0, committed, committed.len())
     }
 }
 
@@ -850,30 +945,73 @@ fn checked_tmemory_range(
     Ok(start..end)
 }
 
-fn memory_object_key(owner_instance: Option<InstanceId>, memory_index: u32) -> MemoryObjectKey {
+fn lock_memory_object_key(memory_index: u32) -> MemoryObjectKey {
     MemoryObjectKey {
-        owner_instance: owner_instance.map(InstanceId::as_u32),
+        owner_instance: None,
         memory_index,
     }
 }
 
-fn global_object_key(owner_instance: Option<InstanceId>, global_index: u32) -> GlobalObjectKey {
-    GlobalObjectKey {
-        owner_instance: owner_instance.map(InstanceId::as_u32),
+fn granule_instance(owner_instance: Option<InstanceId>) -> u32 {
+    owner_instance.map_or(0, InstanceId::as_u32)
+}
+
+fn granule_owner_instance(instance: u32) -> Option<InstanceId> {
+    (instance != 0).then(|| InstanceId::from_u32(instance))
+}
+
+fn global_granule_id(owner_instance: Option<InstanceId>, global_index: u32) -> GranuleId {
+    GranuleId::TGlobal {
+        instance: granule_instance(owner_instance),
         global_index,
     }
+}
+
+fn memory_size_granule_id(owner_instance: Option<InstanceId>, memory_index: u32) -> GranuleId {
+    GranuleId::TMemorySize {
+        instance: granule_instance(owner_instance),
+        memory_index,
+    }
+}
+
+fn memory_granule_id_from_u64(
+    owner_instance: Option<InstanceId>,
+    memory_index: u32,
+    granule_index: u64,
+) -> GranuleId {
+    GranuleId::TMemory {
+        instance: granule_instance(owner_instance),
+        memory_index,
+        granule_index,
+    }
+}
+
+fn memory_granule_id_for_instance(
+    instance: u32,
+    memory_index: u32,
+    granule_index: usize,
+) -> Result<GranuleId> {
+    Ok(GranuleId::TMemory {
+        instance,
+        memory_index,
+        granule_index: u64::try_from(granule_index)
+            .context("tmemory granule index does not fit u64")?,
+    })
 }
 
 fn memory_granule_key(
     owner_instance: Option<InstanceId>,
     memory_index: u32,
     granule_index: usize,
-) -> Result<MemoryGranuleKey> {
-    Ok(MemoryGranuleKey {
-        object: memory_object_key(owner_instance, memory_index),
-        granule_index: u64::try_from(granule_index)
-            .context("tmemory granule index does not fit u64")?,
-    })
+) -> Result<GranuleId> {
+    memory_granule_id_for_instance(granule_instance(owner_instance), memory_index, granule_index)
+}
+
+fn lock_memory_granule_key(memory_index: u32, granule_index: u64) -> MemoryGranuleKey {
+    MemoryGranuleKey {
+        object: lock_memory_object_key(memory_index),
+        granule_index,
+    }
 }
 
 fn tmemory_granule_backing_range(
@@ -1840,6 +1978,125 @@ mod tests {
                 value: GlobalSnapshot::I64(22)
             }]
         );
+    }
+
+    #[test]
+    fn granule_id_orders_by_object_space_and_index() {
+        let mut ids = vec![
+            GranuleId::TGlobal {
+                instance: 0,
+                global_index: 2,
+            },
+            GranuleId::TMemorySize {
+                instance: 0,
+                memory_index: 4,
+            },
+            GranuleId::TMemory {
+                instance: 2,
+                memory_index: 0,
+                granule_index: 0,
+            },
+            GranuleId::TMemory {
+                instance: 1,
+                memory_index: 7,
+                granule_index: 3,
+            },
+            GranuleId::TGlobal {
+                instance: 0,
+                global_index: 1,
+            },
+            GranuleId::TMemorySize {
+                instance: 0,
+                memory_index: 1,
+            },
+            GranuleId::TMemory {
+                instance: 1,
+                memory_index: 7,
+                granule_index: 1,
+            },
+        ];
+
+        ids.sort();
+
+        assert_eq!(
+            ids,
+            vec![
+                GranuleId::TMemory {
+                    instance: 1,
+                    memory_index: 7,
+                    granule_index: 1,
+                },
+                GranuleId::TMemory {
+                    instance: 1,
+                    memory_index: 7,
+                    granule_index: 3,
+                },
+                GranuleId::TMemory {
+                    instance: 2,
+                    memory_index: 0,
+                    granule_index: 0,
+                },
+                GranuleId::TMemorySize {
+                    instance: 0,
+                    memory_index: 1,
+                },
+                GranuleId::TMemorySize {
+                    instance: 0,
+                    memory_index: 4,
+                },
+                GranuleId::TGlobal {
+                    instance: 0,
+                    global_index: 1,
+                },
+                GranuleId::TGlobal {
+                    instance: 0,
+                    global_index: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_merges_staged_and_committed_granules() {
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(7));
+        let instance = 11;
+        let memory_index = 3;
+        let committed: Vec<u8> = (0..TMEMORY_GRANULE_SIZE * 3)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        state.stage_granule_for_test(
+            GranuleId::TMemory {
+                instance,
+                memory_index,
+                granule_index: 0,
+            },
+            vec![0xAA; TMEMORY_GRANULE_SIZE],
+        );
+        state.stage_granule_for_test(
+            GranuleId::TMemory {
+                instance,
+                memory_index,
+                granule_index: 2,
+            },
+            vec![0xCC; TMEMORY_GRANULE_SIZE],
+        );
+
+        let merged = state
+            .read_tmemory_range_for_test(
+                instance,
+                memory_index,
+                (TMEMORY_GRANULE_SIZE - 2) as u64,
+                TMEMORY_GRANULE_SIZE + 6,
+                &committed,
+            )
+            .unwrap();
+
+        let mut expected = vec![0xAA; 2];
+        expected.extend_from_slice(&committed[TMEMORY_GRANULE_SIZE..TMEMORY_GRANULE_SIZE * 2]);
+        expected.extend_from_slice(&[0xCC; 4]);
+
+        assert_eq!(merged, expected);
     }
 
     #[test]
