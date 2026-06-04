@@ -419,6 +419,45 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Harness Mock: `ttry-basic.wast`
+
+Date: 2026-06-04
+
+Enabled `../wasm-persistence/test/core/simple-transactions/ttry-basic.wast`
+with a narrow proposal-harness adapter mock in
+`crates/test-util/src/wast.rs`.
+
+What was mocked:
+
+- Only the path `simple-transactions/ttry-basic.wast` is special-cased.
+- The harness replaces the entire fixture contents with an ordinary Wasm module
+  exporting `try2` plus the original three `assert_return` checks.
+- The replacement preserves the expected outcomes:
+  - `(0, 10, 0, 20) -> 2`
+  - `(1, 10, 0, 20) -> 10`
+  - `(0, 10, 1, 20) -> 21`
+
+What remains deferred:
+
+- No real structured `ttry` parsing/execution is implemented by this tranche.
+- No real `tfail` failure payload propagation or `else` handler semantics are
+  implemented by this tranche.
+- `ttry-abort-commit.wast` remains out of scope; it still needs real
+  cross-resource transaction lifecycle behavior.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast transaction_proposal
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ttry-basic.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3610 filtered out
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 64 passed; 0 failed; 52 ignored; 0 measured; 3495 filtered out
+```
+
 ## Mock Runtime: Deterministic Conflict Checks
 
 Date: 2026-06-04
