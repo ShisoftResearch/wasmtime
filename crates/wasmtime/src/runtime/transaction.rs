@@ -2070,6 +2070,23 @@ mod tests {
     }
 
     #[test]
+    fn commit_rejects_changed_optimistic_read_version() {
+        let mut state = TransactionState::default();
+        let transaction = state.begin().unwrap();
+        let granule = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 0,
+        };
+        state.locks.record_read_for_test(transaction, granule, 1).unwrap();
+
+        let error = state.commit().unwrap_err();
+
+        assert!(error.to_string().contains("transaction read conflict"));
+        assert_eq!(state.active_transaction(), Some(transaction));
+    }
+
+    #[test]
     fn commit_validates_optimistic_read_versions_before_clearing() {
         let mut state = TransactionState::default();
         let transaction = state.begin().unwrap();
