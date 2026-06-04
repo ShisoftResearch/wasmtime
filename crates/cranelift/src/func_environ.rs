@@ -248,6 +248,10 @@ pub struct FuncEnvironment<'module_environment> {
 
     /// Cached alias regions for alias analysis.
     alias_regions: std::collections::HashMap<AliasRegionKey, ir::AliasRegion>,
+
+    /// Whether this function has translated a transaction begin and therefore
+    /// needs to commit an active transaction before normal returns.
+    transaction_may_be_active_on_return: bool,
 }
 
 impl<'module_environment> FuncEnvironment<'module_environment> {
@@ -323,6 +327,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             func_body_offset,
 
             alias_regions: std::collections::HashMap::new(),
+            transaction_may_be_active_on_return: false,
         }
     }
 
@@ -3541,6 +3546,7 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
     ) -> WasmResult<()> {
+        self.transaction_may_be_active_on_return = true;
         self.translate_transaction_lifecycle_builtin(
             builder,
             BuiltinFunctionIndex::transaction_begin(),
@@ -5628,6 +5634,8 @@ impl FuncEnvironment<'_> {
     }
 
     pub fn handle_before_return(&mut self, retvals: &[ir::Value], builder: &mut FunctionBuilder) {
+        self.translate_transaction_commit_before_return(builder);
+
         #[cfg(feature = "wmemcheck")]
         if self.compiler.wmemcheck {
             let func_name = self.current_func_name(builder);
@@ -5639,6 +5647,21 @@ impl FuncEnvironment<'_> {
         }
         #[cfg(not(feature = "wmemcheck"))]
         let _ = (retvals, builder);
+    }
+
+    fn translate_transaction_commit_before_return(&mut self, builder: &mut FunctionBuilder<'_>) {
+        if !self.transaction_may_be_active_on_return {
+            return;
+        }
+
+        let callee = self
+            .builtin_functions
+            .load_builtin(builder.func, BuiltinFunctionIndex::transaction_commit());
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let call = builder.ins().call(callee, &[vmctx]);
+        let succeeded = builder.func.dfg.inst_results(call)[0];
+        self.compiler
+            .raise_if_host_trapped(builder, vmctx, succeeded);
     }
 
     pub fn before_load(

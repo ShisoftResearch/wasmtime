@@ -57,10 +57,12 @@
 use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, InstanceId, StoreOpaque};
+use crate::runtime::transaction::{StagedRecord, TMEMORY_GRANULE_SIZE};
 #[cfg(feature = "gc")]
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{self, HostResultHasUnwindSentinel, VMStore, f32x4, f64x2, i8x16};
 use core::convert::Infallible;
+use core::ops::Range;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
 use core::time::Duration;
@@ -268,7 +270,21 @@ fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<(
     Ok(())
 }
 
-fn transaction_commit(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+
+    let records = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        if state.active_transaction().is_none() {
+            return Ok(());
+        }
+        state.staged_records()?
+    };
+
+    for record in &records {
+        apply_staged_transaction_record(store, instance, record)?;
+    }
+
     store.store_opaque_mut().transaction_state_mut().commit()
 }
 
@@ -295,42 +311,186 @@ fn transaction_tglobal_set(
 }
 
 fn transaction_tmemory_load(
-    _store: &mut dyn VMStore,
-    _instance: InstanceId,
-    _memory: u32,
-    _addr: u64,
-    _offset: u64,
-    _len: u32,
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    addr: u64,
+    offset: u64,
+    len: u32,
 ) -> Result<*mut u8> {
-    bail!("transactional memory load helper is not implemented")
+    let effective = checked_tmemory_effective_address(addr, offset)?;
+    let len = usize::try_from(len).context("tmemory access length overflow")?;
+    flush_pending_tmemory_store(store, instance)?;
+
+    let memory_index = DefinedMemoryIndex::from_u32(memory);
+    let backing = read_memory_snapshot(store, instance, memory_index)?;
+    checked_tmemory_libcall_range(effective, len, backing.len())?;
+
+    let state = store.store_opaque_mut().transaction_state_mut();
+    let bytes = state.read_memory_overlay(memory, effective, len, &backing)?;
+    Ok(state.set_scratch(bytes))
 }
 
 fn transaction_tmemory_store(
-    _store: &mut dyn VMStore,
-    _instance: InstanceId,
-    _memory: u32,
-    _addr: u64,
-    _offset: u64,
-    _len: u32,
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    addr: u64,
+    offset: u64,
+    len: u32,
 ) -> Result<*mut u8> {
-    bail!("transactional memory store helper is not implemented")
+    let effective = checked_tmemory_effective_address(addr, offset)?;
+    let len = usize::try_from(len).context("tmemory access length overflow")?;
+    flush_pending_tmemory_store(store, instance)?;
+
+    let memory_index = DefinedMemoryIndex::from_u32(memory);
+    let backing = read_memory_snapshot(store, instance, memory_index)?;
+    checked_tmemory_libcall_range(effective, len, backing.len())?;
+
+    let state = store.store_opaque_mut().transaction_state_mut();
+    let bytes = state.read_memory_overlay(memory, effective, len, &backing)?;
+    state.set_memory_store_scratch(memory, effective, bytes)
 }
 
 fn transaction_tmemory_size(
-    _store: &mut dyn VMStore,
-    _instance: InstanceId,
-    _memory: u32,
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
 ) -> Result<*mut u8> {
-    bail!("transactional memory size helper is not implemented")
+    flush_pending_tmemory_store(store, instance)?;
+
+    let memory_index = DefinedMemoryIndex::from_u32(memory);
+    let pages = {
+        let instance_ref = store.instance_mut(instance);
+        let module = instance_ref.env_module();
+        let page_size_log2 = module.memories[module.memory_index(memory_index)].page_size_log2;
+        let instance_ref = instance_ref.as_ref();
+        let memory = instance_ref.get_defined_memory(memory_index);
+        memory.byte_size() >> page_size_log2
+    };
+    Ok(pages as *mut u8)
 }
 
 fn transaction_tmemory_grow(
-    _store: &mut dyn VMStore,
-    _instance: InstanceId,
-    _memory: u32,
-    _delta: u64,
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    delta: u64,
 ) -> Result<Option<AllocationSize>> {
-    bail!("transactional memory grow helper is not implemented")
+    flush_pending_tmemory_store(store, instance)?;
+
+    let result = memory_grow(store, instance, delta, memory)?;
+    if let Some(previous) = result.as_ref() {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        if state.active_transaction().is_some() {
+            let previous_pages =
+                u64::try_from(previous.0).context("tmemory previous size overflow")?;
+            let new_pages = previous_pages
+                .checked_add(delta)
+                .context("tmemory grown size overflow")?;
+            state.stage_memory_size(memory, new_pages)?;
+        }
+    }
+    Ok(result)
+}
+
+fn checked_tmemory_effective_address(addr: u64, offset: u64) -> Result<u64> {
+    addr.checked_add(offset).with_context(|| {
+        format!("out of bounds tmemory access: address {addr} plus offset {offset} overflows")
+    })
+}
+
+fn checked_tmemory_libcall_range(
+    addr: u64,
+    len: usize,
+    backing_len: usize,
+) -> Result<Range<usize>> {
+    let start = usize::try_from(addr).context("tmemory address does not fit host usize")?;
+    let end = start.checked_add(len).with_context(|| {
+        format!("out of bounds tmemory access: range starting at {start} overflows")
+    })?;
+    ensure!(
+        end <= backing_len,
+        "out of bounds tmemory access: range {start}..{end} exceeds backing length {backing_len}"
+    );
+    Ok(start..end)
+}
+
+fn read_memory_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: DefinedMemoryIndex,
+) -> Result<Vec<u8>> {
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let memory = instance_ref.get_defined_memory(memory_index);
+    read_memory_bytes(memory, 0, memory.byte_size())
+}
+
+fn read_memory_bytes(memory: &vm::Memory, addr: u64, len: usize) -> Result<Vec<u8>> {
+    let range = checked_tmemory_libcall_range(addr, len, memory.byte_size())?;
+    let def = memory.vmmemory();
+    let base = def.base.as_ptr();
+    let bytes = unsafe { core::slice::from_raw_parts(base.add(range.start), range.len()) };
+    Ok(bytes.to_vec())
+}
+
+fn write_memory_bytes(memory: &mut vm::Memory, addr: u64, bytes: &[u8]) -> Result<()> {
+    let range = checked_tmemory_libcall_range(addr, bytes.len(), memory.byte_size())?;
+    let def = memory.vmmemory();
+    let base = def.base.as_ptr();
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(range.start), bytes.len());
+    }
+    Ok(())
+}
+
+fn flush_pending_tmemory_store(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    let Some((memory, _, _)) = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .pending_memory_store()
+    else {
+        return Ok(());
+    };
+
+    let memory_index = DefinedMemoryIndex::from_u32(memory);
+    let backing = read_memory_snapshot(store, instance, memory_index)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .flush_memory_store_scratch(&backing)?;
+    Ok(())
+}
+
+fn apply_staged_transaction_record(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    record: &StagedRecord,
+) -> Result<()> {
+    match record {
+        StagedRecord::MemoryGranule {
+            memory_index,
+            granule_index,
+            bytes,
+        } => {
+            let granule_size =
+                u64::try_from(TMEMORY_GRANULE_SIZE).context("tmemory granule size overflow")?;
+            let addr = granule_index
+                .checked_mul(granule_size)
+                .context("tmemory granule byte offset overflow")?;
+            let memory_index = DefinedMemoryIndex::from_u32(*memory_index);
+            let mut instance_ref = store.instance_mut(instance);
+            let memory = instance_ref.as_mut().get_defined_memory_mut(memory_index);
+            write_memory_bytes(memory, addr, bytes)?;
+        }
+        StagedRecord::Global { .. } => {}
+        StagedRecord::MemorySize { .. } => {
+            // The mock grow path delegates to ordinary memory.grow immediately;
+            // rollback of successful grows is deferred.
+        }
+    }
+    Ok(())
 }
 
 /// A helper structure to represent the return value of a memory or table growth

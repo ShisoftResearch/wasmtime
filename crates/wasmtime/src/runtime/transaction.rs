@@ -101,6 +101,8 @@ pub(crate) struct TransactionState {
     staged_memory_sizes: BTreeMap<u32, u64>,
     memory_read_granules: BTreeSet<MemoryGranuleKey>,
     memory_write_granules: BTreeSet<MemoryGranuleKey>,
+    scratch: Vec<u8>,
+    pending_memory_store: Option<PendingMemoryStore>,
 }
 
 impl Default for TransactionState {
@@ -113,6 +115,8 @@ impl Default for TransactionState {
             staged_memory_sizes: BTreeMap::new(),
             memory_read_granules: BTreeSet::new(),
             memory_write_granules: BTreeSet::new(),
+            scratch: Vec::new(),
+            pending_memory_store: None,
         }
     }
 }
@@ -146,8 +150,15 @@ struct MemoryGranuleKey {
     granule_index: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingMemoryStore {
+    memory_index: u32,
+    addr: u64,
+    len: usize,
+}
+
 const TMEMORY_GRANULE_SHIFT: usize = 8;
-const TMEMORY_GRANULE_SIZE: usize = 1 << TMEMORY_GRANULE_SHIFT;
+pub(crate) const TMEMORY_GRANULE_SIZE: usize = 1 << TMEMORY_GRANULE_SHIFT;
 
 pub(crate) trait TransactionConcurrencyControl {
     fn acquire_memory_granule_read(
@@ -262,27 +273,36 @@ impl TransactionState {
         F: FnMut(&StagedRecord) -> Result<()>,
     {
         self.ensure_active()?;
-        for (&global_index, &value) in &self.staged_globals {
-            apply(&StagedRecord::Global {
-                global_index,
-                value,
-            })?;
-        }
-        for (key, bytes) in &self.staged_memory_granules {
-            apply(&StagedRecord::MemoryGranule {
-                memory_index: key.memory_index,
-                granule_index: key.granule_index,
-                bytes: bytes.clone(),
-            })?;
-        }
-        for (&memory_index, &new_pages) in &self.staged_memory_sizes {
-            apply(&StagedRecord::MemorySize {
-                memory_index,
-                new_pages,
-            })?;
+        for record in self.staged_records()? {
+            apply(&record)?;
         }
         self.clear_active();
         Ok(())
+    }
+
+    pub(crate) fn staged_records(&self) -> Result<Vec<StagedRecord>> {
+        self.ensure_active()?;
+        let mut records = Vec::new();
+        for (&global_index, &value) in &self.staged_globals {
+            records.push(StagedRecord::Global {
+                global_index,
+                value,
+            });
+        }
+        for (key, bytes) in &self.staged_memory_granules {
+            records.push(StagedRecord::MemoryGranule {
+                memory_index: key.memory_index,
+                granule_index: key.granule_index,
+                bytes: bytes.clone(),
+            });
+        }
+        for (&memory_index, &new_pages) in &self.staged_memory_sizes {
+            records.push(StagedRecord::MemorySize {
+                memory_index,
+                new_pages,
+            });
+        }
+        Ok(records)
     }
 
     pub(crate) fn abort(&mut self) -> Result<()> {
@@ -417,6 +437,48 @@ impl TransactionState {
         Ok(bytes)
     }
 
+    pub(crate) fn set_scratch(&mut self, bytes: Vec<u8>) -> *mut u8 {
+        debug_assert!(self.pending_memory_store.is_none());
+        self.scratch = bytes;
+        self.scratch.as_mut_ptr()
+    }
+
+    pub(crate) fn set_memory_store_scratch(
+        &mut self,
+        memory_index: u32,
+        addr: u64,
+        bytes: Vec<u8>,
+    ) -> Result<*mut u8> {
+        self.ensure_active()?;
+        let len = bytes.len();
+        self.scratch = bytes;
+        self.pending_memory_store = Some(PendingMemoryStore {
+            memory_index,
+            addr,
+            len,
+        });
+        Ok(self.scratch.as_mut_ptr())
+    }
+
+    pub(crate) fn pending_memory_store(&self) -> Option<(u32, u64, usize)> {
+        self.pending_memory_store
+            .map(|pending| (pending.memory_index, pending.addr, pending.len))
+    }
+
+    pub(crate) fn flush_memory_store_scratch(&mut self, backing: &[u8]) -> Result<bool> {
+        self.ensure_active()?;
+        let Some(pending) = self.pending_memory_store.take() else {
+            return Ok(false);
+        };
+        ensure!(
+            self.scratch.len() == pending.len,
+            "pending tmemory store scratch length mismatch"
+        );
+        let bytes = self.scratch[..pending.len].to_vec();
+        self.stage_memory_write(pending.memory_index, pending.addr, &bytes, backing)?;
+        Ok(true)
+    }
+
     pub(crate) fn staged_memory_granule(
         &self,
         memory_index: u32,
@@ -490,6 +552,8 @@ impl TransactionState {
         self.staged_memory_sizes.clear();
         self.memory_read_granules.clear();
         self.memory_write_granules.clear();
+        self.scratch.clear();
+        self.pending_memory_store = None;
     }
 }
 
@@ -574,6 +638,90 @@ mod tests {
         ]);
         wasm.extend_from_slice(payload);
         wasm
+    }
+
+    fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
+        crate::Module::new(engine, wat::parse_str(wat).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn mock_transaction_store_commits_to_memory() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (func (export "write")
+                (ttry)
+                (i32.tstore (i32.const 0) (i32.const 42)))
+              (func (export "read") (result i32)
+                (i32.load (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 42);
+    }
+
+    #[test]
+    fn mock_transaction_fail_discards_memory_write() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (func (export "write_fail")
+                (ttry)
+                (i32.tstore (i32.const 0) (i32.const 42))
+                (tfail))
+              (func (export "read") (result i32)
+                (i32.load (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write_fail = instance
+            .get_typed_func::<(), ()>(&mut store, "write_fail")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        write_fail.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+    }
+
+    #[test]
+    fn mock_transaction_memory_size_returns_backing_memory_pages() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 2)
+              (func (export "size") (result i32)
+                (tmemory.size)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let size = instance
+            .get_typed_func::<(), i32>(&mut store, "size")
+            .unwrap();
+
+        assert_eq!(size.call(&mut store, ()).unwrap(), 2);
     }
 
     #[test]
