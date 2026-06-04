@@ -10,6 +10,7 @@
 use crate::prelude::*;
 use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
 use crate::runtime::vm::{HostAlignedByteCount, Mmap, mmap::AlignedLength};
+use wasmtime_environ::MemoryIndex;
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
 
@@ -42,6 +43,34 @@ pub(crate) trait TMemoryBackendStorage: core::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub(crate) struct TMemory {
     storage: Box<dyn TMemoryBackendStorage>,
+}
+
+/// Per-instance transactional memories keyed by raw module-level `MemoryIndex`.
+#[derive(Debug, Default)]
+pub(crate) struct TMemorySidecar {
+    memories: TryBTreeMap<u32, TMemory>,
+}
+
+impl TMemorySidecar {
+    pub(crate) fn insert(
+        &mut self,
+        memory: MemoryIndex,
+        tmemory: TMemory,
+    ) -> core::result::Result<Option<TMemory>, OutOfMemory> {
+        self.memories.insert(memory.as_u32(), tmemory)
+    }
+
+    pub(crate) fn get(&self, memory: MemoryIndex) -> Option<&TMemory> {
+        self.memories.get(memory.as_u32())
+    }
+
+    pub(crate) fn get_mut(&mut self, memory: MemoryIndex) -> Option<&mut TMemory> {
+        self.memories.get_mut(memory.as_u32())
+    }
+
+    pub(crate) fn contains(&self, memory: MemoryIndex) -> bool {
+        self.memories.contains_key(memory.as_u32())
+    }
 }
 
 impl TMemory {
@@ -613,6 +642,33 @@ mod tests {
         memory.set_granule_info(0, info).unwrap();
 
         assert_eq!(memory.granule_info(0).unwrap(), info);
+    }
+
+    #[test]
+    fn transaction_memory_sidecar_resolves_by_memory_index() {
+        let memory0 = MemoryIndex::from_u32(0);
+        let memory2 = MemoryIndex::from_u32(2);
+        let mut sidecar = TMemorySidecar::default();
+
+        assert!(!sidecar.contains(memory0));
+        assert!(!sidecar.contains(memory2));
+        assert!(sidecar.get(memory0).is_none());
+
+        sidecar
+            .insert(
+                memory0,
+                TMemory::new_vmemory_with_limits(1, Some(2)).unwrap(),
+            )
+            .unwrap();
+
+        assert!(sidecar.contains(memory0));
+        assert!(!sidecar.contains(memory2));
+        assert_eq!(sidecar.get(memory0).unwrap().byte_len(), WASM_PAGE_SIZE);
+        assert!(sidecar.get(memory2).is_none());
+
+        sidecar.get_mut(memory0).unwrap().grow_to_pages(2).unwrap();
+
+        assert_eq!(sidecar.get(memory0).unwrap().byte_len(), WASM_PAGE_SIZE * 2);
     }
 
     #[test]

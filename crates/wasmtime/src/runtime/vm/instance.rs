@@ -5,7 +5,13 @@
 use crate::code::ModuleWithCode;
 use crate::module::ModuleRegistry;
 use crate::prelude::*;
+#[cfg(has_virtual_memory)]
+use crate::runtime::transaction::TransactionConfig;
 use crate::runtime::vm::export::{Export, ExportMemory};
+#[cfg(has_virtual_memory)]
+use crate::runtime::vm::memory::tmemory::{
+    TMemory, TMemorySidecar, WASM_PAGE_SIZE as TMEMORY_WASM_PAGE_SIZE,
+};
 use crate::runtime::vm::memory::{Memory, RuntimeMemoryCreator};
 use crate::runtime::vm::table::{Table, TableElementType};
 use crate::runtime::vm::vmcontext::{
@@ -115,6 +121,10 @@ pub struct Instance {
     /// memory.
     memories: TryPrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)>,
 
+    /// Transactional memory sidecars keyed by module-level `MemoryIndex`.
+    #[cfg(has_virtual_memory)]
+    tmemory_sidecar: TMemorySidecar,
+
     /// WebAssembly table data.
     ///
     /// Like memories, this is only for defined tables in the module and
@@ -168,6 +178,8 @@ impl Instance {
     ) -> Result<InstanceHandle, OutOfMemory> {
         let module = req.runtime_info.env_module();
         let memory_tys = &module.memories;
+        #[cfg(has_virtual_memory)]
+        let tmemory_sidecar = Self::build_tmemory_sidecar(module)?;
         let mut passive_elements = TryVec::with_capacity(module.passive_elements.len())?;
 
         #[cfg(feature = "wmemcheck")]
@@ -195,6 +207,8 @@ impl Instance {
             id: req.id,
             runtime_info: req.runtime_info.clone(),
             memories,
+            #[cfg(has_virtual_memory)]
+            tmemory_sidecar,
             tables,
             passive_elements,
             #[cfg(feature = "wmemcheck")]
@@ -210,6 +224,51 @@ impl Instance {
         }
 
         Ok(ret)
+    }
+
+    #[cfg(has_virtual_memory)]
+    fn build_tmemory_sidecar(
+        module: &wasmtime_environ::Module,
+    ) -> Result<TMemorySidecar, OutOfMemory> {
+        let mut sidecar = TMemorySidecar::default();
+
+        for memory_index in module.transaction_objects.memories.iter().copied() {
+            if module.defined_memory_index(memory_index).is_none() {
+                continue;
+            }
+
+            let memory = &module.memories[memory_index];
+            let min_bytes = memory
+                .minimum_byte_size()
+                .map_err(|_| OutOfMemory::new(usize::MAX))?;
+            let min_pages = Self::bytes_to_tmemory_pages(min_bytes);
+            let max_pages = match memory.limits.max {
+                Some(_) => Some(Self::bytes_to_tmemory_pages(
+                    memory
+                        .maximum_byte_size()
+                        .map_err(|_| OutOfMemory::new(usize::MAX))?,
+                )),
+                None => None,
+            };
+            let tmemory = TMemory::new(TransactionConfig::default(), min_pages, max_pages)
+                .map_err(|_| {
+                    let oom_size = memory
+                        .maximum_byte_size()
+                        .ok()
+                        .or(Some(min_bytes))
+                        .and_then(|bytes| usize::try_from(bytes).ok())
+                        .unwrap_or(usize::MAX);
+                    OutOfMemory::new(oom_size)
+                })?;
+            sidecar.insert(memory_index, tmemory)?;
+        }
+
+        Ok(sidecar)
+    }
+
+    #[cfg(has_virtual_memory)]
+    fn bytes_to_tmemory_pages(bytes: u64) -> u64 {
+        bytes.div_ceil(u64::try_from(TMEMORY_WASM_PAGE_SIZE).unwrap())
     }
 
     /// Trace element segment GC roots inside this `Instance`.
@@ -1020,6 +1079,21 @@ impl Instance {
         &self.memories[index].1
     }
 
+    #[cfg(has_virtual_memory)]
+    #[allow(dead_code)]
+    pub(crate) fn get_tmemory(&self, index: MemoryIndex) -> Option<&TMemory> {
+        self.tmemory_sidecar.get(index)
+    }
+
+    #[cfg(has_virtual_memory)]
+    #[allow(dead_code)]
+    pub(crate) fn get_tmemory_mut(
+        self: Pin<&mut Self>,
+        index: MemoryIndex,
+    ) -> Option<&mut TMemory> {
+        self.tmemory_sidecar_mut().get_mut(index)
+    }
+
     pub fn get_defined_memory_vmimport(&self, index: DefinedMemoryIndex) -> VMMemoryImport {
         crate::runtime::vm::VMMemoryImport {
             from: self.memory_ptr(index).into(),
@@ -1506,6 +1580,13 @@ impl Instance {
     ) -> &mut TryPrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)> {
         // SAFETY: see `store_mut` above.
         unsafe { &mut self.get_unchecked_mut().memories }
+    }
+
+    #[cfg(has_virtual_memory)]
+    #[allow(dead_code)]
+    fn tmemory_sidecar_mut(self: Pin<&mut Self>) -> &mut TMemorySidecar {
+        // SAFETY: see `store_mut` above.
+        unsafe { &mut self.get_unchecked_mut().tmemory_sidecar }
     }
 
     pub(crate) fn tables_mut(
