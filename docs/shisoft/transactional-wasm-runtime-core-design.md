@@ -105,10 +105,15 @@ transaction runtime.
 
 Each active transaction owns a private workspace.
 
-The workspace is indexed by Wizard-style `GranuleId`. For `tmemory`, staged
-entries are keyed by `TMemory { instance, memory_index, granule_index }`. Later,
-when the persistent object table lands, object-backed entries will also carry
-the stable `ObjectId`.
+The first runtime core indexes workspace entries by Wizard-style `GranuleId`.
+For `tmemory`, staged entries are keyed by
+`TMemory { instance, memory_index, granule_index }`. The workspace value stores
+the staged bytes for that granule.
+
+When the persistent object table lands, object-backed workspace entries add a
+stable `ObjectId` alongside the access granule identity. `ObjectId` identifies
+the object-table slot; `GranuleId` continues to identify the transactional
+access unit used for ownership, versioning, and conflict checks.
 
 Reads check the private workspace by `GranuleId` first. If the requested byte
 range has no staged data, the runtime reads committed `tmemory` bytes. Reads
@@ -138,17 +143,21 @@ Initial granule IDs:
 - `TMemorySize { instance, memory_index }`
 - `TGlobal { instance, global_index }`
 
-Later granule IDs:
+Later pre-object-table granule IDs:
 
 - `TTable { instance, table_index, granule_index }`
 - `TTableSize { instance, table_index }`
-- `TStruct { instance, object_key }`
-- `TArray { instance, object_key }`
-- function-reference and external-object keys as needed by the object table
 
-This is not the persistent `ObjectId` design. Persistent `ObjectId` and the
-full `ObjectTable` come later. The purpose of this phase is to establish the
-runtime identity and ownership shape without tying it to storage durability,
+Object-table phase identities:
+
+- `TStruct { object_id, granule_index }`
+- `TArray { object_id, granule_index }`
+- function-reference and external-object identities as needed by the object
+  table
+
+This is not the persistent `ObjectId` implementation. Persistent `ObjectId` and
+the full `ObjectTable` come later. The purpose of this phase is to establish
+the runtime `GranuleId` ownership shape without tying it to storage durability,
 GC, or one concurrency-control implementation.
 
 ## LockBased Concurrency
@@ -195,7 +204,7 @@ However, it must avoid designs that would block it.
 
 Object-table-facing constraints:
 
-- All transactional objects route through `GranuleId`-like identity.
+- All transactional access routes through `GranuleId`-like identity.
 - Ownership/version metadata is attached to the transactional object or
   granule, not to ordinary Wasmtime memory.
 - Runtime APIs accept a transaction context and object identity rather than
@@ -204,7 +213,9 @@ Object-table-facing constraints:
   future object table owns stable object identity.
 
 The object table workstream will later add persistent `ObjectId`, slot layout,
-function references, GC object identity, and backend integration.
+function references, GC object identity, and backend integration. At that point
+object-backed transactional operations carry both stable object identity and
+granule ownership identity.
 
 ## Parser, Validation, And Lowering Implications
 
