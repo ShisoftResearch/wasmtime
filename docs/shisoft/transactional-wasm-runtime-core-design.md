@@ -105,9 +105,14 @@ transaction runtime.
 
 Each active transaction owns a private workspace.
 
-Reads check the private workspace first. If the requested byte range has no
-staged data, the runtime reads committed `tmemory` bytes. Reads spanning
-multiple granules merge staged and committed bytes.
+The workspace is indexed by Wizard-style `GranuleId`. For `tmemory`, staged
+entries are keyed by `TMemory { instance, memory_index, granule_index }`. Later,
+when the persistent object table lands, object-backed entries will also carry
+the stable `ObjectId`.
+
+Reads check the private workspace by `GranuleId` first. If the requested byte
+range has no staged data, the runtime reads committed `tmemory` bytes. Reads
+spanning multiple granules merge staged and committed bytes by granule key.
 
 Writes never update committed `tmemory` immediately. They acquire write
 ownership for every affected granule, then write into the transaction
