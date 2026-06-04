@@ -201,6 +201,9 @@ pub(crate) trait TransactionConcurrencyControl {
 
 #[derive(Debug, Default)]
 pub(crate) struct LockBased {
+    // The milestone mock runtime has one active transaction per store, so the
+    // lock table keys only by store-local memory index. Owner-instance scoped
+    // conflict keys belong with the future transaction object table.
     memory_granules: BTreeMap<MemoryGranuleKey, MemoryGranuleOwnership>,
 }
 
@@ -1754,6 +1757,32 @@ mod tests {
             .unwrap();
 
         state.commit().unwrap();
+
+        state.begin().unwrap();
+        state.acquire_memory_granule_read(0, 0).unwrap();
+    }
+
+    #[test]
+    fn abort_releases_lock_based_ownership_for_next_transaction() {
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+        state.acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
+            .unwrap();
+
+        state.abort().unwrap();
+
+        state.begin().unwrap();
+        state.acquire_memory_granule_read(0, 0).unwrap();
+    }
+
+    #[test]
+    fn fail_releases_lock_based_ownership_for_next_transaction() {
+        let mut state = TransactionState::default();
+        state.begin().unwrap();
+        state.acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
+            .unwrap();
+
+        state.fail().unwrap();
 
         state.begin().unwrap();
         state.acquire_memory_granule_read(0, 0).unwrap();
