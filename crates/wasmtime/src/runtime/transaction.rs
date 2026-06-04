@@ -99,8 +99,7 @@ pub(crate) struct TransactionState {
     next_id: u64,
     staged_globals: BTreeMap<u32, GlobalSnapshot>,
     staged_memory_granules: BTreeMap<MemoryGranuleKey, Vec<u8>>,
-    staged_memory_owners: BTreeMap<u32, InstanceId>,
-    staged_memory_sizes: BTreeMap<u32, u64>,
+    staged_memory_sizes: BTreeMap<MemoryObjectKey, u64>,
     memory_read_granules: BTreeSet<MemoryGranuleKey>,
     memory_write_granules: BTreeSet<MemoryGranuleKey>,
     scratch: Vec<u8>,
@@ -114,7 +113,6 @@ impl Default for TransactionState {
             next_id: 1,
             staged_globals: BTreeMap::new(),
             staged_memory_granules: BTreeMap::new(),
-            staged_memory_owners: BTreeMap::new(),
             staged_memory_sizes: BTreeMap::new(),
             memory_read_granules: BTreeSet::new(),
             memory_write_granules: BTreeSet::new(),
@@ -131,11 +129,13 @@ pub(crate) enum StagedRecord {
         value: GlobalSnapshot,
     },
     MemoryGranule {
+        owner_instance: Option<InstanceId>,
         memory_index: u32,
         granule_index: u64,
         bytes: Vec<u8>,
     },
     MemorySize {
+        owner_instance: Option<InstanceId>,
         memory_index: u32,
         new_pages: u64,
     },
@@ -149,8 +149,14 @@ pub(crate) enum GlobalSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct MemoryGranuleKey {
-    memory_index: u32,
+    object: MemoryObjectKey,
     granule_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MemoryObjectKey {
+    owner_instance: Option<u32>,
+    memory_index: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,7 +207,7 @@ impl TransactionConcurrencyControl for LockBased {
         granule_index: u64,
     ) -> Result<()> {
         let key = MemoryGranuleKey {
-            memory_index,
+            object: memory_object_key(None, memory_index),
             granule_index,
         };
         let ownership = self.memory_granules.entry(key).or_default();
@@ -219,7 +225,7 @@ impl TransactionConcurrencyControl for LockBased {
         granule_index: u64,
     ) -> Result<()> {
         let key = MemoryGranuleKey {
-            memory_index,
+            object: memory_object_key(None, memory_index),
             granule_index,
         };
         let ownership = self.memory_granules.entry(key).or_default();
@@ -295,23 +301,20 @@ impl TransactionState {
         }
         for (key, bytes) in &self.staged_memory_granules {
             records.push(StagedRecord::MemoryGranule {
-                memory_index: key.memory_index,
+                owner_instance: key.object.owner_instance.map(InstanceId::from_u32),
+                memory_index: key.object.memory_index,
                 granule_index: key.granule_index,
                 bytes: bytes.clone(),
             });
         }
-        for (&memory_index, &new_pages) in &self.staged_memory_sizes {
+        for (key, &new_pages) in &self.staged_memory_sizes {
             records.push(StagedRecord::MemorySize {
-                memory_index,
+                owner_instance: key.owner_instance.map(InstanceId::from_u32),
+                memory_index: key.memory_index,
                 new_pages,
             });
         }
         Ok(records)
-    }
-
-    pub(crate) fn staged_memory_owners(&self) -> Result<BTreeMap<u32, InstanceId>> {
-        self.ensure_active()?;
-        Ok(self.staged_memory_owners.clone())
     }
 
     pub(crate) fn abort(&mut self) -> Result<()> {
@@ -325,10 +328,19 @@ impl TransactionState {
     }
 
     pub(crate) fn stage_memory_size(&mut self, memory_index: u32, new_pages: u64) -> Result<bool> {
+        self.stage_memory_size_owned(None, memory_index, new_pages)
+    }
+
+    pub(crate) fn stage_memory_size_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        new_pages: u64,
+    ) -> Result<bool> {
         self.ensure_active()?;
         Ok(self
             .staged_memory_sizes
-            .insert(memory_index, new_pages)
+            .insert(memory_object_key(owner_instance, memory_index), new_pages)
             .is_none())
     }
 
@@ -349,7 +361,7 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         let key = MemoryGranuleKey {
-            memory_index,
+            object: memory_object_key(None, memory_index),
             granule_index,
         };
         self.memory_read_granules.insert(key);
@@ -364,6 +376,17 @@ impl TransactionState {
         bytes: &[u8],
         backing: &[u8],
     ) -> Result<()> {
+        self.stage_memory_write_owned(None, memory_index, addr, bytes, backing)
+    }
+
+    pub(crate) fn stage_memory_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        bytes: &[u8],
+        backing: &[u8],
+    ) -> Result<()> {
         self.ensure_active()?;
         let range = checked_tmemory_range(addr, bytes.len(), backing.len())?;
         let mut offset: usize = 0;
@@ -372,7 +395,7 @@ impl TransactionState {
         while current < range.end {
             let granule_index = current / TMEMORY_GRANULE_SIZE;
             let granule_range = tmemory_granule_backing_range(granule_index, backing.len())?;
-            let key = memory_granule_key(memory_index, granule_index)?;
+            let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
             let granule_offset = current - granule_range.start;
             let chunk_len = (range.end - current).min(granule_range.end - current);
             let granule_chunk_end = granule_offset
@@ -411,6 +434,17 @@ impl TransactionState {
         len: usize,
         backing: &[u8],
     ) -> Result<Vec<u8>> {
+        self.read_memory_overlay_owned(None, memory_index, addr, len, backing)
+    }
+
+    pub(crate) fn read_memory_overlay_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+        backing: &[u8],
+    ) -> Result<Vec<u8>> {
         self.ensure_active()?;
         let range = checked_tmemory_range(addr, len, backing.len())?;
         let mut bytes = backing[range.clone()].to_vec();
@@ -419,7 +453,7 @@ impl TransactionState {
         while current < range.end {
             let granule_index = current / TMEMORY_GRANULE_SIZE;
             let granule_range = tmemory_granule_backing_range(granule_index, backing.len())?;
-            let key = memory_granule_key(memory_index, granule_index)?;
+            let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
             let granule_offset = current - granule_range.start;
             let chunk_len = (range.end - current).min(granule_range.end - current);
             let granule_chunk_end = granule_offset
@@ -492,16 +526,13 @@ impl TransactionState {
             "pending tmemory store scratch length mismatch"
         );
         let bytes = self.scratch[..pending.len].to_vec();
-        self.stage_memory_write(pending.memory_index, pending.addr, &bytes, backing)?;
-        if let Some(existing) = self
-            .staged_memory_owners
-            .insert(pending.memory_index, pending.instance)
-        {
-            ensure!(
-                existing == pending.instance,
-                "tmemory defined memory index used by multiple instances in one transaction"
-            );
-        }
+        self.stage_memory_write_owned(
+            Some(pending.instance),
+            pending.memory_index,
+            pending.addr,
+            &bytes,
+            backing,
+        )?;
         Ok(true)
     }
 
@@ -512,7 +543,7 @@ impl TransactionState {
     ) -> Option<&[u8]> {
         self.staged_memory_granules
             .get(&MemoryGranuleKey {
-                memory_index,
+                object: memory_object_key(None, memory_index),
                 granule_index,
             })
             .map(Vec::as_slice)
@@ -525,7 +556,7 @@ impl TransactionState {
     ) -> Option<&mut [u8]> {
         self.staged_memory_granules
             .get_mut(&MemoryGranuleKey {
-                memory_index,
+                object: memory_object_key(None, memory_index),
                 granule_index,
             })
             .map(Vec::as_mut_slice)
@@ -538,7 +569,7 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         Ok(self.memory_read_granules.insert(MemoryGranuleKey {
-            memory_index,
+            object: memory_object_key(None, memory_index),
             granule_index,
         }))
     }
@@ -554,14 +585,14 @@ impl TransactionState {
 
     pub(crate) fn owns_memory_granule_read(&self, memory_index: u32, granule_index: u64) -> bool {
         self.memory_read_granules.contains(&MemoryGranuleKey {
-            memory_index,
+            object: memory_object_key(None, memory_index),
             granule_index,
         })
     }
 
     pub(crate) fn owns_memory_granule_write(&self, memory_index: u32, granule_index: u64) -> bool {
         self.memory_write_granules.contains(&MemoryGranuleKey {
-            memory_index,
+            object: memory_object_key(None, memory_index),
             granule_index,
         })
     }
@@ -575,7 +606,6 @@ impl TransactionState {
         self.active = None;
         self.staged_globals.clear();
         self.staged_memory_granules.clear();
-        self.staged_memory_owners.clear();
         self.staged_memory_sizes.clear();
         self.memory_read_granules.clear();
         self.memory_write_granules.clear();
@@ -598,9 +628,20 @@ fn checked_tmemory_range(
     Ok(start..end)
 }
 
-fn memory_granule_key(memory_index: u32, granule_index: usize) -> Result<MemoryGranuleKey> {
-    Ok(MemoryGranuleKey {
+fn memory_object_key(owner_instance: Option<InstanceId>, memory_index: u32) -> MemoryObjectKey {
+    MemoryObjectKey {
+        owner_instance: owner_instance.map(InstanceId::as_u32),
         memory_index,
+    }
+}
+
+fn memory_granule_key(
+    owner_instance: Option<InstanceId>,
+    memory_index: u32,
+    granule_index: usize,
+) -> Result<MemoryGranuleKey> {
+    Ok(MemoryGranuleKey {
+        object: memory_object_key(owner_instance, memory_index),
         granule_index: u64::try_from(granule_index)
             .context("tmemory granule index does not fit u64")?,
     })
@@ -858,6 +899,53 @@ mod tests {
     }
 
     #[test]
+    fn mock_transaction_distinguishes_imported_and_local_tmemory_overlays() {
+        let engine = crate::Engine::default();
+        let provider = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory $tx 1)
+              (export "tx" (memory $tx)))
+            "#,
+        );
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (import "env" "tx" (tmemory $imported 1))
+              (tmemory $local 1)
+              (func (export "write_both")
+                (ttry)
+                (i32.tstore $imported (i32.const 0) (i32.const 11))
+                (i32.tstore $local (i32.const 0) (i32.const 22)))
+              (func (export "read_imported") (result i32)
+                (i32.load $imported (i32.const 0)))
+              (func (export "read_local") (result i32)
+                (i32.load $local (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
+        let tx = provider.get_memory(&mut store, "tx").unwrap();
+        let instance = crate::Instance::new(&mut store, &module, &[tx.into()]).unwrap();
+        let write_both = instance
+            .get_typed_func::<(), ()>(&mut store, "write_both")
+            .unwrap();
+        let read_imported = instance
+            .get_typed_func::<(), i32>(&mut store, "read_imported")
+            .unwrap();
+        let read_local = instance
+            .get_typed_func::<(), i32>(&mut store, "read_local")
+            .unwrap();
+
+        write_both.call(&mut store, ()).unwrap();
+
+        assert_eq!(read_imported.call(&mut store, ()).unwrap(), 11);
+        assert_eq!(read_local.call(&mut store, ()).unwrap(), 22);
+    }
+
+    #[test]
     fn default_transaction_config_uses_minimal_vmemory_runtime() {
         let config = TransactionConfig::default();
 
@@ -933,11 +1021,13 @@ mod tests {
                     value: GlobalSnapshot::I64(22)
                 },
                 StagedRecord::MemoryGranule {
+                    owner_instance: None,
                     memory_index: 0,
                     granule_index: 7,
                     bytes: vec![0x22; 256]
                 },
                 StagedRecord::MemorySize {
+                    owner_instance: None,
                     memory_index: 0,
                     new_pages: 2
                 },
