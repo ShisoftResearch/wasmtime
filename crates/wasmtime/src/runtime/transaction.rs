@@ -179,16 +179,16 @@ pub(crate) enum GlobalSnapshot {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum GranuleId {
     TMemory {
-        instance: u32,
+        instance: Option<u32>,
         memory_index: u32,
         granule_index: u64,
     },
     TMemorySize {
-        instance: u32,
+        instance: Option<u32>,
         memory_index: u32,
     },
     TGlobal {
-        instance: u32,
+        instance: Option<u32>,
         global_index: u32,
     },
 }
@@ -835,7 +835,7 @@ impl TransactionState {
 
     fn merge_staged_tmemory_range(
         &self,
-        instance: u32,
+        instance: Option<u32>,
         memory_index: u32,
         addr: u64,
         len: usize,
@@ -921,13 +921,21 @@ impl TransactionState {
 
     fn read_tmemory_range_for_test(
         &self,
-        instance: u32,
+        instance: Option<u32>,
         memory_index: u32,
         addr: u64,
         len: usize,
         committed: &[u8],
     ) -> Result<Vec<u8>> {
-        self.merge_staged_tmemory_range(instance, memory_index, addr, len, 0, committed, committed.len())
+        self.merge_staged_tmemory_range(
+            instance,
+            memory_index,
+            addr,
+            len,
+            0,
+            committed,
+            committed.len(),
+        )
     }
 }
 
@@ -952,12 +960,12 @@ fn lock_memory_object_key(memory_index: u32) -> MemoryObjectKey {
     }
 }
 
-fn granule_instance(owner_instance: Option<InstanceId>) -> u32 {
-    owner_instance.map_or(0, InstanceId::as_u32)
+fn granule_instance(owner_instance: Option<InstanceId>) -> Option<u32> {
+    owner_instance.map(InstanceId::as_u32)
 }
 
-fn granule_owner_instance(instance: u32) -> Option<InstanceId> {
-    (instance != 0).then(|| InstanceId::from_u32(instance))
+fn granule_owner_instance(instance: Option<u32>) -> Option<InstanceId> {
+    instance.map(InstanceId::from_u32)
 }
 
 fn global_granule_id(owner_instance: Option<InstanceId>, global_index: u32) -> GranuleId {
@@ -987,7 +995,7 @@ fn memory_granule_id_from_u64(
 }
 
 fn memory_granule_id_for_instance(
-    instance: u32,
+    instance: Option<u32>,
     memory_index: u32,
     granule_index: usize,
 ) -> Result<GranuleId> {
@@ -1981,36 +1989,207 @@ mod tests {
     }
 
     #[test]
+    fn owner_instance_zero_does_not_alias_ownerless_globals() {
+        let mut state = TransactionState::default();
+        let owner0 = InstanceId::from_u32(0);
+        state.begin().unwrap();
+
+        assert!(state
+            .stage_global_owned(None, 0, GlobalSnapshot::I32(1))
+            .unwrap());
+        assert!(state
+            .stage_global_owned(Some(owner0), 0, GlobalSnapshot::I32(2))
+            .unwrap());
+
+        assert_eq!(state.staged_global_owned(None, 0), Some(GlobalSnapshot::I32(1)));
+        assert_eq!(
+            state.staged_global_owned(Some(owner0), 0),
+            Some(GlobalSnapshot::I32(2))
+        );
+
+        let records = state.staged_records().unwrap();
+        assert!(records.contains(&StagedRecord::Global {
+            owner_instance: None,
+            global_index: 0,
+            value: GlobalSnapshot::I32(1),
+        }));
+        assert!(records.contains(&StagedRecord::Global {
+            owner_instance: Some(owner0),
+            global_index: 0,
+            value: GlobalSnapshot::I32(2),
+        }));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    StagedRecord::Global {
+                        global_index: 0,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn owner_instance_zero_does_not_alias_ownerless_memory_granules() {
+        let mut state = TransactionState::default();
+        let owner0 = InstanceId::from_u32(0);
+        let ownerless_bytes = vec![0x11; TMEMORY_GRANULE_SIZE];
+        let owner0_bytes = vec![0x22; TMEMORY_GRANULE_SIZE];
+        state.begin().unwrap();
+
+        assert!(state
+            .stage_memory_granule(0, 0, ownerless_bytes.clone())
+            .unwrap());
+        assert!(state
+            .acquire_memory_granule_write_owned(Some(owner0), 0, 0, owner0_bytes.clone())
+            .unwrap());
+
+        let records = state.staged_records().unwrap();
+        assert!(records.contains(&StagedRecord::MemoryGranule {
+            owner_instance: None,
+            memory_index: 0,
+            granule_index: 0,
+            bytes: ownerless_bytes,
+        }));
+        assert!(records.contains(&StagedRecord::MemoryGranule {
+            owner_instance: Some(owner0),
+            memory_index: 0,
+            granule_index: 0,
+            bytes: owner0_bytes,
+        }));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    StagedRecord::MemoryGranule {
+                        memory_index: 0,
+                        granule_index: 0,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn owner_instance_zero_does_not_alias_ownerless_memory_sizes() {
+        let mut state = TransactionState::default();
+        let owner0 = InstanceId::from_u32(0);
+        state.begin().unwrap();
+
+        assert!(state.stage_memory_size_owned(None, 0, 1).unwrap());
+        assert!(state
+            .stage_memory_size_owned(Some(owner0), 0, 2)
+            .unwrap());
+
+        let records = state.staged_records().unwrap();
+        assert!(records.contains(&StagedRecord::MemorySize {
+            owner_instance: None,
+            memory_index: 0,
+            new_pages: 1,
+        }));
+        assert!(records.contains(&StagedRecord::MemorySize {
+            owner_instance: Some(owner0),
+            memory_index: 0,
+            new_pages: 2,
+        }));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    StagedRecord::MemorySize { memory_index: 0, .. }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn workspace_merges_staged_and_committed_granules_with_nonzero_backing_base() {
+        let mut state = TransactionState::default();
+        let owner0 = InstanceId::from_u32(0);
+        let memory_index = 0;
+        let backing_base = TMEMORY_GRANULE_SIZE as u64;
+        let memory_len = TMEMORY_GRANULE_SIZE * 4;
+        let committed: Vec<u8> = (0..TMEMORY_GRANULE_SIZE * 2)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let addr = (TMEMORY_GRANULE_SIZE * 2 - 2) as u64;
+        let staged = vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let read_addr = addr - 2;
+        let read_len = 10;
+        state.begin().unwrap();
+
+        state
+            .stage_memory_write_owned_from_backing(
+                Some(owner0),
+                memory_index,
+                addr,
+                &staged,
+                backing_base,
+                &committed,
+                memory_len,
+            )
+            .unwrap();
+
+        let merged = state
+            .read_memory_overlay_owned_from_backing(
+                Some(owner0),
+                memory_index,
+                read_addr,
+                read_len,
+                backing_base,
+                &committed,
+                memory_len,
+            )
+            .unwrap();
+
+        let read_start = read_addr as usize - backing_base as usize;
+        let mut expected = committed[read_start..read_start + read_len].to_vec();
+        let staged_offset = (addr - read_addr) as usize;
+        expected[staged_offset..staged_offset + staged.len()].copy_from_slice(&staged);
+
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
     fn granule_id_orders_by_object_space_and_index() {
         let mut ids = vec![
             GranuleId::TGlobal {
-                instance: 0,
+                instance: None,
                 global_index: 2,
             },
             GranuleId::TMemorySize {
-                instance: 0,
+                instance: None,
                 memory_index: 4,
             },
             GranuleId::TMemory {
-                instance: 2,
+                instance: Some(2),
                 memory_index: 0,
                 granule_index: 0,
             },
             GranuleId::TMemory {
-                instance: 1,
+                instance: Some(1),
                 memory_index: 7,
                 granule_index: 3,
             },
             GranuleId::TGlobal {
-                instance: 0,
+                instance: None,
                 global_index: 1,
             },
             GranuleId::TMemorySize {
-                instance: 0,
+                instance: None,
                 memory_index: 1,
             },
             GranuleId::TMemory {
-                instance: 1,
+                instance: Some(1),
                 memory_index: 7,
                 granule_index: 1,
             },
@@ -2022,34 +2201,34 @@ mod tests {
             ids,
             vec![
                 GranuleId::TMemory {
-                    instance: 1,
+                    instance: Some(1),
                     memory_index: 7,
                     granule_index: 1,
                 },
                 GranuleId::TMemory {
-                    instance: 1,
+                    instance: Some(1),
                     memory_index: 7,
                     granule_index: 3,
                 },
                 GranuleId::TMemory {
-                    instance: 2,
+                    instance: Some(2),
                     memory_index: 0,
                     granule_index: 0,
                 },
                 GranuleId::TMemorySize {
-                    instance: 0,
+                    instance: None,
                     memory_index: 1,
                 },
                 GranuleId::TMemorySize {
-                    instance: 0,
+                    instance: None,
                     memory_index: 4,
                 },
                 GranuleId::TGlobal {
-                    instance: 0,
+                    instance: None,
                     global_index: 1,
                 },
                 GranuleId::TGlobal {
-                    instance: 0,
+                    instance: None,
                     global_index: 2,
                 },
             ]
@@ -2067,7 +2246,7 @@ mod tests {
 
         state.stage_granule_for_test(
             GranuleId::TMemory {
-                instance,
+                instance: Some(instance),
                 memory_index,
                 granule_index: 0,
             },
@@ -2075,7 +2254,7 @@ mod tests {
         );
         state.stage_granule_for_test(
             GranuleId::TMemory {
-                instance,
+                instance: Some(instance),
                 memory_index,
                 granule_index: 2,
             },
@@ -2084,7 +2263,7 @@ mod tests {
 
         let merged = state
             .read_tmemory_range_for_test(
-                instance,
+                Some(instance),
                 memory_index,
                 (TMEMORY_GRANULE_SIZE - 2) as u64,
                 TMEMORY_GRANULE_SIZE + 6,
