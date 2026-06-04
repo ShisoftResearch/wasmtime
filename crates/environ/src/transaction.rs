@@ -430,6 +430,9 @@ pub fn decode_transaction_object_metadata(bytes: &[u8]) -> WasmResult<Transactio
         });
     }
 
+    // Custom-section metadata version 1 carries only tmemory/tglobal indices.
+    // Transactional-function population stays empty here until the parser
+    // bridge work extends how this metadata is produced in a later task.
     Ok(TransactionObjectMetadata {
         memories,
         globals,
