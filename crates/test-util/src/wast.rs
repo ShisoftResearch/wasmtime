@@ -1935,7 +1935,51 @@ fn transaction_proposal_uses_real_text_parser(
         TransactionProposalSuite::SimpleTransactions => {
             matches!(
                 name,
-                "float_tmemory.wast"
+                "return_tcall.wast"
+                    | "return_tcall_indirect.wast"
+                    | "tblock.wast"
+                    | "tbr.wast"
+                    | "tbr_if.wast"
+                    | "tcall.wast"
+                    | "tconflict-tmemory.wast"
+                    | "tconst.wast"
+                    | "tconversions.wast"
+                    | "tf32.wast"
+                    | "tf32_bitwise.wast"
+                    | "tf32_cmp.wast"
+                    | "tf64.wast"
+                    | "tf64_bitwise.wast"
+                    | "tf64_cmp.wast"
+                    | "tfac.wast"
+                    | "tfloat_exprs.wast"
+                    | "tfloat_misc.wast"
+                    | "tforward.wast"
+                    | "ti32.wast"
+                    | "ti64.wast"
+                    | "tif.wast"
+                    | "tinline-module.wast"
+                    | "tint_exprs.wast"
+                    | "tint_literals.wast"
+                    | "tlabels.wast"
+                    | "tleft-to-right.wast"
+                    | "tlocal_get.wast"
+                    | "tlocal_set.wast"
+                    | "tlocal_tee.wast"
+                    | "tloop.wast"
+                    | "tnames.wast"
+                    | "tnop.wast"
+                    | "treturn.wast"
+                    | "tstack.wast"
+                    | "tstart.wast"
+                    | "tswitch.wast"
+                    | "ttraps.wast"
+                    | "ttype.wast"
+                    | "tunreachable.wast"
+                    | "tunwind.wast"
+                    | "tutf8-invalid-encoding.wast"
+                    | "utf8-timport-field.wast"
+                    | "utf8-timport-module.wast"
+                    | "float_tmemory.wast"
                     | "taddress.wast"
                     | "talign.wast"
                     | "tendianness.wast"
@@ -2579,7 +2623,8 @@ mod tests {
 
     #[test]
     fn enables_normalized_core_transaction_proposal_tranche() {
-        for name in ["tstack.wast", "tstart.wast", "tswitch.wast", "tunwind.wast"] {
+        let names: [&str; 0] = [];
+        for name in names {
             let test = WastTest {
                 path: PathBuf::from(name),
                 contents: String::new(),
@@ -2589,6 +2634,71 @@ mod tests {
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
+        }
+    }
+
+    #[test]
+    fn enables_real_text_parser_core_transaction_proposal_tranche() {
+        for name in [
+            "return_tcall.wast",
+            "return_tcall_indirect.wast",
+            "tblock.wast",
+            "tbr.wast",
+            "tbr_if.wast",
+            "tcall.wast",
+            "tconflict-tmemory.wast",
+            "tconst.wast",
+            "tconversions.wast",
+            "tf32.wast",
+            "tf32_bitwise.wast",
+            "tf32_cmp.wast",
+            "tf64.wast",
+            "tf64_bitwise.wast",
+            "tf64_cmp.wast",
+            "tfac.wast",
+            "tfloat_exprs.wast",
+            "tfloat_misc.wast",
+            "tforward.wast",
+            "ti32.wast",
+            "ti64.wast",
+            "tif.wast",
+            "tinline-module.wast",
+            "tint_exprs.wast",
+            "tint_literals.wast",
+            "tlabels.wast",
+            "tleft-to-right.wast",
+            "tlocal_get.wast",
+            "tlocal_set.wast",
+            "tlocal_tee.wast",
+            "tloop.wast",
+            "tnames.wast",
+            "tnop.wast",
+            "treturn.wast",
+            "tstack.wast",
+            "tstart.wast",
+            "tswitch.wast",
+            "ttraps.wast",
+            "ttype.wast",
+            "tunreachable.wast",
+            "tunwind.wast",
+            "tutf8-invalid-encoding.wast",
+            "utf8-timport-field.wast",
+            "utf8-timport-module.wast",
+        ] {
+            let test = WastTest {
+                path: PathBuf::from(name),
+                contents: String::new(),
+                config: TestConfig::default(),
+                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: true,
+            };
+
+            assert!(test.transaction_real_text_parser(), "{name}");
+            assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
         }
     }
 

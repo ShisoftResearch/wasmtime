@@ -49,6 +49,39 @@ pub fn link_spectest<T>(
             println!("{f2}: f64");
         }
     })?;
+    linker.func_wrap("spectest", "tprint", || {})?;
+    linker.func_wrap("spectest", "tprint_i32", move |val: i32| {
+        if !suppress {
+            println!("{val}: i32")
+        }
+    })?;
+    linker.func_wrap("spectest", "tprint_i64", move |val: i64| {
+        if !suppress {
+            println!("{val}: i64")
+        }
+    })?;
+    linker.func_wrap("spectest", "tprint_f32", move |val: f32| {
+        if !suppress {
+            println!("{val}: f32")
+        }
+    })?;
+    linker.func_wrap("spectest", "tprint_f64", move |val: f64| {
+        if !suppress {
+            println!("{val}: f64")
+        }
+    })?;
+    linker.func_wrap("spectest", "tprint_i32_f32", move |i: i32, f: f32| {
+        if !suppress {
+            println!("{i}: i32");
+            println!("{f}: f32");
+        }
+    })?;
+    linker.func_wrap("spectest", "tprint_f64_f64", move |f1: f64, f2: f64| {
+        if !suppress {
+            println!("{f1}: f64");
+            println!("{f2}: f64");
+        }
+    })?;
 
     let ty = GlobalType::new(ValType::I32, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::I32(666))?;

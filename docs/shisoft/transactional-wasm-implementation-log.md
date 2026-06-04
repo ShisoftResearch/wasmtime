@@ -517,6 +517,84 @@ WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast tran
 test result: ok. 69 passed; 0 failed; 47 ignored; 0 measured; 3495 filtered out
 ```
 
+## Runtime Core Task 8: Core Real-Parser Tranche
+
+Date: 2026-06-04
+
+Moved additional core scalar transaction fixtures onto the real text-parser path
+without editing proposal WAST files:
+
+- `return_tcall.wast`
+- `return_tcall_indirect.wast`
+- `tblock.wast`
+- `tbr.wast`
+- `tbr_if.wast`
+- `tcall.wast`
+- `tconflict-tmemory.wast`
+- `tconst.wast`
+- `tconversions.wast`
+- `tf32.wast`
+- `tf32_bitwise.wast`
+- `tf32_cmp.wast`
+- `tf64.wast`
+- `tf64_bitwise.wast`
+- `tf64_cmp.wast`
+- `tfac.wast`
+- `tfloat_exprs.wast`
+- `tfloat_misc.wast`
+- `tforward.wast`
+- `ti32.wast`
+- `ti64.wast`
+- `tif.wast`
+- `tinline-module.wast`
+- `tint_exprs.wast`
+- `tint_literals.wast`
+- `tlabels.wast`
+- `tleft-to-right.wast`
+- `tlocal_get.wast`
+- `tlocal_set.wast`
+- `tlocal_tee.wast`
+- `tloop.wast`
+- `tnames.wast`
+- `tnop.wast`
+- `treturn.wast`
+- `tstack.wast`
+- `tstart.wast`
+- `tswitch.wast`
+- `ttraps.wast`
+- `ttype.wast`
+- `tunreachable.wast`
+- `tunwind.wast`
+- `tutf8-invalid-encoding.wast`
+- `utf8-timport-field.wast`
+- `utf8-timport-module.wast`
+
+Harness additions:
+
+- `spectest` now defines `tprint`, `tprint_i32`, `tprint_i64`,
+  `tprint_f32`, `tprint_f64`, `tprint_i32_f32`, and `tprint_f64_f64`
+  aliases so real-parser fixtures can keep transactional import names.
+- Parser-blocked fixtures remain normalized or mocked: transactional refs,
+  `tcall_ref`/`return_tcall_ref`, `ttry`/`tfail`, bulk tmemory
+  `copy/fill/init`, transactional table/element forms, and object-table/GC
+  fixtures.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast enables_real_text_parser_core_transaction_proposal_tranche
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/simple-transactions/tstart.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/simple-transactions/tnames.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 69 passed; 0 failed; 47 ignored; 0 measured; 3495 filtered out
+```
+
 ## Runtime Core: tfunc Boundary And VMemory/tdata Fixes
 
 Date: 2026-06-04
