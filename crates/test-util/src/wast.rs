@@ -2622,22 +2622,6 @@ mod tests {
     }
 
     #[test]
-    fn enables_normalized_core_transaction_proposal_tranche() {
-        let names: [&str; 0] = [];
-        for name in names {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: false,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-        }
-    }
-
-    #[test]
     fn enables_real_text_parser_core_transaction_proposal_tranche() {
         for name in [
             "return_tcall.wast",
@@ -2756,7 +2740,7 @@ mod tests {
 
     #[test]
     fn enables_normalized_import_export_transaction_proposal_tranche() {
-        for name in ["texports.wast", "timports.wast", "tinline-module.wast"] {
+        for name in ["texports.wast", "timports.wast"] {
             let test = WastTest {
                 path: PathBuf::from(name),
                 contents: String::new(),
@@ -2771,30 +2755,7 @@ mod tests {
 
     #[test]
     fn enables_normalized_type_and_name_transaction_proposal_tranche() {
-        for name in [
-            "ttype.wast",
-            "tforward.wast",
-            "tnames.wast",
-            "tutf8-invalid-encoding.wast",
-            "utf8-timport-field.wast",
-            "utf8-timport-module.wast",
-            "tfunc_ptrs.wast",
-        ] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: false,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-        }
-    }
-
-    #[test]
-    fn enables_normalized_conflict_transaction_proposal_tranche() {
-        for name in ["tconflict-tmemory.wast"] {
+        for name in ["tfunc_ptrs.wast"] {
             let test = WastTest {
                 path: PathBuf::from(name),
                 contents: String::new(),

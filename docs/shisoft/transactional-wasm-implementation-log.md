@@ -510,6 +510,9 @@ Verification:
 cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wast transaction_text_
 test result: ok. 12 passed; 0 failed
 
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wat transaction
+test result: ok. 1 passed; 0 failed
+
 cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wasmparser transaction
 test result: ok. 2 passed; 0 failed
 
@@ -582,6 +585,9 @@ Harness additions:
 Verification:
 
 ```text
+cargo test -p wasmtime-test-util --features wast transaction_proposal_tranche
+test result: ok. 5 passed; 0 failed
+
 cargo test -p wasmtime-test-util --features wast enables_real_text_parser_core_transaction_proposal_tranche
 test result: ok. 1 passed; 0 failed
 
