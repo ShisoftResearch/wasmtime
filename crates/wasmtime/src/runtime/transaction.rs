@@ -237,7 +237,11 @@ impl LockBased {
         granule: GranuleId,
         version: u64,
     ) -> Result<()> {
-        if self.owners.get(&granule).is_some_and(|owner| *owner != transaction) {
+        if self
+            .owners
+            .get(&granule)
+            .is_some_and(|owner| *owner != transaction)
+        {
             bail!("transaction read conflict: granule is owned by another transaction");
         }
 
@@ -262,7 +266,11 @@ impl LockBased {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        if self.owners.get(&granule).is_some_and(|owner| *owner != transaction) {
+        if self
+            .owners
+            .get(&granule)
+            .is_some_and(|owner| *owner != transaction)
+        {
             bail!("transaction write conflict: granule is owned by another transaction");
         }
         if self
@@ -283,7 +291,11 @@ impl LockBased {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        if self.owners.get(&granule).is_some_and(|owner| *owner != transaction) {
+        if self
+            .owners
+            .get(&granule)
+            .is_some_and(|owner| *owner != transaction)
+        {
             bail!("transaction read conflict: granule is owned by another transaction");
         }
         if self
@@ -292,6 +304,25 @@ impl LockBased {
             .is_some_and(|version| *version != current_version)
         {
             bail!("transaction read conflict: optimistic read version changed");
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_transaction_reads<F>(
+        &self,
+        transaction: TransactionId,
+        mut current_version_fn: F,
+    ) -> Result<()>
+    where
+        F: FnMut(GranuleId) -> Result<u64>,
+    {
+        for ((reader, granule), _) in self.read_versions.iter() {
+            if *reader != transaction {
+                continue;
+            }
+            let current_version = current_version_fn(*granule)?;
+            self.validate_read(transaction, *granule, current_version)?;
         }
 
         Ok(())
@@ -409,10 +440,39 @@ impl TransactionState {
     where
         F: FnMut(&StagedRecord) -> Result<()>,
     {
+        self.commit_with_read_validation(|_| Ok(0), |record| apply(record))
+    }
+
+    pub(crate) fn commit_with_read_validation<V, F>(
+        &mut self,
+        current_version_fn: V,
+        mut apply: F,
+    ) -> Result<()>
+    where
+        V: FnMut(GranuleId) -> Result<u64>,
+        F: FnMut(&StagedRecord) -> Result<()>,
+    {
         self.ensure_active()?;
+        self.validate_active_reads_with(current_version_fn)?;
         for record in self.staged_records()? {
             apply(&record)?;
         }
+        self.complete_commit()
+    }
+
+    pub(crate) fn validate_active_reads_with<F>(&self, current_version_fn: F) -> Result<()>
+    where
+        F: FnMut(GranuleId) -> Result<u64>,
+    {
+        let transaction = self
+            .active_transaction()
+            .context("no active transaction in this store")?;
+        self.locks
+            .validate_transaction_reads(transaction, current_version_fn)
+    }
+
+    pub(crate) fn complete_commit(&mut self) -> Result<()> {
+        self.ensure_active()?;
         self.clear_active();
         Ok(())
     }
@@ -490,7 +550,10 @@ impl TransactionState {
         self.ensure_active()?;
         Ok(self
             .staged_memory_sizes
-            .insert(memory_size_granule_id(owner_instance, memory_index), new_pages)
+            .insert(
+                memory_size_granule_id(owner_instance, memory_index),
+                new_pages,
+            )
             .is_none())
     }
 
@@ -598,8 +661,8 @@ impl TransactionState {
             let local_granule_range =
                 (granule_range.start - backing_base)..(granule_range.end - backing_base);
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            let granule_index = u64::try_from(granule_index)
-                .context("tmemory granule index does not fit u64")?;
+            let granule_index =
+                u64::try_from(granule_index).context("tmemory granule index does not fit u64")?;
             let granule_offset = current - granule_range.start;
             let chunk_len = (range.end - current).min(granule_range.end - current);
             let granule_chunk_end = granule_offset
@@ -688,8 +751,8 @@ impl TransactionState {
             let granule_index = current / TMEMORY_GRANULE_SIZE;
             let granule_range = tmemory_granule_backing_range(granule_index, memory_len)?;
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            let granule_index = u64::try_from(granule_index)
-                .context("tmemory granule index does not fit u64")?;
+            let granule_index =
+                u64::try_from(granule_index).context("tmemory granule index does not fit u64")?;
             let chunk_len = (range.end - current).min(granule_range.end - current);
 
             self.lock_memory_granule_read(memory_index, granule_index)?;
@@ -774,7 +837,11 @@ impl TransactionState {
         granule_index: u64,
     ) -> Option<&[u8]> {
         self.staged_granules
-            .get(&memory_granule_id_from_u64(None, memory_index, granule_index))
+            .get(&memory_granule_id_from_u64(
+                None,
+                memory_index,
+                granule_index,
+            ))
             .map(Vec::as_slice)
     }
 
@@ -784,7 +851,11 @@ impl TransactionState {
         granule_index: u64,
     ) -> Option<&mut [u8]> {
         self.staged_granules
-            .get_mut(&memory_granule_id_from_u64(None, memory_index, granule_index))
+            .get_mut(&memory_granule_id_from_u64(
+                None,
+                memory_index,
+                granule_index,
+            ))
             .map(Vec::as_mut_slice)
     }
 
@@ -855,8 +926,8 @@ impl TransactionState {
                 .and_then(|index| index.checked_mul(TMEMORY_GRANULE_SIZE))
                 .context("tmemory pending store granule overflow")?;
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            let granule_index = u64::try_from(granule_index)
-                .context("tmemory granule index does not fit u64")?;
+            let granule_index =
+                u64::try_from(granule_index).context("tmemory granule index does not fit u64")?;
             self.lock_memory_granule_write(memory_index, granule_index)?;
             self.memory_read_granules.insert(key);
             self.memory_write_granules.insert(key);
@@ -892,11 +963,12 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.memory_read_granules.contains(&memory_granule_id_from_u64(
-            owner_instance,
-            memory_index,
-            granule_index,
-        ))
+        self.memory_read_granules
+            .contains(&memory_granule_id_from_u64(
+                owner_instance,
+                memory_index,
+                granule_index,
+            ))
     }
 
     pub(crate) fn owns_memory_granule_write(&self, memory_index: u32, granule_index: u64) -> bool {
@@ -909,11 +981,12 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.memory_write_granules.contains(&memory_granule_id_from_u64(
-            owner_instance,
-            memory_index,
-            granule_index,
-        ))
+        self.memory_write_granules
+            .contains(&memory_granule_id_from_u64(
+                owner_instance,
+                memory_index,
+                granule_index,
+            ))
     }
 
     fn merge_staged_tmemory_range(
@@ -1088,7 +1161,11 @@ fn memory_granule_key(
     memory_index: u32,
     granule_index: usize,
 ) -> Result<GranuleId> {
-    memory_granule_id_for_instance(granule_instance(owner_instance), memory_index, granule_index)
+    memory_granule_id_for_instance(
+        granule_instance(owner_instance),
+        memory_index,
+        granule_index,
+    )
 }
 
 fn tmemory_granule_backing_range(
@@ -1993,6 +2070,59 @@ mod tests {
     }
 
     #[test]
+    fn commit_validates_optimistic_read_versions_before_clearing() {
+        let mut state = TransactionState::default();
+        let transaction = state.begin().unwrap();
+        let granule = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 0,
+        };
+        state
+            .locks
+            .record_read_for_test(transaction, granule, 1)
+            .unwrap();
+
+        let error = state
+            .commit_with_read_validation(|_| Ok(2), |_| Ok(()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("transaction read conflict"));
+        assert_eq!(state.active_transaction(), Some(transaction));
+    }
+
+    #[test]
+    fn commit_validates_reads_before_apply_callback() {
+        let mut state = TransactionState::default();
+        let transaction = state.begin().unwrap();
+        let granule = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 0,
+        };
+        state.stage_global(3, GlobalSnapshot::I32(7)).unwrap();
+        state
+            .locks
+            .record_read_for_test(transaction, granule, 1)
+            .unwrap();
+        let mut applied = false;
+
+        let error = state
+            .commit_with_read_validation(
+                |_| Ok(2),
+                |_| {
+                    applied = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("transaction read conflict"));
+        assert!(!applied);
+        assert_eq!(state.active_transaction(), Some(transaction));
+    }
+
+    #[test]
     fn abort_releases_lock_based_ownership_for_next_transaction() {
         let mut state = TransactionState::default();
         state.begin().unwrap();
@@ -2063,14 +2193,21 @@ mod tests {
         let owner0 = InstanceId::from_u32(0);
         state.begin().unwrap();
 
-        assert!(state
-            .stage_global_owned(None, 0, GlobalSnapshot::I32(1))
-            .unwrap());
-        assert!(state
-            .stage_global_owned(Some(owner0), 0, GlobalSnapshot::I32(2))
-            .unwrap());
+        assert!(
+            state
+                .stage_global_owned(None, 0, GlobalSnapshot::I32(1))
+                .unwrap()
+        );
+        assert!(
+            state
+                .stage_global_owned(Some(owner0), 0, GlobalSnapshot::I32(2))
+                .unwrap()
+        );
 
-        assert_eq!(state.staged_global_owned(None, 0), Some(GlobalSnapshot::I32(1)));
+        assert_eq!(
+            state.staged_global_owned(None, 0),
+            Some(GlobalSnapshot::I32(1))
+        );
         assert_eq!(
             state.staged_global_owned(Some(owner0), 0),
             Some(GlobalSnapshot::I32(2))
@@ -2110,12 +2247,16 @@ mod tests {
         let owner0_bytes = vec![0x22; TMEMORY_GRANULE_SIZE];
         state.begin().unwrap();
 
-        assert!(state
-            .stage_memory_granule(0, 0, ownerless_bytes.clone())
-            .unwrap());
-        assert!(state
-            .acquire_memory_granule_write_owned(Some(owner0), 0, 0, owner0_bytes.clone())
-            .unwrap());
+        assert!(
+            state
+                .stage_memory_granule(0, 0, ownerless_bytes.clone())
+                .unwrap()
+        );
+        assert!(
+            state
+                .acquire_memory_granule_write_owned(Some(owner0), 0, 0, owner0_bytes.clone())
+                .unwrap()
+        );
 
         let records = state.staged_records().unwrap();
         assert!(records.contains(&StagedRecord::MemoryGranule {
@@ -2153,9 +2294,7 @@ mod tests {
         state.begin().unwrap();
 
         assert!(state.stage_memory_size_owned(None, 0, 1).unwrap());
-        assert!(state
-            .stage_memory_size_owned(Some(owner0), 0, 2)
-            .unwrap());
+        assert!(state.stage_memory_size_owned(Some(owner0), 0, 2).unwrap());
 
         let records = state.staged_records().unwrap();
         assert!(records.contains(&StagedRecord::MemorySize {
@@ -2173,7 +2312,10 @@ mod tests {
                 .iter()
                 .filter(|record| matches!(
                     record,
-                    StagedRecord::MemorySize { memory_index: 0, .. }
+                    StagedRecord::MemorySize {
+                        memory_index: 0,
+                        ..
+                    }
                 ))
                 .count(),
             2
@@ -2379,8 +2521,14 @@ mod tests {
         let read_error = locks.record_read_for_test(second, granule, 3).unwrap_err();
         assert!(read_error.to_string().contains("transaction read conflict"));
 
-        let write_error = locks.acquire_write_for_test(second, granule, 3).unwrap_err();
-        assert!(write_error.to_string().contains("transaction write conflict"));
+        let write_error = locks
+            .acquire_write_for_test(second, granule, 3)
+            .unwrap_err();
+        assert!(
+            write_error
+                .to_string()
+                .contains("transaction write conflict")
+        );
     }
 
     #[test]
@@ -2427,7 +2575,9 @@ mod tests {
         };
 
         locks.acquire_write_for_test(first, conflicted, 9).unwrap();
-        locks.acquire_write_for_test(second, independent, 3).unwrap();
+        locks
+            .acquire_write_for_test(second, independent, 3)
+            .unwrap();
 
         let error = locks
             .acquire_write_for_test(second, conflicted, 9)
@@ -2456,7 +2606,9 @@ mod tests {
         locks.acquire_write_for_test(writer, granule, 7).unwrap();
         locks.abort_for_test(writer);
 
-        let error = locks.validate_read_for_test(reader, granule, 8).unwrap_err();
+        let error = locks
+            .validate_read_for_test(reader, granule, 8)
+            .unwrap_err();
         assert!(error.to_string().contains("transaction read conflict"));
     }
 
@@ -2470,7 +2622,9 @@ mod tests {
             granule_index: 0,
         };
 
-        locks.acquire_write_for_test(transaction, granule, 4).unwrap();
+        locks
+            .acquire_write_for_test(transaction, granule, 4)
+            .unwrap();
         assert_eq!(locks.owner_for_test(granule), Some(transaction));
 
         locks.abort_for_test(transaction);

@@ -288,6 +288,9 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         if state.active_transaction().is_none() {
             return Ok(());
         }
+        // SHISOFT-TWASM-MOCK: the real tmemory version source is not wired yet,
+        // so optimistic read validation still uses the placeholder version `0`.
+        state.validate_active_reads_with(|_| Ok(0))?;
         state.staged_records()?
     };
 
@@ -295,7 +298,10 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         apply_staged_transaction_record(store, instance, record)?;
     }
 
-    store.store_opaque_mut().transaction_state_mut().commit()
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .complete_commit()
 }
 
 fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
