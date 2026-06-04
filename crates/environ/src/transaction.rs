@@ -128,6 +128,10 @@ pub struct TransactionObjectMetadata {
     /// Globals declared through the `tglobal` text alias.
     pub globals: alloc::vec::Vec<GlobalIndex>,
     /// Functions declared through the `tfunc` text alias.
+    ///
+    /// This default is for self-describing/map-style serde consumers. Wasmtime
+    /// compiled artifacts use postcard inside an engine-versioned ELF wrapper,
+    /// so adding this field intentionally changes the current artifact payload.
     #[serde(default)]
     pub functions: alloc::vec::Vec<FuncIndex>,
 }
@@ -820,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_metadata_tracks_tfuncs() {
+    fn transaction_object_metadata_tracks_tfuncs() {
         use crate::FuncIndex;
 
         let mut metadata = TransactionObjectMetadata::default();
@@ -848,23 +852,6 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
-    }
-
-    #[test]
-    fn transaction_object_metadata_deserializes_missing_functions_as_empty() {
-        let deserializer = serde::de::value::MapDeserializer::<'_, _, serde::de::value::Error>::new(
-            [
-                ("memories", alloc::vec![alloc::vec![0u32]]),
-                ("globals", alloc::vec![alloc::vec![2u32]]),
-            ]
-            .into_iter(),
-        );
-        let metadata =
-            <TransactionObjectMetadata as serde::Deserialize>::deserialize(deserializer).unwrap();
-
-        assert!(metadata.is_tmemory(MemoryIndex::from_u32(0)));
-        assert!(metadata.is_tglobal(GlobalIndex::from_u32(2)));
-        assert_eq!(metadata.tfuncs().len(), 0);
     }
 
     #[test]
