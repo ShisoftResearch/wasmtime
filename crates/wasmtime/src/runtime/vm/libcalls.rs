@@ -271,6 +271,12 @@ fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<(
 }
 
 fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    let result = transaction_commit_impl(store, instance);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
     let records = {
@@ -318,21 +324,12 @@ fn transaction_tmemory_load(
     offset: u64,
     len: u32,
 ) -> Result<*mut u8> {
-    let effective = checked_tmemory_effective_address(addr, offset)?;
-    let len = usize::try_from(len).context("tmemory access length overflow")?;
-    flush_pending_tmemory_store(store, instance)?;
-
-    let memory_index = DefinedMemoryIndex::from_u32(memory);
-    let backing = read_memory_snapshot(store, instance, memory_index)?;
-    checked_tmemory_libcall_range(effective, len, backing.len())?;
-
-    let state = store.store_opaque_mut().transaction_state_mut();
-    let bytes =
-        state.read_memory_overlay_owned(Some(instance), memory, effective, len, &backing)?;
-    Ok(state.set_scratch(bytes))
+    let result = transaction_tmemory_load_impl(store, instance, memory, addr, offset, len);
+    abort_active_transaction_on_error(store, &result);
+    result
 }
 
-fn transaction_tmemory_store(
+fn transaction_tmemory_load_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
     memory: u32,
@@ -345,16 +342,73 @@ fn transaction_tmemory_store(
     flush_pending_tmemory_store(store, instance)?;
 
     let memory_index = DefinedMemoryIndex::from_u32(memory);
-    let backing = read_memory_snapshot(store, instance, memory_index)?;
-    checked_tmemory_libcall_range(effective, len, backing.len())?;
+    let backing = read_memory_backing_window(store, instance, memory_index, effective, len)?;
 
     let state = store.store_opaque_mut().transaction_state_mut();
-    let bytes =
-        state.read_memory_overlay_owned(Some(instance), memory, effective, len, &backing)?;
+    let bytes = state.read_memory_overlay_owned_from_backing(
+        Some(instance),
+        memory,
+        effective,
+        len,
+        backing.base,
+        &backing.bytes,
+        backing.memory_len,
+    )?;
+    Ok(state.set_scratch(bytes))
+}
+
+fn transaction_tmemory_store(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    addr: u64,
+    offset: u64,
+    len: u32,
+) -> Result<*mut u8> {
+    let result = transaction_tmemory_store_impl(store, instance, memory, addr, offset, len);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tmemory_store_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    addr: u64,
+    offset: u64,
+    len: u32,
+) -> Result<*mut u8> {
+    let effective = checked_tmemory_effective_address(addr, offset)?;
+    let len = usize::try_from(len).context("tmemory access length overflow")?;
+    flush_pending_tmemory_store(store, instance)?;
+
+    let memory_index = DefinedMemoryIndex::from_u32(memory);
+    let backing = read_memory_backing_window(store, instance, memory_index, effective, len)?;
+
+    let state = store.store_opaque_mut().transaction_state_mut();
+    let bytes = state.read_memory_overlay_owned_from_backing(
+        Some(instance),
+        memory,
+        effective,
+        len,
+        backing.base,
+        &backing.bytes,
+        backing.memory_len,
+    )?;
     state.set_memory_store_scratch(instance, memory, effective, bytes)
 }
 
 fn transaction_tmemory_size(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+) -> Result<*mut u8> {
+    let result = transaction_tmemory_size_impl(store, instance, memory);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tmemory_size_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
     memory: u32,
@@ -374,6 +428,17 @@ fn transaction_tmemory_size(
 }
 
 fn transaction_tmemory_grow(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    delta: u64,
+) -> Result<Option<AllocationSize>> {
+    let result = transaction_tmemory_grow_impl(store, instance, memory, delta);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tmemory_grow_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
     memory: u32,
@@ -418,15 +483,50 @@ fn checked_tmemory_libcall_range(
     Ok(start..end)
 }
 
-fn read_memory_snapshot(
+struct MemoryBackingWindow {
+    base: u64,
+    bytes: Vec<u8>,
+    memory_len: usize,
+}
+
+fn read_memory_backing_window(
     store: &mut dyn VMStore,
     instance: InstanceId,
     memory_index: DefinedMemoryIndex,
-) -> Result<Vec<u8>> {
+    addr: u64,
+    len: usize,
+) -> Result<MemoryBackingWindow> {
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
     let memory = instance_ref.get_defined_memory(memory_index);
-    read_memory_bytes(memory, 0, memory.byte_size())
+    let memory_len = memory.byte_size();
+    let access = checked_tmemory_libcall_range(addr, len, memory_len)?;
+    let window = tmemory_backing_window_range(access, memory_len)?;
+    let base = u64::try_from(window.start).context("tmemory backing window base overflow")?;
+    let bytes = read_memory_bytes(memory, base, window.len())?;
+    Ok(MemoryBackingWindow {
+        base,
+        bytes,
+        memory_len,
+    })
+}
+
+fn tmemory_backing_window_range(access: Range<usize>, memory_len: usize) -> Result<Range<usize>> {
+    if access.is_empty() {
+        return Ok(access.start..access.start);
+    }
+
+    let start = (access.start / TMEMORY_GRANULE_SIZE)
+        .checked_mul(TMEMORY_GRANULE_SIZE)
+        .context("tmemory backing window start overflow")?;
+    let last = access.end - 1;
+    let end_granule = last / TMEMORY_GRANULE_SIZE;
+    let end = end_granule
+        .checked_add(1)
+        .and_then(|granule| granule.checked_mul(TMEMORY_GRANULE_SIZE))
+        .context("tmemory backing window end overflow")?
+        .min(memory_len);
+    Ok(start..end)
 }
 
 fn read_memory_bytes(memory: &vm::Memory, addr: u64, len: usize) -> Result<Vec<u8>> {
@@ -448,7 +548,7 @@ fn write_memory_bytes(memory: &mut vm::Memory, addr: u64, bytes: &[u8]) -> Resul
 }
 
 fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
-    let Some((owner, memory, _, _)) = store
+    let Some((owner, memory, addr, len)) = store
         .store_opaque_mut()
         .transaction_state_mut()
         .pending_memory_store()
@@ -457,12 +557,27 @@ fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -
     };
 
     let memory_index = DefinedMemoryIndex::from_u32(memory);
-    let backing = read_memory_snapshot(store, owner, memory_index)?;
+    let backing = read_memory_backing_window(store, owner, memory_index, addr, len)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
-        .flush_memory_store_scratch(&backing)?;
+        .flush_memory_store_scratch_from_backing(
+            backing.base,
+            &backing.bytes,
+            backing.memory_len,
+        )?;
     Ok(())
+}
+
+fn abort_active_transaction_on_error<T>(store: &mut dyn VMStore, result: &Result<T>) {
+    if result.is_ok() {
+        return;
+    }
+
+    let state = store.store_opaque_mut().transaction_state_mut();
+    if state.active_transaction().is_some() {
+        let _ = state.abort();
+    }
 }
 
 fn apply_staged_transaction_record(

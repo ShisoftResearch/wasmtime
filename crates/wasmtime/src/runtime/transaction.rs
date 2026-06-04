@@ -387,14 +387,46 @@ impl TransactionState {
         bytes: &[u8],
         backing: &[u8],
     ) -> Result<()> {
+        self.stage_memory_write_owned_from_backing(
+            owner_instance,
+            memory_index,
+            addr,
+            bytes,
+            0,
+            backing,
+            backing.len(),
+        )
+    }
+
+    pub(crate) fn stage_memory_write_owned_from_backing(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        bytes: &[u8],
+        backing_base: u64,
+        backing: &[u8],
+        memory_len: usize,
+    ) -> Result<()> {
         self.ensure_active()?;
-        let range = checked_tmemory_range(addr, bytes.len(), backing.len())?;
+        let range = checked_tmemory_range(addr, bytes.len(), memory_len)?;
+        let backing_base = usize::try_from(backing_base)
+            .context("tmemory backing base does not fit host usize")?;
+        let backing_end = backing_base
+            .checked_add(backing.len())
+            .context("tmemory backing window overflow")?;
         let mut offset: usize = 0;
         let mut current = range.start;
 
         while current < range.end {
             let granule_index = current / TMEMORY_GRANULE_SIZE;
-            let granule_range = tmemory_granule_backing_range(granule_index, backing.len())?;
+            let granule_range = tmemory_granule_backing_range(granule_index, memory_len)?;
+            ensure!(
+                granule_range.start >= backing_base && granule_range.end <= backing_end,
+                "tmemory backing window does not cover touched granule"
+            );
+            let local_granule_range =
+                (granule_range.start - backing_base)..(granule_range.end - backing_base);
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
             let granule_offset = current - granule_range.start;
             let chunk_len = (range.end - current).min(granule_range.end - current);
@@ -409,7 +441,7 @@ impl TransactionState {
                 let staged = self
                     .staged_memory_granules
                     .entry(key)
-                    .or_insert_with(|| backing[granule_range.clone()].to_vec());
+                    .or_insert_with(|| backing[local_granule_range.clone()].to_vec());
                 ensure!(
                     granule_chunk_end <= staged.len(),
                     "staged tmemory granule length mismatch"
@@ -445,14 +477,44 @@ impl TransactionState {
         len: usize,
         backing: &[u8],
     ) -> Result<Vec<u8>> {
+        self.read_memory_overlay_owned_from_backing(
+            owner_instance,
+            memory_index,
+            addr,
+            len,
+            0,
+            backing,
+            backing.len(),
+        )
+    }
+
+    pub(crate) fn read_memory_overlay_owned_from_backing(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        addr: u64,
+        len: usize,
+        backing_base: u64,
+        backing: &[u8],
+        memory_len: usize,
+    ) -> Result<Vec<u8>> {
         self.ensure_active()?;
-        let range = checked_tmemory_range(addr, len, backing.len())?;
-        let mut bytes = backing[range.clone()].to_vec();
+        let range = checked_tmemory_range(addr, len, memory_len)?;
+        let backing_base = usize::try_from(backing_base)
+            .context("tmemory backing base does not fit host usize")?;
+        let backing_end = backing_base
+            .checked_add(backing.len())
+            .context("tmemory backing window overflow")?;
+        ensure!(
+            range.start >= backing_base && range.end <= backing_end,
+            "tmemory backing window does not cover read range"
+        );
+        let mut bytes = backing[range.start - backing_base..range.end - backing_base].to_vec();
         let mut current = range.start;
 
         while current < range.end {
             let granule_index = current / TMEMORY_GRANULE_SIZE;
-            let granule_range = tmemory_granule_backing_range(granule_index, backing.len())?;
+            let granule_range = tmemory_granule_backing_range(granule_index, memory_len)?;
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
             let granule_offset = current - granule_range.start;
             let chunk_len = (range.end - current).min(granule_range.end - current);
@@ -517,6 +579,15 @@ impl TransactionState {
     }
 
     pub(crate) fn flush_memory_store_scratch(&mut self, backing: &[u8]) -> Result<bool> {
+        self.flush_memory_store_scratch_from_backing(0, backing, backing.len())
+    }
+
+    pub(crate) fn flush_memory_store_scratch_from_backing(
+        &mut self,
+        backing_base: u64,
+        backing: &[u8],
+        memory_len: usize,
+    ) -> Result<bool> {
         self.ensure_active()?;
         let Some(pending) = self.pending_memory_store.take() else {
             return Ok(false);
@@ -526,12 +597,14 @@ impl TransactionState {
             "pending tmemory store scratch length mismatch"
         );
         let bytes = self.scratch[..pending.len].to_vec();
-        self.stage_memory_write_owned(
+        self.stage_memory_write_owned_from_backing(
             Some(pending.instance),
             pending.memory_index,
             pending.addr,
             &bytes,
+            backing_base,
             backing,
+            memory_len,
         )?;
         Ok(true)
     }
@@ -790,6 +863,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(size.call(&mut store, ()).unwrap(), 2);
+    }
+
+    #[test]
+    fn mock_transaction_read_after_write_uses_pending_store_scratch() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (func (export "write_read") (result i32)
+                (ttry)
+                (i32.tstore (i32.const 0) (i32.const 77))
+                (i32.tload (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write_read = instance
+            .get_typed_func::<(), i32>(&mut store, "write_read")
+            .unwrap();
+
+        assert_eq!(write_read.call(&mut store, ()).unwrap(), 77);
+    }
+
+    #[test]
+    fn mock_transaction_tmemory_trap_clears_active_transaction() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (func (export "trap")
+                (ttry)
+                (i32.tstore (i32.const 0) (i32.const 42))
+                (drop (i32.tload (i32.const 65536))))
+              (func (export "write")
+                (ttry)
+                (i32.tstore (i32.const 0) (i32.const 7)))
+              (func (export "read") (result i32)
+                (i32.load (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let trap = instance
+            .get_typed_func::<(), ()>(&mut store, "trap")
+            .unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        assert!(trap.call(&mut store, ()).is_err());
+        assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+
+        write.call(&mut store, ()).unwrap();
+        assert_eq!(read.call(&mut store, ()).unwrap(), 7);
     }
 
     #[test]
