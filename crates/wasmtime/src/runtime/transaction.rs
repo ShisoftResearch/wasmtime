@@ -193,18 +193,6 @@ pub(crate) enum GranuleId {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct MemoryGranuleKey {
-    object: MemoryObjectKey,
-    granule_index: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct MemoryObjectKey {
-    owner_instance: Option<u32>,
-    memory_index: u32,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingMemoryStore {
     instance: InstanceId,
@@ -236,17 +224,122 @@ pub(crate) trait TransactionConcurrencyControl {
 
 #[derive(Debug, Default)]
 pub(crate) struct LockBased {
-    // SHISOFT-TWASM-MOCK: lock ownership is store-local and memory-index based.
-    // The milestone mock runtime has one active transaction per store, so the
-    // lock table keys only by store-local memory index. Owner-instance scoped
-    // conflict keys belong with the future transaction object table.
-    memory_granules: BTreeMap<MemoryGranuleKey, MemoryGranuleOwnership>,
+    // SHISOFT-TWASM-MOCK: the real tmemory path still feeds store-local
+    // `instance: None`/version `0` through `TransactionConcurrencyControl`.
+    owners: BTreeMap<GranuleId, TransactionId>,
+    read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
 }
 
-#[derive(Debug, Default)]
-struct MemoryGranuleOwnership {
-    readers: BTreeSet<TransactionId>,
-    writer: Option<TransactionId>,
+impl LockBased {
+    pub(crate) fn record_read(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        version: u64,
+    ) -> Result<()> {
+        if self.owners.get(&granule).is_some_and(|owner| *owner != transaction) {
+            bail!("transaction read conflict: granule is owned by another transaction");
+        }
+
+        match self.read_versions.entry((transaction, granule)) {
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(version);
+            }
+            alloc::collections::btree_map::Entry::Occupied(entry) => {
+                ensure!(
+                    *entry.get() == version,
+                    "transaction read conflict: optimistic read version changed"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn acquire_write(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        if self.owners.get(&granule).is_some_and(|owner| *owner != transaction) {
+            bail!("transaction write conflict: granule is owned by another transaction");
+        }
+        if self
+            .read_versions
+            .get(&(transaction, granule))
+            .is_some_and(|version| *version != current_version)
+        {
+            bail!("transaction write conflict: optimistic read version changed");
+        }
+
+        self.owners.insert(granule, transaction);
+        Ok(())
+    }
+
+    pub(crate) fn validate_read(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        if self.owners.get(&granule).is_some_and(|owner| *owner != transaction) {
+            bail!("transaction read conflict: granule is owned by another transaction");
+        }
+        if self
+            .read_versions
+            .get(&(transaction, granule))
+            .is_some_and(|version| *version != current_version)
+        {
+            bail!("transaction read conflict: optimistic read version changed");
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn release_transaction(&mut self, transaction: TransactionId) {
+        self.owners.retain(|_, owner| *owner != transaction);
+        self.read_versions
+            .retain(|(reader, _), _| *reader != transaction);
+    }
+}
+
+#[cfg(test)]
+impl LockBased {
+    fn record_read_for_test(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        version: u64,
+    ) -> Result<()> {
+        self.record_read(transaction, granule, version)
+    }
+
+    fn acquire_write_for_test(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        self.acquire_write(transaction, granule, current_version)
+    }
+
+    fn validate_read_for_test(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        self.validate_read(transaction, granule, current_version)
+    }
+
+    fn abort_for_test(&mut self, transaction: TransactionId) {
+        self.release_transaction(transaction);
+    }
+
+    fn owner_for_test(&self, granule: GranuleId) -> Option<TransactionId> {
+        self.owners.get(&granule).copied()
+    }
 }
 
 impl TransactionConcurrencyControl for LockBased {
@@ -256,13 +349,15 @@ impl TransactionConcurrencyControl for LockBased {
         memory_index: u32,
         granule_index: u64,
     ) -> Result<()> {
-        let key = lock_memory_granule_key(memory_index, granule_index);
-        let ownership = self.memory_granules.entry(key).or_default();
-        if ownership.writer.is_some_and(|writer| writer != transaction) {
-            bail!("tmemory granule conflict: write owner blocks read");
-        }
-        ownership.readers.insert(transaction);
-        Ok(())
+        self.record_read(
+            transaction,
+            GranuleId::TMemory {
+                instance: None,
+                memory_index,
+                granule_index,
+            },
+            0,
+        )
     }
 
     fn acquire_memory_granule_write(
@@ -271,31 +366,19 @@ impl TransactionConcurrencyControl for LockBased {
         memory_index: u32,
         granule_index: u64,
     ) -> Result<()> {
-        let key = lock_memory_granule_key(memory_index, granule_index);
-        let ownership = self.memory_granules.entry(key).or_default();
-        if ownership.writer.is_some_and(|writer| writer != transaction) {
-            bail!("tmemory granule conflict: write owner blocks write");
-        }
-        if ownership
-            .readers
-            .iter()
-            .any(|reader| *reader != transaction)
-        {
-            bail!("tmemory granule conflict: read owner blocks write");
-        }
-        ownership.readers.insert(transaction);
-        ownership.writer = Some(transaction);
-        Ok(())
+        self.acquire_write(
+            transaction,
+            GranuleId::TMemory {
+                instance: None,
+                memory_index,
+                granule_index,
+            },
+            0,
+        )
     }
 
     fn release_transaction(&mut self, transaction: TransactionId) {
-        self.memory_granules.retain(|_, ownership| {
-            ownership.readers.remove(&transaction);
-            if ownership.writer == Some(transaction) {
-                ownership.writer = None;
-            }
-            !ownership.readers.is_empty() || ownership.writer.is_some()
-        });
+        LockBased::release_transaction(self, transaction);
     }
 }
 
@@ -953,13 +1036,6 @@ fn checked_tmemory_range(
     Ok(start..end)
 }
 
-fn lock_memory_object_key(memory_index: u32) -> MemoryObjectKey {
-    MemoryObjectKey {
-        owner_instance: None,
-        memory_index,
-    }
-}
-
 fn granule_instance(owner_instance: Option<InstanceId>) -> Option<u32> {
     owner_instance.map(InstanceId::as_u32)
 }
@@ -1013,13 +1089,6 @@ fn memory_granule_key(
     granule_index: usize,
 ) -> Result<GranuleId> {
     memory_granule_id_for_instance(granule_instance(owner_instance), memory_index, granule_index)
-}
-
-fn lock_memory_granule_key(memory_index: u32, granule_index: u64) -> MemoryGranuleKey {
-    MemoryGranuleKey {
-        object: lock_memory_object_key(memory_index),
-        granule_index,
-    }
 }
 
 fn tmemory_granule_backing_range(
@@ -2279,35 +2348,39 @@ mod tests {
     }
 
     #[test]
-    fn lock_based_allows_shared_reads_and_rejects_conflicting_write() {
+    fn lock_based_allows_shared_reads_and_writer_upgrade() {
         let mut locks = LockBased::default();
-        let first = TransactionId(1);
-        let second = TransactionId(2);
+        let first = TransactionId::from_raw(1);
+        let second = TransactionId::from_raw(2);
+        let granule = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 7,
+        };
 
-        locks.acquire_memory_granule_read(first, 0, 7).unwrap();
-        locks.acquire_memory_granule_read(second, 0, 7).unwrap();
-
-        let error = locks
-            .acquire_memory_granule_write(second, 0, 7)
-            .unwrap_err();
-        assert!(error.to_string().contains("tmemory granule conflict"));
+        locks.record_read_for_test(first, granule, 5).unwrap();
+        locks.record_read_for_test(second, granule, 5).unwrap();
+        locks.acquire_write_for_test(second, granule, 5).unwrap();
     }
 
     #[test]
     fn lock_based_writer_excludes_other_transactions() {
         let mut locks = LockBased::default();
-        let first = TransactionId(1);
-        let second = TransactionId(2);
+        let first = TransactionId::from_raw(1);
+        let second = TransactionId::from_raw(2);
+        let granule = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 7,
+        };
 
-        locks.acquire_memory_granule_write(first, 0, 7).unwrap();
+        locks.acquire_write_for_test(first, granule, 3).unwrap();
 
-        let read_error = locks.acquire_memory_granule_read(second, 0, 7).unwrap_err();
-        assert!(read_error.to_string().contains("tmemory granule conflict"));
+        let read_error = locks.record_read_for_test(second, granule, 3).unwrap_err();
+        assert!(read_error.to_string().contains("transaction read conflict"));
 
-        let write_error = locks
-            .acquire_memory_granule_write(second, 0, 7)
-            .unwrap_err();
-        assert!(write_error.to_string().contains("tmemory granule conflict"));
+        let write_error = locks.acquire_write_for_test(second, granule, 3).unwrap_err();
+        assert!(write_error.to_string().contains("transaction write conflict"));
     }
 
     #[test]
@@ -2335,6 +2408,74 @@ mod tests {
         locks.release_transaction(first);
 
         locks.acquire_memory_granule_write(second, 0, 7).unwrap();
+    }
+
+    #[test]
+    fn lock_based_write_conflict_aborts_current_transaction() {
+        let mut locks = LockBased::default();
+        let first = TransactionId::from_raw(1);
+        let second = TransactionId::from_raw(2);
+        let conflicted = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 0,
+        };
+        let independent = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 1,
+        };
+
+        locks.acquire_write_for_test(first, conflicted, 9).unwrap();
+        locks.acquire_write_for_test(second, independent, 3).unwrap();
+
+        let error = locks
+            .acquire_write_for_test(second, conflicted, 9)
+            .unwrap_err();
+        assert!(error.to_string().contains("transaction write conflict"));
+        assert_eq!(locks.owner_for_test(independent), Some(second));
+
+        locks.abort_for_test(second);
+
+        assert_eq!(locks.owner_for_test(conflicted), Some(first));
+        assert_eq!(locks.owner_for_test(independent), None);
+    }
+
+    #[test]
+    fn lock_based_validates_optimistic_reads_at_commit() {
+        let mut locks = LockBased::default();
+        let reader = TransactionId::from_raw(1);
+        let writer = TransactionId::from_raw(2);
+        let granule = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 0,
+        };
+
+        locks.record_read_for_test(reader, granule, 7).unwrap();
+        locks.acquire_write_for_test(writer, granule, 7).unwrap();
+        locks.abort_for_test(writer);
+
+        let error = locks.validate_read_for_test(reader, granule, 8).unwrap_err();
+        assert!(error.to_string().contains("transaction read conflict"));
+    }
+
+    #[test]
+    fn lock_based_abort_releases_owned_granules() {
+        let mut locks = LockBased::default();
+        let transaction = TransactionId::from_raw(1);
+        let granule = GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index: 0,
+        };
+
+        locks.acquire_write_for_test(transaction, granule, 4).unwrap();
+        assert_eq!(locks.owner_for_test(granule), Some(transaction));
+
+        locks.abort_for_test(transaction);
+
+        assert_eq!(locks.owner_for_test(granule), None);
     }
 
     #[test]

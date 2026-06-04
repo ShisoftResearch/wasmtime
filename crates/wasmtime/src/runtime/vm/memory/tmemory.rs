@@ -102,7 +102,29 @@ impl TMemory {
     }
 
     pub(crate) fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
-        self.storage.commit_range(addr, bytes)
+        self.storage.commit_range(addr, bytes)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let end = addr
+            .checked_add(bytes.len())
+            .context("tmemory write address overflow")?;
+        let last_byte = end - 1;
+        let first_granule = addr / TMEMORY_GRANULE_SIZE;
+        let last_granule = last_byte / TMEMORY_GRANULE_SIZE;
+
+        for granule in first_granule..=last_granule {
+            let mut info = self.storage.granule_info(granule)?;
+            info.owner = 0;
+            info.version = info
+                .version
+                .checked_add(1)
+                .context("tmemory granule version overflow")?;
+            self.storage.set_granule_info(granule, info)?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
@@ -466,6 +488,71 @@ mod tests {
         assert_eq!(
             memory.read_committed(6..14).unwrap(),
             vec![0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn commit_range_increments_touched_granule_versions_and_clears_owner() {
+        let mut memory = TMemory::new_vmemory(1).unwrap();
+
+        memory
+            .set_granule_info(
+                0,
+                TMemoryGranuleInfo {
+                    owner: 11,
+                    version: 2,
+                    hash: 33,
+                },
+            )
+            .unwrap();
+        memory
+            .set_granule_info(
+                1,
+                TMemoryGranuleInfo {
+                    owner: 22,
+                    version: 7,
+                    hash: 44,
+                },
+            )
+            .unwrap();
+        memory
+            .set_granule_info(
+                2,
+                TMemoryGranuleInfo {
+                    owner: 99,
+                    version: 1,
+                    hash: 55,
+                },
+            )
+            .unwrap();
+
+        memory
+            .commit_range(TMEMORY_GRANULE_SIZE - 1, &[0xaa, 0xbb])
+            .unwrap();
+
+        assert_eq!(
+            memory.granule_info(0).unwrap(),
+            TMemoryGranuleInfo {
+                owner: 0,
+                version: 3,
+                hash: 33,
+            }
+        );
+        assert_eq!(
+            memory.granule_info(1).unwrap(),
+            TMemoryGranuleInfo {
+                owner: 0,
+                version: 8,
+                hash: 44,
+            }
+        );
+        assert_eq!(
+            memory.granule_info(2).unwrap(),
+            TMemoryGranuleInfo {
+                owner: 99,
+                version: 1,
+                hash: 55,
+            }
         );
     }
 
