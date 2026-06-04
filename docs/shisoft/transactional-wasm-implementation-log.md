@@ -478,8 +478,10 @@ transaction functions:
 
 Runtime tmemory fixes in this tranche:
 
-- Unbounded `VMemory` reserves the Wasm32 default maximum of 65536 pages, so
-  `(tmemory 0)` can grow according to the proposal WAST expectations.
+- Unbounded `VMemory` enforces the Wasm32 default maximum of 65536 pages but
+  reserves only the currently live byte length. It remaps on grow, preserving
+  committed bytes and granule metadata while keeping `(tmemory 0)` cheap to
+  instantiate.
 - Static active `tdata` initializers are copied into the per-instance `TMemory`
   sidecar before ordinary VMContext initialization can null out runtime data
   pointers for COW memory initialization.
@@ -500,6 +502,9 @@ Verification:
 ```text
 CARGO_INCREMENTAL=0 cargo test -p wasmtime --lib mock_transaction_static_tdata_initializes_tmemory_sidecar
 test result: ok. 1 passed; 0 failed
+
+CARGO_INCREMENTAL=0 cargo test -p wasmtime --lib vmemory_unbounded
+test result: ok. 2 passed; 0 failed
 
 WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
 test result: ok. 69 passed; 0 failed; 47 ignored; 0 measured; 3495 filtered out

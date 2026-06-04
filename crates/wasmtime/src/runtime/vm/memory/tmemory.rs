@@ -200,13 +200,19 @@ pub(crate) struct VMemory {
     byte_len: usize,
     byte_capacity: usize,
     granule_capacity: usize,
+    max_pages: u64,
 }
 
 impl VMemory {
     pub(crate) fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
+        let requested_max_pages = max_pages;
+        let max_pages = max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES);
+        ensure!(min_pages <= max_pages, "tmemory minimum exceeds maximum");
         let byte_len = pages_to_bytes(min_pages)?;
-        let byte_capacity = pages_to_bytes(max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES))?;
-        ensure!(byte_len <= byte_capacity, "tmemory minimum exceeds maximum");
+        let byte_capacity = match requested_max_pages {
+            Some(max_pages) => pages_to_bytes(max_pages)?,
+            None => byte_len,
+        };
 
         let granule_capacity = granules_for_bytes(byte_capacity);
         let granule_len = granules_for_bytes(byte_len);
@@ -232,6 +238,7 @@ impl VMemory {
             byte_len,
             byte_capacity,
             granule_capacity,
+            max_pages,
         })
     }
 
@@ -253,16 +260,19 @@ impl VMemory {
     }
 
     pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
-        let new_byte_len = pages_to_bytes(new_pages)?;
         ensure!(
-            new_byte_len <= self.byte_capacity,
-            "tmemory growth exceeds reserved capacity"
+            new_pages <= self.max_pages,
+            "tmemory growth exceeds maximum size"
         );
+        let new_byte_len = pages_to_bytes(new_pages)?;
         if new_byte_len < self.byte_len {
             bail!("tmemory grow cannot shrink");
         }
         if new_byte_len == self.byte_len {
             return Ok(());
+        }
+        if new_byte_len > self.byte_capacity {
+            self.reserve_capacity_to_pages(new_pages)?;
         }
 
         let old_accessible = HostAlignedByteCount::new_rounded_up(self.byte_len)?;
@@ -294,6 +304,57 @@ impl VMemory {
         }
 
         self.byte_len = new_byte_len;
+        Ok(())
+    }
+
+    fn reserve_capacity_to_pages(&mut self, new_capacity_pages: u64) -> Result<()> {
+        let new_byte_capacity = pages_to_bytes(new_capacity_pages)?;
+        ensure!(
+            new_byte_capacity >= self.byte_len,
+            "tmemory capacity cannot shrink below live size"
+        );
+        if new_byte_capacity <= self.byte_capacity {
+            return Ok(());
+        }
+
+        let old_data_accessible = HostAlignedByteCount::new_rounded_up(self.byte_len)?;
+        let new_data_mapping = HostAlignedByteCount::new_rounded_up(new_byte_capacity)?;
+        let mut data = Mmap::accessible_reserved(old_data_accessible, new_data_mapping)?;
+        if self.byte_len > 0 {
+            // SAFETY: the source and destination ranges are live for
+            // `self.byte_len`, and this method has exclusive access to both.
+            unsafe {
+                let old = self.data.slice(0..self.byte_len);
+                data.slice_mut(0..self.byte_len).copy_from_slice(old);
+            }
+        }
+
+        let old_granule_bytes = self
+            .granule_len()
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata size overflow")?;
+        let new_granule_capacity = granules_for_bytes(new_byte_capacity);
+        let new_granule_mapping_bytes = new_granule_capacity
+            .checked_mul(size_of::<TMemoryGranuleInfo>())
+            .context("tmemory granule metadata size overflow")?;
+        let old_granule_accessible = HostAlignedByteCount::new_rounded_up(old_granule_bytes)?;
+        let new_granule_mapping = HostAlignedByteCount::new_rounded_up(new_granule_mapping_bytes)?;
+        let mut granules = Mmap::accessible_reserved(old_granule_accessible, new_granule_mapping)?;
+        if old_granule_bytes > 0 {
+            // SAFETY: the source and destination metadata ranges are live for
+            // `old_granule_bytes`, and this method has exclusive access.
+            unsafe {
+                let old = self.granules.slice(0..old_granule_bytes);
+                granules
+                    .slice_mut(0..old_granule_bytes)
+                    .copy_from_slice(old);
+            }
+        }
+
+        self.data = data;
+        self.granules = granules;
+        self.byte_capacity = new_byte_capacity;
+        self.granule_capacity = new_granule_capacity;
         Ok(())
     }
 
@@ -604,15 +665,37 @@ mod tests {
     }
 
     #[test]
-    fn vmemory_unbounded_constructor_reserves_default_wasm_capacity() {
+    fn vmemory_unbounded_constructor_does_not_eagerly_reserve_default_wasm_capacity() {
         let mut memory = TMemory::new_vmemory_with_limits(0, None).unwrap();
 
         assert_eq!(memory.byte_len(), 0);
-        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 65536);
+        assert_eq!(memory.byte_capacity(), 0);
 
         memory.grow_to_pages(1).unwrap();
 
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE);
+    }
+
+    #[test]
+    fn vmemory_unbounded_grow_remaps_and_preserves_committed_state() {
+        let mut memory = TMemory::new_vmemory_with_limits(1, None).unwrap();
+        let info = TMemoryGranuleInfo {
+            owner: 11,
+            version: 7,
+            hash: 33,
+        };
+
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE);
+
+        memory.commit_range(0, &[1, 2, 3, 4]).unwrap();
+        memory.set_granule_info(0, info).unwrap();
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
+        assert_eq!(memory.read_committed(0..4).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(memory.granule_info(0).unwrap(), info);
     }
 
     #[test]
