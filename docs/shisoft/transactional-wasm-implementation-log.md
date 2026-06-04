@@ -577,6 +577,12 @@ Harness additions:
 - `spectest` now defines `tprint`, `tprint_i32`, `tprint_i64`,
   `tprint_f32`, `tprint_f64`, `tprint_i32_f32`, and `tprint_f64_f64`
   aliases so real-parser fixtures can keep transactional import names.
+- Real-parser tranche tests share the same fixture lists as the harness routing
+  predicates and assert that no path-scoped adapter mock can preempt the real
+  parser path.
+- Transaction diagnostic normalization now uses a shared replacement table plus
+  syntax-normalization-only deltas to reduce drift between normalized and
+  real-parser fixture handling.
 - Parser-blocked fixtures remain normalized or mocked: transactional refs,
   `tcall_ref`/`return_tcall_ref`, `ttry`/`tfail`, bulk tmemory
   `copy/fill/init`, transactional table/element forms, and object-table/GC

@@ -1186,56 +1186,49 @@ fn normalize_load_store_token(token: &str) -> &str {
 }
 
 fn normalize_transaction_diagnostic(text: &str) -> String {
-    let replacements = [
-        ("undefined telement", "undefined element"),
-        ("uninitialized telement", "uninitialized element"),
-        (
-            "indirect tcall type mismatch",
-            "indirect call type mismatch",
-        ),
-        (
-            "out of bounds tmemory access",
-            "out of bounds memory access",
-        ),
-        (
-            "memory size must be at most 65536 pages (4GiB)",
-            "memory size must be at most 0x10000 65536-byte pages",
-        ),
-        ("multiple tmemories", "multiple memories"),
-        ("unknown tmemory", "unknown memory"),
-        ("inline tfunction type", "inline function type"),
-        ("null tfunction", "null function"),
-        ("unknown tglobal", "unknown global"),
-        ("invalid lane index", "SIMD index out of bounds"),
-    ];
-
-    replacements
-        .into_iter()
-        .fold(text.to_string(), |text, (from, to)| text.replace(from, to))
+    apply_transaction_diagnostic_replacements(
+        apply_transaction_diagnostic_replacements(text, TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS),
+        TRANSACTION_SYNTAX_DIAGNOSTIC_REPLACEMENTS,
+    )
 }
 
 fn normalize_transaction_real_parser_diagnostic(text: &str) -> String {
-    let replacements = [
-        ("undefined telement", "undefined element"),
-        ("uninitialized telement", "uninitialized element"),
-        (
-            "indirect tcall type mismatch",
-            "indirect call type mismatch",
-        ),
-        (
-            "memory size must be at most 65536 pages (4GiB)",
-            "memory size must be at most 0x10000 65536-byte pages",
-        ),
-        ("multiple tmemories", "multiple memories"),
-        ("unknown tmemory", "unknown memory"),
-        ("inline tfunction type", "inline function type"),
-        ("null tfunction", "null function"),
-        ("unknown tglobal", "unknown global"),
-    ];
+    apply_transaction_diagnostic_replacements(text, TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS)
+}
 
+const TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
+    ("undefined telement", "undefined element"),
+    ("uninitialized telement", "uninitialized element"),
+    (
+        "indirect tcall type mismatch",
+        "indirect call type mismatch",
+    ),
+    (
+        "memory size must be at most 65536 pages (4GiB)",
+        "memory size must be at most 0x10000 65536-byte pages",
+    ),
+    ("multiple tmemories", "multiple memories"),
+    ("unknown tmemory", "unknown memory"),
+    ("inline tfunction type", "inline function type"),
+    ("null tfunction", "null function"),
+    ("unknown tglobal", "unknown global"),
+];
+
+const TRANSACTION_SYNTAX_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "out of bounds tmemory access",
+        "out of bounds memory access",
+    ),
+    ("invalid lane index", "SIMD index out of bounds"),
+];
+
+fn apply_transaction_diagnostic_replacements(
+    text: impl Into<String>,
+    replacements: &[(&str, &str)],
+) -> String {
     replacements
-        .into_iter()
-        .fold(text.to_string(), |text, (from, to)| text.replace(from, to))
+        .iter()
+        .fold(text.into(), |text, (from, to)| text.replace(from, to))
 }
 
 fn string_end(wast: &str, start: usize) -> usize {
@@ -1848,79 +1841,91 @@ impl WastTest {
     }
 }
 
+const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
+    "return_tcall.wast",
+    "return_tcall_indirect.wast",
+    "tblock.wast",
+    "tbr.wast",
+    "tbr_if.wast",
+    "tcall.wast",
+    "tconflict-tmemory.wast",
+    "tconst.wast",
+    "tconversions.wast",
+    "tf32.wast",
+    "tf32_bitwise.wast",
+    "tf32_cmp.wast",
+    "tf64.wast",
+    "tf64_bitwise.wast",
+    "tf64_cmp.wast",
+    "tfac.wast",
+    "tfloat_exprs.wast",
+    "tfloat_misc.wast",
+    "tforward.wast",
+    "ti32.wast",
+    "ti64.wast",
+    "tif.wast",
+    "tinline-module.wast",
+    "tint_exprs.wast",
+    "tint_literals.wast",
+    "tlabels.wast",
+    "tleft-to-right.wast",
+    "tlocal_get.wast",
+    "tlocal_set.wast",
+    "tlocal_tee.wast",
+    "tloop.wast",
+    "tnames.wast",
+    "tnop.wast",
+    "treturn.wast",
+    "tstack.wast",
+    "tstart.wast",
+    "tswitch.wast",
+    "ttraps.wast",
+    "ttype.wast",
+    "tunreachable.wast",
+    "tunwind.wast",
+    "tutf8-invalid-encoding.wast",
+    "utf8-timport-field.wast",
+    "utf8-timport-module.wast",
+];
+
+const SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY: &[&str] = &[
+    "float_tmemory.wast",
+    "taddress.wast",
+    "talign.wast",
+    "tendianness.wast",
+    "tmemory.wast",
+    "tmemory_redundancy.wast",
+    "tmemory_size.wast",
+    "tmemory_grow.wast",
+    "tload.wast",
+    "tstore.wast",
+    "tmemory_trap.wast",
+    "tskip-stack-guard-page.wast",
+];
+
+fn simple_transaction_real_text_parser_enabled(name: &str) -> bool {
+    SIMPLE_TRANSACTION_REAL_TEXT_CORE.contains(&name)
+        || SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY.contains(&name)
+}
+
 fn simple_transaction_proposal_enabled(name: &str) -> bool {
-    matches!(
-        name,
-        "float_tmemory.wast"
-            | "br_on_tnon_null.wast"
-            | "br_on_tnull.wast"
-            | "taddress.wast"
-            | "talign.wast"
-            | "tblock.wast"
-            | "tbr.wast"
-            | "tbr_if.wast"
-            | "tcall.wast"
-            | "tcall_indirect.wast"
-            | "tcall_ref.wast"
-            | "return_tcall.wast"
-            | "return_tcall_indirect.wast"
-            | "return_tcall_ref.wast"
-            | "tconst.wast"
-            | "ti32.wast"
-            | "ti64.wast"
-            | "tf32.wast"
-            | "tf32_bitwise.wast"
-            | "tf32_cmp.wast"
-            | "tf64.wast"
-            | "tf64_bitwise.wast"
-            | "tf64_cmp.wast"
-            | "tconversions.wast"
-            | "tendianness.wast"
-            | "texports.wast"
-            | "tif.wast"
-            | "timports.wast"
-            | "tinline-module.wast"
-            | "tloop.wast"
-            | "tload.wast"
-            | "tlocal_get.wast"
-            | "tlocal_set.wast"
-            | "tlocal_tee.wast"
-            | "tmemory.wast"
-            | "tmemory_grow.wast"
-            | "tmemory_copy.wast"
-            | "tmemory_fill.wast"
-            | "tmemory_init.wast"
-            | "tmemory_redundancy.wast"
-            | "tmemory_size.wast"
-            | "tmemory_trap.wast"
-            | "treturn.wast"
-            | "tnop.wast"
-            | "tskip-stack-guard-page.wast"
-            | "tstack.wast"
-            | "tstart.wast"
-            | "tstore.wast"
-            | "ttraps.wast"
-            | "ttry-basic.wast"
-            | "tref_as_non_null.wast"
-            | "tswitch.wast"
-            | "tunreachable.wast"
-            | "tunwind.wast"
-            | "tlabels.wast"
-            | "tleft-to-right.wast"
-            | "tfac.wast"
-            | "tint_exprs.wast"
-            | "tint_literals.wast"
-            | "tfloat_exprs.wast"
-            | "tfloat_misc.wast"
-            | "ttype.wast"
-            | "tforward.wast"
-            | "tnames.wast"
-            | "tutf8-invalid-encoding.wast"
-            | "utf8-timport-field.wast"
-            | "utf8-timport-module.wast"
-            | "tfunc_ptrs.wast"
-            | "tconflict-tmemory.wast"
-    )
+    simple_transaction_real_text_parser_enabled(name)
+        || matches!(
+            name,
+            "br_on_tnon_null.wast"
+                | "br_on_tnull.wast"
+                | "tcall_indirect.wast"
+                | "tcall_ref.wast"
+                | "return_tcall_ref.wast"
+                | "texports.wast"
+                | "timports.wast"
+                | "tmemory_copy.wast"
+                | "tmemory_fill.wast"
+                | "tmemory_init.wast"
+                | "ttry-basic.wast"
+                | "tref_as_non_null.wast"
+                | "tfunc_ptrs.wast"
+        )
 }
 
 fn transaction_proposal_uses_real_text_parser(
@@ -1933,65 +1938,7 @@ fn transaction_proposal_uses_real_text_parser(
 
     match suite {
         TransactionProposalSuite::SimpleTransactions => {
-            matches!(
-                name,
-                "return_tcall.wast"
-                    | "return_tcall_indirect.wast"
-                    | "tblock.wast"
-                    | "tbr.wast"
-                    | "tbr_if.wast"
-                    | "tcall.wast"
-                    | "tconflict-tmemory.wast"
-                    | "tconst.wast"
-                    | "tconversions.wast"
-                    | "tf32.wast"
-                    | "tf32_bitwise.wast"
-                    | "tf32_cmp.wast"
-                    | "tf64.wast"
-                    | "tf64_bitwise.wast"
-                    | "tf64_cmp.wast"
-                    | "tfac.wast"
-                    | "tfloat_exprs.wast"
-                    | "tfloat_misc.wast"
-                    | "tforward.wast"
-                    | "ti32.wast"
-                    | "ti64.wast"
-                    | "tif.wast"
-                    | "tinline-module.wast"
-                    | "tint_exprs.wast"
-                    | "tint_literals.wast"
-                    | "tlabels.wast"
-                    | "tleft-to-right.wast"
-                    | "tlocal_get.wast"
-                    | "tlocal_set.wast"
-                    | "tlocal_tee.wast"
-                    | "tloop.wast"
-                    | "tnames.wast"
-                    | "tnop.wast"
-                    | "treturn.wast"
-                    | "tstack.wast"
-                    | "tstart.wast"
-                    | "tswitch.wast"
-                    | "ttraps.wast"
-                    | "ttype.wast"
-                    | "tunreachable.wast"
-                    | "tunwind.wast"
-                    | "tutf8-invalid-encoding.wast"
-                    | "utf8-timport-field.wast"
-                    | "utf8-timport-module.wast"
-                    | "float_tmemory.wast"
-                    | "taddress.wast"
-                    | "talign.wast"
-                    | "tendianness.wast"
-                    | "tmemory.wast"
-                    | "tmemory_redundancy.wast"
-                    | "tmemory_size.wast"
-                    | "tmemory_grow.wast"
-                    | "tload.wast"
-                    | "tstore.wast"
-                    | "tmemory_trap.wast"
-                    | "tskip-stack-guard-page.wast"
-            )
+            simple_transaction_real_text_parser_enabled(name)
         }
         TransactionProposalSuite::Tsimd => false,
     }
@@ -2623,54 +2570,10 @@ mod tests {
 
     #[test]
     fn enables_real_text_parser_core_transaction_proposal_tranche() {
-        for name in [
-            "return_tcall.wast",
-            "return_tcall_indirect.wast",
-            "tblock.wast",
-            "tbr.wast",
-            "tbr_if.wast",
-            "tcall.wast",
-            "tconflict-tmemory.wast",
-            "tconst.wast",
-            "tconversions.wast",
-            "tf32.wast",
-            "tf32_bitwise.wast",
-            "tf32_cmp.wast",
-            "tf64.wast",
-            "tf64_bitwise.wast",
-            "tf64_cmp.wast",
-            "tfac.wast",
-            "tfloat_exprs.wast",
-            "tfloat_misc.wast",
-            "tforward.wast",
-            "ti32.wast",
-            "ti64.wast",
-            "tif.wast",
-            "tinline-module.wast",
-            "tint_exprs.wast",
-            "tint_literals.wast",
-            "tlabels.wast",
-            "tleft-to-right.wast",
-            "tlocal_get.wast",
-            "tlocal_set.wast",
-            "tlocal_tee.wast",
-            "tloop.wast",
-            "tnames.wast",
-            "tnop.wast",
-            "treturn.wast",
-            "tstack.wast",
-            "tstart.wast",
-            "tswitch.wast",
-            "ttraps.wast",
-            "ttype.wast",
-            "tunreachable.wast",
-            "tunwind.wast",
-            "tutf8-invalid-encoding.wast",
-            "utf8-timport-field.wast",
-            "utf8-timport-module.wast",
-        ] {
+        for &name in super::SIMPLE_TRANSACTION_REAL_TEXT_CORE {
+            let path = PathBuf::from("simple-transactions").join(name);
             let test = WastTest {
-                path: PathBuf::from(name),
+                path,
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
@@ -2683,27 +2586,19 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
+            assert!(
+                super::transaction_proposal_adapter_mock(&test.path).is_none(),
+                "{name}"
+            );
         }
     }
 
     #[test]
     fn enables_real_text_parser_transaction_proposal_tranche() {
-        for name in [
-            "float_tmemory.wast",
-            "taddress.wast",
-            "talign.wast",
-            "tendianness.wast",
-            "tmemory.wast",
-            "tmemory_redundancy.wast",
-            "tmemory_size.wast",
-            "tmemory_grow.wast",
-            "tload.wast",
-            "tstore.wast",
-            "tmemory_trap.wast",
-            "tskip-stack-guard-page.wast",
-        ] {
+        for &name in super::SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY {
+            let path = PathBuf::from("simple-transactions").join(name);
             let test = WastTest {
-                path: PathBuf::from(name),
+                path,
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
@@ -2716,6 +2611,10 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
+            assert!(
+                super::transaction_proposal_adapter_mock(&test.path).is_none(),
+                "{name}"
+            );
         }
     }
 
