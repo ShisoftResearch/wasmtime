@@ -90,6 +90,213 @@ Do not merge Immix `LineMark` with transactional granule ownership metadata.
 The first uses one byte per 256-byte line for allocation/GC state; the second
 uses ownership/version/hash-style metadata for transaction conflict control.
 
+## Active Storage Wave: Wizard Block Region Migration
+
+This section supersedes the older flat-`TMemoryBackendStorage` task for the
+next implementation wave. Keep existing `TMemory` public methods and WAST
+behavior stable while moving the implementation under those methods to
+Wizard-style block/chunk storage.
+
+### Storage Wave Task 1: Wizard Layout Types
+
+**Files:**
+- Create: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`
+
+- [ ] **Step 1: Add failing layout tests**
+
+Add unit tests that assert the Wizard layout constants:
+
+```rust
+#[test]
+fn wizard_layout_constants_match_reference() {
+    assert_eq!(BLOCK_SIZE, 512 * 1024);
+    assert_eq!(IMMIX_LINE_SIZE, 256);
+    assert_eq!(PW_REGION_HEADER_SIZE, 56);
+    assert_eq!(META_DATA_DESC_SIZE, 32);
+    assert_eq!(BLOCK_ENTRY_SIZE, 40);
+    assert_eq!(CHUNK_HEADER_SIZE, 32);
+    assert_eq!(LINE_MARK_SIZE, 1);
+}
+```
+
+- [ ] **Step 2: Run the failing test**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib wizard_layout_constants_match_reference
+```
+
+Expected: FAIL because the constants/types do not exist.
+
+- [ ] **Step 3: Implement layout constants and Rust structs**
+
+Define Rust equivalents for Wizard's `PWRegionHeader`, `MetaDataDesc`,
+`BlockEntry`, `ChunkHeader`, `ListKind`, `BlockLists`, and `LineMark`.
+
+Keep this first step structural only. Do not wire allocation or `TMemory`
+through it yet.
+
+- [ ] **Step 4: Verify and commit**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib wizard_layout_constants_match_reference
+git diff --check
+```
+
+Commit:
+
+```bash
+git add crates/wasmtime/src/runtime/vm/memory/tmemory.rs crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs
+git commit -m "Add transactional block region layout types"
+```
+
+### Storage Wave Task 2: Volatile Block Region Backend
+
+**Files:**
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
+
+- [ ] **Step 1: Add failing backend allocation tests**
+
+Add tests that create a `VMemoryBlockRegion`, assert 512 KiB block sizing,
+allocate one-block and multi-block chunks, and observe initialized line marks.
+
+- [ ] **Step 2: Run the failing tests**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib vmemory_block_region
+```
+
+Expected: FAIL because the backend does not exist.
+
+- [ ] **Step 3: Implement `BlockRegionBackend` and `VMemoryBlockRegion`**
+
+Implement the first volatile backend with anonymous memory and Wizard-style
+metadata layout. Include no-op `flush` and `fence` hooks so the API can later
+support `FileBackedMemory` and `NVMemory`.
+
+- [ ] **Step 4: Verify and commit**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib vmemory_block_region
+git diff --check
+```
+
+Commit:
+
+```bash
+git add crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs
+git commit -m "Add volatile transactional block region"
+```
+
+### Storage Wave Task 3: Chunk List And Mapped Linear Region
+
+**Files:**
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
+- Create: `crates/wasmtime/src/runtime/vm/memory/tmemory/linear_region.rs`
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`
+
+- [ ] **Step 1: Add failing mapping tests**
+
+Add tests that build a chunk list with non-contiguous backend chunks and read it
+back through contiguous logical offsets.
+
+- [ ] **Step 2: Run the failing tests**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib mapped_linear_region
+```
+
+Expected: FAIL because `MappedLinearRegion` does not exist.
+
+- [ ] **Step 3: Implement `ChunkList` and `MappedLinearRegion`**
+
+Implement logical-offset mapping over ordered chunks. For the volatile backend,
+copy/read/write through backend chunk storage; do not require OS-level fixed
+address remapping in this step.
+
+- [ ] **Step 4: Verify and commit**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib mapped_linear_region
+git diff --check
+```
+
+Commit:
+
+```bash
+git add crates/wasmtime/src/runtime/vm/memory/tmemory.rs crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs crates/wasmtime/src/runtime/vm/memory/tmemory/linear_region.rs
+git commit -m "Add mapped transactional linear region"
+```
+
+### Storage Wave Task 4: Migrate `TMemory` To `TMemoryRegion`
+
+**Files:**
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/linear_region.rs`
+
+- [ ] **Step 1: Add regression tests around the public `TMemory` API**
+
+Cover:
+
+- `(tmemory 0)` stays cheap.
+- grow by one page initializes 256 new transaction granules.
+- commit/read across a chunk boundary preserves bytes.
+- line marks remain separate from transaction granule metadata.
+
+- [ ] **Step 2: Run regression tests before migration**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib tmemory
+```
+
+Expected: existing flat `VMemory` tests pass, while new chunk-boundary tests may
+fail until the migration exists.
+
+- [ ] **Step 3: Move `TMemory` internals to `TMemoryRegion`**
+
+Keep all existing callers working:
+
+- `TMemory::new_vmemory`
+- `TMemory::new_with_backend`
+- `read_committed`
+- `commit_range`
+- `grow_to_pages`
+- `granule_info`
+- `set_granule_info`
+
+- [ ] **Step 4: Verify full storage and transaction behavior**
+
+Run:
+
+```bash
+cargo test -p wasmtime --lib tmemory
+cargo test -p wasmtime --lib transaction
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tmemory.wast -- --format terse
+git diff --check
+```
+
+Commit:
+
+```bash
+git add crates/wasmtime/src/runtime/vm/memory/tmemory.rs crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs crates/wasmtime/src/runtime/vm/memory/tmemory/linear_region.rs
+git commit -m "Move tmemory onto transactional block regions"
+```
+
 ## File Map
 
 - `crates/environ/src/transaction.rs`
