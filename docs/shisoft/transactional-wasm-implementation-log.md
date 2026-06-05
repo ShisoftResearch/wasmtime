@@ -458,6 +458,223 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## V128 Transactional Globals and SIMD Lane Stores
+
+Date: 2026-06-05
+
+Added mock-runtime support for defined v128 transactional globals:
+
+- `tglobal.get` can now read defined v128 globals through the transactional
+  scratch buffer.
+- `tglobal.set` on v128 values uses a separate pointer-based libcall,
+  `transaction_tglobal_set_v128`, instead of extending the scalar tagged
+  `u64` payload ABI.
+- `GlobalSnapshot` can stage and commit 16-byte v128 snapshots bitwise.
+- Transactional `tglobal.set` now canonicalizes SIMD values to Cranelift's
+  default `I8x16` representation before lowering.
+
+Enabled the four SIMD lane-store WAST files as real-text-parser tests:
+
+- `tsimd_store8_lane.wast`
+- `tsimd_store16_lane.wast`
+- `tsimd_store32_lane.wast`
+- `tsimd_store64_lane.wast`
+
+Mocked/deferred:
+
+- V128 support is limited to defined globals in the current mock runtime.
+- Imported transactional globals still use the existing
+  `SHISOFT-TWASM-MOCK` unsupported path.
+- Reference/object global snapshots remain deferred to the object table work.
+
+Verification:
+
+```text
+CARGO_INCREMENTAL=0 cargo test -p wasmtime --lib mock_transaction_global_v128
+test result: ok. 2 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast -- transaction-proposal/tsimd/tsimd_store --format terse
+test result: ok. 5 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/tsimd -- --format terse
+test result: ok. 56 passed; 0 failed; 1 ignored
+
+CARGO_INCREMENTAL=0 cargo test -p wasmtime --lib transaction
+test result: ok. 78 passed; 0 failed
+```
+
+## SIMD Transactional Memory Slice
+
+Date: 2026-06-05
+
+Implemented real transactional SIMD memory parsing and lowering for the
+proposal `0xfa 0xfd` nested-prefix instruction family:
+
+- `v128.tload` and `v128.tstore`
+- `v128.tload{8,16,32,64}_splat`
+- `v128.tload{8x8,16x4,32x2}_{s,u}`
+- `v128.tload{32,64}_zero`
+- `v128.tload{8,16,32,64}_lane`
+- `v128.tstore{8,16,32,64}_lane`
+
+The local `wasm-tools-transaction` fork now decodes, validates, encodes,
+prints, reparses, and text-parses those operators using raw nested prefix bytes
+`0xfa 0xfd <simd-op>`. Cranelift lowers the memory operations through the
+existing transaction `tmemory` load/store libcalls, so they use the same
+transaction-visible COW scratch path as scalar `*.tload`/`*.tstore`.
+
+Wasmtime now runs the SIMD transactional memory WAST load-family files through
+the real text parser instead of the normalization adapter:
+
+- `tsimd_address.wast`
+- `tsimd_align.wast`
+- `tsimd_load.wast`
+- `tsimd_load_extend.wast`
+- `tsimd_load_splat.wast`
+- `tsimd_load_zero.wast`
+- `tsimd_load{8,16,32,64}_lane.wast`
+- `tsimd_store.wast`
+
+Mocked/deferred:
+
+- `tsimd_store{8,16,32,64}_lane.wast` still use the normalization adapter.
+  Those files require `tglobal v128` before they can run fully real-parser; the
+  lane-store lowering itself is covered by a direct Wasmtime runtime test.
+- SIMD arithmetic aliases remain adapter-normalized; this slice only made SIMD
+  memory operations transaction-aware.
+
+Verification:
+
+```text
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wasmparser transaction_simd_memory_operators_decode
+test result: ok. 1 passed; 0 failed
+
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wast transaction_text_simd_memory_operators_encode
+test result: ok. 1 passed; 0 failed
+
+CARGO_INCREMENTAL=0 cargo test -p wasmtime --lib mock_transaction_simd
+test result: ok. 2 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast enables_real_text_parser_transaction_simd_memory_tranche
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_INCREMENTAL=0 cargo test --test wast transaction-proposal/tsimd -- --format terse
+test result: ok. 56 passed; 0 failed; 1 ignored; 0 measured; 3554 filtered out
+```
+
+## Transactional Table Bulk Runtime Slice
+
+Date: 2026-06-05
+
+Added real parser and mock-runtime scaffolding for transactional table bulk
+operators:
+
+- `ttable.fill`
+- `ttable.copy`
+- `ttable.init`
+- `telem.drop`
+
+The local `wasm-tools-transaction` fork now decodes, validates, encodes,
+prints, and parses the transactional table bulk operator spellings using the
+Wizard-style `0xfa` prefix opcodes already used by the branch. The text parser
+also preserves transactional table metadata for proposal-style declarations such
+as `(table 1 tfuncref)` and `(table 1 texterntref)`, not only `(ttable ...)`.
+
+Wasmtime lowering now handles `TTableFill`, `TTableCopy`, and `TTableInit`.
+Before reusing Wasmtime's ordinary table bulk operation, lowering calls
+transaction runtime helpers that validate the table range and acquire
+`GranuleId::TTable` ownership for the affected Wizard-sized 16-element table
+granules. This gives the mock runtime real lock-based table ownership for table
+bulk paths while deferring table-element COW.
+
+Harness status:
+
+- `ttable_copy.wast` and `ttable_init.wast` now run as real-parser,
+  real-engine proposal WAST tests.
+- `ttable.fill` is covered by Wasmtime funcref runtime tests.
+- `ttable_fill.wast` remains disabled because the proposal file is based on
+  `texterntref`; the current runtime table element path is still funcref-only.
+
+Mocked/deferred:
+
+- `SHISOFT-TWASM-MOCK`: table bulk mutations still go through Wasmtime's
+  ordinary table backing after transactional ownership acquisition. Real
+  table-element COW must replace this.
+- Transactional table runtime support remains funcref-only. `texterntref` and
+  other transactional reference table values need the object-table/reference
+  backend workstream.
+
+Verification:
+
+```text
+cargo test -p wasmparser transaction_milestone1_data_operators_decode
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wast transaction_text_
+test result: ok. 15 passed; 0 failed
+
+cargo test -p wasmtime-environ transaction
+test result: ok. 23 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 74 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast -- transaction-proposal/simple-transactions/ttable_copy.wast --exact
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast -- transaction-proposal/simple-transactions/ttable_init.wast --exact
+test result: ok. 1 passed; 0 failed
+```
+
+## Runtime Core: Real TTable/TTableSize Funcref Paths
+
+Date: 2026-06-05
+
+Wired the first real transactional table execution path for funcref tables.
+
+Implemented:
+
+- Local `wasm-tools-transaction` parser support for binary `0xfa` operators:
+  `ttable.get`, `ttable.set`, `ttable.grow`, and `ttable.size`.
+- Local `wast` text support for `(ttable ...)` declarations/imports/exports
+  and `ttable.get/set/size/grow` instruction spellings.
+- Transaction object metadata now carries optional `ttable` indices after the
+  function vector while remaining compatible with older metadata payloads.
+- Wasmtime Cranelift lowering for `Operator::TTableGet`, `TTableSet`,
+  `TTableSize`, and `TTableGrow`.
+- Runtime libcalls for funcref `ttable.get/set/size/grow`.
+- Store-local `TTable` element granules use Wizard's 16-element granule size.
+- `TTableSize` is separate from element granules and is used by
+  `ttable.size/grow`.
+
+Remaining scaffold:
+
+- `ttable.set` mutates Wasmtime's funcref table backing directly after
+  acquiring `TTable` ownership. Table-element COW and abortable table writes
+  still require the table/object-table workspace.
+- `ttable.grow` acquires `TTableSize`, grows the ordinary table backing, and
+  initializes new entries through ordinary table fill lowering. Growth rollback
+  and element-write staging remain future work.
+- GC reference tables, continuation tables, table bulk operators
+  (`ttable.fill/copy/init`), and transactional reference/object permissions are
+  still outside this slice.
+
+Verification:
+
+```text
+cargo test -p wasmparser transaction_milestone1_data_operators_decode
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wast transaction_text_t
+test result: ok. 3 passed; 0 failed
+
+cargo test -p wasmtime-environ transaction
+test result: ok. 23 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 73 passed; 0 failed
+```
+
 ## Runtime Core Scalar TMemory/TGlobal Unlock
 
 Date: 2026-06-04

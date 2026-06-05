@@ -1197,6 +1197,7 @@ fn normalize_transaction_real_parser_diagnostic(text: &str) -> String {
 }
 
 const TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
+    ("out of bounds ttable access", "out of bounds table access"),
     ("undefined telement", "undefined element"),
     ("uninitialized telement", "uninitialized element"),
     (
@@ -1212,15 +1213,13 @@ const TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
     ("inline tfunction type", "inline function type"),
     ("null tfunction", "null function"),
     ("unknown tglobal", "unknown global"),
-];
-
-const TRANSACTION_SYNTAX_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
-    (
-        "out of bounds tmemory access",
-        "out of bounds memory access",
-    ),
     ("invalid lane index", "SIMD index out of bounds"),
 ];
+
+const TRANSACTION_SYNTAX_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[(
+    "out of bounds tmemory access",
+    "out of bounds memory access",
+)];
 
 fn apply_transaction_diagnostic_replacements(
     text: impl Into<String>,
@@ -1903,9 +1902,34 @@ const SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY: &[&str] = &[
     "tskip-stack-guard-page.wast",
 ];
 
+const SIMPLE_TRANSACTION_REAL_TEXT_TTABLE: &[&str] = &["ttable_copy.wast", "ttable_init.wast"];
+
+const TSIMD_TRANSACTION_REAL_TEXT_MEMORY: &[&str] = &[
+    "tsimd_address.wast",
+    "tsimd_align.wast",
+    "tsimd_load.wast",
+    "tsimd_load_extend.wast",
+    "tsimd_load_splat.wast",
+    "tsimd_load_zero.wast",
+    "tsimd_load8_lane.wast",
+    "tsimd_load16_lane.wast",
+    "tsimd_load32_lane.wast",
+    "tsimd_load64_lane.wast",
+    "tsimd_store.wast",
+    "tsimd_store8_lane.wast",
+    "tsimd_store16_lane.wast",
+    "tsimd_store32_lane.wast",
+    "tsimd_store64_lane.wast",
+];
+
 fn simple_transaction_real_text_parser_enabled(name: &str) -> bool {
     SIMPLE_TRANSACTION_REAL_TEXT_CORE.contains(&name)
         || SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY.contains(&name)
+        || SIMPLE_TRANSACTION_REAL_TEXT_TTABLE.contains(&name)
+}
+
+fn tsimd_transaction_real_text_parser_enabled(name: &str) -> bool {
+    TSIMD_TRANSACTION_REAL_TEXT_MEMORY.contains(&name)
 }
 
 fn simple_transaction_proposal_enabled(name: &str) -> bool {
@@ -1940,7 +1964,7 @@ fn transaction_proposal_uses_real_text_parser(
         TransactionProposalSuite::SimpleTransactions => {
             simple_transaction_real_text_parser_enabled(name)
         }
-        TransactionProposalSuite::Tsimd => false,
+        TransactionProposalSuite::Tsimd => tsimd_transaction_real_text_parser_enabled(name),
     }
 }
 
@@ -2664,6 +2688,45 @@ mod tests {
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
+        }
+    }
+
+    #[test]
+    fn enables_real_text_parser_transaction_simd_memory_tranche() {
+        for name in [
+            "tsimd_address.wast",
+            "tsimd_align.wast",
+            "tsimd_load.wast",
+            "tsimd_load_extend.wast",
+            "tsimd_load_splat.wast",
+            "tsimd_load_zero.wast",
+            "tsimd_load8_lane.wast",
+            "tsimd_load16_lane.wast",
+            "tsimd_load32_lane.wast",
+            "tsimd_load64_lane.wast",
+            "tsimd_store.wast",
+            "tsimd_store8_lane.wast",
+            "tsimd_store16_lane.wast",
+            "tsimd_store32_lane.wast",
+            "tsimd_store64_lane.wast",
+        ] {
+            let test = WastTest {
+                path: PathBuf::from("tsimd").join(name),
+                contents: String::new(),
+                config: TestConfig::default(),
+                transaction_proposal: Some(TransactionProposalSuite::Tsimd),
+                transaction_real_text_parser: true,
+            };
+
+            assert!(test.transaction_real_text_parser(), "{name}");
+            assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(
+                super::transaction_proposal_uses_real_text_parser(
+                    TransactionProposalSuite::Tsimd,
+                    &test.path,
+                ),
+                "{name}"
+            );
         }
     }
 

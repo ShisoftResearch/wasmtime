@@ -18,6 +18,8 @@ macro_rules! foreach_builtin_function {
             transaction_tglobal_get(vmctx: vmctx, global: u32) -> pointer;
             // Stages a transactional global write. `tag` identifies the value type.
             transaction_tglobal_set(vmctx: vmctx, global: u32, tag: u32, value: u64) -> bool;
+            // Stages a transactional v128 global write from a 16-byte value pointer.
+            transaction_tglobal_set_v128(vmctx: vmctx, global: u32, value: pointer) -> bool;
             // Returns a pointer to readable transactional memory bytes.
             transaction_tmemory_load(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
             // Returns a pointer to writable staged transactional memory bytes.
@@ -26,6 +28,18 @@ macro_rules! foreach_builtin_function {
             transaction_tmemory_size(vmctx: vmctx, memory: u32) -> pointer;
             // Stages a transactional memory grow and returns the previous visible size.
             transaction_tmemory_grow(vmctx: vmctx, memory: u32, delta: u64) -> pointer;
+            // Returns a transactional table element.
+            transaction_ttable_get(vmctx: vmctx, table: u32, index: u64) -> pointer;
+            // Stages a transactional table element write.
+            transaction_ttable_set(vmctx: vmctx, table: u32, index: u64, value: pointer) -> bool;
+            // Acquires a readable transactional table range.
+            transaction_ttable_read_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
+            // Acquires a writable transactional table range.
+            transaction_ttable_write_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
+            // Returns the visible transactional table size.
+            transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
+            // Grows a transactional table and returns the previous visible size.
+            transaction_ttable_grow(vmctx: vmctx, table: u32, delta: u64) -> pointer;
             // Returns an index for wasm's `memory.copy`
             memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
             // Returns an index for wasm's `memory.fill` instruction.
@@ -378,6 +392,7 @@ impl BuiltinFunctionIndex {
             (@get memory_grow pointer) => (TrapSentinel::NegativeTwo);
             (@get table_grow pointer) => (TrapSentinel::NegativeTwo);
             (@get transaction_tmemory_grow pointer) => (TrapSentinel::NegativeTwo);
+            (@get transaction_ttable_grow pointer) => (TrapSentinel::NegativeTwo);
 
             // Atomics-related functions return a negative value to indicate a trap.
             (@get memory_atomic_notify u64) => (TrapSentinel::Negative);
@@ -400,6 +415,8 @@ impl BuiltinFunctionIndex {
             (@get transaction_tmemory_load pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_store pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_size pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_ttable_get pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_ttable_size pointer) => (TrapSentinel::NegativeOne);
 
             // These libcalls can't trap
             (@get ref_func pointer) => (return None);
@@ -455,12 +472,22 @@ mod tests {
 
     #[test]
     fn transaction_data_builtins_use_expected_trap_sentinels() {
-        for builtin in [BuiltinFunctionIndex::transaction_tglobal_set()] {
+        for builtin in [
+            BuiltinFunctionIndex::transaction_tglobal_set(),
+            BuiltinFunctionIndex::transaction_tglobal_set_v128(),
+            BuiltinFunctionIndex::transaction_ttable_set(),
+            BuiltinFunctionIndex::transaction_ttable_read_range(),
+            BuiltinFunctionIndex::transaction_ttable_write_range(),
+        ] {
             assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));
         }
 
         assert!(matches!(
             BuiltinFunctionIndex::transaction_tmemory_grow().trap_sentinel(),
+            Some(TrapSentinel::NegativeTwo)
+        ));
+        assert!(matches!(
+            BuiltinFunctionIndex::transaction_ttable_grow().trap_sentinel(),
             Some(TrapSentinel::NegativeTwo)
         ));
 
@@ -474,6 +501,8 @@ mod tests {
             BuiltinFunctionIndex::transaction_tmemory_load(),
             BuiltinFunctionIndex::transaction_tmemory_store(),
             BuiltinFunctionIndex::transaction_tmemory_size(),
+            BuiltinFunctionIndex::transaction_ttable_get(),
+            BuiltinFunctionIndex::transaction_ttable_size(),
         ] {
             assert!(matches!(
                 builtin.trap_sentinel(),

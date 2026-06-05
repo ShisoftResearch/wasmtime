@@ -204,7 +204,11 @@ pub fn translate_operator(
         }
         Operator::TGlobalSet { global_index } => {
             let global_index = GlobalIndex::from_u32(*global_index);
-            let val = environ.stacks.pop1();
+            let mut val = environ.stacks.pop1();
+            // Ensure SIMD values are cast to their default Cranelift type, I8x16.
+            if builder.func.dfg.value_type(val).is_vector() {
+                val = optionally_bitcast_vector(val, I8X16, builder);
+            }
             environ.translate_transaction_tglobal_set(builder, global_index, val)?;
         }
         Operator::TMemorySize { mem } => {
@@ -217,6 +221,74 @@ pub fn translate_operator(
             let val = environ.stacks.pop1();
             let result = environ.translate_transaction_tmemory_grow(builder, mem, val)?;
             environ.stacks.push1(result);
+        }
+        Operator::TTableSize { table: index } => {
+            let result =
+                environ.translate_transaction_ttable_size(builder, TableIndex::from_u32(*index))?;
+            environ.stacks.push1(result);
+        }
+        Operator::TTableGrow { table: index } => {
+            let table_index = TableIndex::from_u32(*index);
+            let delta = environ.stacks.pop1();
+            let init_value = environ.stacks.pop1();
+            let result = environ.translate_transaction_ttable_grow(
+                builder,
+                table_index,
+                delta,
+                init_value,
+            )?;
+            environ.stacks.push1(result);
+        }
+        Operator::TTableGet { table: index } => {
+            let table_index = TableIndex::from_u32(*index);
+            let index = environ.stacks.pop1();
+            let result = environ.translate_transaction_ttable_get(builder, table_index, index)?;
+            environ.stacks.push1(result);
+        }
+        Operator::TTableSet { table: index } => {
+            let table_index = TableIndex::from_u32(*index);
+            let value = environ.stacks.pop1();
+            let index = environ.stacks.pop1();
+            environ.translate_transaction_ttable_set(builder, table_index, value, index)?;
+        }
+        Operator::TTableFill { table } => {
+            let table_index = TableIndex::from_u32(*table);
+            let len = environ.stacks.pop1();
+            let val = environ.stacks.pop1();
+            let dest = environ.stacks.pop1();
+            environ.translate_transaction_ttable_fill(builder, table_index, dest, val, len)?;
+        }
+        Operator::TTableCopy {
+            dst_table: dst_table_index,
+            src_table: src_table_index,
+        } => {
+            let len = environ.stacks.pop1();
+            let src = environ.stacks.pop1();
+            let dest = environ.stacks.pop1();
+            environ.translate_transaction_ttable_copy(
+                builder,
+                TableIndex::from_u32(*dst_table_index),
+                TableIndex::from_u32(*src_table_index),
+                dest,
+                src,
+                len,
+            )?;
+        }
+        Operator::TTableInit {
+            elem_index,
+            table: table_index,
+        } => {
+            let len = environ.stacks.pop1();
+            let src = environ.stacks.pop1();
+            let dest = environ.stacks.pop1();
+            environ.translate_transaction_ttable_init(
+                builder,
+                *elem_index,
+                TableIndex::from_u32(*table_index),
+                dest,
+                src,
+                len,
+            )?;
         }
         /********************************* Stack misc ***************************************
          *  `drop`, `nop`, `unreachable` and `select`.
@@ -1022,6 +1094,9 @@ pub fn translate_operator(
                 translate_load(memarg, ir::Opcode::Load, I8X16, builder, environ)?
             );
         }
+        Operator::V128TLoad { memarg } => {
+            translate_transaction_load(memarg, ir::Opcode::Load, I8X16, builder, environ)?;
+        }
         Operator::V128Load8x8S { memarg } => {
             //TODO(#6829): add before_load() and before_store() hooks for SIMD loads and stores.
             let (flags, _, base) = unwrap_or_return_unreachable_state!(
@@ -1029,6 +1104,11 @@ pub fn translate_operator(
                 prepare_addr(memarg, 8, builder, environ)?
             );
             let loaded = builder.ins().sload8x8(flags, base, 0);
+            environ.stacks.push1(loaded);
+        }
+        Operator::V128TLoad8x8S { memarg } => {
+            let base = translate_transaction_load_base(memarg, 8, builder, environ)?;
+            let loaded = builder.ins().sload8x8(MemFlagsData::trusted(), base, 0);
             environ.stacks.push1(loaded);
         }
         Operator::V128Load8x8U { memarg } => {
@@ -1039,12 +1119,22 @@ pub fn translate_operator(
             let loaded = builder.ins().uload8x8(flags, base, 0);
             environ.stacks.push1(loaded);
         }
+        Operator::V128TLoad8x8U { memarg } => {
+            let base = translate_transaction_load_base(memarg, 8, builder, environ)?;
+            let loaded = builder.ins().uload8x8(MemFlagsData::trusted(), base, 0);
+            environ.stacks.push1(loaded);
+        }
         Operator::V128Load16x4S { memarg } => {
             let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 environ,
                 prepare_addr(memarg, 8, builder, environ)?
             );
             let loaded = builder.ins().sload16x4(flags, base, 0);
+            environ.stacks.push1(loaded);
+        }
+        Operator::V128TLoad16x4S { memarg } => {
+            let base = translate_transaction_load_base(memarg, 8, builder, environ)?;
+            let loaded = builder.ins().sload16x4(MemFlagsData::trusted(), base, 0);
             environ.stacks.push1(loaded);
         }
         Operator::V128Load16x4U { memarg } => {
@@ -1055,6 +1145,11 @@ pub fn translate_operator(
             let loaded = builder.ins().uload16x4(flags, base, 0);
             environ.stacks.push1(loaded);
         }
+        Operator::V128TLoad16x4U { memarg } => {
+            let base = translate_transaction_load_base(memarg, 8, builder, environ)?;
+            let loaded = builder.ins().uload16x4(MemFlagsData::trusted(), base, 0);
+            environ.stacks.push1(loaded);
+        }
         Operator::V128Load32x2S { memarg } => {
             let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 environ,
@@ -1063,12 +1158,22 @@ pub fn translate_operator(
             let loaded = builder.ins().sload32x2(flags, base, 0);
             environ.stacks.push1(loaded);
         }
+        Operator::V128TLoad32x2S { memarg } => {
+            let base = translate_transaction_load_base(memarg, 8, builder, environ)?;
+            let loaded = builder.ins().sload32x2(MemFlagsData::trusted(), base, 0);
+            environ.stacks.push1(loaded);
+        }
         Operator::V128Load32x2U { memarg } => {
             let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 environ,
                 prepare_addr(memarg, 8, builder, environ)?
             );
             let loaded = builder.ins().uload32x2(flags, base, 0);
+            environ.stacks.push1(loaded);
+        }
+        Operator::V128TLoad32x2U { memarg } => {
+            let base = translate_transaction_load_base(memarg, 8, builder, environ)?;
+            let loaded = builder.ins().uload32x2(MemFlagsData::trusted(), base, 0);
             environ.stacks.push1(loaded);
         }
         /****************************** Store instructions ***********************************
@@ -1107,6 +1212,9 @@ pub fn translate_operator(
         }
         Operator::V128Store { memarg } => {
             translate_store(memarg, ir::Opcode::Store, builder, environ)?;
+        }
+        Operator::V128TStore { memarg } => {
+            translate_transaction_store(memarg, ir::Opcode::Store, builder, environ)?;
         }
         /****************************** Nullary Operators ************************************/
         Operator::I32Const { value } => {
@@ -1855,31 +1963,69 @@ pub fn translate_operator(
         Operator::V128Load8Splat { memarg }
         | Operator::V128Load16Splat { memarg }
         | Operator::V128Load32Splat { memarg }
-        | Operator::V128Load64Splat { memarg } => {
-            unwrap_or_return_unreachable_state!(
-                environ,
-                translate_load(
+        | Operator::V128Load64Splat { memarg }
+        | Operator::V128TLoad8Splat { memarg }
+        | Operator::V128TLoad16Splat { memarg }
+        | Operator::V128TLoad32Splat { memarg }
+        | Operator::V128TLoad64Splat { memarg } => {
+            let is_transaction = matches!(
+                op,
+                Operator::V128TLoad8Splat { .. }
+                    | Operator::V128TLoad16Splat { .. }
+                    | Operator::V128TLoad32Splat { .. }
+                    | Operator::V128TLoad64Splat { .. }
+            );
+            if is_transaction {
+                translate_transaction_load(
                     memarg,
                     ir::Opcode::Load,
                     type_of(op).lane_type(),
                     builder,
                     environ,
-                )?
-            );
+                )?;
+            } else {
+                unwrap_or_return_unreachable_state!(
+                    environ,
+                    translate_load(
+                        memarg,
+                        ir::Opcode::Load,
+                        type_of(op).lane_type(),
+                        builder,
+                        environ,
+                    )?
+                );
+            }
             let splatted = builder.ins().splat(type_of(op), environ.stacks.pop1());
             environ.stacks.push1(splatted)
         }
-        Operator::V128Load32Zero { memarg } | Operator::V128Load64Zero { memarg } => {
-            unwrap_or_return_unreachable_state!(
-                environ,
-                translate_load(
+        Operator::V128Load32Zero { memarg }
+        | Operator::V128Load64Zero { memarg }
+        | Operator::V128TLoad32Zero { memarg }
+        | Operator::V128TLoad64Zero { memarg } => {
+            let is_transaction = matches!(
+                op,
+                Operator::V128TLoad32Zero { .. } | Operator::V128TLoad64Zero { .. }
+            );
+            if is_transaction {
+                translate_transaction_load(
                     memarg,
                     ir::Opcode::Load,
                     type_of(op).lane_type(),
                     builder,
                     environ,
-                )?
-            );
+                )?;
+            } else {
+                unwrap_or_return_unreachable_state!(
+                    environ,
+                    translate_load(
+                        memarg,
+                        ir::Opcode::Load,
+                        type_of(op).lane_type(),
+                        builder,
+                        environ,
+                    )?
+                );
+            }
             let as_vector = builder
                 .ins()
                 .scalar_to_vector(type_of(op), environ.stacks.pop1());
@@ -1888,18 +2034,39 @@ pub fn translate_operator(
         Operator::V128Load8Lane { memarg, lane }
         | Operator::V128Load16Lane { memarg, lane }
         | Operator::V128Load32Lane { memarg, lane }
-        | Operator::V128Load64Lane { memarg, lane } => {
+        | Operator::V128Load64Lane { memarg, lane }
+        | Operator::V128TLoad8Lane { memarg, lane }
+        | Operator::V128TLoad16Lane { memarg, lane }
+        | Operator::V128TLoad32Lane { memarg, lane }
+        | Operator::V128TLoad64Lane { memarg, lane } => {
             let vector = pop1_with_bitcast(environ, type_of(op), builder);
-            unwrap_or_return_unreachable_state!(
-                environ,
-                translate_load(
+            let is_transaction = matches!(
+                op,
+                Operator::V128TLoad8Lane { .. }
+                    | Operator::V128TLoad16Lane { .. }
+                    | Operator::V128TLoad32Lane { .. }
+                    | Operator::V128TLoad64Lane { .. }
+            );
+            if is_transaction {
+                translate_transaction_load(
                     memarg,
                     ir::Opcode::Load,
                     type_of(op).lane_type(),
                     builder,
                     environ,
-                )?
-            );
+                )?;
+            } else {
+                unwrap_or_return_unreachable_state!(
+                    environ,
+                    translate_load(
+                        memarg,
+                        ir::Opcode::Load,
+                        type_of(op).lane_type(),
+                        builder,
+                        environ,
+                    )?
+                );
+            }
             let replacement = environ.stacks.pop1();
             environ
                 .stacks
@@ -1908,12 +2075,27 @@ pub fn translate_operator(
         Operator::V128Store8Lane { memarg, lane }
         | Operator::V128Store16Lane { memarg, lane }
         | Operator::V128Store32Lane { memarg, lane }
-        | Operator::V128Store64Lane { memarg, lane } => {
+        | Operator::V128Store64Lane { memarg, lane }
+        | Operator::V128TStore8Lane { memarg, lane }
+        | Operator::V128TStore16Lane { memarg, lane }
+        | Operator::V128TStore32Lane { memarg, lane }
+        | Operator::V128TStore64Lane { memarg, lane } => {
             let vector = pop1_with_bitcast(environ, type_of(op), builder);
             environ
                 .stacks
                 .push1(builder.ins().extractlane(vector, *lane));
-            translate_store(memarg, ir::Opcode::Store, builder, environ)?;
+            let is_transaction = matches!(
+                op,
+                Operator::V128TStore8Lane { .. }
+                    | Operator::V128TStore16Lane { .. }
+                    | Operator::V128TStore32Lane { .. }
+                    | Operator::V128TStore64Lane { .. }
+            );
+            if is_transaction {
+                translate_transaction_store(memarg, ir::Opcode::Store, builder, environ)?;
+            } else {
+                translate_store(memarg, ir::Opcode::Store, builder, environ)?;
+            }
         }
         Operator::I8x16ExtractLaneS { lane } | Operator::I16x8ExtractLaneS { lane } => {
             let vector = pop1_with_bitcast(environ, type_of(op), builder);
@@ -3838,15 +4020,8 @@ fn translate_transaction_load(
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
 ) -> WasmResult<()> {
-    let addr = environ.stacks.pop1();
     let mem_op_size = mem_op_size(opcode, result_ty);
-    let base = environ.translate_transaction_tmemory_load(
-        builder,
-        MemoryIndex::from_u32(memarg.memory),
-        addr,
-        memarg.offset,
-        u32::from(mem_op_size),
-    )?;
+    let base = translate_transaction_load_base(memarg, mem_op_size, builder, environ)?;
     let flags = builder
         .func
         .dfg
@@ -3858,6 +4033,22 @@ fn translate_transaction_load(
         .Load(opcode, result_ty, flags, Offset32::new(0), base);
     environ.stacks.push1(dfg.first_result(load));
     Ok(())
+}
+
+fn translate_transaction_load_base(
+    memarg: &MemArg,
+    access_size: u8,
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+) -> WasmResult<Value> {
+    let addr = environ.stacks.pop1();
+    environ.translate_transaction_tmemory_load(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        addr,
+        memarg.offset,
+        u32::from(access_size),
+    )
 }
 
 fn translate_transaction_store(
@@ -4203,7 +4394,9 @@ fn translate_br_if_args<'a>(
 fn type_of(operator: &Operator) -> Type {
     match operator {
         Operator::V128Load { .. }
+        | Operator::V128TLoad { .. }
         | Operator::V128Store { .. }
+        | Operator::V128TStore { .. }
         | Operator::V128Const { .. }
         | Operator::V128Not
         | Operator::V128And
@@ -4216,8 +4409,11 @@ fn type_of(operator: &Operator) -> Type {
         Operator::I8x16Shuffle { .. }
         | Operator::I8x16Splat
         | Operator::V128Load8Splat { .. }
+        | Operator::V128TLoad8Splat { .. }
         | Operator::V128Load8Lane { .. }
+        | Operator::V128TLoad8Lane { .. }
         | Operator::V128Store8Lane { .. }
+        | Operator::V128TStore8Lane { .. }
         | Operator::I8x16ExtractLaneS { .. }
         | Operator::I8x16ExtractLaneU { .. }
         | Operator::I8x16ReplaceLane { .. }
@@ -4254,8 +4450,11 @@ fn type_of(operator: &Operator) -> Type {
 
         Operator::I16x8Splat
         | Operator::V128Load16Splat { .. }
+        | Operator::V128TLoad16Splat { .. }
         | Operator::V128Load16Lane { .. }
+        | Operator::V128TLoad16Lane { .. }
         | Operator::V128Store16Lane { .. }
+        | Operator::V128TStore16Lane { .. }
         | Operator::I16x8ExtractLaneS { .. }
         | Operator::I16x8ExtractLaneU { .. }
         | Operator::I16x8ReplaceLane { .. }
@@ -4292,8 +4491,11 @@ fn type_of(operator: &Operator) -> Type {
 
         Operator::I32x4Splat
         | Operator::V128Load32Splat { .. }
+        | Operator::V128TLoad32Splat { .. }
         | Operator::V128Load32Lane { .. }
+        | Operator::V128TLoad32Lane { .. }
         | Operator::V128Store32Lane { .. }
+        | Operator::V128TStore32Lane { .. }
         | Operator::I32x4ExtractLane { .. }
         | Operator::I32x4ReplaceLane { .. }
         | Operator::I32x4Eq
@@ -4323,12 +4525,16 @@ fn type_of(operator: &Operator) -> Type {
         | Operator::I32x4TruncSatF32x4S
         | Operator::I32x4TruncSatF32x4U
         | Operator::I32x4RelaxedLaneselect
-        | Operator::V128Load32Zero { .. } => I32X4,
+        | Operator::V128Load32Zero { .. }
+        | Operator::V128TLoad32Zero { .. } => I32X4,
 
         Operator::I64x2Splat
         | Operator::V128Load64Splat { .. }
+        | Operator::V128TLoad64Splat { .. }
         | Operator::V128Load64Lane { .. }
+        | Operator::V128TLoad64Lane { .. }
         | Operator::V128Store64Lane { .. }
+        | Operator::V128TStore64Lane { .. }
         | Operator::I64x2ExtractLane { .. }
         | Operator::I64x2ReplaceLane { .. }
         | Operator::I64x2Eq
@@ -4348,7 +4554,8 @@ fn type_of(operator: &Operator) -> Type {
         | Operator::I64x2Mul
         | Operator::I64x2Bitmask
         | Operator::I64x2RelaxedLaneselect
-        | Operator::V128Load64Zero { .. } => I64X2,
+        | Operator::V128Load64Zero { .. }
+        | Operator::V128TLoad64Zero { .. } => I64X2,
 
         Operator::F32x4Splat
         | Operator::F32x4ExtractLane { .. }

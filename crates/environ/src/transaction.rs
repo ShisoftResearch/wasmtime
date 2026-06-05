@@ -1,4 +1,4 @@
-use crate::{FuncIndex, GlobalIndex, MemoryIndex, WasmError, WasmResult};
+use crate::{FuncIndex, GlobalIndex, MemoryIndex, TableIndex, WasmError, WasmResult};
 use serde_derive::{Deserialize, Serialize};
 
 /// Transaction opcode prefix used by Wizard and the simple-transactions
@@ -73,6 +73,20 @@ pub enum TransactionOperator {
     TMemorySize,
     /// `tmemory.grow`
     TMemoryGrow,
+    /// `ttable.get`
+    TTableGet,
+    /// `ttable.set`
+    TTableSet,
+    /// `ttable.init`
+    TTableInit,
+    /// `ttable.copy`
+    TTableCopy,
+    /// `ttable.fill`
+    TTableFill,
+    /// `ttable.size`
+    TTableSize,
+    /// `ttable.grow`
+    TTableGrow,
 }
 
 /// A decoded prefixed transaction operator and the number of bytes consumed.
@@ -134,6 +148,9 @@ pub struct TransactionObjectMetadata {
     /// so adding this field intentionally changes the current artifact payload.
     #[serde(default)]
     pub functions: alloc::vec::Vec<FuncIndex>,
+    /// Tables declared through the `ttable` text alias.
+    #[serde(default)]
+    pub tables: alloc::vec::Vec<TableIndex>,
 }
 
 impl TransactionObjectMetadata {
@@ -162,6 +179,23 @@ impl TransactionObjectMetadata {
     /// Returns whether `global` was declared as transactional.
     pub fn is_tglobal(&self, global: GlobalIndex) -> bool {
         self.globals.contains(&global)
+    }
+
+    /// Records `index` as transactional.
+    pub fn add_ttable(&mut self, index: TableIndex) {
+        if !self.tables.contains(&index) {
+            self.tables.push(index);
+        }
+    }
+
+    /// Returns whether `table` was declared as transactional.
+    pub fn is_ttable(&self, table: TableIndex) -> bool {
+        self.tables.contains(&table)
+    }
+
+    /// Returns all transactional tables.
+    pub fn ttables(&self) -> impl ExactSizeIterator<Item = TableIndex> + '_ {
+        self.tables.iter().copied()
     }
 }
 
@@ -198,6 +232,13 @@ impl TransactionOperator {
             Self::I64TStore32 => 0x3e,
             Self::TMemorySize => 0x3f,
             Self::TMemoryGrow => 0x40,
+            Self::TTableGet => 0x25,
+            Self::TTableSet => 0x26,
+            Self::TTableInit => 0x0c7c,
+            Self::TTableCopy => 0x0e7c,
+            Self::TTableGrow => 0x0f7c,
+            Self::TTableSize => 0x107c,
+            Self::TTableFill => 0x117c,
         }
     }
 }
@@ -371,7 +412,15 @@ pub fn validate_research_transaction_operator(
                 });
             }
         }
-        TransactionOperator::TTry | TransactionOperator::TFail => {}
+        TransactionOperator::TTableGet
+        | TransactionOperator::TTableSet
+        | TransactionOperator::TTableInit
+        | TransactionOperator::TTableCopy
+        | TransactionOperator::TTableFill
+        | TransactionOperator::TTableSize
+        | TransactionOperator::TTableGrow
+        | TransactionOperator::TTry
+        | TransactionOperator::TFail => {}
     }
 
     Ok(())
@@ -434,6 +483,17 @@ pub fn decode_transaction_object_metadata(bytes: &[u8]) -> WasmResult<Transactio
         }
     }
 
+    let mut tables = alloc::vec::Vec::new();
+    if cursor < bytes.len() {
+        let (table_count, table_count_len) = read_u32_leb(&bytes[cursor..], cursor)?;
+        cursor += table_count_len;
+        for _ in 0..table_count {
+            let (index, len) = read_u32_leb(&bytes[cursor..], cursor)?;
+            tables.push(TableIndex::from_u32(index));
+            cursor += len;
+        }
+    }
+
     if cursor != bytes.len() {
         return Err(WasmError::InvalidWebAssembly {
             message: "trailing transaction object metadata bytes".into(),
@@ -445,6 +505,7 @@ pub fn decode_transaction_object_metadata(bytes: &[u8]) -> WasmResult<Transactio
         memories,
         globals,
         functions,
+        tables,
     })
 }
 
@@ -505,6 +566,10 @@ pub fn decode_milestone1_transaction_operator(subopcode: u32) -> WasmResult<Tran
         0x0f => TransactionOperator::TFail,
         0x23 => TransactionOperator::TGlobalGet,
         0x24 => TransactionOperator::TGlobalSet,
+        0x25 => TransactionOperator::TTableGet,
+        0x26 => TransactionOperator::TTableSet,
+        0x0c7c => TransactionOperator::TTableInit,
+        0x0e7c => TransactionOperator::TTableCopy,
         0x28 => TransactionOperator::I32TLoad,
         0x29 => TransactionOperator::I64TLoad,
         0x2a => TransactionOperator::F32TLoad,
@@ -530,9 +595,12 @@ pub fn decode_milestone1_transaction_operator(subopcode: u32) -> WasmResult<Tran
         0x3e => TransactionOperator::I64TStore32,
         0x3f => TransactionOperator::TMemorySize,
         0x40 => TransactionOperator::TMemoryGrow,
+        0x0f7c => TransactionOperator::TTableGrow,
+        0x107c => TransactionOperator::TTableSize,
+        0x117c => TransactionOperator::TTableFill,
         _ => {
             return Err(WasmError::Unsupported(crate::__format!(
-                "transaction operator 0xfa {subopcode:#x} is outside milestone 1"
+                "transaction operator 0xfa {subopcode:#x} is outside the supported transaction subset"
             )));
         }
     };
@@ -600,8 +668,40 @@ mod tests {
     }
 
     #[test]
+    fn decodes_transaction_table_opcodes() {
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x25).unwrap(),
+            TransactionOperator::TTableGet
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x26).unwrap(),
+            TransactionOperator::TTableSet
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x0c7c).unwrap(),
+            TransactionOperator::TTableInit
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x0e7c).unwrap(),
+            TransactionOperator::TTableCopy
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x0f7c).unwrap(),
+            TransactionOperator::TTableGrow
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x107c).unwrap(),
+            TransactionOperator::TTableSize
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x117c).unwrap(),
+            TransactionOperator::TTableFill
+        );
+    }
+
+    #[test]
     fn rejects_out_of_scope_transaction_opcodes() {
-        let error = decode_milestone1_transaction_operator(0x25).unwrap_err();
+        let error = decode_milestone1_transaction_operator(0x27).unwrap_err();
         match error {
             WasmError::Unsupported(message) => {
                 assert!(message.contains("transaction operator"));
@@ -652,11 +752,11 @@ mod tests {
     #[test]
     fn local_parser_bridge_reports_transaction_operator_offset() {
         let error =
-            parse_research_transaction_operators(&[TRANSACTION_OPCODE_PREFIX, 0x25]).unwrap_err();
+            parse_research_transaction_operators(&[TRANSACTION_OPCODE_PREFIX, 0x27]).unwrap_err();
 
         match error {
             WasmError::Unsupported(message) => {
-                assert!(message.contains("0xfa 0x25"));
+                assert!(message.contains("0xfa 0x27"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -681,14 +781,14 @@ mod tests {
 
     #[test]
     fn generated_module_fixture_reports_function_index_for_bad_transaction_opcode() {
-        let module = generated_module_with_body(&[0x00, TRANSACTION_OPCODE_PREFIX, 0x25, 0x0b]);
+        let module = generated_module_with_body(&[0x00, TRANSACTION_OPCODE_PREFIX, 0x27, 0x0b]);
 
         let error = parse_research_transaction_operators_from_module(&module).unwrap_err();
 
         match error {
             WasmError::Unsupported(message) => {
                 assert!(message.contains("function 0"));
-                assert!(message.contains("0xfa 0x25"));
+                assert!(message.contains("0xfa 0x27"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -848,6 +948,19 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_metadata_decodes_table_indices() {
+        let metadata = decode_transaction_object_metadata(&[1, 0, 0, 0, 2, 1, 4]).unwrap();
+
+        assert!(metadata.is_ttable(TableIndex::from_u32(1)));
+        assert!(metadata.is_ttable(TableIndex::from_u32(4)));
+        assert!(!metadata.is_ttable(TableIndex::from_u32(0)));
+        assert_eq!(
+            metadata.ttables().collect::<alloc::vec::Vec<_>>(),
+            vec![TableIndex::from_u32(1), TableIndex::from_u32(4)]
+        );
+    }
+
+    #[test]
     fn transaction_object_metadata_tracks_tfuncs() {
         use crate::FuncIndex;
 
@@ -864,6 +977,26 @@ mod tests {
         assert!(metadata.is_tfunc(f0));
         assert!(!metadata.is_tfunc(f1));
         assert_eq!(metadata.tfuncs().collect::<alloc::vec::Vec<_>>(), vec![f0]);
+    }
+
+    #[test]
+    fn transaction_object_metadata_tracks_ttables() {
+        let mut metadata = TransactionObjectMetadata::default();
+        let table0 = TableIndex::from_u32(0);
+        let table1 = TableIndex::from_u32(1);
+
+        assert!(!metadata.is_ttable(table0));
+        assert!(!metadata.is_ttable(table1));
+
+        metadata.add_ttable(table0);
+        metadata.add_ttable(table0);
+
+        assert!(metadata.is_ttable(table0));
+        assert!(!metadata.is_ttable(table1));
+        assert_eq!(
+            metadata.ttables().collect::<alloc::vec::Vec<_>>(),
+            vec![table0]
+        );
     }
 
     #[test]
@@ -896,7 +1029,7 @@ mod tests {
 
     #[test]
     fn transaction_object_metadata_rejects_trailing_bytes() {
-        let error = decode_transaction_object_metadata(&[1, 0, 0, 1]).unwrap_err();
+        let error = decode_transaction_object_metadata(&[1, 0, 0, 0, 0, 1]).unwrap_err();
 
         match error {
             WasmError::InvalidWebAssembly { message, .. } => {

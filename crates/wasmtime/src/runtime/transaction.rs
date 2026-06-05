@@ -130,6 +130,8 @@ pub(crate) struct TransactionState {
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
     memory_read_granules: BTreeSet<GranuleId>,
     memory_write_granules: BTreeSet<GranuleId>,
+    table_read_granules: BTreeSet<GranuleId>,
+    table_write_granules: BTreeSet<GranuleId>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
 }
@@ -145,6 +147,8 @@ impl Default for TransactionState {
             staged_memory_sizes: BTreeMap::new(),
             memory_read_granules: BTreeSet::new(),
             memory_write_granules: BTreeSet::new(),
+            table_read_granules: BTreeSet::new(),
+            table_write_granules: BTreeSet::new(),
             scratch: Vec::new(),
             pending_memory_store: None,
         }
@@ -177,6 +181,12 @@ pub(crate) enum GlobalSnapshot {
     I64(i64),
     F32(u32),
     F64(u64),
+    V128([u8; 16]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ObjectId {
+    pub(crate) object_index: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -194,6 +204,20 @@ pub(crate) enum GranuleId {
         instance: Option<u32>,
         global_index: u32,
     },
+    TTable {
+        instance: Option<u32>,
+        table_index: u32,
+        granule_index: u64,
+    },
+    TTableSize {
+        instance: Option<u32>,
+        table_index: u32,
+    },
+    // Future object-table identities; not wired into runtime paths yet.
+    #[allow(dead_code)]
+    TStruct { object_id: ObjectId },
+    #[allow(dead_code)]
+    TArray { object_id: ObjectId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +246,8 @@ pub(crate) struct TMemoryAccessSnapshot {
 
 const TMEMORY_GRANULE_SHIFT: usize = 8;
 pub(crate) const TMEMORY_GRANULE_SIZE: usize = 1 << TMEMORY_GRANULE_SHIFT;
+const TTABLE_GRANULE_SHIFT: u32 = 4;
+pub(crate) const TTABLE_GRANULE_SIZE: u64 = 1 << TTABLE_GRANULE_SHIFT;
 
 pub(crate) trait TransactionConcurrencyControl {
     fn acquire_memory_granule_read(
@@ -1208,6 +1234,166 @@ impl TransactionState {
             ))
     }
 
+    pub(crate) fn acquire_table_granule_read_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        element_index: u64,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let transaction = self.active_transaction_required()?;
+        let key = table_granule_id(owner_instance, table_index, element_index);
+        self.locks.record_read(transaction, key, current_version)?;
+        Ok(self.table_read_granules.insert(key))
+    }
+
+    pub(crate) fn acquire_table_granule_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        element_index: u64,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let transaction = self.active_transaction_required()?;
+        let key = table_granule_id(owner_instance, table_index, element_index);
+        self.locks
+            .acquire_write(transaction, key, current_version)?;
+        self.table_read_granules.insert(key);
+        Ok(self.table_write_granules.insert(key))
+    }
+
+    pub(crate) fn acquire_table_granule_read_range_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        start_element: u64,
+        len: u64,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        if len == 0 {
+            return Ok(false);
+        }
+        let transaction = self.active_transaction_required()?;
+        let last_element = start_element
+            .checked_add(len - 1)
+            .context("ttable read range overflow")?;
+        let first_granule = start_element >> TTABLE_GRANULE_SHIFT;
+        let last_granule = last_element >> TTABLE_GRANULE_SHIFT;
+        let mut inserted = false;
+        for granule_index in first_granule..=last_granule {
+            let key = table_granule_id_from_u64(owner_instance, table_index, granule_index);
+            self.locks.record_read(transaction, key, current_version)?;
+            inserted |= self.table_read_granules.insert(key);
+        }
+        Ok(inserted)
+    }
+
+    pub(crate) fn acquire_table_granule_write_range_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        start_element: u64,
+        len: u64,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        if len == 0 {
+            return Ok(false);
+        }
+        let transaction = self.active_transaction_required()?;
+        let last_element = start_element
+            .checked_add(len - 1)
+            .context("ttable write range overflow")?;
+        let first_granule = start_element >> TTABLE_GRANULE_SHIFT;
+        let last_granule = last_element >> TTABLE_GRANULE_SHIFT;
+        let mut inserted = false;
+        for granule_index in first_granule..=last_granule {
+            let key = table_granule_id_from_u64(owner_instance, table_index, granule_index);
+            self.locks
+                .acquire_write(transaction, key, current_version)?;
+            self.table_read_granules.insert(key);
+            inserted |= self.table_write_granules.insert(key);
+        }
+        Ok(inserted)
+    }
+
+    pub(crate) fn acquire_table_size_read_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let transaction = self.active_transaction_required()?;
+        let key = table_size_granule_id(owner_instance, table_index);
+        self.locks.record_read(transaction, key, current_version)?;
+        Ok(self.table_read_granules.insert(key))
+    }
+
+    pub(crate) fn acquire_table_size_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let transaction = self.active_transaction_required()?;
+        let key = table_size_granule_id(owner_instance, table_index);
+        self.locks
+            .acquire_write(transaction, key, current_version)?;
+        self.table_read_granules.insert(key);
+        Ok(self.table_write_granules.insert(key))
+    }
+
+    pub(crate) fn owns_table_granule_read_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        granule_index: u64,
+    ) -> bool {
+        self.table_read_granules
+            .contains(&table_granule_id_from_u64(
+                owner_instance,
+                table_index,
+                granule_index,
+            ))
+    }
+
+    pub(crate) fn owns_table_granule_write_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        granule_index: u64,
+    ) -> bool {
+        self.table_write_granules
+            .contains(&table_granule_id_from_u64(
+                owner_instance,
+                table_index,
+                granule_index,
+            ))
+    }
+
+    pub(crate) fn owns_table_size_read_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+    ) -> bool {
+        self.table_read_granules
+            .contains(&table_size_granule_id(owner_instance, table_index))
+    }
+
+    pub(crate) fn owns_table_size_write_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+    ) -> bool {
+        self.table_write_granules
+            .contains(&table_size_granule_id(owner_instance, table_index))
+    }
+
     fn merge_staged_tmemory_range(
         &self,
         instance: Option<u32>,
@@ -1338,6 +1524,8 @@ impl TransactionState {
         self.staged_memory_sizes.clear();
         self.memory_read_granules.clear();
         self.memory_write_granules.clear();
+        self.table_read_granules.clear();
+        self.table_write_granules.clear();
         self.scratch.clear();
         self.pending_memory_store = None;
     }
@@ -1461,6 +1649,37 @@ fn memory_size_granule_id(owner_instance: Option<InstanceId>, memory_index: u32)
     GranuleId::TMemorySize {
         instance: granule_instance(owner_instance),
         memory_index,
+    }
+}
+
+fn table_granule_id(
+    owner_instance: Option<InstanceId>,
+    table_index: u32,
+    element_index: u64,
+) -> GranuleId {
+    table_granule_id_from_u64(
+        owner_instance,
+        table_index,
+        element_index >> TTABLE_GRANULE_SHIFT,
+    )
+}
+
+fn table_granule_id_from_u64(
+    owner_instance: Option<InstanceId>,
+    table_index: u32,
+    granule_index: u64,
+) -> GranuleId {
+    GranuleId::TTable {
+        instance: granule_instance(owner_instance),
+        table_index,
+        granule_index,
+    }
+}
+
+fn table_size_granule_id(owner_instance: Option<InstanceId>, table_index: u32) -> GranuleId {
+    GranuleId::TTableSize {
+        instance: granule_instance(owner_instance),
+        table_index,
     }
 }
 
@@ -1595,6 +1814,68 @@ mod tests {
         write.call(&mut store, ()).unwrap();
 
         assert_eq!(read.call(&mut store, ()).unwrap(), 42);
+    }
+
+    #[test]
+    fn mock_transaction_simd_store_commits_to_tmemory() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.const 0)
+                (v128.const i32x4 287454020 1432778632 16909060 84281096)
+                (v128.tstore))
+              (tfunc (export "read_lane0") (result i32)
+                (i32.const 0)
+                (v128.tload)
+                (i32x4.extract_lane 0)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read_lane0 = instance
+            .get_typed_func::<(), i32>(&mut store, "read_lane0")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read_lane0.call(&mut store, ()).unwrap(), 287454020);
+    }
+
+    #[test]
+    fn mock_transaction_simd_lane_store_commits_to_tmemory() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write_lane")
+                (i32.const 0)
+                (v128.const i32x4 287454020 1432778632 16909060 84281096)
+                (v128.tstore32_lane 1))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write_lane = instance
+            .get_typed_func::<(), ()>(&mut store, "write_lane")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        write_lane.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 1432778632);
     }
 
     #[test]
@@ -1855,6 +2136,57 @@ mod tests {
     }
 
     #[test]
+    fn mock_transaction_global_v128_get_reads_defined_global() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tglobal $g (mut v128) (v128.const i32x4 287454020 1432778632 16909060 84281096))
+              (tfunc (export "read_lane1") (result i32)
+                (tglobal.get $g)
+                (i32x4.extract_lane 1)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let read_lane1 = instance
+            .get_typed_func::<(), i32>(&mut store, "read_lane1")
+            .unwrap();
+
+        assert_eq!(read_lane1.call(&mut store, ()).unwrap(), 1432778632);
+    }
+
+    #[test]
+    fn mock_transaction_global_v128_set_commits_bitwise() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tglobal $g (mut v128) (v128.const i32x4 0 0 0 0))
+              (tfunc (export "write")
+                (tglobal.set $g (v128.const i32x4 287454020 1432778632 16909060 84281096)))
+              (tfunc (export "read_lane2") (result i32)
+                (tglobal.get $g)
+                (i32x4.extract_lane 2)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read_lane2 = instance
+            .get_typed_func::<(), i32>(&mut store, "read_lane2")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read_lane2.call(&mut store, ()).unwrap(), 16909060);
+    }
+
+    #[test]
     fn mock_transaction_plain_func_memory_size_requires_active_transaction() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
@@ -1905,6 +2237,137 @@ mod tests {
         assert_eq!(size.call(&mut store, ()).unwrap(), 0);
         assert_eq!(grow.call(&mut store, 1).unwrap(), 0);
         assert_eq!(size.call(&mut store, ()).unwrap(), 1);
+    }
+
+    #[test]
+    fn mock_transaction_ttable_funcref_paths_hit_runtime_libcalls() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (ttable $t 1 funcref)
+              (elem declare func $target)
+              (func $target)
+              (tfunc (export "size") (result i32)
+                (ttable.size $t))
+              (tfunc (export "grow") (result i32)
+                (ref.null func)
+                (i32.const 2)
+                (ttable.grow $t))
+              (tfunc (export "is_null") (result i32)
+                (i32.const 0)
+                (ttable.get $t)
+                (ref.is_null))
+              (tfunc (export "set")
+                (i32.const 0)
+                (ref.func $target)
+                (ttable.set $t)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let size = instance
+            .get_typed_func::<(), i32>(&mut store, "size")
+            .unwrap();
+        let grow = instance
+            .get_typed_func::<(), i32>(&mut store, "grow")
+            .unwrap();
+        let is_null = instance
+            .get_typed_func::<(), i32>(&mut store, "is_null")
+            .unwrap();
+        let set = instance
+            .get_typed_func::<(), ()>(&mut store, "set")
+            .unwrap();
+
+        assert_eq!(size.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(is_null.call(&mut store, ()).unwrap(), 1);
+        set.call(&mut store, ()).unwrap();
+        assert_eq!(is_null.call(&mut store, ()).unwrap(), 0);
+        assert_eq!(grow.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(size.call(&mut store, ()).unwrap(), 3);
+    }
+
+    #[test]
+    fn mock_transaction_ttable_bulk_funcref_paths_hit_runtime_libcalls() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (table $t 4 tfuncref)
+              (elem $e func $target)
+              (func $target)
+              (tfunc (export "is_null") (param i32) (result i32)
+                (local.get 0)
+                (ttable.get $t)
+                (ref.is_null))
+              (tfunc (export "fill")
+                (i32.const 0)
+                (ref.func $target)
+                (i32.const 1)
+                (ttable.fill $t))
+              (tfunc (export "copy")
+                (i32.const 1)
+                (i32.const 0)
+                (i32.const 1)
+                (ttable.copy $t $t))
+              (tfunc (export "init")
+                (i32.const 2)
+                (i32.const 0)
+                (i32.const 1)
+                (ttable.init $t $e)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let is_null = instance
+            .get_typed_func::<i32, i32>(&mut store, "is_null")
+            .unwrap();
+        let fill = instance
+            .get_typed_func::<(), ()>(&mut store, "fill")
+            .unwrap();
+        let copy = instance
+            .get_typed_func::<(), ()>(&mut store, "copy")
+            .unwrap();
+        let init = instance
+            .get_typed_func::<(), ()>(&mut store, "init")
+            .unwrap();
+
+        assert_eq!(is_null.call(&mut store, 0).unwrap(), 1);
+        assert_eq!(is_null.call(&mut store, 1).unwrap(), 1);
+        assert_eq!(is_null.call(&mut store, 2).unwrap(), 1);
+        fill.call(&mut store, ()).unwrap();
+        assert_eq!(is_null.call(&mut store, 0).unwrap(), 0);
+        copy.call(&mut store, ()).unwrap();
+        assert_eq!(is_null.call(&mut store, 1).unwrap(), 0);
+        init.call(&mut store, ()).unwrap();
+        assert_eq!(is_null.call(&mut store, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn module_compilation_rejects_transaction_table_get_on_ordinary_table() {
+        let engine = crate::Engine::default();
+        let error = crate::Module::new(
+            &engine,
+            wat::parse_str(
+                r#"
+                (module
+                  (table $t 1 funcref)
+                  (func (result i32)
+                    (i32.const 0)
+                    (ttable.get $t)
+                    (ref.is_null)))
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("transactional table operator requires ttable"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2809,6 +3272,21 @@ mod tests {
                 memory_index: 7,
                 granule_index: 1,
             },
+            GranuleId::TArray {
+                object_id: ObjectId { object_index: 2 },
+            },
+            GranuleId::TStruct {
+                object_id: ObjectId { object_index: 1 },
+            },
+            GranuleId::TTableSize {
+                instance: None,
+                table_index: 3,
+            },
+            GranuleId::TTable {
+                instance: Some(1),
+                table_index: 2,
+                granule_index: 0,
+            },
         ];
 
         ids.sort();
@@ -2846,6 +3324,21 @@ mod tests {
                 GranuleId::TGlobal {
                     instance: None,
                     global_index: 2,
+                },
+                GranuleId::TTable {
+                    instance: Some(1),
+                    table_index: 2,
+                    granule_index: 0,
+                },
+                GranuleId::TTableSize {
+                    instance: None,
+                    table_index: 3,
+                },
+                GranuleId::TStruct {
+                    object_id: ObjectId { object_index: 1 },
+                },
+                GranuleId::TArray {
+                    object_id: ObjectId { object_index: 2 },
                 },
             ]
         );
@@ -2926,6 +3419,87 @@ mod tests {
             tmemory.read_committed(4..8).expect("read committed"),
             vec![0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn transaction_table_granules_follow_wizard_sixteen_element_chunks() {
+        let owner = InstanceId::from_u32(2);
+
+        assert_eq!(
+            table_granule_id(Some(owner), 3, 0),
+            GranuleId::TTable {
+                instance: Some(2),
+                table_index: 3,
+                granule_index: 0,
+            }
+        );
+        assert_eq!(
+            table_granule_id(Some(owner), 3, 15),
+            GranuleId::TTable {
+                instance: Some(2),
+                table_index: 3,
+                granule_index: 0,
+            }
+        );
+        assert_eq!(
+            table_granule_id(Some(owner), 3, 16),
+            GranuleId::TTable {
+                instance: Some(2),
+                table_index: 3,
+                granule_index: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn transaction_table_granule_acquisition_tracks_read_and_write_sets() {
+        let mut state = TransactionState::default();
+        let owner = InstanceId::from_u32(1);
+        state.begin().unwrap();
+
+        assert!(
+            state
+                .acquire_table_granule_read_owned(Some(owner), 2, 15, 4)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .acquire_table_granule_read_owned(Some(owner), 2, 8, 4)
+                .unwrap()
+        );
+        assert!(state.owns_table_granule_read_owned(Some(owner), 2, 0));
+        assert!(!state.owns_table_granule_write_owned(Some(owner), 2, 0));
+
+        assert!(
+            state
+                .acquire_table_granule_write_owned(Some(owner), 2, 16, 7)
+                .unwrap()
+        );
+        assert!(state.owns_table_granule_read_owned(Some(owner), 2, 1));
+        assert!(state.owns_table_granule_write_owned(Some(owner), 2, 1));
+    }
+
+    #[test]
+    fn transaction_table_size_granule_is_separate_from_element_granules() {
+        let mut state = TransactionState::default();
+        let owner = InstanceId::from_u32(1);
+        state.begin().unwrap();
+
+        assert!(
+            state
+                .acquire_table_size_read_owned(Some(owner), 2, 11)
+                .unwrap()
+        );
+        assert!(state.owns_table_size_read_owned(Some(owner), 2));
+        assert!(!state.owns_table_granule_read_owned(Some(owner), 2, 0));
+
+        assert!(
+            state
+                .acquire_table_size_write_owned(Some(owner), 2, 11)
+                .unwrap()
+        );
+        assert!(state.owns_table_size_write_owned(Some(owner), 2));
+        assert!(!state.owns_table_granule_write_owned(Some(owner), 2, 0));
     }
 
     #[test]

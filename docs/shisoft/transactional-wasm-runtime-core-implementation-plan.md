@@ -23,12 +23,18 @@ failure-handler work:
   operations.
 - Implement Wizard-style transaction boundaries for exported/top-level `tfunc`
   and non-transactional-to-transactional `tcall`.
+- Wire first `ttable.get/set/size/grow` runtime paths for funcref tables using
+  `TTable` and `TTableSize` granule ownership.
 - Move scalar memory/global proposal WAST execution toward real parser and real
   runtime paths.
 
 This plan does not implement:
 
-- Persistent `ObjectId` or the full object table.
+- Table-element COW, table bulk operators, and the full object table.
+  `GranuleId::TTable` and `GranuleId::TTableSize` are used by the first funcref
+  table runtime paths; `GranuleId::TStruct` and `GranuleId::TArray` remain
+  reserved for object-table work. `ObjectId` is carried inside the struct/array
+  granule variants, not used as a standalone ownership key.
 - Transactional structs, arrays, refs, GC integration, or reference-control
   permissions.
 - `ttry`/`tfail` structured failure handlers.
@@ -65,12 +71,14 @@ metadata.
 
 - `crates/wasmtime/src/runtime/vm/libcalls.rs`
   - Routes scalar `*.tload`, `*.tstore`, `tmemory.size`, `tmemory.grow`,
-    `tglobal.get`, and `tglobal.set` to the real transaction runtime.
+    `tglobal.get`, `tglobal.set`, and funcref `ttable.get/set/size/grow` to
+    the real transaction runtime.
 
 - `crates/cranelift/src/func_environ.rs`
   - Lowers transaction memory/global operators to the typed transaction
-    libcalls. Removes per-operation lazy transaction starts after function
-    boundary lowering is in place.
+    libcalls, and lowers the first funcref table transaction operators to
+    table transaction libcalls. Removes per-operation lazy transaction starts
+    after function boundary lowering is in place.
 
 - `crates/cranelift/src/translate/code_translator.rs`
   - Keeps transaction operator dispatch explicit and prevents ordinary
@@ -559,7 +567,9 @@ Expected: commit succeeds with no unrelated files staged.
 - Test: `crates/wasmtime/src/runtime/transaction.rs`
 
 This task replaces memory/global-specific workspace keys with the Wizard-style
-identity shape that can later carry `ObjectId`.
+identity shape. `GranuleId::TTable` and `GranuleId::TTableSize` are now used by
+the first funcref `ttable` runtime paths; table COW, `GranuleId::TStruct`, and
+`GranuleId::TArray` remain for future table/object-table work.
 
 - [ ] **Step 1: Add failing GranuleId and workspace tests**
 
@@ -2023,6 +2033,6 @@ Review order:
 5. Merge Worker E after scalar WAST files run through real parser/runtime
    without normalization or fixture replacement.
 
-Stop before implementing persistent `ObjectId`, the object table, `ttry`/`tfail`,
-or SIMD transactional memory. Those are separate workstreams that build on this
+Stop before wiring object-space granules, the object table, `ttry`/`tfail`, or
+SIMD transactional memory. Those are separate workstreams that build on this
 runtime core.

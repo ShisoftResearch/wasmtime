@@ -346,6 +346,17 @@ fn transaction_tglobal_set(
     result
 }
 
+fn transaction_tglobal_set_v128(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    value: *mut u8,
+) -> Result<()> {
+    let result = transaction_tglobal_set_v128_impl(store, instance, global, value);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
 fn transaction_tglobal_get_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -394,6 +405,27 @@ fn transaction_tglobal_set_impl(
     Ok(())
 }
 
+fn transaction_tglobal_set_v128_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    value: *mut u8,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+
+    let (global_index, wasm_ty) = defined_transaction_global(store, instance, global)?;
+    ensure!(
+        matches!(wasm_ty, WasmValType::V128),
+        "transactional global value tag does not match global type"
+    );
+    let snapshot = GlobalSnapshot::V128(unsafe { *value.cast::<[u8; 16]>() });
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_global_owned(Some(instance), global_index.as_u32(), snapshot)?;
+    Ok(())
+}
+
 fn defined_transaction_global(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -435,8 +467,9 @@ fn read_global_snapshot(
         WasmValType::I64 => Ok(GlobalSnapshot::I64(unsafe { *global.as_i64() })),
         WasmValType::F32 => Ok(GlobalSnapshot::F32(unsafe { *global.as_f32_bits() })),
         WasmValType::F64 => Ok(GlobalSnapshot::F64(unsafe { *global.as_f64_bits() })),
-        WasmValType::V128 | WasmValType::Ref(_) => {
-            // SHISOFT-TWASM-MOCK: global overlays support scalar snapshots only.
+        WasmValType::V128 => Ok(GlobalSnapshot::V128(unsafe { *global.as_u128_bits() })),
+        WasmValType::Ref(_) => {
+            // SHISOFT-TWASM-MOCK: global overlays do not yet support reference/object snapshots.
             bail!("transactional global type is not implemented yet")
         }
     }
@@ -449,6 +482,7 @@ fn write_global_snapshot(global: &mut vm::VMGlobalDefinition, value: GlobalSnaps
             GlobalSnapshot::I64(value) => *global.as_i64_mut() = value,
             GlobalSnapshot::F32(value) => *global.as_f32_bits_mut() = value,
             GlobalSnapshot::F64(value) => *global.as_f64_bits_mut() = value,
+            GlobalSnapshot::V128(value) => global.as_u128_bits_mut().copy_from_slice(&value),
         }
     }
 }
@@ -460,6 +494,7 @@ fn ensure_global_snapshot_type(value: GlobalSnapshot, ty: WasmValType) -> Result
             | (GlobalSnapshot::I64(_), WasmValType::I64)
             | (GlobalSnapshot::F32(_), WasmValType::F32)
             | (GlobalSnapshot::F64(_), WasmValType::F64)
+            | (GlobalSnapshot::V128(_), WasmValType::V128)
     );
     ensure!(
         matches,
@@ -474,6 +509,7 @@ fn global_snapshot_bytes(value: GlobalSnapshot) -> Vec<u8> {
         GlobalSnapshot::I64(value) => value.to_ne_bytes().to_vec(),
         GlobalSnapshot::F32(value) => value.to_ne_bytes().to_vec(),
         GlobalSnapshot::F64(value) => value.to_ne_bytes().to_vec(),
+        GlobalSnapshot::V128(value) => value.to_vec(),
     }
 }
 
@@ -628,6 +664,204 @@ fn transaction_tmemory_grow_impl(
     )))
 }
 
+fn transaction_ttable_get(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+) -> Result<*mut u8> {
+    let result = transaction_ttable_get_impl(store, instance, table, index);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_get_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+) -> Result<*mut u8> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    ensure_defined_table_index_in_bounds(store, instance, table, index)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_table_granule_read_owned(Some(instance), table, index, 0)?;
+
+    let table_index = DefinedTableIndex::from_u32(table);
+    let (mut instance_ref, registry) = store.instance_and_module_registry_mut(instance);
+    let table_ref = instance_ref.as_mut().get_defined_table_with_lazy_init(
+        registry,
+        table_index,
+        core::iter::once(index),
+    );
+    let elem = table_ref.get_func(index)?;
+    Ok(match elem {
+        Some(ptr) => ptr.as_ptr().cast(),
+        None => core::ptr::null_mut(),
+    })
+}
+
+fn transaction_ttable_set(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+    value: *mut u8,
+) -> Result<()> {
+    let result = transaction_ttable_set_impl(store, instance, table, index, value);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_set_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+    value: *mut u8,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    ensure_defined_table_index_in_bounds(store, instance, table, index)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_table_granule_write_owned(Some(instance), table, index, 0)?;
+
+    let elem = NonNull::new(value.cast::<vm::VMFuncRef>());
+    let table_index = DefinedTableIndex::from_u32(table);
+    let mut instance_ref = store.instance_mut(instance);
+    // SHISOFT-TWASM-MOCK: writes go straight to Wasmtime's table backing for
+    // this runtime path. Table-element COW will replace this direct mutation.
+    instance_ref
+        .as_mut()
+        .get_defined_table(table_index)
+        .set_func(index, elem)?;
+    Ok(())
+}
+
+fn transaction_ttable_read_range(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    let result = transaction_ttable_read_range_impl(store, instance, table, start, len);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_read_range_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    ensure_defined_table_range_in_bounds(store, instance, table, start, len)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_table_granule_read_range_owned(Some(instance), table, start, len, 0)?;
+    Ok(())
+}
+
+fn transaction_ttable_write_range(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    let result = transaction_ttable_write_range_impl(store, instance, table, start, len);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_write_range_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    ensure_defined_table_range_in_bounds(store, instance, table, start, len)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_table_granule_write_range_owned(Some(instance), table, start, len, 0)?;
+    Ok(())
+}
+
+fn transaction_ttable_size(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+) -> Result<*mut u8> {
+    let result = transaction_ttable_size_impl(store, instance, table);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_size_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+) -> Result<*mut u8> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_table_size_read_owned(Some(instance), table, 0)?;
+    let size = defined_table_size(store, instance, table)?;
+    Ok(size as *mut u8)
+}
+
+fn transaction_ttable_grow(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    delta: u64,
+) -> Result<Option<AllocationSize>> {
+    let result = transaction_ttable_grow_impl(store, instance, table, delta);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_grow_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    delta: u64,
+) -> Result<Option<AllocationSize>> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_table_size_write_owned(Some(instance), table, 0)?;
+
+    let table_index = DefinedTableIndex::from_u32(table);
+    let (mut limiter, store) = store.resource_limiter_and_store_opaque();
+    let limiter = limiter.as_mut();
+    block_on!(store, async |store, _| unsafe {
+        let result = store
+            .instance_mut(instance)
+            .defined_table_grow(table_index, limiter, delta)
+            .await?
+            .map(AllocationSize);
+        Ok(result)
+    })?
+}
+
 fn checked_tmemory_effective_address(addr: u64, offset: u64) -> Result<u64> {
     addr.checked_add(offset).with_context(|| {
         format!("out of bounds tmemory access: address {addr} plus offset {offset} overflows")
@@ -748,6 +982,42 @@ fn resolve_defined_tmemory_index(
     Ok(memory_index)
 }
 
+fn defined_table_size(store: &mut dyn VMStore, instance: InstanceId, table: u32) -> Result<usize> {
+    let table = DefinedTableIndex::from_u32(table);
+    let mut instance_ref = store.instance_mut(instance);
+    Ok(instance_ref.as_mut().get_defined_table(table).size())
+}
+
+fn ensure_defined_table_index_in_bounds(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+) -> Result<()> {
+    let index = usize::try_from(index).map_err(|_| Trap::TableOutOfBounds)?;
+    let size = defined_table_size(store, instance, table)?;
+    if index >= size {
+        bail!(Trap::TableOutOfBounds);
+    }
+    Ok(())
+}
+
+fn ensure_defined_table_range_in_bounds(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    let size = u64::try_from(defined_table_size(store, instance, table)?)
+        .context("defined table size does not fit u64")?;
+    let end = start.checked_add(len).ok_or(Trap::TableOutOfBounds)?;
+    if start > size || end > size {
+        bail!(Trap::TableOutOfBounds);
+    }
+    Ok(())
+}
+
 fn collect_defined_tmemory_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -798,7 +1068,12 @@ fn current_granule_version(
                     .context("tmemory granule index does not fit host usize")?,
             )
         }
-        GranuleId::TMemorySize { .. } | GranuleId::TGlobal { .. } => Ok(0),
+        GranuleId::TMemorySize { .. }
+        | GranuleId::TGlobal { .. }
+        | GranuleId::TTable { .. }
+        | GranuleId::TTableSize { .. }
+        | GranuleId::TStruct { .. }
+        | GranuleId::TArray { .. } => Ok(0),
     }
 }
 

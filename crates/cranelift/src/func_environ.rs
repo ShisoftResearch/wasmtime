@@ -3630,6 +3630,28 @@ impl FuncEnvironment<'_> {
         let expected_ty = self.transaction_global_value_type(wasm_ty)?;
         debug_assert_eq!(expected_ty, builder.func.dfg.value_type(val));
 
+        if matches!(wasm_ty, WasmValType::V128) {
+            let callee = self.builtin_functions.load_builtin(
+                builder.func,
+                BuiltinFunctionIndex::transaction_tglobal_set_v128(),
+            );
+            let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+                ir::StackSlotKind::ExplicitSlot,
+                16,
+                4,
+            ));
+            let ptr = builder.ins().stack_addr(self.pointer_type(), slot, 0);
+            builder.ins().store(MemFlagsData::trusted(), val, ptr, 0);
+
+            let mut pos = builder.cursor();
+            let vmctx = self.vmctx_val(&mut pos);
+            let global = pos
+                .ins()
+                .iconst(I32, i64::try_from(global.index()).unwrap());
+            pos.ins().call(callee, &[vmctx, global, ptr]);
+            return Ok(());
+        }
+
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tglobal_set(),
@@ -3648,14 +3670,14 @@ impl FuncEnvironment<'_> {
 
     fn transaction_global_value_type(&self, ty: WasmValType) -> WasmResult<ir::Type> {
         match ty {
-            WasmValType::I32 | WasmValType::I64 | WasmValType::F32 | WasmValType::F64 => {
-                Ok(super::value_type(self.isa, ty))
-            }
-            WasmValType::V128 | WasmValType::Ref(_) => {
-                Err(wasmtime_environ::WasmError::Unsupported(
-                    "transactional global type is not implemented yet".into(),
-                ))
-            }
+            WasmValType::I32
+            | WasmValType::I64
+            | WasmValType::F32
+            | WasmValType::F64
+            | WasmValType::V128 => Ok(super::value_type(self.isa, ty)),
+            WasmValType::Ref(_) => Err(wasmtime_environ::WasmError::Unsupported(
+                "transactional global type is not implemented yet".into(),
+            )),
         }
     }
 
@@ -3808,6 +3830,229 @@ impl FuncEnvironment<'_> {
         ))
     }
 
+    pub fn translate_transaction_ttable_size(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+    ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_table(table_index)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_ttable_size(),
+        );
+        let index_type = self.table(table_index).idx_type;
+
+        let mut pos = builder.cursor();
+        let (table_vmctx, defined_table_index) =
+            self.table_vmctx_and_defined_index(&mut pos, table_index);
+        let call = pos.ins().call(callee, &[table_vmctx, defined_table_index]);
+        let size = pos.func.dfg.inst_results(call)[0];
+        Ok(self.convert_pointer_to_index_type(builder.cursor(), size, index_type, false))
+    }
+
+    pub fn translate_transaction_ttable_grow(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        delta: ir::Value,
+        init_value: ir::Value,
+    ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_table(table_index)?;
+        self.ensure_transaction_table_funcref(table_index)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_ttable_grow(),
+        );
+        let index_type = self.table(table_index).idx_type;
+
+        let mut pos = builder.cursor();
+        let (table_vmctx, defined_table_index) =
+            self.table_vmctx_and_defined_index(&mut pos, table_index);
+        let delta64 = self.cast_index_to_i64(&mut pos, delta, index_type);
+        let call = pos
+            .ins()
+            .call(callee, &[table_vmctx, defined_table_index, delta64]);
+        let result = pos.func.dfg.inst_results(call)[0];
+        let result_idx =
+            self.convert_pointer_to_index_type(builder.cursor(), result, index_type, false);
+
+        let current_block = builder.current_block().unwrap();
+        let fill_block = builder.create_block();
+        let done_block = builder.create_block();
+
+        builder.insert_block_after(fill_block, current_block);
+        builder.insert_block_after(done_block, fill_block);
+
+        let failure = builder.ins().iconst(index_type_to_ir_type(index_type), -1);
+        let failed = builder.ins().icmp(IntCC::Equal, result_idx, failure);
+        builder.ins().brif(failed, done_block, &[], fill_block, &[]);
+
+        builder.switch_to_block(fill_block);
+        // SHISOFT-TWASM-MOCK: table grow itself acquires TTableSize. The
+        // initialization fill uses Wasmtime's ordinary table path until
+        // table-element COW is introduced.
+        self.translate_table_fill(builder, table_index, result_idx, init_value, delta)?;
+        builder.ins().jump(done_block, &[]);
+
+        builder.switch_to_block(done_block);
+
+        builder.seal_block(fill_block);
+        builder.seal_block(done_block);
+
+        Ok(result_idx)
+    }
+
+    pub fn translate_transaction_ttable_get(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        index: ir::Value,
+    ) -> WasmResult<ir::Value> {
+        self.ensure_transaction_table(table_index)?;
+        self.ensure_transaction_table_funcref(table_index)?;
+        let callee = self
+            .builtin_functions
+            .load_builtin(builder.func, BuiltinFunctionIndex::transaction_ttable_get());
+        let index_type = self.table(table_index).idx_type;
+
+        let mut pos = builder.cursor();
+        let (table_vmctx, defined_table_index) =
+            self.table_vmctx_and_defined_index(&mut pos, table_index);
+        let index = self.cast_index_to_i64(&mut pos, index, index_type);
+        let call = pos
+            .ins()
+            .call(callee, &[table_vmctx, defined_table_index, index]);
+        Ok(pos.func.dfg.inst_results(call)[0])
+    }
+
+    pub fn translate_transaction_ttable_set(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        value: ir::Value,
+        index: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_table(table_index)?;
+        self.ensure_transaction_table_funcref(table_index)?;
+        let callee = self
+            .builtin_functions
+            .load_builtin(builder.func, BuiltinFunctionIndex::transaction_ttable_set());
+        let index_type = self.table(table_index).idx_type;
+
+        let mut pos = builder.cursor();
+        let (table_vmctx, defined_table_index) =
+            self.table_vmctx_and_defined_index(&mut pos, table_index);
+        let index = self.cast_index_to_i64(&mut pos, index, index_type);
+        pos.ins()
+            .call(callee, &[table_vmctx, defined_table_index, index, value]);
+        Ok(())
+    }
+
+    pub fn translate_transaction_ttable_fill(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        dest: ir::Value,
+        value: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_table(table_index)?;
+        self.ensure_transaction_table_funcref(table_index)?;
+        self.translate_transaction_ttable_write_range(builder, table_index, dest, len)?;
+        // SHISOFT-TWASM-MOCK: this acquires transactional table ownership but
+        // still applies through Wasmtime's ordinary table backing. Replace this
+        // with table-element COW when the real object/table workspace lands.
+        self.translate_table_fill(builder, table_index, dest, value, len)
+    }
+
+    pub fn translate_transaction_ttable_copy(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        dst_table_index: TableIndex,
+        src_table_index: TableIndex,
+        dst: ir::Value,
+        src: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_table(dst_table_index)?;
+        self.ensure_transaction_table(src_table_index)?;
+        self.ensure_transaction_table_funcref(dst_table_index)?;
+        self.ensure_transaction_table_funcref(src_table_index)?;
+        self.translate_transaction_ttable_read_range(builder, src_table_index, src, len)?;
+        self.translate_transaction_ttable_write_range(builder, dst_table_index, dst, len)?;
+        // SHISOFT-TWASM-MOCK: ownership is transactional, data movement still
+        // reuses the ordinary Wasmtime table copy implementation.
+        self.translate_table_copy(builder, dst_table_index, src_table_index, dst, src, len)
+    }
+
+    pub fn translate_transaction_ttable_init(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        seg_index: u32,
+        table_index: TableIndex,
+        dst: ir::Value,
+        src: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_table(table_index)?;
+        self.ensure_transaction_table_funcref(table_index)?;
+        self.translate_transaction_ttable_write_range(builder, table_index, dst, len)?;
+        // SHISOFT-TWASM-MOCK: ownership is transactional, element initialization
+        // still reuses the ordinary Wasmtime table init implementation.
+        self.translate_table_init(builder, seg_index, table_index, dst, src, len)
+    }
+
+    fn translate_transaction_ttable_read_range(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        start: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.translate_transaction_ttable_range(
+            builder,
+            BuiltinFunctionIndex::transaction_ttable_read_range(),
+            table_index,
+            start,
+            len,
+        )
+    }
+
+    fn translate_transaction_ttable_write_range(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        start: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.translate_transaction_ttable_range(
+            builder,
+            BuiltinFunctionIndex::transaction_ttable_write_range(),
+            table_index,
+            start,
+            len,
+        )
+    }
+
+    fn translate_transaction_ttable_range(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        builtin: BuiltinFunctionIndex,
+        table_index: TableIndex,
+        start: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        let callee = self.builtin_functions.load_builtin(builder.func, builtin);
+        let mut pos = builder.cursor();
+        let (table_vmctx, defined_table_index) =
+            self.table_vmctx_and_defined_index(&mut pos, table_index);
+        let start = cast_index_value_to_i64(&mut pos, start);
+        let len = cast_index_value_to_i64(&mut pos, len);
+        pos.ins()
+            .call(callee, &[table_vmctx, defined_table_index, start, len]);
+        Ok(())
+    }
+
     fn ensure_transaction_memory(&self, memory: MemoryIndex) -> WasmResult<()> {
         if self.module.transaction_objects.is_tmemory(memory) {
             return Ok(());
@@ -3826,6 +4071,28 @@ impl FuncEnvironment<'_> {
             message: "transactional global operator requires tglobal".into(),
             offset: self.func_body_offset,
         })
+    }
+
+    fn ensure_transaction_table(&self, table: TableIndex) -> WasmResult<()> {
+        if self.module.transaction_objects.is_ttable(table) {
+            return Ok(());
+        }
+        Err(wasmtime_environ::WasmError::InvalidWebAssembly {
+            message: "transactional table operator requires ttable".into(),
+            offset: self.func_body_offset,
+        })
+    }
+
+    fn ensure_transaction_table_funcref(&self, table: TableIndex) -> WasmResult<()> {
+        if matches!(
+            self.module.tables[table].ref_type.heap_type.top(),
+            WasmHeapTopType::Func
+        ) {
+            return Ok(());
+        }
+        Err(wasmtime_environ::WasmError::Unsupported(
+            "transactional table type is not implemented yet".into(),
+        ))
     }
 
     fn translate_transaction_lifecycle_builtin(
@@ -6566,6 +6833,14 @@ fn index_type_to_ir_type(index_type: IndexType) -> ir::Type {
     match index_type {
         IndexType::I32 => I32,
         IndexType::I64 => I64,
+    }
+}
+
+fn cast_index_value_to_i64(pos: &mut FuncCursor<'_>, value: ir::Value) -> ir::Value {
+    match pos.func.dfg.value_type(value) {
+        I32 => pos.ins().uextend(I64, value),
+        I64 => value,
+        ty => unreachable!("wasm table index value has unexpected type {ty}"),
     }
 }
 
