@@ -4,7 +4,60 @@
 
 use crate::prelude::*;
 
-use super::block_region::{ChunkList, VMemoryBlockRegion};
+use super::block_region::{BLOCK_SIZE, ChunkList, IMMIX_LINE_SIZE, VMemoryBlockRegion};
+
+#[derive(Debug)]
+pub(super) struct TMemoryRegion {
+    linear: MappedLinearRegion,
+}
+
+impl TMemoryRegion {
+    pub(super) fn new(byte_capacity: usize) -> Result<Self> {
+        let block_count = byte_capacity.div_ceil(BLOCK_SIZE);
+        let mut backend = VMemoryBlockRegion::new(block_count)?;
+        let chunks = if block_count == 0 {
+            Vec::new()
+        } else {
+            vec![backend.alloc_chunk(block_count)?]
+        };
+        let chunks = ChunkList::from_chunks(chunks)?;
+        Ok(Self {
+            linear: MappedLinearRegion::new(backend, chunks),
+        })
+    }
+
+    pub(super) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.linear.read(offset, len)
+    }
+
+    pub(super) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.linear.write(offset, bytes)
+    }
+
+    pub(super) fn fill(&mut self, range: core::ops::Range<usize>, byte: u8) -> Result<()> {
+        ensure!(
+            range.start <= range.end,
+            "transactional linear fill invalid range"
+        );
+        let len = range.end - range.start;
+        if len == 0 {
+            return Ok(());
+        }
+        self.linear.write(range.start, &vec![byte; len])
+    }
+
+    pub(super) fn block_size_for_test(&self) -> usize {
+        BLOCK_SIZE
+    }
+
+    pub(super) fn immix_line_size_for_test(&self) -> usize {
+        IMMIX_LINE_SIZE
+    }
+
+    pub(super) fn line_mark_count_for_test(&self) -> usize {
+        self.linear.line_mark_count_for_test()
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct MappedLinearRegion {
@@ -19,6 +72,10 @@ impl MappedLinearRegion {
 
     pub(super) fn logical_len(&self) -> usize {
         self.chunks.logical_len()
+    }
+
+    pub(super) fn line_mark_count_for_test(&self) -> usize {
+        self.backend.line_count()
     }
 
     pub(super) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {

@@ -9,11 +9,12 @@
 
 use crate::prelude::*;
 use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
-use crate::runtime::vm::{HostAlignedByteCount, Mmap, mmap::AlignedLength};
 use wasmtime_environ::MemoryIndex;
 
 mod block_region;
 mod linear_region;
+
+use self::linear_region::TMemoryRegion;
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
 const DEFAULT_MAX_WASM_PAGES: u64 = 1 << 16;
@@ -41,6 +42,12 @@ pub(crate) trait TMemoryBackendStorage: core::fmt::Debug + Send + Sync {
     fn grow_to_pages(&mut self, new_pages: u64) -> Result<()>;
     fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo>;
     fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()>;
+    #[cfg(test)]
+    fn block_region_block_size_for_test(&self) -> usize;
+    #[cfg(test)]
+    fn immix_line_size_for_test(&self) -> usize;
+    #[cfg(test)]
+    fn line_mark_count_for_test(&self) -> usize;
 }
 
 /// Transactional memory storage selected by transaction configuration.
@@ -180,6 +187,21 @@ impl TMemory {
         self.storage.set_granule_info(granule, info)
     }
 
+    #[cfg(test)]
+    pub(crate) fn block_region_block_size_for_test(&self) -> usize {
+        self.storage.block_region_block_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn immix_line_size_for_test(&self) -> usize {
+        self.storage.immix_line_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn line_mark_count_for_test(&self) -> usize {
+        self.storage.line_mark_count_for_test()
+    }
+
     fn new_for_backend(
         backend: TMemoryBackend,
         min_pages: u64,
@@ -198,11 +220,10 @@ impl TMemory {
 /// Volatile anonymous-mmap transactional memory storage.
 #[derive(Debug)]
 pub(crate) struct VMemory {
-    data: Mmap<AlignedLength>,
-    granules: Mmap<AlignedLength>,
+    region: TMemoryRegion,
+    granules: Vec<TMemoryGranuleInfo>,
     byte_len: usize,
     byte_capacity: usize,
-    granule_capacity: usize,
     max_pages: u64,
 }
 
@@ -218,29 +239,12 @@ impl VMemory {
         };
 
         let granule_capacity = granules_for_bytes(byte_capacity);
-        let granule_len = granules_for_bytes(byte_len);
-
-        let data_mapping_size = HostAlignedByteCount::new_rounded_up(byte_capacity)?;
-        let data_accessible = HostAlignedByteCount::new_rounded_up(byte_len)?;
-        let data = Mmap::accessible_reserved(data_accessible, data_mapping_size)?;
-
-        let granule_mapping_bytes = granule_capacity
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata size overflow")?;
-        let granule_accessible_bytes = granule_len
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata size overflow")?;
-        let granules = Mmap::accessible_reserved(
-            HostAlignedByteCount::new_rounded_up(granule_accessible_bytes)?,
-            HostAlignedByteCount::new_rounded_up(granule_mapping_bytes)?,
-        )?;
 
         Ok(Self {
-            data,
-            granules,
+            region: TMemoryRegion::new(byte_capacity)?,
+            granules: vec![TMemoryGranuleInfo::default(); granule_capacity],
             byte_len,
             byte_capacity,
-            granule_capacity,
             max_pages,
         })
     }
@@ -254,7 +258,7 @@ impl VMemory {
     }
 
     pub(crate) fn granule_capacity(&self) -> usize {
-        self.granule_capacity
+        self.granules.len()
     }
 
     pub(crate) fn granule_index(addr: u64) -> Result<usize> {
@@ -278,34 +282,6 @@ impl VMemory {
             self.reserve_capacity_to_pages(new_pages)?;
         }
 
-        let old_accessible = HostAlignedByteCount::new_rounded_up(self.byte_len)?;
-        let new_accessible = HostAlignedByteCount::new_rounded_up(new_byte_len)?;
-        let data_delta = new_accessible
-            .checked_sub(old_accessible)
-            .context("tmemory accessible data underflow")?;
-        // SAFETY: this is newly live memory that has not been handed out.
-        unsafe {
-            self.data.make_accessible(old_accessible, data_delta)?;
-        }
-
-        let old_granule_bytes = self
-            .granule_len()
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata size overflow")?;
-        let new_granule_bytes = granules_for_bytes(new_byte_len)
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata size overflow")?;
-        let old_granule_accessible = HostAlignedByteCount::new_rounded_up(old_granule_bytes)?;
-        let new_granule_accessible = HostAlignedByteCount::new_rounded_up(new_granule_bytes)?;
-        let granule_delta = new_granule_accessible
-            .checked_sub(old_granule_accessible)
-            .context("tmemory accessible granule metadata underflow")?;
-        // SAFETY: this is newly live metadata that has not been handed out.
-        unsafe {
-            self.granules
-                .make_accessible(old_granule_accessible, granule_delta)?;
-        }
-
         self.byte_len = new_byte_len;
         Ok(())
     }
@@ -320,44 +296,18 @@ impl VMemory {
             return Ok(());
         }
 
-        let old_data_accessible = HostAlignedByteCount::new_rounded_up(self.byte_len)?;
-        let new_data_mapping = HostAlignedByteCount::new_rounded_up(new_byte_capacity)?;
-        let mut data = Mmap::accessible_reserved(old_data_accessible, new_data_mapping)?;
+        let mut region = TMemoryRegion::new(new_byte_capacity)?;
         if self.byte_len > 0 {
-            // SAFETY: the source and destination ranges are live for
-            // `self.byte_len`, and this method has exclusive access to both.
-            unsafe {
-                let old = self.data.slice(0..self.byte_len);
-                data.slice_mut(0..self.byte_len).copy_from_slice(old);
-            }
+            let old = self.region.read(0, self.byte_len)?;
+            region.write(0, &old)?;
         }
 
-        let old_granule_bytes = self
-            .granule_len()
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata size overflow")?;
         let new_granule_capacity = granules_for_bytes(new_byte_capacity);
-        let new_granule_mapping_bytes = new_granule_capacity
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata size overflow")?;
-        let old_granule_accessible = HostAlignedByteCount::new_rounded_up(old_granule_bytes)?;
-        let new_granule_mapping = HostAlignedByteCount::new_rounded_up(new_granule_mapping_bytes)?;
-        let mut granules = Mmap::accessible_reserved(old_granule_accessible, new_granule_mapping)?;
-        if old_granule_bytes > 0 {
-            // SAFETY: the source and destination metadata ranges are live for
-            // `old_granule_bytes`, and this method has exclusive access.
-            unsafe {
-                let old = self.granules.slice(0..old_granule_bytes);
-                granules
-                    .slice_mut(0..old_granule_bytes)
-                    .copy_from_slice(old);
-            }
-        }
+        self.granules
+            .resize(new_granule_capacity, TMemoryGranuleInfo::default());
 
-        self.data = data;
-        self.granules = granules;
+        self.region = region;
         self.byte_capacity = new_byte_capacity;
-        self.granule_capacity = new_granule_capacity;
         Ok(())
     }
 
@@ -369,24 +319,12 @@ impl VMemory {
         let new_granule_len = granules_for_bytes(new_byte_len);
 
         if new_byte_len < old_byte_len {
-            // SAFETY: the truncated byte range is currently accessible and we
-            // have exclusive access to the storage.
-            unsafe {
-                self.data.slice_mut(new_byte_len..old_byte_len).fill(0);
-            }
+            self.region.fill(new_byte_len..old_byte_len, 0)?;
         }
 
         if new_granule_len < old_granule_len {
-            let start = new_granule_len
-                .checked_mul(size_of::<TMemoryGranuleInfo>())
-                .context("tmemory granule metadata offset overflow")?;
-            let end = old_granule_len
-                .checked_mul(size_of::<TMemoryGranuleInfo>())
-                .context("tmemory granule metadata offset overflow")?;
-            // SAFETY: the truncated metadata range is currently accessible and
-            // we have exclusive access to the storage.
-            unsafe {
-                self.granules.slice_mut(start..end).fill(0);
+            for info in &mut self.granules[new_granule_len..old_granule_len] {
+                *info = TMemoryGranuleInfo::default();
             }
         }
 
@@ -399,13 +337,7 @@ impl VMemory {
             granule < self.granule_len(),
             "tmemory granule out of bounds"
         );
-        let start = granule
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata offset overflow")?;
-        let end = start + size_of::<TMemoryGranuleInfo>();
-        // SAFETY: bounds are checked above and the metadata range is live.
-        let bytes = unsafe { self.granules.slice(start..end) };
-        Ok(read_granule_info(bytes))
+        Ok(self.granules[granule])
     }
 
     pub(crate) fn copy_granule(&self, granule: usize) -> Result<Vec<u8>> {
@@ -414,8 +346,7 @@ impl VMemory {
             "tmemory granule out of bounds"
         );
         let range = self.granule_range(granule)?;
-        // SAFETY: bounds are checked by `granule_range`.
-        Ok(unsafe { self.data.slice(range) }.to_vec())
+        self.region.read(range.start, range.end - range.start)
     }
 
     pub(crate) fn write_granule(&mut self, granule: usize, bytes: &[u8]) -> Result<()> {
@@ -428,11 +359,7 @@ impl VMemory {
             bytes.len() == range.end - range.start,
             "tmemory granule writeback length mismatch"
         );
-        // SAFETY: bounds are checked by `granule_range` and we have `&mut self`.
-        unsafe {
-            self.data.slice_mut(range).copy_from_slice(bytes);
-        }
-        Ok(())
+        self.region.write(range.start, bytes)
     }
 
     pub(crate) fn set_txn_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
@@ -440,32 +367,20 @@ impl VMemory {
             granule < self.granule_len(),
             "tmemory granule out of bounds"
         );
-        let start = granule
-            .checked_mul(size_of::<TMemoryGranuleInfo>())
-            .context("tmemory granule metadata offset overflow")?;
-        let end = start + size_of::<TMemoryGranuleInfo>();
-        // SAFETY: bounds are checked above and the metadata range is live.
-        unsafe {
-            write_granule_info(self.granules.slice_mut(start..end), info);
-        }
+        self.granules[granule] = info;
         Ok(())
     }
 
     pub(crate) fn fill(&mut self, range: core::ops::Range<usize>, byte: u8) -> Result<()> {
         ensure!(range.start <= range.end, "tmemory write invalid range");
         ensure!(range.end <= self.byte_len, "tmemory write out of bounds");
-        // SAFETY: bounds are checked above and we have `&mut self`.
-        unsafe {
-            self.data.slice_mut(range).fill(byte);
-        }
-        Ok(())
+        self.region.fill(range, byte)
     }
 
     pub(crate) fn read(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
         ensure!(range.start <= range.end, "tmemory read invalid range");
         ensure!(range.end <= self.byte_len, "tmemory read out of bounds");
-        // SAFETY: bounds are checked above.
-        Ok(unsafe { self.data.slice(range) }.to_vec())
+        self.region.read(range.start, range.end - range.start)
     }
 
     fn granule_range(&self, granule: usize) -> Result<core::ops::Range<usize>> {
@@ -477,6 +392,21 @@ impl VMemory {
             .saturating_add(TMEMORY_GRANULE_SIZE)
             .min(self.byte_len);
         Ok(start..end)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_region_block_size_for_test(&self) -> usize {
+        self.region.block_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn immix_line_size_for_test(&self) -> usize {
+        self.region.immix_line_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn line_mark_count_for_test(&self) -> usize {
+        self.region.line_mark_count_for_test()
     }
 }
 
@@ -506,11 +436,7 @@ impl TMemoryBackendStorage for VMemory {
             .checked_add(bytes.len())
             .context("tmemory write address overflow")?;
         ensure!(end <= self.byte_len, "tmemory write out of bounds");
-        // SAFETY: bounds are checked above and we have `&mut self`.
-        unsafe {
-            self.data.slice_mut(addr..end).copy_from_slice(bytes);
-        }
-        Ok(())
+        self.region.write(addr, bytes)
     }
 
     fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
@@ -524,6 +450,21 @@ impl TMemoryBackendStorage for VMemory {
     fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
         self.set_txn_info(granule, info)
     }
+
+    #[cfg(test)]
+    fn block_region_block_size_for_test(&self) -> usize {
+        self.block_region_block_size_for_test()
+    }
+
+    #[cfg(test)]
+    fn immix_line_size_for_test(&self) -> usize {
+        self.immix_line_size_for_test()
+    }
+
+    #[cfg(test)]
+    fn line_mark_count_for_test(&self) -> usize {
+        self.line_mark_count_for_test()
+    }
 }
 
 fn pages_to_bytes(pages: u64) -> Result<usize> {
@@ -535,25 +476,6 @@ fn pages_to_bytes(pages: u64) -> Result<usize> {
 
 fn granules_for_bytes(bytes: usize) -> usize {
     bytes.div_ceil(TMEMORY_GRANULE_SIZE)
-}
-
-fn read_granule_info(bytes: &[u8]) -> TMemoryGranuleInfo {
-    debug_assert_eq!(bytes.len(), size_of::<TMemoryGranuleInfo>());
-    let owner = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-    let version = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
-    let hash = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
-    TMemoryGranuleInfo {
-        owner,
-        version,
-        hash,
-    }
-}
-
-fn write_granule_info(bytes: &mut [u8], info: TMemoryGranuleInfo) {
-    debug_assert_eq!(bytes.len(), size_of::<TMemoryGranuleInfo>());
-    bytes[0..8].copy_from_slice(&info.owner.to_ne_bytes());
-    bytes[8..16].copy_from_slice(&info.version.to_ne_bytes());
-    bytes[16..24].copy_from_slice(&info.hash.to_ne_bytes());
 }
 
 fn unsupported_backend_error(backend: TMemoryBackend) -> Error {
@@ -582,6 +504,45 @@ mod tests {
         assert_eq!(memory.backend(), TMemoryBackend::VMemory);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
         assert_eq!(memory.granule_len(), 256);
+    }
+
+    #[test]
+    fn tmemory_vmemory_uses_block_region_storage() {
+        let memory = TMemory::new_vmemory_with_limits(0, Some(0)).unwrap();
+
+        assert_eq!(
+            memory.block_region_block_size_for_test(),
+            block_region::BLOCK_SIZE
+        );
+        assert_eq!(
+            memory.immix_line_size_for_test(),
+            block_region::IMMIX_LINE_SIZE
+        );
+        assert_eq!(memory.line_mark_count_for_test(), 0);
+    }
+
+    #[test]
+    fn tmemory_commit_and_read_crosses_block_region_chunk_boundary() {
+        let mut memory = TMemory::new_vmemory_with_limits(9, Some(9)).unwrap();
+
+        assert_eq!(
+            memory.block_region_block_size_for_test(),
+            block_region::BLOCK_SIZE
+        );
+        assert_eq!(
+            memory.line_mark_count_for_test(),
+            2 * (block_region::BLOCK_SIZE / block_region::IMMIX_LINE_SIZE)
+        );
+
+        let boundary = block_region::BLOCK_SIZE;
+        memory
+            .commit_range(boundary - 2, &[0x11, 0x22, 0x33, 0x44])
+            .unwrap();
+
+        assert_eq!(
+            memory.read_committed(boundary - 2..boundary + 2).unwrap(),
+            vec![0x11, 0x22, 0x33, 0x44]
+        );
     }
 
     #[test]
@@ -924,16 +885,16 @@ mod tests {
             .fill(WASM_PAGE_SIZE..WASM_PAGE_SIZE + 8, 0x44)
             .unwrap();
 
-        let second_page_metadata = 256 * size_of::<TMemoryGranuleInfo>();
-        let second_page_metadata_end = second_page_metadata + size_of::<TMemoryGranuleInfo>();
-        // SAFETY: the second page's metadata is live after growing to two
-        // pages, and tests have exclusive access to the storage.
-        unsafe {
-            memory
-                .granules
-                .slice_mut(second_page_metadata..second_page_metadata_end)
-                .fill(0xff);
-        }
+        memory
+            .set_txn_info(
+                256,
+                TMemoryGranuleInfo {
+                    owner: 0xff,
+                    version: 0xff,
+                    hash: 0xff,
+                },
+            )
+            .unwrap();
         assert_ne!(memory.txn_info(256).unwrap(), TMemoryGranuleInfo::default());
 
         memory.shrink_to_pages(1).unwrap();
