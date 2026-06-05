@@ -103,7 +103,7 @@ Wizard-style block/chunk storage.
 - Create: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
 - Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`
 
-- [ ] **Step 1: Add failing layout tests**
+- [x] **Step 1: Add failing layout tests**
 
 Add unit tests that assert the Wizard layout constants:
 
@@ -120,7 +120,7 @@ fn wizard_layout_constants_match_reference() {
 }
 ```
 
-- [ ] **Step 2: Run the failing test**
+- [x] **Step 2: Run the failing test**
 
 Run:
 
@@ -130,7 +130,7 @@ cargo test -p wasmtime --lib wizard_layout_constants_match_reference
 
 Expected: FAIL because the constants/types do not exist.
 
-- [ ] **Step 3: Implement layout constants and Rust structs**
+- [x] **Step 3: Implement layout constants and Rust structs**
 
 Define Rust equivalents for Wizard's `PWRegionHeader`, `MetaDataDesc`,
 `BlockEntry`, `ChunkHeader`, `ListKind`, `BlockLists`, and `LineMark`.
@@ -138,7 +138,7 @@ Define Rust equivalents for Wizard's `PWRegionHeader`, `MetaDataDesc`,
 Keep this first step structural only. Do not wire allocation or `TMemory`
 through it yet.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run:
 
@@ -159,12 +159,12 @@ git commit -m "Add transactional block region layout types"
 **Files:**
 - Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
 
-- [ ] **Step 1: Add failing backend allocation tests**
+- [x] **Step 1: Add failing backend allocation tests**
 
 Add tests that create a `VMemoryBlockRegion`, assert 512 KiB block sizing,
 allocate one-block and multi-block chunks, and observe initialized line marks.
 
-- [ ] **Step 2: Run the failing tests**
+- [x] **Step 2: Run the failing tests**
 
 Run:
 
@@ -174,13 +174,13 @@ cargo test -p wasmtime --lib vmemory_block_region
 
 Expected: FAIL because the backend does not exist.
 
-- [ ] **Step 3: Implement `BlockRegionBackend` and `VMemoryBlockRegion`**
+- [x] **Step 3: Implement `BlockRegionBackend` and `VMemoryBlockRegion`**
 
 Implement the first volatile backend with anonymous memory and Wizard-style
 metadata layout. Include no-op `flush` and `fence` hooks so the API can later
 support `FileBackedMemory` and `NVMemory`.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run:
 
@@ -203,12 +203,12 @@ git commit -m "Add volatile transactional block region"
 - Create: `crates/wasmtime/src/runtime/vm/memory/tmemory/linear_region.rs`
 - Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`
 
-- [ ] **Step 1: Add failing mapping tests**
+- [x] **Step 1: Add failing mapping tests**
 
 Add tests that build a chunk list with non-contiguous backend chunks and read it
 back through contiguous logical offsets.
 
-- [ ] **Step 2: Run the failing tests**
+- [x] **Step 2: Run the failing tests**
 
 Run:
 
@@ -218,13 +218,13 @@ cargo test -p wasmtime --lib mapped_linear_region
 
 Expected: FAIL because `MappedLinearRegion` does not exist.
 
-- [ ] **Step 3: Implement `ChunkList` and `MappedLinearRegion`**
+- [x] **Step 3: Implement `ChunkList` and `MappedLinearRegion`**
 
 Implement logical-offset mapping over ordered chunks. For the volatile backend,
 copy/read/write through backend chunk storage; do not require OS-level fixed
 address remapping in this step.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run:
 
@@ -247,7 +247,7 @@ git commit -m "Add mapped transactional linear region"
 - Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
 - Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/linear_region.rs`
 
-- [ ] **Step 1: Add regression tests around the public `TMemory` API**
+- [x] **Step 1: Add regression tests around the public `TMemory` API**
 
 Cover:
 
@@ -256,7 +256,7 @@ Cover:
 - commit/read across a chunk boundary preserves bytes.
 - line marks remain separate from transaction granule metadata.
 
-- [ ] **Step 2: Run regression tests before migration**
+- [x] **Step 2: Run regression tests before migration**
 
 Run:
 
@@ -267,7 +267,7 @@ cargo test -p wasmtime --lib tmemory
 Expected: existing flat `VMemory` tests pass, while new chunk-boundary tests may
 fail until the migration exists.
 
-- [ ] **Step 3: Move `TMemory` internals to `TMemoryRegion`**
+- [x] **Step 3: Move `TMemory` internals to `TMemoryRegion`**
 
 Keep all existing callers working:
 
@@ -279,7 +279,7 @@ Keep all existing callers working:
 - `granule_info`
 - `set_granule_info`
 
-- [ ] **Step 4: Verify full storage and transaction behavior**
+- [x] **Step 4: Verify full storage and transaction behavior**
 
 Run:
 

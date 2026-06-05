@@ -458,6 +458,45 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Storage Wave: Wizard Block Region Backing
+
+Date: 2026-06-05
+
+Implemented the first Wizard-style block/chunk storage wave for volatile
+transactional memory.
+
+Commits:
+
+- `f5681004c Add transactional block region layout types`
+- `434e2e813 Add volatile transactional block region`
+- `75f8014d7 Add mapped transactional linear region`
+- `353235cea Move tmemory onto transactional block regions`
+
+Runtime storage changes:
+
+- Added Rust equivalents for Wizard's `PWRegionHeader`, `MetaDataDesc`,
+  `BlockEntry`, `ChunkHeader`, `ListKind`, `BlockLists`, and `LineMark`.
+- Added `VMemoryBlockRegion` with Wizard's 512 KiB block size and 256-byte
+  Immix line marks.
+- Added `ChunkList` and `MappedLinearRegion` so logical linear memory can span
+  ordered chunks while the backend chunks need not be physically adjacent.
+- Moved `VMemory` storage under `TMemoryRegion`; committed bytes now go through
+  the block/chunk linear region, while transaction granule metadata remains
+  separate from Immix line marks.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib tmemory
+test result: ok. 39 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 78 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tmemory.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+```
+
 ## Storage Design: Eliot Block/Chunk Clarification
 
 Date: 2026-06-05
