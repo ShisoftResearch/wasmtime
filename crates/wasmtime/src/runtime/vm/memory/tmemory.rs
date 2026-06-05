@@ -12,6 +12,8 @@ use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
 use crate::runtime::vm::{HostAlignedByteCount, Mmap, mmap::AlignedLength};
 use wasmtime_environ::MemoryIndex;
 
+mod block_region;
+
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
 const DEFAULT_MAX_WASM_PAGES: u64 = 1 << 16;
 
@@ -560,6 +562,17 @@ fn unsupported_backend_error(backend: TMemoryBackend) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wizard_layout_constants_match_reference() {
+        assert_eq!(block_region::BLOCK_SIZE, 512 * 1024);
+        assert_eq!(block_region::IMMIX_LINE_SIZE, 256);
+        assert_eq!(block_region::PW_REGION_HEADER_SIZE, 56);
+        assert_eq!(block_region::META_DATA_DESC_SIZE, 32);
+        assert_eq!(block_region::BLOCK_ENTRY_SIZE, 40);
+        assert_eq!(block_region::CHUNK_HEADER_SIZE, 32);
+        assert_eq!(block_region::LINE_MARK_SIZE, 1);
+    }
 
     #[test]
     fn tmemory_uses_configured_vmemory_backend() {
