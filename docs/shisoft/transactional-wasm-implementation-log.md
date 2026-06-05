@@ -458,6 +458,39 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Storage Design: Eliot Block/Chunk Clarification
+
+Date: 2026-06-05
+
+Recorded Eliot Moss's storage clarification in the design docs:
+
+- The long-term storage substrate is a persistent or volatile region of
+  fixed-size aligned blocks grouped into chunks.
+- `TMemory`, the persistent object heap, and the persistent object table are
+  separate logical frontends over that shared block/chunk substrate.
+- A linear `tmemory` is physically a possibly discontiguous chunk list, but it
+  is mapped into one contiguous virtual reservation for the running VM.
+- The object heap uses object chunks; the object table uses chunks that are
+  physically discontiguous but mapped contiguously so `ObjectId` can index
+  directly into it.
+- The existing flat `VMemory` implementation remains a transitional executable
+  milestone. The next storage wave should split it into shared block/chunk
+  region infrastructure plus a `TMemoryRegion` frontend.
+- Implementation detail should copy Wizard's `TxnPWRegion.v3` layout names and
+  invariants: `PWRegionHeader`, `MetaDataDesc`, `BlockEntry`, `ChunkHeader`,
+  `ListKind`, `BlockLists`, and `LineMark`.
+- The first Wasmtime block-region implementation should use Wizard's x86-64
+  Immix default of 512 KiB blocks. Wizard's 256-byte Immix line size and
+  256-byte transaction granule size are intentionally separate metadata
+  concepts even though the first values match.
+
+Updated docs:
+
+- `docs/shisoft/transactional-wasm-runtime-core-design.md`
+- `docs/shisoft/transactional-wasm-runtime-core-implementation-plan.md`
+- `docs/shisoft/transactional-wasm-wizard-first.md`
+- `docs/shisoft/transactional-wasm-action-plan.md`
+
 ## V128 Transactional Globals and SIMD Lane Stores
 
 Date: 2026-06-05

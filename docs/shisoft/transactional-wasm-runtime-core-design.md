@@ -43,6 +43,25 @@ Important Wizard behavior observed for this design:
 - Lock-based concurrency supports optimistic reads and pessimistic writes.
 - Transaction abort releases ownership and discards uncommitted data.
 
+Additional design clarification from Eliot Moss, June 5, 2026:
+
+- Persistent storage is organized as a region of fixed-size aligned blocks.
+  Blocks are grouped into chunks, where each chunk is a contiguous run of one
+  or more blocks.
+- The persistent object heap, persistent object table, and persistent linear
+  memories are separate logical consumers of the same block/chunk storage
+  substrate.
+- A linear `tmemory` is physically backed by a possibly discontiguous chunk
+  list, but it is mapped into one contiguous virtual address reservation for
+  the running VM.
+- The persistent object table is also physically chunk-backed and virtually
+  contiguous, so `ObjectId` can index directly into the table. DRAM object-table
+  space can use large anonymous mmap reservations with inaccessible gaps for
+  shared non-transactional objects and transaction-local objects.
+- `ObjectId` is the granule identity for object-model transaction conflicts,
+  together with the fact that the granule is an object rather than a linear
+  memory, table, or other object space.
+
 ## Transaction Boundaries
 
 Wasmtime should copy Wizard's transaction entry model.
@@ -85,27 +104,83 @@ Current coverage includes scalar memory/global operators and funcref
 `ttable.get/set/size/grow`. Later workstreams extend the same rule to table
 bulk operators, GC objects, refs, and SIMD.
 
+## Shared Block/Chunk Storage
+
+The long-term storage boundary is not `TMemory` itself. Following Eliot's
+design clarification, `VMemory`, `FileBackedMemory`, and `NVMemory` implement a
+shared block/chunk region layer that can back multiple logical consumers:
+
+- `TMemoryRegion` for linear transactional memories.
+- `ObjectHeapRegion` for transactional Wasm heap objects.
+- `ObjectTableRegion` for persistent object-table entries.
+- Future transactional table, element, data, and minor runtime-state regions.
+
+A region is divided into fixed-size aligned blocks. A chunk is a contiguous run
+of blocks. Block size is a backend policy. The first Wasmtime implementation
+should copy Wizard's x86-64 Immix region default of 512 KiB blocks. That is a
+multiple of the 64 KiB Wasm page size and sits within Eliot's suggested
+256 KiB to 1 MiB range. A chunk list records the logical order in which chunks
+make up a higher-level region.
+
+The first volatile backend may implement the same shape with anonymous mmap
+rather than durable storage. `FileBackedMemory` and `NVMemory` later replace
+the allocation and flush/fence behavior without changing the logical region
+frontends.
+
+### Wizard Region Layout To Copy
+
+The first block/chunk implementation should mirror Wizard's
+`TxnPWRegion.v3` layout names and invariants, translated into Rust rather than
+inventing a Wasmtime-specific allocator shape:
+
+- `PWRegionHeader`: offsets to block table, list sentinels, metadata area, and
+  metadata descriptors, plus region block and byte counts.
+- `MetaDataDesc`: metadata kind, fixed bytes, unit size, bytes per unit, and
+  metadata offset.
+- `BlockEntry`: per-block list state with memory-order links and free-list
+  links.
+- `ChunkHeader`: allocation cursor, allocation limit, chunk limit, and
+  `linemarks` offset.
+- `ListKind`: metadata, none, used, small-free, and large-free block states.
+- `LineMark`: one-byte Immix line mark.
+
+Wizard's Immix line size is 256 bytes. That currently matches Wizard's
+transactional memory granule size, but the concepts must remain separate:
+line marks are allocation/GC metadata for block-region users, while
+transaction granule metadata is ownership/version metadata for transactional
+conflict control and COW.
+
 ## TMemory Storage
 
 Ordinary Wasmtime `memory` remains unchanged. `tmemory` uses its own storage
 path.
 
-The runtime defines a backend trait for transactional memory storage. The first
-implemented backend is `VMemory`, an anonymous mmap-backed volatile store.
-`FileBackedMemory` and `NVMemory` stay represented in configuration but are
-rejected until their backends exist.
+The runtime defines a `TMemoryRegion` frontend over the shared block/chunk
+storage layer. The first implemented backend is `VMemory`, an anonymous
+mmap-backed volatile block region. `FileBackedMemory` and `NVMemory` stay
+represented in configuration but are rejected until their block-region backends
+exist.
 
-The backend trait must support:
+A linear `tmemory` is physically backed by a possibly discontiguous chunk list.
+For execution, it reserves a contiguous virtual address range for the running
+VM, following Wizard's 8 GiB reservation model for the current Wasm32-style
+research target. Unused virtual space remains inaccessible. Active chunks are
+mapped read-write into their logical offsets inside that reservation, so
+compiled code and runtime helpers still see a contiguous linear memory.
+
+The `TMemoryRegion` frontend must support:
 
 - current byte length and page length
 - capacity and grow
 - reading committed bytes
 - committing byte ranges or granules
 - resolving granule metadata for ownership and version checks
+- mapping a chunk list into the linear virtual reservation
+- growing by attaching or allocating additional chunks
 
-The trait should not encode a specific persistence model. `VMemory`,
-`FileBackedMemory`, and `NVMemory` should be interchangeable behind the
-transaction runtime.
+The frontend must not encode a specific persistence model. `VMemory`,
+`FileBackedMemory`, and `NVMemory` should be interchangeable behind the shared
+block-region API.
 
 ## Copy-On-Write Workspace
 
@@ -165,7 +240,7 @@ Object-table phase identities carry `ObjectId` as the stable object-table slot:
 - `TStruct { object_id }`
 - `TArray { object_id }`
 
-The object table decides how `object_index` maps to structs, arrays, function
+The object table decides how `object_id` maps to structs, arrays, function
 references, external objects, or future GC-backed transaction objects.
 
 This is not the persistent object-table implementation. Persistent object-space
@@ -228,14 +303,24 @@ Object-table-facing constraints:
   granule, not to ordinary Wasmtime memory.
 - Runtime APIs accept a transaction context and `GranuleId` rather than
   assuming one global store-local map.
-- Backends own payload bytes; concurrency control owns access policy; the
-  future object table owns stable object-space `GranuleId` assignment.
+- The shared block/chunk backend owns physical storage; concurrency control
+  owns access policy; `TMemoryRegion`, `ObjectHeapRegion`, and
+  `ObjectTableRegion` own their logical address/object interpretations.
+- The persistent object heap is a not-necessarily-contiguous collection of
+  object chunks. Small objects usually use chunks of one block; objects larger
+  than a block may use larger chunks.
+- The persistent object table is a not-necessarily-contiguous collection of
+  blocks physically, but it is mapped into contiguous virtual table space so an
+  `ObjectId` can index directly into the table.
+- The DRAM object table can be a large anonymous mmap reservation with most
+  pages inaccessible and with deliberate gaps between persistent,
+  non-transactional shared, and transaction-local object-id ranges.
 
 The object table workstream will later wire `TStruct` and `TArray` granules to
-persistent slot layout, function references, GC object identity, and backend
-integration. Following Wizard, they start at whole-object granularity. More
-precise field or element granules are a later Wasmtime-specific extension, not
-part of the Wizard-first runtime core.
+persistent slot layout, function references, GC object identity, external
+object references, and backend integration. Following Wizard, they start at
+whole-object granularity. More precise field or element granules are a later
+Wasmtime-specific extension, not part of the Wizard-first runtime core.
 
 ## Parser, Validation, And Lowering Implications
 
@@ -277,16 +362,20 @@ Final success requires:
 ## Workstream Order
 
 1. Runtime metadata and transaction boundary tracking for `tfunc` entry/exit.
-2. `TMemoryBackend` trait and wired `VMemory` allocation for `tmemory`.
-3. Copy-on-write workspace reads, writes, commit, and abort for `tmemory`.
-4. Wizard-style `GranuleId` plus `LockBased` optimistic-read/pessimistic-write
+2. Shared block/chunk storage facade, with `VMemory` as the first volatile
+   block-region backend.
+3. `TMemoryRegion` frontend that maps chunk lists into a contiguous linear
+   virtual reservation.
+4. Copy-on-write workspace reads, writes, commit, and abort for `tmemory`.
+5. Wizard-style `GranuleId` plus `LockBased` optimistic-read/pessimistic-write
    ownership.
-5. Real parser and validation migration for scalar memory/global WAST files.
-6. Remove path-scoped mocks for `tcall_ref`, `return_tcall_ref`, and
+6. Real parser and validation migration for scalar memory/global WAST files.
+7. Remove path-scoped mocks for `tcall_ref`, `return_tcall_ref`, and
    transactional ref-control only after object identity exists.
-7. Full object table and transactional refs/GC workstream.
-8. SIMD transactional memory workstream.
-9. `ttry`/`tfail` structured failure handler workstream.
+8. Full object table and transactional refs/GC workstream, reusing the shared
+   block/chunk backend through object-heap and object-table regions.
+9. SIMD transactional memory workstream.
+10. `ttry`/`tfail` structured failure handler workstream.
 
 This order prioritizes the executable runtime foundation before the object-table
 and structured failure-handler work that depends on it.

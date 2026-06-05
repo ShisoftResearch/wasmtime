@@ -142,15 +142,21 @@ only extra validation rules. It needs a special storage system, following
 Wizard's `Target.newTMemory = X86_64Memory.new(_, true)` path.
 
 The reason for this separation is not only transaction rollback. In the long
-term, `tmemory` is the memory class that can become persistent, while ordinary
+term, transactional storage frontends can become persistent, while ordinary
 WebAssembly `memory` remains the regular volatile linear memory. Wasmtime's
 ordinary memory allocation, growth, direct-store lowering, and embedder API
-should stay as they are. Future backends should be able to map `tmemory` onto
-anonymous mmap, file-backed mmap, or persistent memory such as Optane-style
-PMEM/DAX without changing the semantics of ordinary memories.
+should stay as they are. Future backends should be able to map `tmemory` and
+later object-storage frontends onto anonymous mmap, file-backed mmap, or
+persistent memory such as Optane-style PMEM/DAX without changing the semantics
+of ordinary memories.
 
-Wizard's transactional memory allocation has two spatially related mmap-backed
-regions:
+The storage boundary should follow Eliot Moss's June 5, 2026 clarification:
+persistent storage is a region of fixed-size aligned blocks, grouped into
+chunks. `TMemory`, the persistent object heap, and the persistent object table
+are separate logical consumers of that same block/chunk substrate.
+
+Wizard's current transactional memory allocation has two spatially related
+mmap-backed regions:
 
 - the normal linear byte-addressed memory reservation
 - a side reservation for per-granule transaction metadata
@@ -163,16 +169,23 @@ metadata record containing transaction ownership/version information and a hash.
 Growing and shrinking `tmemory` changes both the live linear-memory range and
 the live granule-info range.
 
-Wasmtime should copy this shape before trying a higher-level abstraction:
+Wasmtime should copy the execution shape while making the storage substrate
+block/chunk based:
 
 - ordinary `memory` continues to use Wasmtime's existing linear-memory
   allocation path and is not expected to become persistent
-- `tmemory` uses a separate allocator/storage type
+- `tmemory` uses a separate `TMemoryRegion` frontend over the shared
+  block/chunk storage substrate
+- the persistent object heap and persistent object table later reuse that same
+  substrate through their own frontends rather than through `TMemory`
 - transaction configuration selects only the `tmemory` backend; it must not
   change how ordinary Wasmtime memories are allocated
-- the `tmemory` allocator uses mmap/reservation/protection directly, either by
-  extending Wasmtime's internal `MmapMemory` path or by adding a
-  transaction-specific implementation of `LinearMemory`
+- the first volatile implementation may use mmap/reservation/protection
+  directly, but the long-term backend interface should allocate, map, protect,
+  flush, and fence fixed-size block chunks
+- a linear `tmemory` is physically backed by a possibly discontiguous chunk
+  list, but its chunks are mapped into one contiguous virtual reservation for
+  the running VM
 - the allocator interface should leave room for multiple backends: `VMemory`
   for volatile anonymous mmap in milestone 1, `FileBackedMemory` for
   persistence experiments, and `NVMemory` for PMEM/DAX mappings when the
@@ -183,11 +196,10 @@ Wasmtime should copy this shape before trying a higher-level abstraction:
 - the storage object owns both the byte region and the granule-info region
 - every transaction granule lookup maps `address >> TMEMORY_GRANULE_SHIFT` to
   a metadata slot in the side region
-- `tmemory.grow` stages the new visible size in the transaction state
-- committing a staged `tmemory.grow` makes new data pages accessible and
-  initializes new granule-info records
-- aborting a staged `tmemory.grow` leaves the committed visible byte length and
-  granule-info reachability unchanged
+- `tmemory.grow` grows the committed region immediately and is not rolled back
+  on abort in the Wasmtime research runtime
+- growing `tmemory` attaches or allocates additional chunks, maps them into
+  the virtual reservation, and initializes new granule-info records
 - `tmemory` storage should expose helper methods for transactional lowering,
   such as `txn_info(granule_index)`, `copy_granule(granule_index)`, and
   `write_granule(granule_index, bytes)`
@@ -197,7 +209,8 @@ metadata volatile. `FileBackedMemory`, `NVMemory`, durable transaction metadata,
 and MAP_SYNC/DAX-style behavior belong to later durability/object-table work and
 should not block milestone 1. The storage boundary should nevertheless be
 designed now so persistence can be added by changing the configured `tmemory`
-backend rather than rewriting every transactional memory operation.
+backend and shared block-region backend rather than rewriting every
+transactional memory operation.
 
 ## Dynamic Configuration
 
@@ -340,7 +353,8 @@ Wizard unit semantics to mirror as Rust tests:
 
 - global staging is dropped after `tfail`
 - memory granule staging is dropped after `tfail`
-- memory size staging is dropped after failed `tmemory.grow`
+- failed `tmemory.grow` leaves committed size unchanged
+- successful `tmemory.grow` is visible immediately and survives later abort
 - multiple writes to one granule update one staged buffer
 - writes across two 256-byte granules stage both granules
 - commit writes staged values
@@ -529,8 +543,9 @@ Milestone 1 is complete when:
   operators.
 - `tfail` aborts and drops staged transactional globals.
 - `tfail` aborts and drops every staged 256-byte memory granule.
-- failed `tmemory.grow` and aborted successful `tmemory.grow` leave committed
-  memory size unchanged.
+- failed `tmemory.grow` leaves committed memory size unchanged; successful
+  `tmemory.grow` grows committed storage immediately and is not rolled back by
+  a later transaction abort.
 - `tmemory` is allocated through a distinct storage path with side metadata for
   256-byte granules, even if the backend is still volatile.
 - successful transactions write staged final global and memory values at

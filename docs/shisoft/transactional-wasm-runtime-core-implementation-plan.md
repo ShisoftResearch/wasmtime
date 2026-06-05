@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the scalar transactional Wasm mock runtime with the first real Wizard-style runtime core: `tfunc` transaction boundaries, real `VMemory`-backed `tmemory`, copy-on-write workspace, and `LockBased` granule ownership.
+**Goal:** Replace the scalar transactional Wasm mock runtime with the first real Wizard-style runtime core: `tfunc` transaction boundaries, real `VMemory`-backed `tmemory`, copy-on-write workspace, and `LockBased` granule ownership. The storage direction follows Eliot Moss's June 5, 2026 clarification: `TMemory`, the object heap, and the object table are separate logical users of one shared block/chunk storage substrate.
 
-**Architecture:** Ordinary Wasmtime memory remains unchanged. Transactional memory is a sidecar runtime object addressed by Wizard-style `GranuleId`; transaction operations go through libcalls that read committed `tmemory`, stage writes in a private workspace, and commit or abort through the configured transaction runtime. Parser and WAST harness cleanup happens after the runtime path is executable, so WAST files can move from normalized fixtures to the real engine without changing test cases.
+**Architecture:** Ordinary Wasmtime memory remains unchanged. Transactional memory is a sidecar runtime object addressed by Wizard-style `GranuleId`; transaction operations go through libcalls that read committed `tmemory`, stage writes in a private workspace, and commit or abort through the configured transaction runtime. Storage backends are block/chunk region backends: `TMemoryRegion` maps a possibly discontiguous chunk list into a contiguous virtual linear memory reservation, while future object-heap and object-table regions reuse the same substrate with object-specific indexing. Parser and WAST harness cleanup happens after the runtime path is executable, so WAST files can move from normalized fixtures to the real engine without changing test cases.
 
 **Tech Stack:** Rust, Wasmtime runtime internals, Cranelift translation hooks, local `wasm-tools-transaction` fork for `wasmparser`/`wat`, proposal WAST tests, `cargo test`.
 
@@ -15,7 +15,8 @@
 This plan implements the runtime core needed before object-table and structured
 failure-handler work:
 
-- Implement real `VMemory` storage for `tmemory`.
+- Implement real `VMemory` storage for `tmemory`, first as the executable
+  volatile backend and then as the first block/chunk region backend.
 - Implement copy-on-write transaction workspace indexed by `GranuleId`.
 - Implement `LockBased` optimistic-read/pessimistic-write ownership for
   memory granules and globals.
@@ -38,12 +39,56 @@ This plan does not implement:
 - Transactional structs, arrays, refs, GC integration, or reference-control
   permissions.
 - `ttry`/`tfail` structured failure handlers.
-- `FileBackedMemory` or `NVMemory` storage.
+- Durable `FileBackedMemory` or `NVMemory` block-region storage.
 - Full SIMD transactional memory operations.
 
 Those parts remain enabled by the shapes introduced here: `GranuleId`,
 backend traits, explicit concurrency-control hooks, and transaction boundary
 metadata.
+
+## Storage Design Amendment
+
+The original runtime-core plan introduced `TMemoryBackendStorage` as the first
+executable storage boundary. That remains acceptable as a transitional
+milestone, but it is not the final abstraction boundary.
+
+The next storage refactor must introduce a lower shared region layer:
+
+- `BlockRegionBackend`: allocates, maps, protects, flushes, fences, and
+  releases fixed-size aligned blocks.
+- `ChunkList`: records a logical region as an ordered list of chunks, where
+  each chunk is a contiguous run of blocks.
+- `MappedLinearRegion`: maps a chunk list into a contiguous virtual reservation
+  for linear-memory execution.
+- `TMemoryRegion`: linear-memory frontend over `MappedLinearRegion`, with
+  Wizard-style 256-byte transaction granules.
+- `ObjectHeapRegion`: later object-payload frontend over the same block/chunk
+  substrate.
+- `ObjectTableRegion`: later object-table frontend whose persistent chunks are
+  physically discontiguous but mapped contiguously so `ObjectId` indexes
+  directly into the table.
+
+Backend block size is a policy of `BlockRegionBackend`. The first
+implementation should copy Wizard's x86-64 Immix region default:
+`MemRegions.BlockSize = 512 KiB`. For `TMemoryRegion`, block size must remain a
+multiple of the 64 KiB Wasm page size. The 64 KiB Wasm page remains the
+grow/accounting unit, and the 256-byte Wizard granule remains the transaction
+conflict/COW unit.
+
+Copy Wizard's block-region layout names and roles directly:
+
+- `PWRegionHeader`
+- `MetaDataDesc`
+- `BlockEntry`
+- `ChunkHeader`
+- `ListKind`
+- `BlockLists`
+- `LineMark`
+- `ImmixLineSize = 256`
+
+Do not merge Immix `LineMark` with transactional granule ownership metadata.
+The first uses one byte per 256-byte line for allocation/GC state; the second
+uses ownership/version/hash-style metadata for transaction conflict control.
 
 ## File Map
 
@@ -58,8 +103,10 @@ metadata.
     transaction state transitions.
 
 - `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`
-  - Owns `TMemory`, the transactional memory backend trait, and the first
-    `VMemory` backend implementation.
+  - Owns `TMemory`, the transitional transactional memory backend trait, and
+    the first `VMemory` backend implementation. The next storage wave should
+    split this file into shared block/chunk region infrastructure plus the
+    `TMemoryRegion` frontend.
 
 - `crates/wasmtime/src/runtime/vm/memory.rs`
   - Re-exports transactional memory types to the runtime VM layer while keeping

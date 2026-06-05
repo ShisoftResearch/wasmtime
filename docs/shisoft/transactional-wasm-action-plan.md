@@ -23,7 +23,10 @@ Make Wasmtime execute a Wizard-style transactional WebAssembly slice:
 Milestone 1 is complete when `tmemory` has a distinct volatile mmap-backed
 storage path with 256-byte granule metadata, transactional writes use
 copy-on-write staging, commit writes staged values into `tmemory`, abort drops
-staged values, and migrated tests document Wizard-first behavior.
+staged values, and migrated tests document Wizard-first behavior. The storage
+path is transitional: Eliot Moss's June 5, 2026 clarification makes the
+block/chunk region the long-term persistence substrate, with `TMemory`, the
+object heap, and the object table as separate frontends.
 
 ## Fixed Choices
 
@@ -32,7 +35,8 @@ staged values, and migrated tests document Wizard-first behavior.
 - `TTABLE_GRANULE_SHIFT = 4`.
 - Ordinary `memory` stays on Wasmtime's normal volatile linear-memory path.
 - Do not retrofit ordinary Wasmtime memory into transactional memory.
-- `tmemory` is the future persistence boundary.
+- the shared block/chunk storage layer is the future persistence boundary;
+  `tmemory` is the first linear-memory frontend over it.
 - `tmemory` chooses its storage backend from transaction configuration.
 - Milestone 1 implements only `VMemory`, the volatile anonymous mmap backend
   for `tmemory`.
@@ -69,6 +73,33 @@ components. It should not hard-code storage, durability, or concurrency-control
 policy into every lowered operation. For milestone 1, unimplemented selections
 must be represented but rejected if requested, so the executable runtime stays
 minimal and uses only `TMemoryBackend::VMemory`.
+
+## Storage Region Direction
+
+Following Eliot's clarification, storage backends should converge on this
+shape:
+
+- `BlockRegionBackend`: fixed-size aligned blocks with backend-specific
+  map/protect/flush/fence behavior. The first implementation copies Wizard's
+  x86-64 Immix default of 512 KiB blocks.
+- `ChunkList`: a logical region represented as ordered chunks, where a chunk is
+  a contiguous run of blocks.
+- Wizard layout structures translated directly into Rust:
+  `PWRegionHeader`, `MetaDataDesc`, `BlockEntry`, `ChunkHeader`, `ListKind`,
+  `BlockLists`, and `LineMark`.
+- `TMemoryRegion`: a linear memory whose chunk list may be physically
+  discontiguous but is mapped contiguously into the running VM's virtual
+  address space.
+- `ObjectHeapRegion`: future persistent Wasm heap object storage over the same
+  block/chunk backend.
+- `ObjectTableRegion`: future object-id table storage whose persistent chunks
+  are physically discontiguous but virtually contiguous for direct `ObjectId`
+  indexing.
+
+The 64 KiB Wasm page remains the linear-memory grow unit. Wizard's 256-byte
+Immix line size is copied for line marks. Wizard's 256-byte memory granule
+remains the transaction ownership and COW unit, but line marks and transaction
+granule metadata stay separate.
 
 ## Workstream A: Baseline And Dependency Strategy
 
@@ -237,7 +268,10 @@ Checkpoint:
 ## Workstream D: `tmemory` Storage
 
 Purpose: instantiate transactional memories through a dedicated storage path
-with side metadata for 256-byte granules.
+with side metadata for 256-byte granules. The completed flat `VMemory`
+implementation is the executable milestone; the next storage wave should split
+the backend into shared block/chunk region infrastructure plus a `TMemoryRegion`
+frontend.
 
 Primary owner: memory/storage implementer.
 
@@ -520,7 +554,9 @@ Exit:
 - milestone-1 operators execute
 - abort drops staged transactional globals
 - abort drops staged 256-byte memory granules
-- abort after `tmemory.grow` drops the staged size
+- failed `tmemory.grow` leaves committed size unchanged
+- successful `tmemory.grow` grows committed storage immediately and is not
+  rolled back by a later abort
 - commit writes staged values into runtime objects
 
 ### M1d: Test Migration
