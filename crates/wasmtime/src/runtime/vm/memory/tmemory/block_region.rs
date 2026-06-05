@@ -90,6 +90,8 @@ pub(super) trait BlockRegionBackend {
     fn num_blocks(&self) -> usize;
     fn bytes_len(&self) -> usize;
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk>;
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
     fn flush(&self, offset: usize, len: usize) -> Result<()>;
     fn fence(&self) -> Result<()>;
 }
@@ -112,6 +114,43 @@ impl RegionChunk {
     pub(super) fn byte_range(&self) -> Range<usize> {
         let start = self.start_block * BLOCK_SIZE;
         start..start + self.block_count * BLOCK_SIZE
+    }
+
+    pub(super) fn byte_len(&self) -> usize {
+        self.block_count * BLOCK_SIZE
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct ChunkList {
+    chunks: Vec<RegionChunk>,
+    logical_len: usize,
+}
+
+impl ChunkList {
+    pub(super) fn from_chunks(chunks: Vec<RegionChunk>) -> Result<Self> {
+        let mut logical_len = 0usize;
+        for chunk in &chunks {
+            ensure!(
+                chunk.block_count > 0,
+                "transactional chunk list cannot contain empty chunks"
+            );
+            logical_len = logical_len
+                .checked_add(chunk.byte_len())
+                .context("transactional chunk list byte length overflow")?;
+        }
+        Ok(Self {
+            chunks,
+            logical_len,
+        })
+    }
+
+    pub(super) fn chunks(&self) -> &[RegionChunk] {
+        &self.chunks
+    }
+
+    pub(super) fn logical_len(&self) -> usize {
+        self.logical_len
     }
 }
 
@@ -240,6 +279,29 @@ impl VMemoryBlockRegion {
     pub(super) fn fence(&self) -> Result<()> {
         Ok(())
     }
+
+    pub(super) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let end = offset
+            .checked_add(len)
+            .context("transactional block read range overflow")?;
+        ensure!(
+            end <= self.data.len(),
+            "transactional block read range out of bounds"
+        );
+        Ok(self.data[offset..end].to_vec())
+    }
+
+    pub(super) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .context("transactional block write range overflow")?;
+        ensure!(
+            end <= self.data.len(),
+            "transactional block write range out of bounds"
+        );
+        self.data[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
 }
 
 impl BlockRegionBackend for VMemoryBlockRegion {
@@ -257,6 +319,14 @@ impl BlockRegionBackend for VMemoryBlockRegion {
 
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
         self.alloc_chunk(block_count)
+    }
+
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.read(offset, len)
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.write(offset, bytes)
     }
 
     fn flush(&self, offset: usize, len: usize) -> Result<()> {

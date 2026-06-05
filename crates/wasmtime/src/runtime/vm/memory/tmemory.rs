@@ -13,6 +13,7 @@ use crate::runtime::vm::{HostAlignedByteCount, Mmap, mmap::AlignedLength};
 use wasmtime_environ::MemoryIndex;
 
 mod block_region;
+mod linear_region;
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
 const DEFAULT_MAX_WASM_PAGES: u64 = 1 << 16;
