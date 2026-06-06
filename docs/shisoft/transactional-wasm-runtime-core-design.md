@@ -258,6 +258,64 @@ Wasmtime's table backing after acquiring `TTable` ownership. This is a
 scaffolded execution path, not table-element COW. The future table/object-table
 workspace must replace direct mutation so abort can discard table writes.
 
+## Object Identity And Record Header
+
+Wizard has two relevant object-header shapes. The interpreter object model stores
+transaction metadata in `HeapTObject.hdr: GranuleInfo`; the object kind is
+implied by the concrete object class and type declaration. The later
+object-table prototype separates the stable table slot from the object payload:
+the object table maps `ObjectId` to a current address, while the payload record
+carries a fixed header and object bytes. Wasmtime should copy the observable
+Wizard semantics, but use an explicit backend record header so the design is
+ready for volatile `VMemory`, file-backed mmap, and PMEM backends.
+
+`VMGcRef` remains the Wasm-visible GC handle. It must not become the durable
+transaction identity because it is collector-owned, may require rooting/barriers,
+and can represent immediate `i31ref` values that are not heap records.
+Transactional object identity is instead:
+
+```text
+VMGcRef -> volatile TxObjectRegistry -> ObjectId
+ObjectId -> object table slot -> current object record address
+object record header -> object_id + kind + type/layout metadata
+```
+
+The volatile `TxObjectRegistry` associates Wasmtime GC objects with `ObjectId`s
+for the running store. It must create the association atomically so concurrent
+transactions cannot assign different `ObjectId`s to the same GC object. After
+lookup, concurrency control operates on `GranuleId::TStruct { object_id }` or
+`GranuleId::TArray { object_id }`, not on the raw `VMGcRef`.
+
+The object table owns current-address publication, live-slot versioning,
+freelist reuse, and lock state. These properties must stay with the stable
+`ObjectId` slot because COW writes allocate a new private object record before
+commit. The object record header owns stable facts about the bytes at that
+address:
+
+```rust
+#[repr(C)]
+struct TxObjectHeader {
+    record_len: u64,
+    object_id: u64,
+    kind: u16,
+    flags: u16,
+    type_index: u32,
+    version: u64,
+}
+
+#[repr(C)]
+struct TxArrayHeader {
+    base: TxObjectHeader,
+    length: u32,
+}
+```
+
+The first implementation can keep the table and object records volatile, but it
+should keep this separation intact: `ObjectId` is the granule and backend slot
+identity, `VMGcRef` is a transient Wasmtime handle, and object references inside
+transactional object payloads should be represented as object IDs rather than
+raw PMEM or process-local addresses.
+
 ## Runtime Permissions
 
 Wizard permissions are modeled as read/write access modes over `GranuleId`.
