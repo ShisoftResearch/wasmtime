@@ -56,14 +56,15 @@
 
 use crate::bail_bug;
 use crate::prelude::*;
-use crate::runtime::store::{Asyncness, InstanceId, StoreOpaque};
+use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,
     collect_tmemory_access_snapshot,
 };
-#[cfg(feature = "gc")]
 use crate::runtime::vm::VMGcRef;
-use crate::runtime::vm::{self, HostResultHasUnwindSentinel, VMStore, f32x4, f64x2, i8x16};
+use crate::runtime::vm::{
+    self, HostResultHasUnwindSentinel, TableElementType, VMStore, f32x4, f64x2, i8x16,
+};
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
@@ -71,7 +72,7 @@ use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
     CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GlobalIndex, MemoryIndex,
-    PassiveElemIndex, TableIndex, Trap, WasmValType,
+    PassiveElemIndex, TableIndex, Trap, WasmHeapTopType, WasmValType,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::AccessError::{
@@ -371,6 +372,7 @@ fn transaction_tglobal_get_impl(
             state.active_transaction().is_some(),
             "transaction operation requires an active transaction"
         );
+        state.acquire_global_read_owned(Some(instance), global_index.as_u32())?;
         state.staged_global_owned(Some(instance), global_index.as_u32())
     };
     let snapshot = match staged {
@@ -445,6 +447,8 @@ fn global_snapshot_from_tag(tag: u32, value: u64) -> Result<GlobalSnapshot> {
         1 => Ok(GlobalSnapshot::I64(value as i64)),
         2 => Ok(GlobalSnapshot::F32(value as u32)),
         3 => Ok(GlobalSnapshot::F64(value)),
+        4 => Ok(GlobalSnapshot::GcRef(value as u32)),
+        5 => Ok(GlobalSnapshot::FuncRef(usize::try_from(value)?)),
         _ => bail!("unknown transactional global value tag: {tag}"),
     }
 }
@@ -463,10 +467,17 @@ fn read_global_snapshot(
         WasmValType::F32 => Ok(GlobalSnapshot::F32(unsafe { *global.as_f32_bits() })),
         WasmValType::F64 => Ok(GlobalSnapshot::F64(unsafe { *global.as_f64_bits() })),
         WasmValType::V128 => Ok(GlobalSnapshot::V128(unsafe { *global.as_u128_bits() })),
-        WasmValType::Ref(_) => {
-            // SHISOFT-TWASM-MOCK: global overlays do not yet support reference/object snapshots.
-            bail!("transactional global type is not implemented yet")
-        }
+        WasmValType::Ref(ref_ty) => match ref_ty.heap_type.top() {
+            WasmHeapTopType::Func => Ok(GlobalSnapshot::FuncRef(unsafe {
+                global.as_func_ref() as usize
+            })),
+            WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
+                Ok(GlobalSnapshot::GcRef(unsafe {
+                    global.as_gc_ref().map_or(0, VMGcRef::as_raw_u32)
+                }))
+            }
+            WasmHeapTopType::Cont => bail!("transactional contref global is not implemented yet"),
+        },
     }
 }
 
@@ -484,7 +495,11 @@ fn global_definition_ptr(
     Ok(instance_ref.imported_global(global).from.as_non_null())
 }
 
-fn write_global_snapshot(global: &mut vm::VMGlobalDefinition, value: GlobalSnapshot) {
+fn write_global_snapshot(
+    store: &mut StoreOpaque,
+    global: &mut vm::VMGlobalDefinition,
+    value: GlobalSnapshot,
+) -> Result<()> {
     unsafe {
         match value {
             GlobalSnapshot::I32(value) => *global.as_i32_mut() = value,
@@ -492,19 +507,34 @@ fn write_global_snapshot(global: &mut vm::VMGlobalDefinition, value: GlobalSnaps
             GlobalSnapshot::F32(value) => *global.as_f32_bits_mut() = value,
             GlobalSnapshot::F64(value) => *global.as_f64_bits_mut() = value,
             GlobalSnapshot::V128(value) => global.as_u128_bits_mut().copy_from_slice(&value),
+            GlobalSnapshot::GcRef(value) => {
+                let value = VMGcRef::from_raw_u32(value);
+                global.write_gc_ref(store, value.as_ref())?;
+            }
+            GlobalSnapshot::FuncRef(value) => {
+                *global.as_func_ref_mut() = core::ptr::with_exposed_provenance_mut(value);
+            }
         }
     }
+    Ok(())
 }
 
 fn ensure_global_snapshot_type(value: GlobalSnapshot, ty: WasmValType) -> Result<()> {
-    let matches = matches!(
-        (value, ty),
+    let matches = match (value, ty) {
         (GlobalSnapshot::I32(_), WasmValType::I32)
-            | (GlobalSnapshot::I64(_), WasmValType::I64)
-            | (GlobalSnapshot::F32(_), WasmValType::F32)
-            | (GlobalSnapshot::F64(_), WasmValType::F64)
-            | (GlobalSnapshot::V128(_), WasmValType::V128)
-    );
+        | (GlobalSnapshot::I64(_), WasmValType::I64)
+        | (GlobalSnapshot::F32(_), WasmValType::F32)
+        | (GlobalSnapshot::F64(_), WasmValType::F64)
+        | (GlobalSnapshot::V128(_), WasmValType::V128) => true,
+        (GlobalSnapshot::FuncRef(_), WasmValType::Ref(ref_ty)) => {
+            matches!(ref_ty.heap_type.top(), WasmHeapTopType::Func)
+        }
+        (GlobalSnapshot::GcRef(_), WasmValType::Ref(ref_ty)) => matches!(
+            ref_ty.heap_type.top(),
+            WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn
+        ),
+        _ => false,
+    };
     ensure!(
         matches,
         "transactional global value tag does not match global type"
@@ -519,6 +549,8 @@ fn global_snapshot_bytes(value: GlobalSnapshot) -> Vec<u8> {
         GlobalSnapshot::F32(value) => value.to_ne_bytes().to_vec(),
         GlobalSnapshot::F64(value) => value.to_ne_bytes().to_vec(),
         GlobalSnapshot::V128(value) => value.to_vec(),
+        GlobalSnapshot::GcRef(value) => value.to_ne_bytes().to_vec(),
+        GlobalSnapshot::FuncRef(value) => value.to_ne_bytes().to_vec(),
     }
 }
 
@@ -885,16 +917,24 @@ fn transaction_ttable_get_impl(
         .acquire_table_granule_read_owned(Some(instance), table, index, 0)?;
 
     let table_index = DefinedTableIndex::from_u32(table);
-    let (mut instance_ref, registry) = store.instance_and_module_registry_mut(instance);
-    let table_ref = instance_ref.as_mut().get_defined_table_with_lazy_init(
+    let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
+    let (_gc_store, registry, instance_ref) =
+        store.optional_gc_store_and_registry_and_instance_mut(instance);
+    let table_ref = instance_ref.get_defined_table_with_lazy_init(
         registry,
         table_index,
         core::iter::once(index),
     );
-    let elem = table_ref.get_func(index)?;
-    Ok(match elem {
-        Some(ptr) => ptr.as_ptr().cast(),
-        None => core::ptr::null_mut(),
+    Ok(match table_ref.element_type() {
+        TableElementType::Func => match table_ref.get_func(index)? {
+            Some(ptr) => ptr.as_ptr().cast(),
+            None => core::ptr::null_mut(),
+        },
+        TableElementType::GcRef => {
+            let raw = table_ref.get_gc_ref(index)?.map_or(0, VMGcRef::as_raw_u32);
+            core::ptr::with_exposed_provenance_mut(usize::try_from(raw).unwrap())
+        }
+        TableElementType::Cont => bail!("transactional contref table is not implemented yet"),
     })
 }
 
@@ -925,15 +965,26 @@ fn transaction_ttable_set_impl(
         .transaction_state_mut()
         .acquire_table_granule_write_owned(Some(instance), table, index, 0)?;
 
-    let elem = NonNull::new(value.cast::<vm::VMFuncRef>());
     let table_index = DefinedTableIndex::from_u32(table);
-    let mut instance_ref = store.instance_mut(instance);
+    let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
+    let (gc_store, _registry, instance_ref) =
+        store.optional_gc_store_and_registry_and_instance_mut(instance);
+    let table_ref = instance_ref.get_defined_table(table_index);
     // SHISOFT-TWASM-MOCK: writes go straight to Wasmtime's table backing for
     // this runtime path. Table-element COW will replace this direct mutation.
-    instance_ref
-        .as_mut()
-        .get_defined_table(table_index)
-        .set_func(index, elem)?;
+    match table_ref.element_type() {
+        TableElementType::Func => {
+            let elem = NonNull::new(value.cast::<vm::VMFuncRef>());
+            table_ref.set_func(index, elem)?;
+        }
+        TableElementType::GcRef => {
+            let raw = u32::try_from(value.addr())
+                .context("transactional table GC reference does not fit u32")?;
+            let elem = VMGcRef::from_raw_u32(raw);
+            table_ref.set_gc_ref(gc_store, index, elem.as_ref())?;
+        }
+        TableElementType::Cont => bail!("transactional contref table is not implemented yet"),
+    }
     Ok(())
 }
 
@@ -1139,7 +1190,7 @@ fn apply_staged_transaction_record(
             let global_index = GlobalIndex::from_u32(*global_index);
             let mut global = global_definition_ptr(store, owner, global_index)?;
             let global = unsafe { global.as_mut() };
-            write_global_snapshot(global, *value);
+            write_global_snapshot(store.store_opaque_mut(), global, *value)?;
         }
         StagedRecord::MemorySize { .. } => {
             // SHISOFT-TWASM-MOCK: the grow path delegates to ordinary

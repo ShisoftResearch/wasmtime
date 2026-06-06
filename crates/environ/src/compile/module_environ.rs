@@ -410,13 +410,11 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     let len = elems.len();
                     self.result.module.types.reserve(len)?;
                     for (ty, validator_ty) in elems.zip(validator_elems) {
-                        let is_transactional_func = match &validator_types[validator_ty]
-                            .composite_type
-                            .inner
-                        {
-                            wasmparser::CompositeInnerType::Func(func) => func.transaction(),
-                            _ => false,
-                        };
+                        let is_transactional_func =
+                            match &validator_types[validator_ty].composite_type.inner {
+                                wasmparser::CompositeInnerType::Func(func) => func.transaction(),
+                                _ => false,
+                            };
                         self.transactional_func_types.push(is_transactional_func);
                         self.result.module.types.push(ty.into())?;
                     }
@@ -599,10 +597,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     let ty = self.convert_global_type(&ty)?;
                     let index = self.result.module.globals.push(ty)?;
                     if is_transactional {
-                        self.result
-                            .module
-                            .transaction_objects
-                            .add_tglobal(index);
+                        self.result.module.transaction_objects.add_tglobal(index);
                     }
                     let defined_index = self.result.module.defined_global_index(index).unwrap();
                     match initializer.const_eval() {
@@ -1734,6 +1729,36 @@ mod tests {
                 .module
                 .transaction_objects
                 .is_tglobal(GlobalIndex::from_u32(0))
+        );
+    }
+
+    #[test]
+    fn translation_records_transactional_table_with_indexed_tref_type() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (type $t (tfunc))
+              (table 1 (tref null $t)))
+            "#,
+        )
+        .unwrap();
+        let tunables = Tunables::default_u32();
+        let mut validator = Validator::new();
+        let mut types = ModuleTypesBuilder::new(&validator);
+        let translation = ModuleEnvironment::new(
+            &tunables,
+            &mut validator,
+            &mut types,
+            StaticModuleIndex::from_u32(0),
+        )
+        .translate(Parser::new(0), &wasm)
+        .unwrap();
+
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_ttable(TableIndex::from_u32(0))
         );
     }
 }

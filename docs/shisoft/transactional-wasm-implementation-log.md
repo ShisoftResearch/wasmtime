@@ -67,9 +67,18 @@ Implemented runtime paths:
 - Per-instance `TMemory` sidecars backed by `VMemory` block/chunk regions.
 - Copy-on-write transaction workspace indexed by `GranuleId`.
 - `GranuleId::TMemory`, `TMemorySize`, `TGlobal`, `TTable`, and `TTableSize`.
-  `TStruct` and `TArray` are reserved with `ObjectId` for the object-table
-  workstream.
+  `TStruct` and `TArray` are wired to `ObjectId` through the first in-memory
+  `ObjectTable` foundation.
 - Store-local `LockBased` optimistic-read/pessimistic-write ownership.
+- Generic runtime read/write permission acquisition over every `GranuleId`
+  kind; memory, globals, tables, memory/table sizes, and object granules now
+  share one permission path.
+- `ObjectTable` foundation with dense stable `ObjectId` allocation, freed-slot
+  reuse, live-slot version metadata, and kind-aware `TStruct`/`TArray` granule
+  acquisition.
+- Object payload copy-on-write foundation for struct/array payloads, including
+  staged transaction payloads, abort discard, commit application, and
+  optimistic object read-version validation.
 - `tfunc` entry/normal-return transaction boundaries.
 - Scalar `tmemory` loads/stores, size/grow, `tmemory.copy/fill/init`, static
   and segmented active `tdata` initialization, imported `tmemory` active data,
@@ -89,8 +98,8 @@ Remaining tagged mock boundaries:
 - Text-normalization compatibility for fixtures outside the real-parser
   allowlists, especially transactional refs/GC objects, `ttry`/`tfail`, binary
   transactional encodings, and SIMD numeric-only aliases.
-- Reference/object-valued transactional global snapshots and object-table
-  permissions. Numeric imported `tglobal` is on the real runtime path.
+- Reference/object-valued transactional global snapshots and full object-model
+  runtime operations. Numeric imported `tglobal` is on the real runtime path.
 - Table element COW and reference/object permissions for table bulk/object
   operations.
 - Binary transactional type encodings such as the `0xe0` tfunc/ref encodings.
@@ -106,7 +115,7 @@ cargo test -p wasmtime --lib tmemory
 test result: ok. 39 passed; 0 failed; 0 ignored
 
 cargo test -p wasmtime --lib transaction
-test result: ok. 78 passed; 0 failed; 0 ignored
+test result: ok. 84 passed; 0 failed; 0 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
 test result: ok. 71 passed; 0 failed; 45 ignored
@@ -538,6 +547,152 @@ Current proposal harness result:
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+```
+
+## Real Parser/Runtime WAST Expansion
+
+Date: 2026-06-06
+
+Moved another tranche of transaction proposal WAST files off generated
+fixtures, path-scoped normalization, and smoke-only parser paths. The new
+baseline is still intentionally short of the object-table, structured
+`ttry`/`tfail`, and conflict-control waves, but table/global/data/ref smoke
+coverage now runs through the real Wasmtime engine path.
+
+Runtime and harness work in this tranche:
+
+- The local `wasm-tools-transaction` fork now recognizes indexed transactional
+  table ref types such as `(tref null $t)` as transactional table metadata.
+- Transactional const expressions accept `tglobal.get` and lower it through
+  Wasmtime's normal `ConstOp::GlobalGet` path.
+- Ref-valued transactional globals now carry scaffold snapshot payload tags for
+  raw `funcref` and raw GC-ref words.
+- Ref-valued `ttable.get/set/size/grow/fill/copy/init` are wired for current
+  WAST-visible table cases. These paths acquire transactional table granules,
+  but table element COW is still deferred.
+- Named transactional data segment references now resolve for
+  `tdata.drop $name` and `tmemory.init $name`.
+- TMemory out-of-bounds diagnostics were aligned with the proposal WAST wording.
+
+Real-parser WAST files added to the passing set:
+
+- `tref_is_null.wast`
+- `tref_tfunc.wast`
+- `tglobal.wast`
+- `tbulk.wast`
+- `tdata.wast`
+- `telem.wast`
+- `tbr_table.wast`
+- `tfunc.wast`
+- `tlinking.wast`
+- `tendianness.wast`
+- `tfloat_literals.wast`
+- `ttable.wast`
+- `ttable-sub.wast`
+- `ttable_copy.wast`
+- `ttable_fill.wast`
+- `ttable_get.wast`
+- `ttable_grow.wast`
+- `ttable_init.wast`
+- `ttable_set.wast`
+- `ttable_size.wast`
+
+Mocked/deferred:
+
+- `tcall_ref` and ref-control WASTs still depend on harness replacement until
+  real transactional function references are lowered and validated.
+- Table operators acquire `TTable`/`TTableSize` granules but still write through
+  Wasmtime's committed table backing; table COW is pending.
+- Ref-valued globals store raw words only. Rooted object references and
+  object-table snapshots remain object-model work.
+- Remaining ignored files are object-model, binary encoding, conflict, or
+  structured `ttry`/`tfail` workstreams. The only ignored file outside
+  `simple-transactions` is `transaction-proposal/tsimd/tsimd_const.wast`.
+
+Verification:
+
+```text
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wast transaction_text -- --format terse
+test result: ok. 23 passed; 0 failed
+
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wasmparser transaction -- --format terse
+test result: ok. 12 passed; 0 failed
+
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wast transaction_text_indexed_tref_table_type_emit_object_metadata -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wast transaction_text_tdata_drop_resolves_named_data_segment -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test --manifest-path /home/shisoft/Code/Research/wasm-tools-transaction/Cargo.toml -p wast transaction_text_tmemory_init_resolves_named_data_segment -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-environ --features compile translation_records_transactional_table_with_indexed_tref_type -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 84 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast -- transaction-proposal/simple-transactions -- --format terse
+test result: ok. 92 passed; 0 failed; 24 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast -- transaction-proposal -- --format terse
+test result: ok. 148 passed; 0 failed; 25 ignored
+```
+
+## Real Parser/Binary WAST Continuation
+
+Date: 2026-06-06
+
+Continued the all-WAST roadmap by moving the remaining non-object proposal
+tests that were only ignored because of harness gating:
+
+- `tsimd_const.wast` now runs in the `tsimd` suite on the real transaction text
+  path. Its binary module coverage exercises the existing transactional binary
+  type parsing rather than the syntax normalization adapter.
+- `tbinary.wast` and `tbinary-leb128.wast` now run as simple-transaction binary
+  WASTs on the real parser path.
+- `tunreached-valid.wast` and `tunreached-invalid.wast` now run on the real
+  parser path. These cover validation-after-unreachable behavior; they do not
+  claim full object/reference runtime support.
+
+Deferred after this checkpoint:
+
+- The remaining reference-cast files allocate and inspect `tstruct`, `tarray`,
+  `ti31`, and `textern` values. They should move with real object-table and
+  object-reference support, not via aliases or harness replacement.
+- `tconflict-*` remains concurrency-control work.
+- `ttry-abort-commit.wast` remains structured `ttry`/`tfail` work.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast enables_real_text_parser_transaction_simd_memory_tranche -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast enables_real_binary_transaction_proposal_tranche -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast enables_real_unreachable_validation_transaction_proposal_tranche -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/tsimd/tsimd_const.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tbinary.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tbinary-leb128.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tunreached-valid.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tunreached-invalid.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 153 passed; 0 failed; 20 ignored
 ```
 
 ## Simple-Transactions Harness Checkpoint: 40/45

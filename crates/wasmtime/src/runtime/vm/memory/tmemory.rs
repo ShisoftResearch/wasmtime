@@ -372,7 +372,7 @@ impl VMemory {
 
     pub(crate) fn fill(&mut self, range: core::ops::Range<usize>, byte: u8) -> Result<()> {
         ensure!(range.start <= range.end, "tmemory write invalid range");
-        ensure!(range.end <= self.byte_len, "tmemory write out of bounds");
+        ensure!(range.end <= self.byte_len, "out of bounds tmemory access");
         self.region.fill(range, byte)
     }
 
@@ -434,7 +434,7 @@ impl TMemoryBackendStorage for VMemory {
         let end = addr
             .checked_add(bytes.len())
             .context("tmemory write address overflow")?;
-        ensure!(end <= self.byte_len, "tmemory write out of bounds");
+        ensure!(end <= self.byte_len, "out of bounds tmemory access");
         self.region.write(addr, bytes)
     }
 

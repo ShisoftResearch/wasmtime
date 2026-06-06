@@ -128,10 +128,9 @@ pub(crate) struct TransactionState {
     staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
     staged_granules: BTreeMap<GranuleId, Vec<u8>>,
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
-    memory_read_granules: BTreeSet<GranuleId>,
-    memory_write_granules: BTreeSet<GranuleId>,
-    table_read_granules: BTreeSet<GranuleId>,
-    table_write_granules: BTreeSet<GranuleId>,
+    staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    read_granules: BTreeSet<GranuleId>,
+    write_granules: BTreeSet<GranuleId>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
 }
@@ -145,10 +144,9 @@ impl Default for TransactionState {
             staged_globals: BTreeMap::new(),
             staged_granules: BTreeMap::new(),
             staged_memory_sizes: BTreeMap::new(),
-            memory_read_granules: BTreeSet::new(),
-            memory_write_granules: BTreeSet::new(),
-            table_read_granules: BTreeSet::new(),
-            table_write_granules: BTreeSet::new(),
+            staged_objects: BTreeMap::new(),
+            read_granules: BTreeSet::new(),
+            write_granules: BTreeSet::new(),
             scratch: Vec::new(),
             pending_memory_store: None,
         }
@@ -182,11 +180,214 @@ pub(crate) enum GlobalSnapshot {
     F32(u32),
     F64(u64),
     V128([u8; 16]),
+    /// SHISOFT-TWASM-MOCK: reference snapshots are raw Wasmtime reference
+    /// words for `tglobal.get` execution. Non-null staged reference globals
+    /// still need a rooted/object-table snapshot before `tglobal.set` is
+    /// enabled for references.
+    GcRef(u32),
+    FuncRef(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ObjectId {
     pub(crate) object_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectKind {
+    Struct,
+    Array,
+    I31,
+    Extern,
+    Func,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ObjectValue {
+    I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
+    V128([u8; 16]),
+    Ref(Option<ObjectId>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ObjectPayload {
+    Struct(Vec<ObjectValue>),
+    Array(Vec<ObjectValue>),
+    I31(i32),
+    Extern(u64),
+    Func(u32),
+}
+
+impl ObjectPayload {
+    fn kind(&self) -> ObjectKind {
+        match self {
+            ObjectPayload::Struct(_) => ObjectKind::Struct,
+            ObjectPayload::Array(_) => ObjectKind::Array,
+            ObjectPayload::I31(_) => ObjectKind::I31,
+            ObjectPayload::Extern(_) => ObjectKind::Extern,
+            ObjectPayload::Func(_) => ObjectKind::Func,
+        }
+    }
+
+    fn default_for_kind(kind: ObjectKind) -> Self {
+        match kind {
+            ObjectKind::Struct => ObjectPayload::Struct(Vec::new()),
+            ObjectKind::Array => ObjectPayload::Array(Vec::new()),
+            ObjectKind::I31 => ObjectPayload::I31(0),
+            ObjectKind::Extern => ObjectPayload::Extern(0),
+            ObjectKind::Func => ObjectPayload::Func(0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ObjectTableSlot {
+    kind: ObjectKind,
+    version: u64,
+    payload: ObjectPayload,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ObjectTable {
+    slots: Vec<Option<ObjectTableSlot>>,
+    free_list: Vec<ObjectId>,
+    next_version: u64,
+    live_count: usize,
+}
+
+impl ObjectTable {
+    pub(crate) fn allocate(&mut self, kind: ObjectKind) -> Result<ObjectId> {
+        self.allocate_payload(ObjectPayload::default_for_kind(kind))
+    }
+
+    pub(crate) fn allocate_struct(&mut self, fields: Vec<ObjectValue>) -> Result<ObjectId> {
+        self.allocate_payload(ObjectPayload::Struct(fields))
+    }
+
+    pub(crate) fn allocate_array(&mut self, elements: Vec<ObjectValue>) -> Result<ObjectId> {
+        self.allocate_payload(ObjectPayload::Array(elements))
+    }
+
+    pub(crate) fn allocate_payload(&mut self, payload: ObjectPayload) -> Result<ObjectId> {
+        let object_id = match self.free_list.pop() {
+            Some(object_id) => object_id,
+            None => ObjectId {
+                object_index: u64::try_from(self.slots.len())
+                    .context("object table slot count does not fit u64")?,
+            },
+        };
+        let index = object_slot_index(object_id)?;
+        if index == self.slots.len() {
+            self.slots.push(None);
+        }
+        ensure!(
+            index < self.slots.len(),
+            "object table freelist entry is outside slot range"
+        );
+        ensure!(
+            self.slots[index].is_none(),
+            "object table freelist entry points at a live slot"
+        );
+        let version = self.bump_object_version()?;
+        let kind = payload.kind();
+        self.slots[index] = Some(ObjectTableSlot {
+            kind,
+            version,
+            payload,
+        });
+        self.live_count = self
+            .live_count
+            .checked_add(1)
+            .context("object table live count overflow")?;
+        Ok(object_id)
+    }
+
+    pub(crate) fn live_count(&self) -> usize {
+        self.live_count
+    }
+
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(crate) fn kind(&self, object_id: ObjectId) -> Result<ObjectKind> {
+        Ok(self.live_slot(object_id)?.kind)
+    }
+
+    pub(crate) fn version(&self, object_id: ObjectId) -> Result<u64> {
+        Ok(self.live_slot(object_id)?.version)
+    }
+
+    pub(crate) fn payload(&self, object_id: ObjectId) -> Result<ObjectPayload> {
+        Ok(self.live_slot(object_id)?.payload.clone())
+    }
+
+    pub(crate) fn update_payload(
+        &mut self,
+        object_id: ObjectId,
+        payload: ObjectPayload,
+    ) -> Result<()> {
+        let index = object_slot_index(object_id)?;
+        let kind = self.live_slot(object_id)?.kind;
+        ensure!(
+            kind == payload.kind(),
+            "object payload kind does not match object table slot kind"
+        );
+        let version = self.bump_object_version()?;
+        self.slots[index] = Some(ObjectTableSlot {
+            kind,
+            version,
+            payload,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn granule_id(&self, object_id: ObjectId) -> Result<GranuleId> {
+        match self.kind(object_id)? {
+            ObjectKind::Struct => Ok(GranuleId::TStruct { object_id }),
+            ObjectKind::Array => Ok(GranuleId::TArray { object_id }),
+            ObjectKind::I31 | ObjectKind::Extern | ObjectKind::Func => {
+                bail!("object kind does not have a transactional granule yet")
+            }
+        }
+    }
+
+    pub(crate) fn free(&mut self, object_id: ObjectId) -> Result<bool> {
+        let index = object_slot_index(object_id)?;
+        if index >= self.slots.len() {
+            return Ok(false);
+        }
+        if self.slots[index].is_none() {
+            return Ok(false);
+        }
+        self.slots[index] = None;
+        self.bump_object_version()?;
+        self.free_list.push(object_id);
+        self.live_count = self
+            .live_count
+            .checked_sub(1)
+            .context("object table live count underflow")?;
+        Ok(true)
+    }
+
+    fn live_slot(&self, object_id: ObjectId) -> Result<&ObjectTableSlot> {
+        let index = object_slot_index(object_id)?;
+        self.slots
+            .get(index)
+            .and_then(Option::as_ref)
+            .with_context(|| format!("object table slot is not live: {object_id:?}"))
+    }
+
+    fn bump_object_version(&mut self) -> Result<u64> {
+        self.next_version = self
+            .next_version
+            .checked_add(1)
+            .context("object table version overflow")?;
+        Ok(self.next_version)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -250,18 +451,18 @@ const TTABLE_GRANULE_SHIFT: u32 = 4;
 pub(crate) const TTABLE_GRANULE_SIZE: u64 = 1 << TTABLE_GRANULE_SHIFT;
 
 pub(crate) trait TransactionConcurrencyControl {
-    fn acquire_memory_granule_read(
+    fn acquire_granule_read(
         &mut self,
         transaction: TransactionId,
-        memory_index: u32,
-        granule_index: u64,
+        granule: GranuleId,
+        current_version: u64,
     ) -> Result<()>;
 
-    fn acquire_memory_granule_write(
+    fn acquire_granule_write(
         &mut self,
         transaction: TransactionId,
-        memory_index: u32,
-        granule_index: u64,
+        granule: GranuleId,
+        current_version: u64,
     ) -> Result<()>;
 
     fn release_transaction(&mut self, transaction: TransactionId);
@@ -400,6 +601,32 @@ impl LockBased {
         self.acquire_write(transaction, granule, current_version)
     }
 
+    fn acquire_memory_granule_read(
+        &mut self,
+        transaction: TransactionId,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> Result<()> {
+        self.acquire_granule_read(
+            transaction,
+            memory_granule_id_from_u64(None, memory_index, granule_index),
+            0,
+        )
+    }
+
+    fn acquire_memory_granule_write(
+        &mut self,
+        transaction: TransactionId,
+        memory_index: u32,
+        granule_index: u64,
+    ) -> Result<()> {
+        self.acquire_granule_write(
+            transaction,
+            memory_granule_id_from_u64(None, memory_index, granule_index),
+            0,
+        )
+    }
+
     fn validate_read_for_test(
         &self,
         transaction: TransactionId,
@@ -419,38 +646,22 @@ impl LockBased {
 }
 
 impl TransactionConcurrencyControl for LockBased {
-    fn acquire_memory_granule_read(
+    fn acquire_granule_read(
         &mut self,
         transaction: TransactionId,
-        memory_index: u32,
-        granule_index: u64,
+        granule: GranuleId,
+        current_version: u64,
     ) -> Result<()> {
-        self.record_read(
-            transaction,
-            GranuleId::TMemory {
-                instance: None,
-                memory_index,
-                granule_index,
-            },
-            0,
-        )
+        self.record_read(transaction, granule, current_version)
     }
 
-    fn acquire_memory_granule_write(
+    fn acquire_granule_write(
         &mut self,
         transaction: TransactionId,
-        memory_index: u32,
-        granule_index: u64,
+        granule: GranuleId,
+        current_version: u64,
     ) -> Result<()> {
-        self.acquire_write(
-            transaction,
-            GranuleId::TMemory {
-                instance: None,
-                memory_index,
-                granule_index,
-            },
-            0,
-        )
+        self.acquire_write(transaction, granule, current_version)
     }
 
     fn release_transaction(&mut self, transaction: TransactionId) {
@@ -475,6 +686,39 @@ impl TransactionState {
 
     pub(crate) fn active_transaction(&self) -> Option<TransactionId> {
         self.active
+    }
+
+    pub(crate) fn acquire_granule_read(
+        &mut self,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let transaction = self.active_transaction_required()?;
+        self.locks
+            .acquire_granule_read(transaction, granule, current_version)?;
+        Ok(self.read_granules.insert(granule))
+    }
+
+    pub(crate) fn acquire_granule_write(
+        &mut self,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        let transaction = self.active_transaction_required()?;
+        self.locks
+            .acquire_granule_write(transaction, granule, current_version)?;
+        self.read_granules.insert(granule);
+        Ok(self.write_granules.insert(granule))
+    }
+
+    pub(crate) fn owns_granule_read(&self, granule: GranuleId) -> bool {
+        self.read_granules.contains(&granule)
+    }
+
+    pub(crate) fn owns_granule_write(&self, granule: GranuleId) -> bool {
+        self.write_granules.contains(&granule)
     }
 
     pub(crate) fn commit(&mut self) -> Result<()> {
@@ -611,6 +855,7 @@ impl TransactionState {
         new_pages: u64,
     ) -> Result<bool> {
         self.ensure_active()?;
+        self.acquire_granule_write(memory_size_granule_id(owner_instance, memory_index), 0)?;
         Ok(self
             .staged_memory_sizes
             .insert(
@@ -635,10 +880,9 @@ impl TransactionState {
         value: GlobalSnapshot,
     ) -> Result<bool> {
         self.ensure_active()?;
-        Ok(self
-            .staged_globals
-            .insert(global_granule_id(owner_instance, global_index), value)
-            .is_none())
+        let key = global_granule_id(owner_instance, global_index);
+        self.acquire_granule_write(key, 0)?;
+        Ok(self.staged_globals.insert(key, value).is_none())
     }
 
     pub(crate) fn staged_global_owned(
@@ -658,10 +902,8 @@ impl TransactionState {
         bytes: Vec<u8>,
     ) -> Result<bool> {
         self.ensure_active()?;
-        self.lock_memory_granule_write(memory_index, granule_index)?;
         let key = memory_granule_id_from_u64(None, memory_index, granule_index);
-        self.memory_read_granules.insert(key);
-        self.memory_write_granules.insert(key);
+        self.acquire_granule_write(key, 0)?;
         Ok(self.staged_granules.insert(key, bytes).is_none())
     }
 
@@ -724,8 +966,6 @@ impl TransactionState {
             let local_granule_range =
                 (granule_range.start - backing_base)..(granule_range.end - backing_base);
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            let granule_index =
-                u64::try_from(granule_index).context("tmemory granule index does not fit u64")?;
             let granule_offset = current - granule_range.start;
             let chunk_len = (range.end - current).min(granule_range.end - current);
             let granule_chunk_end = granule_offset
@@ -735,7 +975,7 @@ impl TransactionState {
                 .checked_add(chunk_len)
                 .context("tmemory write offset overflow")?;
 
-            self.lock_memory_granule_write(memory_index, granule_index)?;
+            self.acquire_granule_write(key, 0)?;
             {
                 let staged = self
                     .staged_granules
@@ -749,8 +989,6 @@ impl TransactionState {
                     .copy_from_slice(&bytes[offset..write_chunk_end]);
             }
 
-            self.memory_read_granules.insert(key);
-            self.memory_write_granules.insert(key);
             current += chunk_len;
             offset = write_chunk_end;
         }
@@ -786,7 +1024,6 @@ impl TransactionState {
     ) -> Result<()> {
         self.ensure_active()?;
         let range = checked_tmemory_range(addr, bytes.len(), snapshot.byte_len)?;
-        let transaction = self.active_transaction_required()?;
         let mut offset: usize = 0;
         let mut current = range.start;
 
@@ -805,8 +1042,7 @@ impl TransactionState {
                 .checked_add(chunk_len)
                 .context("tmemory write offset overflow")?;
 
-            self.locks
-                .acquire_write(transaction, key, granule.version)?;
+            self.acquire_granule_write(key, granule.version)?;
             {
                 let staged = self
                     .staged_granules
@@ -820,8 +1056,6 @@ impl TransactionState {
                     .copy_from_slice(&bytes[offset..write_chunk_end]);
             }
 
-            self.memory_read_granules.insert(key);
-            self.memory_write_granules.insert(key);
             current += chunk_len;
             offset = write_chunk_end;
         }
@@ -885,12 +1119,9 @@ impl TransactionState {
             let granule_index = current / TMEMORY_GRANULE_SIZE;
             let granule_range = tmemory_granule_backing_range(granule_index, memory_len)?;
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            let granule_index =
-                u64::try_from(granule_index).context("tmemory granule index does not fit u64")?;
             let chunk_len = (range.end - current).min(granule_range.end - current);
 
-            self.lock_memory_granule_read(memory_index, granule_index)?;
-            self.memory_read_granules.insert(key);
+            self.acquire_granule_read(key, 0)?;
             current += chunk_len;
         }
 
@@ -919,7 +1150,6 @@ impl TransactionState {
     ) -> Result<Vec<u8>> {
         self.ensure_active()?;
         let range = checked_tmemory_range(addr, len, snapshot.byte_len)?;
-        let transaction = self.active_transaction_required()?;
         let bytes = self.merge_staged_tmemory_range(
             granule_instance(owner_instance),
             memory_index,
@@ -939,8 +1169,7 @@ impl TransactionState {
             let key = memory_granule_key(owner_instance, memory_index, granule.granule_index)?;
             let chunk_len = (range.end - current).min(granule.range.end - current);
 
-            self.locks.record_read(transaction, key, granule.version)?;
-            self.memory_read_granules.insert(key);
+            self.acquire_granule_read(key, granule.version)?;
             current += chunk_len;
         }
 
@@ -1122,13 +1351,191 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> Result<bool> {
+        self.acquire_granule_read(
+            memory_granule_id_from_u64(owner_instance, memory_index, granule_index),
+            0,
+        )
+    }
+
+    pub(crate) fn acquire_memory_size_read_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+    ) -> Result<bool> {
+        self.acquire_granule_read(memory_size_granule_id(owner_instance, memory_index), 0)
+    }
+
+    pub(crate) fn acquire_memory_size_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+    ) -> Result<bool> {
+        self.acquire_granule_write(memory_size_granule_id(owner_instance, memory_index), 0)
+    }
+
+    pub(crate) fn acquire_global_read_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        global_index: u32,
+    ) -> Result<bool> {
+        self.acquire_granule_read(global_granule_id(owner_instance, global_index), 0)
+    }
+
+    pub(crate) fn acquire_global_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        global_index: u32,
+    ) -> Result<bool> {
+        self.acquire_granule_write(global_granule_id(owner_instance, global_index), 0)
+    }
+
+    pub(crate) fn acquire_struct_read(&mut self, object_id: ObjectId) -> Result<bool> {
+        self.acquire_granule_read(GranuleId::TStruct { object_id }, 0)
+    }
+
+    pub(crate) fn acquire_struct_write(&mut self, object_id: ObjectId) -> Result<bool> {
+        self.acquire_granule_write(GranuleId::TStruct { object_id }, 0)
+    }
+
+    pub(crate) fn acquire_array_read(&mut self, object_id: ObjectId) -> Result<bool> {
+        self.acquire_granule_read(GranuleId::TArray { object_id }, 0)
+    }
+
+    pub(crate) fn acquire_array_write(&mut self, object_id: ObjectId) -> Result<bool> {
+        self.acquire_granule_write(GranuleId::TArray { object_id }, 0)
+    }
+
+    pub(crate) fn acquire_object_read(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+    ) -> Result<bool> {
+        self.acquire_granule_read(
+            object_table.granule_id(object_id)?,
+            object_table.version(object_id)?,
+        )
+    }
+
+    pub(crate) fn acquire_object_write(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+    ) -> Result<bool> {
+        self.acquire_granule_write(
+            object_table.granule_id(object_id)?,
+            object_table.version(object_id)?,
+        )
+    }
+
+    pub(crate) fn read_object_payload(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+    ) -> Result<ObjectPayload> {
+        self.acquire_object_read(object_table, object_id)?;
+        if let Some(payload) = self.staged_objects.get(&object_id) {
+            return Ok(payload.clone());
+        }
+        object_table.payload(object_id)
+    }
+
+    pub(crate) fn stage_object_payload(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+        payload: ObjectPayload,
+    ) -> Result<bool> {
+        ensure!(
+            object_table.kind(object_id)? == payload.kind(),
+            "object payload kind does not match object table slot kind"
+        );
+        self.acquire_object_write(object_table, object_id)?;
+        Ok(self.staged_objects.insert(object_id, payload).is_none())
+    }
+
+    pub(crate) fn commit_object_payloads(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<bool> {
         self.ensure_active()?;
-        self.lock_memory_granule_read(memory_index, granule_index)?;
-        Ok(self.memory_read_granules.insert(memory_granule_id_from_u64(
-            owner_instance,
-            memory_index,
-            granule_index,
-        )))
+        self.validate_active_object_reads(object_table)?;
+        if self.staged_objects.is_empty() {
+            return Ok(false);
+        }
+        let updates = self
+            .staged_objects
+            .iter()
+            .map(|(&object_id, payload)| {
+                ensure!(
+                    object_table.kind(object_id)? == payload.kind(),
+                    "object payload kind does not match object table slot kind"
+                );
+                Ok((object_id, payload.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (object_id, payload) in updates {
+            object_table.update_payload(object_id, payload)?;
+        }
+        self.staged_objects.clear();
+        Ok(true)
+    }
+
+    pub(crate) fn validate_active_object_reads(&self, object_table: &ObjectTable) -> Result<()> {
+        for granule in self.active_read_granules()? {
+            let Some(object_id) = object_granule_object_id(granule) else {
+                continue;
+            };
+            self.validate_active_read(granule, object_table.version(object_id)?)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owns_memory_size_read_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+    ) -> bool {
+        self.owns_granule_read(memory_size_granule_id(owner_instance, memory_index))
+    }
+
+    pub(crate) fn owns_memory_size_write_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+    ) -> bool {
+        self.owns_granule_write(memory_size_granule_id(owner_instance, memory_index))
+    }
+
+    pub(crate) fn owns_global_read_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        global_index: u32,
+    ) -> bool {
+        self.owns_granule_read(global_granule_id(owner_instance, global_index))
+    }
+
+    pub(crate) fn owns_global_write_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        global_index: u32,
+    ) -> bool {
+        self.owns_granule_write(global_granule_id(owner_instance, global_index))
+    }
+
+    pub(crate) fn owns_struct_read(&self, object_id: ObjectId) -> bool {
+        self.owns_granule_read(GranuleId::TStruct { object_id })
+    }
+
+    pub(crate) fn owns_struct_write(&self, object_id: ObjectId) -> bool {
+        self.owns_granule_write(GranuleId::TStruct { object_id })
+    }
+
+    pub(crate) fn owns_array_read(&self, object_id: ObjectId) -> bool {
+        self.owns_granule_read(GranuleId::TArray { object_id })
+    }
+
+    pub(crate) fn owns_array_write(&self, object_id: ObjectId) -> bool {
+        self.owns_granule_write(GranuleId::TArray { object_id })
     }
 
     pub(crate) fn acquire_memory_granule_write(
@@ -1148,10 +1555,8 @@ impl TransactionState {
         bytes: Vec<u8>,
     ) -> Result<bool> {
         self.ensure_active()?;
-        self.lock_memory_granule_write(memory_index, granule_index)?;
         let key = memory_granule_id_from_u64(owner_instance, memory_index, granule_index);
-        self.memory_read_granules.insert(key);
-        self.memory_write_granules.insert(key);
+        self.acquire_granule_write(key, 0)?;
         Ok(self.staged_granules.insert(key, bytes).is_none())
     }
 
@@ -1175,27 +1580,11 @@ impl TransactionState {
                 .and_then(|index| index.checked_mul(TMEMORY_GRANULE_SIZE))
                 .context("tmemory pending store granule overflow")?;
             let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
-            let granule_index =
-                u64::try_from(granule_index).context("tmemory granule index does not fit u64")?;
-            self.lock_memory_granule_write(memory_index, granule_index)?;
-            self.memory_read_granules.insert(key);
-            self.memory_write_granules.insert(key);
+            self.acquire_granule_write(key, 0)?;
             current = end.min(granule_end);
         }
 
         Ok(())
-    }
-
-    fn lock_memory_granule_read(&mut self, memory_index: u32, granule_index: u64) -> Result<()> {
-        let transaction = self.active_transaction_required()?;
-        self.locks
-            .acquire_memory_granule_read(transaction, memory_index, granule_index)
-    }
-
-    fn lock_memory_granule_write(&mut self, memory_index: u32, granule_index: u64) -> Result<()> {
-        let transaction = self.active_transaction_required()?;
-        self.locks
-            .acquire_memory_granule_write(transaction, memory_index, granule_index)
     }
 
     pub(crate) fn owns_memory_granule_read(&self, memory_index: u32, granule_index: u64) -> bool {
@@ -1208,12 +1597,11 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.memory_read_granules
-            .contains(&memory_granule_id_from_u64(
-                owner_instance,
-                memory_index,
-                granule_index,
-            ))
+        self.owns_granule_read(memory_granule_id_from_u64(
+            owner_instance,
+            memory_index,
+            granule_index,
+        ))
     }
 
     pub(crate) fn owns_memory_granule_write(&self, memory_index: u32, granule_index: u64) -> bool {
@@ -1226,12 +1614,11 @@ impl TransactionState {
         memory_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.memory_write_granules
-            .contains(&memory_granule_id_from_u64(
-                owner_instance,
-                memory_index,
-                granule_index,
-            ))
+        self.owns_granule_write(memory_granule_id_from_u64(
+            owner_instance,
+            memory_index,
+            granule_index,
+        ))
     }
 
     pub(crate) fn acquire_table_granule_read_owned(
@@ -1241,11 +1628,8 @@ impl TransactionState {
         element_index: u64,
         current_version: u64,
     ) -> Result<bool> {
-        self.ensure_active()?;
-        let transaction = self.active_transaction_required()?;
         let key = table_granule_id(owner_instance, table_index, element_index);
-        self.locks.record_read(transaction, key, current_version)?;
-        Ok(self.table_read_granules.insert(key))
+        self.acquire_granule_read(key, current_version)
     }
 
     pub(crate) fn acquire_table_granule_write_owned(
@@ -1255,13 +1639,8 @@ impl TransactionState {
         element_index: u64,
         current_version: u64,
     ) -> Result<bool> {
-        self.ensure_active()?;
-        let transaction = self.active_transaction_required()?;
         let key = table_granule_id(owner_instance, table_index, element_index);
-        self.locks
-            .acquire_write(transaction, key, current_version)?;
-        self.table_read_granules.insert(key);
-        Ok(self.table_write_granules.insert(key))
+        self.acquire_granule_write(key, current_version)
     }
 
     pub(crate) fn acquire_table_granule_read_range_owned(
@@ -1276,7 +1655,6 @@ impl TransactionState {
         if len == 0 {
             return Ok(false);
         }
-        let transaction = self.active_transaction_required()?;
         let last_element = start_element
             .checked_add(len - 1)
             .context("ttable read range overflow")?;
@@ -1285,8 +1663,7 @@ impl TransactionState {
         let mut inserted = false;
         for granule_index in first_granule..=last_granule {
             let key = table_granule_id_from_u64(owner_instance, table_index, granule_index);
-            self.locks.record_read(transaction, key, current_version)?;
-            inserted |= self.table_read_granules.insert(key);
+            inserted |= self.acquire_granule_read(key, current_version)?;
         }
         Ok(inserted)
     }
@@ -1303,7 +1680,6 @@ impl TransactionState {
         if len == 0 {
             return Ok(false);
         }
-        let transaction = self.active_transaction_required()?;
         let last_element = start_element
             .checked_add(len - 1)
             .context("ttable write range overflow")?;
@@ -1312,10 +1688,7 @@ impl TransactionState {
         let mut inserted = false;
         for granule_index in first_granule..=last_granule {
             let key = table_granule_id_from_u64(owner_instance, table_index, granule_index);
-            self.locks
-                .acquire_write(transaction, key, current_version)?;
-            self.table_read_granules.insert(key);
-            inserted |= self.table_write_granules.insert(key);
+            inserted |= self.acquire_granule_write(key, current_version)?;
         }
         Ok(inserted)
     }
@@ -1326,11 +1699,8 @@ impl TransactionState {
         table_index: u32,
         current_version: u64,
     ) -> Result<bool> {
-        self.ensure_active()?;
-        let transaction = self.active_transaction_required()?;
         let key = table_size_granule_id(owner_instance, table_index);
-        self.locks.record_read(transaction, key, current_version)?;
-        Ok(self.table_read_granules.insert(key))
+        self.acquire_granule_read(key, current_version)
     }
 
     pub(crate) fn acquire_table_size_write_owned(
@@ -1339,13 +1709,8 @@ impl TransactionState {
         table_index: u32,
         current_version: u64,
     ) -> Result<bool> {
-        self.ensure_active()?;
-        let transaction = self.active_transaction_required()?;
         let key = table_size_granule_id(owner_instance, table_index);
-        self.locks
-            .acquire_write(transaction, key, current_version)?;
-        self.table_read_granules.insert(key);
-        Ok(self.table_write_granules.insert(key))
+        self.acquire_granule_write(key, current_version)
     }
 
     pub(crate) fn owns_table_granule_read_owned(
@@ -1354,12 +1719,11 @@ impl TransactionState {
         table_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.table_read_granules
-            .contains(&table_granule_id_from_u64(
-                owner_instance,
-                table_index,
-                granule_index,
-            ))
+        self.owns_granule_read(table_granule_id_from_u64(
+            owner_instance,
+            table_index,
+            granule_index,
+        ))
     }
 
     pub(crate) fn owns_table_granule_write_owned(
@@ -1368,12 +1732,11 @@ impl TransactionState {
         table_index: u32,
         granule_index: u64,
     ) -> bool {
-        self.table_write_granules
-            .contains(&table_granule_id_from_u64(
-                owner_instance,
-                table_index,
-                granule_index,
-            ))
+        self.owns_granule_write(table_granule_id_from_u64(
+            owner_instance,
+            table_index,
+            granule_index,
+        ))
     }
 
     pub(crate) fn owns_table_size_read_owned(
@@ -1381,8 +1744,7 @@ impl TransactionState {
         owner_instance: Option<InstanceId>,
         table_index: u32,
     ) -> bool {
-        self.table_read_granules
-            .contains(&table_size_granule_id(owner_instance, table_index))
+        self.owns_granule_read(table_size_granule_id(owner_instance, table_index))
     }
 
     pub(crate) fn owns_table_size_write_owned(
@@ -1390,8 +1752,7 @@ impl TransactionState {
         owner_instance: Option<InstanceId>,
         table_index: u32,
     ) -> bool {
-        self.table_write_granules
-            .contains(&table_size_granule_id(owner_instance, table_index))
+        self.owns_granule_write(table_size_granule_id(owner_instance, table_index))
     }
 
     fn merge_staged_tmemory_range(
@@ -1522,10 +1883,9 @@ impl TransactionState {
         self.staged_globals.clear();
         self.staged_granules.clear();
         self.staged_memory_sizes.clear();
-        self.memory_read_granules.clear();
-        self.memory_write_granules.clear();
-        self.table_read_granules.clear();
-        self.table_write_granules.clear();
+        self.staged_objects.clear();
+        self.read_granules.clear();
+        self.write_granules.clear();
         self.scratch.clear();
         self.pending_memory_store = None;
     }
@@ -1642,6 +2002,21 @@ fn global_granule_id(owner_instance: Option<InstanceId>, global_index: u32) -> G
     GranuleId::TGlobal {
         instance: granule_instance(owner_instance),
         global_index,
+    }
+}
+
+fn object_slot_index(object_id: ObjectId) -> Result<usize> {
+    usize::try_from(object_id.object_index).context("object id does not fit host usize")
+}
+
+fn object_granule_object_id(granule: GranuleId) -> Option<ObjectId> {
+    match granule {
+        GranuleId::TStruct { object_id } | GranuleId::TArray { object_id } => Some(object_id),
+        GranuleId::TMemory { .. }
+        | GranuleId::TMemorySize { .. }
+        | GranuleId::TGlobal { .. }
+        | GranuleId::TTable { .. }
+        | GranuleId::TTableSize { .. } => None,
     }
 }
 
@@ -3496,6 +3871,208 @@ mod tests {
         );
         assert!(state.owns_table_size_write_owned(Some(owner), 2));
         assert!(!state.owns_table_granule_write_owned(Some(owner), 2, 0));
+    }
+
+    #[test]
+    fn granule_permission_acquisition_tracks_all_granule_kinds() {
+        let mut state = TransactionState::default();
+        let owner = InstanceId::from_u32(1);
+        let object = ObjectId { object_index: 9 };
+        let granules = [
+            GranuleId::TMemory {
+                instance: Some(1),
+                memory_index: 0,
+                granule_index: 2,
+            },
+            GranuleId::TMemorySize {
+                instance: Some(1),
+                memory_index: 0,
+            },
+            GranuleId::TGlobal {
+                instance: Some(1),
+                global_index: 3,
+            },
+            GranuleId::TTable {
+                instance: Some(1),
+                table_index: 4,
+                granule_index: 5,
+            },
+            GranuleId::TTableSize {
+                instance: Some(1),
+                table_index: 4,
+            },
+            GranuleId::TStruct { object_id: object },
+            GranuleId::TArray { object_id: object },
+        ];
+
+        state.begin().unwrap();
+
+        for granule in granules {
+            assert!(state.acquire_granule_read(granule, 7).unwrap());
+            assert!(!state.acquire_granule_read(granule, 7).unwrap());
+            assert!(state.owns_granule_read(granule));
+            assert!(!state.owns_granule_write(granule));
+
+            assert!(state.acquire_granule_write(granule, 7).unwrap());
+            assert!(!state.acquire_granule_write(granule, 7).unwrap());
+            assert!(state.owns_granule_read(granule));
+            assert!(state.owns_granule_write(granule));
+        }
+
+        assert!(state.owns_memory_granule_write_owned(Some(owner), 0, 2));
+        assert!(state.owns_table_granule_write_owned(Some(owner), 4, 5));
+        assert!(state.owns_table_size_write_owned(Some(owner), 4));
+    }
+
+    #[test]
+    fn stage_global_acquires_tglobal_write_permission() {
+        let mut state = TransactionState::default();
+        let owner = InstanceId::from_u32(3);
+        let granule = GranuleId::TGlobal {
+            instance: Some(3),
+            global_index: 1,
+        };
+
+        state.begin().unwrap();
+
+        state
+            .stage_global_owned(Some(owner), 1, GlobalSnapshot::I32(42))
+            .unwrap();
+
+        assert!(state.owns_granule_read(granule));
+        assert!(state.owns_granule_write(granule));
+    }
+
+    #[test]
+    fn object_table_allocates_dense_stable_ids_and_reuses_freed_slots() {
+        let mut objects = ObjectTable::default();
+
+        let first = objects.allocate(ObjectKind::Struct).unwrap();
+        let second = objects.allocate(ObjectKind::Array).unwrap();
+
+        assert_eq!(first, ObjectId { object_index: 0 });
+        assert_eq!(second, ObjectId { object_index: 1 });
+        assert_eq!(objects.live_count(), 2);
+        assert_eq!(objects.slot_count(), 2);
+        assert_eq!(objects.kind(first).unwrap(), ObjectKind::Struct);
+        assert_eq!(objects.kind(second).unwrap(), ObjectKind::Array);
+
+        let second_version = objects.version(second).unwrap();
+        assert!(objects.free(second).unwrap());
+        assert_eq!(objects.live_count(), 1);
+        assert_eq!(objects.slot_count(), 2);
+        assert!(objects.kind(second).is_err());
+
+        let reused = objects.allocate(ObjectKind::Struct).unwrap();
+
+        assert_eq!(reused, second);
+        assert_eq!(objects.live_count(), 2);
+        assert_eq!(objects.slot_count(), 2);
+        assert!(objects.version(reused).unwrap() > second_version);
+        assert_eq!(objects.kind(reused).unwrap(), ObjectKind::Struct);
+    }
+
+    #[test]
+    fn object_table_granule_permissions_are_kind_aware() {
+        let mut objects = ObjectTable::default();
+        let struct_object = objects.allocate(ObjectKind::Struct).unwrap();
+        let array_object = objects.allocate(ObjectKind::Array).unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        assert!(state.acquire_object_read(&objects, struct_object).unwrap());
+        assert!(state.owns_granule_read(GranuleId::TStruct {
+            object_id: struct_object,
+        }));
+        assert!(!state.owns_granule_write(GranuleId::TStruct {
+            object_id: struct_object,
+        }));
+
+        assert!(state.acquire_object_write(&objects, array_object).unwrap());
+        assert!(state.owns_granule_read(GranuleId::TArray {
+            object_id: array_object,
+        }));
+        assert!(state.owns_granule_write(GranuleId::TArray {
+            object_id: array_object,
+        }));
+
+        state.abort().unwrap();
+
+        assert!(!state.owns_granule_read(GranuleId::TStruct {
+            object_id: struct_object,
+        }));
+        assert!(!state.owns_granule_write(GranuleId::TArray {
+            object_id: array_object,
+        }));
+    }
+
+    #[test]
+    fn object_payload_updates_are_copy_on_write_until_commit() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        assert_eq!(
+            state.read_object_payload(&objects, object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+        );
+        state
+            .stage_object_payload(
+                &objects,
+                object,
+                ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)]),
+            )
+            .unwrap();
+        assert_eq!(
+            state.read_object_payload(&objects, object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)])
+        );
+        state.abort().unwrap();
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+        );
+
+        state.begin().unwrap();
+        state
+            .stage_object_payload(
+                &objects,
+                object,
+                ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)]),
+            )
+            .unwrap();
+        assert!(state.commit_object_payloads(&mut objects).unwrap());
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)])
+        );
+    }
+
+    #[test]
+    fn object_payload_commit_validates_object_read_versions() {
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        state.read_object_payload(&objects, object).unwrap();
+        objects
+            .update_payload(object, ObjectPayload::Struct(vec![ObjectValue::I32(2)]))
+            .unwrap();
+
+        let error = state.commit_object_payloads(&mut objects).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("optimistic read version changed")
+        );
     }
 
     #[test]

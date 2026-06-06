@@ -191,12 +191,12 @@ For `tmemory`, staged entries are keyed by
 `TMemory { instance, memory_index, granule_index }`. The workspace value stores
 the staged bytes for that granule.
 
-When the persistent object table lands, object-backed workspace entries remain
-keyed by `GranuleId`. `ObjectId` is not a standalone `GranuleId` variant; it is
-the object-table slot identity carried by object-space variants such as
-`TStruct` and `TArray`. Following Wizard, those variants are whole-object
-granules in the first object-table workstream. Ownership, versioning, and
-conflict checks all use the same `GranuleId` key family.
+Object-backed workspace entries remain keyed by `GranuleId`. `ObjectId` is not
+a standalone `GranuleId` variant; it is the object-table slot identity carried
+by object-space variants such as `TStruct` and `TArray`. Following Wizard,
+those variants are whole-object granules in the first object-table workstream.
+Ownership, versioning, and conflict checks all use the same `GranuleId` key
+family.
 
 Reads check the private workspace by `GranuleId` first. If the requested byte
 range has no staged data, the runtime reads committed `tmemory` bytes. Reads
@@ -240,18 +240,36 @@ Object-table phase identities carry `ObjectId` as the stable object-table slot:
 - `TStruct { object_id }`
 - `TArray { object_id }`
 
-The object table decides how `object_id` maps to structs, arrays, function
-references, external objects, or future GC-backed transaction objects.
+The first in-memory `ObjectTable` foundation allocates dense stable
+`ObjectId`s, reuses freed slots, stores live-slot versions, and maps struct and
+array slots to `TStruct`/`TArray` granules. It also supports staged
+struct/array payload snapshots so transactions can read staged values, discard
+them on abort, apply them on commit, and validate optimistic object reads
+against current object slot versions. Later object-model work will attach full
+payload layout, GC identity, transactional refs, and persistence.
 
 This is not the persistent object-table implementation. Persistent object-space
-`GranuleId` variants and the full `ObjectTable` come later. The purpose of this
-phase is to establish the runtime `GranuleId` ownership shape without tying it
-to storage durability, GC, or one concurrency-control implementation.
+payload storage comes later. The purpose of this phase is to establish the
+runtime `GranuleId` ownership shape without tying it to storage durability, GC,
+or one concurrency-control implementation.
 
 The current `ttable` runtime writes funcref table entries directly to
 Wasmtime's table backing after acquiring `TTable` ownership. This is a
 scaffolded execution path, not table-element COW. The future table/object-table
 workspace must replace direct mutation so abort can discard table writes.
+
+## Runtime Permissions
+
+Wizard permissions are modeled as read/write access modes over `GranuleId`.
+They are not limited to object references. The same permission API applies to
+`TMemory`, `TMemorySize`, `TGlobal`, `TTable`, `TTableSize`, `TStruct`, and
+`TArray` granules.
+
+The Wasm-visible `tref none/read/write` permission is the frontend type-system
+surface for transactional references. Runtime enforcement still resolves to
+granule acquisition: reads acquire optimistic read permission for the target
+granule, and writes acquire pessimistic write ownership for the target granule.
+Write ownership implies read access in the active transaction.
 
 ## LockBased Concurrency
 

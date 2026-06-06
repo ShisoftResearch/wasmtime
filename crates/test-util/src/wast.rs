@@ -1861,11 +1861,16 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tblock.wast",
     "tbr.wast",
     "tbr_if.wast",
+    "tbr_table.wast",
+    "tbulk.wast",
     "tcall.wast",
     "tcall_indirect.wast",
     "tconflict-tmemory.wast",
     "tconst.wast",
     "tconversions.wast",
+    "tdata.wast",
+    "telem.wast",
+    "tendianness.wast",
     "texports.wast",
     "tf32.wast",
     "tf32_bitwise.wast",
@@ -1875,9 +1880,12 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tf64_cmp.wast",
     "tfac.wast",
     "tfloat_exprs.wast",
+    "tfloat_literals.wast",
     "tfloat_misc.wast",
     "tforward.wast",
+    "tfunc.wast",
     "tfunc_ptrs.wast",
+    "tglobal.wast",
     "ti32.wast",
     "ti64.wast",
     "tif.wast",
@@ -1887,6 +1895,8 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tint_literals.wast",
     "tlabels.wast",
     "tleft-to-right.wast",
+    "tlinking.wast",
+    "tlocal_init.wast",
     "tlocal_get.wast",
     "tlocal_set.wast",
     "tlocal_tee.wast",
@@ -1894,11 +1904,18 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tnames.wast",
     "tnop.wast",
     "treturn.wast",
+    "tref.wast",
+    "tref_is_null.wast",
+    "tref_null.wast",
+    "tref_tfunc.wast",
+    "tselect.wast",
     "tstack.wast",
     "tstart.wast",
     "tswitch.wast",
     "ttraps.wast",
     "ttype.wast",
+    "tunreached-invalid.wast",
+    "tunreached-valid.wast",
     "tunreachable.wast",
     "tunwind.wast",
     "tutf8-invalid-encoding.wast",
@@ -1924,11 +1941,24 @@ const SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY: &[&str] = &[
     "tskip-stack-guard-page.wast",
 ];
 
-const SIMPLE_TRANSACTION_REAL_TEXT_TTABLE: &[&str] = &["ttable_copy.wast", "ttable_init.wast"];
+const SIMPLE_TRANSACTION_REAL_TEXT_TTABLE: &[&str] = &[
+    "ttable.wast",
+    "ttable-sub.wast",
+    "ttable_copy.wast",
+    "ttable_fill.wast",
+    "ttable_get.wast",
+    "ttable_grow.wast",
+    "ttable_init.wast",
+    "ttable_set.wast",
+    "ttable_size.wast",
+];
+
+const SIMPLE_TRANSACTION_REAL_BINARY: &[&str] = &["tbinary.wast", "tbinary-leb128.wast"];
 
 const TSIMD_TRANSACTION_REAL_TEXT_MEMORY: &[&str] = &[
     "tsimd_address.wast",
     "tsimd_align.wast",
+    "tsimd_const.wast",
     "tsimd_load.wast",
     "tsimd_load_extend.wast",
     "tsimd_load_splat.wast",
@@ -1948,6 +1978,7 @@ fn simple_transaction_real_text_parser_enabled(name: &str) -> bool {
     SIMPLE_TRANSACTION_REAL_TEXT_CORE.contains(&name)
         || SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY.contains(&name)
         || SIMPLE_TRANSACTION_REAL_TEXT_TTABLE.contains(&name)
+        || SIMPLE_TRANSACTION_REAL_BINARY.contains(&name)
 }
 
 fn tsimd_transaction_real_text_parser_enabled(name: &str) -> bool {
@@ -1991,6 +2022,7 @@ fn tsimd_transaction_proposal_enabled(name: &str) -> bool {
             | "tsimd_bit_shift.wast"
             | "tsimd_bitwise.wast"
             | "tsimd_boolean.wast"
+            | "tsimd_const.wast"
             | "tsimd_conversions.wast"
             | "tsimd_f32x4.wast"
             | "tsimd_f32x4_arith.wast"
@@ -2771,10 +2803,57 @@ mod tests {
     }
 
     #[test]
+    fn enables_real_binary_transaction_proposal_tranche() {
+        for name in ["tbinary.wast", "tbinary-leb128.wast"] {
+            let test = WastTest {
+                path: PathBuf::from(name),
+                contents: String::new(),
+                config: TestConfig::default(),
+                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: true,
+            };
+
+            assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
+            assert!(
+                super::transaction_proposal_adapter_mock(&test.path).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn enables_real_unreachable_validation_transaction_proposal_tranche() {
+        for name in ["tunreached-valid.wast", "tunreached-invalid.wast"] {
+            let test = WastTest {
+                path: PathBuf::from(name),
+                contents: String::new(),
+                config: TestConfig::default(),
+                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: true,
+            };
+
+            assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
+            assert!(
+                super::transaction_proposal_adapter_mock(&test.path).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn enables_real_text_parser_transaction_simd_memory_tranche() {
         for name in [
             "tsimd_address.wast",
             "tsimd_align.wast",
+            "tsimd_const.wast",
             "tsimd_load.wast",
             "tsimd_load_extend.wast",
             "tsimd_load_splat.wast",

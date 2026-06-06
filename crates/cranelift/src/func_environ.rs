@@ -3674,10 +3674,8 @@ impl FuncEnvironment<'_> {
             | WasmValType::I64
             | WasmValType::F32
             | WasmValType::F64
-            | WasmValType::V128 => Ok(super::value_type(self.isa, ty)),
-            WasmValType::Ref(_) => Err(wasmtime_environ::WasmError::Unsupported(
-                "transactional global type is not implemented yet".into(),
-            )),
+            | WasmValType::V128
+            | WasmValType::Ref(_) => Ok(super::value_type(self.isa, ty)),
         }
     }
 
@@ -3698,11 +3696,27 @@ impl FuncEnvironment<'_> {
                 let bits = builder.ins().bitcast(I64, MemFlagsData::new(), val);
                 Ok((3, bits))
             }
-            WasmValType::V128 | WasmValType::Ref(_) => {
-                Err(wasmtime_environ::WasmError::Unsupported(
-                    "transactional global type is not implemented yet".into(),
-                ))
-            }
+            WasmValType::V128 => Err(wasmtime_environ::WasmError::Unsupported(
+                "transactional global type is not implemented yet".into(),
+            )),
+            WasmValType::Ref(ref_ty) => match ref_ty.heap_type.top() {
+                WasmHeapTopType::Func => {
+                    let val_ty = builder.func.dfg.value_type(val);
+                    let value = if val_ty == I64 {
+                        val
+                    } else {
+                        debug_assert_eq!(val_ty, self.pointer_type());
+                        builder.ins().uextend(I64, val)
+                    };
+                    Ok((5, value))
+                }
+                WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
+                    Ok((4, builder.ins().uextend(I64, val)))
+                }
+                WasmHeapTopType::Cont => Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional contref global is not implemented yet".into(),
+                )),
+            },
         }
     }
 
@@ -4024,7 +4038,6 @@ impl FuncEnvironment<'_> {
         init_value: ir::Value,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_table(table_index)?;
-        self.ensure_transaction_table_funcref(table_index)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_ttable_grow(),
@@ -4075,7 +4088,7 @@ impl FuncEnvironment<'_> {
         index: ir::Value,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_table(table_index)?;
-        self.ensure_transaction_table_funcref(table_index)?;
+        let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
         let callee = self
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_ttable_get());
@@ -4088,7 +4101,20 @@ impl FuncEnvironment<'_> {
         let call = pos
             .ins()
             .call(callee, &[table_vmctx, defined_table_index, index]);
-        Ok(pos.func.dfg.inst_results(call)[0])
+        let value = pos.func.dfg.inst_results(call)[0];
+        match ref_top {
+            WasmHeapTopType::Func => Ok(value),
+            WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
+                if self.pointer_type() == I32 {
+                    Ok(value)
+                } else {
+                    Ok(pos.ins().ireduce(I32, value))
+                }
+            }
+            WasmHeapTopType::Cont => Err(wasmtime_environ::WasmError::Unsupported(
+                "transactional contref table is not implemented yet".into(),
+            )),
+        }
     }
 
     pub fn translate_transaction_ttable_set(
@@ -4099,7 +4125,7 @@ impl FuncEnvironment<'_> {
         index: ir::Value,
     ) -> WasmResult<()> {
         self.ensure_transaction_table(table_index)?;
-        self.ensure_transaction_table_funcref(table_index)?;
+        let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
         let callee = self
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_ttable_set());
@@ -4109,6 +4135,21 @@ impl FuncEnvironment<'_> {
         let (table_vmctx, defined_table_index) =
             self.table_vmctx_and_defined_index(&mut pos, table_index);
         let index = self.cast_index_to_i64(&mut pos, index, index_type);
+        let value = match ref_top {
+            WasmHeapTopType::Func => value,
+            WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
+                if self.pointer_type() == I32 {
+                    value
+                } else {
+                    pos.ins().uextend(self.pointer_type(), value)
+                }
+            }
+            WasmHeapTopType::Cont => {
+                return Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional contref table is not implemented yet".into(),
+                ));
+            }
+        };
         pos.ins()
             .call(callee, &[table_vmctx, defined_table_index, index, value]);
         Ok(())
@@ -4123,7 +4164,6 @@ impl FuncEnvironment<'_> {
         len: ir::Value,
     ) -> WasmResult<()> {
         self.ensure_transaction_table(table_index)?;
-        self.ensure_transaction_table_funcref(table_index)?;
         self.translate_transaction_ttable_write_range(builder, table_index, dest, len)?;
         // SHISOFT-TWASM-MOCK: this acquires transactional table ownership but
         // still applies through Wasmtime's ordinary table backing. Replace this

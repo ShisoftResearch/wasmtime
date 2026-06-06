@@ -32,9 +32,13 @@ Current verified status:
 - SIMD transactional memory load/store families run through the real parser and
   transactional memory runtime. SIMD numeric-only aliases still use the
   compatibility adapter.
-- Funcref `ttable.get/set/size/grow` and the `ttable.copy/init` WAST smoke
-  paths are wired. Table element COW and reference/object permissions remain
-  object-table work.
+- Ref-valued `ttable.get/set/size/grow/fill/copy/init` paths are wired for the
+  current WAST-visible table cases. Table element COW remains deferred; these
+  paths still acquire table granules and then apply through Wasmtime's table
+  backing.
+- Ref-valued `tglobal.get/set` is wired for raw `funcref` and raw GC-ref words
+  as a scaffold. Rooted/object-table snapshots for non-null object references
+  remain object-model work.
 
 Latest verification:
 
@@ -50,20 +54,25 @@ Results on 2026-06-06:
 
 - `wasmtime-environ transaction_object_metadata`: 8 passed.
 - `wasmtime --lib tmemory`: 39 passed.
-- `wasmtime --lib transaction`: 78 passed.
-- `simple-transactions`: 71 passed, 45 ignored.
-- full transaction proposal slice: 127 passed, 46 ignored.
+- `wasmtime --lib transaction`: 84 passed.
+- `simple-transactions`: 96 passed, 20 ignored.
+- full transaction proposal slice: 153 passed, 20 ignored.
 
 Remaining implementation work before all ignored WAST can run without
 normalization:
 
-- Transactional refs and the object table: `tref`, `tcall_ref`,
-  `return_tcall_ref`, branch-on-ref, `tstruct`, `tarray`, `ti31`, `textern`,
-  casts, and object permission checks.
-- Table element COW for transactional refs and object-valued tables.
+- Transactional refs and the full object-model runtime: real `tcall_ref`,
+  `return_tcall_ref`, branch-on-ref without harness mocks, `tstruct`,
+  `tarray`, `ti31`, `textern`, casts, and object permission checks.
+- Table element COW for transactional refs and object-valued tables. Current
+  table operations acquire ownership but still mutate the committed table path.
 - Structured `ttry`/`tfail` semantics.
-- Reference/object-valued transactional globals and imported v128 globals.
-- Binary transactional type/reference encodings.
+- Rooted reference/object-valued transactional globals and imported v128
+  globals.
+- Full object/reference-model validation and lowering. The remaining
+  ref-control files allocate or inspect `tstruct`, `tarray`, `ti31`, and
+  `textern` objects and should move with object-table work, not adapter
+  aliases.
 - Durable `FileBackedMemory` and `NVMemory` backends.
 
 ## Scope
@@ -87,10 +96,11 @@ failure-handler work:
 
 This plan does not implement:
 
-- Table-element COW, table bulk operators, and the full object table.
+- Table-element COW, table bulk operators, and the full object-model runtime.
   `GranuleId::TTable` and `GranuleId::TTableSize` are used by the first funcref
-  table runtime paths; `GranuleId::TStruct` and `GranuleId::TArray` remain
-  reserved for object-table work. `ObjectId` is carried inside the struct/array
+  table runtime paths; `GranuleId::TStruct` and `GranuleId::TArray` are backed
+  by the first in-memory `ObjectTable` foundation with payload COW and object
+  read-version validation. `ObjectId` is carried inside the struct/array
   granule variants, not used as a standalone ownership key.
 - Transactional structs, arrays, refs, GC integration, or reference-control
   permissions.
