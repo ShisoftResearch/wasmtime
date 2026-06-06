@@ -58,8 +58,8 @@ use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
-    GlobalSnapshot, GranuleId, StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,
-    collect_tmemory_access_snapshot,
+    GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectTable, ObjectValue, ObjectValueAbi,
+    StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot, collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -1112,6 +1112,162 @@ fn transaction_ttable_grow_impl(
             .map(AllocationSize);
         Ok(result)
     })?
+}
+
+fn transaction_tstruct_new(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+    struct_type: u32,
+    field_count: u32,
+    fields: *mut u8,
+) -> Result<()> {
+    let result =
+        transaction_tstruct_new_impl(store, instance, gc_ref, struct_type, field_count, fields);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tstruct_new_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+    _struct_type: u32,
+    field_count: u32,
+    fields: *mut u8,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let field_count =
+        usize::try_from(field_count).context("transactional struct field count overflow")?;
+    ensure!(
+        field_count == 0 || !fields.is_null(),
+        "transactional struct fields pointer is null"
+    );
+    let fields = if field_count == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(fields.cast::<ObjectValueAbi>(), field_count) }
+    };
+
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    let mut values = Vec::with_capacity(field_count);
+    for abi in fields {
+        values.push(object_value_from_transaction_abi(object_table, *abi)?);
+    }
+    let object_id = object_table.allocate_struct_for_gc_ref(gc_ref, values)?;
+    state.acquire_object_write(object_table, object_id)?;
+    Ok(())
+}
+
+fn transaction_tstruct_set(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+    field: u32,
+    tag: u32,
+    low: u64,
+    high: u64,
+) -> Result<()> {
+    let result = transaction_tstruct_set_impl(store, instance, gc_ref, field, tag, low, high);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tstruct_set_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+    field: u32,
+    tag: u32,
+    low: u64,
+    high: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let abi = ObjectValueAbi::from_parts(tag, low, high)?;
+    let field = usize::try_from(field).context("transactional struct field index overflow")?;
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+    let value = object_value_from_transaction_abi(object_table, abi)?;
+    state.stage_struct_field(object_table, object_id, field, value)
+}
+
+fn transaction_tstruct_get(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+    field: u32,
+) -> Result<*mut u8> {
+    let result = transaction_tstruct_get_impl(store, instance, gc_ref, field);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tstruct_get_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+    field: u32,
+) -> Result<*mut u8> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let field = usize::try_from(field).context("transactional struct field index overflow")?;
+    let abi = {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+        let value = state.read_struct_field(object_table, object_id, field)?;
+        transaction_abi_from_object_value(object_table, &value)?
+    };
+    let bytes = object_value_abi_bytes(abi);
+    Ok(store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .set_scratch(bytes))
+}
+
+fn object_value_from_transaction_abi(
+    object_table: &ObjectTable,
+    abi: ObjectValueAbi,
+) -> Result<ObjectValue> {
+    let (tag, low, high) = abi.as_parts();
+    if tag != OBJECT_VALUE_ABI_TAG_REF {
+        return abi.to_object_value();
+    }
+    ensure!(high == 0, "non-canonical ref object value ABI payload");
+    let raw = u32::try_from(low).context("transactional object GC ref does not fit u32")?;
+    let object_id = if raw == 0 {
+        None
+    } else {
+        Some(object_table.object_id_for_gc_ref(raw)?)
+    };
+    Ok(ObjectValue::Ref(object_id))
+}
+
+fn transaction_abi_from_object_value(
+    object_table: &ObjectTable,
+    value: &ObjectValue,
+) -> Result<ObjectValueAbi> {
+    let ObjectValue::Ref(object_id) = value else {
+        return ObjectValueAbi::from_object_value(value);
+    };
+    let raw = match object_id {
+        Some(object_id) => u64::from(object_table.gc_ref_for_object_id(*object_id)?),
+        None => 0,
+    };
+    ObjectValueAbi::from_parts(OBJECT_VALUE_ABI_TAG_REF, raw, 0)
+}
+
+fn object_value_abi_bytes(abi: ObjectValueAbi) -> Vec<u8> {
+    let (tag, low, high) = abi.as_parts();
+    let mut bytes = vec![0; core::mem::size_of::<ObjectValueAbi>()];
+    bytes[0..4].copy_from_slice(&tag.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&low.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&high.to_ne_bytes());
+    bytes
 }
 
 fn checked_tmemory_effective_address(addr: u64, offset: u64) -> Result<u64> {

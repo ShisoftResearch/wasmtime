@@ -2079,7 +2079,7 @@ impl ConstOp {
             O::RefFunc { function_index } => Self::RefFunc(FuncIndex::from_u32(function_index)),
             O::GlobalGet { global_index } => Self::GlobalGet(GlobalIndex::from_u32(global_index)),
             O::TGlobalGet { global_index } => Self::GlobalGet(GlobalIndex::from_u32(global_index)),
-            O::RefI31 => Self::RefI31,
+            O::RefI31 | O::TRefI31 => Self::RefI31,
             O::I32Add => Self::I32Add,
             O::I32Sub => Self::I32Sub,
             O::I32Mul => Self::I32Mul,

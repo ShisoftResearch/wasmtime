@@ -397,6 +397,12 @@ struct ObjectTableSlot {
 pub(crate) struct ObjectTable {
     slots: Vec<Option<ObjectTableSlot>>,
     free_list: Vec<ObjectId>,
+    // SHISOFT-TWASM-MOCK: this volatile side map lets the first transactional
+    // object libcalls use Wasmtime GC refs while the persistent-object GC is
+    // still future work. A moving/persistent collector must replace raw
+    // `VMGcRef` keys with stable persistent object headers.
+    gc_ref_to_object: BTreeMap<u32, ObjectId>,
+    object_to_gc_ref: BTreeMap<ObjectId, u32>,
     next_version: u64,
     live_count: usize,
     heap: object_heap::ObjectHeap,
@@ -409,6 +415,24 @@ impl ObjectTable {
 
     pub(crate) fn allocate_struct(&mut self, fields: Vec<ObjectValue>) -> Result<ObjectId> {
         self.allocate_payload(ObjectPayload::Struct(fields))
+    }
+
+    pub(crate) fn allocate_struct_for_gc_ref(
+        &mut self,
+        gc_ref: u32,
+        fields: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        ensure!(
+            gc_ref != 0,
+            "transactional struct object cannot use null GC ref"
+        );
+        ensure!(
+            !self.gc_ref_to_object.contains_key(&gc_ref),
+            "transactional object GC ref is already associated"
+        );
+        let object_id = self.allocate_struct(fields)?;
+        self.associate_gc_ref(gc_ref, object_id)?;
+        Ok(object_id)
     }
 
     pub(crate) fn allocate_array(&mut self, elements: Vec<ObjectValue>) -> Result<ObjectId> {
@@ -457,6 +481,44 @@ impl ObjectTable {
 
     pub(crate) fn live_count(&self) -> usize {
         self.live_count
+    }
+
+    pub(crate) fn associate_gc_ref(&mut self, gc_ref: u32, object_id: ObjectId) -> Result<()> {
+        ensure!(gc_ref != 0, "transactional object cannot use null GC ref");
+        self.live_slot(object_id)?;
+        if let Some(existing) = self.gc_ref_to_object.get(&gc_ref).copied() {
+            ensure!(
+                existing == object_id,
+                "transactional object GC ref is already associated"
+            );
+        }
+        if let Some(existing) = self.object_to_gc_ref.get(&object_id).copied() {
+            ensure!(
+                existing == gc_ref,
+                "transactional object id is already associated with another GC ref"
+            );
+        }
+        self.gc_ref_to_object.insert(gc_ref, object_id);
+        self.object_to_gc_ref.insert(object_id, gc_ref);
+        Ok(())
+    }
+
+    pub(crate) fn object_id_for_gc_ref(&self, gc_ref: u32) -> Result<ObjectId> {
+        ensure!(gc_ref != 0, "transactional object cannot use null GC ref");
+        self.gc_ref_to_object
+            .get(&gc_ref)
+            .copied()
+            .with_context(|| format!("unknown transactional object GC ref: {gc_ref:#x}"))
+    }
+
+    pub(crate) fn gc_ref_for_object_id(&self, object_id: ObjectId) -> Result<u32> {
+        self.live_slot(object_id)?;
+        self.object_to_gc_ref
+            .get(&object_id)
+            .copied()
+            .with_context(|| {
+                format!("transactional object has no GC ref association: {object_id:?}")
+            })
     }
 
     pub(crate) fn slot_count(&self) -> usize {
@@ -525,6 +587,9 @@ impl ObjectTable {
             return Ok(false);
         }
         self.slots[index] = None;
+        if let Some(gc_ref) = self.object_to_gc_ref.remove(&object_id) {
+            self.gc_ref_to_object.remove(&gc_ref);
+        }
         self.bump_object_version()?;
         self.free_list.push(object_id);
         self.live_count = self
@@ -5360,5 +5425,77 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn module_compilation_rejects_transaction_struct_reference_fields_for_now() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let error = crate::Module::new(
+            &engine,
+            wat::parse_str(
+                r#"
+                (module
+                  (type $s (struct (field (mut (ref null i31)))))
+                  (tfunc (export "x")
+                    (drop (tstruct.new_default $s))))
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("transactional struct reference fields are not implemented yet"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn transaction_object_tstruct_executes_through_object_table() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $s (struct (field (mut i32))))
+              (tfunc (export "create_set_get") (result i32)
+                (local $sref (ref $s))
+                (local.set $sref
+                  (tstruct.new $s (i32.const 41)))
+                (tstruct.set $s 0 (local.get $sref) (i32.const 42))
+                (tstruct.get $s 0 (local.get $sref)))
+              (tfunc (export "i31s") (result i32)
+                (ti31.get_s (tref.ti31 (i32.const 0x7fffffff))))
+              (tfunc (export "i31u") (result i32)
+                (ti31.get_u (tref.ti31 (i32.const 0x7fffffff)))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let create_set_get = instance
+            .get_typed_func::<(), i32>(&mut store, "create_set_get")
+            .unwrap();
+        let i31s = instance
+            .get_typed_func::<(), i32>(&mut store, "i31s")
+            .unwrap();
+        let i31u = instance
+            .get_typed_func::<(), i32>(&mut store, "i31u")
+            .unwrap();
+
+        assert_eq!(create_set_get.call(&mut store, ()).unwrap(), 42);
+        assert_eq!(i31s.call(&mut store, ()).unwrap(), -1);
+        assert_eq!(i31u.call(&mut store, ()).unwrap(), 0x7fffffff);
+        assert_eq!(store.transaction_object_table().live_count(), 1);
+        assert_eq!(
+            store
+                .transaction_object_table()
+                .payload(ObjectId { object_index: 0 })
+                .unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(42)])
+        );
     }
 }

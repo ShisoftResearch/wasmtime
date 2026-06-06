@@ -50,6 +50,12 @@ macro_rules! foreach_builtin_function {
             transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
             // Grows a transactional table and returns the previous visible size.
             transaction_ttable_grow(vmctx: vmctx, table: u32, delta: u64) -> pointer;
+            // Associates a newly allocated Wasmtime GC struct with a transactional object record.
+            transaction_tstruct_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer) -> bool;
+            // Stages a transactional struct field write.
+            transaction_tstruct_set(vmctx: vmctx, gc_ref: u32, field: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Reads a transactional struct field as an ObjectValueAbi scratch pointer.
+            transaction_tstruct_get(vmctx: vmctx, gc_ref: u32, field: u32) -> pointer;
             // Returns an index for wasm's `memory.copy`
             memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
             // Returns an index for wasm's `memory.fill` instruction.
@@ -427,6 +433,7 @@ impl BuiltinFunctionIndex {
             (@get transaction_tmemory_size pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_ttable_get pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_ttable_size pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_tstruct_get pointer) => (TrapSentinel::NegativeOne);
 
             // These libcalls can't trap
             (@get ref_func pointer) => (return None);
@@ -488,6 +495,8 @@ mod tests {
             BuiltinFunctionIndex::transaction_ttable_set(),
             BuiltinFunctionIndex::transaction_ttable_read_range(),
             BuiltinFunctionIndex::transaction_ttable_write_range(),
+            BuiltinFunctionIndex::transaction_tstruct_new(),
+            BuiltinFunctionIndex::transaction_tstruct_set(),
         ] {
             assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));
         }
@@ -513,6 +522,7 @@ mod tests {
             BuiltinFunctionIndex::transaction_tmemory_size(),
             BuiltinFunctionIndex::transaction_ttable_get(),
             BuiltinFunctionIndex::transaction_ttable_size(),
+            BuiltinFunctionIndex::transaction_tstruct_get(),
         ] {
             assert!(matches!(
                 builtin.trap_sentinel(),

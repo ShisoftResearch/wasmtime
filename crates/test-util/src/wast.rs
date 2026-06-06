@@ -1401,6 +1401,8 @@ const SIMPLE_TRANSACTION_REAL_TEXT_TTABLE: &[&str] = &[
     "ttable_size.wast",
 ];
 
+const SIMPLE_TRANSACTION_REAL_TEXT_OBJECT: &[&str] = &["ti31.wast"];
+
 const SIMPLE_TRANSACTION_REAL_BINARY: &[&str] = &["tbinary.wast", "tbinary-leb128.wast"];
 
 const TSIMD_TRANSACTION_REAL_TEXT_MEMORY: &[&str] = &[
@@ -1426,6 +1428,7 @@ fn simple_transaction_real_text_parser_enabled(name: &str) -> bool {
     SIMPLE_TRANSACTION_REAL_TEXT_CORE.contains(&name)
         || SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY.contains(&name)
         || SIMPLE_TRANSACTION_REAL_TEXT_TTABLE.contains(&name)
+        || SIMPLE_TRANSACTION_REAL_TEXT_OBJECT.contains(&name)
         || SIMPLE_TRANSACTION_REAL_BINARY.contains(&name)
 }
 
@@ -2165,6 +2168,29 @@ mod tests {
     #[test]
     fn enables_real_binary_transaction_proposal_tranche() {
         for name in ["tbinary.wast", "tbinary-leb128.wast"] {
+            let test = WastTest {
+                path: PathBuf::from(name),
+                contents: String::new(),
+                config: TestConfig::default(),
+                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
+                transaction_real_text_parser: true,
+            };
+
+            assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
+            assert!(
+                super::transaction_proposal_adapter_mock(&test.path).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn enables_real_object_transaction_proposal_tranche() {
+        for &name in super::SIMPLE_TRANSACTION_REAL_TEXT_OBJECT {
             let test = WastTest {
                 path: PathBuf::from(name),
                 contents: String::new(),

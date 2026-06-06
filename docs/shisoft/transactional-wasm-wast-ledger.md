@@ -28,10 +28,17 @@ Fresh Wave 0 verification:
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
-test result: ok. 96 passed; 0 failed; 20 ignored
+test result: ok. 97 passed; 0 failed; 19 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 153 passed; 0 failed; 20 ignored
+test result: ok. 154 passed; 0 failed; 19 ignored
+```
+
+Focused object update:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti31.wast -- --format terse
+test result: ok. 1 passed; 0 failed
 ```
 
 All currently ignored proposal tests are under `simple-transactions`:
@@ -52,7 +59,6 @@ All currently ignored proposal tests are under `simple-transactions`:
 - `tref_eq.wast`
 - `textern.wast`
 - `tref_test.wast`
-- `ti31.wast`
 - `tstruct.wast`
 - `ttry-abort-commit.wast`
 - `ttype-equivalence.wast`
@@ -114,7 +120,7 @@ counts.
 | `../wasm-persistence/test/core/simple-transactions/tfunc.wast` | types-binary-linking | blocked | transactional-refs-gc-runtime | normalized text reaches `tref.tfunc` cases around line 636 |
 | `../wasm-persistence/test/core/simple-transactions/tfunc_ptrs.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tfunc_ptrs.wast`; real transaction text parser over transactional function/table pointer syntax |
 | `../wasm-persistence/test/core/simple-transactions/tglobal.wast` | lifecycle-globals | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tglobal.wast`; real parser/runtime path for numeric transactional globals; ref-valued global snapshots remain covered by later object/ref work |
-| `../wasm-persistence/test/core/simple-transactions/ti31.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `(tref ti31)`, `tref.ti31`, and `ti31.get_*` syntax before execution |
+| `../wasm-persistence/test/core/simple-transactions/ti31.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti31.wast`; `tref.ti31` const expressions alias to ordinary `ref.i31`, and `ti31.get_s/get_u` use Wasmtime's immediate i31 representation |
 | `../wasm-persistence/test/core/simple-transactions/ti32.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti32.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/ti64.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti64.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tif.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tif.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |

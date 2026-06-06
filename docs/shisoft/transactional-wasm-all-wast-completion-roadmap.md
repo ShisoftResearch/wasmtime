@@ -58,17 +58,17 @@ test result: ok. 84 passed; 0 failed; 0 ignored
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
-test result: ok. 96 passed; 0 failed; 20 ignored
+test result: ok. 97 passed; 0 failed; 19 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 153 passed; 0 failed; 20 ignored
+test result: ok. 154 passed; 0 failed; 19 ignored
 ```
 
 Remaining simple-transaction ignored files are now concentrated in object-model
 and later semantic waves:
 
-- object/reference model: `tstruct.wast`, `tarray*.wast`, `ti31.wast`,
-  `textern.wast`, `tref_eq.wast`, `tref_test.wast`, `tref_cast.wast`,
+- object/reference model: `tstruct.wast`, `tarray*.wast`, `textern.wast`,
+  `tref_eq.wast`, `tref_test.wast`, `tref_cast.wast`,
   `br_on_tcast*.wast`, `ttype-*.wast`
 - structured failure/concurrency: `ttry-abort-commit.wast`,
   `tconflict-basic.wast`, `tconflict-tmemory_1.wast`
@@ -83,6 +83,17 @@ proposal harness run.
 - Added a tagged two-word `ObjectValueAbi` scaffold for future `tstruct` and
   `tarray` libcalls, including scalar, reference, and `v128` payloads.
 - Unified object heap record serialization with the same object-reference ABI.
+
+2026-06-06 object bridge update:
+
+- Added a volatile `VMGcRef` to `ObjectId` association bridge so compiled
+  `tstruct.new/set/get` can exercise the in-memory `ObjectTable` without
+  changing Wasmtime's ordinary GC representation.
+- Promoted `ti31.wast` onto the real parser/runtime path by accepting
+  `tref.ti31` in const expressions as an alias of ordinary `ref.i31`.
+- Full `tstruct.wast` remains ignored because global initializers still hit
+  const-expression `TStructNew` and persistent-object allocation/abort logging
+  is not complete.
 
 ## Ground Rules
 

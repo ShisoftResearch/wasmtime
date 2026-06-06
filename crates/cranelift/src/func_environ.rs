@@ -50,6 +50,16 @@ pub(crate) enum Extension {
     Zero,
 }
 
+const TRANSACTION_OBJECT_VALUE_ABI_SIZE: u32 = 24;
+const TRANSACTION_OBJECT_VALUE_ABI_TAG_OFFSET: i32 = 0;
+const TRANSACTION_OBJECT_VALUE_ABI_LOW_OFFSET: i32 = 8;
+const TRANSACTION_OBJECT_VALUE_ABI_HIGH_OFFSET: i32 = 16;
+const TRANSACTION_OBJECT_VALUE_ABI_TAG_I32: u32 = 0;
+const TRANSACTION_OBJECT_VALUE_ABI_TAG_I64: u32 = 1;
+const TRANSACTION_OBJECT_VALUE_ABI_TAG_F32: u32 = 2;
+const TRANSACTION_OBJECT_VALUE_ABI_TAG_F64: u32 = 3;
+const TRANSACTION_OBJECT_VALUE_ABI_TAG_V128: u32 = 4;
+
 /// A struct with an `Option<ir::FuncRef>` member for every builtin
 /// function, to de-duplicate constructing/getting its function.
 pub(crate) struct BuiltinFunctions {
@@ -2917,6 +2927,454 @@ impl FuncEnvironment<'_> {
             struct_ref,
             value,
         )
+    }
+
+    pub fn translate_transaction_tstruct_new(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        struct_type_index: TypeIndex,
+        fields: StructFieldsVec,
+    ) -> WasmResult<ir::Value> {
+        let struct_ref = self.translate_struct_new(builder, struct_type_index, fields.clone())?;
+        self.translate_transaction_tstruct_record_new(
+            builder,
+            struct_type_index,
+            struct_ref,
+            &fields,
+        )?;
+        Ok(struct_ref)
+    }
+
+    pub fn translate_transaction_tstruct_new_default(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        struct_type_index: TypeIndex,
+    ) -> WasmResult<ir::Value> {
+        let field_types = self.transaction_struct_field_types(struct_type_index)?;
+        let fields = field_types
+            .iter()
+            .map(|ty| self.transaction_default_field_value(builder, ty))
+            .collect::<WasmResult<StructFieldsVec>>()?;
+        let struct_ref = self.translate_struct_new(builder, struct_type_index, fields.clone())?;
+        self.translate_transaction_tstruct_record_new(
+            builder,
+            struct_type_index,
+            struct_ref,
+            &fields,
+        )?;
+        Ok(struct_ref)
+    }
+
+    pub fn translate_transaction_tstruct_get(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        struct_type_index: TypeIndex,
+        field_index: u32,
+        struct_ref: ir::Value,
+        extension: Option<Extension>,
+    ) -> WasmResult<ir::Value> {
+        self.trapz(builder, struct_ref, crate::TRAP_NULL_REFERENCE);
+        let field_ty = self.transaction_struct_field_type(struct_type_index, field_index)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tstruct_get(),
+        );
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let field = pos.ins().iconst(I32, i64::from(field_index));
+        let call = pos.ins().call(callee, &[vmctx, struct_ref, field]);
+        let ptr = pos.func.dfg.inst_results(call)[0];
+        self.translate_transaction_object_value_from_abi_pointer(builder, field_ty, ptr, extension)
+    }
+
+    pub fn translate_transaction_tstruct_set(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        struct_type_index: TypeIndex,
+        field_index: u32,
+        struct_ref: ir::Value,
+        value: ir::Value,
+    ) -> WasmResult<()> {
+        self.trapz(builder, struct_ref, crate::TRAP_NULL_REFERENCE);
+        let field_ty = self.transaction_struct_field_type(struct_type_index, field_index)?;
+        let (tag, low, high) =
+            self.translate_transaction_object_value_to_abi_values(builder, field_ty, value)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tstruct_set(),
+        );
+
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let field = pos.ins().iconst(I32, i64::from(field_index));
+        pos.ins()
+            .call(callee, &[vmctx, struct_ref, field, tag, low, high]);
+        Ok(())
+    }
+
+    fn translate_transaction_tstruct_record_new(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        struct_type_index: TypeIndex,
+        struct_ref: ir::Value,
+        fields: &[ir::Value],
+    ) -> WasmResult<()> {
+        let field_types = self.transaction_struct_field_types(struct_type_index)?;
+        debug_assert_eq!(field_types.len(), fields.len());
+        let fields_ptr =
+            self.translate_transaction_object_values_to_stack(builder, &field_types, fields)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tstruct_new(),
+        );
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let struct_type = pos
+            .ins()
+            .iconst(I32, i64::try_from(struct_type_index.index()).unwrap());
+        let field_count = pos.ins().iconst(I32, i64::try_from(fields.len()).unwrap());
+        pos.ins().call(
+            callee,
+            &[vmctx, struct_ref, struct_type, field_count, fields_ptr],
+        );
+        Ok(())
+    }
+
+    fn transaction_struct_field_types(
+        &mut self,
+        struct_type_index: TypeIndex,
+    ) -> WasmResult<SmallVec<[WasmStorageType; 8]>> {
+        let ty = self.module.types[struct_type_index].unwrap_module_type_index();
+        let fields = &self.types.unwrap_struct(ty)?.fields;
+        fields
+            .iter()
+            .map(|field| self.ensure_transaction_struct_field_type_supported(field.element_type))
+            .collect()
+    }
+
+    fn transaction_struct_field_type(
+        &mut self,
+        struct_type_index: TypeIndex,
+        field_index: u32,
+    ) -> WasmResult<WasmStorageType> {
+        let ty = self.module.types[struct_type_index].unwrap_module_type_index();
+        let fields = &self.types.unwrap_struct(ty)?.fields;
+        let field_index = usize::try_from(field_index).map_err(|_| {
+            wasmtime_environ::WasmError::Unsupported(
+                "transactional struct field index does not fit host usize".into(),
+            )
+        })?;
+        let field = fields.get(field_index).ok_or_else(|| {
+            wasmtime_environ::WasmError::Unsupported(
+                "transactional struct field index is out of bounds".into(),
+            )
+        })?;
+        self.ensure_transaction_struct_field_type_supported(field.element_type)
+    }
+
+    fn ensure_transaction_struct_field_type_supported(
+        &self,
+        ty: WasmStorageType,
+    ) -> WasmResult<WasmStorageType> {
+        if matches!(ty, WasmStorageType::Val(WasmValType::Ref(_))) {
+            return Err(wasmtime_environ::WasmError::Unsupported(
+                "transactional struct reference fields are not implemented yet".into(),
+            ));
+        }
+        Ok(ty)
+    }
+
+    fn transaction_default_field_value(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ty: &WasmStorageType,
+    ) -> WasmResult<ir::Value> {
+        let mut cursor = builder.cursor();
+        Ok(match ty {
+            WasmStorageType::I8 | WasmStorageType::I16 => cursor.ins().iconst(I32, 0),
+            WasmStorageType::Val(v) => match v {
+                WasmValType::I32 => cursor.ins().iconst(I32, 0),
+                WasmValType::I64 => cursor.ins().iconst(I64, 0),
+                WasmValType::F32 => cursor.ins().f32const(0.0),
+                WasmValType::F64 => cursor.ins().f64const(0.0),
+                WasmValType::V128 => {
+                    let c = cursor.func.dfg.constants.insert(vec![0; 16].into());
+                    cursor.ins().vconst(I8X16, c)
+                }
+                WasmValType::Ref(_) => {
+                    return Err(wasmtime_environ::WasmError::Unsupported(
+                        "transactional struct reference fields are not implemented yet".into(),
+                    ));
+                }
+            },
+        })
+    }
+
+    fn translate_transaction_object_values_to_stack(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        field_types: &[WasmStorageType],
+        fields: &[ir::Value],
+    ) -> WasmResult<ir::Value> {
+        debug_assert_eq!(field_types.len(), fields.len());
+        if fields.is_empty() {
+            return Ok(builder.ins().iconst(self.pointer_type(), 1));
+        }
+        let field_count = u32::try_from(fields.len()).map_err(|_| {
+            wasmtime_environ::WasmError::Unsupported(
+                "transactional struct field count does not fit u32".into(),
+            )
+        })?;
+        let size = field_count
+            .checked_mul(TRANSACTION_OBJECT_VALUE_ABI_SIZE)
+            .ok_or_else(|| {
+                wasmtime_environ::WasmError::Unsupported(
+                    "transactional struct field ABI stack slot is too large".into(),
+                )
+            })?;
+        let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            size,
+            8,
+        ));
+        let ptr = builder.ins().stack_addr(self.pointer_type(), slot, 0);
+        for (i, (ty, value)) in field_types.iter().zip(fields).enumerate() {
+            let index = u32::try_from(i).map_err(|_| {
+                wasmtime_environ::WasmError::Unsupported(
+                    "transactional struct field index does not fit u32".into(),
+                )
+            })?;
+            let offset = index
+                .checked_mul(TRANSACTION_OBJECT_VALUE_ABI_SIZE)
+                .and_then(|offset| i32::try_from(offset).ok())
+                .ok_or_else(|| {
+                    wasmtime_environ::WasmError::Unsupported(
+                        "transactional struct field ABI offset is too large".into(),
+                    )
+                })?;
+            self.store_transaction_object_value_abi(builder, ptr, offset, *ty, *value)?;
+        }
+        Ok(ptr)
+    }
+
+    fn store_transaction_object_value_abi(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ptr: ir::Value,
+        offset: i32,
+        ty: WasmStorageType,
+        value: ir::Value,
+    ) -> WasmResult<()> {
+        let (tag, low, high) =
+            self.translate_transaction_object_value_to_abi_values(builder, ty, value)?;
+        let flags = MemFlagsData::trusted();
+        builder.ins().store(
+            flags,
+            tag,
+            ptr,
+            offset + TRANSACTION_OBJECT_VALUE_ABI_TAG_OFFSET,
+        );
+        builder.ins().store(
+            flags,
+            low,
+            ptr,
+            offset + TRANSACTION_OBJECT_VALUE_ABI_LOW_OFFSET,
+        );
+        builder.ins().store(
+            flags,
+            high,
+            ptr,
+            offset + TRANSACTION_OBJECT_VALUE_ABI_HIGH_OFFSET,
+        );
+        Ok(())
+    }
+
+    fn translate_transaction_object_value_to_abi_values(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ty: WasmStorageType,
+        value: ir::Value,
+    ) -> WasmResult<(ir::Value, ir::Value, ir::Value)> {
+        let tag =
+            |builder: &mut FunctionBuilder<'_>, tag| builder.ins().iconst(I32, i64::from(tag));
+        let zero_high = builder.ins().iconst(I64, 0);
+        let value_ty = builder.func.dfg.value_type(value);
+        Ok(match ty {
+            WasmStorageType::I8 | WasmStorageType::I16 => {
+                debug_assert_eq!(value_ty, I32);
+                (
+                    tag(builder, TRANSACTION_OBJECT_VALUE_ABI_TAG_I32),
+                    builder.ins().uextend(I64, value),
+                    zero_high,
+                )
+            }
+            WasmStorageType::Val(WasmValType::I32) => {
+                debug_assert_eq!(value_ty, I32);
+                (
+                    tag(builder, TRANSACTION_OBJECT_VALUE_ABI_TAG_I32),
+                    builder.ins().uextend(I64, value),
+                    zero_high,
+                )
+            }
+            WasmStorageType::Val(WasmValType::I64) => {
+                debug_assert_eq!(value_ty, I64);
+                (
+                    tag(builder, TRANSACTION_OBJECT_VALUE_ABI_TAG_I64),
+                    value,
+                    zero_high,
+                )
+            }
+            WasmStorageType::Val(WasmValType::F32) => {
+                debug_assert_eq!(value_ty, F32);
+                let bits = builder.ins().bitcast(I32, MemFlagsData::new(), value);
+                (
+                    tag(builder, TRANSACTION_OBJECT_VALUE_ABI_TAG_F32),
+                    builder.ins().uextend(I64, bits),
+                    zero_high,
+                )
+            }
+            WasmStorageType::Val(WasmValType::F64) => {
+                debug_assert_eq!(value_ty, F64);
+                let bits = builder.ins().bitcast(I64, MemFlagsData::new(), value);
+                (
+                    tag(builder, TRANSACTION_OBJECT_VALUE_ABI_TAG_F64),
+                    bits,
+                    zero_high,
+                )
+            }
+            WasmStorageType::Val(WasmValType::V128) => {
+                debug_assert_eq!(value_ty, I8X16);
+                let (low, high) = self.translate_v128_to_i64_pair(builder, value);
+                (
+                    tag(builder, TRANSACTION_OBJECT_VALUE_ABI_TAG_V128),
+                    low,
+                    high,
+                )
+            }
+            WasmStorageType::Val(WasmValType::Ref(_)) => {
+                return Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional struct reference fields are not implemented yet".into(),
+                ));
+            }
+        })
+    }
+
+    fn translate_transaction_object_value_from_abi_pointer(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ty: WasmStorageType,
+        ptr: ir::Value,
+        extension: Option<Extension>,
+    ) -> WasmResult<ir::Value> {
+        let flags = MemFlagsData::trusted();
+        let tag = builder
+            .ins()
+            .load(I32, flags, ptr, TRANSACTION_OBJECT_VALUE_ABI_TAG_OFFSET);
+        let low = builder
+            .ins()
+            .load(I64, flags, ptr, TRANSACTION_OBJECT_VALUE_ABI_LOW_OFFSET);
+        let high = builder
+            .ins()
+            .load(I64, flags, ptr, TRANSACTION_OBJECT_VALUE_ABI_HIGH_OFFSET);
+        let expected_tag = self.expected_transaction_object_value_abi_tag(ty)?;
+        let expected = builder.ins().iconst(I32, i64::from(expected_tag));
+        let tag_matches = builder.ins().icmp(IntCC::Equal, tag, expected);
+        self.trapz(builder, tag_matches, crate::TRAP_INTERNAL_ASSERT);
+        let high_zero = builder.ins().icmp_imm(IntCC::Equal, high, 0);
+        if expected_tag != TRANSACTION_OBJECT_VALUE_ABI_TAG_V128 {
+            self.trapz(builder, high_zero, crate::TRAP_INTERNAL_ASSERT);
+        }
+
+        Ok(match ty {
+            WasmStorageType::I8 => {
+                let value = builder.ins().ireduce(I32, low);
+                let value = builder.ins().ireduce(I8, value);
+                match extension {
+                    Some(Extension::Sign) => builder.ins().sextend(I32, value),
+                    Some(Extension::Zero) => builder.ins().uextend(I32, value),
+                    None => builder.ins().uextend(I32, value),
+                }
+            }
+            WasmStorageType::I16 => {
+                let value = builder.ins().ireduce(I32, low);
+                let value = builder.ins().ireduce(I16, value);
+                match extension {
+                    Some(Extension::Sign) => builder.ins().sextend(I32, value),
+                    Some(Extension::Zero) => builder.ins().uextend(I32, value),
+                    None => builder.ins().uextend(I32, value),
+                }
+            }
+            WasmStorageType::Val(WasmValType::I32) => builder.ins().ireduce(I32, low),
+            WasmStorageType::Val(WasmValType::I64) => low,
+            WasmStorageType::Val(WasmValType::F32) => {
+                let bits = builder.ins().ireduce(I32, low);
+                builder.ins().bitcast(F32, MemFlagsData::new(), bits)
+            }
+            WasmStorageType::Val(WasmValType::F64) => {
+                builder.ins().bitcast(F64, MemFlagsData::new(), low)
+            }
+            WasmStorageType::Val(WasmValType::V128) => {
+                self.translate_i64_pair_to_v128(builder, low, high)
+            }
+            WasmStorageType::Val(WasmValType::Ref(_)) => {
+                return Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional struct reference fields are not implemented yet".into(),
+                ));
+            }
+        })
+    }
+
+    fn expected_transaction_object_value_abi_tag(&self, ty: WasmStorageType) -> WasmResult<u32> {
+        Ok(match ty {
+            WasmStorageType::I8 | WasmStorageType::I16 => TRANSACTION_OBJECT_VALUE_ABI_TAG_I32,
+            WasmStorageType::Val(WasmValType::I32) => TRANSACTION_OBJECT_VALUE_ABI_TAG_I32,
+            WasmStorageType::Val(WasmValType::I64) => TRANSACTION_OBJECT_VALUE_ABI_TAG_I64,
+            WasmStorageType::Val(WasmValType::F32) => TRANSACTION_OBJECT_VALUE_ABI_TAG_F32,
+            WasmStorageType::Val(WasmValType::F64) => TRANSACTION_OBJECT_VALUE_ABI_TAG_F64,
+            WasmStorageType::Val(WasmValType::V128) => TRANSACTION_OBJECT_VALUE_ABI_TAG_V128,
+            WasmStorageType::Val(WasmValType::Ref(_)) => {
+                return Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional struct reference fields are not implemented yet".into(),
+                ));
+            }
+        })
+    }
+
+    fn translate_v128_to_i64_pair(
+        &self,
+        builder: &mut FunctionBuilder,
+        value: ir::Value,
+    ) -> (ir::Value, ir::Value) {
+        let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            8,
+        ));
+        let ptr = builder.ins().stack_addr(self.pointer_type(), slot, 0);
+        let flags = MemFlagsData::trusted();
+        builder.ins().store(flags, value, ptr, 0);
+        let low = builder.ins().load(I64, flags, ptr, 0);
+        let high = builder.ins().load(I64, flags, ptr, 8);
+        (low, high)
+    }
+
+    fn translate_i64_pair_to_v128(
+        &self,
+        builder: &mut FunctionBuilder,
+        low: ir::Value,
+        high: ir::Value,
+    ) -> ir::Value {
+        let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            8,
+        ));
+        let ptr = builder.ins().stack_addr(self.pointer_type(), slot, 0);
+        let flags = MemFlagsData::trusted();
+        builder.ins().store(flags, low, ptr, 0);
+        builder.ins().store(flags, high, ptr, 8);
+        builder.ins().load(I8X16, flags, ptr, 0)
     }
 
     pub fn translate_exn_unbox(

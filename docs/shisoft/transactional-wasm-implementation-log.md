@@ -591,6 +591,57 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Object Runtime Bridge: TStruct Scaffold And TI31 Promotion
+
+Date: 2026-06-06
+
+Added the first executable transactional object bridge:
+
+- `tstruct.new` now allocates an `ObjectTable` struct record and associates the
+  Wasmtime `VMGcRef` word with the resulting `ObjectId`.
+- `tstruct.set` stages a struct-field update through `TransactionState` COW
+  payload helpers.
+- `tstruct.get/get_s/get_u` read through the staged/committed `ObjectTable`
+  payload and return an `ObjectValueAbi` scratch cell to compiled code.
+- `tref.ti31` is accepted in const expressions as the transactional alias of
+  ordinary `ref.i31`; `ti31.wast` now runs through the real parser/runtime path.
+
+Scaffold boundaries:
+
+- The `VMGcRef` to `ObjectId` map is volatile and store-local. It is a bridge
+  for current Wasmtime GC identity, not the final persistent-GC object header.
+- Ref-typed transactional struct fields are rejected at compile time in this
+  bridge. The object payload model only has persistent `ObjectId` references
+  today, so immediate `i31` refs and ordinary volatile GC refs must wait for
+  the persistent-object reference model.
+- `tstruct.new` currently creates the object-table record immediately; abort of
+  newly allocated transactional objects still needs a transactional allocation
+  log before full `tstruct.wast` promotion.
+- Full `tstruct.wast` remains blocked by const-expression `TStructNew` global
+  initialization and wider object/reference semantics.
+
+Focused verification:
+
+```text
+cargo test -p wasmtime --lib transaction_object_tstruct_executes_through_object_table -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 108 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime-test-util --features wast enables_real_object_transaction_proposal_tranche -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti31.wast -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 97 passed; 0 failed; 19 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 154 passed; 0 failed; 19 ignored
+```
+
 ## Transactional Object Parser Bridge
 
 Date: 2026-06-06

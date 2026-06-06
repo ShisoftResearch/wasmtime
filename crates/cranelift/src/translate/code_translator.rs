@@ -3002,10 +3002,10 @@ pub fn translate_operator(
         }
 
         // SHISOFT-TWASM-MOCK: transactional object operators are parsed as
-        // distinct `0xfa 0xfb` operators, but this bridge still lowers them
-        // through ordinary volatile Wasmtime GC. Replace these `T*` arms with
-        // `ObjectId` COW libcalls when the persistent transactional object
-        // runtime is wired through Cranelift.
+        // distinct `0xfa 0xfb` operators. `tstruct.*` is now routed through
+        // the volatile VMGcRef/ObjectId bridge; the remaining object/ref arms
+        // below still lower through ordinary Wasmtime GC until their
+        // persistent-object runtime paths land.
         Operator::RefI31 | Operator::TRefI31 => {
             let val = environ.stacks.pop1();
             let i31ref = environ.translate_ref_i31(builder.cursor(), val)?;
@@ -3022,7 +3022,7 @@ pub fn translate_operator(
             environ.stacks.push1(val);
         }
 
-        Operator::StructNew { struct_type_index } | Operator::TStructNew { struct_type_index } => {
+        Operator::StructNew { struct_type_index } => {
             let struct_type_index = TypeIndex::from_u32(*struct_type_index);
             let arity = environ.struct_fields_len(struct_type_index)?;
             let fields: StructFieldsVec = environ.stacks.peekn(arity).iter().copied().collect();
@@ -3031,18 +3031,30 @@ pub fn translate_operator(
             environ.stacks.push1(struct_ref);
         }
 
-        Operator::StructNewDefault { struct_type_index }
-        | Operator::TStructNewDefault { struct_type_index } => {
+        Operator::TStructNew { struct_type_index } => {
+            let struct_type_index = TypeIndex::from_u32(*struct_type_index);
+            let arity = environ.struct_fields_len(struct_type_index)?;
+            let fields: StructFieldsVec = environ.stacks.peekn(arity).iter().copied().collect();
+            environ.stacks.popn(arity);
+            let struct_ref =
+                environ.translate_transaction_tstruct_new(builder, struct_type_index, fields)?;
+            environ.stacks.push1(struct_ref);
+        }
+
+        Operator::StructNewDefault { struct_type_index } => {
             let struct_type_index = TypeIndex::from_u32(*struct_type_index);
             let struct_ref = environ.translate_struct_new_default(builder, struct_type_index)?;
             environ.stacks.push1(struct_ref);
         }
 
-        Operator::StructSet {
-            struct_type_index,
-            field_index,
+        Operator::TStructNewDefault { struct_type_index } => {
+            let struct_type_index = TypeIndex::from_u32(*struct_type_index);
+            let struct_ref =
+                environ.translate_transaction_tstruct_new_default(builder, struct_type_index)?;
+            environ.stacks.push1(struct_ref);
         }
-        | Operator::TStructSet {
+
+        Operator::StructSet {
             struct_type_index,
             field_index,
         } => {
@@ -3058,11 +3070,23 @@ pub fn translate_operator(
             )?;
         }
 
-        Operator::StructGetS {
+        Operator::TStructSet {
             struct_type_index,
             field_index,
+        } => {
+            let struct_type_index = TypeIndex::from_u32(*struct_type_index);
+            let val = environ.stacks.pop1();
+            let struct_ref = environ.stacks.pop1();
+            environ.translate_transaction_tstruct_set(
+                builder,
+                struct_type_index,
+                *field_index,
+                struct_ref,
+                val,
+            )?;
         }
-        | Operator::TStructGetS {
+
+        Operator::StructGetS {
             struct_type_index,
             field_index,
         } => {
@@ -3078,11 +3102,23 @@ pub fn translate_operator(
             environ.stacks.push1(val);
         }
 
-        Operator::StructGetU {
+        Operator::TStructGetS {
             struct_type_index,
             field_index,
+        } => {
+            let struct_type_index = TypeIndex::from_u32(*struct_type_index);
+            let struct_ref = environ.stacks.pop1();
+            let val = environ.translate_transaction_tstruct_get(
+                builder,
+                struct_type_index,
+                *field_index,
+                struct_ref,
+                Some(Extension::Sign),
+            )?;
+            environ.stacks.push1(val);
         }
-        | Operator::TStructGetU {
+
+        Operator::StructGetU {
             struct_type_index,
             field_index,
         } => {
@@ -3098,17 +3134,45 @@ pub fn translate_operator(
             environ.stacks.push1(val);
         }
 
-        Operator::StructGet {
+        Operator::TStructGetU {
             struct_type_index,
             field_index,
+        } => {
+            let struct_type_index = TypeIndex::from_u32(*struct_type_index);
+            let struct_ref = environ.stacks.pop1();
+            let val = environ.translate_transaction_tstruct_get(
+                builder,
+                struct_type_index,
+                *field_index,
+                struct_ref,
+                Some(Extension::Zero),
+            )?;
+            environ.stacks.push1(val);
         }
-        | Operator::TStructGet {
+
+        Operator::StructGet {
             struct_type_index,
             field_index,
         } => {
             let struct_type_index = TypeIndex::from_u32(*struct_type_index);
             let struct_ref = environ.stacks.pop1();
             let val = environ.translate_struct_get(
+                builder,
+                struct_type_index,
+                *field_index,
+                struct_ref,
+                None,
+            )?;
+            environ.stacks.push1(val);
+        }
+
+        Operator::TStructGet {
+            struct_type_index,
+            field_index,
+        } => {
+            let struct_type_index = TypeIndex::from_u32(*struct_type_index);
+            let struct_ref = environ.stacks.pop1();
+            let val = environ.translate_transaction_tstruct_get(
                 builder,
                 struct_type_index,
                 *field_index,
