@@ -297,6 +297,7 @@ fn run_wast(test: &WastTest, config: WastConfig) -> wasmtime::Result<()> {
             wast_context.register_spectest(&SpectestConfig {
                 use_shared_memory: true,
                 suppress_prints: true,
+                transaction_helpers: test.transaction_proposal().is_some(),
             })?;
 
             // Ignore error messages for spec tests because Wasmtime will often

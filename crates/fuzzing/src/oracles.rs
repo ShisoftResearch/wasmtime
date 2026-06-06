@@ -681,6 +681,7 @@ pub fn wast_test(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<()> {
         .register_spectest(&wasmtime_wast::SpectestConfig {
             use_shared_memory: true,
             suppress_prints: true,
+            transaction_helpers: false,
         })
         .unwrap();
     wast_context.register_wasmtime().unwrap();

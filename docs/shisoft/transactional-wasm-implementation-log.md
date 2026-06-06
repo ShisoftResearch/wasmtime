@@ -43,6 +43,16 @@ Current tagged mock categories:
   funcref `ttable` paths acquire `TTable`/`TTableSize` ownership, but table
   element COW and transactional reference/object permissions remain future
   object-table work.
+- Opt-in proposal `spectest` transaction helper imports in
+  `crates/wast/src/spectest.rs`. This `SHISOFT-TWASM-MOCK` surface provides
+  deterministic transaction ids, granule-size helpers, and synchronous
+  `run_as_tid` calls for harness progress; it is not the real Wizard scheduler
+  or lock-based multi-transaction runtime.
+- The local `wasm-tools-transaction` fork also carries
+  `SHISOFT_TRANSACTION_SCAFFOLD` parser comments for transaction text shapes
+  that parse proposal fixtures while later runtime semantics are still pending,
+  including permission casts, `tblock`, structured `ttry`, and folded
+  `tfail` failure-code text.
 
 ## Runtime Core Current Status
 
@@ -528,6 +538,62 @@ Current proposal harness result:
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+```
+
+## Simple-Transactions Harness Checkpoint: 40/45
+
+Date: 2026-06-06
+
+Advanced the ignored simple-transactions proposal WAST group from 34/45 passing
+to 40/45 passing with real Wasmtime execution and scaffolded harness support.
+
+Implemented in this checkpoint:
+
+- Enabled SIMD for the two simple-transactions conflict fixtures that use
+  `v128`, without enabling SIMD for the whole suite.
+- Added Wasmtime-style diagnostic equivalences for transactional object/table
+  aliases where the current lowering uses ordinary Wasmtime GC/table traps.
+- Added an opt-in `spectest` transaction helper mock for proposal WAST:
+  `current_tid`, `tcurrent_tid`, `next_*_tid`, `tmemory_granule_size`,
+  `ttable_granule_size`, `run_as_tid`, `abort_txn`, and `tcommit_txn`.
+- Extended the local wasm-tools fork to parse structured `(ttry ((...)))`
+  text and folded `(tfail (...))` failure-code text. The folded failure code is
+  evaluated and dropped because the current runtime `TFail` ignores it.
+
+Remaining failing simple-transactions fixtures:
+
+- `tarray_copy.wast`: blocked on real permissioned object-reference validation.
+- `tarray_fill.wast`: blocked on real permissioned object-reference validation.
+- `ttry-abort-commit.wast`: parses and reaches runtime, but still needs real
+  `ttry` abort-control semantics to stop executing the success body after
+  `tfail`.
+- `tconflict-basic.wast`: blocked on real concurrency/object-table semantics;
+  the harness `run_as_tid` mock calls synchronously and does not model Wizard's
+  live transaction scheduler.
+- `tconflict-tmemory_1.wast`: blocked on the same conflict/object-reference
+  tranche, plus a remaining typed result mismatch in the fixture's current
+  scaffolded reference path.
+
+Verification:
+
+```text
+cargo test -p wast transaction_ -- --format terse
+test result: ok. 22 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast normalizes_real_parser_transaction_object_diagnostics -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast simple_transaction_v128_conflict_fixtures_enable_simd -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-wast transaction_spectest_helpers_are_opt_in -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-wast transaction_spectest_helpers_match_fixture_ids_and_granules -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast -- transaction-proposal/simple-transactions --ignored --format terse
+test result: FAILED. 40 passed; 5 failed
 ```
 
 ## Storage Wave: Wizard Block Region Backing

@@ -296,6 +296,8 @@ fn transaction_proposal_test_config(test: &Path) -> TestConfig {
     if test
         .parent()
         .is_some_and(|parent| parent.ends_with("tsimd"))
+        || test.ends_with("simple-transactions/tconflict-basic.wast")
+        || test.ends_with("simple-transactions/tconflict-tmemory_1.wast")
     {
         ret.simd = Some(true);
     }
@@ -1199,13 +1201,24 @@ fn normalize_transaction_real_parser_diagnostic(text: &str) -> String {
 }
 
 const TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
+    ("tarray is immutable", "array is immutable"),
+    ("tarray types do not match", "array types do not match"),
+    (
+        "tarray type is not numeric or vector",
+        "array type is not numeric or vector",
+    ),
+    ("immutable tglobal", "global is immutable"),
     ("out of bounds ttable access", "out of bounds table access"),
+    ("out of bounds tarray access", "out of bounds array access"),
     ("undefined telement", "undefined element"),
     ("uninitialized telement", "uninitialized element"),
+    ("null tstructure", "null reference"),
+    ("null tarray", "null reference"),
     (
         "indirect tcall type mismatch",
         "indirect call type mismatch",
     ),
+    ("indirect tcall", "indirect call type mismatch"),
     (
         "memory size must be at most 65536 pages (4GiB)",
         "memory size must be at most 0x10000 65536-byte pages",
@@ -2036,10 +2049,11 @@ fn tsimd_transaction_proposal_enabled(name: &str) -> bool {
 mod tests {
     use super::{
         TestConfig, TransactionProposalSuite, WastTest, normalize_transaction_proposal_wast,
+        transaction_proposal_test_config,
     };
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -2227,6 +2241,49 @@ mod tests {
         assert!(normalized.contains("\"multiple memories\""));
         assert!(normalized.contains("\"unknown memory\""));
         assert!(normalized.contains("\"multiple tmemories\""));
+    }
+
+    #[test]
+    fn normalizes_real_parser_transaction_object_diagnostics() {
+        let wast = r#"
+            (assert_invalid (module) "tarray is immutable")
+            (assert_invalid (module) "tarray types do not match")
+            (assert_invalid (module) "tarray type is not numeric or vector")
+            (assert_invalid (module) "immutable tglobal")
+            (assert_trap (invoke "x") "null tstructure")
+            (assert_trap (invoke "x") "null tarray")
+            (assert_trap (invoke "x") "out of bounds tarray access")
+            (assert_trap (invoke "x") "indirect tcall type mismatch")
+            (assert_trap (invoke "x") "indirect tcall")
+        "#;
+
+        let normalized = super::normalize_transaction_proposal_wast_diagnostics(wast);
+
+        assert!(normalized.contains("\"array is immutable\""));
+        assert!(normalized.contains("\"array types do not match\""));
+        assert!(normalized.contains("\"array type is not numeric or vector\""));
+        assert!(normalized.contains("\"global is immutable\""));
+        assert!(normalized.contains("\"null reference\""));
+        assert!(normalized.contains("\"out of bounds array access\""));
+        assert!(normalized.contains("\"indirect call type mismatch\""));
+        assert!(!normalized.contains("\"indirect call type mismatch type mismatch\""));
+    }
+
+    #[test]
+    fn simple_transaction_v128_conflict_fixtures_enable_simd() {
+        assert!(
+            transaction_proposal_test_config(Path::new("simple-transactions/tconflict-basic.wast"))
+                .simd()
+        );
+        assert!(
+            transaction_proposal_test_config(Path::new(
+                "simple-transactions/tconflict-tmemory_1.wast"
+            ))
+            .simd()
+        );
+        assert!(
+            !transaction_proposal_test_config(Path::new("simple-transactions/tcall.wast")).simd()
+        );
     }
 
     #[test]

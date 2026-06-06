@@ -88,6 +88,7 @@ impl WastCommand {
             .register_spectest(&SpectestConfig {
                 use_shared_memory: true,
                 suppress_prints: false,
+                transaction_helpers: false,
             })
             .expect("error instantiating \"spectest\"");
         wast_context.ignore_error_messages(self.ignore_error_messages);
