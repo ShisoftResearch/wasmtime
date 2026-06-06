@@ -448,6 +448,15 @@ Route parser operators to Cranelift lowering and then to the runtime helpers.
 Use existing Wasmtime GC type/layout metadata for validation where possible,
 but do not store `VMGcRef` inside persistent payloads.
 
+Progress: the local `wasm-tools-transaction` fork now emits distinct
+`0xfa 0xfb` parser operators for `tstruct`, `tarray`, `ti31`, and
+`textern` object operations, and Wasmtime's reachable Cranelift translator has
+explicit arms for those variants. The current Wasmtime arms are intentionally
+tagged `SHISOFT-TWASM-MOCK` because they bridge to ordinary volatile Wasmtime
+GC lowering. The fork also now emits a data-count section for transactional
+array data operators. The next part of this step is to replace the volatile-GC
+bridge with `ObjectId` COW object libcalls.
+
 - [ ] **Step 5: Move object WAST files to the real path**
 
 Run focused files first:

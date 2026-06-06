@@ -591,6 +591,56 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Transactional Object Parser Bridge
+
+Date: 2026-06-06
+
+Patched the local `wasm-tools-transaction` fork so `tstruct.*`, `tarray.*`,
+`tref.ti31`, `ti31.get_*`, `tany.convert_textern`, and
+`textern.convert_tany` text forms emit the proposal-style `0xfa 0xfb`
+transactional object opcode prefix instead of ordinary `0xfb` GC opcodes.
+The fork also has distinct `wasmparser::Operator` variants, validator bridge
+methods, printer names, encoder instructions, and data-count-section emission
+for transactional array data operators.
+
+Wasmtime now has explicit Cranelift arms for the new transactional object
+operator variants. This is a parser/lowering bridge only:
+
+- `tstruct`, `tarray`, `ti31`, and `textern` operators no longer fall into the
+  generic unsupported-operator path during reachable function translation.
+- The current lowering is tagged `SHISOFT-TWASM-MOCK` because it delegates to
+  ordinary volatile Wasmtime GC lowering.
+- Proposal object WAST files remain ignored until this bridge is replaced with
+  real `ObjectId` COW object libcalls.
+
+Verification:
+
+```text
+cargo check -p wasmparser
+Finished `dev` profile
+
+cargo check -p wasm-encoder
+Finished `dev` profile
+
+cargo check -p wasmprinter
+Finished `dev` profile
+
+cargo test -p wast transaction_text_reference_object_operator_aliases_use_transaction_prefix -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmparser@0.251.0 transaction_object_operators_decode -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime --lib module_compilation_accepts_transaction_object_helper_lowering -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tstruct.wast -- --format terse
+test result: ok. 0 passed; 0 failed; 1 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti31.wast -- --format terse
+test result: ok. 0 passed; 0 failed; 1 ignored
+```
+
 ## Wave 2: Ref-Control Real Parser Tranche
 
 Date: 2026-06-06

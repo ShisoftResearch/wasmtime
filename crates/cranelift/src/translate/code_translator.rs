@@ -3001,23 +3001,28 @@ pub fn translate_operator(
             environ.stacks.push1(r);
         }
 
-        Operator::RefI31 => {
+        // SHISOFT-TWASM-MOCK: transactional object operators are parsed as
+        // distinct `0xfa 0xfb` operators, but this bridge still lowers them
+        // through ordinary volatile Wasmtime GC. Replace these `T*` arms with
+        // `ObjectId` COW libcalls when the persistent transactional object
+        // runtime is wired through Cranelift.
+        Operator::RefI31 | Operator::TRefI31 => {
             let val = environ.stacks.pop1();
             let i31ref = environ.translate_ref_i31(builder.cursor(), val)?;
             environ.stacks.push1(i31ref);
         }
-        Operator::I31GetS => {
+        Operator::I31GetS | Operator::TI31GetS => {
             let i31ref = environ.stacks.pop1();
             let val = environ.translate_i31_get_s(builder, i31ref)?;
             environ.stacks.push1(val);
         }
-        Operator::I31GetU => {
+        Operator::I31GetU | Operator::TI31GetU => {
             let i31ref = environ.stacks.pop1();
             let val = environ.translate_i31_get_u(builder, i31ref)?;
             environ.stacks.push1(val);
         }
 
-        Operator::StructNew { struct_type_index } => {
+        Operator::StructNew { struct_type_index } | Operator::TStructNew { struct_type_index } => {
             let struct_type_index = TypeIndex::from_u32(*struct_type_index);
             let arity = environ.struct_fields_len(struct_type_index)?;
             let fields: StructFieldsVec = environ.stacks.peekn(arity).iter().copied().collect();
@@ -3026,13 +3031,18 @@ pub fn translate_operator(
             environ.stacks.push1(struct_ref);
         }
 
-        Operator::StructNewDefault { struct_type_index } => {
+        Operator::StructNewDefault { struct_type_index }
+        | Operator::TStructNewDefault { struct_type_index } => {
             let struct_type_index = TypeIndex::from_u32(*struct_type_index);
             let struct_ref = environ.translate_struct_new_default(builder, struct_type_index)?;
             environ.stacks.push1(struct_ref);
         }
 
         Operator::StructSet {
+            struct_type_index,
+            field_index,
+        }
+        | Operator::TStructSet {
             struct_type_index,
             field_index,
         } => {
@@ -3051,6 +3061,10 @@ pub fn translate_operator(
         Operator::StructGetS {
             struct_type_index,
             field_index,
+        }
+        | Operator::TStructGetS {
+            struct_type_index,
+            field_index,
         } => {
             let struct_type_index = TypeIndex::from_u32(*struct_type_index);
             let struct_ref = environ.stacks.pop1();
@@ -3065,6 +3079,10 @@ pub fn translate_operator(
         }
 
         Operator::StructGetU {
+            struct_type_index,
+            field_index,
+        }
+        | Operator::TStructGetU {
             struct_type_index,
             field_index,
         } => {
@@ -3083,6 +3101,10 @@ pub fn translate_operator(
         Operator::StructGet {
             struct_type_index,
             field_index,
+        }
+        | Operator::TStructGet {
+            struct_type_index,
+            field_index,
         } => {
             let struct_type_index = TypeIndex::from_u32(*struct_type_index);
             let struct_ref = environ.stacks.pop1();
@@ -3096,19 +3118,24 @@ pub fn translate_operator(
             environ.stacks.push1(val);
         }
 
-        Operator::ArrayNew { array_type_index } => {
+        Operator::ArrayNew { array_type_index } | Operator::TArrayNew { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (elem, len) = environ.stacks.pop2();
             let array_ref = environ.translate_array_new(builder, array_type_index, elem, len)?;
             environ.stacks.push1(array_ref);
         }
-        Operator::ArrayNewDefault { array_type_index } => {
+        Operator::ArrayNewDefault { array_type_index }
+        | Operator::TArrayNewDefault { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let len = environ.stacks.pop1();
             let array_ref = environ.translate_array_new_default(builder, array_type_index, len)?;
             environ.stacks.push1(array_ref);
         }
         Operator::ArrayNewFixed {
+            array_type_index,
+            array_size,
+        }
+        | Operator::TArrayNewFixed {
             array_type_index,
             array_size,
         } => {
@@ -3120,6 +3147,10 @@ pub fn translate_operator(
             environ.stacks.push1(array_ref);
         }
         Operator::ArrayNewData {
+            array_type_index,
+            array_data_index,
+        }
+        | Operator::TArrayNewData {
             array_type_index,
             array_data_index,
         } => {
@@ -3138,6 +3169,10 @@ pub fn translate_operator(
         Operator::ArrayNewElem {
             array_type_index,
             array_elem_index,
+        }
+        | Operator::TArrayNewElem {
+            array_type_index,
+            array_elem_index,
         } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let array_elem_index = ElemIndex::from_u32(*array_elem_index);
@@ -3152,6 +3187,10 @@ pub fn translate_operator(
             environ.stacks.push1(array_ref);
         }
         Operator::ArrayCopy {
+            array_type_index_dst,
+            array_type_index_src,
+        }
+        | Operator::TArrayCopy {
             array_type_index_dst,
             array_type_index_src,
         } => {
@@ -3169,12 +3208,16 @@ pub fn translate_operator(
                 len,
             )?;
         }
-        Operator::ArrayFill { array_type_index } => {
+        Operator::ArrayFill { array_type_index } | Operator::TArrayFill { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index, val, len) = environ.stacks.pop4();
             environ.translate_array_fill(builder, array_type_index, array, index, val, len)?;
         }
         Operator::ArrayInitData {
+            array_type_index,
+            array_data_index,
+        }
+        | Operator::TArrayInitData {
             array_type_index,
             array_data_index,
         } => {
@@ -3194,6 +3237,10 @@ pub fn translate_operator(
         Operator::ArrayInitElem {
             array_type_index,
             array_elem_index,
+        }
+        | Operator::TArrayInitElem {
+            array_type_index,
+            array_elem_index,
         } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let array_elem_index = ElemIndex::from_u32(*array_elem_index);
@@ -3208,19 +3255,19 @@ pub fn translate_operator(
                 len,
             )?;
         }
-        Operator::ArrayLen => {
+        Operator::ArrayLen | Operator::TArrayLen => {
             let array = environ.stacks.pop1();
             let len = environ.translate_array_len(builder, array)?;
             environ.stacks.push1(len);
         }
-        Operator::ArrayGet { array_type_index } => {
+        Operator::ArrayGet { array_type_index } | Operator::TArrayGet { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index) = environ.stacks.pop2();
             let elem =
                 environ.translate_array_get(builder, array_type_index, array, index, None)?;
             environ.stacks.push1(elem);
         }
-        Operator::ArrayGetS { array_type_index } => {
+        Operator::ArrayGetS { array_type_index } | Operator::TArrayGetS { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index) = environ.stacks.pop2();
             let elem = environ.translate_array_get(
@@ -3232,7 +3279,7 @@ pub fn translate_operator(
             )?;
             environ.stacks.push1(elem);
         }
-        Operator::ArrayGetU { array_type_index } => {
+        Operator::ArrayGetU { array_type_index } | Operator::TArrayGetU { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index) = environ.stacks.pop2();
             let elem = environ.translate_array_get(
@@ -3244,7 +3291,7 @@ pub fn translate_operator(
             )?;
             environ.stacks.push1(elem);
         }
-        Operator::ArraySet { array_type_index } => {
+        Operator::ArraySet { array_type_index } | Operator::TArraySet { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index, elem) = environ.stacks.pop3();
             environ.translate_array_set(builder, array_type_index, array, index, elem)?;
@@ -3394,11 +3441,11 @@ pub fn translate_operator(
             builder.switch_to_block(cast_succeeds_block);
         }
 
-        Operator::AnyConvertExtern => {
+        Operator::AnyConvertExtern | Operator::TAnyConvertTExtern => {
             // Pop an `externref`, push an `anyref`. But they have the same
             // representation, so we don't actually need to do anything.
         }
-        Operator::ExternConvertAny => {
+        Operator::ExternConvertAny | Operator::TExternConvertTAny => {
             // Pop an `anyref`, push an `externref`. But they have the same
             // representation, so we don't actually need to do anything.
         }

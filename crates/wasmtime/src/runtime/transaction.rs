@@ -5278,4 +5278,87 @@ mod tests {
 
         crate::Module::new(&engine, wasm).unwrap();
     }
+
+    #[test]
+    fn module_compilation_accepts_transaction_object_helper_lowering() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        crate::Module::new(
+            &engine,
+            wat::parse_str(
+                r#"
+                (module
+                  (type $s (struct (field (mut i32))))
+                  (type $ps (struct (field (mut i8))))
+                  (type $a (array (mut i32)))
+                  (type $pa (array (mut i8)))
+                  (type $ra (array (mut funcref)))
+                  (func $f)
+                  (data $d "\00\01\02\03")
+                  (elem $e func $f $f)
+                  (func (export "object-smoke") (result i32)
+                    (local $sref (ref $s))
+                    (local $psref (ref $ps))
+                    (local $aref (ref $a))
+                    (local $aref2 (ref $a))
+                    (local $paref (ref $pa))
+                    (local $raref (ref $ra))
+                    (local.set $sref
+                      (tstruct.new $s (i32.const 41)))
+                    (drop (tstruct.new_default $s))
+                    (local.set $psref
+                      (tstruct.new $ps (i32.const -1)))
+                    (drop (tstruct.get_s $ps 0 (local.get $psref)))
+                    (drop (tstruct.get_u $ps 0 (local.get $psref)))
+                    (tstruct.set $s 0 (local.get $sref) (i32.const 42))
+                    (local.set $aref
+                      (tarray.new $a (i32.const 7) (i32.const 4)))
+                    (local.set $aref2
+                      (tarray.new_default $a (i32.const 4)))
+                    (drop (tarray.new_fixed $a 2 (i32.const 1) (i32.const 2)))
+                    (local.set $paref
+                      (tarray.new_data $pa $d (i32.const 0) (i32.const 4)))
+                    (local.set $raref
+                      (tarray.new_elem $ra $e (i32.const 0) (i32.const 2)))
+                    (tarray.set $a
+                      (local.get $aref)
+                      (i32.const 1)
+                      (i31.get_s (tref.ti31 (i32.const 13))))
+                    (drop (tarray.len (local.get $aref)))
+                    (drop (tarray.get_s $pa (local.get $paref) (i32.const 0)))
+                    (drop (tarray.get_u $pa (local.get $paref) (i32.const 0)))
+                    (tarray.fill $a
+                      (local.get $aref)
+                      (i32.const 2)
+                      (i32.const 5)
+                      (i32.const 1))
+                    (tarray.copy $a $a
+                      (local.get $aref)
+                      (i32.const 3)
+                      (local.get $aref2)
+                      (i32.const 0)
+                      (i32.const 1))
+                    (tarray.init_data $pa $d
+                      (local.get $paref)
+                      (i32.const 1)
+                      (i32.const 0)
+                      (i32.const 1))
+                    (tarray.init_elem $ra $e
+                      (local.get $raref)
+                      (i32.const 0)
+                      (i32.const 0)
+                      (i32.const 1))
+                    (drop (ti31.get_u (tref.ti31 (i32.const 13))))
+                    (drop (tany.convert_textern
+                      (textern.convert_tany (tref.ti31 (i32.const 7)))))
+                    (i32.add
+                      (tstruct.get $s 0 (local.get $sref))
+                      (tarray.get $a (local.get $aref) (i32.const 1)))))
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }
