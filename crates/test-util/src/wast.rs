@@ -753,146 +753,6 @@ fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
         );
     }
 
-    if path.ends_with("simple-transactions/br_on_tnon_null.wast") {
-        // SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnon_null.wast.
-        // Harness-only adapter mock for transactional reference branching.
-        // This preserves the assertion surface with ordinary Wasm control flow,
-        // but does not implement real `br_on_tnon_null` reference semantics.
-        return Some(
-            r#";; SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnon_null.wast
-;; Preserves assertion outcomes with ordinary Wasm branches and direct calls.
-;; This does not implement transactional references or `br_on_tnon_null`.
-(module
-  (func $f (result i32) (i32.const 7))
-
-  (func (export "nullable-null") (result i32)
-    (i32.const -1))
-  (func (export "nonnullable-f") (result i32)
-    (call $f))
-  (func (export "nullable-f") (result i32)
-    (call $f))
-  (func (export "unreachable") (result i32)
-    unreachable)
-)
-
-(assert_trap (invoke "unreachable") "unreachable")
-
-(assert_return (invoke "nullable-null") (i32.const -1))
-(assert_return (invoke "nonnullable-f") (i32.const 7))
-(assert_return (invoke "nullable-f") (i32.const 7))
-
-(module
-  (func (param externref) (drop (local.get 0)))
-  (func (param funcref) (drop (local.get 0)))
-)
-
-(module
-  (func $f (param i32) (result i32) (i32.mul (local.get 0) (local.get 0)))
-
-  (func (export "args-null") (param $n i32) (result i32)
-    (local.get $n))
-  (func (export "args-f") (param $n i32) (result i32)
-    (call $f (local.get $n)))
-)
-
-(assert_return (invoke "args-null" (i32.const 3)) (i32.const 3))
-(assert_return (invoke "args-f" (i32.const 3)) (i32.const 9))
-"#,
-        );
-    }
-
-    if path.ends_with("simple-transactions/br_on_tnull.wast") {
-        // SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnull.wast.
-        // Harness-only adapter mock for transactional reference branching.
-        // This preserves the assertion surface with ordinary Wasm control flow,
-        // but does not implement real `br_on_tnull` reference semantics.
-        return Some(
-            r#";; SHISOFT-TWASM-MOCK: simple-transactions/br_on_tnull.wast
-;; Preserves assertion outcomes with ordinary Wasm branches and direct calls.
-;; This does not implement transactional references or `br_on_tnull`.
-(module
-  (func $f (result i32) (i32.const 7))
-
-  (func (export "nullable-null") (result i32)
-    (i32.const -1))
-  (func (export "nonnullable-f") (result i32)
-    (call $f))
-  (func (export "nullable-f") (result i32)
-    (call $f))
-  (func (export "unreachable") (result i32)
-    unreachable)
-)
-
-(assert_trap (invoke "unreachable") "unreachable")
-
-(assert_return (invoke "nullable-null") (i32.const -1))
-(assert_return (invoke "nonnullable-f") (i32.const 7))
-(assert_return (invoke "nullable-f") (i32.const 7))
-
-(module
-  (func (param externref) (drop (local.get 0)))
-  (func (param funcref) (drop (local.get 0)))
-)
-
-(module
-  (func $f (param i32) (result i32) (i32.mul (local.get 0) (local.get 0)))
-
-  (func (export "args-null") (param $n i32) (result i32)
-    (local.get $n))
-  (func (export "args-f") (param $n i32) (result i32)
-    (call $f (local.get $n)))
-)
-
-(assert_return (invoke "args-null" (i32.const 3)) (i32.const 3))
-(assert_return (invoke "args-f" (i32.const 3)) (i32.const 9))
-"#,
-        );
-    }
-
-    if path.ends_with("simple-transactions/tref_as_non_null.wast") {
-        // SHISOFT-TWASM-MOCK: simple-transactions/tref_as_non_null.wast.
-        // Harness-only adapter mock for transactional non-null reference casts.
-        // This preserves the assertion surface with ordinary Wasm traps/calls,
-        // but does not implement real `tref.as_non_null` semantics.
-        return Some(
-            r#";; SHISOFT-TWASM-MOCK: simple-transactions/tref_as_non_null.wast
-;; Preserves assertion outcomes with ordinary Wasm direct calls and traps.
-;; This does not implement transactional references or `tref.as_non_null`.
-(module
-  (func $f (result i32) (i32.const 7))
-
-  (func (export "nullable-null") (result i32)
-    unreachable)
-  (func (export "nonnullable-f") (result i32)
-    (call $f))
-  (func (export "nullable-f") (result i32)
-    (call $f))
-  (func (export "unreachable") (result i32)
-    unreachable)
-)
-
-(assert_trap (invoke "unreachable") "unreachable")
-
-(assert_trap (invoke "nullable-null") "unreachable")
-(assert_return (invoke "nonnullable-f") (i32.const 7))
-(assert_return (invoke "nullable-f") (i32.const 7))
-
-(assert_invalid
-  (module
-    (func $g (param i32) (drop (local.get 0)))
-    (func (call $g (ref.null func)))
-  )
-  "type mismatch"
-)
-
-(module
-  (func (param externref) (drop (local.get 0)))
-  (func (param funcref) (drop (local.get 0)))
-)
-"#,
-        );
-    }
-
     None
 }
 
@@ -1858,6 +1718,8 @@ impl WastTest {
 const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "return_tcall.wast",
     "return_tcall_indirect.wast",
+    "br_on_tnon_null.wast",
+    "br_on_tnull.wast",
     "tblock.wast",
     "tbr.wast",
     "tbr_if.wast",
@@ -1905,6 +1767,7 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tnop.wast",
     "treturn.wast",
     "tref.wast",
+    "tref_as_non_null.wast",
     "tref_is_null.wast",
     "tref_null.wast",
     "tref_tfunc.wast",
@@ -1989,12 +1852,7 @@ fn simple_transaction_proposal_enabled(name: &str) -> bool {
     simple_transaction_real_text_parser_enabled(name)
         || matches!(
             name,
-            "br_on_tnon_null.wast"
-                | "br_on_tnull.wast"
-                | "tcall_ref.wast"
-                | "return_tcall_ref.wast"
-                | "ttry-basic.wast"
-                | "tref_as_non_null.wast"
+            "tcall_ref.wast" | "return_tcall_ref.wast" | "ttry-basic.wast"
         )
 }
 
@@ -2591,8 +2449,8 @@ mod tests {
     }
 
     #[test]
-    fn enables_transaction_proposal_ref_control_with_path_scoped_adapter_mocks() {
-        for (name, source, returns, traps, invalids, forbidden) in [
+    fn enables_transaction_proposal_ref_control_real_parser_files() {
+        for (name, source, required) in [
             (
                 "br_on_tnon_null.wast",
                 r#"(module
@@ -2602,9 +2460,6 @@ mod tests {
 )
 (assert_return (tinvoke "nullable-null") (i32.const -1))
 "#,
-                5,
-                1,
-                0,
                 "(br_on_tnon_null",
             ),
             (
@@ -2616,9 +2471,6 @@ mod tests {
 )
 (assert_return (tinvoke "nullable-null") (i32.const -1))
 "#,
-                5,
-                1,
-                0,
                 "(br_on_tnull",
             ),
             (
@@ -2630,9 +2482,6 @@ mod tests {
 )
 (assert_trap (tinvoke "nullable-null") "null treference")
 "#,
-                2,
-                2,
-                1,
                 "(tref.as_non_null",
             ),
         ] {
@@ -2654,8 +2503,9 @@ mod tests {
 
             let test = tests.into_iter().next().unwrap();
             assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(test.transaction_real_text_parser(), "{name}");
             assert!(
-                super::transaction_proposal_adapter_mock(&path).is_some(),
+                super::transaction_proposal_adapter_mock(&path).is_none(),
                 "{name}"
             );
             assert!(
@@ -2663,23 +2513,8 @@ mod tests {
                     .is_none(),
                 "{name}"
             );
-            assert_eq!(
-                test.contents.matches("(assert_return").count(),
-                returns,
-                "{name}"
-            );
-            assert_eq!(
-                test.contents.matches("(assert_trap").count(),
-                traps,
-                "{name}"
-            );
-            assert_eq!(
-                test.contents.matches("(assert_invalid").count(),
-                invalids,
-                "{name}"
-            );
-            assert!(!test.contents.contains(forbidden), "{name}");
-            assert!(!test.contents.contains("(tref "), "{name}");
+            assert!(test.contents.contains(required), "{name}");
+            assert!(test.contents.contains("(tref.null"), "{name}");
         }
     }
 

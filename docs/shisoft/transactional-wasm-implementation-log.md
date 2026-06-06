@@ -42,9 +42,6 @@ Current tagged mock categories:
   - `simple-transactions/ttry-basic.wast`
   - `simple-transactions/tcall_ref.wast`
   - `simple-transactions/return_tcall_ref.wast`
-  - `simple-transactions/br_on_tnon_null.wast`
-  - `simple-transactions/br_on_tnull.wast`
-  - `simple-transactions/tref_as_non_null.wast`
 - Text-normalization harness adapter in `crates/test-util/src/wast.rs`.
   It maps proposal spellings to ordinary Wasm only for compatibility fixtures
   that are not yet on the real transaction parser/runtime path. Scalar
@@ -112,9 +109,8 @@ Implemented runtime paths:
 
 Remaining tagged mock boundaries:
 
-- Path-scoped fixture replacements for `ttry-basic`, `tcall_ref`,
-  `return_tcall_ref`, `br_on_tnon_null`, `br_on_tnull`, and
-  `tref_as_non_null`.
+- Path-scoped fixture replacements for `ttry-basic`, `tcall_ref`, and
+  `return_tcall_ref`.
 - Text-normalization compatibility for fixtures outside the real-parser
   allowlists, especially transactional refs/GC objects, `ttry`/`tfail`, binary
   transactional encodings, and SIMD numeric-only aliases.
@@ -590,6 +586,41 @@ Current proposal harness result:
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
+```
+
+## Wave 2: Ref-Control Real Parser Tranche
+
+Date: 2026-06-06
+
+Removed path-scoped harness replacements for:
+
+- `simple-transactions/br_on_tnon_null.wast`
+- `simple-transactions/br_on_tnull.wast`
+- `simple-transactions/tref_as_non_null.wast`
+
+These files now keep their transactional text spellings and run through the
+real transaction text parser plus Wasmtime's existing reference lowering. This
+is an intermediate Wave 2 slice: the final persistent `ObjectId` tref encoding
+is still deferred, and `tcall_ref.wast`/`return_tcall_ref.wast` still use
+whole-fixture replacements until transactional function refs are wired.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast enables_transaction_proposal_ref_control_real_parser_files -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tref_as_non_null.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/br_on_tnull.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/br_on_tnon_null.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 153 passed; 0 failed; 20 ignored; 0 measured; 3438 filtered out
 ```
 
 ## Remaining Roadmap Wave 1: Object Record Heap
@@ -1174,9 +1205,6 @@ WAST harness state after this unlock:
   - `ttry-basic.wast`
   - `tcall_ref.wast`
   - `return_tcall_ref.wast`
-  - `br_on_tnon_null.wast`
-  - `br_on_tnull.wast`
-  - `tref_as_non_null.wast`
 - Remaining text-normalization categories:
   - transactional SIMD numeric aliases
   - transactional refs, tables, object-table permission cases, and
@@ -1460,6 +1488,10 @@ test result: ok. 122 passed; 0 failed; 51 ignored; 0 measured; 3438 filtered out
 ## Harness Mock: Transactional Ref Control
 
 Date: 2026-06-04
+
+Superseded on June 6, 2026: `br_on_tnon_null.wast`, `br_on_tnull.wast`, and
+`tref_as_non_null.wast` now run through the real parser/runtime path. This
+section records the earlier temporary harness state.
 
 Enabled three small transactional reference-control fixtures through
 path-scoped harness adapter mocks:

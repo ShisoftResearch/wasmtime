@@ -41,9 +41,11 @@ Current real runtime foundations:
 
 Current remaining mock categories:
 
-- Path-scoped fixture replacements for `ttry-basic`, `tcall_ref`,
-  `return_tcall_ref`, `br_on_tnon_null`, `br_on_tnull`, and
-  `tref_as_non_null`.
+- Path-scoped fixture replacements for `ttry-basic`, `tcall_ref`, and
+  `return_tcall_ref`.
+- `br_on_tnon_null.wast`, `br_on_tnull.wast`, and `tref_as_non_null.wast`
+  now run through the real transaction text parser and Wasmtime reference
+  lowering without whole-fixture replacement.
 - Text-normalization compatibility outside the current real-parser allowlists.
 - Reference/object-valued transactional global snapshots.
 - Table element COW; current table writes acquire ownership then mutate
@@ -315,6 +317,11 @@ Route the operators through runtime helpers or direct lowering:
 - `br_on_tnull`: branch on encoded null
 - `br_on_tnon_null`: branch and pass non-null encoded `ObjectId`
 
+Progress: `tref.as_non_null`, `br_on_tnull`, and `br_on_tnon_null` now bypass
+the path-scoped fixture replacement and execute through the real text parser
+and Wasmtime's existing reference lowering. They still use ordinary Wasmtime
+reference values, not the final encoded persistent `ObjectId` representation.
+
 - [ ] **Step 4: Lower transactional function refs**
 
 Implement enough `tcall_ref` and `return_tcall_ref` to remove the path-scoped
@@ -325,11 +332,11 @@ refs only, with validation rejecting ordinary function refs.
 
 Delete the replacement entries and their tests for:
 
-- `tcall_ref.wast`
-- `return_tcall_ref.wast`
-- `br_on_tnon_null.wast`
-- `br_on_tnull.wast`
-- `tref_as_non_null.wast`
+- [ ] `tcall_ref.wast`
+- [ ] `return_tcall_ref.wast`
+- [x] `br_on_tnon_null.wast`
+- [x] `br_on_tnull.wast`
+- [x] `tref_as_non_null.wast`
 
 Run:
 
