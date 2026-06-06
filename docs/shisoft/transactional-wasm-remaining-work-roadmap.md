@@ -41,11 +41,11 @@ Current real runtime foundations:
 
 Current remaining mock categories:
 
-- Path-scoped fixture replacements for `ttry-basic`, `tcall_ref`, and
-  `return_tcall_ref`.
-- `br_on_tnon_null.wast`, `br_on_tnull.wast`, and `tref_as_non_null.wast`
-  now run through the real transaction text parser and Wasmtime reference
-  lowering without whole-fixture replacement.
+- Path-scoped fixture replacement for `ttry-basic`.
+- `br_on_tnon_null.wast`, `br_on_tnull.wast`, `tref_as_non_null.wast`,
+  `tcall_ref.wast`, and `return_tcall_ref.wast` now run through the real
+  transaction text parser and Wasmtime reference/function-reference lowering
+  without whole-fixture replacement.
 - Text-normalization compatibility outside the current real-parser allowlists.
 - Reference/object-valued transactional global snapshots.
 - Table element COW; current table writes acquire ownership then mutate
@@ -322,18 +322,23 @@ the path-scoped fixture replacement and execute through the real text parser
 and Wasmtime's existing reference lowering. They still use ordinary Wasmtime
 reference values, not the final encoded persistent `ObjectId` representation.
 
-- [ ] **Step 4: Lower transactional function refs**
+- [x] **Step 4: Lower transactional function refs**
 
 Implement enough `tcall_ref` and `return_tcall_ref` to remove the path-scoped
 fixture replacements. The first implementation may support transaction function
 refs only, with validation rejecting ordinary function refs.
 
-- [ ] **Step 5: Remove the path-scoped ref-control replacements**
+Progress: `tcall_ref` and `return_tcall_ref` now bypass the path-scoped fixture
+replacement and execute through the real text parser plus Wasmtime's existing
+`call_ref`/`return_call_ref` lowering. They still use ordinary Wasmtime function
+references, not the final persistent `ObjectId` function-reference encoding.
+
+- [x] **Step 5: Remove the path-scoped ref-control replacements**
 
 Delete the replacement entries and their tests for:
 
-- [ ] `tcall_ref.wast`
-- [ ] `return_tcall_ref.wast`
+- [x] `tcall_ref.wast`
+- [x] `return_tcall_ref.wast`
 - [x] `br_on_tnon_null.wast`
 - [x] `br_on_tnull.wast`
 - [x] `tref_as_non_null.wast`

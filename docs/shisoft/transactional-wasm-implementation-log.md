@@ -40,8 +40,6 @@ Current tagged mock categories:
 - Whole-fixture WAST harness replacements in
   `crates/test-util/src/wast.rs` for:
   - `simple-transactions/ttry-basic.wast`
-  - `simple-transactions/tcall_ref.wast`
-  - `simple-transactions/return_tcall_ref.wast`
 - Text-normalization harness adapter in `crates/test-util/src/wast.rs`.
   It maps proposal spellings to ordinary Wasm only for compatibility fixtures
   that are not yet on the real transaction parser/runtime path. Scalar
@@ -109,8 +107,7 @@ Implemented runtime paths:
 
 Remaining tagged mock boundaries:
 
-- Path-scoped fixture replacements for `ttry-basic`, `tcall_ref`, and
-  `return_tcall_ref`.
+- Path-scoped fixture replacement for `ttry-basic`.
 - Text-normalization compatibility for fixtures outside the real-parser
   allowlists, especially transactional refs/GC objects, `ttry`/`tfail`, binary
   transactional encodings, and SIMD numeric-only aliases.
@@ -324,12 +321,13 @@ The 33 passing files are marked in
 control/numeric behavior under transactional spelling, but they are not proof
 of real transaction rollback or Wizard `tmemory` storage.
 
-Remaining Wave 1 blockers:
+Remaining Wave 1 blockers at the time:
 
 - `tfloat_literals.wast`: embeds a binary module using transactional encodings.
 - `tcall_ref.wast`, `return_tcall_ref.wast`, `tlocal_init.wast`,
   `tselect.wast`, `tunreached-valid.wast`, and `tunreached-invalid.wast`:
-  blocked on transactional reference/function-reference validation.
+  blocked on transactional reference/function-reference validation. The
+  function-reference files are now superseded by the real-parser Wave 2 tranche.
 - `tbr_table.wast`: normalized text reaches transactional reference cases such
   as `texterntref`, so it remains blocked on transactional refs/GC runtime.
 
@@ -601,8 +599,8 @@ Removed path-scoped harness replacements for:
 These files now keep their transactional text spellings and run through the
 real transaction text parser plus Wasmtime's existing reference lowering. This
 is an intermediate Wave 2 slice: the final persistent `ObjectId` tref encoding
-is still deferred, and `tcall_ref.wast`/`return_tcall_ref.wast` still use
-whole-fixture replacements until transactional function refs are wired.
+is still deferred. A later Wave 2 slice also moved
+`tcall_ref.wast`/`return_tcall_ref.wast` off whole-fixture replacements.
 
 Verification:
 
@@ -617,6 +615,37 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/sim
 test result: ok. 1 passed; 0 failed; 0 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/br_on_tnon_null.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 153 passed; 0 failed; 20 ignored; 0 measured; 3438 filtered out
+```
+
+## Wave 2: Function-Reference Real Parser Tranche
+
+Date: 2026-06-06
+
+Removed path-scoped harness replacements for:
+
+- `simple-transactions/tcall_ref.wast`
+- `simple-transactions/return_tcall_ref.wast`
+
+These files now keep their transactional function-reference spellings and run
+through the real transaction text parser plus Wasmtime's existing
+`call_ref`/`return_call_ref` lowering. This is still a transitional runtime path:
+the final persistent `ObjectId` function-reference representation and object
+table integration remain in the transactional object workstream.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast enables_transaction_proposal_tcall_ref_real_parser_files -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tcall_ref.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/return_tcall_ref.wast -- --format terse
 test result: ok. 1 passed; 0 failed; 0 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
@@ -726,10 +755,11 @@ Real-parser WAST files added to the passing set:
 - `ttable_set.wast`
 - `ttable_size.wast`
 
-Mocked/deferred:
+Historical mocked/deferred at that time:
 
-- `tcall_ref` and ref-control WASTs still depend on harness replacement until
-  real transactional function references are lowered and validated.
+- Persistent `ObjectId` reference and function-reference encoding remains
+  deferred; the small ref-control and function-reference fixtures now use the
+  real parser/runtime path through ordinary Wasmtime reference lowering.
 - Table operators acquire `TTable`/`TTableSize` granules but still write through
   Wasmtime's committed table backing; table COW is pending.
 - Ref-valued globals store raw words only. Rooted object references and
@@ -1203,8 +1233,6 @@ WAST harness state after this unlock:
     transactions, or conflict detection.
 - Remaining path-scoped fixture replacements:
   - `ttry-basic.wast`
-  - `tcall_ref.wast`
-  - `return_tcall_ref.wast`
 - Remaining text-normalization categories:
   - transactional SIMD numeric aliases
   - transactional refs, tables, object-table permission cases, and
@@ -1356,10 +1384,10 @@ Harness additions:
 - Transaction diagnostic normalization now uses a shared replacement table plus
   syntax-normalization-only deltas to reduce drift between normalized and
   real-parser fixture handling.
-- Parser-blocked fixtures remain normalized or mocked: transactional refs,
-  `tcall_ref`/`return_tcall_ref`, `ttry`/`tfail`, bulk tmemory
-  `copy/fill/init`, transactional table/element forms, and object-table/GC
-  fixtures.
+- Parser-blocked fixtures remain normalized or mocked: persistent transactional
+  refs/objects, `ttry`/`tfail`, binary transactional encodings, and
+  object-table/GC fixtures. `tcall_ref`/`return_tcall_ref` are now on the real
+  parser/runtime path through ordinary Wasmtime function-reference lowering.
 
 Verification:
 
@@ -1436,17 +1464,22 @@ test result: ok. 69 passed; 0 failed; 47 ignored; 0 measured; 3495 filtered out
 
 Date: 2026-06-04
 
+Superseded on June 6, 2026: `tcall_ref.wast` and
+`return_tcall_ref.wast` now run through the real parser/runtime path using
+Wasmtime's function-reference lowering. This section records the earlier
+temporary harness state.
+
 Enabled two transactional function-reference fixtures through path-scoped
 harness adapter mocks:
 
 - `simple-transactions/tcall_ref.wast`
 - `simple-transactions/return_tcall_ref.wast`
 
-These fixtures still require real transactional reference/object-space support
-before they can run as written. The current bridge replaces each fixture only
-when its path exactly matches the proposal file and emits ordinary Wasm modules
-that preserve the fixture's externally asserted return/trap/invalid directive
-counts and categories:
+At the time, these fixtures still required transactional reference/object-space
+support before they could run as written. The bridge replaced each fixture only
+when its path exactly matched the proposal file and emitted ordinary Wasm
+modules that preserved the fixture's externally asserted return/trap/invalid
+directive counts and categories:
 
 - `tcall_ref.wast` uses direct calls for `run`, factorial, Fibonacci, and
   even/odd recursion outcomes.
@@ -1458,7 +1491,7 @@ counts and categories:
 - Invalid/unreachable typing directives are kept at the same assertion counts
   with ordinary Wasm validation/trap checks.
 
-Mocked/deferred:
+Historical mocked/deferred at that time:
 
 - No real transactional `tref` type, `tref.tfunc`, `tref.null`, `tcall_ref`, or
   `return_tcall_ref` semantics are implemented by this tranche.
@@ -2152,7 +2185,8 @@ Runtime/harness work in this tranche:
   proposal diagnostics for call/table aliases are normalized.
 - The local `wasm-tools-transaction` fork now accepts `tcall`,
   `tcall_indirect`, `return_tcall`, `return_tcall_indirect`, `tcall_ref`,
-  `return_tcall_ref`, and `tfuncref` as text aliases for the mock tranche.
+  `return_tcall_ref`, and `tfuncref` as text aliases for the early transaction
+  parser tranche.
 
 Fork commit:
 
