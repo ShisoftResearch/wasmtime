@@ -1093,8 +1093,9 @@ fn normalize_transaction_import_name(name: &str) -> &str {
     }
 }
 
-// SHISOFT-TWASM-MOCK: token-level semantic substitution for control,
-// reference, table, memory, global, and SIMD transaction proposal spelling.
+// SHISOFT-TWASM-MOCK: token-level semantic substitution for proposal files that
+// are not yet on the real transaction parser/runtime path. Real-parser
+// allowlisted files bypass this adapter.
 fn normalize_transaction_token(token: &str) -> &str {
     match token {
         "return_tcall_indirect" => "return_call_indirect",
@@ -1155,7 +1156,8 @@ fn normalize_transaction_token(token: &str) -> &str {
 }
 
 // SHISOFT-TWASM-MOCK: scalar transactional load/store spelling is lowered to
-// ordinary Wasm load/store spelling by the harness adapter.
+// ordinary Wasm load/store spelling only for normalized compatibility
+// fixtures. Scalar memory WAST files on the real-parser allowlist bypass this.
 fn normalize_load_store_token(token: &str) -> &str {
     match token {
         "i32.tload" => "i32.load",
@@ -1847,9 +1849,11 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tbr.wast",
     "tbr_if.wast",
     "tcall.wast",
+    "tcall_indirect.wast",
     "tconflict-tmemory.wast",
     "tconst.wast",
     "tconversions.wast",
+    "texports.wast",
     "tf32.wast",
     "tf32_bitwise.wast",
     "tf32_cmp.wast",
@@ -1860,9 +1864,11 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tfloat_exprs.wast",
     "tfloat_misc.wast",
     "tforward.wast",
+    "tfunc_ptrs.wast",
     "ti32.wast",
     "ti64.wast",
     "tif.wast",
+    "timports.wast",
     "tinline-module.wast",
     "tint_exprs.wast",
     "tint_literals.wast",
@@ -1896,6 +1902,9 @@ const SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY: &[&str] = &[
     "tmemory_redundancy.wast",
     "tmemory_size.wast",
     "tmemory_grow.wast",
+    "tmemory_copy.wast",
+    "tmemory_fill.wast",
+    "tmemory_init.wast",
     "tload.wast",
     "tstore.wast",
     "tmemory_trap.wast",
@@ -1938,17 +1947,10 @@ fn simple_transaction_proposal_enabled(name: &str) -> bool {
             name,
             "br_on_tnon_null.wast"
                 | "br_on_tnull.wast"
-                | "tcall_indirect.wast"
                 | "tcall_ref.wast"
                 | "return_tcall_ref.wast"
-                | "texports.wast"
-                | "timports.wast"
-                | "tmemory_copy.wast"
-                | "tmemory_fill.wast"
-                | "tmemory_init.wast"
                 | "ttry-basic.wast"
                 | "tref_as_non_null.wast"
-                | "tfunc_ptrs.wast"
         )
 }
 
@@ -2643,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn enables_normalized_bulk_memory_transaction_proposal_tranche() {
+    fn enables_real_text_parser_bulk_memory_transaction_proposal_tranche() {
         for name in [
             "tmemory_copy.wast",
             "tmemory_fill.wast",
@@ -2654,40 +2656,60 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: false,
+                transaction_real_text_parser: true,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
         }
     }
 
     #[test]
-    fn enables_normalized_import_export_transaction_proposal_tranche() {
+    fn enables_real_text_parser_import_export_transaction_proposal_tranche() {
         for name in ["texports.wast", "timports.wast"] {
             let test = WastTest {
                 path: PathBuf::from(name),
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: false,
+                transaction_real_text_parser: true,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
+            assert!(
+                super::transaction_proposal_adapter_mock(&test.path).is_none(),
+                "{name}"
+            );
         }
     }
 
     #[test]
-    fn enables_normalized_type_and_name_transaction_proposal_tranche() {
+    fn enables_real_text_parser_type_and_name_transaction_proposal_tranche() {
         for name in ["tfunc_ptrs.wast"] {
             let test = WastTest {
                 path: PathBuf::from(name),
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: false,
+                transaction_real_text_parser: true,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(super::transaction_proposal_uses_real_text_parser(
+                TransactionProposalSuite::SimpleTransactions,
+                &test.path
+            ));
+            assert!(
+                super::transaction_proposal_adapter_mock(&test.path).is_none(),
+                "{name}"
+            );
         }
     }
 

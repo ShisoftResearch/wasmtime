@@ -26,21 +26,93 @@ Current tagged mock categories:
   - `simple-transactions/br_on_tnull.wast`
   - `simple-transactions/tref_as_non_null.wast`
 - Text-normalization harness adapter in `crates/test-util/src/wast.rs`.
-  It maps proposal spellings such as `tfunc`, `tcall`, `return_tcall`,
-  `tmemory.*`, `tglobal.*`, scalar `*.tload`/`*.tstore`, and SIMD
-  `v128.tload`/`v128.tstore` aliases to ordinary Wasm spellings.
-- Runtime libcall scaffold in `crates/wasmtime/src/runtime/vm/libcalls.rs`.
-  Compiled transaction ops run through these helpers, but they use ordinary
-  Wasmtime memory/global backing plus store-local copy-on-write overlays.
+  It maps proposal spellings to ordinary Wasm only for compatibility fixtures
+  that are not yet on the real transaction parser/runtime path. Scalar
+  `tmemory` including `tmemory.copy/fill/init`, core numeric/control, selected
+  `ttable` funcref bulk files, and SIMD transactional memory files now bypass
+  this adapter.
+- Runtime libcall gaps in `crates/wasmtime/src/runtime/vm/libcalls.rs`.
+  Scalar `tmemory` and numeric/v128 `tglobal` ops run through real compiled
+  helper paths. Numeric imported `tglobal` is supported; reference/object
+  snapshots and table-element COW remain tagged.
 - Transaction state/config scaffold in
   `crates/wasmtime/src/runtime/transaction.rs`. Backend, durability,
   conflict-policy, and concurrency-control selection have the future shape,
   but only store-local `LockBased` and volatile `VMemory` behavior are active.
-- TMemory storage prototype in
-  `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`. It provides the mmap and
-  granule helper boundary for future allocation work, but it is not wired into
-  instance allocation yet, and `FileBackedMemory`/`NVMemory` are not
-  implemented.
+- Table bulk and element-object gaps in Cranelift/runtime lowering. The current
+  funcref `ttable` paths acquire `TTable`/`TTableSize` ownership, but table
+  element COW and transactional reference/object permissions remain future
+  object-table work.
+
+## Runtime Core Current Status
+
+Date: 2026-06-06
+
+The runtime-core implementation plan through the block/chunk storage wave is
+implemented on branch `transaction`.
+
+Implemented runtime paths:
+
+- Transaction object metadata for `tmemory`, `tglobal`, `tfunc`, and `ttable`.
+- Per-instance `TMemory` sidecars backed by `VMemory` block/chunk regions.
+- Copy-on-write transaction workspace indexed by `GranuleId`.
+- `GranuleId::TMemory`, `TMemorySize`, `TGlobal`, `TTable`, and `TTableSize`.
+  `TStruct` and `TArray` are reserved with `ObjectId` for the object-table
+  workstream.
+- Store-local `LockBased` optimistic-read/pessimistic-write ownership.
+- `tfunc` entry/normal-return transaction boundaries.
+- Scalar `tmemory` loads/stores, size/grow, `tmemory.copy/fill/init`, static
+  and segmented active `tdata` initialization, imported `tmemory` active data,
+  and dynamic imported `tmemory` size matching through real `tmemory` storage.
+- Numeric transactional globals for defined and imported globals; v128
+  transactional globals for defined globals.
+- Transactional SIMD memory load/store families through real parser/lowering
+  and `tmemory`.
+- Funcref `ttable.get/set/size/grow` plus `ttable.copy/init` ownership/runtime
+  smoke paths.
+
+Remaining tagged mock boundaries:
+
+- Path-scoped fixture replacements for `ttry-basic`, `tcall_ref`,
+  `return_tcall_ref`, `br_on_tnon_null`, `br_on_tnull`, and
+  `tref_as_non_null`.
+- Text-normalization compatibility for fixtures outside the real-parser
+  allowlists, especially transactional refs/GC objects, `ttry`/`tfail`, binary
+  transactional encodings, and SIMD numeric-only aliases.
+- Reference/object-valued transactional global snapshots and object-table
+  permissions. Numeric imported `tglobal` is on the real runtime path.
+- Table element COW and reference/object permissions for table bulk/object
+  operations.
+- Binary transactional type encodings such as the `0xe0` tfunc/ref encodings.
+- Durable `FileBackedMemory` and `NVMemory` backends.
+
+Verification:
+
+```text
+cargo test -p wasmtime-environ transaction_object_metadata
+test result: ok. 8 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib tmemory
+test result: ok. 39 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction
+test result: ok. 78 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 71 passed; 0 failed; 45 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 127 passed; 0 failed; 46 ignored
+```
+
+Current promotion note:
+
+- `tcall_indirect.wast`, `tfunc_ptrs.wast`, `texports.wast`, and
+  `timports.wast` are now real-parser WAST files rather than normalized
+  compatibility fixtures.
+- `timports.wast` uses real transactional spectest imports, numeric imported
+  `tglobal`, active imported `tmemory` data initialization, and dynamic
+  `tmemory` import-size matching after grow.
 
 ## Wave 0: Baseline
 
@@ -555,8 +627,6 @@ Enabled the four SIMD lane-store WAST files as real-text-parser tests:
 Mocked/deferred:
 
 - V128 support is limited to defined globals in the current mock runtime.
-- Imported transactional globals still use the existing
-  `SHISOFT-TWASM-MOCK` unsupported path.
 - Reference/object global snapshots remain deferred to the object table work.
 
 Verification:
@@ -789,9 +859,7 @@ WAST harness state after this unlock:
   - `br_on_tnull.wast`
   - `tref_as_non_null.wast`
 - Remaining text-normalization categories:
-  - bulk `tmemory.copy/fill/init`
-  - import/export and function-pointer compatibility files
-  - transactional SIMD memory and SIMD numeric aliases
+  - transactional SIMD numeric aliases
   - transactional refs, tables, object-table permission cases, and
     `ttry`/`tfail`
 

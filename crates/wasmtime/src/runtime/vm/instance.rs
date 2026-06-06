@@ -217,14 +217,14 @@ impl Instance {
             vmctx: OwnedVMContext::new(),
         })?;
 
-        #[cfg(has_virtual_memory)]
-        ret.get_mut().initialize_tmemory_sidecar_static_data()?;
-
         // SAFETY: this vmctx was allocated with the same layout above, so it
         // should be safe to initialize with the same values here.
         unsafe {
             ret.get_mut().initialize_vmctx(req.store, req.imports);
         }
+
+        #[cfg(has_virtual_memory)]
+        ret.get_mut().initialize_tmemory_sidecar_static_data()?;
 
         Ok(ret)
     }
@@ -294,17 +294,56 @@ impl Instance {
             initializers.push((memory_index, offset, copy))?;
         }
 
-        let sidecar = self.as_mut().tmemory_sidecar_mut();
         for (memory_index, offset, data) in initializers {
-            let Some(tmemory) = sidecar.get_mut(memory_index) else {
-                continue;
-            };
-            tmemory
-                .commit_range(offset, &data)
-                .map_err(|_| OutOfMemory::new(data.len()))?;
+            self.as_mut()
+                .commit_tmemory_static_data(memory_index, offset, &data)?;
         }
 
         Ok(())
+    }
+
+    #[cfg(has_virtual_memory)]
+    fn commit_tmemory_static_data(
+        mut self: Pin<&mut Self>,
+        memory_index: MemoryIndex,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), OutOfMemory> {
+        if self
+            .runtime_info
+            .env_module()
+            .defined_memory_index(memory_index)
+            .is_some()
+        {
+            let Some(tmemory) = self.as_mut().tmemory_sidecar_mut().get_mut(memory_index) else {
+                return Ok(());
+            };
+            return tmemory
+                .commit_range(offset, data)
+                .map_err(|_| OutOfMemory::new(data.len()));
+        }
+
+        let import = *self.as_ref().get_ref().imported_memory(memory_index);
+        let vmctx = import.vmctx.as_non_null();
+        // SAFETY: imported VM memory records are initialized before transactional
+        // sidecar data is committed, and the import's `vmctx` belongs to the
+        // same store as this instance.
+        let mut foreign_instance = unsafe { self.as_mut().sibling_vmctx_mut(vmctx) };
+        let source_memory_index = foreign_instance
+            .as_ref()
+            .get_ref()
+            .env_module()
+            .memory_index(import.index);
+        let Some(tmemory) = foreign_instance
+            .as_mut()
+            .tmemory_sidecar_mut()
+            .get_mut(source_memory_index)
+        else {
+            return Ok(());
+        };
+        tmemory
+            .commit_range(offset, data)
+            .map_err(|_| OutOfMemory::new(data.len()))
     }
 
     #[cfg(has_virtual_memory)]
@@ -518,7 +557,7 @@ impl Instance {
     }
 
     /// Return the indexed `VMGlobalImport`.
-    fn imported_global(&self, index: GlobalIndex) -> &VMGlobalImport {
+    pub(crate) fn imported_global(&self, index: GlobalIndex) -> &VMGlobalImport {
         unsafe { self.vmctx_plus_offset(self.offsets().vmctx_vmglobal_import(index)) }
     }
 

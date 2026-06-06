@@ -28,6 +28,16 @@ macro_rules! foreach_builtin_function {
             transaction_tmemory_size(vmctx: vmctx, memory: u32) -> pointer;
             // Stages a transactional memory grow and returns the previous visible size.
             transaction_tmemory_grow(vmctx: vmctx, memory: u32, delta: u64) -> pointer;
+            // Stages a transactional memory fill.
+            transaction_tmemory_fill(vmctx: vmctx, memory: u32, dst: u64, val: u32, len: u64) -> bool;
+            // Stages a transactional memory copy.
+            transaction_tmemory_copy(vmctx: vmctx, dst_memory: u32, src_memory: u32, dst: u64, src: u64, len: u64) -> bool;
+            // Stages a transactional memory initialization from runtime data bytes.
+            transaction_tmemory_init(vmctx: vmctx, memory: u32, dst: u64, src: u64, len: u64, data: pointer, data_len: u64) -> bool;
+            // Initializes committed transactional memory from active data during module startup.
+            transaction_tmemory_static_init(vmctx: vmctx, memory: u32, dst: u64, len: u64, data: pointer, data_len: u64) -> bool;
+            // Checks transactional context before lowering applies `tdata.drop`.
+            transaction_tdata_drop(vmctx: vmctx, data: u32) -> bool;
             // Returns a transactional table element.
             transaction_ttable_get(vmctx: vmctx, table: u32, index: u64) -> pointer;
             // Stages a transactional table element write.

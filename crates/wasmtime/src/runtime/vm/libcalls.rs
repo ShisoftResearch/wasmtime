@@ -70,8 +70,8 @@ use core::ptr::NonNull;
 use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
-    CompiledTrap, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, FuncIndex,
-    GlobalIndex, MemoryIndex, PassiveElemIndex, TableIndex, Trap, WasmValType,
+    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GlobalIndex, MemoryIndex,
+    PassiveElemIndex, TableIndex, Trap, WasmValType,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::AccessError::{
@@ -267,10 +267,10 @@ fn memory_grow(
     })?
 }
 
-// SHISOFT-TWASM-MOCK: transaction libcall runtime scaffold.
-// These helpers execute compiled transactional operators against store-local
-// staged overlays and ordinary Wasmtime memory/global backing until tmemory
-// storage, persistent backends, and the transaction object table are wired.
+// Transaction libcalls execute compiled transactional operators against
+// store-local transaction state and per-instance `tmemory` sidecars. Remaining
+// `SHISOFT-TWASM-MOCK` tags below mark object-table, reference/object global,
+// imported-v128 global, and table-element COW gaps.
 fn transaction_enter_tfunc(store: &mut dyn VMStore, _instance: InstanceId) -> Result<u32> {
     let state = store.store_opaque_mut().transaction_state_mut();
     if state.active_transaction().is_some() {
@@ -364,7 +364,7 @@ fn transaction_tglobal_get_impl(
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (global_index, wasm_ty) = defined_transaction_global(store, instance, global)?;
+    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let staged = {
         let state = store.store_opaque_mut().transaction_state_mut();
         ensure!(
@@ -395,7 +395,7 @@ fn transaction_tglobal_set_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (global_index, wasm_ty) = defined_transaction_global(store, instance, global)?;
+    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = global_snapshot_from_tag(tag, value)?;
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
     store
@@ -413,7 +413,7 @@ fn transaction_tglobal_set_v128_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (global_index, wasm_ty) = defined_transaction_global(store, instance, global)?;
+    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     ensure!(
         matches!(wasm_ty, WasmValType::V128),
         "transactional global value tag does not match global type"
@@ -426,22 +426,17 @@ fn transaction_tglobal_set_v128_impl(
     Ok(())
 }
 
-fn defined_transaction_global(
+fn transaction_global(
     store: &mut dyn VMStore,
     instance: InstanceId,
     global: u32,
-) -> Result<(DefinedGlobalIndex, WasmValType)> {
+) -> Result<(GlobalIndex, WasmValType)> {
     let global = GlobalIndex::from_u32(global);
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
     let module = instance_ref.env_module();
     let wasm_ty = module.globals[global].wasm_ty;
-    let Some(index) = module.defined_global_index(global) else {
-        // SHISOFT-TWASM-MOCK: imported tglobals need object-table ownership and
-        // backing writes before they can participate in real transactions.
-        bail!("transactional imported globals are not implemented in the mock runtime");
-    };
-    Ok((index, wasm_ty))
+    Ok((global, wasm_ty))
 }
 
 fn global_snapshot_from_tag(tag: u32, value: u64) -> Result<GlobalSnapshot> {
@@ -457,11 +452,11 @@ fn global_snapshot_from_tag(tag: u32, value: u64) -> Result<GlobalSnapshot> {
 fn read_global_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    global: DefinedGlobalIndex,
+    global: GlobalIndex,
     ty: WasmValType,
 ) -> Result<GlobalSnapshot> {
-    let instance_ref = store.instance_mut(instance);
-    let global = unsafe { instance_ref.as_ref().global_ptr(global).as_ref() };
+    let global = global_definition_ptr(store, instance, global)?;
+    let global = unsafe { global.as_ref() };
     match ty {
         WasmValType::I32 => Ok(GlobalSnapshot::I32(unsafe { *global.as_i32() })),
         WasmValType::I64 => Ok(GlobalSnapshot::I64(unsafe { *global.as_i64() })),
@@ -473,6 +468,20 @@ fn read_global_snapshot(
             bail!("transactional global type is not implemented yet")
         }
     }
+}
+
+fn global_definition_ptr(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: GlobalIndex,
+) -> Result<NonNull<vm::VMGlobalDefinition>> {
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let module = instance_ref.env_module();
+    if let Some(defined) = module.defined_global_index(global) {
+        return Ok(instance_ref.global_ptr(defined));
+    }
+    Ok(instance_ref.imported_global(global).from.as_non_null())
 }
 
 fn write_global_snapshot(global: &mut vm::VMGlobalDefinition, value: GlobalSnapshot) {
@@ -662,6 +671,192 @@ fn transaction_tmemory_grow_impl(
     Ok(Some(AllocationSize(
         usize::try_from(previous_pages).context("tmemory previous size overflow")?,
     )))
+}
+
+fn transaction_tmemory_fill(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    dst: u64,
+    val: u32,
+    len: u64,
+) -> Result<()> {
+    let result = transaction_tmemory_fill_impl(store, instance, memory, dst, val, len);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tmemory_fill_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    dst: u64,
+    val: u32,
+    len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let len = usize::try_from(len).context("tmemory fill length overflow")?;
+    let (memory_index, snapshot) =
+        collect_defined_tmemory_snapshot(store, instance, memory, dst, len)?;
+    let bytes = alloc::vec![val as u8; len];
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_tmemory_write_owned_from_snapshot(
+            Some(instance),
+            memory_index.as_u32(),
+            dst,
+            &bytes,
+            &snapshot,
+        )
+}
+
+fn transaction_tmemory_copy(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    dst_memory: u32,
+    src_memory: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    let result =
+        transaction_tmemory_copy_impl(store, instance, dst_memory, src_memory, dst, src, len);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tmemory_copy_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    dst_memory: u32,
+    src_memory: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let len = usize::try_from(len).context("tmemory copy length overflow")?;
+    let (src_memory_index, src_snapshot) =
+        collect_defined_tmemory_snapshot(store, instance, src_memory, src, len)?;
+    let bytes = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .read_tmemory_owned_from_snapshot(
+            Some(instance),
+            src_memory_index.as_u32(),
+            src,
+            len,
+            &src_snapshot,
+        )?;
+    let (dst_memory_index, dst_snapshot) =
+        collect_defined_tmemory_snapshot(store, instance, dst_memory, dst, len)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_tmemory_write_owned_from_snapshot(
+            Some(instance),
+            dst_memory_index.as_u32(),
+            dst,
+            &bytes,
+            &dst_snapshot,
+        )
+}
+
+fn transaction_tmemory_init(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+    data: *mut u8,
+    data_len: u64,
+) -> Result<()> {
+    let result =
+        transaction_tmemory_init_impl(store, instance, memory, dst, src, len, data, data_len);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tmemory_init_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+    data: *mut u8,
+    data_len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let len = usize::try_from(len).context("tmemory init length overflow")?;
+    let data_len = usize::try_from(data_len).context("tmemory init data length overflow")?;
+    let src = usize::try_from(src).context("tmemory init source offset overflow")?;
+    let src_end = src
+        .checked_add(len)
+        .context("tmemory init source range overflow")?;
+    ensure!(
+        src <= data_len && src_end <= data_len,
+        "out of bounds tmemory access: data source range {src}..{src_end} exceeds segment length {data_len}"
+    );
+    let (memory_index, snapshot) =
+        collect_defined_tmemory_snapshot(store, instance, memory, dst, len)?;
+    let data = unsafe { data.add(src) };
+    let bytes = unsafe { core::slice::from_raw_parts(data.cast_const(), len) };
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_tmemory_write_owned_from_snapshot(
+            Some(instance),
+            memory_index.as_u32(),
+            dst,
+            bytes,
+            &snapshot,
+        )
+}
+
+fn transaction_tmemory_static_init(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: u32,
+    dst: u64,
+    len: u64,
+    data: *mut u8,
+    data_len: u64,
+) -> Result<()> {
+    let len = usize::try_from(len).context("tmemory static init length overflow")?;
+    let data_len = usize::try_from(data_len).context("tmemory static init data length overflow")?;
+    ensure!(
+        len <= data_len,
+        "out of bounds tmemory access: data range 0..{len} exceeds segment length {data_len}"
+    );
+    let dst = usize::try_from(dst).context("tmemory static init destination offset overflow")?;
+    let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(data.cast_const(), len) }
+    };
+    let mut instance_ref = store.instance_mut(instance);
+    let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory_index) else {
+        bail!("transactional memory operation targeted non-transactional memory");
+    };
+    tmemory.commit_range(dst, bytes)
+}
+
+fn transaction_tdata_drop(store: &mut dyn VMStore, instance: InstanceId, _data: u32) -> Result<()> {
+    let result = transaction_tdata_drop_impl(store, instance);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tdata_drop_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)
 }
 
 fn transaction_ttable_get(
@@ -941,9 +1136,9 @@ fn apply_staged_transaction_record(
             value,
         } => {
             let owner = owner_instance.unwrap_or(instance);
-            let global_index = DefinedGlobalIndex::from_u32(*global_index);
-            let mut instance_ref = store.instance_mut(owner);
-            let global = unsafe { instance_ref.as_mut().global_ptr(global_index).as_mut() };
+            let global_index = GlobalIndex::from_u32(*global_index);
+            let mut global = global_definition_ptr(store, owner, global_index)?;
+            let global = unsafe { global.as_mut() };
             write_global_snapshot(global, *value);
         }
         StagedRecord::MemorySize { .. } => {

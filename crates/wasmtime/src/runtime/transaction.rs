@@ -7,10 +7,10 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::ops::Range;
 
-// SHISOFT-TWASM-MOCK: milestone runtime scaffold for proposal WAST progress.
-// The current runtime uses store-local transaction state, VMemory-only backend
-// selection, and ordinary Wasmtime memory/global backing until the real
-// transactional object table and tmemory allocation path are wired.
+// Milestone runtime core for proposal WAST progress. The current runtime uses
+// store-local transaction state, `VMemory`-only transactional memory storage,
+// and real `tmemory` sidecars. Remaining `SHISOFT-TWASM-MOCK` tags in this
+// file identify policy/backend selection and object-table gaps.
 
 /// Storage backend selected for transactional memories.
 ///
@@ -2051,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_transaction_global_imported_tglobal_is_unsupported_without_backing_write() {
+    fn mock_transaction_global_imported_tglobal_commits_to_backing_global() {
         let engine = crate::Engine::default();
         let provider = transaction_test_module(
             &engine,
@@ -2083,13 +2083,9 @@ mod tests {
             .get_typed_func::<(), i32>(&mut store, "read")
             .unwrap();
 
-        let error = write.call(&mut store, ()).unwrap_err();
+        write.call(&mut store, ()).unwrap();
 
-        assert!(
-            format!("{error:?}")
-                .contains("transactional imported globals are not implemented in the mock runtime")
-        );
-        assert_eq!(read.call(&mut store, ()).unwrap(), 5);
+        assert_eq!(read.call(&mut store, ()).unwrap(), 11);
     }
 
     #[test]

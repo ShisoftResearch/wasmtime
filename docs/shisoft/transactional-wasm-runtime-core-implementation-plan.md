@@ -10,6 +10,62 @@
 
 ---
 
+## Current Execution Status
+
+Date: 2026-06-06
+
+This plan's runtime-core tasks are implemented through the Wizard block/chunk
+storage wave. The historical checkbox sections below are preserved as the
+execution recipe that produced the current branch; their unchecked boxes are
+stale unless a later section explicitly calls out a remaining gap.
+
+Current verified status:
+
+- `TMemory` is wired into instances as a per-instance sidecar and backed by
+  `VMemory` block/chunk regions.
+- Scalar `tmemory` loads/stores, `tmemory.size/grow`, `tmemory.copy/fill/init`,
+  static and segmented active `tdata` initialization, numeric imported
+  `tglobal`, numeric/v128 defined `tglobal` ops, and `tfunc` transaction
+  boundaries run through real Wasmtime runtime paths.
+- `LockBased` ownership is active for `GranuleId`-indexed memory/global/table
+  granules.
+- SIMD transactional memory load/store families run through the real parser and
+  transactional memory runtime. SIMD numeric-only aliases still use the
+  compatibility adapter.
+- Funcref `ttable.get/set/size/grow` and the `ttable.copy/init` WAST smoke
+  paths are wired. Table element COW and reference/object permissions remain
+  object-table work.
+
+Latest verification:
+
+```text
+cargo test -p wasmtime-environ transaction_object_metadata
+cargo test -p wasmtime --lib tmemory
+cargo test -p wasmtime --lib transaction
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+```
+
+Results on 2026-06-06:
+
+- `wasmtime-environ transaction_object_metadata`: 8 passed.
+- `wasmtime --lib tmemory`: 39 passed.
+- `wasmtime --lib transaction`: 78 passed.
+- `simple-transactions`: 71 passed, 45 ignored.
+- full transaction proposal slice: 127 passed, 46 ignored.
+
+Remaining implementation work before all ignored WAST can run without
+normalization:
+
+- Transactional refs and the object table: `tref`, `tcall_ref`,
+  `return_tcall_ref`, branch-on-ref, `tstruct`, `tarray`, `ti31`, `textern`,
+  casts, and object permission checks.
+- Table element COW for transactional refs and object-valued tables.
+- Structured `ttry`/`tfail` semantics.
+- Reference/object-valued transactional globals and imported v128 globals.
+- Binary transactional type/reference encodings.
+- Durable `FileBackedMemory` and `NVMemory` backends.
+
 ## Scope
 
 This plan implements the runtime core needed before object-table and structured
@@ -40,7 +96,7 @@ This plan does not implement:
   permissions.
 - `ttry`/`tfail` structured failure handlers.
 - Durable `FileBackedMemory` or `NVMemory` block-region storage.
-- Full SIMD transactional memory operations.
+- SIMD numeric aliases beyond transaction-aware memory load/store operations.
 
 Those parts remain enabled by the shapes introduced here: `GranuleId`,
 backend traits, explicit concurrency-control hooks, and transaction boundary
@@ -2141,8 +2197,8 @@ modified, omit them from `git add`.
 - Test: proposal WAST commands
 
 This task updates ignored-test boundaries to match the real runtime core and
-keeps remaining mocks visible for future object-table, SIMD, and `ttry`/`tfail`
-work.
+keeps remaining mocks visible for future object-table/ref, SIMD numeric-alias,
+binary-encoding, and `ttry`/`tfail` work.
 
 - [ ] **Step 1: Audit remaining mock tags**
 
@@ -2155,7 +2211,7 @@ rg -n "SHISOFT-TWASM-MOCK|transaction_proposal_adapter_mock|normaliz" crates tes
 Expected: output only references remaining non-core categories:
 
 - object-table and transactional refs
-- SIMD transactional memory
+- SIMD numeric aliases outside the transaction-aware memory load/store families
 - `ttry`/`tfail`
 - files still explicitly ignored because they require one of those categories
 
@@ -2174,7 +2230,7 @@ Keep ignored entries for:
 - transactional refs and branch-on-ref
 - `tstruct`, `tarray`, `ti31`, `textern`
 - `ttry`/`tfail`
-- SIMD `v128.tload*` and `v128.tstore*`
+- SIMD numeric aliases that do not exercise transactional memory
 - object-table permission tests
 
 - [ ] **Step 3: Run focused unlocked WAST tests**
@@ -2198,7 +2254,7 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 ```
 
 Expected: PASS for unlocked scalar files. Output may still report ignored tests
-for object-table, refs, SIMD, and `ttry`/`tfail`.
+for object-table, refs, binary encodings, and `ttry`/`tfail`.
 
 - [ ] **Step 5: Update implementation log**
 
@@ -2214,8 +2270,8 @@ Append an entry to `docs/shisoft/transactional-wasm-implementation-log.md`:
   granules.
 - Unlocked scalar memory/global proposal WAST files through the real parser and
   real Wasmtime runtime path.
-- Remaining mocks are limited to object-table/ref permissions, SIMD
-  transactional memory, and `ttry`/`tfail`.
+- Remaining mocks are limited to object-table/ref permissions, SIMD numeric
+  aliases outside memory operations, binary encodings, and `ttry`/`tfail`.
 ```
 
 - [ ] **Step 6: Commit**
@@ -2260,7 +2316,7 @@ Expected final state for this plan:
 - Scalar transaction WAST tests pass through the real parser and real Wasmtime
   runtime path.
 - Full proposal WAST command passes with ignores only for object-table/refs,
-  SIMD transactional memory, and `ttry`/`tfail`.
+  SIMD numeric aliases, binary encodings, and `ttry`/`tfail`.
 - `rg` output contains no scalar `tmemory`, scalar `tglobal`, transaction
   boundary, or ordinary-memory-backend mock tags.
 

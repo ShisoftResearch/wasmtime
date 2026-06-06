@@ -86,22 +86,27 @@ pub fn link_spectest<T>(
     let ty = GlobalType::new(ValType::I32, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::I32(666))?;
     linker.define(&mut *store, "spectest", "global_i32", g)?;
+    linker.define(&mut *store, "spectest", "tglobal_i32", g)?;
 
     let ty = GlobalType::new(ValType::I64, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::I64(666))?;
     linker.define(&mut *store, "spectest", "global_i64", g)?;
+    linker.define(&mut *store, "spectest", "tglobal_i64", g)?;
 
     let ty = GlobalType::new(ValType::F32, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::F32(0x4426_a666))?;
     linker.define(&mut *store, "spectest", "global_f32", g)?;
+    linker.define(&mut *store, "spectest", "tglobal_f32", g)?;
 
     let ty = GlobalType::new(ValType::F64, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::F64(0x4084_d4cc_cccc_cccd))?;
     linker.define(&mut *store, "spectest", "global_f64", g)?;
+    linker.define(&mut *store, "spectest", "tglobal_f64", g)?;
 
     let ty = TableType::new(RefType::FUNCREF, 10, Some(20));
     let table = Table::new(&mut *store, ty, Ref::Func(None))?;
     linker.define(&mut *store, "spectest", "table", table)?;
+    linker.define(&mut *store, "spectest", "ttable", table)?;
 
     let ty = TableType::new64(RefType::FUNCREF, 10, Some(20));
     let table = Table::new(&mut *store, ty, Ref::Func(None))?;
@@ -110,6 +115,16 @@ pub fn link_spectest<T>(
     let ty = MemoryType::new(1, Some(2));
     let memory = Memory::new(&mut *store, ty)?;
     linker.define(&mut *store, "spectest", "memory", memory)?;
+
+    let transaction_memory = Module::new(
+        store.engine(),
+        r#"(module (tmemory (export "tmemory") 1 2))"#,
+    )?;
+    let transaction_memory = Instance::new(&mut *store, &transaction_memory, &[])?;
+    let transaction_memory = transaction_memory
+        .get_memory(&mut *store, "tmemory")
+        .expect("transaction memory module exports tmemory");
+    linker.define(&mut *store, "spectest", "tmemory", transaction_memory)?;
 
     if config.use_shared_memory {
         let ty = MemoryType::shared(1, 1);

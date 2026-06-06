@@ -3830,6 +3830,172 @@ impl FuncEnvironment<'_> {
         ))
     }
 
+    pub fn translate_transaction_tmemory_fill(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        memory: MemoryIndex,
+        dst: ir::Value,
+        val: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_memory(memory)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_fill(),
+        );
+        let index_type = self.memory(memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let (memory_vmctx, defined_memory_index) =
+            self.memory_vmctx_and_defined_index(&mut pos, memory);
+        let dst = self.cast_index_to_i64(&mut pos, dst, index_type);
+        let len = self.cast_index_to_i64(&mut pos, len, index_type);
+        pos.ins()
+            .call(callee, &[memory_vmctx, defined_memory_index, dst, val, len]);
+        Ok(())
+    }
+
+    pub fn translate_transaction_tmemory_copy(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        dst_memory: MemoryIndex,
+        src_memory: MemoryIndex,
+        dst: ir::Value,
+        src: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_memory(dst_memory)?;
+        self.ensure_transaction_memory(src_memory)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_copy(),
+        );
+        let dst_index_type = self.memory(dst_memory).idx_type;
+        let src_index_type = self.memory(src_memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let (dst_vmctx, defined_dst_memory) =
+            self.memory_vmctx_and_defined_index(&mut pos, dst_memory);
+        let (_, defined_src_memory) = self.memory_vmctx_and_defined_index(&mut pos, src_memory);
+        let dst = self.cast_index_to_i64(&mut pos, dst, dst_index_type);
+        let src = self.cast_index_to_i64(&mut pos, src, src_index_type);
+        let len = cast_index_value_to_i64(&mut pos, len);
+        pos.ins().call(
+            callee,
+            &[
+                dst_vmctx,
+                defined_dst_memory,
+                defined_src_memory,
+                dst,
+                src,
+                len,
+            ],
+        );
+        Ok(())
+    }
+
+    pub fn translate_transaction_tmemory_init(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        memory: MemoryIndex,
+        seg_index: u32,
+        dst: ir::Value,
+        src: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_memory(memory)?;
+        if builder.func.dfg.value_type(src) != I32 || builder.func.dfg.value_type(len) != I32 {
+            return Err(wasmtime_environ::WasmError::Unsupported(
+                "transactional tmemory.init for memory64 is not implemented yet".into(),
+            ));
+        }
+        let data_index = DataIndex::from_u32(seg_index);
+        let pointer_type = self.pointer_type();
+        let (data, data_len) = match self.translation.runtime_data_map[data_index] {
+            Some(runtime_index) => (
+                self.load_runtime_data_base(builder, runtime_index),
+                self.load_runtime_data_length_as_pointer(builder, runtime_index),
+            ),
+            None => (
+                builder.ins().iconst(pointer_type, 1),
+                builder.ins().iconst(pointer_type, 0),
+            ),
+        };
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_init(),
+        );
+        let index_type = self.memory(memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let (memory_vmctx, defined_memory_index) =
+            self.memory_vmctx_and_defined_index(&mut pos, memory);
+        let dst = self.cast_index_to_i64(&mut pos, dst, index_type);
+        let src = self.cast_index_to_i64(&mut pos, src, IndexType::I32);
+        let len = self.cast_index_to_i64(&mut pos, len, IndexType::I32);
+        let data_len = cast_index_value_to_i64(&mut pos, data_len);
+        pos.ins().call(
+            callee,
+            &[
+                memory_vmctx,
+                defined_memory_index,
+                dst,
+                src,
+                len,
+                data,
+                data_len,
+            ],
+        );
+        Ok(())
+    }
+
+    fn translate_transaction_tmemory_static_init(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        memory: MemoryIndex,
+        dst: ir::Value,
+        data_index: RuntimeDataIndex,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_memory(memory)?;
+        let data = self.load_runtime_data_base(builder, data_index);
+        let data_len = self.load_runtime_data_length_as_pointer(builder, data_index);
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_tmemory_static_init(),
+        );
+        let index_type = self.memory(memory).idx_type;
+
+        let mut pos = builder.cursor();
+        let (memory_vmctx, defined_memory_index) =
+            self.memory_vmctx_and_defined_index(&mut pos, memory);
+        let dst = self.cast_index_to_i64(&mut pos, dst, index_type);
+        let len = self.cast_index_to_i64(&mut pos, len, IndexType::I32);
+        let data_len = cast_index_value_to_i64(&mut pos, data_len);
+        pos.ins().call(
+            callee,
+            &[memory_vmctx, defined_memory_index, dst, len, data, data_len],
+        );
+        Ok(())
+    }
+
+    pub fn translate_transaction_tdata_drop(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        seg_index: u32,
+    ) -> WasmResult<()> {
+        let callee = self
+            .builtin_functions
+            .load_builtin(builder.func, BuiltinFunctionIndex::transaction_tdata_drop());
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let data = builder.ins().iconst(I32, i64::from(seg_index));
+        builder.ins().call(callee, &[vmctx, data]);
+        // SHISOFT-TWASM-MOCK: `tdata.drop` is applied immediately through the
+        // ordinary runtime-data length slot. Wizard-style rollback of dropped
+        // data segments belongs with the later ttry/tfail rollback workstream.
+        self.translate_data_drop(builder.cursor(), seg_index)
+    }
+
     pub fn translate_transaction_ttable_size(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -6686,10 +6852,14 @@ impl FuncEnvironment<'_> {
             MemorySegmentOffset::Expr(expr) => self.translate_const_expr(builder, expr)?,
         };
 
-        // Model the initialization here as a `memory.init`.
         let len = self.load_runtime_data_length(builder, data);
-        let start = builder.ins().iconst(I32, 0);
-        self.translate_entity_copy(builder, memory, data, offset, start, len)?;
+        if self.module.transaction_objects.is_tmemory(memory) {
+            self.translate_transaction_tmemory_static_init(builder, memory, offset, data, len)?;
+        } else {
+            // Model the initialization here as a `memory.init`.
+            let start = builder.ins().iconst(I32, 0);
+            self.translate_entity_copy(builder, memory, data, offset, start, len)?;
+        }
 
         // Finalize control-flow for the `MemorySegmentOffset::Static` case
         // above.

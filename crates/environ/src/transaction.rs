@@ -73,6 +73,14 @@ pub enum TransactionOperator {
     TMemorySize,
     /// `tmemory.grow`
     TMemoryGrow,
+    /// `tmemory.init`
+    TMemoryInit,
+    /// `tdata.drop`
+    TDataDrop,
+    /// `tmemory.copy`
+    TMemoryCopy,
+    /// `tmemory.fill`
+    TMemoryFill,
     /// `ttable.get`
     TTableGet,
     /// `ttable.set`
@@ -232,6 +240,10 @@ impl TransactionOperator {
             Self::I64TStore32 => 0x3e,
             Self::TMemorySize => 0x3f,
             Self::TMemoryGrow => 0x40,
+            Self::TMemoryInit => 0x087c,
+            Self::TDataDrop => 0x097c,
+            Self::TMemoryCopy => 0x0a7c,
+            Self::TMemoryFill => 0x0b7c,
             Self::TTableGet => 0x25,
             Self::TTableSet => 0x26,
             Self::TTableInit => 0x0c7c,
@@ -404,7 +416,10 @@ pub fn validate_research_transaction_operator(
         | TransactionOperator::I64TStore16
         | TransactionOperator::I64TStore32
         | TransactionOperator::TMemorySize
-        | TransactionOperator::TMemoryGrow => {
+        | TransactionOperator::TMemoryGrow
+        | TransactionOperator::TMemoryInit
+        | TransactionOperator::TMemoryCopy
+        | TransactionOperator::TMemoryFill => {
             if metadata.tmemory_count == 0 {
                 return Err(WasmError::InvalidWebAssembly {
                     message: "transactional memory operator requires a transactional memory".into(),
@@ -412,6 +427,7 @@ pub fn validate_research_transaction_operator(
                 });
             }
         }
+        TransactionOperator::TDataDrop => {}
         TransactionOperator::TTableGet
         | TransactionOperator::TTableSet
         | TransactionOperator::TTableInit
@@ -595,6 +611,10 @@ pub fn decode_milestone1_transaction_operator(subopcode: u32) -> WasmResult<Tran
         0x3e => TransactionOperator::I64TStore32,
         0x3f => TransactionOperator::TMemorySize,
         0x40 => TransactionOperator::TMemoryGrow,
+        0x087c => TransactionOperator::TMemoryInit,
+        0x097c => TransactionOperator::TDataDrop,
+        0x0a7c => TransactionOperator::TMemoryCopy,
+        0x0b7c => TransactionOperator::TMemoryFill,
         0x0f7c => TransactionOperator::TTableGrow,
         0x107c => TransactionOperator::TTableSize,
         0x117c => TransactionOperator::TTableFill,
@@ -664,6 +684,22 @@ mod tests {
         assert_eq!(
             decode_milestone1_transaction_operator(0x40).unwrap(),
             TransactionOperator::TMemoryGrow
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x087c).unwrap(),
+            TransactionOperator::TMemoryInit
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x097c).unwrap(),
+            TransactionOperator::TDataDrop
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x0a7c).unwrap(),
+            TransactionOperator::TMemoryCopy
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x0b7c).unwrap(),
+            TransactionOperator::TMemoryFill
         );
     }
 

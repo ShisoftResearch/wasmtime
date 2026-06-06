@@ -222,6 +222,39 @@ pub fn translate_operator(
             let result = environ.translate_transaction_tmemory_grow(builder, mem, val)?;
             environ.stacks.push1(result);
         }
+        Operator::TMemoryFill { mem } => {
+            let mem = MemoryIndex::from_u32(*mem);
+            let len = environ.stacks.pop1();
+            let val = environ.stacks.pop1();
+            let dest = environ.stacks.pop1();
+            environ.translate_transaction_tmemory_fill(builder, mem, dest, val, len)?;
+        }
+        Operator::TMemoryCopy { dst_mem, src_mem } => {
+            let dst_mem = MemoryIndex::from_u32(*dst_mem);
+            let src_mem = MemoryIndex::from_u32(*src_mem);
+            let len = environ.stacks.pop1();
+            let src = environ.stacks.pop1();
+            let dest = environ.stacks.pop1();
+            environ
+                .translate_transaction_tmemory_copy(builder, dst_mem, src_mem, dest, src, len)?;
+        }
+        Operator::TMemoryInit { data_index, mem } => {
+            let mem = MemoryIndex::from_u32(*mem);
+            let len = environ.stacks.pop1();
+            let src = environ.stacks.pop1();
+            let dest = environ.stacks.pop1();
+            environ.translate_transaction_tmemory_init(
+                builder,
+                mem,
+                *data_index,
+                dest,
+                src,
+                len,
+            )?;
+        }
+        Operator::TDataDrop { data_index } => {
+            environ.translate_transaction_tdata_drop(builder, *data_index)?;
+        }
         Operator::TTableSize { table: index } => {
             let result =
                 environ.translate_transaction_ttable_size(builder, TableIndex::from_u32(*index))?;

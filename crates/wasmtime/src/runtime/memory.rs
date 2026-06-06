@@ -508,7 +508,24 @@ impl Memory {
     }
 
     pub(crate) fn internal_data_size(&self, store: &StoreOpaque) -> usize {
+        #[cfg(has_virtual_memory)]
+        if let Some(size) = self.internal_tmemory_data_size(store) {
+            return size;
+        }
         store[self.instance].memory(self.index).current_length()
+    }
+
+    #[cfg(has_virtual_memory)]
+    fn internal_tmemory_data_size(&self, store: &StoreOpaque) -> Option<usize> {
+        let instance = &store[self.instance];
+        let module = instance.env_module();
+        let memory_index = module.memory_index(self.index);
+        if !module.transaction_objects.is_tmemory(memory_index) {
+            return None;
+        }
+        instance
+            .get_tmemory(memory_index)
+            .map(crate::runtime::vm::TMemory::byte_len)
     }
 
     /// Returns the size, in units of pages, of this Wasm memory.

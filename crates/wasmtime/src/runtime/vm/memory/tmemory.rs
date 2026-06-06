@@ -1,9 +1,8 @@
-//! Storage-only prototype for Wizard-style transactional memories.
+//! Wizard-style storage for transactional memories.
 //!
-//! SHISOFT-TWASM-MOCK: storage prototype scaffold. This module is intentionally
-//! not wired into instance allocation yet. It establishes the mmap-backed
-//! storage boundary and granule helpers that transactional lowering will need
-//! once parser/runtime support exists.
+//! This module backs per-instance `tmemory` sidecars with the first volatile
+//! block/chunk backend. `FileBackedMemory` and `NVMemory` remain represented in
+//! configuration, but are not implemented yet.
 
 #![allow(dead_code)]
 
