@@ -1,4 +1,4 @@
-use super::{ObjectId, ObjectKind, ObjectPayload, ObjectValue};
+use super::{ObjectId, ObjectKind, ObjectPayload, ObjectRefValue, ObjectValue};
 use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::vm::block_region::{BLOCK_SIZE, LINE_MARKED};
@@ -383,20 +383,14 @@ fn append_object_value_bytes(bytes: &mut Vec<u8>, value: &ObjectValue) -> Result
         ObjectValue::F64(value) => bytes.extend_from_slice(&value.to_le_bytes()),
         ObjectValue::V128(value) => bytes.extend_from_slice(value),
         ObjectValue::Ref(object_id) => {
-            bytes.extend_from_slice(&encode_object_ref(*object_id)?.to_le_bytes());
+            bytes.extend_from_slice(
+                &ObjectRefValue::from_optional_object_id(*object_id)?
+                    .as_raw()
+                    .to_le_bytes(),
+            );
         }
     }
     Ok(())
-}
-
-fn encode_object_ref(object_id: Option<ObjectId>) -> Result<u64> {
-    match object_id {
-        Some(object_id) => object_id
-            .object_index
-            .checked_add(1)
-            .context("object reference encoding overflow"),
-        None => Ok(0),
-    }
 }
 
 fn trace_value_kind(value: &ObjectValue) -> TraceValueKind {

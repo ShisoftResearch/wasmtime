@@ -94,6 +94,11 @@ Implemented runtime paths:
 - Object payload copy-on-write foundation for struct/array payloads, including
   staged transaction payloads, abort discard, commit application, and
   optimistic object read-version validation.
+- Shared transactional object ABI scaffold for future object libcalls:
+  `ObjectId` references use `0` for null and `object_index + 1` for non-null
+  persistent objects, while scalar/ref/v128 object field values use an explicit
+  tag plus two 64-bit payload words. Object heap record serialization now uses
+  the same object-reference encoding.
 - `tfunc` entry/normal-return transaction boundaries.
 - Scalar `tmemory` loads/stores, size/grow, `tmemory.copy/fill/init`, static
   and segmented active `tdata` initialization, imported `tmemory` active data,

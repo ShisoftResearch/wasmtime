@@ -235,6 +235,125 @@ pub(crate) enum ObjectValue {
     Ref(Option<ObjectId>),
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectRefValue(u64);
+
+impl ObjectRefValue {
+    pub(crate) fn from_optional_object_id(object_id: Option<ObjectId>) -> Result<Self> {
+        Ok(match object_id {
+            Some(object_id) => Self(
+                object_id
+                    .object_index
+                    .checked_add(1)
+                    .context("object reference encoding overflow")?,
+            ),
+            None => Self(0),
+        })
+    }
+
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) fn as_raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn decode(self) -> Option<ObjectId> {
+        self.0
+            .checked_sub(1)
+            .map(|object_index| ObjectId { object_index })
+    }
+}
+
+pub(crate) const OBJECT_VALUE_ABI_TAG_I32: u32 = 0;
+pub(crate) const OBJECT_VALUE_ABI_TAG_I64: u32 = 1;
+pub(crate) const OBJECT_VALUE_ABI_TAG_F32: u32 = 2;
+pub(crate) const OBJECT_VALUE_ABI_TAG_F64: u32 = 3;
+pub(crate) const OBJECT_VALUE_ABI_TAG_V128: u32 = 4;
+pub(crate) const OBJECT_VALUE_ABI_TAG_REF: u32 = 5;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectValueAbi {
+    tag: u32,
+    low: u64,
+    high: u64,
+}
+
+impl ObjectValueAbi {
+    pub(crate) fn from_parts(tag: u32, low: u64, high: u64) -> Result<Self> {
+        match tag {
+            OBJECT_VALUE_ABI_TAG_I32 => ensure!(
+                high == 0 && low <= u64::from(u32::MAX),
+                "non-canonical i32 object value ABI payload"
+            ),
+            OBJECT_VALUE_ABI_TAG_I64 => {
+                ensure!(high == 0, "non-canonical i64 object value ABI payload")
+            }
+            OBJECT_VALUE_ABI_TAG_F32 => ensure!(
+                high == 0 && low <= u64::from(u32::MAX),
+                "non-canonical f32 object value ABI payload"
+            ),
+            OBJECT_VALUE_ABI_TAG_F64 => {
+                ensure!(high == 0, "non-canonical f64 object value ABI payload")
+            }
+            OBJECT_VALUE_ABI_TAG_V128 => {}
+            OBJECT_VALUE_ABI_TAG_REF => {
+                ensure!(high == 0, "non-canonical ref object value ABI payload")
+            }
+            _ => bail!("unknown object value ABI tag: {tag}"),
+        }
+        Ok(Self { tag, low, high })
+    }
+
+    pub(crate) fn as_parts(self) -> (u32, u64, u64) {
+        (self.tag, self.low, self.high)
+    }
+
+    pub(crate) fn from_object_value(value: &ObjectValue) -> Result<Self> {
+        match value {
+            ObjectValue::I32(value) => {
+                Self::from_parts(OBJECT_VALUE_ABI_TAG_I32, u64::from(*value as u32), 0)
+            }
+            ObjectValue::I64(value) => Self::from_parts(OBJECT_VALUE_ABI_TAG_I64, *value as u64, 0),
+            ObjectValue::F32(value) => {
+                Self::from_parts(OBJECT_VALUE_ABI_TAG_F32, u64::from(*value), 0)
+            }
+            ObjectValue::F64(value) => Self::from_parts(OBJECT_VALUE_ABI_TAG_F64, *value, 0),
+            ObjectValue::V128(value) => {
+                let low = u64::from_le_bytes(value[0..8].try_into().unwrap());
+                let high = u64::from_le_bytes(value[8..16].try_into().unwrap());
+                Self::from_parts(OBJECT_VALUE_ABI_TAG_V128, low, high)
+            }
+            ObjectValue::Ref(object_id) => Self::from_parts(
+                OBJECT_VALUE_ABI_TAG_REF,
+                ObjectRefValue::from_optional_object_id(*object_id)?.as_raw(),
+                0,
+            ),
+        }
+    }
+
+    pub(crate) fn to_object_value(self) -> Result<ObjectValue> {
+        let Self { tag, low, high } = Self::from_parts(self.tag, self.low, self.high)?;
+        Ok(match tag {
+            OBJECT_VALUE_ABI_TAG_I32 => ObjectValue::I32(low as u32 as i32),
+            OBJECT_VALUE_ABI_TAG_I64 => ObjectValue::I64(low as i64),
+            OBJECT_VALUE_ABI_TAG_F32 => ObjectValue::F32(low as u32),
+            OBJECT_VALUE_ABI_TAG_F64 => ObjectValue::F64(low),
+            OBJECT_VALUE_ABI_TAG_V128 => {
+                let mut bytes = [0; 16];
+                bytes[0..8].copy_from_slice(&low.to_le_bytes());
+                bytes[8..16].copy_from_slice(&high.to_le_bytes());
+                ObjectValue::V128(bytes)
+            }
+            OBJECT_VALUE_ABI_TAG_REF => ObjectValue::Ref(ObjectRefValue::from_raw(low).decode()),
+            _ => unreachable!(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ObjectPayload {
     Struct(Vec<ObjectValue>),
@@ -4190,6 +4309,117 @@ mod tests {
         assert!(!state.owns_granule_write(GranuleId::TArray {
             object_id: array_object,
         }));
+    }
+
+    #[test]
+    fn transaction_object_abi_encodes_null_and_object_ids() {
+        let null = ObjectRefValue::from_optional_object_id(None).unwrap();
+        assert_eq!(null.as_raw(), 0);
+        assert_eq!(ObjectRefValue::from_raw(0).decode(), None);
+
+        let object = ObjectId { object_index: 41 };
+        let encoded = ObjectRefValue::from_optional_object_id(Some(object)).unwrap();
+        assert_eq!(encoded.as_raw(), 42);
+        assert_eq!(encoded.decode(), Some(object));
+
+        let max_encodable_object = ObjectId {
+            object_index: u64::MAX - 1,
+        };
+        let encoded = ObjectRefValue::from_optional_object_id(Some(max_encodable_object)).unwrap();
+        assert_eq!(encoded.as_raw(), u64::MAX);
+        assert_eq!(encoded.decode(), Some(max_encodable_object));
+    }
+
+    #[test]
+    fn transaction_object_abi_rejects_ref_encoding_overflow() {
+        let error = ObjectRefValue::from_optional_object_id(Some(ObjectId {
+            object_index: u64::MAX,
+        }))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("object reference encoding overflow")
+        );
+    }
+
+    #[test]
+    fn transaction_object_abi_layout_is_explicit() {
+        assert_eq!(
+            core::mem::size_of::<ObjectRefValue>(),
+            core::mem::size_of::<u64>()
+        );
+        assert_eq!(
+            core::mem::align_of::<ObjectRefValue>(),
+            core::mem::align_of::<u64>()
+        );
+        assert_eq!(core::mem::size_of::<ObjectValueAbi>(), 24);
+        assert_eq!(
+            core::mem::align_of::<ObjectValueAbi>(),
+            core::mem::align_of::<u64>()
+        );
+    }
+
+    #[test]
+    fn transaction_object_abi_roundtrips_object_values() {
+        let values = [
+            ObjectValue::I32(-17),
+            ObjectValue::I64(-18),
+            ObjectValue::F32(0x7fc0_0001),
+            ObjectValue::F64(0x7ff8_0000_0000_0001),
+            ObjectValue::V128([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            ObjectValue::Ref(None),
+            ObjectValue::Ref(Some(ObjectId { object_index: 8 })),
+        ];
+
+        for value in values {
+            let abi = ObjectValueAbi::from_object_value(&value).unwrap();
+            assert_eq!(abi.to_object_value().unwrap(), value);
+        }
+
+        assert_eq!(
+            ObjectValueAbi::from_object_value(&ObjectValue::Ref(Some(ObjectId {
+                object_index: 8
+            })))
+            .unwrap()
+            .as_parts(),
+            (OBJECT_VALUE_ABI_TAG_REF, 9, 0)
+        );
+        assert_eq!(
+            ObjectValueAbi::from_object_value(&ObjectValue::V128([
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            ]))
+            .unwrap()
+            .as_parts(),
+            (
+                OBJECT_VALUE_ABI_TAG_V128,
+                0x0706_0504_0302_0100,
+                0x0f0e_0d0c_0b0a_0908,
+            )
+        );
+    }
+
+    #[test]
+    fn transaction_object_abi_rejects_unknown_and_noncanonical_values() {
+        let error = ObjectValueAbi::from_parts(99, 0, 0).unwrap_err();
+        assert!(error.to_string().contains("unknown object value ABI tag"));
+
+        let error =
+            ObjectValueAbi::from_parts(OBJECT_VALUE_ABI_TAG_I32, u64::from(u32::MAX) + 1, 0)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("non-canonical i32 object value ABI payload")
+        );
+
+        let error = ObjectValueAbi::from_parts(OBJECT_VALUE_ABI_TAG_REF, 0, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("non-canonical ref object value ABI payload")
+        );
     }
 
     #[test]

@@ -76,6 +76,14 @@ and later semantic waves:
 There are no ignored files outside `simple-transactions` in the current
 proposal harness run.
 
+2026-06-06 object ABI update:
+
+- Added shared runtime encoding for persistent object references: null is `0`,
+  non-null is `object_index + 1`.
+- Added a tagged two-word `ObjectValueAbi` scaffold for future `tstruct` and
+  `tarray` libcalls, including scalar, reference, and `v128` payloads.
+- Unified object heap record serialization with the same object-reference ABI.
+
 ## Ground Rules
 
 - Do not edit proposal WAST test cases.
