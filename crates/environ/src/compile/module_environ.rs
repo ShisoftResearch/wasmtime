@@ -9,8 +9,9 @@ use crate::{
     MemoryIndex, MemoryInitializer, ModuleInternedTypeIndex, ModuleStartup, ModuleTypesBuilder,
     PanicOnOom as _, PassiveElemIndex, PrimaryMap, RuntimeDataIndex, StaticModuleIndex,
     TRANSACTION_OBJECTS_CUSTOM_SECTION, TableIndex, TableInitialValue, TableInitialization, Tag,
-    TagIndex, Tunables, TypeConvert, TypeIndex, WasmHeapTopType, WasmHeapType, WasmResult,
-    WasmValType, WasmparserTypeConverter, decode_transaction_object_metadata,
+    TagIndex, TransactionObjectMetadata, Tunables, TypeConvert, TypeIndex, WasmHeapTopType,
+    WasmHeapType, WasmResult, WasmValType, WasmparserTypeConverter,
+    decode_transaction_object_metadata,
 };
 use alloc::borrow::Cow;
 use cranelift_entity::SecondaryMap;
@@ -36,6 +37,9 @@ pub struct ModuleEnvironment<'a, 'data> {
     // Various bits and pieces of configuration
     validator: &'a mut Validator,
     tunables: &'a Tunables,
+
+    /// Whether each module type index was encoded as a transactional function.
+    transactional_func_types: PrimaryMap<TypeIndex, bool>,
 }
 
 /// The result of translating via `ModuleEnvironment`.
@@ -294,6 +298,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
             types,
             tunables,
             validator,
+            transactional_func_types: PrimaryMap::default(),
         }
     }
 
@@ -401,9 +406,18 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     // index space.
                     let interned = self.types.intern_rec_group(validator_types, rec_group_id)?;
                     let elems = self.types.rec_group_elements(interned);
+                    let validator_elems = validator_types.rec_group_elements(rec_group_id);
                     let len = elems.len();
                     self.result.module.types.reserve(len)?;
-                    for ty in elems {
+                    for (ty, validator_ty) in elems.zip(validator_elems) {
+                        let is_transactional_func = match &validator_types[validator_ty]
+                            .composite_type
+                            .inner
+                        {
+                            wasmparser::CompositeInnerType::Func(func) => func.transaction(),
+                            _ => false,
+                        };
+                        self.transactional_func_types.push(is_transactional_func);
                         self.result.module.types.push(ty.into())?;
                     }
 
@@ -420,23 +434,31 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                 for entry in imports.into_imports() {
                     let import = entry?;
+                    let mut transaction_func = false;
+                    let mut transaction_memory = false;
+                    let mut transaction_global = false;
+                    let mut transaction_table = false;
                     let ty = match import.ty {
                         TypeRef::Func(index) => {
                             let index = TypeIndex::from_u32(index);
                             let interned_index = self.result.module.types[index];
+                            transaction_func = self.is_transactional_func_type(index);
                             self.result.module.num_imported_funcs += 1;
                             self.result.debuginfo.wasm_file.imported_func_count += 1;
                             EntityType::Function(interned_index)
                         }
                         TypeRef::Memory(ty) => {
+                            transaction_memory = ty.transaction;
                             self.result.module.num_imported_memories += 1;
                             EntityType::Memory(ty.into())
                         }
                         TypeRef::Global(ty) => {
+                            transaction_global = ty.transaction;
                             self.result.module.num_imported_globals += 1;
                             EntityType::Global(self.convert_global_type(&ty)?)
                         }
                         TypeRef::Table(ty) => {
+                            transaction_table = ty.transaction;
                             self.result.module.num_imported_tables += 1;
                             EntityType::Table(self.convert_table_type(&ty)?)
                         }
@@ -457,7 +479,22 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                             bail!("custom-descriptors proposal not implemented yet");
                         }
                     };
-                    self.declare_import(import.module, import.name, ty)?;
+                    let index = self.declare_import(import.module, import.name, ty)?;
+                    match index {
+                        EntityIndex::Function(index) if transaction_func => {
+                            self.result.module.transaction_objects.add_tfunc(index);
+                        }
+                        EntityIndex::Memory(index) if transaction_memory => {
+                            self.result.module.transaction_objects.add_tmemory(index);
+                        }
+                        EntityIndex::Global(index) if transaction_global => {
+                            self.result.module.transaction_objects.add_tglobal(index);
+                        }
+                        EntityIndex::Table(index) if transaction_table => {
+                            self.result.module.transaction_objects.add_ttable(index);
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -471,7 +508,10 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     let sigindex = entry?;
                     let ty = TypeIndex::from_u32(sigindex);
                     let interned_index = self.result.module.types[ty];
-                    self.result.module.push_function(interned_index);
+                    let func_index = self.result.module.push_function(interned_index);
+                    if self.is_transactional_func_type(ty) {
+                        self.result.module.transaction_objects.add_tfunc(func_index);
+                    }
                 }
             }
 
@@ -482,9 +522,16 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                 for entry in tables {
                     let wasmparser::Table { ty, init } = entry?;
+                    let is_transactional = ty.transaction;
                     let table = self.convert_table_type(&ty)?;
                     self.result.module.needs_gc_heap |= table.ref_type.is_vmgcref_type();
-                    self.result.module.tables.push(table)?;
+                    let table_index = self.result.module.tables.push(table)?;
+                    if is_transactional {
+                        self.result
+                            .module
+                            .transaction_objects
+                            .add_ttable(table_index);
+                    }
                     let init = match init {
                         wasmparser::TableInit::RefNull => TableInitialValue::Null,
                         wasmparser::TableInit::Expr(expr) => {
@@ -511,7 +558,14 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                 for entry in memories {
                     let memory = entry?;
-                    self.result.module.memories.push(memory.into())?;
+                    let is_transactional = memory.transaction;
+                    let memory_index = self.result.module.memories.push(memory.into())?;
+                    if is_transactional {
+                        self.result
+                            .module
+                            .transaction_objects
+                            .add_tmemory(memory_index);
+                    }
                 }
             }
 
@@ -537,12 +591,19 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                 for entry in globals {
                     let wasmparser::Global { ty, init_expr } = entry?;
+                    let is_transactional = ty.transaction;
                     let (initializer, escaped) = ConstExpr::from_wasmparser(self, init_expr)?;
                     for f in escaped {
                         self.flag_func_escaped(f);
                     }
                     let ty = self.convert_global_type(&ty)?;
                     let index = self.result.module.globals.push(ty)?;
+                    if is_transactional {
+                        self.result
+                            .module
+                            .transaction_objects
+                            .add_tglobal(index);
+                    }
                     let defined_index = self.result.module.defined_global_index(index).unwrap();
                     match initializer.const_eval() {
                         Some(val) => {
@@ -813,8 +874,8 @@ and for re-adding support for interface types you can see this issue:
 
     fn register_custom_section(&mut self, section: &CustomSectionReader<'data>) -> Result<()> {
         if section.name() == TRANSACTION_OBJECTS_CUSTOM_SECTION {
-            self.result.module.transaction_objects =
-                decode_transaction_object_metadata(section.data())?;
+            let metadata = decode_transaction_object_metadata(section.data())?;
+            self.merge_transaction_object_metadata(metadata);
             return Ok(());
         }
 
@@ -853,6 +914,28 @@ and for re-adding support for interface types you can see this issue:
             }
         }
         Ok(())
+    }
+
+    fn is_transactional_func_type(&self, ty: TypeIndex) -> bool {
+        self.transactional_func_types
+            .get(ty)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn merge_transaction_object_metadata(&mut self, metadata: TransactionObjectMetadata) {
+        for memory in metadata.memories {
+            self.result.module.transaction_objects.add_tmemory(memory);
+        }
+        for global in metadata.globals {
+            self.result.module.transaction_objects.add_tglobal(global);
+        }
+        for function in metadata.functions {
+            self.result.module.transaction_objects.add_tfunc(function);
+        }
+        for table in metadata.tables {
+            self.result.module.transaction_objects.add_ttable(table);
+        }
     }
 
     fn dwarf_section(&mut self, name: &str, section: &CustomSectionReader<'data>) {
@@ -923,14 +1006,14 @@ and for re-adding support for interface types you can see this issue:
         module: &'data str,
         field: &'data str,
         ty: EntityType,
-    ) -> Result<(), OutOfMemory> {
+    ) -> Result<EntityIndex, OutOfMemory> {
         let index = self.push_type(ty);
         self.result.module.initializers.push(Initializer::Import {
             name: self.result.module.strings.insert(module)?,
             field: self.result.module.strings.insert(field)?,
             index,
         })?;
-        Ok(())
+        Ok(index)
     }
 
     fn push_type(&mut self, ty: EntityType) -> EntityIndex {
@@ -1602,6 +1685,55 @@ mod tests {
                 .module
                 .transaction_objects
                 .is_tfunc(FuncIndex::from_u32(0))
+        );
+    }
+
+    #[test]
+    fn translation_records_transactional_binary_metadata() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x01, 0x05, 0x01, 0xe0, 0x7d, 0x00, 0x00, // tfunc type
+            0x03, 0x02, 0x01, 0x00, // one function with type 0
+            0x04, 0x06, 0x01, 0xf0, 0x7d, 0x00, 0x00, 0x00, // one ttable
+            0x05, 0x03, 0x01, 0x40, 0x00, // one tmemory
+            0x06, 0x06, 0x01, 0x7f, 0x40, 0x41, 0x00, 0x0b, // one tglobal
+            0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // empty function body
+        ];
+        let tunables = Tunables::default_u32();
+        let mut validator = Validator::new();
+        let mut types = ModuleTypesBuilder::new(&validator);
+        let translation = ModuleEnvironment::new(
+            &tunables,
+            &mut validator,
+            &mut types,
+            StaticModuleIndex::from_u32(0),
+        )
+        .translate(Parser::new(0), &wasm)
+        .unwrap();
+
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_tfunc(FuncIndex::from_u32(0))
+        );
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_ttable(TableIndex::from_u32(0))
+        );
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_tmemory(MemoryIndex::from_u32(0))
+        );
+        assert!(
+            translation
+                .module
+                .transaction_objects
+                .is_tglobal(GlobalIndex::from_u32(0))
         );
     }
 }

@@ -162,6 +162,13 @@ pub struct TransactionObjectMetadata {
 }
 
 impl TransactionObjectMetadata {
+    /// Records `index` as a transactional memory.
+    pub fn add_tmemory(&mut self, index: MemoryIndex) {
+        if !self.memories.contains(&index) {
+            self.memories.push(index);
+        }
+    }
+
     /// Records `index` as transactional.
     pub fn add_tfunc(&mut self, index: FuncIndex) {
         if !self.functions.contains(&index) {
@@ -182,6 +189,13 @@ impl TransactionObjectMetadata {
     /// Returns whether `memory` was declared as transactional.
     pub fn is_tmemory(&self, memory: MemoryIndex) -> bool {
         self.memories.contains(&memory)
+    }
+
+    /// Records `index` as a transactional global.
+    pub fn add_tglobal(&mut self, index: GlobalIndex) {
+        if !self.globals.contains(&index) {
+            self.globals.push(index);
+        }
     }
 
     /// Returns whether `global` was declared as transactional.
