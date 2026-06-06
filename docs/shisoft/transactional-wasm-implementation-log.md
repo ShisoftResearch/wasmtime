@@ -3,6 +3,26 @@
 This log records execution state for the Wizard-first transactional Wasmtime
 research branch.
 
+## Current Roadmap
+
+Date: 2026-06-06
+
+Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
+work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
+or object-model sequencing have drifted.
+
+## Persistent Object GC Decision
+
+Date: 2026-06-06
+
+Persistent-object GC is a future workstream, but the object heap/table work
+must be persistent-GC-ready immediately. Current implementation waves should
+produce `ObjectId`-addressed records with explicit headers, traceable payload
+layouts, and committed refs stored as `ObjectId`s. The branch may reuse
+Wasmtime GC type/layout/cast/validation code, but must not reuse `GcHeap`,
+`VMGcRef`, Wasmtime GC roots, or Wasmtime GC barriers as persistent object
+identity or storage.
+
 ## Mock Registry and Tagging
 
 Date: 2026-06-04
