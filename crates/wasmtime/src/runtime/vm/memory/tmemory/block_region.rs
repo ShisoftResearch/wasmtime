@@ -5,18 +5,18 @@
 use crate::prelude::*;
 use core::{mem::size_of, ops::Range};
 
-pub(super) const BLOCK_SIZE: usize = 512 * 1024;
-pub(super) const IMMIX_LINE_SIZE: usize = 256;
+pub(crate) const BLOCK_SIZE: usize = 512 * 1024;
+pub(crate) const IMMIX_LINE_SIZE: usize = 256;
 
-pub(super) const PW_REGION_HEADER_SIZE: usize = size_of::<PWRegionHeader>();
-pub(super) const META_DATA_DESC_SIZE: usize = size_of::<MetaDataDesc>();
-pub(super) const BLOCK_ENTRY_SIZE: usize = size_of::<BlockEntry>();
-pub(super) const CHUNK_HEADER_SIZE: usize = size_of::<ChunkHeader>();
-pub(super) const LINE_MARK_SIZE: usize = size_of::<LineMark>();
+pub(crate) const PW_REGION_HEADER_SIZE: usize = size_of::<PWRegionHeader>();
+pub(crate) const META_DATA_DESC_SIZE: usize = size_of::<MetaDataDesc>();
+pub(crate) const BLOCK_ENTRY_SIZE: usize = size_of::<BlockEntry>();
+pub(crate) const CHUNK_HEADER_SIZE: usize = size_of::<ChunkHeader>();
+pub(crate) const LINE_MARK_SIZE: usize = size_of::<LineMark>();
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct PWRegionHeader {
+pub(crate) struct PWRegionHeader {
     pub block_table: u64,
     pub sentinels: u64,
     pub num_blocks: u64,
@@ -28,7 +28,7 @@ pub(super) struct PWRegionHeader {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct MetaDataDesc {
+pub(crate) struct MetaDataDesc {
     pub kind: u64,
     pub fixed_bytes: u32,
     pub unit_size: u32,
@@ -39,7 +39,7 @@ pub(super) struct MetaDataDesc {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct BlockEntry {
+pub(crate) struct BlockEntry {
     pub list_num: i16,
     pub used: u8,
     padding: [u8; 5],
@@ -51,7 +51,7 @@ pub(super) struct BlockEntry {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ChunkHeader {
+pub(crate) struct ChunkHeader {
     pub offset: u64,
     pub limit: u64,
     pub chunk_limit: u64,
@@ -60,7 +60,7 @@ pub(super) struct ChunkHeader {
 
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ListKind {
+pub(crate) enum ListKind {
     Metadata = -1,
     None = -2,
     Used = -3,
@@ -68,24 +68,24 @@ pub(super) enum ListKind {
     LargeFree = 1,
 }
 
-pub(super) struct BlockLists;
+pub(crate) struct BlockLists;
 
 impl BlockLists {
-    pub(super) const MAX_LISTS: usize = 8;
+    pub(crate) const MAX_LISTS: usize = 8;
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct LineMark {
+pub(crate) struct LineMark {
     pub mark: u8,
 }
 
-pub(super) const IMMIX_LINE_MARK_META_KIND: u64 = 0x0000_0001_0000_0000;
-pub(super) const IMMIX_LINE_MARK_RESET_VALUE: u8 = 0;
-pub(super) const LINE_FREE: u8 = 0;
-pub(super) const LINE_MARKED: u8 = 1;
+pub(crate) const IMMIX_LINE_MARK_META_KIND: u64 = 0x0000_0001_0000_0000;
+pub(crate) const IMMIX_LINE_MARK_RESET_VALUE: u8 = 0;
+pub(crate) const LINE_FREE: u8 = 0;
+pub(crate) const LINE_MARKED: u8 = 1;
 
-pub(super) trait BlockRegionBackend {
+pub(crate) trait BlockRegionBackend {
     fn block_size(&self) -> usize;
     fn num_blocks(&self) -> usize;
     fn bytes_len(&self) -> usize;
@@ -97,38 +97,38 @@ pub(super) trait BlockRegionBackend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct RegionChunk {
+pub(crate) struct RegionChunk {
     start_block: usize,
     block_count: usize,
 }
 
 impl RegionChunk {
-    pub(super) fn start_block(&self) -> usize {
+    pub(crate) fn start_block(&self) -> usize {
         self.start_block
     }
 
-    pub(super) fn block_count(&self) -> usize {
+    pub(crate) fn block_count(&self) -> usize {
         self.block_count
     }
 
-    pub(super) fn byte_range(&self) -> Range<usize> {
+    pub(crate) fn byte_range(&self) -> Range<usize> {
         let start = self.start_block * BLOCK_SIZE;
         start..start + self.block_count * BLOCK_SIZE
     }
 
-    pub(super) fn byte_len(&self) -> usize {
+    pub(crate) fn byte_len(&self) -> usize {
         self.block_count * BLOCK_SIZE
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct ChunkList {
+pub(crate) struct ChunkList {
     chunks: Vec<RegionChunk>,
     logical_len: usize,
 }
 
 impl ChunkList {
-    pub(super) fn from_chunks(chunks: Vec<RegionChunk>) -> Result<Self> {
+    pub(crate) fn from_chunks(chunks: Vec<RegionChunk>) -> Result<Self> {
         let mut logical_len = 0usize;
         for chunk in &chunks {
             ensure!(
@@ -145,24 +145,24 @@ impl ChunkList {
         })
     }
 
-    pub(super) fn chunks(&self) -> &[RegionChunk] {
+    pub(crate) fn chunks(&self) -> &[RegionChunk] {
         &self.chunks
     }
 
-    pub(super) fn logical_len(&self) -> usize {
+    pub(crate) fn logical_len(&self) -> usize {
         self.logical_len
     }
 }
 
 #[derive(Debug)]
-pub(super) struct VMemoryBlockRegion {
+pub(crate) struct VMemoryBlockRegion {
     data: Vec<u8>,
     block_entries: Vec<BlockEntry>,
     line_marks: Vec<LineMark>,
 }
 
 impl VMemoryBlockRegion {
-    pub(super) fn new(num_blocks: usize) -> Result<Self> {
+    pub(crate) fn new(num_blocks: usize) -> Result<Self> {
         let bytes_len = num_blocks
             .checked_mul(BLOCK_SIZE)
             .context("transactional block region size overflow")?;
@@ -179,27 +179,27 @@ impl VMemoryBlockRegion {
         })
     }
 
-    pub(super) fn block_size(&self) -> usize {
+    pub(crate) fn block_size(&self) -> usize {
         BLOCK_SIZE
     }
 
-    pub(super) fn num_blocks(&self) -> usize {
+    pub(crate) fn num_blocks(&self) -> usize {
         self.block_entries.len()
     }
 
-    pub(super) fn bytes_len(&self) -> usize {
+    pub(crate) fn bytes_len(&self) -> usize {
         self.data.len()
     }
 
-    pub(super) fn lines_per_block(&self) -> usize {
+    pub(crate) fn lines_per_block(&self) -> usize {
         BLOCK_SIZE / IMMIX_LINE_SIZE
     }
 
-    pub(super) fn line_count(&self) -> usize {
+    pub(crate) fn line_count(&self) -> usize {
         self.line_marks.len()
     }
 
-    pub(super) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+    pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
         ensure!(block_count > 0, "transactional chunk must contain a block");
         ensure!(
             block_count <= self.num_blocks(),
@@ -227,14 +227,14 @@ impl VMemoryBlockRegion {
         bail!("transactional block region is out of contiguous chunks")
     }
 
-    pub(super) fn line_mark(&self, line_index: usize) -> Result<u8> {
+    pub(crate) fn line_mark(&self, line_index: usize) -> Result<u8> {
         self.line_marks
             .get(line_index)
             .map(|mark| mark.mark)
             .context("transactional line mark index out of bounds")
     }
 
-    pub(super) fn mark_line(&mut self, line_index: usize) -> Result<()> {
+    pub(crate) fn mark_line(&mut self, line_index: usize) -> Result<()> {
         let line = self
             .line_marks
             .get_mut(line_index)
@@ -243,7 +243,7 @@ impl VMemoryBlockRegion {
         Ok(())
     }
 
-    pub(super) fn reset_line_marks(&mut self, chunk: RegionChunk) -> Result<()> {
+    pub(crate) fn reset_line_marks(&mut self, chunk: RegionChunk) -> Result<()> {
         let start = chunk
             .start_block
             .checked_mul(self.lines_per_block())
@@ -265,7 +265,7 @@ impl VMemoryBlockRegion {
         Ok(())
     }
 
-    pub(super) fn flush(&self, offset: usize, len: usize) -> Result<()> {
+    pub(crate) fn flush(&self, offset: usize, len: usize) -> Result<()> {
         let end = offset
             .checked_add(len)
             .context("transactional block flush range overflow")?;
@@ -276,11 +276,11 @@ impl VMemoryBlockRegion {
         Ok(())
     }
 
-    pub(super) fn fence(&self) -> Result<()> {
+    pub(crate) fn fence(&self) -> Result<()> {
         Ok(())
     }
 
-    pub(super) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+    pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         let end = offset
             .checked_add(len)
             .context("transactional block read range overflow")?;
@@ -291,7 +291,7 @@ impl VMemoryBlockRegion {
         Ok(self.data[offset..end].to_vec())
     }
 
-    pub(super) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
         let end = offset
             .checked_add(bytes.len())
             .context("transactional block write range overflow")?;

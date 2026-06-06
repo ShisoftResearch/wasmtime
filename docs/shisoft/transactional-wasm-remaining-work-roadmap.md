@@ -177,7 +177,7 @@ records traceable without redesign.
 - Modify: `crates/wasmtime/src/runtime/mod.rs`
 - Modify: `docs/shisoft/transactional-wasm-implementation-log.md`
 
-- [ ] **Step 1: Add object-record header tests**
+- [x] **Step 1: Add object-record header tests**
 
 Add tests under `crates/wasmtime/src/runtime/transaction.rs` or the new
 `object_heap.rs` test module for:
@@ -199,7 +199,7 @@ cargo test -p wasmtime --lib object_table_publish -- --format terse
 
 Expected: tests fail before the object-record layer exists.
 
-- [ ] **Step 2: Implement volatile object records**
+- [x] **Step 2: Implement volatile object records**
 
 Add a volatile object heap layer with these responsibilities:
 
@@ -211,7 +211,7 @@ Add a volatile object heap layer with these responsibilities:
 - store enough layout metadata to later trace embedded `ObjectId` references
 - avoid depending on `GcHeap` storage, `VMGcRef` identity, or Wasmtime GC roots
 
-- [ ] **Step 3: Move committed payloads behind record publication**
+- [x] **Step 3: Move committed payloads behind record publication**
 
 Change `ObjectTableSlot` from owning `ObjectPayload` directly to owning current
 record metadata. Keep the existing public helpers:
@@ -223,7 +223,7 @@ record metadata. Keep the existing public helpers:
 - `granule_id`
 - `version`
 
-- [ ] **Step 4: Add trace-descriptor helpers**
+- [x] **Step 4: Add trace-descriptor helpers**
 
 Add helpers that identify reference-bearing payload slots without tracing them
 yet:
@@ -239,7 +239,7 @@ storing an untraceable committed payload.
 Expected behavior stays the same for current unit tests, but the storage shape
 now matches the persistent design and can support a later `ObjectId` collector.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run:
 

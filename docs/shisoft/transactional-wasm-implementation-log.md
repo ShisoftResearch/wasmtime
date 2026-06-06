@@ -592,6 +592,61 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Remaining Roadmap Wave 1: Object Record Heap
+
+Date: 2026-06-06
+
+Added the first volatile, persistent-GC-ready object record heap shape:
+
+- `ObjectTableSlot` now publishes a current `TxRecordHandle` instead of owning
+  committed `ObjectPayload` directly. `ObjectId` stays stable while record
+  handles change on payload update.
+- `TxObjectHeader` stores record length, object id, object kind, flags, and type
+  index. `TxArrayHeader` embeds the object header and stores array length.
+- `ObjectHeap` serializes each record into the shared Wizard-style
+  `VMemoryBlockRegion` substrate, using 512 KiB blocks and 256-byte Immix
+  lines, and marks the lines covered by each allocation.
+- Typed `ObjectPayload` is still retained beside the serialized record as the
+  current runtime semantic view.
+- Trace descriptor helpers identify scalar fields, reference fields, scalar
+  arrays, reference-bearing arrays, and embedded `ObjectId` edges from the
+  current published record.
+- The tmemory block/chunk backend is now crate-visible so object heap storage
+  can share the same block-region substrate instead of inventing a separate
+  allocator family.
+
+Still deferred:
+
+- `ObjectTable` allocates records with default `flags = 0` and `type_index = 0`
+  until proposal object type/layout metadata is wired through lowering.
+- The object heap is volatile and append-only. Obsolete record reclamation,
+  durable recovery, and persistent GC remain later workstreams.
+- Object-model WAST execution is not enabled by this wave; structs, arrays,
+  casts, transactional refs, and promotion semantics remain in the following
+  roadmap slices.
+
+Verification:
+
+```text
+cargo fmt --check --package wasmtime
+exit 0
+
+cargo test -p wasmtime --lib transaction_object -- --format terse
+test result: ok. 7 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 92 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib vmemory_block_region -- --format terse
+test result: ok. 3 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile
+
+git diff --check -- crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/transaction/object_heap.rs crates/wasmtime/src/runtime/vm.rs crates/wasmtime/src/runtime/vm/memory/tmemory.rs crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs
+exit 0
+```
+
 ## Real Parser/Runtime WAST Expansion
 
 Date: 2026-06-06

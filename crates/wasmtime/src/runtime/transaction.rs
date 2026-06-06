@@ -7,6 +7,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::ops::Range;
 
+#[path = "transaction/object_heap.rs"]
+mod object_heap;
+
 // Milestone runtime core for proposal WAST progress. The current runtime uses
 // store-local transaction state, `VMemory`-only transactional memory storage,
 // and real `tmemory` sidecars. Remaining `SHISOFT-TWASM-MOCK` tags in this
@@ -193,6 +196,7 @@ pub(crate) struct ObjectId {
     pub(crate) object_index: u64,
 }
 
+#[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObjectKind {
     Struct,
@@ -247,7 +251,8 @@ impl ObjectPayload {
 struct ObjectTableSlot {
     kind: ObjectKind,
     version: u64,
-    payload: ObjectPayload,
+    type_index: u32,
+    current_record: object_heap::TxRecordHandle,
 }
 
 #[derive(Debug, Default)]
@@ -256,6 +261,7 @@ pub(crate) struct ObjectTable {
     free_list: Vec<ObjectId>,
     next_version: u64,
     live_count: usize,
+    heap: object_heap::ObjectHeap,
 }
 
 impl ObjectTable {
@@ -272,7 +278,8 @@ impl ObjectTable {
     }
 
     pub(crate) fn allocate_payload(&mut self, payload: ObjectPayload) -> Result<ObjectId> {
-        let object_id = match self.free_list.pop() {
+        let reused_slot = self.free_list.last().copied();
+        let object_id = match reused_slot {
             Some(object_id) => object_id,
             None => ObjectId {
                 object_index: u64::try_from(self.slots.len())
@@ -291,12 +298,17 @@ impl ObjectTable {
             self.slots[index].is_none(),
             "object table freelist entry points at a live slot"
         );
-        let version = self.bump_object_version()?;
         let kind = payload.kind();
+        let record = self.heap.allocate_record(object_id, kind, 0, 0, &payload)?;
+        let version = self.bump_object_version()?;
+        if reused_slot.is_some() {
+            let _ = self.free_list.pop();
+        }
         self.slots[index] = Some(ObjectTableSlot {
             kind,
             version,
-            payload,
+            type_index: 0,
+            current_record: record,
         });
         self.live_count = self
             .live_count
@@ -322,7 +334,13 @@ impl ObjectTable {
     }
 
     pub(crate) fn payload(&self, object_id: ObjectId) -> Result<ObjectPayload> {
-        Ok(self.live_slot(object_id)?.payload.clone())
+        let slot = self.live_slot(object_id)?;
+        Ok(self.heap.payload(slot.current_record)?.clone())
+    }
+
+    pub(crate) fn trace_object_ids(&self, object_id: ObjectId) -> Result<Vec<ObjectId>> {
+        let slot = self.live_slot(object_id)?;
+        self.heap.trace_object_ids(slot.current_record)
     }
 
     pub(crate) fn update_payload(
@@ -336,11 +354,16 @@ impl ObjectTable {
             kind == payload.kind(),
             "object payload kind does not match object table slot kind"
         );
+        let type_index = self.live_slot(object_id)?.type_index;
+        let record = self
+            .heap
+            .allocate_record(object_id, kind, 0, type_index, &payload)?;
         let version = self.bump_object_version()?;
         self.slots[index] = Some(ObjectTableSlot {
             kind,
             version,
-            payload,
+            type_index,
+            current_record: record,
         });
         Ok(())
     }
@@ -387,6 +410,14 @@ impl ObjectTable {
             .checked_add(1)
             .context("object table version overflow")?;
         Ok(self.next_version)
+    }
+
+    #[cfg(test)]
+    fn current_record_handle_for_test(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<object_heap::TxRecordHandle> {
+        Ok(self.live_slot(object_id)?.current_record)
     }
 }
 
@@ -4072,6 +4103,234 @@ mod tests {
             error
                 .to_string()
                 .contains("optimistic read version changed")
+        );
+    }
+
+    #[test]
+    fn transaction_object_header_records_object_metadata() {
+        let mut heap = object_heap::ObjectHeap::default();
+        let object_id = ObjectId { object_index: 17 };
+        let payload = ObjectPayload::Struct(vec![
+            ObjectValue::I32(11),
+            ObjectValue::Ref(Some(ObjectId { object_index: 3 })),
+        ]);
+
+        let handle = heap
+            .allocate_record(object_id, ObjectKind::Struct, 0x23, 41, &payload)
+            .unwrap();
+        let header = heap.header(handle).unwrap();
+
+        assert_eq!(header.object_id, object_id.object_index);
+        assert_eq!(header.kind, ObjectKind::Struct as u16);
+        assert_eq!(header.flags, 0x23);
+        assert_eq!(header.type_index, 41);
+        assert_eq!(header.record_len, heap.record_len(handle).unwrap());
+    }
+
+    #[test]
+    fn transaction_object_array_header_records_length() {
+        let mut heap = object_heap::ObjectHeap::default();
+        let object_id = ObjectId { object_index: 9 };
+        let payload = ObjectPayload::Array(vec![
+            ObjectValue::I64(1),
+            ObjectValue::Ref(Some(ObjectId { object_index: 4 })),
+            ObjectValue::Ref(None),
+        ]);
+
+        let handle = heap
+            .allocate_record(object_id, ObjectKind::Array, 0, 7, &payload)
+            .unwrap();
+        let header = heap.array_header(handle).unwrap();
+
+        assert_eq!(header.base.object_id, object_id.object_index);
+        assert_eq!(header.base.kind, ObjectKind::Array as u16);
+        assert_eq!(header.base.type_index, 7);
+        assert_eq!(header.length, 3);
+        assert_eq!(header.base.record_len, heap.record_len(handle).unwrap());
+    }
+
+    #[test]
+    fn transaction_object_heap_writes_records_to_block_region() {
+        let mut heap = object_heap::ObjectHeap::default();
+        let payload = ObjectPayload::Struct(vec![ObjectValue::I32(0x1122_3344)]);
+
+        let handle = heap
+            .allocate_record(
+                ObjectId { object_index: 17 },
+                ObjectKind::Struct,
+                0x23,
+                41,
+                &payload,
+            )
+            .unwrap();
+
+        let bytes = heap.record_bytes_for_test(handle).unwrap();
+        let payload_offset = core::mem::size_of::<object_heap::TxObjectHeader>();
+        assert_eq!(heap.record_offset_for_test(handle).unwrap(), 0);
+        assert_eq!(
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            heap.record_len(handle).unwrap()
+        );
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 17);
+        assert_eq!(
+            u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+            ObjectKind::Struct as u16
+        );
+        assert_eq!(u16::from_le_bytes(bytes[18..20].try_into().unwrap()), 0x23);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 41);
+        assert_eq!(
+            i32::from_le_bytes(
+                bytes[payload_offset..payload_offset + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x1122_3344
+        );
+    }
+
+    #[test]
+    fn transaction_object_heap_marks_allocated_lines() {
+        let mut heap = object_heap::ObjectHeap::default();
+        let handle = heap
+            .allocate_record(
+                ObjectId { object_index: 3 },
+                ObjectKind::Struct,
+                0,
+                0,
+                &ObjectPayload::Struct(vec![ObjectValue::I64(9)]),
+            )
+            .unwrap();
+
+        assert_eq!(heap.block_region_block_size_for_test(), 512 * 1024);
+        assert_eq!(heap.immix_line_size_for_test(), 256);
+        assert!(heap.line_mark_for_record_for_test(handle).unwrap());
+    }
+
+    #[test]
+    fn transaction_object_id_stays_stable_when_record_handle_changes() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+            .unwrap();
+
+        let first_handle = objects.current_record_handle_for_test(object).unwrap();
+        let first_version = objects.version(object).unwrap();
+
+        objects
+            .update_payload(
+                object,
+                ObjectPayload::Struct(vec![
+                    ObjectValue::I32(2),
+                    ObjectValue::Ref(Some(ObjectId { object_index: 99 })),
+                ]),
+            )
+            .unwrap();
+
+        let second_handle = objects.current_record_handle_for_test(object).unwrap();
+        let second_version = objects.version(object).unwrap();
+
+        assert_eq!(object, ObjectId { object_index: 0 });
+        assert_ne!(first_handle, second_handle);
+        assert!(second_version > first_version);
+    }
+
+    #[test]
+    fn transaction_object_scanner_returns_embedded_refs_from_struct_and_array_payloads() {
+        let mut struct_heap = object_heap::ObjectHeap::default();
+        let struct_handle = struct_heap
+            .allocate_record(
+                ObjectId { object_index: 1 },
+                ObjectKind::Struct,
+                0,
+                3,
+                &ObjectPayload::Struct(vec![
+                    ObjectValue::I32(7),
+                    ObjectValue::Ref(Some(ObjectId { object_index: 11 })),
+                    ObjectValue::Ref(None),
+                    ObjectValue::V128([0; 16]),
+                    ObjectValue::Ref(Some(ObjectId { object_index: 12 })),
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            struct_heap.trace_object_ids(struct_handle).unwrap(),
+            vec![ObjectId { object_index: 11 }, ObjectId { object_index: 12 }]
+        );
+
+        let mut array_heap = object_heap::ObjectHeap::default();
+        let array_handle = array_heap
+            .allocate_record(
+                ObjectId { object_index: 2 },
+                ObjectKind::Array,
+                0,
+                4,
+                &ObjectPayload::Array(vec![
+                    ObjectValue::Ref(None),
+                    ObjectValue::Ref(Some(ObjectId { object_index: 21 })),
+                    ObjectValue::I64(4),
+                    ObjectValue::Ref(Some(ObjectId { object_index: 22 })),
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            array_heap.trace_object_ids(array_handle).unwrap(),
+            vec![ObjectId { object_index: 21 }, ObjectId { object_index: 22 }]
+        );
+    }
+
+    #[test]
+    fn transaction_object_trace_descriptor_distinguishes_scalar_arrays() {
+        let mut heap = object_heap::ObjectHeap::default();
+        let handle = heap
+            .allocate_record(
+                ObjectId { object_index: 3 },
+                ObjectKind::Array,
+                0,
+                8,
+                &ObjectPayload::Array(vec![ObjectValue::I32(1), ObjectValue::I32(2)]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            heap.trace_descriptor(handle).unwrap(),
+            object_heap::TraceDescriptor::Array(object_heap::TraceArrayDescriptor {
+                element_kind: object_heap::TraceValueKind::Scalar,
+                length: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn object_table_reports_embedded_refs_from_current_record() {
+        let mut objects = ObjectTable::default();
+        let first = ObjectId { object_index: 8 };
+        let second = ObjectId { object_index: 9 };
+        let object = objects
+            .allocate_struct(vec![
+                ObjectValue::I32(1),
+                ObjectValue::Ref(Some(first)),
+                ObjectValue::Ref(None),
+            ])
+            .unwrap();
+
+        assert_eq!(objects.trace_object_ids(object).unwrap(), vec![first]);
+
+        objects
+            .update_payload(
+                object,
+                ObjectPayload::Struct(vec![
+                    ObjectValue::Ref(Some(second)),
+                    ObjectValue::I64(3),
+                    ObjectValue::Ref(Some(first)),
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            objects.trace_object_ids(object).unwrap(),
+            vec![second, first]
         );
     }
 

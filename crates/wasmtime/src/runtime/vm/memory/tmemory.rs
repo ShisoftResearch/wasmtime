@@ -10,7 +10,7 @@ use crate::prelude::*;
 use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
 use wasmtime_environ::MemoryIndex;
 
-mod block_region;
+pub(crate) mod block_region;
 mod linear_region;
 
 use self::linear_region::TMemoryRegion;
