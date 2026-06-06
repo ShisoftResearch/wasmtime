@@ -82,7 +82,7 @@ use crate::error::OutOfMemory;
 use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
-use crate::runtime::transaction::TransactionState;
+use crate::runtime::transaction::{ObjectTable, TransactionState};
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
 #[cfg(feature = "stack-switching")]
@@ -478,6 +478,8 @@ pub struct StoreOpaque {
     host_globals: TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
     #[allow(dead_code)]
     transaction_state: TransactionState,
+    #[allow(dead_code)]
+    transaction_object_table: ObjectTable,
     // GC-related fields.
     gc_store: Option<GcStore>,
     gc_roots: RootSet,
@@ -767,6 +769,7 @@ impl<T> Store<T> {
             func_refs: FuncRefs::default(),
             host_globals: TryPrimaryMap::new(),
             transaction_state: TransactionState::default(),
+            transaction_object_table: ObjectTable::default(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
             memory_count: 0,
@@ -858,6 +861,23 @@ impl<T> Store<T> {
     #[allow(dead_code)]
     pub(crate) fn transaction_state_mut(&mut self) -> &mut TransactionState {
         self.inner.transaction_state_mut()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_object_table(&self) -> &ObjectTable {
+        self.inner.transaction_object_table()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_object_table_mut(&mut self) -> &mut ObjectTable {
+        self.inner.transaction_object_table_mut()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_state_and_object_table_mut(
+        &mut self,
+    ) -> (&mut TransactionState, &mut ObjectTable) {
+        self.inner.transaction_state_and_object_table_mut()
     }
 
     /// Access the underlying `T` data owned by this `Store`.
@@ -1596,6 +1616,26 @@ impl StoreOpaque {
     #[allow(dead_code)]
     pub(crate) fn transaction_state_mut(&mut self) -> &mut TransactionState {
         &mut self.transaction_state
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_object_table(&self) -> &ObjectTable {
+        &self.transaction_object_table
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_object_table_mut(&mut self) -> &mut ObjectTable {
+        &mut self.transaction_object_table
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_state_and_object_table_mut(
+        &mut self,
+    ) -> (&mut TransactionState, &mut ObjectTable) {
+        (
+            &mut self.transaction_state,
+            &mut self.transaction_object_table,
+        )
     }
 
     #[cfg(feature = "debug")]
@@ -2759,6 +2799,56 @@ mod tests {
         assert_eq!(store.transaction_state().active_transaction(), None);
         store.transaction_state_mut().begin().unwrap();
         assert!(store.transaction_state().active_transaction().is_some());
+    }
+
+    #[test]
+    fn new_store_has_empty_transaction_object_table() {
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        assert_eq!(store.transaction_object_table().live_count(), 0);
+
+        let object = store
+            .transaction_object_table_mut()
+            .allocate(crate::runtime::transaction::ObjectKind::Struct)
+            .unwrap();
+
+        assert_eq!(store.transaction_object_table().live_count(), 1);
+        assert_eq!(
+            store.transaction_object_table().kind(object).unwrap(),
+            crate::runtime::transaction::ObjectKind::Struct
+        );
+    }
+
+    #[test]
+    fn store_exposes_split_transaction_state_and_object_table_mut() {
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        let object = store
+            .transaction_object_table_mut()
+            .allocate_struct(vec![crate::runtime::transaction::ObjectValue::I32(1)])
+            .unwrap();
+
+        let (state, objects) = store.transaction_state_and_object_table_mut();
+        state.begin().unwrap();
+        state
+            .stage_struct_field(
+                objects,
+                object,
+                0,
+                crate::runtime::transaction::ObjectValue::I32(2),
+            )
+            .unwrap();
+        assert!(state.commit_object_payloads(objects).unwrap());
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            store.transaction_object_table().payload(object).unwrap(),
+            crate::runtime::transaction::ObjectPayload::Struct(vec![
+                crate::runtime::transaction::ObjectValue::I32(2),
+            ])
+        );
     }
 
     #[test]

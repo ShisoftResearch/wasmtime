@@ -382,7 +382,7 @@ object COW rather than the normalization adapter.
 - Modify: `/home/shisoft/Code/Research/wasm-tools-transaction/crates/wasmparser/src/readers/core/operators.rs`
 - Modify: `crates/test-util/src/wast.rs`
 
-- [ ] **Step 1: Add object COW unit tests**
+- [x] **Step 1: Add object COW unit tests**
 
 Add unit tests for:
 
@@ -403,7 +403,15 @@ Run:
 cargo test -p wasmtime --lib transaction_object -- --format terse
 ```
 
-Expected: tests fail until libcalls and lowering are wired.
+Status: complete for the runtime core foundation. The current test run covers
+store-owned `ObjectTable`, struct field staged-before-committed reads, staged
+struct abort, array len/get/set/fill/copy COW, immediate `ti31`, and unsupported
+`textern` promotion abort:
+
+```text
+cargo test -p wasmtime --lib transaction_object -- --format terse
+test result: ok. 15 passed; 0 failed; 0 ignored
+```
 
 - [ ] **Step 2: Implement struct and array libcalls**
 
@@ -417,12 +425,22 @@ Add runtime helpers for:
 - validate object kind on every operation
 - acquire `TStruct` or `TArray` read/write permission before payload access
 
+Progress: runtime-level helpers now exist on `TransactionState` for struct
+field reads/writes, array len/element/fill/copy operations, whole-object staged
+payload publication, and store-owned `ObjectTable` access. Exported object
+libcalls and Cranelift lowering are still pending.
+
 - [ ] **Step 3: Implement `ti31` and `textern` operations**
 
 Keep `ti31` simple and Wasmtime-compatible. Use `ObjectId` only where the
 transactional object model requires persistent object identity. For `textern`,
 support null and cast/test behavior first; abort promotion for unsupported
 host-only extern objects.
+
+Progress: `ti31` has an immediate 31-bit runtime value helper that requires an
+active transaction and does not allocate an object record. Unsupported
+persistent `textern` promotion aborts the active transaction with a clear
+runtime error. Full `textern` null/cast/test behavior remains pending.
 
 - [ ] **Step 4: Lower object operators**
 

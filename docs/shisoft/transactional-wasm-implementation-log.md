@@ -652,6 +652,56 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 153 passed; 0 failed; 20 ignored; 0 measured; 3438 filtered out
 ```
 
+## Wave 3: Object COW Runtime Helper Tranche
+
+Date: 2026-06-06
+
+Added the first runtime-level object operator helpers over the volatile
+`ObjectTable` foundation:
+
+- `StoreOpaque` now owns a store-local volatile `ObjectTable`, with shared,
+  mutable, and split mutable accessors for transaction/object commit paths.
+- `TransactionState` has typed helpers for `tstruct` field read/write over the
+  existing whole-object staged payload map.
+- `TransactionState` has typed helpers for `tarray` length, element read/write,
+  range fill, and range copy. Range writes stage whole-array payloads and keep
+  committed object records unchanged until object commit.
+- `transaction_commit_impl` now validates object granules against object-table
+  slot versions and publishes staged object payloads before clearing the active
+  transaction.
+- `ti31` is represented as an immediate masked 31-bit value that requires an
+  active transaction but does not allocate an object record.
+- Unsupported persistent `textern` promotion aborts the active transaction with
+  `persistent extern object promotion is not supported`.
+
+Still deferred:
+
+- Exported object libcalls and Cranelift lowering for `tstruct.*`, `tarray.*`,
+  `ti31.*`, and `textern.*`.
+- Wasmtime GC type/layout mapping for proposal object validation.
+- Persistent `ObjectId` reference ABI values and promotion from `VMGcRef`.
+- Full object WAST enablement; current local fork parsing still maps many
+  object spellings to ordinary Wasmtime GC operators.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib transaction_object -- --format terse
+test result: ok. 15 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 101 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib object_table -- --format terse
+test result: ok. 6 passed; 0 failed; 0 ignored
+
+cargo check -p wasmtime
+Finished `dev` profile [unoptimized + debuginfo] target(s)
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 153 passed; 0 failed; 20 ignored; 0 measured; 3438 filtered out
+```
+
 ## Remaining Roadmap Wave 1: Object Record Heap
 
 Date: 2026-06-06

@@ -315,6 +315,12 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         apply_staged_transaction_record(store, instance, record)?;
     }
 
+    {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.commit_object_payloads(object_table)?;
+    }
+
     store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -1314,12 +1320,14 @@ fn current_granule_version(
                     .context("tmemory granule index does not fit host usize")?,
             )
         }
+        GranuleId::TStruct { object_id } | GranuleId::TArray { object_id } => store
+            .store_opaque_mut()
+            .transaction_object_table()
+            .version(object_id),
         GranuleId::TMemorySize { .. }
         | GranuleId::TGlobal { .. }
         | GranuleId::TTable { .. }
-        | GranuleId::TTableSize { .. }
-        | GranuleId::TStruct { .. }
-        | GranuleId::TArray { .. } => Ok(0),
+        | GranuleId::TTableSize { .. } => Ok(0),
     }
 }
 

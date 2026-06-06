@@ -196,6 +196,25 @@ pub(crate) struct ObjectId {
     pub(crate) object_index: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct I31Value(u32);
+
+impl I31Value {
+    const MASK: u32 = 0x7fff_ffff;
+
+    fn new(value: i32) -> Self {
+        Self((value as u32) & Self::MASK)
+    }
+
+    pub(crate) fn get_s(self) -> i32 {
+        ((self.0 << 1) as i32) >> 1
+    }
+
+    pub(crate) fn get_u(self) -> i32 {
+        i32::try_from(self.0).unwrap()
+    }
+}
+
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObjectKind {
@@ -1420,22 +1439,6 @@ impl TransactionState {
         self.acquire_granule_write(global_granule_id(owner_instance, global_index), 0)
     }
 
-    pub(crate) fn acquire_struct_read(&mut self, object_id: ObjectId) -> Result<bool> {
-        self.acquire_granule_read(GranuleId::TStruct { object_id }, 0)
-    }
-
-    pub(crate) fn acquire_struct_write(&mut self, object_id: ObjectId) -> Result<bool> {
-        self.acquire_granule_write(GranuleId::TStruct { object_id }, 0)
-    }
-
-    pub(crate) fn acquire_array_read(&mut self, object_id: ObjectId) -> Result<bool> {
-        self.acquire_granule_read(GranuleId::TArray { object_id }, 0)
-    }
-
-    pub(crate) fn acquire_array_write(&mut self, object_id: ObjectId) -> Result<bool> {
-        self.acquire_granule_write(GranuleId::TArray { object_id }, 0)
-    }
-
     pub(crate) fn acquire_object_read(
         &mut self,
         object_table: &ObjectTable,
@@ -1482,6 +1485,153 @@ impl TransactionState {
         );
         self.acquire_object_write(object_table, object_id)?;
         Ok(self.staged_objects.insert(object_id, payload).is_none())
+    }
+
+    pub(crate) fn read_struct_field(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+        field_index: usize,
+    ) -> Result<ObjectValue> {
+        let payload = self.read_object_payload(object_table, object_id)?;
+        let ObjectPayload::Struct(fields) = payload else {
+            bail!("object is not a struct");
+        };
+        fields
+            .get(field_index)
+            .cloned()
+            .context("out of bounds struct access")
+    }
+
+    pub(crate) fn stage_struct_field(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+        field_index: usize,
+        value: ObjectValue,
+    ) -> Result<()> {
+        let payload = self.read_object_payload(object_table, object_id)?;
+        let ObjectPayload::Struct(mut fields) = payload else {
+            bail!("object is not a struct");
+        };
+        let field = fields
+            .get_mut(field_index)
+            .context("out of bounds struct access")?;
+        *field = value;
+        self.stage_object_payload(object_table, object_id, ObjectPayload::Struct(fields))?;
+        Ok(())
+    }
+
+    pub(crate) fn read_array_len(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+    ) -> Result<usize> {
+        let payload = self.read_object_payload(object_table, object_id)?;
+        let ObjectPayload::Array(elements) = payload else {
+            bail!("object is not an array");
+        };
+        Ok(elements.len())
+    }
+
+    pub(crate) fn read_array_element(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+        element_index: usize,
+    ) -> Result<ObjectValue> {
+        let payload = self.read_object_payload(object_table, object_id)?;
+        let ObjectPayload::Array(elements) = payload else {
+            bail!("object is not an array");
+        };
+        elements
+            .get(element_index)
+            .cloned()
+            .context("out of bounds array access")
+    }
+
+    pub(crate) fn stage_array_element(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+        element_index: usize,
+        value: ObjectValue,
+    ) -> Result<()> {
+        let payload = self.read_object_payload(object_table, object_id)?;
+        let ObjectPayload::Array(mut elements) = payload else {
+            bail!("object is not an array");
+        };
+        let element = elements
+            .get_mut(element_index)
+            .context("out of bounds array access")?;
+        *element = value;
+        self.stage_object_payload(object_table, object_id, ObjectPayload::Array(elements))?;
+        Ok(())
+    }
+
+    pub(crate) fn fill_array_range(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+        start: usize,
+        len: usize,
+        value: ObjectValue,
+    ) -> Result<()> {
+        let payload = self.read_object_payload(object_table, object_id)?;
+        let ObjectPayload::Array(mut elements) = payload else {
+            bail!("object is not an array");
+        };
+        let end = checked_array_range_end(start, len)?;
+        ensure!(end <= elements.len(), "out of bounds array access");
+        elements[start..end].fill(value);
+        self.stage_object_payload(object_table, object_id, ObjectPayload::Array(elements))?;
+        Ok(())
+    }
+
+    pub(crate) fn copy_array_range(
+        &mut self,
+        object_table: &ObjectTable,
+        dst_object_id: ObjectId,
+        dst_start: usize,
+        src_object_id: ObjectId,
+        src_start: usize,
+        len: usize,
+    ) -> Result<()> {
+        let src_payload = self.read_object_payload(object_table, src_object_id)?;
+        let ObjectPayload::Array(src_elements) = src_payload else {
+            bail!("source object is not an array");
+        };
+        let src_end = checked_array_range_end(src_start, len)?;
+        ensure!(src_end <= src_elements.len(), "out of bounds array access");
+        let copied = src_elements[src_start..src_end].to_vec();
+
+        let dst_payload = self.read_object_payload(object_table, dst_object_id)?;
+        let ObjectPayload::Array(mut dst_elements) = dst_payload else {
+            bail!("destination object is not an array");
+        };
+        let dst_end = checked_array_range_end(dst_start, len)?;
+        ensure!(dst_end <= dst_elements.len(), "out of bounds array access");
+        dst_elements[dst_start..dst_end].clone_from_slice(&copied);
+        self.stage_object_payload(
+            object_table,
+            dst_object_id,
+            ObjectPayload::Array(dst_elements),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn create_i31(&self, value: i32) -> Result<I31Value> {
+        self.ensure_active()?;
+        Ok(I31Value::new(value))
+    }
+
+    pub(crate) fn promote_extern_ref_for_persistence(
+        &mut self,
+        _extern_ref: u64,
+    ) -> Result<ObjectId> {
+        self.ensure_active()?;
+        self.abort()?;
+        bail!("persistent extern object promotion is not supported")
     }
 
     pub(crate) fn commit_object_payloads(
@@ -2049,6 +2199,10 @@ fn object_granule_object_id(granule: GranuleId) -> Option<ObjectId> {
         | GranuleId::TTable { .. }
         | GranuleId::TTableSize { .. } => None,
     }
+}
+
+fn checked_array_range_end(start: usize, len: usize) -> Result<usize> {
+    start.checked_add(len).context("out of bounds array access")
 }
 
 fn memory_size_granule_id(owner_instance: Option<InstanceId>, memory_index: u32) -> GranuleId {
@@ -4086,6 +4240,194 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed_record() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_struct(vec![ObjectValue::I32(1), ObjectValue::I64(2)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        assert_eq!(
+            state.read_struct_field(&objects, object, 0).unwrap(),
+            ObjectValue::I32(1)
+        );
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+            .unwrap();
+
+        assert_eq!(objects.version(object).unwrap(), 1);
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::I64(2)])
+        );
+        assert_eq!(
+            state.read_struct_field(&objects, object, 0).unwrap(),
+            ObjectValue::I32(9)
+        );
+        assert!(state.owns_struct_write(object));
+
+        assert!(state.commit_object_payloads(&mut objects).unwrap());
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(9), ObjectValue::I64(2)])
+        );
+        assert!(!state.owns_struct_write(object));
+    }
+
+    #[test]
+    fn transaction_object_tstruct_field_abort_discards_staged_payload() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_struct(vec![ObjectValue::I32(1), ObjectValue::I32(2)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        state
+            .stage_struct_field(&objects, object, 1, ObjectValue::I32(7))
+            .unwrap();
+        assert_eq!(
+            state.read_struct_field(&objects, object, 1).unwrap(),
+            ObjectValue::I32(7)
+        );
+
+        state.abort().unwrap();
+
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::I32(2)])
+        );
+        assert!(!state.owns_struct_write(object));
+    }
+
+    #[test]
+    fn transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_array(vec![
+                ObjectValue::I32(0),
+                ObjectValue::I32(1),
+                ObjectValue::I32(2),
+                ObjectValue::I32(3),
+                ObjectValue::I32(4),
+            ])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        assert_eq!(state.read_array_len(&objects, object).unwrap(), 5);
+        assert_eq!(
+            state.read_array_element(&objects, object, 2).unwrap(),
+            ObjectValue::I32(2)
+        );
+
+        state
+            .stage_array_element(&objects, object, 2, ObjectValue::I32(20))
+            .unwrap();
+        state
+            .fill_array_range(&objects, object, 3, 2, ObjectValue::I32(9))
+            .unwrap();
+        state
+            .copy_array_range(&objects, object, 0, object, 2, 3)
+            .unwrap();
+
+        assert_eq!(
+            state.read_object_payload(&objects, object).unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::I32(20),
+                ObjectValue::I32(9),
+                ObjectValue::I32(9),
+                ObjectValue::I32(9),
+                ObjectValue::I32(9),
+            ])
+        );
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::I32(0),
+                ObjectValue::I32(1),
+                ObjectValue::I32(2),
+                ObjectValue::I32(3),
+                ObjectValue::I32(4),
+            ])
+        );
+        assert!(state.owns_array_write(object));
+
+        assert!(state.commit_object_payloads(&mut objects).unwrap());
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::I32(20),
+                ObjectValue::I32(9),
+                ObjectValue::I32(9),
+                ObjectValue::I32(9),
+                ObjectValue::I32(9),
+            ])
+        );
+    }
+
+    #[test]
+    fn transaction_object_tarray_range_helpers_validate_bounds() {
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_array(vec![ObjectValue::I32(0)]).unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        let error = state.read_array_element(&objects, object, 1).unwrap_err();
+        assert!(error.to_string().contains("out of bounds array access"));
+
+        let error = state
+            .fill_array_range(&objects, object, 1, 1, ObjectValue::I32(3))
+            .unwrap_err();
+        assert!(error.to_string().contains("out of bounds array access"));
+    }
+
+    #[test]
+    fn transaction_object_ti31_is_immediate_and_does_not_allocate_object_record() {
+        let objects = ObjectTable::default();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        let positive = state.create_i31(0x4000_0001).unwrap();
+        assert_eq!(positive.get_u(), 0x4000_0001);
+        assert_eq!(positive.get_s(), -0x3fff_ffff);
+
+        let negative = state.create_i31(-1).unwrap();
+        assert_eq!(negative.get_u(), 0x7fff_ffff);
+        assert_eq!(negative.get_s(), -1);
+
+        assert_eq!(objects.live_count(), 0);
+        assert_eq!(objects.slot_count(), 0);
+    }
+
+    #[test]
+    fn transaction_object_unsupported_textern_promotion_aborts_transaction() {
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        let error = state
+            .promote_extern_ref_for_persistence(0x1234)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("persistent extern object promotion is not supported")
+        );
+        assert!(state.active_transaction().is_none());
+    }
+
+    #[test]
     fn object_payload_commit_validates_object_read_versions() {
         let mut objects = ObjectTable::default();
         let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
@@ -4099,6 +4441,29 @@ mod tests {
 
         let error = state.commit_object_payloads(&mut objects).unwrap_err();
 
+        assert!(
+            error
+                .to_string()
+                .contains("optimistic read version changed")
+        );
+    }
+
+    #[test]
+    fn transaction_object_read_validation_uses_object_table_versions() {
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        state.acquire_object_read(&objects, object).unwrap();
+
+        state.validate_active_object_reads(&objects).unwrap();
+
+        objects
+            .update_payload(object, ObjectPayload::Struct(vec![ObjectValue::I32(2)]))
+            .unwrap();
+
+        let error = state.validate_active_object_reads(&objects).unwrap_err();
         assert!(
             error
                 .to_string()
