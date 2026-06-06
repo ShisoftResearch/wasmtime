@@ -21,7 +21,7 @@ The last recorded full proposal status in the implementation log is:
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 127 passed; 0 failed; 46 ignored
+test result: ok. 153 passed; 0 failed; 20 ignored
 ```
 
 The older WAST-only roadmap has drifted in places. This roadmap supersedes it

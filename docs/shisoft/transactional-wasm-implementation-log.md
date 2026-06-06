@@ -138,10 +138,10 @@ cargo test -p wasmtime --lib transaction
 test result: ok. 84 passed; 0 failed; 0 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
-test result: ok. 71 passed; 0 failed; 45 ignored
+test result: ok. 96 passed; 0 failed; 20 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 127 passed; 0 failed; 46 ignored
+test result: ok. 153 passed; 0 failed; 20 ignored
 ```
 
 Current promotion note:
@@ -152,6 +152,29 @@ Current promotion note:
 - `timports.wast` uses real transactional spectest imports, numeric imported
   `tglobal`, active imported `tmemory` data initialization, and dynamic
   `tmemory` import-size matching after grow.
+
+Current ignored proposal files after the 2026-06-06 Wave 0 refresh:
+
+- `simple-transactions/br_on_tcast.wast`
+- `simple-transactions/br_on_tcast_fail.wast`
+- `simple-transactions/tarray.wast`
+- `simple-transactions/tarray_copy.wast`
+- `simple-transactions/tarray_fill.wast`
+- `simple-transactions/tarray_init_data.wast`
+- `simple-transactions/tarray_init_elem.wast`
+- `simple-transactions/tconflict-basic.wast`
+- `simple-transactions/tconflict-tmemory_1.wast`
+- `simple-transactions/ttype-canon.wast`
+- `simple-transactions/tref_cast.wast`
+- `simple-transactions/ttype-rec.wast`
+- `simple-transactions/ttype-subtyping.wast`
+- `simple-transactions/tref_eq.wast`
+- `simple-transactions/textern.wast`
+- `simple-transactions/tref_test.wast`
+- `simple-transactions/ti31.wast`
+- `simple-transactions/tstruct.wast`
+- `simple-transactions/ttry-abort-commit.wast`
+- `simple-transactions/ttype-equivalence.wast`
 
 ## Wave 0: Baseline
 
