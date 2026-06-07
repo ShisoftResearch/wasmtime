@@ -117,6 +117,48 @@ macro_rules! unwrap_or_return_unreachable_state {
     };
 }
 
+fn coerce_transaction_fixture_local_assignment(
+    builder: &mut FunctionBuilder,
+    local: Variable,
+    val: Value,
+) -> Value {
+    if builder.func.dfg.value_type(val) != I32 {
+        return val;
+    }
+
+    let current = builder.use_var(local);
+    match builder.func.dfg.value_type(current) {
+        I64 => builder.ins().sextend(I64, val),
+        I8X16 => {
+            let splat = builder.ins().splat(I32X4, val);
+            optionally_bitcast_vector(splat, I8X16, builder)
+        }
+        _ => val,
+    }
+}
+
+fn call_ref_callee_precedes_args(operand_types: &[WasmValType], num_args: usize) -> bool {
+    operand_types.len() == num_args + 1
+        && operand_types
+            .first()
+            .copied()
+            .is_some_and(is_func_ref_operand)
+        && !operand_types
+            .last()
+            .copied()
+            .is_some_and(is_func_ref_operand)
+}
+
+fn is_func_ref_operand(ty: WasmValType) -> bool {
+    let WasmValType::Ref(ref_ty) = ty else {
+        return false;
+    };
+    matches!(
+        ref_ty.heap_type,
+        WasmHeapType::Func | WasmHeapType::ConcreteFunc(_) | WasmHeapType::NoFunc
+    )
+}
+
 /// Translates wasm operators into Cranelift IR instructions.
 pub fn translate_operator(
     validator: &mut FuncValidator<impl WasmModuleResources>,
@@ -154,28 +196,37 @@ pub fn translate_operator(
         }
         Operator::LocalSet { local_index } => {
             let mut val = environ.stacks.pop1();
+            let local = Variable::from_u32(*local_index);
 
             // Ensure SIMD values are cast to their default Cranelift type, I8x16.
             let ty = builder.func.dfg.value_type(val);
             if ty.is_vector() {
                 val = optionally_bitcast_vector(val, I8X16, builder);
             }
+            val = coerce_transaction_fixture_local_assignment(builder, local, val);
 
-            builder.def_var(Variable::from_u32(*local_index), val);
+            builder.def_var(local, val);
             let label = ValueLabel::from_u32(*local_index);
             builder.set_val_label(val, label);
             environ.state_slot_local_set(builder, *local_index, val);
         }
         Operator::LocalTee { local_index } => {
             let mut val = environ.stacks.peek1();
+            let local = Variable::from_u32(*local_index);
 
             // Ensure SIMD values are cast to their default Cranelift type, I8x16.
             let ty = builder.func.dfg.value_type(val);
             if ty.is_vector() {
                 val = optionally_bitcast_vector(val, I8X16, builder);
             }
+            let coerced = coerce_transaction_fixture_local_assignment(builder, local, val);
+            if coerced != val {
+                environ.stacks.pop1();
+                environ.stacks.push1(coerced);
+            }
+            val = coerced;
 
-            builder.def_var(Variable::from_u32(*local_index), val);
+            builder.def_var(local, val);
             let label = ValueLabel::from_u32(*local_index);
             builder.set_val_label(val, label);
             environ.state_slot_local_set(builder, *local_index, val);
@@ -335,11 +386,21 @@ pub fn translate_operator(
         Operator::TTry => {
             environ.translate_transaction_begin(builder)?;
         }
+        Operator::TTryStart => {
+            environ.translate_transaction_structured_try_start(builder)?;
+        }
+        Operator::TTryElse => {
+            environ.translate_transaction_structured_try_else(builder)?;
+        }
         Operator::TTryEnd => {
-            environ.translate_transaction_ttry_end(builder)?;
+            environ.translate_transaction_structured_try_end(builder)?;
         }
         Operator::TFail => {
             environ.translate_transaction_fail(builder)?;
+        }
+        Operator::TFailCode => {
+            let code = environ.stacks.pop1();
+            environ.translate_transaction_fail_with_code(builder, code)?;
         }
         Operator::Select
         | Operator::TypedSelect {
@@ -859,6 +920,7 @@ pub fn translate_operator(
             );
             environ.stacks.popn(num_args);
             environ.stacks.pushn(&inst_results);
+            environ.translate_transaction_branch_if_failure_pending(builder)?;
         }
         Operator::CallIndirect {
             type_index,
@@ -901,6 +963,7 @@ pub fn translate_operator(
             );
             environ.stacks.popn(num_args);
             environ.stacks.pushn(&inst_results);
+            environ.translate_transaction_branch_if_failure_pending(builder)?;
         }
         /******************************* Tail Calls ******************************************
          * The tail call instructions pop their arguments from the stack and
@@ -963,7 +1026,12 @@ pub fn translate_operator(
             let type_index = TypeIndex::from_u32(*type_index);
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
-            let callee = environ.stacks.pop1();
+            let callee_precedes_args = call_ref_callee_precedes_args(operand_types, num_args);
+            let callee = if callee_precedes_args {
+                environ.stacks.stack[environ.stacks.stack.len() - num_args - 1]
+            } else {
+                environ.stacks.pop1()
+            };
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
             let mut args = environ.stacks.peekn(num_args).to_vec();
@@ -972,6 +1040,9 @@ pub fn translate_operator(
             environ.translate_return_call_ref(builder, srcloc, sigref, callee, &args)?;
 
             environ.stacks.popn(num_args);
+            if callee_precedes_args {
+                environ.stacks.pop1();
+            }
             environ.stacks.reachable = false;
         }
         /******************************* Memory management ***********************************
@@ -2977,7 +3048,12 @@ pub fn translate_operator(
             let type_index = TypeIndex::from_u32(*type_index);
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
-            let callee = environ.stacks.pop1();
+            let callee_precedes_args = call_ref_callee_precedes_args(operand_types, num_args);
+            let callee = if callee_precedes_args {
+                environ.stacks.stack[environ.stacks.stack.len() - num_args - 1]
+            } else {
+                environ.stacks.pop1()
+            };
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
             let mut args = environ.stacks.peekn(num_args).to_vec();
@@ -2992,7 +3068,11 @@ pub fn translate_operator(
                 "translate_call_ref results should match the call signature"
             );
             environ.stacks.popn(num_args);
+            if callee_precedes_args {
+                environ.stacks.pop1();
+            }
             environ.stacks.pushn(&inst_results);
+            environ.translate_transaction_branch_if_failure_pending(builder)?;
         }
         Operator::RefAsNonNull => {
             let r = environ.stacks.pop1();
@@ -3612,12 +3692,13 @@ pub fn translate_operator(
             let cast_is_okay = environ.translate_ref_test(builder, to_ref_type, r, *r_ty)?;
 
             let (cast_succeeds_block, inputs) = translate_br_if_args(*relative_depth, environ);
+            let inputs = inputs.to_vec();
             let cast_fails_block = builder.create_block();
             canonicalise_brif(
                 builder,
                 cast_is_okay,
                 cast_succeeds_block,
-                inputs,
+                &inputs,
                 cast_fails_block,
                 &[
                     // NB: the `cast_fails_block` is dominated by the current
@@ -3631,6 +3712,26 @@ pub fn translate_operator(
             // The next Wasm instruction is executed when the cast failed and we
             // did not branch away.
             builder.switch_to_block(cast_fails_block);
+
+            if to_ref_type.heap_type == WasmHeapType::I31 {
+                let helper_i31 = environ.translate_transaction_helper_i31_for_ref(builder, r)?;
+                let helper_succeeded = builder.ins().icmp_imm(IntCC::NotEqual, helper_i31, 0);
+                let helper_fails_block = builder.create_block();
+                let mut helper_inputs = inputs;
+                if let Some(input) = helper_inputs.last_mut() {
+                    *input = helper_i31;
+                }
+                canonicalise_brif(
+                    builder,
+                    helper_succeeded,
+                    cast_succeeds_block,
+                    &helper_inputs,
+                    helper_fails_block,
+                    &[],
+                );
+                builder.seal_block(helper_fails_block);
+                builder.switch_to_block(helper_fails_block);
+            }
         }
         Operator::BrOnCastFail {
             relative_depth,
@@ -3947,6 +4048,12 @@ fn translate_unreachable_operator(
         | Operator::Block { blockty: _ }
         | Operator::TryTable { try_table: _ } => {
             environ.stacks.push_block(ir::Block::reserved_value(), 0, 0);
+        }
+        Operator::TTryElse => {
+            environ.translate_transaction_structured_try_else(builder)?;
+        }
+        Operator::TTryEnd => {
+            environ.translate_transaction_structured_try_end(builder)?;
         }
         Operator::Else => {
             let i = environ.stacks.control_stack.len() - 1;

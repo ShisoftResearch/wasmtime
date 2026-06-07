@@ -5,7 +5,7 @@ use crate::runtime::store::InstanceId;
 use crate::runtime::vm::TMemory;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use core::{mem, ops::Range};
+use core::{cell::Cell, mem, ops::Range};
 
 #[path = "transaction/object_heap.rs"]
 mod object_heap;
@@ -113,6 +113,32 @@ impl TransactionConfig {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TransactionId(u64);
 
+std::thread_local! {
+    static CURRENT_TRANSACTION: Cell<Option<TransactionId>> = const { Cell::new(None) };
+}
+
+fn current_thread_transaction() -> Option<TransactionId> {
+    CURRENT_TRANSACTION.with(Cell::get)
+}
+
+fn replace_current_thread_transaction(transaction: Option<TransactionId>) -> Option<TransactionId> {
+    CURRENT_TRANSACTION.with(|current| {
+        let previous = current.get();
+        current.set(transaction);
+        previous
+    })
+}
+
+#[cfg(test)]
+fn current_thread_transaction_for_test() -> Option<TransactionId> {
+    current_thread_transaction()
+}
+
+#[cfg(test)]
+fn clear_current_thread_transaction_for_test() {
+    replace_current_thread_transaction(None);
+}
+
 impl TransactionId {
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -127,6 +153,7 @@ impl TransactionId {
 pub(crate) struct TransactionState {
     active: Option<TransactionId>,
     failed: bool,
+    failure_code: u32,
     next_id: u64,
     locks: LockBased,
     suspended: BTreeMap<TransactionId, TransactionWorkspace>,
@@ -138,6 +165,7 @@ pub(crate) struct TransactionState {
     original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
     allocated_objects: Vec<ObjectId>,
+    granule_versions: BTreeMap<GranuleId, u64>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
     scratch: Vec<u8>,
@@ -165,7 +193,8 @@ impl Default for TransactionState {
         Self {
             active: None,
             failed: false,
-            next_id: 1,
+            failure_code: 0,
+            next_id: 10_001,
             locks: LockBased::default(),
             suspended: BTreeMap::new(),
             staged_globals: BTreeMap::new(),
@@ -176,6 +205,7 @@ impl Default for TransactionState {
             original_table_elements: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             allocated_objects: Vec::new(),
+            granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
             write_granules: BTreeSet::new(),
             scratch: Vec::new(),
@@ -811,7 +841,7 @@ pub(crate) struct TMemoryAccessSnapshot {
     granules: Vec<TMemoryGranuleSnapshot>,
 }
 
-const TMEMORY_GRANULE_SHIFT: usize = 8;
+pub(crate) const TMEMORY_GRANULE_SHIFT: usize = 6;
 pub(crate) const TMEMORY_GRANULE_SIZE: usize = 1 << TMEMORY_GRANULE_SHIFT;
 const TTABLE_GRANULE_SHIFT: u32 = 4;
 pub(crate) const TTABLE_GRANULE_SIZE: u64 = 1 << TTABLE_GRANULE_SHIFT;
@@ -822,14 +852,14 @@ pub(crate) trait TransactionConcurrencyControl {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<()>;
+    ) -> Result<Option<TransactionId>>;
 
     fn acquire_granule_write(
         &mut self,
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<()>;
+    ) -> Result<Option<TransactionId>>;
 
     fn release_transaction(&mut self, transaction: TransactionId);
 }
@@ -848,14 +878,8 @@ impl LockBased {
         transaction: TransactionId,
         granule: GranuleId,
         version: u64,
-    ) -> Result<()> {
-        if self
-            .owners
-            .get(&granule)
-            .is_some_and(|owner| *owner != transaction)
-        {
-            bail!("transaction read conflict: granule is owned by another transaction");
-        }
+    ) -> Result<Option<TransactionId>> {
+        let aborted = self.resolve_writer_conflict(transaction, granule, "read")?;
 
         match self.read_versions.entry((transaction, granule)) {
             alloc::collections::btree_map::Entry::Vacant(entry) => {
@@ -869,7 +893,7 @@ impl LockBased {
             }
         }
 
-        Ok(())
+        Ok(aborted)
     }
 
     pub(crate) fn acquire_write(
@@ -877,14 +901,8 @@ impl LockBased {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<()> {
-        if self
-            .owners
-            .get(&granule)
-            .is_some_and(|owner| *owner != transaction)
-        {
-            bail!("transaction write conflict: granule is owned by another transaction");
-        }
+    ) -> Result<Option<TransactionId>> {
+        let aborted = self.resolve_writer_conflict(transaction, granule, "write")?;
         if self
             .read_versions
             .get(&(transaction, granule))
@@ -894,7 +912,7 @@ impl LockBased {
         }
 
         self.owners.insert(granule, transaction);
-        Ok(())
+        Ok(aborted)
     }
 
     pub(crate) fn validate_read(
@@ -940,10 +958,40 @@ impl LockBased {
         Ok(())
     }
 
+    fn refresh_read_version(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) {
+        if let Some(version) = self.read_versions.get_mut(&(transaction, granule)) {
+            *version = current_version;
+        }
+    }
+
     pub(crate) fn release_transaction(&mut self, transaction: TransactionId) {
         self.owners.retain(|_, owner| *owner != transaction);
         self.read_versions
             .retain(|(reader, _), _| *reader != transaction);
+    }
+
+    fn resolve_writer_conflict(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        access: &str,
+    ) -> Result<Option<TransactionId>> {
+        let Some(owner) = self.owners.get(&granule).copied() else {
+            return Ok(None);
+        };
+        if owner == transaction {
+            return Ok(None);
+        }
+        if transaction < owner {
+            self.release_transaction(owner);
+            return Ok(Some(owner));
+        }
+        bail!("transaction {access} conflict: granule is owned by another transaction");
     }
 }
 
@@ -955,7 +1003,8 @@ impl LockBased {
         granule: GranuleId,
         version: u64,
     ) -> Result<()> {
-        self.record_read(transaction, granule, version)
+        self.record_read(transaction, granule, version)?;
+        Ok(())
     }
 
     fn acquire_write_for_test(
@@ -964,7 +1013,8 @@ impl LockBased {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        self.acquire_write(transaction, granule, current_version)
+        self.acquire_write(transaction, granule, current_version)?;
+        Ok(())
     }
 
     fn acquire_memory_granule_read(
@@ -977,7 +1027,8 @@ impl LockBased {
             transaction,
             memory_granule_id_from_u64(None, memory_index, granule_index),
             0,
-        )
+        )?;
+        Ok(())
     }
 
     fn acquire_memory_granule_write(
@@ -990,7 +1041,8 @@ impl LockBased {
             transaction,
             memory_granule_id_from_u64(None, memory_index, granule_index),
             0,
-        )
+        )?;
+        Ok(())
     }
 
     fn validate_read_for_test(
@@ -1017,7 +1069,7 @@ impl TransactionConcurrencyControl for LockBased {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<TransactionId>> {
         self.record_read(transaction, granule, current_version)
     }
 
@@ -1026,7 +1078,7 @@ impl TransactionConcurrencyControl for LockBased {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<TransactionId>> {
         self.acquire_write(transaction, granule, current_version)
     }
 
@@ -1051,6 +1103,7 @@ impl TransactionState {
             .checked_add(1)
             .context("transaction id overflow")?;
         self.active = Some(id);
+        replace_current_thread_transaction(Some(id));
         Ok(id)
     }
 
@@ -1070,6 +1123,7 @@ impl TransactionState {
         let workspace = self.suspended.remove(&transaction).unwrap_or_default();
         self.install_workspace(workspace);
         self.active = Some(transaction);
+        replace_current_thread_transaction(Some(transaction));
         Ok(previous)
     }
 
@@ -1089,6 +1143,7 @@ impl TransactionState {
                 self.active = None;
             }
         }
+        replace_current_thread_transaction(previous);
         Ok(())
     }
 
@@ -1101,7 +1156,8 @@ impl TransactionState {
             self.abort()?;
             return Ok(true);
         }
-        if self.suspended.remove(&transaction).is_some() {
+        if let Some(workspace) = self.suspended.remove(&transaction) {
+            self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
             self.locks.release_transaction(transaction);
             return Ok(true);
         }
@@ -1123,6 +1179,7 @@ impl TransactionState {
         for object_id in workspace.allocated_objects.iter().rev().copied() {
             object_table.free(object_id)?;
         }
+        self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
         self.locks.release_transaction(transaction);
         Ok(true)
     }
@@ -1135,8 +1192,13 @@ impl TransactionState {
         self.failed
     }
 
+    pub(crate) fn structured_failure_code(&self) -> u32 {
+        self.failure_code
+    }
+
     pub(crate) fn clear_structured_failure(&mut self) {
         self.failed = false;
+        self.failure_code = 0;
     }
 
     pub(crate) fn acquire_granule_read(
@@ -1146,8 +1208,16 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         let transaction = self.active_transaction_required()?;
-        self.locks
+        let current_version = self.current_version_for_granule(granule, current_version);
+        let aborted = self
+            .locks
             .acquire_granule_read(transaction, granule, current_version)?;
+        if aborted.is_some() {
+            self.discard_conflict_aborted_transaction(aborted)?;
+            let current_version = self.current_version_for_granule(granule, current_version);
+            self.locks
+                .refresh_read_version(transaction, granule, current_version);
+        }
         Ok(self.read_granules.insert(granule))
     }
 
@@ -1158,8 +1228,16 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         let transaction = self.active_transaction_required()?;
-        self.locks
+        let current_version = self.current_version_for_granule(granule, current_version);
+        let aborted = self
+            .locks
             .acquire_granule_write(transaction, granule, current_version)?;
+        if aborted.is_some() {
+            self.discard_conflict_aborted_transaction(aborted)?;
+            let current_version = self.current_version_for_granule(granule, current_version);
+            self.locks
+                .refresh_read_version(transaction, granule, current_version);
+        }
         self.read_granules.insert(granule);
         Ok(self.write_granules.insert(granule))
     }
@@ -1229,8 +1307,55 @@ impl TransactionState {
             .validate_read(transaction, granule, current_version)
     }
 
+    pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> u64 {
+        self.granule_versions.get(&granule).copied().unwrap_or(0)
+    }
+
+    fn current_version_for_granule(&self, granule: GranuleId, backend_version: u64) -> u64 {
+        if granule_uses_transaction_state_version(granule) {
+            self.versioned_granule_version(granule)
+        } else {
+            backend_version
+        }
+    }
+
+    fn discard_conflict_aborted_transaction(
+        &mut self,
+        transaction: Option<TransactionId>,
+    ) -> Result<()> {
+        let Some(transaction) = transaction else {
+            return Ok(());
+        };
+        if let Some(workspace) = self.suspended.remove(&transaction) {
+            self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
+        }
+        Ok(())
+    }
+
+    fn bump_active_versioned_write_granules(&mut self) -> Result<()> {
+        let granules = self.write_granules.iter().copied().collect::<Vec<_>>();
+        self.bump_versioned_granules(granules)
+    }
+
+    fn bump_versioned_granules<I>(&mut self, granules: I) -> Result<()>
+    where
+        I: IntoIterator<Item = GranuleId>,
+    {
+        for granule in granules {
+            if !granule_uses_transaction_state_version(granule) {
+                continue;
+            }
+            let version = self.granule_versions.entry(granule).or_insert(0);
+            *version = version
+                .checked_add(1)
+                .context("transaction granule version overflow")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn complete_commit(&mut self) -> Result<()> {
         self.ensure_active()?;
+        self.bump_active_versioned_write_granules()?;
         self.clear_active();
         Ok(())
     }
@@ -1309,6 +1434,7 @@ impl TransactionState {
 
     pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
+        self.bump_active_versioned_write_granules()?;
         self.clear_active();
         Ok(())
     }
@@ -1327,13 +1453,23 @@ impl TransactionState {
         for object_id in self.allocated_objects.iter().rev().copied() {
             object_table.free(object_id)?;
         }
+        self.bump_active_versioned_write_granules()?;
         self.clear_active();
         Ok(())
     }
 
     pub(crate) fn fail_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
+        self.fail_allocated_objects_with_code(object_table, 0)
+    }
+
+    pub(crate) fn fail_allocated_objects_with_code(
+        &mut self,
+        object_table: &mut ObjectTable,
+        code: u32,
+    ) -> Result<()> {
         self.abort_allocated_objects(object_table)?;
         self.failed = true;
+        self.failure_code = code;
         Ok(())
     }
 
@@ -1342,8 +1478,13 @@ impl TransactionState {
     }
 
     pub(crate) fn fail_structured(&mut self) -> Result<()> {
+        self.fail_structured_with_code(0)
+    }
+
+    pub(crate) fn fail_structured_with_code(&mut self, code: u32) -> Result<()> {
         self.abort()?;
         self.failed = true;
+        self.failure_code = code;
         Ok(())
     }
 
@@ -2615,6 +2756,10 @@ impl TransactionState {
     }
 
     fn active_transaction_required(&self) -> Result<TransactionId> {
+        ensure!(
+            current_thread_transaction() == self.active,
+            "thread transaction state does not match active transaction"
+        );
         self.active_transaction()
             .context("transaction operation requires an active transaction")
     }
@@ -2623,6 +2768,10 @@ impl TransactionState {
         ensure!(
             self.active.is_some(),
             "transaction operation requires an active transaction"
+        );
+        ensure!(
+            current_thread_transaction() == self.active,
+            "thread transaction state does not match active transaction"
         );
         Ok(())
     }
@@ -2675,6 +2824,7 @@ impl TransactionState {
         if let Some(transaction) = self.active.take() {
             self.locks.release_transaction(transaction);
         }
+        replace_current_thread_transaction(None);
         self.install_workspace(TransactionWorkspace::default());
     }
 }
@@ -2682,6 +2832,7 @@ impl TransactionState {
 #[cfg(test)]
 impl TransactionState {
     fn new_for_test(transaction: TransactionId) -> Self {
+        replace_current_thread_transaction(Some(transaction));
         Self {
             active: Some(transaction),
             next_id: transaction.as_raw().saturating_add(1),
@@ -2806,6 +2957,16 @@ fn object_granule_object_id(granule: GranuleId) -> Option<ObjectId> {
         | GranuleId::TTable { .. }
         | GranuleId::TTableSize { .. } => None,
     }
+}
+
+fn granule_uses_transaction_state_version(granule: GranuleId) -> bool {
+    matches!(
+        granule,
+        GranuleId::TMemorySize { .. }
+            | GranuleId::TGlobal { .. }
+            | GranuleId::TTable { .. }
+            | GranuleId::TTableSize { .. }
+    )
 }
 
 fn checked_array_range_end(start: usize, len: usize) -> Result<usize> {
@@ -3850,17 +4011,22 @@ mod tests {
 
     #[test]
     fn begin_commit_and_abort_clear_active_transaction() {
+        clear_current_thread_transaction_for_test();
         let mut state = TransactionState::default();
 
         let first = state.begin().unwrap();
         assert_eq!(state.active_transaction(), Some(first));
+        assert_eq!(current_thread_transaction_for_test(), Some(first));
         state.commit().unwrap();
         assert_eq!(state.active_transaction(), None);
+        assert_eq!(current_thread_transaction_for_test(), None);
 
         let second = state.begin().unwrap();
         assert_eq!(state.active_transaction(), Some(second));
+        assert_eq!(current_thread_transaction_for_test(), Some(second));
         state.abort().unwrap();
         assert_eq!(state.active_transaction(), None);
+        assert_eq!(current_thread_transaction_for_test(), None);
     }
 
     #[test]
@@ -3871,8 +4037,12 @@ mod tests {
         state.stage_memory_size(0, 2).unwrap();
         state.stage_global(3, GlobalSnapshot::I64(11)).unwrap();
         state.stage_global(3, GlobalSnapshot::I64(22)).unwrap();
-        state.stage_memory_granule(0, 7, vec![0x11; 256]).unwrap();
-        state.stage_memory_granule(0, 7, vec![0x22; 256]).unwrap();
+        state
+            .stage_memory_granule(0, 7, vec![0x11; TMEMORY_GRANULE_SIZE])
+            .unwrap();
+        state
+            .stage_memory_granule(0, 7, vec![0x22; TMEMORY_GRANULE_SIZE])
+            .unwrap();
 
         let mut applied = Vec::new();
         state
@@ -3894,7 +4064,7 @@ mod tests {
                     owner_instance: None,
                     memory_index: 0,
                     granule_index: 7,
-                    bytes: vec![0x22; 256]
+                    bytes: vec![0x22; TMEMORY_GRANULE_SIZE]
                 },
                 StagedRecord::MemorySize {
                     owner_instance: None,
@@ -3911,7 +4081,9 @@ mod tests {
         state.begin().unwrap();
         state.stage_memory_size(0, 9).unwrap();
         state.stage_global(3, GlobalSnapshot::I32(4)).unwrap();
-        state.stage_memory_granule(0, 7, vec![0x11; 256]).unwrap();
+        state
+            .stage_memory_granule(0, 7, vec![0x11; TMEMORY_GRANULE_SIZE])
+            .unwrap();
 
         state.abort().unwrap();
         assert_eq!(state.active_transaction(), None);
@@ -3933,11 +4105,19 @@ mod tests {
         let mut state = TransactionState::default();
         state.begin().unwrap();
 
-        assert!(state.stage_memory_granule(0, 7, vec![0x11; 256]).unwrap());
-        assert!(!state.stage_memory_granule(0, 7, vec![0x22; 256]).unwrap());
+        assert!(
+            state
+                .stage_memory_granule(0, 7, vec![0x11; TMEMORY_GRANULE_SIZE])
+                .unwrap()
+        );
+        assert!(
+            !state
+                .stage_memory_granule(0, 7, vec![0x22; TMEMORY_GRANULE_SIZE])
+                .unwrap()
+        );
 
         let staged = state.staged_memory_granule(0, 7).unwrap();
-        assert_eq!(staged, &[0x22; 256]);
+        assert_eq!(staged, &[0x22; TMEMORY_GRANULE_SIZE]);
     }
 
     #[test]
@@ -3947,7 +4127,7 @@ mod tests {
         assert!(state.acquire_memory_granule_read(0, 7).is_err());
         assert!(
             state
-                .acquire_memory_granule_write(0, 7, vec![0x11; 256])
+                .acquire_memory_granule_write(0, 7, vec![0x11; TMEMORY_GRANULE_SIZE])
                 .is_err()
         );
     }
@@ -3964,18 +4144,21 @@ mod tests {
 
         assert!(
             state
-                .acquire_memory_granule_write(0, 7, vec![0x11; 256])
+                .acquire_memory_granule_write(0, 7, vec![0x11; TMEMORY_GRANULE_SIZE])
                 .unwrap()
         );
         assert!(
             !state
-                .acquire_memory_granule_write(0, 7, vec![0x22; 256])
+                .acquire_memory_granule_write(0, 7, vec![0x22; TMEMORY_GRANULE_SIZE])
                 .unwrap()
         );
         assert!(state.owns_memory_granule_read(0, 7));
         assert!(state.owns_memory_granule_write(0, 7));
 
-        assert_eq!(state.staged_memory_granule(0, 7).unwrap(), &[0x22; 256]);
+        assert_eq!(
+            state.staged_memory_granule(0, 7).unwrap(),
+            &[0x22; TMEMORY_GRANULE_SIZE]
+        );
     }
 
     #[test]
@@ -4202,14 +4385,17 @@ mod tests {
 
     #[test]
     fn lock_based_transaction_ids_keep_separate_workspaces() {
+        clear_current_thread_transaction_for_test();
         let mut state = TransactionState::default();
         let first = TransactionId::from_raw(11);
         let second = TransactionId::from_raw(22);
 
         assert_eq!(state.enter_transaction(first).unwrap(), None);
+        assert_eq!(current_thread_transaction_for_test(), Some(first));
         state.stage_global(0, GlobalSnapshot::I32(11)).unwrap();
 
         assert_eq!(state.enter_transaction(second).unwrap(), Some(first));
+        assert_eq!(current_thread_transaction_for_test(), Some(second));
         state.stage_global(1, GlobalSnapshot::I32(22)).unwrap();
         assert_eq!(state.staged_global_owned(None, 0), None);
         assert_eq!(
@@ -4218,6 +4404,7 @@ mod tests {
         );
 
         state.restore_transaction(Some(first)).unwrap();
+        assert_eq!(current_thread_transaction_for_test(), Some(first));
         assert_eq!(
             state.staged_global_owned(None, 0),
             Some(GlobalSnapshot::I32(11))
@@ -4226,8 +4413,50 @@ mod tests {
 
         state.restore_transaction(None).unwrap();
         assert_eq!(state.active_transaction(), None);
+        assert_eq!(current_thread_transaction_for_test(), None);
         assert!(state.transaction_is_open(first));
         assert!(state.transaction_is_open(second));
+    }
+
+    #[test]
+    fn lower_transaction_id_aborts_higher_suspended_writer() {
+        clear_current_thread_transaction_for_test();
+        let mut state = TransactionState::default();
+        let higher = TransactionId::from_raw(100_001);
+        let lower = TransactionId::from_raw(1);
+
+        state.enter_transaction(higher).unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(100)).unwrap();
+        state.restore_transaction(None).unwrap();
+        assert!(state.transaction_is_open(higher));
+
+        state.enter_transaction(lower).unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(200)).unwrap();
+
+        assert!(!state.transaction_is_open(higher));
+        assert!(state.transaction_is_open(lower));
+    }
+
+    #[test]
+    fn lower_transaction_id_reader_records_version_after_aborting_writer() {
+        clear_current_thread_transaction_for_test();
+        let mut state = TransactionState::default();
+        let higher = TransactionId::from_raw(100_001);
+        let lower = TransactionId::from_raw(1);
+
+        state.enter_transaction(higher).unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(100)).unwrap();
+        state.restore_transaction(None).unwrap();
+
+        state.enter_transaction(lower).unwrap();
+        state.acquire_global_read_owned(None, 0).unwrap();
+        assert!(!state.transaction_is_open(higher));
+        state
+            .validate_active_read(
+                global_granule_id(None, 0),
+                state.versioned_granule_version(global_granule_id(None, 0)),
+            )
+            .unwrap();
     }
 
     #[test]

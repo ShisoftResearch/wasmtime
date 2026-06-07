@@ -163,14 +163,8 @@ fn add_tests(tests: &mut Vec<WastTest>, path: &Path, config: &FindConfig) -> Res
         };
         let transaction_real_text_parser = transaction_proposal
             .is_some_and(|suite| transaction_proposal_uses_real_text_parser(suite, &path));
-        if transaction_proposal.is_some() {
-            contents = if let Some(mock) = transaction_proposal_adapter_mock(&path) {
-                mock.to_string()
-            } else if transaction_real_text_parser {
-                normalize_transaction_proposal_wast_diagnostics(&contents)
-            } else {
-                normalize_transaction_proposal_wast(&contents)
-            };
+        if transaction_proposal.is_some() && transaction_real_text_parser {
+            contents = normalize_transaction_proposal_wast_diagnostics(&contents);
         }
         tests.push(WastTest {
             path,
@@ -305,52 +299,10 @@ fn transaction_proposal_test_config(test: &Path) -> TestConfig {
     ret
 }
 
-// SHISOFT-TWASM-MOCK: path-scoped proposal WAST fixture replacements.
-// Replace these whole-fixture adapters with real parser, validation, and
-// runtime semantics as each transactional feature lands.
-fn transaction_proposal_adapter_mock(path: &Path) -> Option<&'static str> {
-    if path.ends_with("simple-transactions/ttry-basic.wast") {
-        // SHISOFT-TWASM-MOCK: simple-transactions/ttry-basic.wast.
-        // Harness-only adapter mock for structured `ttry`/`tfail`/`else`
-        // failure-handler semantics. This replaces the whole fixture with an
-        // ordinary Wasm module that preserves the assertion outcomes while the
-        // real structured control-flow/runtime work stays deferred.
-        return Some(
-            r#";; SHISOFT-TWASM-MOCK: simple-transactions/ttry-basic.wast
-;; Preserves the three exported `try2` outcomes without implementing
-;; structured transactional failure-handler semantics in Wasmtime.
-(module
-  (func (export "try2") (param i32 i32 i32 i32) (result i32)
-    (if (result i32) (local.get 0)
-      (then (local.get 1))
-      (else
-        (if (result i32) (local.get 2)
-          (then (i32.add (i32.const 1) (local.get 3)))
-          (else (i32.const 2))))))
-)
-
-(assert_return (invoke "try2" (i32.const 0) (i32.const 10) (i32.const 0) (i32.const 20)) (i32.const 2))
-(assert_return (invoke "try2" (i32.const 1) (i32.const 10) (i32.const 0) (i32.const 20)) (i32.const 10))
-(assert_return (invoke "try2" (i32.const 0) (i32.const 10) (i32.const 1) (i32.const 20)) (i32.const 21))
-"#,
-        );
-    }
-
-    None
-}
-
-// SHISOFT-TWASM-MOCK: proposal text-normalization adapter.
-// This maps transactional text spellings to ordinary Wasm so early WAST
-// tranches can execute before full text-parser/object-space semantics exist.
-fn normalize_transaction_proposal_wast(wast: &str) -> String {
-    normalize_transaction_proposal_wast_with(wast, true)
-}
-
+// Proposal WAST assertions use proposal diagnostic wording. Wasmtime is allowed
+// to use equivalent local diagnostics, so keep this pass scoped to assertion
+// strings and nested `(module quote "...")` strings only.
 fn normalize_transaction_proposal_wast_diagnostics(wast: &str) -> String {
-    normalize_transaction_proposal_wast_with(wast, false)
-}
-
-fn normalize_transaction_proposal_wast_with(wast: &str, normalize_syntax: bool) -> String {
     let mut out = String::with_capacity(wast.len());
     let mut chars = wast.char_indices().peekable();
     let mut lists: Vec<ListContext> = Vec::new();
@@ -364,16 +316,11 @@ fn normalize_transaction_proposal_wast_with(wast: &str, normalize_syntax: bool) 
                         && tokens.tokens[0] == "module"
                         && tokens.tokens[1] == "quote"
                 });
-                let import_field_name = lists
-                    .last()
-                    .is_some_and(ListContext::is_spectest_import_field_name);
                 let diagnostic = lists.last().is_some_and(ListContext::is_assert_diagnostic);
                 out.push_str(&normalize_transaction_string(
                     &wast[idx..end],
                     quote_module,
-                    import_field_name,
                     diagnostic,
-                    normalize_syntax,
                 ));
                 if let Some(tokens) = lists.last_mut() {
                     if let Some(body) = wast[idx..end]
@@ -382,7 +329,6 @@ fn normalize_transaction_proposal_wast_with(wast: &str, normalize_syntax: bool) 
                     {
                         tokens.tokens.push(body.to_string());
                     }
-                    tokens.string_count += 1;
                 }
                 while chars.peek().is_some_and(|(next, _)| *next < end) {
                     chars.next();
@@ -416,11 +362,7 @@ fn normalize_transaction_proposal_wast_with(wast: &str, normalize_syntax: bool) 
             _ => {
                 let end = token_end(wast, idx);
                 let token = &wast[idx..end];
-                if normalize_syntax {
-                    out.push_str(normalize_transaction_token(token));
-                } else {
-                    out.push_str(token);
-                }
+                out.push_str(token);
                 if let Some(tokens) = lists.last_mut() {
                     tokens.tokens.push(token.to_string());
                 }
@@ -437,16 +379,9 @@ fn normalize_transaction_proposal_wast_with(wast: &str, normalize_syntax: bool) 
 #[derive(Default)]
 struct ListContext {
     tokens: Vec<String>,
-    string_count: usize,
 }
 
 impl ListContext {
-    fn is_spectest_import_field_name(&self) -> bool {
-        self.tokens.first().is_some_and(|token| token == "import")
-            && self.string_count == 1
-            && self.tokens.get(1).is_some_and(|token| token == "spectest")
-    }
-
     fn is_assert_diagnostic(&self) -> bool {
         self.tokens.first().is_some_and(|token| {
             matches!(
@@ -457,36 +392,19 @@ impl ListContext {
     }
 }
 
-fn normalize_transaction_string(
-    string: &str,
-    quote_module: bool,
-    import_field_name: bool,
-    diagnostic: bool,
-    normalize_syntax: bool,
-) -> String {
+fn normalize_transaction_string(string: &str, quote_module: bool, diagnostic: bool) -> String {
     let Some(body) = string.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
         return string.to_string();
     };
 
     if quote_module {
         let decoded = decode_module_quote_body(body);
-        let normalized = normalize_transaction_proposal_wast_with(&decoded, normalize_syntax);
+        let normalized = normalize_transaction_proposal_wast_diagnostics(&decoded);
         return format!("\"{}\"", encode_module_quote_body(&normalized));
     }
 
-    if normalize_syntax && import_field_name {
-        let normalized = normalize_transaction_import_name(body);
-        if normalized != body {
-            return format!("\"{normalized}\"");
-        }
-    }
-
     if diagnostic {
-        let normalized = if normalize_syntax {
-            normalize_transaction_diagnostic(body)
-        } else {
-            normalize_transaction_real_parser_diagnostic(body)
-        };
+        let normalized = normalize_transaction_real_parser_diagnostic(body);
         if normalized != body {
             return format!("\"{normalized}\"");
         }
@@ -517,126 +435,6 @@ fn decode_module_quote_body(body: &str) -> String {
 
 fn encode_module_quote_body(body: &str) -> String {
     body.replace('"', "\\\"")
-}
-
-fn normalize_transaction_import_name(name: &str) -> &str {
-    match name {
-        "tprint" => "print",
-        "tprint_i32" => "print_i32",
-        "tprint_i64" => "print_i64",
-        "tprint_f32" => "print_f32",
-        "tprint_f64" => "print_f64",
-        "tprint_i32_f32" => "print_i32_f32",
-        "tprint_f64_f64" => "print_f64_f64",
-        "tmemory" => "memory",
-        "tglobal_i32" => "global_i32",
-        "tglobal_i64" => "global_i64",
-        "tglobal_f32" => "global_f32",
-        "tglobal_f64" => "global_f64",
-        "ttable" => "table",
-        _ => name,
-    }
-}
-
-// SHISOFT-TWASM-MOCK: token-level semantic substitution for proposal files that
-// are not yet on the real transaction parser/runtime path. Real-parser
-// allowlisted files bypass this adapter.
-fn normalize_transaction_token(token: &str) -> &str {
-    match token {
-        "return_tcall_indirect" => "return_call_indirect",
-        "return_tcall_ref" => "return_call_ref",
-        "return_tcall" => "return_call",
-        "tcall_indirect" => "call_indirect",
-        "tcall_ref" => "call_ref",
-        "tcall" => "call",
-        "tinvoke" => "invoke",
-        "tget" => "get",
-        "tfuncref" => "funcref",
-        "tfunc" => "func",
-        "ttable.size" => "table.size",
-        "ttable.grow" => "table.grow",
-        "ttable.fill" => "table.fill",
-        "ttable.copy" => "table.copy",
-        "ttable.init" => "table.init",
-        "ttable.get" => "table.get",
-        "ttable.set" => "table.set",
-        "ttable" => "table",
-        "telem.drop" => "elem.drop",
-        "telem" => "elem",
-        "tmemory.grow" => "memory.grow",
-        "tmemory.size" => "memory.size",
-        "tmemory.copy" => "memory.copy",
-        "tmemory.fill" => "memory.fill",
-        "tmemory.init" => "memory.init",
-        "tglobal.get" => "global.get",
-        "tglobal.set" => "global.set",
-        "tglobal" => "global",
-        "tmemory" => "memory",
-        "tdata.drop" => "data.drop",
-        "tdata" => "data",
-        "v128.tload" => "v128.load",
-        "v128.tload8_splat" => "v128.load8_splat",
-        "v128.tload16_splat" => "v128.load16_splat",
-        "v128.tload32_splat" => "v128.load32_splat",
-        "v128.tload64_splat" => "v128.load64_splat",
-        "v128.tload8x8_s" => "v128.load8x8_s",
-        "v128.tload8x8_u" => "v128.load8x8_u",
-        "v128.tload16x4_s" => "v128.load16x4_s",
-        "v128.tload16x4_u" => "v128.load16x4_u",
-        "v128.tload32x2_s" => "v128.load32x2_s",
-        "v128.tload32x2_u" => "v128.load32x2_u",
-        "v128.tload32_zero" => "v128.load32_zero",
-        "v128.tload64_zero" => "v128.load64_zero",
-        "v128.tload8_lane" => "v128.load8_lane",
-        "v128.tload16_lane" => "v128.load16_lane",
-        "v128.tload32_lane" => "v128.load32_lane",
-        "v128.tload64_lane" => "v128.load64_lane",
-        "v128.tstore" => "v128.store",
-        "v128.tstore8_lane" => "v128.store8_lane",
-        "v128.tstore16_lane" => "v128.store16_lane",
-        "v128.tstore32_lane" => "v128.store32_lane",
-        "v128.tstore64_lane" => "v128.store64_lane",
-        _ => normalize_load_store_token(token),
-    }
-}
-
-// SHISOFT-TWASM-MOCK: scalar transactional load/store spelling is lowered to
-// ordinary Wasm load/store spelling only for normalized compatibility
-// fixtures. Scalar memory WAST files on the real-parser allowlist bypass this.
-fn normalize_load_store_token(token: &str) -> &str {
-    match token {
-        "i32.tload" => "i32.load",
-        "i32.tload8_s" => "i32.load8_s",
-        "i32.tload8_u" => "i32.load8_u",
-        "i32.tload16_s" => "i32.load16_s",
-        "i32.tload16_u" => "i32.load16_u",
-        "i64.tload" => "i64.load",
-        "i64.tload8_s" => "i64.load8_s",
-        "i64.tload8_u" => "i64.load8_u",
-        "i64.tload16_s" => "i64.load16_s",
-        "i64.tload16_u" => "i64.load16_u",
-        "i64.tload32_s" => "i64.load32_s",
-        "i64.tload32_u" => "i64.load32_u",
-        "f32.tload" => "f32.load",
-        "f64.tload" => "f64.load",
-        "i32.tstore" => "i32.store",
-        "i32.tstore8" => "i32.store8",
-        "i32.tstore16" => "i32.store16",
-        "i64.tstore" => "i64.store",
-        "i64.tstore8" => "i64.store8",
-        "i64.tstore16" => "i64.store16",
-        "i64.tstore32" => "i64.store32",
-        "f32.tstore" => "f32.store",
-        "f64.tstore" => "f64.store",
-        _ => token,
-    }
-}
-
-fn normalize_transaction_diagnostic(text: &str) -> String {
-    apply_transaction_diagnostic_replacements(
-        apply_transaction_diagnostic_replacements(text, TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS),
-        TRANSACTION_SYNTAX_DIAGNOSTIC_REPLACEMENTS,
-    )
 }
 
 fn normalize_transaction_real_parser_diagnostic(text: &str) -> String {
@@ -679,11 +477,6 @@ const TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
     ("unknown tglobal", "unknown global"),
     ("invalid lane index", "SIMD index out of bounds"),
 ];
-
-const TRANSACTION_SYNTAX_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[(
-    "out of bounds tmemory access",
-    "out of bounds memory access",
-)];
 
 fn apply_transaction_diagnostic_replacements(
     text: impl Into<String>,
@@ -993,7 +786,7 @@ impl WastTest {
     }
 
     /// Returns whether this proposal test uses the real transaction text parser
-    /// instead of the research normalization adapter.
+    /// and diagnostic-only assertion rewriting.
     pub fn transaction_real_text_parser(&self) -> bool {
         self.transaction_real_text_parser
     }
@@ -1318,7 +1111,9 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tcall.wast",
     "tcall_indirect.wast",
     "tcall_ref.wast",
+    "tconflict-basic.wast",
     "tconflict-tmemory.wast",
+    "tconflict-tmemory_1.wast",
     "tconst.wast",
     "tconversions.wast",
     "tdata.wast",
@@ -1368,6 +1163,7 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tswitch.wast",
     "ttraps.wast",
     "ttry-abort-commit.wast",
+    "ttry-basic.wast",
     "ttype.wast",
     "ttype-canon.wast",
     "ttype-equivalence.wast",
@@ -1458,11 +1254,11 @@ fn simple_transaction_real_text_parser_enabled(name: &str) -> bool {
 }
 
 fn tsimd_transaction_real_text_parser_enabled(name: &str) -> bool {
-    TSIMD_TRANSACTION_REAL_TEXT_MEMORY.contains(&name)
+    TSIMD_TRANSACTION_REAL_TEXT_MEMORY.contains(&name) || tsimd_transaction_proposal_enabled(name)
 }
 
 fn simple_transaction_proposal_enabled(name: &str) -> bool {
-    simple_transaction_real_text_parser_enabled(name) || matches!(name, "ttry-basic.wast")
+    simple_transaction_real_text_parser_enabled(name)
 }
 
 fn transaction_proposal_uses_real_text_parser(
@@ -1546,10 +1342,7 @@ fn tsimd_transaction_proposal_enabled(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TestConfig, TransactionProposalSuite, WastTest, normalize_transaction_proposal_wast,
-        transaction_proposal_test_config,
-    };
+    use super::{TestConfig, TransactionProposalSuite, WastTest, transaction_proposal_test_config};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1575,156 +1368,6 @@ mod tests {
             path: std::env::temp_dir()
                 .join(format!("wasmtime-{label}-{unique}-{}", std::process::id())),
         }
-    }
-
-    #[test]
-    fn normalizes_transaction_proposal_text() {
-        let wast = r#"
-            (module
-              (type $ft (tfunc (param i32) (result i32)))
-              (tmemory 1)
-              (tglobal $g (mut i32) (i32.const 0))
-              (tfunc $f (export "tcall(name)") (param i32) (result i32)
-                (tglobal.set $g (local.get 0))
-                (i32.tstore (i32.const 0) (local.get 0))
-                (i32.tload (i32.const 0)))
-              (func (export "run") (result i32)
-                (return_tcall $f (i32.const 1))))
-            (assert_return (tinvoke "run") (i32.const 1))
-            (assert_trap (tinvoke "run") "out of bounds tmemory access")
-            (assert_invalid (module) "unknown tmemory 0")
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains("(type $ft (func"));
-        assert!(normalized.contains("(memory 1)"));
-        assert!(normalized.contains("(global $g"));
-        assert!(normalized.contains("(func $f"));
-        assert!(normalized.contains("(global.set $g"));
-        assert!(normalized.contains("(i32.store"));
-        assert!(normalized.contains("(i32.load"));
-        assert!(normalized.contains("(return_call $f"));
-        assert!(normalized.contains("(invoke \"run\""));
-        assert!(normalized.contains("(export \"tcall(name)\""));
-        assert!(normalized.contains("out of bounds memory access"));
-        assert!(normalized.contains("unknown memory 0"));
-    }
-
-    #[test]
-    fn normalizes_only_module_quote_strings_recursively() {
-        let wast = r#"
-            (assert_malformed
-              (module quote "(tglobal $foo i32)")
-              "duplicate tglobal")
-            (assert_malformed
-              (module quote "(tfunc (i32.tload (i32.const 0)))")
-              "diagnostic with tcall(name)")
-            (assert_return (invoke "unknown tmemory 0"))
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains("\"(global $foo i32)\""));
-        assert!(normalized.contains("\"duplicate tglobal\""));
-        assert!(normalized.contains("\"(func (i32.load (i32.const 0)))\""));
-        assert!(normalized.contains("\"diagnostic with tcall(name)\""));
-        assert!(normalized.contains("\"unknown tmemory 0\""));
-        assert!(!normalized.contains("\"unknown memory 0\""));
-    }
-
-    #[test]
-    fn normalizes_module_quote_after_escaped_inner_strings() {
-        let wast = r#"
-            (assert_malformed
-              (module quote "(tfunc) (import \"\" \"\" (tfunc))")
-              "import after tfunction")
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains(r#""(func) (import \"\" \"\" (func))""#));
-    }
-
-    #[test]
-    fn normalizes_all_module_quote_string_fragments() {
-        let wast = r#"
-            (assert_malformed
-              (module quote
-                "(type $sig (tfunc (param i32) (result i32)))"
-                "(table 0 tfuncref)"
-                "(tfunc (result i32)"
-                "  (return_tcall_indirect (type $sig) (result i32) (param i32)"
-                "    (i32.const 0) (i32.const 0)"
-                "  )"
-                ")")
-              "unexpected token")
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains(r#""(type $sig (func (param i32) (result i32)))""#));
-        assert!(normalized.contains(r#""(table 0 funcref)""#));
-        assert!(normalized.contains(r#""(func (result i32)""#));
-        assert!(
-            normalized
-                .contains(r#""  (return_call_indirect (type $sig) (result i32) (param i32)""#)
-        );
-    }
-
-    #[test]
-    fn normalizes_transaction_spectest_import_field_names() {
-        let wast = r#"
-            (module
-              (tfunc $print_i32 (import "spectest" "tprint_i32") (param i32))
-              (tfunc $print (import "spectest" "tprint"))
-              (tfunc (export "tprint_i32") (tcall $print_i32 (i32.const 1))))
-            (assert_return (tinvoke "tprint"))
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains(r#"(func $print_i32 (import "spectest" "print_i32")"#));
-        assert!(normalized.contains(r#"(func $print (import "spectest" "print")"#));
-        assert!(normalized.contains(r#"(export "tprint_i32")"#));
-        assert!(normalized.contains(r#"(invoke "tprint")"#));
-    }
-
-    #[test]
-    fn normalizes_only_spectest_import_field_names() {
-        let wast = r#"
-            (module
-              (func (import "tprint_i32" "tprint_i32"))
-              (func (import "spectest" "tmemory"))
-              (func (import "spectest" "ttable"))
-              (func (import "spectest" "tprint_i32"))
-              (func (import "spectest" "tprint_i32_f32"))
-              (func (import "spectest" "tprint_f64_f64")))
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains(r#"(func (import "tprint_i32" "tprint_i32"))"#));
-        assert!(normalized.contains(r#"(func (import "spectest" "memory"))"#));
-        assert!(normalized.contains(r#"(func (import "spectest" "table"))"#));
-        assert!(normalized.contains(r#"(func (import "spectest" "print_i32"))"#));
-        assert!(normalized.contains(r#"(func (import "spectest" "print_i32_f32"))"#));
-        assert!(normalized.contains(r#"(func (import "spectest" "print_f64_f64"))"#));
-    }
-
-    #[test]
-    fn normalizes_transaction_memory_diagnostics() {
-        let wast = r#"
-            (assert_invalid (module (tmemory 0) (tmemory 0)) "multiple tmemories")
-            (assert_invalid (module (tmemory 65537)) "memory size must be at most 65536 pages (4GiB)")
-            (assert_return (invoke "multiple tmemories"))
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains("\"multiple memories\""));
-        assert!(normalized.contains("\"memory size must be at most 0x10000 65536-byte pages\""));
-        assert!(normalized.contains("\"multiple tmemories\""));
     }
 
     #[test]
@@ -1800,95 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_transaction_bulk_memory_tokens() {
-        let wast = r#"
-            (module
-              (tmemory 1)
-              (tdata "abc")
-              (tfunc
-                (tmemory.copy (i32.const 0) (i32.const 1) (i32.const 2))
-                (tmemory.fill (i32.const 0) (i32.const 1) (i32.const 2))
-                (tmemory.init 0 (i32.const 0) (i32.const 1) (i32.const 2))
-                (tdata.drop 0)))
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains("(memory.copy"));
-        assert!(normalized.contains("(memory.fill"));
-        assert!(normalized.contains("(memory.init 0"));
-        assert!(normalized.contains("(data.drop 0"));
-    }
-
-    #[test]
-    fn normalizes_transaction_table_and_get_tokens() {
-        let wast = r#"
-            (module
-              (table 1 funcref)
-              (func
-                (drop (ttable.size))
-                (drop (ttable.grow (ref.null func) (i32.const 0)))
-                (ttable.fill (i32.const 0) (ref.null func) (i32.const 0))
-                (ttable.copy 0 0 (i32.const 0) (i32.const 0) (i32.const 0))
-                (ttable.init 0 (i32.const 0) (i32.const 0) (i32.const 0))
-                (telem.drop 0))
-              (export "x" (ttable 0)))
-            (assert_return (tget "x"))
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains("(table.size"));
-        assert!(normalized.contains("(table.grow"));
-        assert!(normalized.contains("(table.fill"));
-        assert!(normalized.contains("(table.copy"));
-        assert!(normalized.contains("(table.init"));
-        assert!(normalized.contains("(elem.drop 0"));
-        assert!(normalized.contains(r#"(export "x" (table 0))"#));
-        assert!(normalized.contains(r#"(assert_return (get "x")"#));
-    }
-
-    #[test]
-    fn normalizes_transaction_simd_memory_tokens() {
-        let wast = r#"
-            (module
-              (tmemory 1)
-              (tfunc
-                (v128.tstore (i32.const 0) (v128.tload (i32.const 0)))
-                (drop (v128.tload8_splat (i32.const 0)))
-                (drop (v128.tload16x4_u (i32.const 0)))
-                (drop (v128.tload32_zero (i32.const 0)))
-                (drop (v128.tload8_lane 0 (i32.const 0) (v128.const i32x4 0 0 0 0)))
-                (v128.tstore64_lane 0 (i32.const 0) (v128.const i32x4 0 0 0 0))))
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains("(v128.store "));
-        assert!(normalized.contains("(v128.load "));
-        assert!(normalized.contains("(v128.load8_splat "));
-        assert!(normalized.contains("(v128.load16x4_u "));
-        assert!(normalized.contains("(v128.load32_zero "));
-        assert!(normalized.contains("(v128.load8_lane "));
-        assert!(normalized.contains("(v128.store64_lane "));
-    }
-
-    #[test]
-    fn normalizes_transaction_simd_diagnostics() {
-        let wast = r#"
-            (assert_invalid
-              (module (tfunc (result v128)
-                (v128.tload8_lane 16 (i32.const 0) (v128.const i32x4 0 0 0 0))))
-              "invalid lane index")
-        "#;
-
-        let normalized = normalize_transaction_proposal_wast(wast);
-
-        assert!(normalized.contains("\"SIMD index out of bounds\""));
-    }
-
-    #[test]
-    fn enables_transaction_proposal_ttry_basic_with_a_path_scoped_adapter_mock() {
+    fn enables_transaction_proposal_ttry_basic_with_real_parser() {
         let root = temp_transaction_dir("ttry-basic");
         let dir = root.path.join("simple-transactions");
         fs::create_dir_all(&dir).unwrap();
@@ -1930,11 +1485,7 @@ mod tests {
 
         let test = tests.into_iter().next().unwrap();
         assert!(test.transaction_proposal_enabled());
-        assert!(super::transaction_proposal_adapter_mock(&path).is_some());
-        assert!(
-            super::transaction_proposal_adapter_mock(&root.path.join("other/ttry-basic.wast"))
-                .is_none()
-        );
+        assert!(test.transaction_real_text_parser());
         assert!(test.contents.contains(r#"(func (export "try2")"#));
         assert!(test.contents.contains(
             r#"(assert_return (invoke "try2" (i32.const 0) (i32.const 10) (i32.const 0) (i32.const 20)) (i32.const 2))"#
@@ -1945,8 +1496,8 @@ mod tests {
         assert!(test.contents.contains(
             r#"(assert_return (invoke "try2" (i32.const 0) (i32.const 10) (i32.const 1) (i32.const 20)) (i32.const 21))"#
         ));
-        assert!(!test.contents.contains("(ttry"));
-        assert!(!test.contents.contains("(tfail"));
+        assert!(test.contents.contains("(ttry"));
+        assert!(test.contents.contains("(tfail"));
     }
 
     #[test]
@@ -2001,15 +1552,6 @@ mod tests {
             let test = tests.into_iter().next().unwrap();
             assert!(test.transaction_proposal_enabled(), "{name}");
             assert!(test.transaction_real_text_parser(), "{name}");
-            assert!(
-                super::transaction_proposal_adapter_mock(&path).is_none(),
-                "{name}"
-            );
-            assert!(
-                super::transaction_proposal_adapter_mock(&root.path.join(format!("other/{name}")))
-                    .is_none(),
-                "{name}"
-            );
             assert!(test.contents.contains(required), "{name}");
             assert!(test.contents.contains("(tref.null"), "{name}");
         }
@@ -2071,15 +1613,6 @@ mod tests {
             let test = tests.into_iter().next().unwrap();
             assert!(test.transaction_proposal_enabled(), "{name}");
             assert!(test.transaction_real_text_parser(), "{name}");
-            assert!(
-                super::transaction_proposal_adapter_mock(&path).is_none(),
-                "{name}"
-            );
-            assert!(
-                super::transaction_proposal_adapter_mock(&root.path.join(format!("other/{name}")))
-                    .is_none(),
-                "{name}"
-            );
             assert!(test.contents.contains(required), "{name}");
             assert!(test.contents.contains("(tref.null"), "{name}");
         }
@@ -2103,10 +1636,6 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
-            assert!(
-                super::transaction_proposal_adapter_mock(&test.path).is_none(),
-                "{name}"
-            );
         }
     }
 
@@ -2128,10 +1657,6 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
-            assert!(
-                super::transaction_proposal_adapter_mock(&test.path).is_none(),
-                "{name}"
-            );
         }
     }
 
@@ -2174,10 +1699,6 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
-            assert!(
-                super::transaction_proposal_adapter_mock(&test.path).is_none(),
-                "{name}"
-            );
         }
     }
 
@@ -2197,10 +1718,6 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
-            assert!(
-                super::transaction_proposal_adapter_mock(&test.path).is_none(),
-                "{name}"
-            );
         }
     }
 
@@ -2220,10 +1737,6 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
-            assert!(
-                super::transaction_proposal_adapter_mock(&test.path).is_none(),
-                "{name}"
-            );
         }
     }
 
@@ -2243,10 +1756,6 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
-            assert!(
-                super::transaction_proposal_adapter_mock(&test.path).is_none(),
-                "{name}"
-            );
         }
     }
 
@@ -2266,10 +1775,6 @@ mod tests {
                 TransactionProposalSuite::SimpleTransactions,
                 &test.path
             ));
-            assert!(
-                super::transaction_proposal_adapter_mock(&test.path).is_none(),
-                "{name}"
-            );
         }
     }
 
@@ -2314,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn enables_normalized_transaction_simd_proposal_tranche() {
+    fn enables_real_text_parser_transaction_simd_proposal_tranche() {
         for name in [
             "tsimd_address.wast",
             "tsimd_align.wast",
@@ -2378,10 +1883,18 @@ mod tests {
                 contents: String::new(),
                 config: TestConfig::default(),
                 transaction_proposal: Some(TransactionProposalSuite::Tsimd),
-                transaction_real_text_parser: false,
+                transaction_real_text_parser: true,
             };
 
             assert!(test.transaction_proposal_enabled(), "{name}");
+            assert!(test.transaction_real_text_parser(), "{name}");
+            assert!(
+                super::transaction_proposal_uses_real_text_parser(
+                    TransactionProposalSuite::Tsimd,
+                    &test.path,
+                ),
+                "{name}"
+            );
         }
     }
 }

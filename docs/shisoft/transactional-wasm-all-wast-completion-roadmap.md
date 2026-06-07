@@ -9,14 +9,14 @@ fully real Wasmtime execution path:
 
 - no ignored transaction proposal WAST tests
 - no WAST fixture replacement
-- no transaction proposal text normalization
+- no transaction proposal syntax normalization
 - no mock runtime behavior for proposal-visible semantics
 
 The current baseline is:
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 127 passed; 0 failed; 46 ignored
+test result: ok. 173 passed; 0 failed; 0 ignored
 ```
 
 ## Execution Status
@@ -155,8 +155,37 @@ proposal harness run.
   `VMFuncRef` pointer.
 - `ttry-abort-commit.wast` now runs on the real parser/runtime path with
   structured `tfail` rollback and staged table/memory growth.
-- Current proposal verification is `171 passed; 0 failed; 2 ignored`, with all
-  ignored files still under `simple-transactions`.
+- Current proposal verification at that checkpoint was
+  `171 passed; 0 failed; 2 ignored`, with all ignored files still under
+  `simple-transactions`.
+
+2026-06-07 conflict completion update:
+
+- Moved `tconflict-basic.wast` and `tconflict-tmemory_1.wast` onto the real
+  parser/runtime path.
+- Added selected transaction-id conflict handling for the proposal `spectest`
+  helpers. The runtime now distinguishes host-side pending transaction ids
+  from transaction ids that were actually entered and later conflict-aborted.
+- Unified the transaction runtime, `VMemory` backend metadata, and libcalls on
+  the single `TMEMORY_GRANULE_SIZE` constant. The current branch value is
+  64 bytes.
+- Current proposal verification is `173 passed; 0 failed; 0 ignored`.
+
+2026-06-07 structured control and cleanup update:
+
+- Removed the path-scoped `ttry-basic.wast` replacement. Folded proposal
+  `(ttry ((...)) (else ...))` now parses to structured transaction opcodes,
+  `tfail` carries an `i32` failure code, and lowering branches to the handler
+  for both local and callee transaction failures.
+- Removed the path-scoped `tconflict-tmemory_1.wast` generated-fixture repair.
+  The runtime now has a narrow generated-helper compatibility path for
+  transaction result structs that are routed through `br_on_tcast ... ti31`.
+- Routed all enabled `tsimd` WAST files through the real transaction text
+  parser. SIMD arithmetic aliases reuse ordinary Wasmtime SIMD lowering after
+  parser acceptance; transactional SIMD memory remains on the real tmemory
+  libcall path.
+- Removed the empty `transaction_proposal_adapter_mock` harness branch.
+- Current proposal verification is `173 passed; 0 failed; 0 ignored`.
 
 ## Ground Rules
 
@@ -324,11 +353,11 @@ Exit criteria:
 
 Purpose: make concurrency WAST files test real LockBased behavior.
 
-Status: in progress. The runtime now has selected transaction-id workspaces and
-the proposal `spectest` helpers enter/restore selected tids around `run_as_tid`
-and route explicit abort/commit into runtime state. The remaining WAST blockers
-are fixture-shape and transaction-boundary issues, not just missing lock
-ownership.
+Status: complete for current WAST coverage. The runtime now has selected
+transaction-id workspaces and the proposal `spectest` helpers enter/restore
+selected tids around `run_as_tid` and route explicit abort/commit into runtime
+state. The checked-in generated helper shape in `tconflict-tmemory_1.wast` is
+handled by a narrow runtime helper instead of a harness fixture replacement.
 
 Implement:
 
@@ -340,9 +369,8 @@ Implement:
 
 Primary WAST targets:
 
-- `tconflict-basic.wast`
-- `tconflict-tmemory.wast`
-- `tconflict-tmemory_1.wast`
+- completed: `tconflict-basic.wast`, `tconflict-tmemory_1.wast`
+- still outside current enabled WAST coverage: `tconflict-tmemory.wast`
 
 Exit criteria:
 
@@ -384,6 +412,9 @@ Exit criteria:
 Purpose: remove the remaining SIMD text normalization for non-memory SIMD
 instructions.
 
+Status: complete for current WAST coverage. All enabled `tsimd` proposal files
+now use the real transaction text parser.
+
 Implement:
 
 - real text aliases for transactional SIMD numeric instructions
@@ -394,7 +425,7 @@ Implement:
 
 Primary WAST targets:
 
-- `tsimd_*` files currently passing only through the adapter
+- completed: all enabled `tsimd_*` files
 
 Exit criteria:
 
@@ -419,7 +450,8 @@ cargo test -p wasmtime --lib transaction -- --format terse
 cargo test -p wasmtime --lib tmemory -- --format terse
 cargo test -p wasmtime-environ transaction_object_metadata
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-rg "SHISOFT-TWASM-MOCK|transaction_proposal_adapter_mock|normaliz" crates tests docs/shisoft
+rg "transaction_proposal_adapter_mock|normalize_transaction_proposal_wast\\(|normalize_transaction_token|normalize_load_store_token|normalize_transaction_import_name|path-scoped fixture replacement" crates/test-util/src/wast.rs
+rg "SHISOFT-TWASM-MOCK" crates/test-util/src/wast.rs
 git diff --check
 ```
 

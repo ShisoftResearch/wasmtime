@@ -21,7 +21,7 @@ Make Wasmtime execute a Wizard-style transactional WebAssembly slice:
 - `tmemory.grow`
 
 Milestone 1 is complete when `tmemory` has a distinct volatile mmap-backed
-storage path with 256-byte granule metadata, transactional writes use
+storage path with transaction-granule metadata, transactional writes use
 copy-on-write staging, commit writes staged values into `tmemory`, abort drops
 staged values, and migrated tests document Wizard-first behavior. The storage
 path is transitional: Eliot Moss's June 5, 2026 clarification makes the
@@ -31,7 +31,8 @@ object heap, and the object table as separate frontends.
 ## Fixed Choices
 
 - Wizard semantics are the source of truth.
-- `TMEMORY_GRANULE_SHIFT = 8`.
+- `TMEMORY_GRANULE_SHIFT = 6` for the current branch, so one transactional
+  memory granule is 64 bytes.
 - `TTABLE_GRANULE_SHIFT = 4`.
 - Ordinary `memory` stays on Wasmtime's normal volatile linear-memory path.
 - Do not retrofit ordinary Wasmtime memory into transactional memory.
@@ -97,9 +98,9 @@ shape:
   indexing.
 
 The 64 KiB Wasm page remains the linear-memory grow unit. Wizard's 256-byte
-Immix line size is copied for line marks. Wizard's 256-byte memory granule
-remains the transaction ownership and COW unit, but line marks and transaction
-granule metadata stay separate.
+Immix line size is copied for line marks. The transaction ownership and COW
+unit is the single `TMEMORY_GRANULE_SIZE` constant, currently 64 bytes; line
+marks and transaction granule metadata stay separate.
 
 ## Workstream A: Baseline And Dependency Strategy
 
@@ -268,7 +269,7 @@ Checkpoint:
 ## Workstream D: `tmemory` Storage
 
 Purpose: instantiate transactional memories through a dedicated storage path
-with side metadata for 256-byte granules. The completed flat `VMemory`
+with side metadata for `TMEMORY_GRANULE_SIZE` granules. The completed flat `VMemory`
 implementation is the executable milestone; the next storage wave should split
 the backend into shared block/chunk region infrastructure plus a `TMemoryRegion`
 frontend.
@@ -291,7 +292,7 @@ Tasks:
 - [x] Define the `tmemory` backend interface.
 - [x] Implement `VMemory` backend.
 - [x] Add `TMemory` storage type that dispatches to the configured backend.
-- [x] Add side metadata reservation for 256-byte granules.
+- [x] Add side metadata reservation for transaction granules.
 - [x] Add metadata initialization for newly live granules.
 - [x] Add copy and writeback helpers.
 - [x] Add grow and shrink helpers that update both data and metadata ranges.
@@ -308,9 +309,10 @@ Required helpers:
 
 Storage-only tests:
 
-- one Wasm page has `65536 / 256` granules
-- growing by one Wasm page adds 256 metadata records
-- copy and write back one 256-byte granule
+- one Wasm page has `WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE` granules
+- growing by one Wasm page adds `WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE`
+  metadata records
+- copy and write back one transaction granule
 - writing one granule does not modify neighboring granules
 - shrinking returns visible byte length to the old size
 
@@ -420,8 +422,8 @@ Required behavior:
 - normal transaction exit commits.
 - `tfail` aborts.
 - `tglobal.set` stages the final transactional global value.
-- `*.tstore` copies every touched 256-byte granule into the transaction write
-  set before modifying staged bytes.
+- `*.tstore` copies every touched `TMEMORY_GRANULE_SIZE` granule into the
+  transaction write set before modifying staged bytes.
 - stores crossing a granule boundary stage both granules.
 - `*.tload` reads staged bytes first, then committed `tmemory` bytes.
 - `tmemory.grow` stages the new visible size.
@@ -485,7 +487,7 @@ Tasks:
 - [ ] Add transaction-runtime unit tests.
 - [ ] Add generated binary or `.wast` tests for milestone-1 operators.
 - [ ] Split out cases requiring tables, refs, GC, SIMD, or conflict behavior.
-- [ ] Annotate expectations that depend on 256-byte Wizard granules.
+- [ ] Annotate expectations that depend on the transaction granule size.
 - [ ] Maintain exact verification commands as test names stabilize.
 
 Initial verification commands:
@@ -553,7 +555,7 @@ Exit:
 
 - milestone-1 operators execute
 - abort drops staged transactional globals
-- abort drops staged 256-byte memory granules
+- abort drops staged transaction memory granules
 - failed `tmemory.grow` leaves committed size unchanged
 - successful `tmemory.grow` grows committed storage immediately and is not
   rolled back by a later abort

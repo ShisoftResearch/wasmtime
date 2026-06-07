@@ -49,7 +49,11 @@ Important Wizard behavior observed for this design:
   begins.
 - Non-transactional-to-transactional `tcall` starts a transaction around the
   callee and ends it when the callee returns.
-- Transactional memory uses 256-byte granules.
+- Transactional memory currently uses `TMEMORY_GRANULE_SHIFT = 6`, or
+  64-byte granules. This constant is the single source of truth shared by the
+  transaction runtime, `VMemory` metadata, and transaction libcalls, so later
+  granule-size experiments should change that constant rather than per-callsite
+  arithmetic.
 - Transactional table element ownership uses 16-element granules, with table
   size tracked by a separate granule.
 - Lock-based concurrency supports optimistic reads and pessimistic writes.
@@ -155,11 +159,11 @@ inventing a Wasmtime-specific allocator shape:
 - `ListKind`: metadata, none, used, small-free, and large-free block states.
 - `LineMark`: one-byte Immix line mark.
 
-Wizard's Immix line size is 256 bytes. That currently matches Wizard's
-transactional memory granule size, but the concepts must remain separate:
-line marks are allocation/GC metadata for block-region users, while
-transaction granule metadata is ownership/version metadata for transactional
-conflict control and COW.
+Wizard's Immix line size is 256 bytes. The current transaction granule size is
+64 bytes, so the implementation must keep these concepts separate: line marks
+are allocation/GC metadata for block-region users, while transaction granule
+metadata is ownership/version metadata for transactional conflict control and
+COW.
 
 ## TMemory Storage
 

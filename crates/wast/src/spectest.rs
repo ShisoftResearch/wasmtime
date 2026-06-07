@@ -146,6 +146,7 @@ pub fn link_spectest<T>(
 #[derive(Default)]
 struct TransactionSpectestState {
     active: BTreeSet<i32>,
+    entered: BTreeSet<i32>,
     next_lo_tid: i32,
     next_hi_tid: i32,
     next_current_tid: i32,
@@ -178,11 +179,22 @@ impl TransactionSpectestState {
     fn activate(&mut self, tid: i32) {
         if tid != 0 {
             self.active.insert(tid);
+            self.entered.insert(tid);
         }
     }
 
     fn finish(&mut self, tid: i32) -> i32 {
+        self.entered.remove(&tid);
         if self.active.remove(&tid) { 0 } else { 2 }
+    }
+
+    fn finish_missing_runtime_transaction(&mut self, tid: i32) -> i32 {
+        if self.entered.contains(&tid) {
+            self.finish(tid);
+            2
+        } else {
+            self.finish(tid)
+        }
     }
 }
 
@@ -232,7 +244,7 @@ where
         linker.func_wrap("spectest", name, || -> i32 { 16 })?;
     }
     for name in ["tmemory_granule_size", "ttmemory_granule_size"] {
-        linker.func_wrap("spectest", name, || -> i32 { 256 })?;
+        linker.func_wrap("spectest", name, || -> i32 { 64 })?;
     }
 
     for name in ["abort_txn", "tabort_txn"] {
@@ -243,12 +255,13 @@ where
                     return Ok(2);
                 };
                 let runtime_aborted = caller.transaction_spectest_abort_tid(tid_raw)?;
-                let harness_code =
-                    with_transaction_spectest_state(&state, |state| state.finish(tid))?;
-                Ok(if runtime_aborted || harness_code == 0 {
-                    0
-                } else {
-                    2
+                with_transaction_spectest_state(&state, |state| {
+                    if runtime_aborted {
+                        state.finish(tid);
+                        0
+                    } else {
+                        state.finish_missing_runtime_transaction(tid)
+                    }
                 })
             }
         })?;
@@ -264,7 +277,9 @@ where
                     with_transaction_spectest_state(&state, |state| state.finish(tid))?;
                     Ok(0)
                 }
-                Ok(false) => with_transaction_spectest_state(&state, |state| state.finish(tid)),
+                Ok(false) => with_transaction_spectest_state(&state, |state| {
+                    state.finish_missing_runtime_transaction(tid)
+                }),
                 Err(_) => {
                     let _ = caller.transaction_spectest_abort_tid(tid_raw);
                     with_transaction_spectest_state(&state, |state| state.finish(tid))?;
@@ -597,7 +612,7 @@ mod tests {
         assert_eq!(abort.call(&mut store, 100_001)?, 0);
         assert_eq!(call(&mut store, "thi")?, 100_002);
         assert_eq!(abort.call(&mut store, 100_002)?, 0);
-        assert_eq!(call(&mut store, "tmemory_granule")?, 256);
+        assert_eq!(call(&mut store, "tmemory_granule")?, 64);
         assert_eq!(call(&mut store, "ttable_granule")?, 16);
 
         Ok(())

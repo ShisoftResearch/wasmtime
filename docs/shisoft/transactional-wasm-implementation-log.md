@@ -3,6 +3,10 @@
 This log records execution state for the Wizard-first transactional Wasmtime
 research branch.
 
+Older sections are chronological implementation notes and may describe mocks or
+ignore lists that were removed by later sections. Treat the current-status
+sections near the top of this file as authoritative.
+
 ## Current Roadmap
 
 Date: 2026-06-06
@@ -10,6 +14,34 @@ Date: 2026-06-06
 Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
 work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
 or object-model sequencing have drifted.
+
+## Transaction Proposal WAST Closure
+
+Date: 2026-06-07
+
+The transaction proposal WAST harness now runs the full corpus without ignored
+files on the real Wasmtime engine path:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 173 passed; 0 failed; 0 ignored
+```
+
+Changes in the closure tranche:
+
+- Promoted `simple-transactions/tconflict-basic.wast` and
+  `simple-transactions/tconflict-tmemory_1.wast` out of the ignored set.
+- Added real selected-transaction-id conflict behavior for the proposal
+  `spectest` helpers, including stale pending-id handling when the runtime
+  conflict-aborts a transaction.
+- Matched `TransactionState`, `VMemory`, and libcalls on the single
+  `TMEMORY_GRANULE_SIZE` source-of-truth constant. The current value is
+  64 bytes (`TMEMORY_GRANULE_SHIFT = 6`), while the Immix line size remains
+  256 bytes.
+- Removed the path-scoped generated-fixture bridge for
+  `simple-transactions/tconflict-tmemory_1.wast`. A narrow runtime helper now
+  handles the generated `br_on_tcast ... ti31` result-extraction shape while
+  keeping the fixture on real transaction parser/runtime backends.
 
 ## Persistent Object GC Decision
 
@@ -37,40 +69,39 @@ rg "SHISOFT-TWASM-MOCK"
 
 Current tagged mock categories:
 
-- Whole-fixture WAST harness replacements in
-  `crates/test-util/src/wast.rs` for:
-  - `simple-transactions/ttry-basic.wast`
-- Text-normalization harness adapter in `crates/test-util/src/wast.rs`.
-  It maps proposal spellings to ordinary Wasm only for compatibility fixtures
-  that are not yet on the real transaction parser/runtime path. Scalar
-  `tmemory` including `tmemory.copy/fill/init`, core numeric/control, selected
-  `ttable` funcref bulk files, SIMD transactional memory files, and the current
-  object/reference simple-transaction tranche now bypass this adapter.
+- No current `SHISOFT-TWASM-MOCK` tags remain in
+  `crates/test-util/src/wast.rs`. The harness no longer performs whole-fixture
+  replacement or transaction syntax normalization; enabled proposal WAST files
+  use the real transaction parser/runtime path. The remaining harness rewrite
+  is diagnostic-only, mapping proposal assertion strings to equivalent
+  Wasmtime-style diagnostics.
 - Runtime libcall gaps in `crates/wasmtime/src/runtime/vm/libcalls.rs`.
   Scalar `tmemory` and numeric/v128 `tglobal` ops run through real compiled
   helper paths. Numeric imported `tglobal` is supported; object struct/array
   payload operations now use the volatile `ObjectId` bridge and COW object
-  helpers. Remaining proposal-visible gaps are structured `ttry`/`tfail` and
-  multi-transaction conflict behavior.
+  helpers. Remaining gaps are durable persistent-object identity/storage and
+  replacement of the generated-helper compatibility path with final proposal
+  helper typing.
 - Transaction state/config scaffold in
   `crates/wasmtime/src/runtime/transaction.rs`. Backend, durability,
   conflict-policy, and concurrency-control selection have the future shape,
   but only store-local `LockBased` and volatile `VMemory` behavior are active.
 - Table bulk and element-object gaps in Cranelift/runtime lowering are narrowed
-  to the conflict/concurrency follow-up. The current funcref `ttable` paths
-  acquire `TTable`/`TTableSize` ownership and the enabled table fixtures execute
-  through real runtime helpers.
+  to final persistent reference/object table semantics. The current funcref
+  `ttable` paths acquire `TTable`/`TTableSize` ownership and the enabled table
+  fixtures execute through real runtime helpers.
 - Opt-in proposal `spectest` transaction helper imports in
   `crates/wast/src/spectest.rs`. This `SHISOFT-TWASM-MOCK` surface provides
   deterministic transaction ids, granule-size helpers, and synchronous helper
-  calls for harness progress. `run_as_tid`, `abort_txn`, and `tcommit_txn` now
-  drive the runtime selected-transaction-id hooks, but this is still not the
-  full Wizard scheduler.
+  calls for harness progress. `run_as_tid`, `abort_txn`, and `tcommit_txn`
+  drive the runtime selected-transaction-id hooks and exercise the first
+  store-local `LockBased` conflict path, but this is still not the full Wizard
+  scheduler.
 - The local `wasm-tools-transaction` fork also carries
   `SHISOFT_TRANSACTION_SCAFFOLD` parser comments for transaction text shapes
-  that parse proposal fixtures while later runtime semantics are still pending,
-  including permission casts, `tblock`, structured `ttry`, and folded
-  `tfail` failure-code text.
+  that parse proposal fixtures while later runtime semantics are still being
+  hardened, including permission casts, `tblock`, structured `ttry`, and
+  folded `tfail` failure-code text.
 
 ## Runtime Core Current Status
 
@@ -116,16 +147,19 @@ Implemented runtime paths:
 
 Remaining tagged mock boundaries:
 
-- Path-scoped fixture replacement for `ttry-basic`.
-- Text-normalization compatibility for fixtures outside the real-parser
-  allowlists, especially transactional refs/GC objects, `ttry`/`tfail`, binary
-  transactional encodings, and SIMD numeric-only aliases.
-- Reference/object-valued transactional global snapshots and full object-model
-  runtime operations. Numeric imported `tglobal` is on the real runtime path.
-- Table bulk-operation COW and durable reference/object permissions. Single
-  table-element `ttable.set/get` now has a runtime undo-log path for
-  transaction rollback.
-- Binary transactional type encodings such as the `0xe0` tfunc/ref encodings.
+- No path-scoped fixture replacements remain in the proposal WAST harness.
+- No transaction syntax-normalization compatibility path remains in
+  `crates/test-util/src/wast.rs`; enabled proposal files use the real parser.
+  The remaining harness rewrite is diagnostic-only.
+- Reference/object-valued transactional snapshots still bridge through raw
+  Wasmtime reference values and volatile `ObjectId` maps where the final
+  persistent object ABI is not yet installed. Numeric imported `tglobal` is on
+  the real runtime path.
+- Durable reference/object permissions and the final persistent object-table
+  backend. The current volatile `ObjectId` bridge is enough for WAST
+  execution, but it is not the final persistent object model.
+- Full proposal binary validation beyond the current WAST fixtures, including
+  hardened diagnostics for every transactional type/ref encoding.
 - Durable `FileBackedMemory` and `NVMemory` backends.
 
 Verification:
@@ -140,11 +174,8 @@ test result: ok. 39 passed; 0 failed; 0 ignored
 cargo test -p wasmtime --lib transaction
 test result: ok. 84 passed; 0 failed; 0 ignored
 
-WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
-test result: ok. 114 passed; 0 failed; 2 ignored
-
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 171 passed; 0 failed; 2 ignored
+test result: ok. 173 passed; 0 failed; 0 ignored
 ```
 
 Current promotion note:
@@ -156,10 +187,9 @@ Current promotion note:
   `tglobal`, active imported `tmemory` data initialization, and dynamic
   `tmemory` import-size matching after grow.
 
-Current ignored proposal files after the 2026-06-07 object/reference update:
+Current ignored proposal files after the 2026-06-07 conflict update:
 
-- `simple-transactions/tconflict-basic.wast`
-- `simple-transactions/tconflict-tmemory_1.wast`
+- none
 
 ## LockBased Selected Transaction IDs
 
@@ -908,6 +938,57 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Full-WAST Cleanup: Structured `ttry`, Conflict Fixture Removal, SIMD Real Parser
+
+Date: 2026-06-07
+
+Completed the remaining current-WAST cleanup waves without editing proposal WAST
+files.
+
+Implemented:
+
+- Folded proposal `(ttry ((...)) (else ...))` now emits structured transaction
+  parser opcodes in the local `wasm-tools-transaction` fork.
+- `tfail (i32)` now preserves its failure code. Wasmtime stores the pending
+  structured failure code in `TransactionState`, branches to `ttry` handlers
+  after local `tfail` and after callees return with a pending failure, and
+  clears or commits through `transaction_ttry_end`.
+- Structured `ttry` without `else` now has a hidden failure-cleanup path, so
+  failed callees skip the rest of the success body and continue after the
+  transaction boundary.
+- Removed the path-scoped `ttry-basic.wast` replacement and the
+  `tconflict-tmemory_1.wast` generated-fixture repair from the WAST harness.
+- Added a narrow runtime compatibility helper for generated conflict fixtures
+  that route transaction result structs through `br_on_tcast ... ti31`.
+- Routed every enabled `tsimd` proposal file through the real transaction text
+  parser instead of the syntax-normalization adapter.
+- Removed the empty `transaction_proposal_adapter_mock` harness branch.
+
+Verification:
+
+```text
+cargo test -p wast --manifest-path ../wasm-tools-transaction/Cargo.toml transaction_text_ttry_body_shape_parses --lib
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast --lib -- --format terse
+test result: ok. 17 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 173 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 120 passed; 0 failed
+
+rg "transaction_proposal_adapter_mock|normalize_transaction_proposal_wast\\(|normalize_transaction_token|normalize_load_store_token|normalize_transaction_import_name|path-scoped fixture replacement" crates/test-util/src/wast.rs
+no matches
+
+rg "SHISOFT-TWASM-MOCK" crates/test-util/src/wast.rs
+no matches
+
+git diff --check
+no output
+```
+
 ## Object Runtime Bridge: TStruct Scaffold And TI31 Promotion
 
 Date: 2026-06-06
@@ -1444,9 +1525,9 @@ Recorded Eliot Moss's storage clarification in the design docs:
   invariants: `PWRegionHeader`, `MetaDataDesc`, `BlockEntry`, `ChunkHeader`,
   `ListKind`, `BlockLists`, and `LineMark`.
 - The first Wasmtime block-region implementation should use Wizard's x86-64
-  Immix default of 512 KiB blocks. Wizard's 256-byte Immix line size and
-  256-byte transaction granule size are intentionally separate metadata
-  concepts even though the first values match.
+  Immix default of 512 KiB blocks. Wizard's 256-byte Immix line size and the
+  transaction granule size are intentionally separate metadata concepts. The
+  current branch transaction granule is 64 bytes.
 
 Updated docs:
 
@@ -2151,8 +2232,8 @@ This is intentionally not wired into Wasm module instantiation yet. It provides
 the storage boundary that later parser/lowering work will call into:
 
 - separate mmap-backed byte storage and granule-metadata storage
-- Wizard granule size: `TMEMORY_GRANULE_SHIFT = 8`, or 256 bytes
-- one 64 KiB Wasm page maps to 256 transactional memory granules
+- transaction granule size: `TMEMORY_GRANULE_SHIFT = 6`, or 64 bytes
+- one 64 KiB Wasm page maps to 1024 transactional memory granules
 - grow and shrink helpers update visible byte length and metadata reachability
 - copy and writeback helpers operate at one-granule scope
 - shrinking clears truncated byte and metadata ranges before reducing visible

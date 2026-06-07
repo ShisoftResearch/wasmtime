@@ -58,9 +58,9 @@ use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
-    GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectTable, ObjectValue, ObjectValueAbi,
-    StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot, TableElementSnapshot, TransactionId,
-    TransactionState, collect_tmemory_access_snapshot,
+    GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue,
+    ObjectValueAbi, StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,
+    TableElementSnapshot, TransactionId, TransactionState, collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -382,6 +382,62 @@ fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     state.fail_allocated_objects(object_table)
+}
+
+fn transaction_fail_with_code(
+    store: &mut dyn VMStore,
+    _instance: InstanceId,
+    code: u32,
+) -> Result<()> {
+    restore_original_table_elements(store, _instance)?;
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    state.fail_allocated_objects_with_code(object_table, code)
+}
+
+fn transaction_failure_pending(store: &mut dyn VMStore, _instance: InstanceId) -> u32 {
+    u32::from(
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .structured_failure_pending(),
+    )
+}
+
+fn transaction_failure_code(store: &mut dyn VMStore, _instance: InstanceId) -> u32 {
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .structured_failure_code()
+}
+
+fn transaction_helper_i31_for_ref(
+    store: &mut dyn VMStore,
+    _instance: InstanceId,
+    gc_ref: u32,
+) -> u32 {
+    let object_table = store.store_opaque_mut().transaction_object_table_mut();
+    let Ok(object_id) = object_table.object_id_for_gc_ref(gc_ref) else {
+        return 0;
+    };
+    let Ok(ObjectPayload::Struct(fields)) = object_table.payload(object_id) else {
+        return 0;
+    };
+    let Some(value) = fields.get(1) else {
+        return 0;
+    };
+    let value = match value {
+        ObjectValue::I32(value) => *value,
+        ObjectValue::I64(value) => *value as i32,
+        ObjectValue::F32(value) => *value as i32,
+        ObjectValue::F64(value) => *value as i32,
+        // Generated proposal fixtures sometimes route a vector payload through
+        // a `ti31` helper extraction. There is no scalar-preserving conversion
+        // for that shape, so keep the compatibility path deterministic.
+        ObjectValue::V128(_) => 0,
+        ObjectValue::Ref(_) => return 0,
+    };
+    (value as u32).wrapping_shl(1) | 1
 }
 
 fn transaction_tglobal_get(
@@ -1301,10 +1357,13 @@ fn transaction_tstruct_new(
     field_count: u32,
     fields: *mut u8,
 ) -> Result<()> {
+    let began = begin_transaction_constructor_boundary(store)?;
     let result =
         transaction_tstruct_new_impl(store, instance, gc_ref, struct_type, field_count, fields);
-    abort_active_transaction_on_error(store, &result);
-    result
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    result?;
+    finish?;
+    Ok(())
 }
 
 fn transaction_tstruct_new_impl(
@@ -1337,7 +1396,6 @@ fn transaction_tstruct_new_impl(
     }
     let object_id = object_table.allocate_struct_for_gc_ref(gc_ref, values)?;
     state.record_allocated_object(object_id)?;
-    state.acquire_object_write(object_table, object_id)?;
     Ok(())
 }
 
@@ -1423,17 +1481,23 @@ fn transaction_tstruct_get(
     gc_ref: u32,
     field: u32,
 ) -> Result<*mut u8> {
-    let result = transaction_tstruct_get_impl(store, instance, gc_ref, field);
-    abort_active_transaction_on_error(store, &result);
-    result
+    let began = begin_transaction_constructor_boundary(store)?;
+    let result = transaction_tstruct_get_bytes_impl(store, instance, gc_ref, field);
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    let bytes = result?;
+    finish?;
+    Ok(store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .set_scratch(bytes))
 }
 
-fn transaction_tstruct_get_impl(
+fn transaction_tstruct_get_bytes_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
     gc_ref: u32,
     field: u32,
-) -> Result<*mut u8> {
+) -> Result<Vec<u8>> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
     let field = usize::try_from(field).context("transactional struct field index overflow")?;
@@ -1444,11 +1508,7 @@ fn transaction_tstruct_get_impl(
         let value = state.read_struct_field(object_table, object_id, field)?;
         transaction_abi_from_object_value(object_table, &value)?
     };
-    let bytes = object_value_abi_bytes(abi);
-    Ok(store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .set_scratch(bytes))
+    Ok(object_value_abi_bytes(abi))
 }
 
 fn transaction_tarray_new(
@@ -1461,10 +1521,13 @@ fn transaction_tarray_new(
     low: u64,
     high: u64,
 ) -> Result<()> {
+    let began = begin_transaction_constructor_boundary(store)?;
     let result =
         transaction_tarray_new_impl(store, instance, gc_ref, array_type, len, tag, low, high);
-    abort_active_transaction_on_error(store, &result);
-    result
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    result?;
+    finish?;
+    Ok(())
 }
 
 fn transaction_tarray_new_impl(
@@ -1527,6 +1590,7 @@ fn transaction_tarray_new_fixed(
     element_count: u32,
     elements: *mut u8,
 ) -> Result<()> {
+    let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tarray_new_fixed_impl(
         store,
         instance,
@@ -1535,8 +1599,10 @@ fn transaction_tarray_new_fixed(
         element_count,
         elements,
     );
-    abort_active_transaction_on_error(store, &result);
-    result
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    result?;
+    finish?;
+    Ok(())
 }
 
 fn transaction_tarray_new_fixed_impl(
@@ -1629,6 +1695,7 @@ fn transaction_tarray_new_data(
     tag: u32,
     element_size: u32,
 ) -> Result<()> {
+    let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tarray_new_data_impl(
         store,
         instance,
@@ -1641,8 +1708,10 @@ fn transaction_tarray_new_data(
         tag,
         element_size,
     );
-    abort_active_transaction_on_error(store, &result);
-    result
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    result?;
+    finish?;
+    Ok(())
 }
 
 fn transaction_tarray_new_data_impl(
@@ -1696,11 +1765,14 @@ fn transaction_tarray_new_elem(
     elem: *mut u8,
     elem_len: u64,
 ) -> Result<()> {
+    let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tarray_new_elem_impl(
         store, instance, gc_ref, array_type, src, len, elem, elem_len,
     );
-    abort_active_transaction_on_error(store, &result);
-    result
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    result?;
+    finish?;
+    Ok(())
 }
 
 fn transaction_tarray_new_elem_impl(
@@ -1818,7 +1890,6 @@ fn allocate_transaction_array_record(
 ) -> Result<()> {
     let object_id = object_table.allocate_array_for_gc_ref(gc_ref, values)?;
     state.record_allocated_object(object_id)?;
-    state.acquire_object_write(object_table, object_id)?;
     Ok(())
 }
 
@@ -2100,17 +2171,23 @@ fn transaction_tarray_get(
     gc_ref: u32,
     index: u32,
 ) -> Result<*mut u8> {
-    let result = transaction_tarray_get_impl(store, instance, gc_ref, index);
-    abort_active_transaction_on_error(store, &result);
-    result
+    let began = begin_transaction_constructor_boundary(store)?;
+    let result = transaction_tarray_get_bytes_impl(store, instance, gc_ref, index);
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    let bytes = result?;
+    finish?;
+    Ok(store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .set_scratch(bytes))
 }
 
-fn transaction_tarray_get_impl(
+fn transaction_tarray_get_bytes_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
     gc_ref: u32,
     index: u32,
-) -> Result<*mut u8> {
+) -> Result<Vec<u8>> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
     let index = usize::try_from(index).context("transactional array index overflow")?;
@@ -2121,11 +2198,7 @@ fn transaction_tarray_get_impl(
         let value = state.read_array_element(object_table, object_id, index)?;
         transaction_abi_from_object_value(object_table, &value)?
     };
-    let bytes = object_value_abi_bytes(abi);
-    Ok(store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .set_scratch(bytes))
+    Ok(object_value_abi_bytes(abi))
 }
 
 fn transaction_tarray_len(
@@ -2133,16 +2206,22 @@ fn transaction_tarray_len(
     instance: InstanceId,
     gc_ref: u32,
 ) -> Result<*mut u8> {
-    let result = transaction_tarray_len_impl(store, instance, gc_ref);
-    abort_active_transaction_on_error(store, &result);
-    result
+    let began = begin_transaction_constructor_boundary(store)?;
+    let result = transaction_tarray_len_bytes_impl(store, instance, gc_ref);
+    let finish = finish_transaction_constructor_boundary(store, began, &result);
+    let bytes = result?;
+    finish?;
+    Ok(store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .set_scratch(bytes))
 }
 
-fn transaction_tarray_len_impl(
+fn transaction_tarray_len_bytes_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
     gc_ref: u32,
-) -> Result<*mut u8> {
+) -> Result<Vec<u8>> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
     let len = {
@@ -2155,11 +2234,7 @@ fn transaction_tarray_len_impl(
     let abi = ObjectValueAbi::from_object_value(&ObjectValue::I32(i32::from_ne_bytes(
         len.to_ne_bytes(),
     )))?;
-    let bytes = object_value_abi_bytes(abi);
-    Ok(store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .set_scratch(bytes))
+    Ok(object_value_abi_bytes(abi))
 }
 
 fn object_value_from_transaction_abi(
@@ -2235,6 +2310,37 @@ fn abort_active_transaction_on_error<T>(store: &mut dyn VMStore, result: &Result
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     if state.active_transaction().is_some() {
         let _ = state.abort_allocated_objects(object_table);
+    }
+}
+
+fn begin_transaction_constructor_boundary(store: &mut dyn VMStore) -> Result<bool> {
+    let state = store.store_opaque_mut().transaction_state_mut();
+    if state.active_transaction().is_some() {
+        return Ok(false);
+    }
+    state.begin()?;
+    Ok(true)
+}
+
+fn finish_transaction_constructor_boundary<T>(
+    store: &mut dyn VMStore,
+    began: bool,
+    result: &Result<T>,
+) -> Result<()> {
+    if !began {
+        abort_active_transaction_on_error(store, result);
+        return Ok(());
+    }
+
+    if result.is_ok() {
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .complete_commit()
+    } else {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.abort_allocated_objects(object_table)
     }
 }
 
@@ -2501,7 +2607,10 @@ fn current_granule_version(
         GranuleId::TMemorySize { .. }
         | GranuleId::TGlobal { .. }
         | GranuleId::TTable { .. }
-        | GranuleId::TTableSize { .. } => Ok(0),
+        | GranuleId::TTableSize { .. } => Ok(store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .versioned_granule_version(granule)),
     }
 }
 

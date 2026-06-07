@@ -180,7 +180,7 @@ Implementation themes:
 - alignment validation
 - endian behavior
 - traps abort transactions
-- memory copy/fill/init over multiple 256-byte granules
+- memory copy/fill/init over multiple `TMEMORY_GRANULE_SIZE` granules
 - passive data segment transaction metadata
 
 Subagent split:
@@ -191,8 +191,8 @@ Subagent split:
 
 Exit:
 
-- `tmemory.*`, `tload`, `tstore`, and bulk memory files pass under Wizard
-  256-byte granule behavior
+- `tmemory.*`, `tload`, `tstore`, and bulk memory files pass under the shared
+  `TMEMORY_GRANULE_SIZE` behavior
 
 ## Wave 3: Transactional Tables, Elements, Imports, Exports
 

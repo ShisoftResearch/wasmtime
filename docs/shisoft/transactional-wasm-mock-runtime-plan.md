@@ -4,7 +4,7 @@
 
 **Goal:** Make supported simple-transactions proposal WAST tests run through the real Wasmtime engine using a mock transactional runtime backed by ordinary Wasmtime memory.
 
-**Architecture:** Keep ordinary Wasmtime memory/global allocation unchanged. Transaction operators continue to lower to transaction libcalls; those libcalls use `TransactionState` for staged copy-on-write writes, deterministic 256-byte granule conflict checks, and commit/abort behavior. Unsupported proposal features remain disabled in the WAST harness until their semantics exist.
+**Architecture:** Keep ordinary Wasmtime memory/global allocation unchanged. Transaction operators continue to lower to transaction libcalls; those libcalls use `TransactionState` for staged copy-on-write writes, deterministic `TMEMORY_GRANULE_SIZE` conflict checks, and commit/abort behavior. Unsupported proposal features remain disabled in the WAST harness until their semantics exist.
 
 **Tech Stack:** Rust, Wasmtime runtime VM libcalls, `wasmtime-environ` transaction metadata, local patched wasm-tools `wast`/`wat`, existing WAST test harness.
 

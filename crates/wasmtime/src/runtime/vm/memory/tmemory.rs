@@ -7,7 +7,9 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
-use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
+use crate::runtime::transaction::{
+    TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TransactionConfig,
+};
 use wasmtime_environ::MemoryIndex;
 
 pub(crate) mod block_region;
@@ -17,12 +19,6 @@ use self::linear_region::TMemoryRegion;
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
 const DEFAULT_MAX_WASM_PAGES: u64 = 1 << 16;
-
-/// Wizard-compatible transactional memory granule shift.
-pub const TMEMORY_GRANULE_SHIFT: usize = 8;
-
-/// Wizard-compatible transactional memory granule size in bytes.
-pub const TMEMORY_GRANULE_SIZE: usize = 1 << TMEMORY_GRANULE_SHIFT;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TMemoryGranuleInfo {
@@ -504,6 +500,8 @@ fn unsupported_backend_error(backend: TMemoryBackend) -> Error {
 mod tests {
     use super::*;
 
+    const GRANULES_PER_WASM_PAGE: usize = WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE;
+
     #[test]
     fn wizard_layout_constants_match_reference() {
         assert_eq!(block_region::BLOCK_SIZE, 512 * 1024);
@@ -521,7 +519,7 @@ mod tests {
 
         assert_eq!(memory.backend(), TMemoryBackend::VMemory);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
-        assert_eq!(memory.granule_len(), 256);
+        assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE);
     }
 
     #[test]
@@ -569,7 +567,7 @@ mod tests {
 
         assert_eq!(memory.backend_kind(), TMemoryBackend::VMemory);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
-        assert_eq!(memory.granule_count(), 512);
+        assert_eq!(memory.granule_count(), GRANULES_PER_WASM_PAGE * 2);
 
         memory.commit_range(8, &[0xaa, 0xbb, 0xcc, 0xdd]).unwrap();
 
@@ -695,18 +693,18 @@ mod tests {
     fn vmemory_grow_initializes_new_granule_metadata() {
         let mut memory = TMemory::new(TransactionConfig::default(), 1, Some(2)).unwrap();
 
-        assert_eq!(memory.granule_count(), 256);
+        assert_eq!(memory.granule_count(), GRANULES_PER_WASM_PAGE);
 
         memory.grow_to_pages(2).unwrap();
 
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
-        assert_eq!(memory.granule_count(), 512);
+        assert_eq!(memory.granule_count(), GRANULES_PER_WASM_PAGE * 2);
         assert_eq!(
-            memory.granule_info(256).unwrap(),
+            memory.granule_info(GRANULES_PER_WASM_PAGE).unwrap(),
             TMemoryGranuleInfo::default()
         );
         assert_eq!(
-            memory.granule_info(511).unwrap(),
+            memory.granule_info(GRANULES_PER_WASM_PAGE * 2 - 1).unwrap(),
             TMemoryGranuleInfo::default()
         );
     }
@@ -804,27 +802,30 @@ mod tests {
     fn one_wasm_page_has_wizard_granules() {
         let memory = VMemory::new(1, Some(1)).unwrap();
 
-        assert_eq!(TMEMORY_GRANULE_SIZE, 256);
+        assert_eq!(TMEMORY_GRANULE_SIZE, 64);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
-        assert_eq!(memory.granule_len(), 256);
-        assert_eq!(memory.granule_capacity(), 256);
+        assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE);
+        assert_eq!(memory.granule_capacity(), GRANULES_PER_WASM_PAGE);
         assert_eq!(VMemory::granule_index(0).unwrap(), 0);
-        assert_eq!(VMemory::granule_index(255).unwrap(), 0);
-        assert_eq!(VMemory::granule_index(256).unwrap(), 1);
+        assert_eq!(VMemory::granule_index(63).unwrap(), 0);
+        assert_eq!(VMemory::granule_index(64).unwrap(), 1);
     }
 
     #[test]
     fn growing_one_page_adds_granule_metadata() {
         let mut memory = VMemory::new(1, Some(2)).unwrap();
 
-        assert_eq!(memory.granule_len(), 256);
-        assert_eq!(memory.granule_capacity(), 512);
+        assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE);
+        assert_eq!(memory.granule_capacity(), GRANULES_PER_WASM_PAGE * 2);
 
         memory.grow_to_pages(2).unwrap();
 
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
-        assert_eq!(memory.granule_len(), 512);
-        assert_eq!(memory.txn_info(511).unwrap(), TMemoryGranuleInfo::default());
+        assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE * 2);
+        assert_eq!(
+            memory.txn_info(GRANULES_PER_WASM_PAGE * 2 - 1).unwrap(),
+            TMemoryGranuleInfo::default()
+        );
     }
 
     #[test]
@@ -905,7 +906,7 @@ mod tests {
 
         memory
             .set_txn_info(
-                256,
+                GRANULES_PER_WASM_PAGE,
                 TMemoryGranuleInfo {
                     owner: 0xff,
                     version: 0xff,
@@ -913,7 +914,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_ne!(memory.txn_info(256).unwrap(), TMemoryGranuleInfo::default());
+        assert_ne!(
+            memory.txn_info(GRANULES_PER_WASM_PAGE).unwrap(),
+            TMemoryGranuleInfo::default()
+        );
 
         memory.shrink_to_pages(1).unwrap();
         memory.grow_to_pages(2).unwrap();
@@ -922,6 +926,9 @@ mod tests {
             memory.read(WASM_PAGE_SIZE..WASM_PAGE_SIZE + 8).unwrap(),
             [0; 8]
         );
-        assert_eq!(memory.txn_info(256).unwrap(), TMemoryGranuleInfo::default());
+        assert_eq!(
+            memory.txn_info(GRANULES_PER_WASM_PAGE).unwrap(),
+            TMemoryGranuleInfo::default()
+        );
     }
 }

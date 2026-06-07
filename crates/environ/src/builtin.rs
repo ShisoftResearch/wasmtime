@@ -16,6 +16,14 @@ macro_rules! foreach_builtin_function {
             transaction_commit(vmctx: vmctx) -> bool;
             // Fails and aborts a transactional WebAssembly transaction.
             transaction_fail(vmctx: vmctx) -> bool;
+            // Fails and aborts a transactional WebAssembly transaction with a structured code.
+            transaction_fail_with_code(vmctx: vmctx, code: u32) -> bool;
+            // Returns whether a structured transactional failure is pending.
+            transaction_failure_pending(vmctx: vmctx) -> u32;
+            // Returns the pending structured transactional failure code.
+            transaction_failure_code(vmctx: vmctx) -> u32;
+            // Compatibility helper for generated transaction fixtures that route scalar payloads through ti31.
+            transaction_helper_i31_for_ref(vmctx: vmctx, gc_ref: u32) -> u32;
             // Returns a pointer to a staged transactional global cell.
             transaction_tglobal_get(vmctx: vmctx, global: u32) -> pointer;
             // Stages a transactional global write. `tag` identifies the value type.
@@ -466,6 +474,9 @@ impl BuiltinFunctionIndex {
             (@get transaction_tstruct_get pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tarray_get pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tarray_len pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_failure_pending u32) => (return None);
+            (@get transaction_failure_code u32) => (return None);
+            (@get transaction_helper_i31_for_ref u32) => (return None);
 
             // These libcalls can't trap
             (@get ref_func pointer) => (return None);

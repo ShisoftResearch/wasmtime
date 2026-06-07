@@ -319,7 +319,7 @@ Add tests for:
 
 - `tstore` stages bytes and does not mutate committed `VMemory` before commit.
 - `tload` reads staged bytes first.
-- crossing a 256-byte granule boundary stages both granules.
+- crossing a `TMEMORY_GRANULE_SIZE` boundary stages both granules.
 - abort/fail drops staged bytes.
 - commit writes staged bytes into committed `VMemory`.
 - `tmemory.grow` stages visible pages and commit applies them.
@@ -347,7 +347,7 @@ Add helpers to `TransactionState`:
 - `stage_tmemory_grow`
 - `commit_into_vmemory`
 
-Use `TMEMORY_GRANULE_SHIFT = 8`.
+Use the shared `TMEMORY_GRANULE_SHIFT`/`TMEMORY_GRANULE_SIZE` constants.
 
 - [ ] **Step 4: Wire libcall helpers**
 

@@ -127,7 +127,8 @@ The next storage refactor must introduce a lower shared region layer:
 - `MappedLinearRegion`: maps a chunk list into a contiguous virtual reservation
   for linear-memory execution.
 - `TMemoryRegion`: linear-memory frontend over `MappedLinearRegion`, with
-  Wizard-style 256-byte transaction granules.
+  transaction granules derived from the single `TMEMORY_GRANULE_SIZE`
+  constant. The current branch value is 64 bytes.
 - `ObjectHeapRegion`: later object-payload frontend over the same block/chunk
   substrate.
 - `ObjectTableRegion`: later object-table frontend whose persistent chunks are
@@ -138,7 +139,7 @@ Backend block size is a policy of `BlockRegionBackend`. The first
 implementation should copy Wizard's x86-64 Immix region default:
 `MemRegions.BlockSize = 512 KiB`. For `TMemoryRegion`, block size must remain a
 multiple of the 64 KiB Wasm page size. The 64 KiB Wasm page remains the
-grow/accounting unit, and the 256-byte Wizard granule remains the transaction
+grow/accounting unit, and `TMEMORY_GRANULE_SIZE` remains the transaction
 conflict/COW unit.
 
 Copy Wizard's block-region layout names and roles directly:
@@ -318,7 +319,8 @@ git commit -m "Add mapped transactional linear region"
 Cover:
 
 - `(tmemory 0)` stays cheap.
-- grow by one page initializes 256 new transaction granules.
+- grow by one page initializes `WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE` new
+  transaction granules.
 - commit/read across a chunk boundary preserves bytes.
 - line marks remain separate from transaction granule metadata.
 

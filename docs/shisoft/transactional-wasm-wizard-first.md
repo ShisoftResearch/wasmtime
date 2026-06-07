@@ -44,10 +44,12 @@ Wizard implementation areas to mirror:
 
 ## Compatibility Choices
 
-Use Wizard's granule constants for the first Wasmtime implementation:
+Use Wizard's granule model for the first Wasmtime implementation, but keep the
+memory granule size centralized so experiments can adjust it by changing one
+constant:
 
-- `TMEMORY_GRANULE_SHIFT = 8`, so each transactional memory granule is 256
-  bytes.
+- `TMEMORY_GRANULE_SHIFT = 6` in the current branch, so each transactional
+  memory granule is 64 bytes.
 - `TTABLE_GRANULE_SHIFT = 4`, so each transactional table granule is 16 table
   entries.
 
@@ -164,10 +166,10 @@ mmap-backed regions:
 In Wizard, the linear memory reserves a large inaccessible address range, then
 uses `mprotect` to make the currently live pages readable and writable. For a
 transactional memory, Wizard also reserves a granule-info region sized by
-`TMEMORY_GRANULE_SHIFT`. Each 256-byte memory granule has a corresponding
-metadata record containing transaction ownership/version information and a hash.
-Growing and shrinking `tmemory` changes both the live linear-memory range and
-the live granule-info range.
+`TMEMORY_GRANULE_SHIFT`. Each `TMEMORY_GRANULE_SIZE` memory granule has a
+corresponding metadata record containing transaction ownership/version
+information and a hash. Growing and shrinking `tmemory` changes both the live
+linear-memory range and the live granule-info range.
 
 Wasmtime should copy the execution shape while making the storage substrate
 block/chunk based:
@@ -356,7 +358,7 @@ Wizard unit semantics to mirror as Rust tests:
 - failed `tmemory.grow` leaves committed size unchanged
 - successful `tmemory.grow` is visible immediately and survives later abort
 - multiple writes to one granule update one staged buffer
-- writes across two 256-byte granules stage both granules
+- writes across two transaction granules stage both granules
 - commit writes staged values
 
 ## Milestone 2: Bulk Memory And Tables
@@ -542,12 +544,12 @@ Milestone 1 is complete when:
 - Wasmtime can compile and run a module containing milestone-1 transactional
   operators.
 - `tfail` aborts and drops staged transactional globals.
-- `tfail` aborts and drops every staged 256-byte memory granule.
+- `tfail` aborts and drops every staged transaction memory granule.
 - failed `tmemory.grow` leaves committed memory size unchanged; successful
   `tmemory.grow` grows committed storage immediately and is not rolled back by
   a later transaction abort.
 - `tmemory` is allocated through a distinct storage path with side metadata for
-  256-byte granules, even if the backend is still volatile.
+  transaction granules, even if the backend is still volatile.
 - successful transactions write staged final global and memory values at
   commit.
 - transactional and non-transactional object spaces are rejected when mixed.
