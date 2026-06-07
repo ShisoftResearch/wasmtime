@@ -235,12 +235,44 @@ where
         linker.func_wrap("spectest", name, || -> i32 { 256 })?;
     }
 
-    for name in ["abort_txn", "tabort_txn", "tcommit_txn"] {
+    for name in ["abort_txn", "tabort_txn"] {
         linker.func_wrap("spectest", name, {
             let state = state.clone();
-            move |tid: i32| with_transaction_spectest_state(&state, |state| state.finish(tid))
+            move |mut caller: Caller<'_, T>, tid: i32| -> Result<i32> {
+                let Some(tid_raw) = transaction_spectest_tid(tid) else {
+                    return Ok(2);
+                };
+                let runtime_aborted = caller.transaction_spectest_abort_tid(tid_raw)?;
+                let harness_code =
+                    with_transaction_spectest_state(&state, |state| state.finish(tid))?;
+                Ok(if runtime_aborted || harness_code == 0 {
+                    0
+                } else {
+                    2
+                })
+            }
         })?;
     }
+    linker.func_wrap("spectest", "tcommit_txn", {
+        let state = state.clone();
+        move |mut caller: Caller<'_, T>, tid: i32| -> Result<i32> {
+            let Some(tid_raw) = transaction_spectest_tid(tid) else {
+                return Ok(2);
+            };
+            match caller.transaction_spectest_commit_tid(tid_raw) {
+                Ok(true) => {
+                    with_transaction_spectest_state(&state, |state| state.finish(tid))?;
+                    Ok(0)
+                }
+                Ok(false) => with_transaction_spectest_state(&state, |state| state.finish(tid)),
+                Err(_) => {
+                    let _ = caller.transaction_spectest_abort_tid(tid_raw);
+                    with_transaction_spectest_state(&state, |state| state.finish(tid))?;
+                    Ok(1)
+                }
+            }
+        }
+    })?;
 
     let run_as_ty = FuncType::new(
         store.engine(),
@@ -264,21 +296,50 @@ where
                     results[1] = Val::AnyRef(None);
                     return Ok(());
                 };
+                let Some(tid_raw) = transaction_spectest_tid(tid) else {
+                    results[0] = Val::I32(2);
+                    results[1] = Val::AnyRef(None);
+                    return Ok(());
+                };
+                let previous = match caller.transaction_spectest_enter_tid(tid_raw) {
+                    Ok(previous) => previous,
+                    Err(error) if error.to_string().contains("already current") => {
+                        results[0] = Val::I32(2);
+                        results[1] = Val::AnyRef(None);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
                 with_transaction_spectest_state(&state, |state| {
                     state.activate(tid);
                     0
                 })?;
 
                 let mut call_results = [Val::AnyRef(None)];
-                func.call(&mut caller, &params[2..3], &mut call_results)?;
-                results[0] = Val::I32(0);
-                results[1] = call_results[0].clone();
+                let call_result = func.call(&mut caller, &params[2..3], &mut call_results);
+                caller.transaction_spectest_restore_tid(previous)?;
+                match call_result {
+                    Ok(()) => {
+                        results[0] = Val::I32(0);
+                        results[1] = call_results[0].clone();
+                    }
+                    Err(_) => {
+                        let _ = caller.transaction_spectest_abort_tid(tid_raw);
+                        with_transaction_spectest_state(&state, |state| state.finish(tid))?;
+                        results[0] = Val::I32(1);
+                        results[1] = Val::AnyRef(None);
+                    }
+                }
                 Ok(())
             }
         })?;
     }
 
     Ok(())
+}
+
+fn transaction_spectest_tid(tid: i32) -> Option<u64> {
+    u64::try_from(tid).ok().filter(|tid| *tid != 0)
 }
 
 #[cfg(feature = "component-model")]

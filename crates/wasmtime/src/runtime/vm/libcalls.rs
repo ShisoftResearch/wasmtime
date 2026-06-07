@@ -59,7 +59,7 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectTable, ObjectValue, ObjectValueAbi,
-    StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot, TableElementSnapshot,
+    StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot, TableElementSnapshot, TransactionId,
     TransactionState, collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
@@ -307,6 +307,35 @@ fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<(
     let result = transaction_commit_impl(store, instance);
     abort_active_transaction_on_error(store, &result);
     result
+}
+
+pub(crate) fn transaction_commit_selected_for_host(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    transaction: TransactionId,
+) -> Result<bool> {
+    let previous = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        if !state.transaction_is_open(transaction) {
+            return Ok(false);
+        }
+        if state.active_transaction() == Some(transaction) {
+            None
+        } else {
+            state.enter_transaction(transaction)?
+        }
+    };
+
+    let result = transaction_commit_impl(store, instance);
+    abort_active_transaction_on_error(store, &result);
+    let restore_result = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .restore_transaction(previous);
+
+    result?;
+    restore_result?;
+    Ok(true)
 }
 
 fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {

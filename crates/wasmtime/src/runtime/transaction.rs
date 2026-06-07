@@ -5,7 +5,7 @@ use crate::runtime::store::InstanceId;
 use crate::runtime::vm::TMemory;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use core::ops::Range;
+use core::{mem, ops::Range};
 
 #[path = "transaction/object_heap.rs"]
 mod object_heap;
@@ -30,8 +30,8 @@ pub(crate) enum TMemoryBackend {
     NVMemory,
 }
 
-/// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. `LockBased` is
-/// store-local today and must move behind the future transaction object table.
+/// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. `LockBased` is the
+/// only implemented policy today and remains store-local.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcurrencyControl {
     LockBased,
@@ -129,6 +129,23 @@ pub(crate) struct TransactionState {
     failed: bool,
     next_id: u64,
     locks: LockBased,
+    suspended: BTreeMap<TransactionId, TransactionWorkspace>,
+    staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
+    staged_granules: BTreeMap<GranuleId, Vec<u8>>,
+    staged_memory_sizes: BTreeMap<GranuleId, u64>,
+    staged_table_sizes: BTreeMap<GranuleId, u64>,
+    staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
+    original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
+    staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    allocated_objects: Vec<ObjectId>,
+    read_granules: BTreeSet<GranuleId>,
+    write_granules: BTreeSet<GranuleId>,
+    scratch: Vec<u8>,
+    pending_memory_store: Option<PendingMemoryStore>,
+}
+
+#[derive(Debug, Default)]
+struct TransactionWorkspace {
     staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
     staged_granules: BTreeMap<GranuleId, Vec<u8>>,
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
@@ -150,6 +167,7 @@ impl Default for TransactionState {
             failed: false,
             next_id: 1,
             locks: LockBased::default(),
+            suspended: BTreeMap::new(),
             staged_globals: BTreeMap::new(),
             staged_granules: BTreeMap::new(),
             staged_memory_sizes: BTreeMap::new(),
@@ -818,8 +836,8 @@ pub(crate) trait TransactionConcurrencyControl {
 
 #[derive(Debug, Default)]
 pub(crate) struct LockBased {
-    // SHISOFT-TWASM-MOCK: the real tmemory path still feeds store-local
-    // `instance: None`/version `0` through `TransactionConcurrencyControl`.
+    // SHISOFT-TWASM-MOCK: versioned persistent backends are still incomplete,
+    // so some non-object granules feed version `0` through the lock manager.
     owners: BTreeMap<GranuleId, TransactionId>,
     read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
 }
@@ -1034,6 +1052,79 @@ impl TransactionState {
             .context("transaction id overflow")?;
         self.active = Some(id);
         Ok(id)
+    }
+
+    pub(crate) fn enter_transaction(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<Option<TransactionId>> {
+        ensure!(
+            !self.failed,
+            "cannot enter transaction while structured ttry failure is pending"
+        );
+        ensure!(
+            self.active != Some(transaction),
+            "transaction id is already current"
+        );
+        let previous = self.suspend_active_workspace()?;
+        let workspace = self.suspended.remove(&transaction).unwrap_or_default();
+        self.install_workspace(workspace);
+        self.active = Some(transaction);
+        Ok(previous)
+    }
+
+    pub(crate) fn restore_transaction(&mut self, previous: Option<TransactionId>) -> Result<()> {
+        self.suspend_active_workspace()?;
+        match previous {
+            Some(transaction) => {
+                let workspace = self
+                    .suspended
+                    .remove(&transaction)
+                    .with_context(|| format!("transaction is not suspended: {transaction:?}"))?;
+                self.install_workspace(workspace);
+                self.active = Some(transaction);
+            }
+            None => {
+                self.install_workspace(TransactionWorkspace::default());
+                self.active = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transaction_is_open(&self, transaction: TransactionId) -> bool {
+        self.active == Some(transaction) || self.suspended.contains_key(&transaction)
+    }
+
+    pub(crate) fn abort_transaction(&mut self, transaction: TransactionId) -> Result<bool> {
+        if self.active == Some(transaction) {
+            self.abort()?;
+            return Ok(true);
+        }
+        if self.suspended.remove(&transaction).is_some() {
+            self.locks.release_transaction(transaction);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn abort_transaction_allocated_objects(
+        &mut self,
+        object_table: &mut ObjectTable,
+        transaction: TransactionId,
+    ) -> Result<bool> {
+        if self.active == Some(transaction) {
+            self.abort_allocated_objects(object_table)?;
+            return Ok(true);
+        }
+        let Some(workspace) = self.suspended.remove(&transaction) else {
+            return Ok(false);
+        };
+        for object_id in workspace.allocated_objects.iter().rev().copied() {
+            object_table.free(object_id)?;
+        }
+        self.locks.release_transaction(transaction);
+        Ok(true)
     }
 
     pub(crate) fn active_transaction(&self) -> Option<TransactionId> {
@@ -2536,22 +2627,55 @@ impl TransactionState {
         Ok(())
     }
 
+    fn suspend_active_workspace(&mut self) -> Result<Option<TransactionId>> {
+        let Some(transaction) = self.active.take() else {
+            return Ok(None);
+        };
+        let workspace = self.take_workspace();
+        ensure!(
+            self.suspended.insert(transaction, workspace).is_none(),
+            "transaction workspace is already suspended"
+        );
+        Ok(Some(transaction))
+    }
+
+    fn take_workspace(&mut self) -> TransactionWorkspace {
+        TransactionWorkspace {
+            staged_globals: mem::take(&mut self.staged_globals),
+            staged_granules: mem::take(&mut self.staged_granules),
+            staged_memory_sizes: mem::take(&mut self.staged_memory_sizes),
+            staged_table_sizes: mem::take(&mut self.staged_table_sizes),
+            staged_table_elements: mem::take(&mut self.staged_table_elements),
+            original_table_elements: mem::take(&mut self.original_table_elements),
+            staged_objects: mem::take(&mut self.staged_objects),
+            allocated_objects: mem::take(&mut self.allocated_objects),
+            read_granules: mem::take(&mut self.read_granules),
+            write_granules: mem::take(&mut self.write_granules),
+            scratch: mem::take(&mut self.scratch),
+            pending_memory_store: self.pending_memory_store.take(),
+        }
+    }
+
+    fn install_workspace(&mut self, workspace: TransactionWorkspace) {
+        self.staged_globals = workspace.staged_globals;
+        self.staged_granules = workspace.staged_granules;
+        self.staged_memory_sizes = workspace.staged_memory_sizes;
+        self.staged_table_sizes = workspace.staged_table_sizes;
+        self.staged_table_elements = workspace.staged_table_elements;
+        self.original_table_elements = workspace.original_table_elements;
+        self.staged_objects = workspace.staged_objects;
+        self.allocated_objects = workspace.allocated_objects;
+        self.read_granules = workspace.read_granules;
+        self.write_granules = workspace.write_granules;
+        self.scratch = workspace.scratch;
+        self.pending_memory_store = workspace.pending_memory_store;
+    }
+
     fn clear_active(&mut self) {
         if let Some(transaction) = self.active.take() {
             self.locks.release_transaction(transaction);
         }
-        self.staged_globals.clear();
-        self.staged_granules.clear();
-        self.staged_memory_sizes.clear();
-        self.staged_table_sizes.clear();
-        self.staged_table_elements.clear();
-        self.original_table_elements.clear();
-        self.staged_objects.clear();
-        self.allocated_objects.clear();
-        self.read_granules.clear();
-        self.write_granules.clear();
-        self.scratch.clear();
-        self.pending_memory_store = None;
+        self.install_workspace(TransactionWorkspace::default());
     }
 }
 
@@ -4074,6 +4198,60 @@ mod tests {
 
         state.begin().unwrap();
         state.acquire_memory_granule_read(0, 0).unwrap();
+    }
+
+    #[test]
+    fn lock_based_transaction_ids_keep_separate_workspaces() {
+        let mut state = TransactionState::default();
+        let first = TransactionId::from_raw(11);
+        let second = TransactionId::from_raw(22);
+
+        assert_eq!(state.enter_transaction(first).unwrap(), None);
+        state.stage_global(0, GlobalSnapshot::I32(11)).unwrap();
+
+        assert_eq!(state.enter_transaction(second).unwrap(), Some(first));
+        state.stage_global(1, GlobalSnapshot::I32(22)).unwrap();
+        assert_eq!(state.staged_global_owned(None, 0), None);
+        assert_eq!(
+            state.staged_global_owned(None, 1),
+            Some(GlobalSnapshot::I32(22))
+        );
+
+        state.restore_transaction(Some(first)).unwrap();
+        assert_eq!(
+            state.staged_global_owned(None, 0),
+            Some(GlobalSnapshot::I32(11))
+        );
+        assert_eq!(state.staged_global_owned(None, 1), None);
+
+        state.restore_transaction(None).unwrap();
+        assert_eq!(state.active_transaction(), None);
+        assert!(state.transaction_is_open(first));
+        assert!(state.transaction_is_open(second));
+    }
+
+    #[test]
+    fn aborting_suspended_transaction_releases_only_its_locks() {
+        let mut state = TransactionState::default();
+        let first = TransactionId::from_raw(11);
+        let second = TransactionId::from_raw(22);
+
+        state.enter_transaction(first).unwrap();
+        state
+            .acquire_memory_granule_write(0, 0, vec![0xaa; TMEMORY_GRANULE_SIZE])
+            .unwrap();
+        state.enter_transaction(second).unwrap();
+        state
+            .acquire_memory_granule_write(0, 1, vec![0xbb; TMEMORY_GRANULE_SIZE])
+            .unwrap();
+
+        let conflict = state.acquire_memory_granule_read(0, 0).unwrap_err();
+        assert!(conflict.to_string().contains("transaction read conflict"));
+
+        assert!(state.abort_transaction(first).unwrap());
+        state.acquire_memory_granule_read(0, 0).unwrap();
+        assert!(state.owns_memory_granule_write(0, 1));
+        assert!(!state.abort_transaction(first).unwrap());
     }
 
     #[test]

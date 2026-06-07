@@ -2138,6 +2138,41 @@ impl<T> Caller<'_, T> {
         self.store.data_mut()
     }
 
+    #[doc(hidden)]
+    pub fn transaction_spectest_enter_tid(&mut self, tid: u64) -> Result<Option<u64>> {
+        self.store
+            .0
+            .transaction_state_mut()
+            .enter_transaction(crate::runtime::transaction::TransactionId::from_raw(tid))
+            .map(|previous| previous.map(crate::runtime::transaction::TransactionId::as_raw))
+    }
+
+    #[doc(hidden)]
+    pub fn transaction_spectest_restore_tid(&mut self, previous: Option<u64>) -> Result<()> {
+        self.store
+            .0
+            .transaction_state_mut()
+            .restore_transaction(previous.map(crate::runtime::transaction::TransactionId::from_raw))
+    }
+
+    #[doc(hidden)]
+    pub fn transaction_spectest_abort_tid(&mut self, tid: u64) -> Result<bool> {
+        let (state, object_table) = self.store.0.transaction_state_and_object_table_mut();
+        state.abort_transaction_allocated_objects(
+            object_table,
+            crate::runtime::transaction::TransactionId::from_raw(tid),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn transaction_spectest_commit_tid(&mut self, tid: u64) -> Result<bool> {
+        crate::runtime::vm::libcalls::transaction_commit_selected_for_host(
+            self.store.0,
+            self.caller.id(),
+            crate::runtime::transaction::TransactionId::from_raw(tid),
+        )
+    }
+
     /// Returns the underlying [`Engine`] this store is connected to.
     pub fn engine(&self) -> &Engine {
         self.store.engine()

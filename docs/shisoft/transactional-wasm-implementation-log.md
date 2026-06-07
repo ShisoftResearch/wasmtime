@@ -62,9 +62,10 @@ Current tagged mock categories:
   through real runtime helpers.
 - Opt-in proposal `spectest` transaction helper imports in
   `crates/wast/src/spectest.rs`. This `SHISOFT-TWASM-MOCK` surface provides
-  deterministic transaction ids, granule-size helpers, and synchronous
-  `run_as_tid` calls for harness progress; it is not the real Wizard scheduler
-  or lock-based multi-transaction runtime.
+  deterministic transaction ids, granule-size helpers, and synchronous helper
+  calls for harness progress. `run_as_tid`, `abort_txn`, and `tcommit_txn` now
+  drive the runtime selected-transaction-id hooks, but this is still not the
+  full Wizard scheduler.
 - The local `wasm-tools-transaction` fork also carries
   `SHISOFT_TRANSACTION_SCAFFOLD` parser comments for transaction text shapes
   that parse proposal fixtures while later runtime semantics are still pending,
@@ -86,7 +87,8 @@ Implemented runtime paths:
 - `GranuleId::TMemory`, `TMemorySize`, `TGlobal`, `TTable`, and `TTableSize`.
   `TStruct` and `TArray` are wired to `ObjectId` through the first in-memory
   `ObjectTable` foundation.
-- Store-local `LockBased` optimistic-read/pessimistic-write ownership.
+- Store-local `LockBased` optimistic-read/pessimistic-write ownership with
+  selected transaction-id workspaces.
 - Generic runtime read/write permission acquisition over every `GranuleId`
   kind; memory, globals, tables, memory/table sizes, and object granules now
   share one permission path.
@@ -158,6 +160,46 @@ Current ignored proposal files after the 2026-06-07 object/reference update:
 
 - `simple-transactions/tconflict-basic.wast`
 - `simple-transactions/tconflict-tmemory_1.wast`
+
+## LockBased Selected Transaction IDs
+
+Date: 2026-06-07
+
+Added the first runtime slice needed by the conflict WAST workstream:
+
+- `TransactionState` now supports selected transaction ids with separate
+  suspended workspaces. Existing transaction operators continue to read and
+  write the current workspace, while `enter_transaction`/`restore_transaction`
+  can switch the current workspace around a nested call.
+- The shared `LockBased` ownership table remains store-local and is shared by
+  every selected transaction id, so pessimistic write ownership and optimistic
+  read-version validation work across suspended transactions.
+- Added selected abort and selected commit hooks. Selected commit reuses the
+  existing staged-record application path used by compiled `transaction_commit`.
+- The proposal `spectest` helpers now use doc-hidden `Caller` hooks to enter a
+  selected tid for `run_as_tid`, restore the previous tid after the call, and
+  route `abort_txn`/`tcommit_txn` into runtime transaction state.
+
+Still deferred:
+
+- `tconflict-basic.wast` cannot simply be promoted yet. On the real-parser path
+  it reaches `general_conflict_test`, which creates transactional arrays in an
+  ordinary function before any explicit transaction boundary. That conflicts
+  with the current Wizard-first rule that t-prefixed operations require an
+  active transaction.
+- `tconflict-tmemory_1.wast` still has the separate WAST/type-shape issue where
+  an `i32` `ti31.get_s` result feeds an `i64` local in the generated conflict
+  helper.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 118 passed; 0 failed
+
+cargo test -p wasmtime-wast transaction_spectest_helpers_match_fixture_ids_and_granules -- --format terse
+test result: ok. 1 passed; 0 failed
+```
 
 ## Structured TTry And Growth Rollback
 

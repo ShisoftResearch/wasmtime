@@ -324,9 +324,16 @@ Exit criteria:
 
 Purpose: make concurrency WAST files test real LockBased behavior.
 
+Status: in progress. The runtime now has selected transaction-id workspaces and
+the proposal `spectest` helpers enter/restore selected tids around `run_as_tid`
+and route explicit abort/commit into runtime state. The remaining WAST blockers
+are fixture-shape and transaction-boundary issues, not just missing lock
+ownership.
+
 Implement:
 
 - real transaction spectest helper semantics for multiple transaction ids
+  (partially complete for selected runtime tid switching)
 - object/table/memory conflict routes through one `GranuleId` permission layer
 - deterministic abort on conflict, without automatic retry
 - conflict tests for optimistic read validation and pessimistic write ownership
@@ -342,6 +349,9 @@ Exit criteria:
 - conflict WAST files no longer rely on smoke-only behavior.
 - `crates/wast/src/spectest.rs` transaction helper mocks are either removed or
   narrowed to non-semantic test harness plumbing.
+- ordinary conflict helper setup either moves behind an explicit transaction
+  boundary or has a documented Wizard-compatible rule for t-prefixed object
+  construction in helper functions.
 
 ## Wave 7: Binary Transaction Encodings
 
