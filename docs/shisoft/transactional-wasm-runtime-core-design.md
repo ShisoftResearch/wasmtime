@@ -24,6 +24,8 @@ The executable runtime core includes:
 The persistent object direction adds:
 
 - `ObjectId` as the runtime identity for persistent transactional objects.
+- `ObjectId` as the persistent identity for transactional function objects and
+  persistent function references.
 - A persistent transactional object heap separate from ordinary Wasmtime GC.
 - Backend object records with explicit object headers.
 - Commit-time promotion from transaction-local volatile objects into persistent
@@ -283,6 +285,8 @@ The runtime identity split is:
 ```text
 ordinary volatile object runtime identity = VMGcRef
 persistent object runtime identity        = ObjectId
+ordinary Wasmtime function metadata       = FuncIndex / compiled code handles
+persistent transactional function identity = ObjectId
 ```
 
 `ObjectId` is used at runtime only for persistent transactional objects. It is
@@ -296,6 +300,14 @@ Transactional references are `ObjectId`-carrying runtime values, not ordinary
 GC references backed by a side table. A transitional implementation may need a
 Wasmtime-compatible wrapper while parser, lowering, and ABI plumbing are being
 replaced, but the semantic identity of a persistent `tref` is `ObjectId`.
+
+The same rule applies to transactional function references. Wasmtime
+`FuncIndex`, `VMFuncRef`, and compiled-code handles identify executable code
+inside the current process/module, but they are not persistent identity. A
+persistent transactional function reference is a function object table entry
+identified by `ObjectId`; its payload may point to module/function metadata,
+signature metadata, and compiled entry stubs, but the stable reference stored in
+persistent objects, roots, tables, and transaction workspaces is the `ObjectId`.
 
 Persistent object records live in `ObjectHeapRegion` and are reached through the
 object table:
@@ -480,7 +492,9 @@ Object-table-facing constraints:
   pages inaccessible and with deliberate gaps between persistent,
   non-transactional shared, and transaction-local object-id ranges.
 - Persistent object payloads store references as `ObjectId`s, never raw
-  `VMGcRef`s, process-local pointers, or PMEM addresses.
+  `VMGcRef`s, `VMFuncRef`s, process-local pointers, or PMEM addresses.
+- Persistent transactional function references are stored as `ObjectId`s whose
+  object-table payload describes the target function metadata.
 - Ordinary volatile Wasmtime objects can enter the persistent graph only through
   transaction commit promotion.
 
@@ -541,18 +555,21 @@ order:
 1. Keep the executable `tfunc`, `tmemory`, `tglobal`, `ttable`, and SIMD
    transaction paths stable while removing remaining parser/harness scaffolds.
 2. Define the `ObjectId`-carrying `tref` runtime representation and ABI boundary.
-3. Add volatile `VMemory` object-heap records and object-table slots with the
+3. Define transactional function objects so persistent `tfunc` and function
+   references use `ObjectId` identity while Wasmtime function indices remain
+   payload metadata.
+4. Add volatile `VMemory` object-heap records and object-table slots with the
    explicit `TxObjectHeader` shape.
-4. Wire `tstruct` and `tarray` operators to `ObjectId`, whole-object granules,
+5. Wire `tstruct` and `tarray` operators to `ObjectId`, whole-object granules,
    and COW payload staging.
-5. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
+6. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
    persistent `ObjectId` graphs.
-6. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
+7. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
    metadata so persistent GC can be added without changing committed formats.
-7. Implement `ttry`/`tfail` structured failure semantics after transaction entry,
+8. Implement `ttry`/`tfail` structured failure semantics after transaction entry,
    object COW, promotion, and ownership are stable.
-8. Add the first non-moving persistent `ObjectId` mark/sweep collector.
-9. Add file-backed and NVMemory backends behind the same block/chunk interfaces.
+9. Add the first non-moving persistent `ObjectId` mark/sweep collector.
+10. Add file-backed and NVMemory backends behind the same block/chunk interfaces.
 
 This order keeps ordinary Wasmtime GC isolated while the persistent object heap
 is brought online, then adds persistent reachability collection after the

@@ -126,12 +126,17 @@ impl TransactionId {
 #[derive(Debug)]
 pub(crate) struct TransactionState {
     active: Option<TransactionId>,
+    failed: bool,
     next_id: u64,
     locks: LockBased,
     staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
     staged_granules: BTreeMap<GranuleId, Vec<u8>>,
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
+    staged_table_sizes: BTreeMap<GranuleId, u64>,
+    staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
+    original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    allocated_objects: Vec<ObjectId>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
     scratch: Vec<u8>,
@@ -142,12 +147,17 @@ impl Default for TransactionState {
     fn default() -> Self {
         Self {
             active: None,
+            failed: false,
             next_id: 1,
             locks: LockBased::default(),
             staged_globals: BTreeMap::new(),
             staged_granules: BTreeMap::new(),
             staged_memory_sizes: BTreeMap::new(),
+            staged_table_sizes: BTreeMap::new(),
+            staged_table_elements: BTreeMap::new(),
+            original_table_elements: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
+            allocated_objects: Vec::new(),
             read_granules: BTreeSet::new(),
             write_granules: BTreeSet::new(),
             scratch: Vec::new(),
@@ -174,6 +184,17 @@ pub(crate) enum StagedRecord {
         memory_index: u32,
         new_pages: u64,
     },
+    TableSize {
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        new_elements: u64,
+    },
+    TableElement {
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        element_index: u64,
+        value: TableElementSnapshot,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +210,15 @@ pub(crate) enum GlobalSnapshot {
     /// enabled for references.
     GcRef(u32),
     FuncRef(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TableElementSnapshot {
+    /// Raw `VMFuncRef` pointer address, with `0` representing null.
+    FuncRef(usize),
+    /// Raw nullable `VMGcRef` word. This is a volatile scaffold until
+    /// persistent references use `ObjectId`.
+    GcRef(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -360,7 +390,9 @@ pub(crate) enum ObjectPayload {
     Array(Vec<ObjectValue>),
     I31(i32),
     Extern(u64),
-    Func(u32),
+    // The payload stores Wasmtime/module-local function metadata. The function
+    // object's identity is the `ObjectId` table slot that owns this payload.
+    Func(u64),
 }
 
 impl ObjectPayload {
@@ -397,12 +429,16 @@ struct ObjectTableSlot {
 pub(crate) struct ObjectTable {
     slots: Vec<Option<ObjectTableSlot>>,
     free_list: Vec<ObjectId>,
-    // SHISOFT-TWASM-MOCK: this volatile side map lets the first transactional
-    // object libcalls use Wasmtime GC refs while the persistent-object GC is
-    // still future work. A moving/persistent collector must replace raw
-    // `VMGcRef` keys with stable persistent object headers.
+    // SHISOFT-TWASM-MOCK: these volatile side maps let the first transactional
+    // object libcalls use Wasmtime GC refs and VMFuncRef pointers while the
+    // persistent-object runtime is still coming online. The final form uses
+    // `ObjectId` as the canonical identifier for persistent objects and
+    // transactional function objects; raw Wasmtime refs are only live wrappers
+    // around that identity.
     gc_ref_to_object: BTreeMap<u32, ObjectId>,
     object_to_gc_ref: BTreeMap<ObjectId, u32>,
+    func_ref_to_object: BTreeMap<u64, ObjectId>,
+    object_to_func_ref: BTreeMap<ObjectId, u64>,
     next_version: u64,
     live_count: usize,
     heap: object_heap::ObjectHeap,
@@ -437,6 +473,40 @@ impl ObjectTable {
 
     pub(crate) fn allocate_array(&mut self, elements: Vec<ObjectValue>) -> Result<ObjectId> {
         self.allocate_payload(ObjectPayload::Array(elements))
+    }
+
+    pub(crate) fn allocate_array_for_gc_ref(
+        &mut self,
+        gc_ref: u32,
+        elements: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        ensure!(
+            gc_ref != 0,
+            "transactional array object cannot use null GC ref"
+        );
+        ensure!(
+            !self.gc_ref_to_object.contains_key(&gc_ref),
+            "transactional object GC ref is already associated"
+        );
+        let object_id = self.allocate_array(elements)?;
+        self.associate_gc_ref(gc_ref, object_id)?;
+        Ok(object_id)
+    }
+
+    pub(crate) fn object_id_for_raw_ref_or_func(&mut self, raw_ref: u64) -> Result<ObjectId> {
+        ensure!(raw_ref != 0, "transactional object cannot use null ref");
+        if let Ok(gc_ref) = u32::try_from(raw_ref)
+            && let Some(object_id) = self.gc_ref_to_object.get(&gc_ref).copied()
+        {
+            return Ok(object_id);
+        }
+        if let Some(object_id) = self.func_ref_to_object.get(&raw_ref).copied() {
+            return Ok(object_id);
+        }
+
+        let object_id = self.allocate_payload(ObjectPayload::Func(raw_ref))?;
+        self.associate_func_ref(raw_ref, object_id)?;
+        Ok(object_id)
     }
 
     pub(crate) fn allocate_payload(&mut self, payload: ObjectPayload) -> Result<ObjectId> {
@@ -503,6 +573,32 @@ impl ObjectTable {
         Ok(())
     }
 
+    pub(crate) fn associate_func_ref(&mut self, func_ref: u64, object_id: ObjectId) -> Result<()> {
+        ensure!(
+            func_ref != 0,
+            "transactional function object cannot use null VMFuncRef"
+        );
+        ensure!(
+            self.kind(object_id)? == ObjectKind::Func,
+            "transactional function ref can only be associated with function objects"
+        );
+        if let Some(existing) = self.func_ref_to_object.get(&func_ref).copied() {
+            ensure!(
+                existing == object_id,
+                "transactional function ref is already associated"
+            );
+        }
+        if let Some(existing) = self.object_to_func_ref.get(&object_id).copied() {
+            ensure!(
+                existing == func_ref,
+                "transactional function object is already associated with another VMFuncRef"
+            );
+        }
+        self.func_ref_to_object.insert(func_ref, object_id);
+        self.object_to_func_ref.insert(object_id, func_ref);
+        Ok(())
+    }
+
     pub(crate) fn object_id_for_gc_ref(&self, gc_ref: u32) -> Result<ObjectId> {
         ensure!(gc_ref != 0, "transactional object cannot use null GC ref");
         self.gc_ref_to_object
@@ -519,6 +615,14 @@ impl ObjectTable {
             .with_context(|| {
                 format!("transactional object has no GC ref association: {object_id:?}")
             })
+    }
+
+    pub(crate) fn raw_ref_for_object_id(&self, object_id: ObjectId) -> Result<u64> {
+        self.live_slot(object_id)?;
+        if let Some(func_ref) = self.object_to_func_ref.get(&object_id).copied() {
+            return Ok(func_ref);
+        }
+        Ok(u64::from(self.gc_ref_for_object_id(object_id)?))
     }
 
     pub(crate) fn slot_count(&self) -> usize {
@@ -590,6 +694,9 @@ impl ObjectTable {
         if let Some(gc_ref) = self.object_to_gc_ref.remove(&object_id) {
             self.gc_ref_to_object.remove(&gc_ref);
         }
+        if let Some(func_ref) = self.object_to_func_ref.remove(&object_id) {
+            self.func_ref_to_object.remove(&func_ref);
+        }
         self.bump_object_version()?;
         self.free_list.push(object_id);
         self.live_count = self
@@ -653,6 +760,13 @@ pub(crate) enum GranuleId {
     TStruct { object_id: ObjectId },
     #[allow(dead_code)]
     TArray { object_id: ObjectId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct TableElementKey {
+    instance: Option<u32>,
+    table_index: u32,
+    element_index: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -906,6 +1020,10 @@ impl TransactionConcurrencyControl for LockBased {
 impl TransactionState {
     pub(crate) fn begin(&mut self) -> Result<TransactionId> {
         ensure!(
+            !self.failed,
+            "cannot begin transaction while structured ttry failure is pending"
+        );
+        ensure!(
             self.active.is_none(),
             "transaction is already active in this store"
         );
@@ -920,6 +1038,14 @@ impl TransactionState {
 
     pub(crate) fn active_transaction(&self) -> Option<TransactionId> {
         self.active
+    }
+
+    pub(crate) fn structured_failure_pending(&self) -> bool {
+        self.failed
+    }
+
+    pub(crate) fn clear_structured_failure(&mut self) {
+        self.failed = false;
     }
 
     pub(crate) fn acquire_granule_read(
@@ -1065,6 +1191,28 @@ impl TransactionState {
                 new_pages,
             });
         }
+        for (key, &new_elements) in &self.staged_table_sizes {
+            let GranuleId::TTableSize {
+                instance,
+                table_index,
+            } = *key
+            else {
+                bail!("staged table size map contains non-table-size key");
+            };
+            records.push(StagedRecord::TableSize {
+                owner_instance: granule_owner_instance(instance),
+                table_index,
+                new_elements,
+            });
+        }
+        for (key, &value) in &self.staged_table_elements {
+            records.push(StagedRecord::TableElement {
+                owner_instance: granule_owner_instance(key.instance),
+                table_index: key.table_index,
+                element_index: key.element_index,
+                value,
+            });
+        }
         Ok(records)
     }
 
@@ -1074,8 +1222,38 @@ impl TransactionState {
         Ok(())
     }
 
+    pub(crate) fn record_allocated_object(&mut self, object_id: ObjectId) -> Result<bool> {
+        self.ensure_active()?;
+        if self.allocated_objects.contains(&object_id) {
+            return Ok(false);
+        }
+        self.allocated_objects.push(object_id);
+        Ok(true)
+    }
+
+    pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
+        self.ensure_active()?;
+        for object_id in self.allocated_objects.iter().rev().copied() {
+            object_table.free(object_id)?;
+        }
+        self.clear_active();
+        Ok(())
+    }
+
+    pub(crate) fn fail_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
+        self.abort_allocated_objects(object_table)?;
+        self.failed = true;
+        Ok(())
+    }
+
     pub(crate) fn fail(&mut self) -> Result<()> {
         self.abort()
+    }
+
+    pub(crate) fn fail_structured(&mut self) -> Result<()> {
+        self.abort()?;
+        self.failed = true;
+        Ok(())
     }
 
     pub(crate) fn stage_memory_size(&mut self, memory_index: u32, new_pages: u64) -> Result<bool> {
@@ -1097,6 +1275,16 @@ impl TransactionState {
                 new_pages,
             )
             .is_none())
+    }
+
+    pub(crate) fn staged_memory_size_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+    ) -> Option<u64> {
+        self.staged_memory_sizes
+            .get(&memory_size_granule_id(owner_instance, memory_index))
+            .copied()
     }
 
     pub(crate) fn stage_global(
@@ -1126,6 +1314,95 @@ impl TransactionState {
     ) -> Option<GlobalSnapshot> {
         self.staged_globals
             .get(&global_granule_id(owner_instance, global_index))
+            .copied()
+    }
+
+    pub(crate) fn stage_table_element_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        element_index: u64,
+        value: TableElementSnapshot,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        self.acquire_table_granule_write_owned(owner_instance, table_index, element_index, 0)?;
+        Ok(self
+            .staged_table_elements
+            .insert(
+                table_element_key(owner_instance, table_index, element_index),
+                value,
+            )
+            .is_none())
+    }
+
+    pub(crate) fn stage_table_element_with_original_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        element_index: u64,
+        original: TableElementSnapshot,
+        value: TableElementSnapshot,
+    ) -> Result<bool> {
+        let key = table_element_key(owner_instance, table_index, element_index);
+        self.original_table_elements.entry(key).or_insert(original);
+        self.stage_table_element_owned(owner_instance, table_index, element_index, value)
+    }
+
+    pub(crate) fn staged_table_element_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        element_index: u64,
+    ) -> Option<TableElementSnapshot> {
+        self.staged_table_elements
+            .get(&table_element_key(
+                owner_instance,
+                table_index,
+                element_index,
+            ))
+            .copied()
+    }
+
+    pub(crate) fn original_table_elements(
+        &self,
+    ) -> Vec<(Option<InstanceId>, u32, u64, TableElementSnapshot)> {
+        self.original_table_elements
+            .iter()
+            .map(|(key, &value)| {
+                (
+                    granule_owner_instance(key.instance),
+                    key.table_index,
+                    key.element_index,
+                    value,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn stage_table_size_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+        new_elements: u64,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        self.acquire_table_size_write_owned(owner_instance, table_index, 0)?;
+        Ok(self
+            .staged_table_sizes
+            .insert(
+                table_size_granule_id(owner_instance, table_index),
+                new_elements,
+            )
+            .is_none())
+    }
+
+    pub(crate) fn staged_table_size_owned(
+        &self,
+        owner_instance: Option<InstanceId>,
+        table_index: u32,
+    ) -> Option<u64> {
+        self.staged_table_sizes
+            .get(&table_size_granule_id(owner_instance, table_index))
             .copied()
     }
 
@@ -1772,6 +2049,24 @@ impl TransactionState {
         Ok(())
     }
 
+    pub(crate) fn write_array_range(
+        &mut self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+        start: usize,
+        values: Vec<ObjectValue>,
+    ) -> Result<()> {
+        let payload = self.read_object_payload(object_table, object_id)?;
+        let ObjectPayload::Array(mut elements) = payload else {
+            bail!("object is not an array");
+        };
+        let end = checked_array_range_end(start, values.len())?;
+        ensure!(end <= elements.len(), "out of bounds array access");
+        elements[start..end].clone_from_slice(&values);
+        self.stage_object_payload(object_table, object_id, ObjectPayload::Array(elements))?;
+        Ok(())
+    }
+
     pub(crate) fn copy_array_range(
         &mut self,
         object_table: &ObjectTable,
@@ -2248,7 +2543,11 @@ impl TransactionState {
         self.staged_globals.clear();
         self.staged_granules.clear();
         self.staged_memory_sizes.clear();
+        self.staged_table_sizes.clear();
+        self.staged_table_elements.clear();
+        self.original_table_elements.clear();
         self.staged_objects.clear();
+        self.allocated_objects.clear();
         self.read_granules.clear();
         self.write_granules.clear();
         self.scratch.clear();
@@ -2420,6 +2719,18 @@ fn table_granule_id_from_u64(
     }
 }
 
+fn table_element_key(
+    owner_instance: Option<InstanceId>,
+    table_index: u32,
+    element_index: u64,
+) -> TableElementKey {
+    TableElementKey {
+        instance: granule_instance(owner_instance),
+        table_index,
+        element_index,
+    }
+}
+
 fn table_size_granule_id(owner_instance: Option<InstanceId>, table_index: u32) -> GranuleId {
     GranuleId::TTableSize {
         instance: granule_instance(owner_instance),
@@ -2487,8 +2798,15 @@ pub(crate) fn execute_research_transaction_fixture(
             wasmtime_environ::TransactionOperator::TTry => {
                 state.begin()?;
             }
+            wasmtime_environ::TransactionOperator::TTryEnd => {
+                if state.active_transaction().is_some() {
+                    state.commit()?;
+                } else {
+                    state.clear_structured_failure();
+                }
+            }
             wasmtime_environ::TransactionOperator::TFail => {
-                state.fail()?;
+                state.fail_structured()?;
             }
             other => {
                 bail!(
@@ -4600,6 +4918,52 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_abort_frees_objects_allocated_by_active_transaction() {
+        let mut objects = ObjectTable::default();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        state.record_allocated_object(object).unwrap();
+        assert_eq!(objects.live_count(), 1);
+
+        state.abort_allocated_objects(&mut objects).unwrap();
+
+        assert!(state.active_transaction().is_none());
+        assert_eq!(objects.live_count(), 0);
+        assert!(objects.kind(object).is_err());
+
+        let reused = objects.allocate_array(vec![ObjectValue::I32(2)]).unwrap();
+        assert_eq!(reused, object);
+    }
+
+    #[test]
+    fn transaction_object_commit_keeps_objects_allocated_by_active_transaction() {
+        let mut objects = ObjectTable::default();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        state.record_allocated_object(object).unwrap();
+        state.complete_commit().unwrap();
+
+        assert_eq!(objects.live_count(), 1);
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1)])
+        );
+
+        state.begin().unwrap();
+        state.abort_allocated_objects(&mut objects).unwrap();
+
+        assert_eq!(objects.live_count(), 1);
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1)])
+        );
+    }
+
+    #[test]
     fn transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges() {
         let mut objects = ObjectTable::default();
         let object = objects
@@ -4630,13 +4994,21 @@ mod tests {
         state
             .copy_array_range(&objects, object, 0, object, 2, 3)
             .unwrap();
+        state
+            .write_array_range(
+                &objects,
+                object,
+                1,
+                vec![ObjectValue::I32(30), ObjectValue::I32(31)],
+            )
+            .unwrap();
 
         assert_eq!(
             state.read_object_payload(&objects, object).unwrap(),
             ObjectPayload::Array(vec![
                 ObjectValue::I32(20),
-                ObjectValue::I32(9),
-                ObjectValue::I32(9),
+                ObjectValue::I32(30),
+                ObjectValue::I32(31),
                 ObjectValue::I32(9),
                 ObjectValue::I32(9),
             ])
@@ -4660,8 +5032,8 @@ mod tests {
             objects.payload(object).unwrap(),
             ObjectPayload::Array(vec![
                 ObjectValue::I32(20),
-                ObjectValue::I32(9),
-                ObjectValue::I32(9),
+                ObjectValue::I32(30),
+                ObjectValue::I32(31),
                 ObjectValue::I32(9),
                 ObjectValue::I32(9),
             ])
@@ -5158,6 +5530,39 @@ mod tests {
         execute_research_transaction_fixture(&mut state, &operators).unwrap();
 
         assert_eq!(state.active_transaction(), None);
+        assert!(state.structured_failure_pending());
+        state.clear_structured_failure();
+        assert!(!state.structured_failure_pending());
+    }
+
+    #[test]
+    fn fixture_executor_ttry_end_consumes_pending_failure() {
+        let mut state = TransactionState::default();
+        let operators = [
+            wasmtime_environ::ResearchTransactionModuleOperator {
+                function_index: 0,
+                body_offset: 0,
+                operator: wasmtime_environ::TransactionOperator::TTry,
+                bytes_read: 2,
+            },
+            wasmtime_environ::ResearchTransactionModuleOperator {
+                function_index: 0,
+                body_offset: 2,
+                operator: wasmtime_environ::TransactionOperator::TFail,
+                bytes_read: 2,
+            },
+            wasmtime_environ::ResearchTransactionModuleOperator {
+                function_index: 0,
+                body_offset: 4,
+                operator: wasmtime_environ::TransactionOperator::TTryEnd,
+                bytes_read: 2,
+            },
+        ];
+
+        execute_research_transaction_fixture(&mut state, &operators).unwrap();
+
+        assert_eq!(state.active_transaction(), None);
+        assert!(!state.structured_failure_pending());
     }
 
     #[test]
@@ -5354,29 +5759,30 @@ mod tests {
             wat::parse_str(
                 r#"
                 (module
-                  (type $s (struct (field (mut i32))))
-                  (type $ps (struct (field (mut i8))))
-                  (type $a (array (mut i32)))
-                  (type $pa (array (mut i8)))
-                  (type $ra (array (mut funcref)))
-                  (func $f)
+                  (type $s (tstruct (field (mut i32))))
+                  (type $ps (tstruct (field (mut i8))))
+                  (type $a (tarray (mut i32)))
+                  (type $pa (tarray (mut i8)))
+                  (type $ra (tarray (mut (tref $s))))
                   (data $d "\00\01\02\03")
-                  (elem $e func $f $f)
-                  (func (export "object-smoke") (result i32)
-                    (local $sref (ref $s))
-                    (local $psref (ref $ps))
-                    (local $aref (ref $a))
-                    (local $aref2 (ref $a))
-                    (local $paref (ref $pa))
-                    (local $raref (ref $ra))
+                  (elem $e (tref $s)
+                    (tstruct.new $s (i32.const 1))
+                    (tstruct.new $s (i32.const 2)))
+                  (tfunc (export "object-smoke") (result i32)
+                    (local $sref (tref $s))
+                    (local $psref (tref $ps))
+                    (local $aref (tref $a))
+                    (local $aref2 (tref $a))
+                    (local $paref (tref $pa))
+                    (local $raref (tref $ra))
                     (local.set $sref
                       (tstruct.new $s (i32.const 41)))
                     (drop (tstruct.new_default $s))
                     (local.set $psref
                       (tstruct.new $ps (i32.const -1)))
-                    (drop (tstruct.get_s $ps 0 (local.get $psref)))
-                    (drop (tstruct.get_u $ps 0 (local.get $psref)))
-                    (tstruct.set $s 0 (local.get $sref) (i32.const 42))
+                    (drop (tstruct.get_s $ps 0 (tref.cast_read (local.get $psref))))
+                    (drop (tstruct.get_u $ps 0 (tref.cast_read (local.get $psref))))
+                    (tstruct.set $s 0 (tref.cast_write (local.get $sref)) (i32.const 42))
                     (local.set $aref
                       (tarray.new $a (i32.const 7) (i32.const 4)))
                     (local.set $aref2
@@ -5387,30 +5793,30 @@ mod tests {
                     (local.set $raref
                       (tarray.new_elem $ra $e (i32.const 0) (i32.const 2)))
                     (tarray.set $a
-                      (local.get $aref)
+                      (tref.cast_write (local.get $aref))
                       (i32.const 1)
                       (i31.get_s (tref.ti31 (i32.const 13))))
                     (drop (tarray.len (local.get $aref)))
-                    (drop (tarray.get_s $pa (local.get $paref) (i32.const 0)))
-                    (drop (tarray.get_u $pa (local.get $paref) (i32.const 0)))
+                    (drop (tarray.get_s $pa (tref.cast_read (local.get $paref)) (i32.const 0)))
+                    (drop (tarray.get_u $pa (tref.cast_read (local.get $paref)) (i32.const 0)))
                     (tarray.fill $a
-                      (local.get $aref)
+                      (tref.cast_write (local.get $aref))
                       (i32.const 2)
                       (i32.const 5)
                       (i32.const 1))
                     (tarray.copy $a $a
-                      (local.get $aref)
+                      (tref.cast_write (local.get $aref))
                       (i32.const 3)
-                      (local.get $aref2)
+                      (tref.cast_read (local.get $aref2))
                       (i32.const 0)
                       (i32.const 1))
                     (tarray.init_data $pa $d
-                      (local.get $paref)
+                      (tref.cast_write (local.get $paref))
                       (i32.const 1)
                       (i32.const 0)
                       (i32.const 1))
                     (tarray.init_elem $ra $e
-                      (local.get $raref)
+                      (tref.cast_write (local.get $raref))
                       (i32.const 0)
                       (i32.const 0)
                       (i32.const 1))
@@ -5418,8 +5824,8 @@ mod tests {
                     (drop (tany.convert_textern
                       (textern.convert_tany (tref.ti31 (i32.const 7)))))
                     (i32.add
-                      (tstruct.get $s 0 (local.get $sref))
-                      (tarray.get $a (local.get $aref) (i32.const 1)))))
+                      (tstruct.get $s 0 (tref.cast_read (local.get $sref)))
+                      (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 1)))))
                 "#,
             )
             .unwrap(),
@@ -5428,7 +5834,7 @@ mod tests {
     }
 
     #[test]
-    fn module_compilation_rejects_transaction_struct_reference_fields_for_now() {
+    fn module_compilation_rejects_transaction_i31_reference_fields_for_now() {
         let mut config = crate::Config::new();
         config.wasm_gc(true);
         let engine = crate::Engine::new(&config).unwrap();
@@ -5447,7 +5853,7 @@ mod tests {
         .unwrap_err();
         let error = format!("{error:?}");
         assert!(
-            error.contains("transactional struct reference fields are not implemented yet"),
+            error.contains("transactional i31 reference ObjectId values are not implemented yet"),
             "{error}"
         );
     }
@@ -5461,13 +5867,13 @@ mod tests {
             &engine,
             r#"
             (module
-              (type $s (struct (field (mut i32))))
+              (type $s (tstruct (field (mut i32))))
               (tfunc (export "create_set_get") (result i32)
-                (local $sref (ref $s))
+                (local $sref (tref $s))
                 (local.set $sref
                   (tstruct.new $s (i32.const 41)))
-                (tstruct.set $s 0 (local.get $sref) (i32.const 42))
-                (tstruct.get $s 0 (local.get $sref)))
+                (tstruct.set $s 0 (tref.cast_write (local.get $sref)) (i32.const 42))
+                (tstruct.get $s 0 (tref.cast_read (local.get $sref))))
               (tfunc (export "i31s") (result i32)
                 (ti31.get_s (tref.ti31 (i32.const 0x7fffffff))))
               (tfunc (export "i31u") (result i32)
@@ -5497,5 +5903,160 @@ mod tests {
                 .unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(42)])
         );
+    }
+
+    #[test]
+    fn transaction_object_tstruct_tfail_frees_new_object_record() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $s (struct (field (mut i32))))
+              (tfunc (export "create_fail")
+                (drop (tstruct.new $s (i32.const 41)))
+                (tfail)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let create_fail = instance
+            .get_typed_func::<(), ()>(&mut store, "create_fail")
+            .unwrap();
+
+        create_fail.call(&mut store, ()).unwrap();
+
+        assert_eq!(store.transaction_object_table().live_count(), 0);
+    }
+
+    #[test]
+    fn transaction_object_tarray_executes_through_object_table() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $a (tarray (mut i32)))
+              (tfunc (export "create_set_get") (result i32)
+                (local $aref (tref $a))
+                (local.set $aref
+                  (tarray.new $a (i32.const 7) (i32.const 3)))
+                (tarray.set $a (tref.cast_write (local.get $aref)) (i32.const 1) (i32.const 42))
+                (i32.add
+                  (tarray.len (local.get $aref))
+                  (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 1)))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let create_set_get = instance
+            .get_typed_func::<(), i32>(&mut store, "create_set_get")
+            .unwrap();
+
+        assert_eq!(create_set_get.call(&mut store, ()).unwrap(), 45);
+        assert_eq!(store.transaction_object_table().live_count(), 1);
+        assert_eq!(
+            store
+                .transaction_object_table()
+                .payload(ObjectId { object_index: 0 })
+                .unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::I32(7),
+                ObjectValue::I32(42),
+                ObjectValue::I32(7)
+            ])
+        );
+    }
+
+    #[test]
+    fn transaction_object_tarray_default_and_fixed_constructors_create_object_records() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $a (tarray (mut f32)))
+              (tfunc (export "default_get") (result f32)
+                (local $aref (tref $a))
+                (local.set $aref (tarray.new_default $a (i32.const 2)))
+                (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 1)))
+              (tfunc (export "fixed_get") (result f32)
+                (local $aref (tref $a))
+                (local.set $aref
+                  (tarray.new_fixed $a 3
+                    (f32.const 1)
+                    (f32.const 2)
+                    (f32.const 3)))
+                (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 2))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let default_get = instance
+            .get_typed_func::<(), f32>(&mut store, "default_get")
+            .unwrap();
+        let fixed_get = instance
+            .get_typed_func::<(), f32>(&mut store, "fixed_get")
+            .unwrap();
+
+        assert_eq!(default_get.call(&mut store, ()).unwrap().to_bits(), 0);
+        assert_eq!(
+            fixed_get.call(&mut store, ()).unwrap().to_bits(),
+            3.0f32.to_bits()
+        );
+        assert_eq!(store.transaction_object_table().live_count(), 2);
+        assert_eq!(
+            store
+                .transaction_object_table()
+                .payload(ObjectId { object_index: 0 })
+                .unwrap(),
+            ObjectPayload::Array(vec![ObjectValue::F32(0), ObjectValue::F32(0)])
+        );
+        assert_eq!(
+            store
+                .transaction_object_table()
+                .payload(ObjectId { object_index: 1 })
+                .unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::F32(1.0f32.to_bits()),
+                ObjectValue::F32(2.0f32.to_bits()),
+                ObjectValue::F32(3.0f32.to_bits())
+            ])
+        );
+    }
+
+    #[test]
+    fn exported_tfunc_returning_tarray_ref_enters_transaction() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $a (array (mut f32)))
+              (tfunc $new (export "new") (result (ref $a))
+                (tarray.new_default $a (i32.const 2)))
+              (tfunc (export "read") (result f32)
+                (tarray.get $a (tref.cast_read (tcall $new)) (i32.const 1))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let new = instance.get_func(&mut store, "new").unwrap();
+        let read = instance
+            .get_typed_func::<(), f32>(&mut store, "read")
+            .unwrap();
+        let mut results = [crate::Val::null_any_ref()];
+
+        new.call(&mut store, &[], &mut results).unwrap();
+        assert_eq!(read.call(&mut store, ()).unwrap().to_bits(), 0);
+        assert_eq!(store.transaction_object_table().live_count(), 2);
     }
 }

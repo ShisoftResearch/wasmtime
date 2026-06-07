@@ -640,6 +640,12 @@ fn normalize_transaction_diagnostic(text: &str) -> String {
 }
 
 fn normalize_transaction_real_parser_diagnostic(text: &str) -> String {
+    if text == "null tarray reference" {
+        return text.into();
+    }
+    if text.starts_with("type mismatch: instruction requires ") {
+        return "type mismatch".into();
+    }
     apply_transaction_diagnostic_replacements(text, TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS)
 }
 
@@ -1361,7 +1367,12 @@ const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
     "tstart.wast",
     "tswitch.wast",
     "ttraps.wast",
+    "ttry-abort-commit.wast",
     "ttype.wast",
+    "ttype-canon.wast",
+    "ttype-equivalence.wast",
+    "ttype-rec.wast",
+    "ttype-subtyping.wast",
     "tunreached-invalid.wast",
     "tunreached-valid.wast",
     "tunreachable.wast",
@@ -1401,7 +1412,21 @@ const SIMPLE_TRANSACTION_REAL_TEXT_TTABLE: &[&str] = &[
     "ttable_size.wast",
 ];
 
-const SIMPLE_TRANSACTION_REAL_TEXT_OBJECT: &[&str] = &["ti31.wast"];
+const SIMPLE_TRANSACTION_REAL_TEXT_OBJECT: &[&str] = &[
+    "br_on_tcast.wast",
+    "br_on_tcast_fail.wast",
+    "ti31.wast",
+    "textern.wast",
+    "tref_cast.wast",
+    "tref_eq.wast",
+    "tref_test.wast",
+    "tstruct.wast",
+    "tarray.wast",
+    "tarray_fill.wast",
+    "tarray_copy.wast",
+    "tarray_init_data.wast",
+    "tarray_init_elem.wast",
+];
 
 const SIMPLE_TRANSACTION_REAL_BINARY: &[&str] = &["tbinary.wast", "tbinary-leb128.wast"];
 
@@ -1741,6 +1766,20 @@ mod tests {
         assert!(normalized.contains("\"out of bounds array access\""));
         assert!(normalized.contains("\"indirect call type mismatch\""));
         assert!(!normalized.contains("\"indirect call type mismatch type mismatch\""));
+    }
+
+    #[test]
+    fn normalizes_real_parser_transaction_permission_diagnostics() {
+        let wast = r#"
+            (assert_invalid
+              (module)
+              "type mismatch: instruction requires [(tref null write (tarray (mut i8))) i32 (tref null read (tarray (mut i8))) i32 i32] but stack has [(tref 0) i32 (tref 0) i32 i32]")
+        "#;
+
+        let normalized = super::normalize_transaction_proposal_wast_diagnostics(wast);
+
+        assert!(normalized.contains("\"type mismatch\""));
+        assert!(!normalized.contains("instruction requires"));
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub(crate) trait TMemoryBackendStorage: core::fmt::Debug + Send + Sync {
     fn granule_count(&self) -> usize;
     fn read_committed(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>>;
     fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()>;
+    fn can_grow_to_pages(&self, new_pages: u64) -> bool;
     fn grow_to_pages(&mut self, new_pages: u64) -> Result<()>;
     fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo>;
     fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()>;
@@ -170,6 +171,10 @@ impl TMemory {
         self.storage.grow_to_pages(new_pages)
     }
 
+    pub(crate) fn can_grow_to_pages(&self, new_pages: u64) -> bool {
+        self.storage.can_grow_to_pages(new_pages)
+    }
+
     pub(crate) fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
         self.storage.granule_info(granule)
     }
@@ -283,6 +288,16 @@ impl VMemory {
 
         self.byte_len = new_byte_len;
         Ok(())
+    }
+
+    pub(crate) fn can_grow_to_pages(&self, new_pages: u64) -> bool {
+        if new_pages > self.max_pages {
+            return false;
+        }
+        let Ok(new_byte_len) = pages_to_bytes(new_pages) else {
+            return false;
+        };
+        new_byte_len >= self.byte_len
     }
 
     fn reserve_capacity_to_pages(&mut self, new_capacity_pages: u64) -> Result<()> {
@@ -436,6 +451,10 @@ impl TMemoryBackendStorage for VMemory {
             .context("tmemory write address overflow")?;
         ensure!(end <= self.byte_len, "out of bounds tmemory access");
         self.region.write(addr, bytes)
+    }
+
+    fn can_grow_to_pages(&self, new_pages: u64) -> bool {
+        VMemory::can_grow_to_pages(self, new_pages)
     }
 
     fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {

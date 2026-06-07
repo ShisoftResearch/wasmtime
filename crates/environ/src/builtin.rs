@@ -10,6 +10,8 @@ macro_rules! foreach_builtin_function {
             transaction_enter_tfunc(vmctx: vmctx) -> u64;
             // Begins a transactional WebAssembly transaction.
             transaction_begin(vmctx: vmctx) -> bool;
+            // Ends a structured transactional `ttry` body.
+            transaction_ttry_end(vmctx: vmctx) -> bool;
             // Commits a transactional WebAssembly transaction.
             transaction_commit(vmctx: vmctx) -> bool;
             // Fails and aborts a transactional WebAssembly transaction.
@@ -48,14 +50,42 @@ macro_rules! foreach_builtin_function {
             transaction_ttable_write_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
             // Returns the visible transactional table size.
             transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
-            // Grows a transactional table and returns the previous visible size.
-            transaction_ttable_grow(vmctx: vmctx, table: u32, delta: u64) -> pointer;
+            // Stages a transactional table grow and returns the previous visible size.
+            transaction_ttable_grow(vmctx: vmctx, table: u32, delta: u64, init: pointer) -> pointer;
             // Associates a newly allocated Wasmtime GC struct with a transactional object record.
             transaction_tstruct_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer) -> bool;
+            // Associates a module-initializer Wasmtime GC struct with a committed transactional object record.
+            transaction_tstruct_static_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer) -> bool;
             // Stages a transactional struct field write.
             transaction_tstruct_set(vmctx: vmctx, gc_ref: u32, field: u32, tag: u32, low: u64, high: u64) -> bool;
             // Reads a transactional struct field as an ObjectValueAbi scratch pointer.
             transaction_tstruct_get(vmctx: vmctx, gc_ref: u32, field: u32) -> pointer;
+            // Associates a newly allocated Wasmtime GC array with a transactional object record.
+            transaction_tarray_new(vmctx: vmctx, gc_ref: u32, array_type: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Associates a module-initializer Wasmtime GC array with a committed transactional object record.
+            transaction_tarray_static_new(vmctx: vmctx, gc_ref: u32, array_type: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Associates a newly allocated Wasmtime GC array with explicit transactional element records.
+            transaction_tarray_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_count: u32, elements: pointer) -> bool;
+            // Associates a module-initializer Wasmtime GC fixed array with committed transactional element records.
+            transaction_tarray_static_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_count: u32, elements: pointer) -> bool;
+            // Associates a newly allocated Wasmtime GC numeric array initialized from data bytes.
+            transaction_tarray_new_data(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
+            // Associates a newly allocated Wasmtime GC reference array initialized from an element segment.
+            transaction_tarray_new_elem(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
+            // Stages a transactional array element write.
+            transaction_tarray_set(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Stages a transactional array range fill.
+            transaction_tarray_fill(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64, len: u32) -> bool;
+            // Stages a transactional array range copy.
+            transaction_tarray_copy(vmctx: vmctx, dst_gc_ref: u32, dst_index: u32, src_gc_ref: u32, src_index: u32, len: u32) -> bool;
+            // Stages a transactional array range initialized from data bytes.
+            transaction_tarray_init_data(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
+            // Stages a transactional array range initialized from an element segment.
+            transaction_tarray_init_elem(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
+            // Reads a transactional array element as an ObjectValueAbi scratch pointer.
+            transaction_tarray_get(vmctx: vmctx, gc_ref: u32, index: u32) -> pointer;
+            // Reads a transactional array length as an ObjectValueAbi scratch pointer.
+            transaction_tarray_len(vmctx: vmctx, gc_ref: u32) -> pointer;
             // Returns an index for wasm's `memory.copy`
             memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
             // Returns an index for wasm's `memory.fill` instruction.
@@ -434,6 +464,8 @@ impl BuiltinFunctionIndex {
             (@get transaction_ttable_get pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_ttable_size pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tstruct_get pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_tarray_get pointer) => (TrapSentinel::NegativeOne);
+            (@get transaction_tarray_len pointer) => (TrapSentinel::NegativeOne);
 
             // These libcalls can't trap
             (@get ref_func pointer) => (return None);
@@ -480,6 +512,7 @@ mod tests {
     fn transaction_lifecycle_builtins_use_falsy_trap_sentinel() {
         for builtin in [
             BuiltinFunctionIndex::transaction_begin(),
+            BuiltinFunctionIndex::transaction_ttry_end(),
             BuiltinFunctionIndex::transaction_commit(),
             BuiltinFunctionIndex::transaction_fail(),
         ] {
@@ -496,7 +529,19 @@ mod tests {
             BuiltinFunctionIndex::transaction_ttable_read_range(),
             BuiltinFunctionIndex::transaction_ttable_write_range(),
             BuiltinFunctionIndex::transaction_tstruct_new(),
+            BuiltinFunctionIndex::transaction_tstruct_static_new(),
             BuiltinFunctionIndex::transaction_tstruct_set(),
+            BuiltinFunctionIndex::transaction_tarray_new(),
+            BuiltinFunctionIndex::transaction_tarray_static_new(),
+            BuiltinFunctionIndex::transaction_tarray_new_fixed(),
+            BuiltinFunctionIndex::transaction_tarray_static_new_fixed(),
+            BuiltinFunctionIndex::transaction_tarray_new_data(),
+            BuiltinFunctionIndex::transaction_tarray_new_elem(),
+            BuiltinFunctionIndex::transaction_tarray_set(),
+            BuiltinFunctionIndex::transaction_tarray_fill(),
+            BuiltinFunctionIndex::transaction_tarray_copy(),
+            BuiltinFunctionIndex::transaction_tarray_init_data(),
+            BuiltinFunctionIndex::transaction_tarray_init_elem(),
         ] {
             assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));
         }
@@ -523,6 +568,8 @@ mod tests {
             BuiltinFunctionIndex::transaction_ttable_get(),
             BuiltinFunctionIndex::transaction_ttable_size(),
             BuiltinFunctionIndex::transaction_tstruct_get(),
+            BuiltinFunctionIndex::transaction_tarray_get(),
+            BuiltinFunctionIndex::transaction_tarray_len(),
         ] {
             assert!(matches!(
                 builtin.trap_sentinel(),

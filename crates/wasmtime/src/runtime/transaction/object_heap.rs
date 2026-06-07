@@ -313,7 +313,7 @@ fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Res
             .sum::<Result<u64>>()?,
         ObjectPayload::I31(_) => 4,
         ObjectPayload::Extern(_) => 8,
-        ObjectPayload::Func(_) => 4,
+        ObjectPayload::Func(_) => 8,
     };
     let header_len = u64::try_from(header_len).context("record header length overflow")?;
     header_len

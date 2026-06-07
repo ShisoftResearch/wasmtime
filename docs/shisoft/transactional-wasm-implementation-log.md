@@ -44,20 +44,22 @@ Current tagged mock categories:
   It maps proposal spellings to ordinary Wasm only for compatibility fixtures
   that are not yet on the real transaction parser/runtime path. Scalar
   `tmemory` including `tmemory.copy/fill/init`, core numeric/control, selected
-  `ttable` funcref bulk files, and SIMD transactional memory files now bypass
-  this adapter.
+  `ttable` funcref bulk files, SIMD transactional memory files, and the current
+  object/reference simple-transaction tranche now bypass this adapter.
 - Runtime libcall gaps in `crates/wasmtime/src/runtime/vm/libcalls.rs`.
   Scalar `tmemory` and numeric/v128 `tglobal` ops run through real compiled
-  helper paths. Numeric imported `tglobal` is supported; reference/object
-  snapshots and table-element COW remain tagged.
+  helper paths. Numeric imported `tglobal` is supported; object struct/array
+  payload operations now use the volatile `ObjectId` bridge and COW object
+  helpers. Remaining proposal-visible gaps are structured `ttry`/`tfail` and
+  multi-transaction conflict behavior.
 - Transaction state/config scaffold in
   `crates/wasmtime/src/runtime/transaction.rs`. Backend, durability,
   conflict-policy, and concurrency-control selection have the future shape,
   but only store-local `LockBased` and volatile `VMemory` behavior are active.
-- Table bulk and element-object gaps in Cranelift/runtime lowering. The current
-  funcref `ttable` paths acquire `TTable`/`TTableSize` ownership, but table
-  element COW and transactional reference/object permissions remain future
-  object-table work.
+- Table bulk and element-object gaps in Cranelift/runtime lowering are narrowed
+  to the conflict/concurrency follow-up. The current funcref `ttable` paths
+  acquire `TTable`/`TTableSize` ownership and the enabled table fixtures execute
+  through real runtime helpers.
 - Opt-in proposal `spectest` transaction helper imports in
   `crates/wast/src/spectest.rs`. This `SHISOFT-TWASM-MOCK` surface provides
   deterministic transaction ids, granule-size helpers, and synchronous
@@ -118,8 +120,9 @@ Remaining tagged mock boundaries:
   transactional encodings, and SIMD numeric-only aliases.
 - Reference/object-valued transactional global snapshots and full object-model
   runtime operations. Numeric imported `tglobal` is on the real runtime path.
-- Table element COW and reference/object permissions for table bulk/object
-  operations.
+- Table bulk-operation COW and durable reference/object permissions. Single
+  table-element `ttable.set/get` now has a runtime undo-log path for
+  transaction rollback.
 - Binary transactional type encodings such as the `0xe0` tfunc/ref encodings.
 - Durable `FileBackedMemory` and `NVMemory` backends.
 
@@ -136,10 +139,10 @@ cargo test -p wasmtime --lib transaction
 test result: ok. 84 passed; 0 failed; 0 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
-test result: ok. 96 passed; 0 failed; 20 ignored
+test result: ok. 114 passed; 0 failed; 2 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 153 passed; 0 failed; 20 ignored
+test result: ok. 171 passed; 0 failed; 2 ignored
 ```
 
 Current promotion note:
@@ -151,28 +154,300 @@ Current promotion note:
   `tglobal`, active imported `tmemory` data initialization, and dynamic
   `tmemory` import-size matching after grow.
 
-Current ignored proposal files after the 2026-06-06 Wave 0 refresh:
+Current ignored proposal files after the 2026-06-07 object/reference update:
 
-- `simple-transactions/br_on_tcast.wast`
-- `simple-transactions/br_on_tcast_fail.wast`
-- `simple-transactions/tarray.wast`
-- `simple-transactions/tarray_copy.wast`
-- `simple-transactions/tarray_fill.wast`
-- `simple-transactions/tarray_init_data.wast`
-- `simple-transactions/tarray_init_elem.wast`
 - `simple-transactions/tconflict-basic.wast`
 - `simple-transactions/tconflict-tmemory_1.wast`
-- `simple-transactions/ttype-canon.wast`
-- `simple-transactions/tref_cast.wast`
-- `simple-transactions/ttype-rec.wast`
-- `simple-transactions/ttype-subtyping.wast`
-- `simple-transactions/tref_eq.wast`
-- `simple-transactions/textern.wast`
-- `simple-transactions/tref_test.wast`
-- `simple-transactions/ti31.wast`
-- `simple-transactions/tstruct.wast`
-- `simple-transactions/ttry-abort-commit.wast`
-- `simple-transactions/ttype-equivalence.wast`
+
+## Structured TTry And Growth Rollback
+
+Date: 2026-06-07
+
+Moved `simple-transactions/ttry-abort-commit.wast` onto the real parser/runtime
+path without WAST edits.
+
+Runtime/compiler work in this tranche:
+
+- Added an internal `ttry.end` marker in the local `wasm-tools-transaction`
+  fork for structured text `ttry` bodies.
+- `tfail` now marks structured failure, aborts active transaction state, and
+  suppresses later nested `tfunc` calls until the enclosing `ttry.end` clears
+  the failure.
+- `ttable.set` uses an undo-log write-through path so `tcall_indirect` sees
+  same-transaction function table updates while `tfail`/trap rollback restores
+  the original table elements.
+- `ttable.grow` and `tmemory.grow` now stage logical size changes and commit
+  physical growth only on successful transaction commit. Early limit checks
+  preserve the proposal `-1` grow result instead of trapping during commit.
+
+Still deferred:
+
+- `ttry-basic.wast` remains a path-scoped harness replacement for structured
+  `else` handler semantics.
+- Conflict WAST fixtures still need real multi-transaction helper/concurrency
+  behavior.
+
+Verification:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast ttry-abort-commit -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 171 passed; 0 failed; 2 ignored; 0 measured; 3438 filtered out
+```
+
+## Object Bridge: TArray Data/Elem And ObjectId Identity
+
+Date: 2026-06-07
+
+Moved `simple-transactions/tarray.wast` onto the real parser/runtime path
+without modifying the proposal WAST file.
+
+Runtime/compiler work in this tranche:
+
+- `tarray.new_data` now records the ordinary Wasmtime GC allocation in the
+  transactional `ObjectTable`, keyed by `ObjectId`, and decodes scalar/vector
+  data-segment bytes into transactional array payload values.
+- `tarray.new_elem` now records reference-array allocations in the
+  transactional `ObjectTable` and converts live element-segment `VMGcRef` words
+  into `ObjectValue::Ref(ObjectId)` payload values.
+- Transactional array get/set/new/default/fixed paths can now carry non-i31 GC
+  reference elements through the temporary Wasmtime `VMGcRef` ABI bridge while
+  storing transaction payload identity as `ObjectId`.
+- The runtime design now explicitly requires persistent transactional function
+  references to use function-object `ObjectId`s. Wasmtime `FuncIndex`,
+  `VMFuncRef`, and compiled-code handles are payload metadata, not persistent
+  identity.
+
+Still deferred:
+
+- `tarray.copy`, `tarray.init_data`, and `tarray.init_elem` still need
+  transaction-aware object payload updates.
+- Function references, i31 immediates, extern references, and full `tref`
+  casts/tests still need the final `ObjectId` runtime representation rather
+  than this temporary `VMGcRef` bridge.
+
+Verification:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tarray.wast -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 99 passed; 0 failed; 17 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 156 passed; 0 failed; 17 ignored
+```
+
+## Object Bridge: TArray Fill And Permission Type-State
+
+Date: 2026-06-07
+
+Moved `simple-transactions/tarray_fill.wast` onto the real parser/runtime path
+without modifying the proposal WAST file.
+
+Implemented in this checkpoint:
+
+- The local `wasm-tools-transaction` fork now preserves `tref none/read/write`
+  permission type-state in parsed/validated `RefType`s.
+- `tref.cast_read` and `tref.cast_write` now parse as distinct local
+  transactional operators. Wasmtime lowers them as identity operations because
+  they change validator type-state, not reference identity.
+- Validator subtyping treats `write` as usable where `read` is expected and
+  treats `tref.null` as permission-top type-state because null carries no
+  object to acquire.
+- `tarray.fill` now lowers to a transaction libcall, resolves the target through
+  the temporary `VMGcRef` to `ObjectId` bridge, stages the COW array payload
+  update, and aborts the active transaction on runtime errors.
+
+Still deferred:
+
+- Permission type-state is static validation state. Runtime conflict and
+  ownership enforcement remains keyed by `GranuleId`/`ObjectId`, not by a
+  permission stored in the reference value itself.
+- `tarray.init_data` and `tarray.init_elem` remained array-object bulk payload
+  paths at this checkpoint; `tarray.copy` is moved in the next checkpoint below.
+- `tstruct`, `textern`, `tref.cast/test/eq`, and recursive type fixtures still
+  require the persistent object-reference tranche.
+
+Verification:
+
+```text
+cargo test -p wasmparser transaction_ref_null_matches_permissioned_result -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmparser transaction -- --format terse
+test result: ok. 15 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_fill -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tbinary -- --format terse
+test result: ok. 2 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 99 passed; 0 failed; 17 ignored
+```
+
+## Object Bridge: TArray Copy
+
+Date: 2026-06-07
+
+Moved `simple-transactions/tarray_copy.wast` onto the real parser/runtime path
+without modifying the proposal WAST file.
+
+Implemented in this checkpoint:
+
+- `TArrayCopy` now lowers through a transaction-specific Cranelift helper
+  instead of the ordinary Wasmtime GC array-copy path.
+- Added the `transaction_tarray_copy` builtin/libcall. The helper resolves the
+  destination and source `VMGcRef`s through the temporary `ObjectId` bridge,
+  checks null references, and calls `TransactionState::copy_array_range`.
+- Copy uses the existing object COW path, so it reads staged payloads first,
+  stages the destination payload, acquires read/write object granules through
+  the object table, and snapshots the source range before writing to preserve
+  overlap semantics.
+- Added a real-parser diagnostic normalization for proposal permission stack
+  messages so Wasmtime-style `type mismatch` diagnostics are accepted without
+  changing the WAST file.
+
+Still deferred at this checkpoint:
+
+- `tarray.init_data` and `tarray.init_elem` remained the next array-object bulk
+  payload paths at this checkpoint; `tarray.init_data` is moved below.
+- Reference-object type tests, casts, externs, structs, and recursive type
+  fixtures are moved in the later object/reference completion checkpoint.
+
+Verification:
+
+```text
+cargo test -p wasmtime-test-util --features wast normalizes_real_parser_transaction_permission_diagnostics -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime --lib transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_copy -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 100 passed; 0 failed; 16 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 157 passed; 0 failed; 16 ignored
+```
+
+## Object Bridge: TArray Init Data
+
+Date: 2026-06-07
+
+Moved `simple-transactions/tarray_init_data.wast` onto the real parser/runtime
+path without modifying the proposal WAST file.
+
+Implemented in this checkpoint:
+
+- `TArrayInitData` now lowers through a transaction-specific Cranelift helper
+  instead of the ordinary Wasmtime GC array/data copy path.
+- Added the `transaction_tarray_init_data` builtin/libcall. It resolves the
+  target `VMGcRef` through the temporary `ObjectId` bridge, checks destination
+  array bounds before data-source bounds, decodes data bytes by element type,
+  and stages the destination payload through `TransactionState::write_array_range`.
+- `tarray.init_data` uses byte offsets for data sources, matching the proposal
+  fixture's `i16` case, while `tarray.new_data` keeps its existing element-offset
+  allocation path.
+- Data-source traps report `out of bounds tmemory access`; destination traps
+  report `out of bounds tarray access` through the existing Wasmtime-style
+  diagnostic equivalence.
+
+Still deferred at this checkpoint:
+
+- `tarray.init_elem` remains the last array-object bulk payload path in this
+  tranche.
+- Reference-object type tests, casts, externs, structs, and recursive type
+  fixtures are moved in the later object/reference completion checkpoint.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_init_data -- --format terse
+test result: ok. 1 passed; 0 failed
+
+cargo test -p wasmtime-test-util --features wast normalizes_real_parser_transaction -- --format terse
+test result: ok. 3 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 101 passed; 0 failed; 15 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 158 passed; 0 failed; 15 ignored
+```
+
+## Object Bridge: TArray Init Elem And Reference Fixtures
+
+Date: 2026-06-07
+
+Moved the remaining object/reference/type simple-transaction fixtures in this
+tranche onto the real parser/runtime path without modifying proposal WAST
+files:
+
+- `tarray_init_elem.wast`
+- `tstruct.wast`
+- `tref_eq.wast`
+- `textern.wast`
+- `tref_test.wast`
+- `tref_cast.wast`
+- `br_on_tcast.wast`
+- `br_on_tcast_fail.wast`
+- `ttype-canon.wast`
+- `ttype-equivalence.wast`
+- `ttype-rec.wast`
+- `ttype-subtyping.wast`
+
+Implemented in this checkpoint:
+
+- `TArrayInitElem` now lowers through a transaction-specific Cranelift helper
+  and the `transaction_tarray_init_elem` libcall instead of ordinary Wasmtime
+  GC array mutation.
+- The runtime decodes passive element-segment `ValRaw` entries, maps non-null
+  references to transactional `ObjectId` values, and stages the destination
+  array payload through object COW.
+- Source offsets are treated as element offsets, destination bounds are checked
+  before source element bounds, and runtime errors abort the active transaction.
+- `ObjectTable` now has a volatile `VMFuncRef -> ObjectId` bridge for function
+  references stored in transactional object payloads. The payload identity is an
+  `ObjectId`; the raw `VMFuncRef` is retained only so compiled Wasmtime calls
+  can recover the executable function pointer.
+
+Still deferred:
+
+- The `VMFuncRef -> ObjectId` bridge is store-local scaffolding. The final
+  persistent function-object path must allocate durable function-object records
+  and treat Wasmtime compiled-code handles as metadata.
+- Structured `ttry`/`tfail` rollback is handled in the later
+  "Structured TTry And Growth Rollback" tranche.
+- `tconflict-basic.wast` and `tconflict-tmemory_1.wast` remain the lock-based
+  multi-transaction conflict workstream.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib transaction_object_abi_roundtrips_object_values -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_init_elem -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+test result: ok. 114 passed; 0 failed; 2 ignored
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 171 passed; 0 failed; 2 ignored
+```
 
 ## Wave 0: Baseline
 
@@ -977,7 +1252,9 @@ Deferred after this checkpoint:
   `ti31`, and `textern` values. They should move with real object-table and
   object-reference support, not via aliases or harness replacement.
 - `tconflict-*` remains concurrency-control work.
-- `ttry-abort-commit.wast` remains structured `ttry`/`tfail` work.
+- `ttry-abort-commit.wast` was structured `ttry`/`tfail` work at this
+  checkpoint; this is superseded by the later "Structured TTry And Growth
+  Rollback" tranche.
 
 Verification:
 
@@ -1030,13 +1307,11 @@ Implemented in this checkpoint:
   text and folded `(tfail (...))` failure-code text. The folded failure code is
   evaluated and dropped because the current runtime `TFail` ignores it.
 
-Remaining failing simple-transactions fixtures:
+Remaining failing simple-transactions fixtures at this checkpoint:
 
-- `tarray_copy.wast`: blocked on real permissioned object-reference validation.
-- `tarray_fill.wast`: blocked on real permissioned object-reference validation.
-- `ttry-abort-commit.wast`: parses and reaches runtime, but still needs real
-  `ttry` abort-control semantics to stop executing the success body after
-  `tfail`.
+- `ttry-abort-commit.wast`: parsed and reached runtime, but still needed real
+  `ttry` abort-control semantics at this checkpoint. This is superseded by
+  the later "Structured TTry And Growth Rollback" tranche.
 - `tconflict-basic.wast`: blocked on real concurrency/object-table semantics;
   the harness `run_as_tid` mock calls synchronously and does not model Wizard's
   live transaction scheduler.
@@ -1742,13 +2017,13 @@ What was mocked:
   - `(1, 10, 0, 20) -> 10`
   - `(0, 10, 1, 20) -> 21`
 
-What remains deferred:
+What remained deferred in this harness-only tranche:
 
 - No real structured `ttry` parsing/execution is implemented by this tranche.
 - No real `tfail` failure payload propagation or `else` handler semantics are
   implemented by this tranche.
-- `ttry-abort-commit.wast` remains out of scope; it still needs real
-  cross-resource transaction lifecycle behavior.
+- `ttry-abort-commit.wast` was out of scope for this tranche; this is
+  superseded by the later "Structured TTry And Growth Rollback" tranche.
 
 Verification:
 

@@ -335,6 +335,9 @@ pub fn translate_operator(
         Operator::TTry => {
             environ.translate_transaction_begin(builder)?;
         }
+        Operator::TTryEnd => {
+            environ.translate_transaction_ttry_end(builder)?;
+        }
         Operator::TFail => {
             environ.translate_transaction_fail(builder)?;
         }
@@ -3000,6 +3003,13 @@ pub fn translate_operator(
             environ.trapnz(builder, is_null, crate::TRAP_NULL_REFERENCE);
             environ.stacks.push1(r);
         }
+        Operator::TRefCastRead | Operator::TRefCastWrite => {
+            // Transactional read/write casts update validator type-state only.
+            // Runtime acquisition is keyed by transaction state and granules,
+            // so the reference identity itself is unchanged here.
+            let r = environ.stacks.pop1();
+            environ.stacks.push1(r);
+        }
 
         // SHISOFT-TWASM-MOCK: transactional object operators are parsed as
         // distinct `0xfa 0xfb` operators. `tstruct.*` is now routed through
@@ -3182,24 +3192,33 @@ pub fn translate_operator(
             environ.stacks.push1(val);
         }
 
-        Operator::ArrayNew { array_type_index } | Operator::TArrayNew { array_type_index } => {
+        Operator::ArrayNew { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (elem, len) = environ.stacks.pop2();
             let array_ref = environ.translate_array_new(builder, array_type_index, elem, len)?;
             environ.stacks.push1(array_ref);
         }
-        Operator::ArrayNewDefault { array_type_index }
-        | Operator::TArrayNewDefault { array_type_index } => {
+        Operator::TArrayNew { array_type_index } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let (elem, len) = environ.stacks.pop2();
+            let array_ref =
+                environ.translate_transaction_tarray_new(builder, array_type_index, elem, len)?;
+            environ.stacks.push1(array_ref);
+        }
+        Operator::ArrayNewDefault { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let len = environ.stacks.pop1();
             let array_ref = environ.translate_array_new_default(builder, array_type_index, len)?;
             environ.stacks.push1(array_ref);
         }
-        Operator::ArrayNewFixed {
-            array_type_index,
-            array_size,
+        Operator::TArrayNewDefault { array_type_index } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let len = environ.stacks.pop1();
+            let array_ref =
+                environ.translate_transaction_tarray_new_default(builder, array_type_index, len)?;
+            environ.stacks.push1(array_ref);
         }
-        | Operator::TArrayNewFixed {
+        Operator::ArrayNewFixed {
             array_type_index,
             array_size,
         } => {
@@ -3210,11 +3229,22 @@ pub fn translate_operator(
             environ.stacks.popn(array_size);
             environ.stacks.push1(array_ref);
         }
-        Operator::ArrayNewData {
+        Operator::TArrayNewFixed {
             array_type_index,
-            array_data_index,
+            array_size,
+        } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let array_size = usize::try_from(*array_size).unwrap();
+            let elems = environ.stacks.peekn(array_size).to_vec();
+            let array_ref = environ.translate_transaction_tarray_new_fixed(
+                builder,
+                array_type_index,
+                &elems,
+            )?;
+            environ.stacks.popn(array_size);
+            environ.stacks.push1(array_ref);
         }
-        | Operator::TArrayNewData {
+        Operator::ArrayNewData {
             array_type_index,
             array_data_index,
         } => {
@@ -3230,11 +3260,23 @@ pub fn translate_operator(
             )?;
             environ.stacks.push1(array_ref);
         }
-        Operator::ArrayNewElem {
+        Operator::TArrayNewData {
             array_type_index,
-            array_elem_index,
+            array_data_index,
+        } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let array_data_index = DataIndex::from_u32(*array_data_index);
+            let (data_offset, len) = environ.stacks.pop2();
+            let array_ref = environ.translate_transaction_tarray_new_data(
+                builder,
+                array_type_index,
+                array_data_index,
+                data_offset,
+                len,
+            )?;
+            environ.stacks.push1(array_ref);
         }
-        | Operator::TArrayNewElem {
+        Operator::ArrayNewElem {
             array_type_index,
             array_elem_index,
         } => {
@@ -3250,11 +3292,23 @@ pub fn translate_operator(
             )?;
             environ.stacks.push1(array_ref);
         }
-        Operator::ArrayCopy {
-            array_type_index_dst,
-            array_type_index_src,
+        Operator::TArrayNewElem {
+            array_type_index,
+            array_elem_index,
+        } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let array_elem_index = ElemIndex::from_u32(*array_elem_index);
+            let (elem_offset, len) = environ.stacks.pop2();
+            let array_ref = environ.translate_transaction_tarray_new_elem(
+                builder,
+                array_type_index,
+                array_elem_index,
+                elem_offset,
+                len,
+            )?;
+            environ.stacks.push1(array_ref);
         }
-        | Operator::TArrayCopy {
+        Operator::ArrayCopy {
             array_type_index_dst,
             array_type_index_src,
         } => {
@@ -3272,16 +3326,42 @@ pub fn translate_operator(
                 len,
             )?;
         }
-        Operator::ArrayFill { array_type_index } | Operator::TArrayFill { array_type_index } => {
+        Operator::TArrayCopy {
+            array_type_index_dst,
+            array_type_index_src,
+        } => {
+            let array_type_index_dst = TypeIndex::from_u32(*array_type_index_dst);
+            let array_type_index_src = TypeIndex::from_u32(*array_type_index_src);
+            let (dst_array, dst_index, src_array, src_index, len) = environ.stacks.pop5();
+            environ.translate_transaction_tarray_copy(
+                builder,
+                array_type_index_dst,
+                dst_array,
+                dst_index,
+                array_type_index_src,
+                src_array,
+                src_index,
+                len,
+            )?;
+        }
+        Operator::ArrayFill { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index, val, len) = environ.stacks.pop4();
             environ.translate_array_fill(builder, array_type_index, array, index, val, len)?;
         }
-        Operator::ArrayInitData {
-            array_type_index,
-            array_data_index,
+        Operator::TArrayFill { array_type_index } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let (array, index, val, len) = environ.stacks.pop4();
+            environ.translate_transaction_tarray_fill(
+                builder,
+                array_type_index,
+                array,
+                index,
+                val,
+                len,
+            )?;
         }
-        | Operator::TArrayInitData {
+        Operator::ArrayInitData {
             array_type_index,
             array_data_index,
         } => {
@@ -3298,11 +3378,24 @@ pub fn translate_operator(
                 len,
             )?;
         }
-        Operator::ArrayInitElem {
+        Operator::TArrayInitData {
             array_type_index,
-            array_elem_index,
+            array_data_index,
+        } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let array_data_index = DataIndex::from_u32(*array_data_index);
+            let (array, dst_index, src_index, len) = environ.stacks.pop4();
+            environ.translate_transaction_tarray_init_data(
+                builder,
+                array_type_index,
+                array,
+                dst_index,
+                array_data_index,
+                src_index,
+                len,
+            )?;
         }
-        | Operator::TArrayInitElem {
+        Operator::ArrayInitElem {
             array_type_index,
             array_elem_index,
         } => {
@@ -3319,19 +3412,53 @@ pub fn translate_operator(
                 len,
             )?;
         }
-        Operator::ArrayLen | Operator::TArrayLen => {
+        Operator::TArrayInitElem {
+            array_type_index,
+            array_elem_index,
+        } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let array_elem_index = ElemIndex::from_u32(*array_elem_index);
+            let (array, dst_index, src_index, len) = environ.stacks.pop4();
+            environ.translate_transaction_tarray_init_elem(
+                builder,
+                array_type_index,
+                array,
+                dst_index,
+                array_elem_index,
+                src_index,
+                len,
+            )?;
+        }
+        Operator::ArrayLen => {
             let array = environ.stacks.pop1();
             let len = environ.translate_array_len(builder, array)?;
             environ.stacks.push1(len);
         }
-        Operator::ArrayGet { array_type_index } | Operator::TArrayGet { array_type_index } => {
+        Operator::TArrayLen => {
+            let array = environ.stacks.pop1();
+            let len = environ.translate_transaction_tarray_len(builder, array)?;
+            environ.stacks.push1(len);
+        }
+        Operator::ArrayGet { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index) = environ.stacks.pop2();
             let elem =
                 environ.translate_array_get(builder, array_type_index, array, index, None)?;
             environ.stacks.push1(elem);
         }
-        Operator::ArrayGetS { array_type_index } | Operator::TArrayGetS { array_type_index } => {
+        Operator::TArrayGet { array_type_index } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let (array, index) = environ.stacks.pop2();
+            let elem = environ.translate_transaction_tarray_get(
+                builder,
+                array_type_index,
+                array,
+                index,
+                None,
+            )?;
+            environ.stacks.push1(elem);
+        }
+        Operator::ArrayGetS { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index) = environ.stacks.pop2();
             let elem = environ.translate_array_get(
@@ -3343,7 +3470,19 @@ pub fn translate_operator(
             )?;
             environ.stacks.push1(elem);
         }
-        Operator::ArrayGetU { array_type_index } | Operator::TArrayGetU { array_type_index } => {
+        Operator::TArrayGetS { array_type_index } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let (array, index) = environ.stacks.pop2();
+            let elem = environ.translate_transaction_tarray_get(
+                builder,
+                array_type_index,
+                array,
+                index,
+                Some(Extension::Sign),
+            )?;
+            environ.stacks.push1(elem);
+        }
+        Operator::ArrayGetU { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index) = environ.stacks.pop2();
             let elem = environ.translate_array_get(
@@ -3355,10 +3494,33 @@ pub fn translate_operator(
             )?;
             environ.stacks.push1(elem);
         }
-        Operator::ArraySet { array_type_index } | Operator::TArraySet { array_type_index } => {
+        Operator::TArrayGetU { array_type_index } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let (array, index) = environ.stacks.pop2();
+            let elem = environ.translate_transaction_tarray_get(
+                builder,
+                array_type_index,
+                array,
+                index,
+                Some(Extension::Zero),
+            )?;
+            environ.stacks.push1(elem);
+        }
+        Operator::ArraySet { array_type_index } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
             let (array, index, elem) = environ.stacks.pop3();
             environ.translate_array_set(builder, array_type_index, array, index, elem)?;
+        }
+        Operator::TArraySet { array_type_index } => {
+            let array_type_index = TypeIndex::from_u32(*array_type_index);
+            let (array, index, elem) = environ.stacks.pop3();
+            environ.translate_transaction_tarray_set(
+                builder,
+                array_type_index,
+                array,
+                index,
+                elem,
+            )?;
         }
         Operator::RefEq => {
             let (r1, r2) = environ.stacks.pop2();

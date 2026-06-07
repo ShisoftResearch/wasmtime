@@ -2047,6 +2047,12 @@ pub enum ConstOp {
     StructNewDefault {
         struct_type_index: TypeIndex,
     },
+    TStructNew {
+        struct_type_index: TypeIndex,
+    },
+    TStructNewDefault {
+        struct_type_index: TypeIndex,
+    },
     ArrayNew {
         array_type_index: TypeIndex,
     },
@@ -2054,6 +2060,16 @@ pub enum ConstOp {
         array_type_index: TypeIndex,
     },
     ArrayNewFixed {
+        array_type_index: TypeIndex,
+        array_size: u32,
+    },
+    TArrayNew {
+        array_type_index: TypeIndex,
+    },
+    TArrayNewDefault {
+        array_type_index: TypeIndex,
+    },
+    TArrayNewFixed {
         array_type_index: TypeIndex,
         array_size: u32,
     },
@@ -2092,6 +2108,12 @@ impl ConstOp {
             O::StructNewDefault { struct_type_index } => Self::StructNewDefault {
                 struct_type_index: TypeIndex::from_u32(struct_type_index),
             },
+            O::TStructNew { struct_type_index } => Self::TStructNew {
+                struct_type_index: TypeIndex::from_u32(struct_type_index),
+            },
+            O::TStructNewDefault { struct_type_index } => Self::TStructNewDefault {
+                struct_type_index: TypeIndex::from_u32(struct_type_index),
+            },
             O::ArrayNew { array_type_index } => Self::ArrayNew {
                 array_type_index: TypeIndex::from_u32(array_type_index),
             },
@@ -2102,6 +2124,19 @@ impl ConstOp {
                 array_type_index,
                 array_size,
             } => Self::ArrayNewFixed {
+                array_type_index: TypeIndex::from_u32(array_type_index),
+                array_size,
+            },
+            O::TArrayNew { array_type_index } => Self::TArrayNew {
+                array_type_index: TypeIndex::from_u32(array_type_index),
+            },
+            O::TArrayNewDefault { array_type_index } => Self::TArrayNewDefault {
+                array_type_index: TypeIndex::from_u32(array_type_index),
+            },
+            O::TArrayNewFixed {
+                array_type_index,
+                array_size,
+            } => Self::TArrayNewFixed {
                 array_type_index: TypeIndex::from_u32(array_type_index),
                 array_size,
             },

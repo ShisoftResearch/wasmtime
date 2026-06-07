@@ -22,16 +22,16 @@ Each wave should refine entries as tests start running.
 
 ## Current Baseline
 
-Date: 2026-06-06
+Date: 2026-06-07
 
 Fresh Wave 0 verification:
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
-test result: ok. 97 passed; 0 failed; 19 ignored
+test result: ok. 114 passed; 0 failed; 2 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 154 passed; 0 failed; 19 ignored
+test result: ok. 171 passed; 0 failed; 2 ignored
 ```
 
 Focused object update:
@@ -39,29 +39,30 @@ Focused object update:
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti31.wast -- --format terse
 test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_copy -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_init_data -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_init_elem -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tstruct -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tref_eq -- --format terse
+test result: ok. 1 passed; 0 failed
+
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast ttype -- --format terse
+test result: ok. 5 passed; 0 failed
 ```
 
 All currently ignored proposal tests are under `simple-transactions`:
 
-- `br_on_tcast.wast`
-- `br_on_tcast_fail.wast`
-- `tarray.wast`
-- `tarray_copy.wast`
-- `tarray_fill.wast`
-- `tarray_init_data.wast`
-- `tarray_init_elem.wast`
 - `tconflict-basic.wast`
 - `tconflict-tmemory_1.wast`
-- `ttype-canon.wast`
-- `tref_cast.wast`
-- `ttype-rec.wast`
-- `ttype-subtyping.wast`
-- `tref_eq.wast`
-- `textern.wast`
-- `tref_test.wast`
-- `tstruct.wast`
-- `ttry-abort-commit.wast`
-- `ttype-equivalence.wast`
 
 The table below preserves per-file implementation notes accumulated across
 earlier waves. Prefer this current baseline section for the latest pass/ignore
@@ -71,8 +72,8 @@ counts.
 
 | Path | Feature family | Status | Blocking subsystem | Notes |
 | --- | --- | --- | --- | --- |
-| `../wasm-persistence/test/core/simple-transactions/br_on_tcast.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tstruct` type syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/br_on_tcast_fail.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tstruct` type syntax before execution |
+| `../wasm-persistence/test/core/simple-transactions/br_on_tcast.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast br_on_tcast`; real parser/runtime path over transactional cast branch aliases and object bridge values |
+| `../wasm-persistence/test/core/simple-transactions/br_on_tcast_fail.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast br_on_tcast_fail`; real parser/runtime path over transactional failed-cast branch aliases and object bridge values |
 | `../wasm-persistence/test/core/simple-transactions/br_on_tnon_null.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/br_on_tnon_null.wast`; real transaction text parser using Wasmtime's reference branch lowering with transactional aliases preserved |
 | `../wasm-persistence/test/core/simple-transactions/br_on_tnull.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/br_on_tnull.wast`; real transaction text parser using Wasmtime's reference branch lowering with transactional aliases preserved |
 | `../wasm-persistence/test/core/simple-transactions/float_tmemory.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/float_tmemory.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
@@ -81,18 +82,18 @@ counts.
 | `../wasm-persistence/test/core/simple-transactions/return_tcall_ref.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/return_tcall_ref.wast`; real transaction text parser using Wasmtime's `return_call_ref` lowering with transactional aliases preserved; final persistent `ObjectId` function-reference encoding remains deferred |
 | `../wasm-persistence/test/core/simple-transactions/taddress.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/taddress.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
 | `../wasm-persistence/test/core/simple-transactions/talign.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/talign.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tarray.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tarray` type syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tarray_copy.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tarray` type syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tarray_fill.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tarray` type syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tarray_init_data.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tarray` type syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tarray_init_elem.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tarray` type syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tbinary-leb128.wast` | types-binary-linking | blocked | binary-transaction-encoding | reaches transactional binary limits/type encodings such as transactional table/memory flags and `0xe0 0x7d` `tfunc` type bytes |
-| `../wasm-persistence/test/core/simple-transactions/tbinary.wast` | types-binary-linking | blocked | binary-transaction-encoding | reaches transactional binary type/operator encodings; probe fails on invalid transactional type byte `0xe0` |
+| `../wasm-persistence/test/core/simple-transactions/tarray.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tarray.wast`; real parser plus temporary `VMGcRef -> ObjectId` bridge for transactional array records |
+| `../wasm-persistence/test/core/simple-transactions/tarray_copy.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_copy`; real parser plus transaction-specific `TArrayCopy` lowering/libcall and COW object payload staging |
+| `../wasm-persistence/test/core/simple-transactions/tarray_fill.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_fill`; real parser plus transaction-specific `TArrayFill` lowering/libcall and COW object payload staging |
+| `../wasm-persistence/test/core/simple-transactions/tarray_init_data.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_init_data`; real parser plus transaction-specific `TArrayInitData` lowering/libcall and COW object payload staging from data bytes |
+| `../wasm-persistence/test/core/simple-transactions/tarray_init_elem.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tarray_init_elem`; real parser plus transaction-specific `TArrayInitElem` lowering/libcall and COW object payload staging from passive element segments |
+| `../wasm-persistence/test/core/simple-transactions/tbinary-leb128.wast` | types-binary-linking | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run; local parser fork handles the transactional binary encoding coverage exercised by this fixture |
+| `../wasm-persistence/test/core/simple-transactions/tbinary.wast` | types-binary-linking | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run; local parser fork handles the transactional binary encoding coverage exercised by this fixture |
 | `../wasm-persistence/test/core/simple-transactions/tblock.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tblock.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tbr.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tbr.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tbr_if.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tbr_if.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tbr_table.wast` | core-control-numeric | blocked | transactional-refs-gc-runtime | normalized text reaches `texterntref` cases; `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tbr_table.wast` fails at line 997 |
-| `../wasm-persistence/test/core/simple-transactions/tbulk.wast` | memory-bulk | blocked | transactional-refs-gc-runtime | normalized text reaches `tref.tfunc`/`tref.null` element payloads |
+| `../wasm-persistence/test/core/simple-transactions/tbr_table.wast` | core-control-numeric | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/tbulk.wast` | memory-bulk | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tcall.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tcall.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tcall_indirect.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tcall_indirect.wast`; real transaction text parser plus compiled `tfunc`/`tcall_indirect` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tcall_ref.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tcall_ref.wast`; real transaction text parser using Wasmtime's `call_ref` lowering with transactional aliases preserved; final persistent `ObjectId` function-reference encoding remains deferred |
@@ -101,11 +102,11 @@ counts.
 | `../wasm-persistence/test/core/simple-transactions/tconflict-tmemory_1.wast` | conflict-concurrency | blocked | transactional-refs-gc-runtime | probe reaches `tstruct`, `tref.cast_*`, `br_on_tcast`, `tblock`, SIMD transactional loads/stores, and conflict host functions before execution |
 | `../wasm-persistence/test/core/simple-transactions/tconst.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tconst.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tconversions.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tconversions.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tdata.wast` | memory-bulk | blocked | transactional-refs-gc-runtime | normalized text reaches `tref.null` payloads in data directives |
-| `../wasm-persistence/test/core/simple-transactions/telem.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `tref.tfunc`/`tref.null` element payloads |
+| `../wasm-persistence/test/core/simple-transactions/tdata.wast` | memory-bulk | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/telem.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tendianness.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tendianness.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
 | `../wasm-persistence/test/core/simple-transactions/texports.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/texports.wast`; real transaction text parser with transactional export aliases and `tget` handling |
-| `../wasm-persistence/test/core/simple-transactions/textern.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tstruct`/`tarray` and `tany`/`textern` conversion syntax before execution |
+| `../wasm-persistence/test/core/simple-transactions/textern.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast textern`; real parser/runtime path using the transactional object bridge for extern/cast/test fixture coverage |
 | `../wasm-persistence/test/core/simple-transactions/tf32.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tf32.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tf32_bitwise.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tf32_bitwise.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tf32_cmp.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tf32_cmp.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
@@ -114,10 +115,10 @@ counts.
 | `../wasm-persistence/test/core/simple-transactions/tf64_cmp.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tf64_cmp.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tfac.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tfac.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tfloat_exprs.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tfloat_exprs.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tfloat_literals.wast` | core-control-numeric | blocked | binary-transaction-encoding | embeds a binary module using transactional encodings; text adapter cannot normalize it |
+| `../wasm-persistence/test/core/simple-transactions/tfloat_literals.wast` | core-control-numeric | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tfloat_misc.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tfloat_misc.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tforward.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tforward.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tfunc.wast` | types-binary-linking | blocked | transactional-refs-gc-runtime | normalized text reaches `tref.tfunc` cases around line 636 |
+| `../wasm-persistence/test/core/simple-transactions/tfunc.wast` | types-binary-linking | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tfunc_ptrs.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tfunc_ptrs.wast`; real transaction text parser over transactional function/table pointer syntax |
 | `../wasm-persistence/test/core/simple-transactions/tglobal.wast` | lifecycle-globals | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tglobal.wast`; real parser/runtime path for numeric transactional globals; ref-valued global snapshots remain covered by later object/ref work |
 | `../wasm-persistence/test/core/simple-transactions/ti31.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ti31.wast`; `tref.ti31` const expressions alias to ordinary `ref.i31`, and `ti31.get_s/get_u` use Wasmtime's immediate i31 representation |
@@ -130,10 +131,10 @@ counts.
 | `../wasm-persistence/test/core/simple-transactions/tint_literals.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tint_literals.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tlabels.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tlabels.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tleft-to-right.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tleft-to-right.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tlinking.wast` | types-binary-linking | blocked | transactional-refs-gc-runtime | normalized text reaches transactional ref globals after ordinary linking section |
+| `../wasm-persistence/test/core/simple-transactions/tlinking.wast` | types-binary-linking | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tload.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tload.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tlocal_get.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tlocal_get.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tlocal_init.wast` | core-control-numeric | blocked | transactional-refs-gc-runtime | uses transactional ref locals and defaultability validation |
+| `../wasm-persistence/test/core/simple-transactions/tlocal_init.wast` | core-control-numeric | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tlocal_set.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tlocal_set.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tlocal_tee.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tlocal_tee.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tloop.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tloop.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
@@ -147,42 +148,42 @@ counts.
 | `../wasm-persistence/test/core/simple-transactions/tmemory_trap.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tmemory_trap.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tnames.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tnames.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tnop.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tnop.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tref.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches transactional heap types such as `texterntref` and `(tref ...)` before execution |
+| `../wasm-persistence/test/core/simple-transactions/tref.wast` | refs-gc-objects | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tref_as_non_null.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tref_as_non_null.wast`; real transaction text parser using Wasmtime's `ref.as_non_null` lowering with Wasmtime-style null-reference diagnostics |
-| `../wasm-persistence/test/core/simple-transactions/tref_cast.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tstruct`, `tarray`, and transactional cast syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tref_eq.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tstruct`, `tarray`, `tref.eq`, and `tref.ti31` syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tref_is_null.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tref.is_null`, transactional tables, and transactional extern refs before execution |
-| `../wasm-persistence/test/core/simple-transactions/tref_null.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches transactional heap types such as `tanyref` and `tref.null` syntax before execution |
-| `../wasm-persistence/test/core/simple-transactions/tref_test.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tstruct`, `tarray`, `tref.test`, and transactional extern conversions before execution |
-| `../wasm-persistence/test/core/simple-transactions/tref_tfunc.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tref.tfunc` syntax before execution |
+| `../wasm-persistence/test/core/simple-transactions/tref_cast.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tref_cast`; real parser/runtime path over transactional cast aliases and object bridge values |
+| `../wasm-persistence/test/core/simple-transactions/tref_eq.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tref_eq`; real parser/runtime path over transactional ref equality and object bridge values |
+| `../wasm-persistence/test/core/simple-transactions/tref_is_null.wast` | refs-gc-objects | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/tref_null.wast` | refs-gc-objects | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/tref_test.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tref_test`; real parser/runtime path over transactional test aliases and object bridge values |
+| `../wasm-persistence/test/core/simple-transactions/tref_tfunc.wast` | refs-gc-objects | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/treturn.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/treturn.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tselect.wast` | core-control-numeric | blocked | transactional-refs-gc-runtime | includes transactional ref/null/function-reference select cases |
+| `../wasm-persistence/test/core/simple-transactions/tselect.wast` | core-control-numeric | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tskip-stack-guard-page.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tskip-stack-guard-page.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tstack.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tstack.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tstart.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tstart.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tstore.wast` | memory-core | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tstore.wast`; real transaction text parser plus VMemory-backed `tmemory` runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tstruct.wast` | refs-gc-objects | blocked | transactional-refs-gc-runtime | probe reaches `tstruct` type syntax before execution |
+| `../wasm-persistence/test/core/simple-transactions/tstruct.wast` | refs-gc-objects | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast tstruct`; real parser plus transaction-specific struct object payload COW over `ObjectId` bridge values |
 | `../wasm-persistence/test/core/simple-transactions/tswitch.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tswitch.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/ttable-sub.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `(tref null ...)` table types |
-| `../wasm-persistence/test/core/simple-transactions/ttable.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `(tref null ...)` table types and ref-valued table initializers |
+| `../wasm-persistence/test/core/simple-transactions/ttable-sub.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/ttable.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/ttable_copy.wast` | tables-elements | passing | real-parser-runtime-smoke | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast -- transaction-proposal/simple-transactions/ttable_copy.wast --exact`; real parser plus funcref table ownership/runtime smoke, not full transactional ref/object table semantics |
-| `../wasm-persistence/test/core/simple-transactions/ttable_fill.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `texterntref` table types |
-| `../wasm-persistence/test/core/simple-transactions/ttable_get.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `texterntref` table types |
-| `../wasm-persistence/test/core/simple-transactions/ttable_grow.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `texterntref`/`tref.*` table growth cases |
+| `../wasm-persistence/test/core/simple-transactions/ttable_fill.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/ttable_get.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/ttable_grow.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/ttable_init.wast` | tables-elements | passing | real-parser-runtime-smoke | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast -- transaction-proposal/simple-transactions/ttable_init.wast --exact`; real parser plus funcref table ownership/runtime smoke, not full transactional ref/object table semantics |
-| `../wasm-persistence/test/core/simple-transactions/ttable_set.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `texterntref` table types |
-| `../wasm-persistence/test/core/simple-transactions/ttable_size.wast` | tables-elements | blocked | transactional-refs-gc-runtime | normalized text reaches `texterntref` table types |
+| `../wasm-persistence/test/core/simple-transactions/ttable_set.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/ttable_size.wast` | tables-elements | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/ttraps.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ttraps.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/ttry-abort-commit.wast` | lifecycle-globals | unstarted | transaction-lifecycle-cross-resource-rollback | crosses globals, memory, tables, structs, arrays |
+| `../wasm-persistence/test/core/simple-transactions/ttry-abort-commit.wast` | lifecycle-globals | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast ttry-abort-commit`; structured `tfail` rollback across globals, memory, tables, structs, arrays, and staged table/memory growth |
 | `../wasm-persistence/test/core/simple-transactions/ttry-basic.wast` | lifecycle-globals | passing | text-normalization-adapter-mock | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ttry-basic.wast`; path-scoped harness replacement with an ordinary Wasm `try2` module preserving the three assertion outcomes, not real structured `ttry`/`tfail`/`else` semantics |
-| `../wasm-persistence/test/core/simple-transactions/ttype-canon.wast` | types-binary-linking | blocked | transactional-refs-gc-runtime | normalized text reaches transactional ref type syntax such as `(tref $t3)` |
-| `../wasm-persistence/test/core/simple-transactions/ttype-equivalence.wast` | types-binary-linking | blocked | transactional-refs-gc-runtime | normalized text reaches `(tref ...)`, `tref.tfunc`, and ref-valued indirect-call cases |
-| `../wasm-persistence/test/core/simple-transactions/ttype-rec.wast` | types-binary-linking | blocked | transactional-refs-gc-runtime | normalized text reaches transactional GC object types such as `tstruct` and `tref` |
-| `../wasm-persistence/test/core/simple-transactions/ttype-subtyping.wast` | types-binary-linking | blocked | transactional-refs-gc-runtime | normalized text reaches transactional GC object types such as `tarray`, `tstruct`, and `tref` |
+| `../wasm-persistence/test/core/simple-transactions/ttype-canon.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast ttype`; real parser/runtime path for transactional canonical type fixture coverage |
+| `../wasm-persistence/test/core/simple-transactions/ttype-equivalence.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast ttype`; real parser/runtime path for transactional type-equivalence fixture coverage |
+| `../wasm-persistence/test/core/simple-transactions/ttype-rec.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast ttype`; real parser/runtime path for recursive transactional object type fixture coverage |
+| `../wasm-persistence/test/core/simple-transactions/ttype-subtyping.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast ttype`; real parser/runtime path for transactional object/reference subtype fixture coverage |
 | `../wasm-persistence/test/core/simple-transactions/ttype.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ttype.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tunreachable.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tunreachable.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
-| `../wasm-persistence/test/core/simple-transactions/tunreached-invalid.wast` | core-control-numeric | blocked | transactional-refs-gc-runtime | unreachable invalid transactional ref/call-ref/global validation cases |
-| `../wasm-persistence/test/core/simple-transactions/tunreached-valid.wast` | core-control-numeric | blocked | transactional-refs-gc-runtime | unreachable transactional ref/call-ref validation cases |
+| `../wasm-persistence/test/core/simple-transactions/tunreached-invalid.wast` | core-control-numeric | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
+| `../wasm-persistence/test/core/simple-transactions/tunreached-valid.wast` | core-control-numeric | passing | real-parser-runtime | included in current `transaction-proposal/simple-transactions` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tunwind.wast` | core-control-numeric | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tunwind.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/tutf8-invalid-encoding.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/tutf8-invalid-encoding.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
 | `../wasm-persistence/test/core/simple-transactions/utf8-timport-field.wast` | types-binary-linking | passing | real-parser-runtime | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/utf8-timport-field.wast`; real transaction text parser plus compiled `tfunc`/`tcall` boundary runtime path |
@@ -192,7 +193,7 @@ counts.
 | `../wasm-persistence/test/core/tsimd/tsimd_bit_shift.wast` | transactional-simd-numeric | passing | text-normalization-adapter | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/tsimd/tsimd_bit_shift.wast`; adapter pass over ordinary SIMD numeric behavior |
 | `../wasm-persistence/test/core/tsimd/tsimd_bitwise.wast` | transactional-simd-numeric | passing | text-normalization-adapter | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/tsimd/tsimd_bitwise.wast`; adapter pass over ordinary SIMD numeric behavior |
 | `../wasm-persistence/test/core/tsimd/tsimd_boolean.wast` | transactional-simd-numeric | passing | text-normalization-adapter | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/tsimd/tsimd_boolean.wast`; adapter pass over ordinary SIMD numeric behavior |
-| `../wasm-persistence/test/core/tsimd/tsimd_const.wast` | transactional-simd-numeric | blocked | binary-transaction-encoding | embeds transactional binary type encoding; probe fails on invalid transactional type byte `0xe0` |
+| `../wasm-persistence/test/core/tsimd/tsimd_const.wast` | transactional-simd-numeric | passing | real-parser-runtime | included in current `transaction-proposal` run through the real parser/runtime path |
 | `../wasm-persistence/test/core/tsimd/tsimd_conversions.wast` | transactional-simd-numeric | passing | text-normalization-adapter | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/tsimd/tsimd_conversions.wast`; adapter pass over ordinary SIMD numeric behavior |
 | `../wasm-persistence/test/core/tsimd/tsimd_f32x4.wast` | transactional-simd-numeric | passing | text-normalization-adapter | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/tsimd/tsimd_f32x4.wast`; adapter pass over ordinary SIMD numeric behavior |
 | `../wasm-persistence/test/core/tsimd/tsimd_f32x4_arith.wast` | transactional-simd-numeric | passing | text-normalization-adapter | `WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/tsimd/tsimd_f32x4_arith.wast`; adapter pass over ordinary SIMD numeric behavior |

@@ -17,6 +17,8 @@ pub const TRANSACTION_OBJECTS_VERSION: u8 = 1;
 pub enum TransactionOperator {
     /// `ttry`
     TTry,
+    /// Internal structured `ttry` end marker emitted by the local parser fork.
+    TTryEnd,
     /// `tfail`
     TFail,
     /// `tglobal.get`
@@ -226,6 +228,7 @@ impl TransactionOperator {
     pub const fn subopcode(self) -> u32 {
         match self {
             Self::TTry => 0x04,
+            Self::TTryEnd => 0x05,
             Self::TFail => 0x0f,
             Self::TGlobalGet => 0x23,
             Self::TGlobalSet => 0x24,
@@ -450,6 +453,7 @@ pub fn validate_research_transaction_operator(
         | TransactionOperator::TTableSize
         | TransactionOperator::TTableGrow
         | TransactionOperator::TTry
+        | TransactionOperator::TTryEnd
         | TransactionOperator::TFail => {}
     }
 
@@ -593,6 +597,7 @@ fn parse_research_code_section(
 pub fn decode_milestone1_transaction_operator(subopcode: u32) -> WasmResult<TransactionOperator> {
     let operator = match subopcode {
         0x04 => TransactionOperator::TTry,
+        0x05 => TransactionOperator::TTryEnd,
         0x0f => TransactionOperator::TFail,
         0x23 => TransactionOperator::TGlobalGet,
         0x24 => TransactionOperator::TGlobalSet,
@@ -674,6 +679,10 @@ mod tests {
         assert_eq!(
             decode_milestone1_transaction_operator(0x04).unwrap(),
             TransactionOperator::TTry
+        );
+        assert_eq!(
+            decode_milestone1_transaction_operator(0x05).unwrap(),
+            TransactionOperator::TTryEnd
         );
         assert_eq!(
             decode_milestone1_transaction_operator(0x0f).unwrap(),

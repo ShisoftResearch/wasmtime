@@ -58,20 +58,16 @@ test result: ok. 84 passed; 0 failed; 0 ignored
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
-test result: ok. 97 passed; 0 failed; 19 ignored
+test result: ok. 114 passed; 0 failed; 2 ignored
 
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 154 passed; 0 failed; 19 ignored
+test result: ok. 171 passed; 0 failed; 2 ignored
 ```
 
-Remaining simple-transaction ignored files are now concentrated in object-model
-and later semantic waves:
+Remaining simple-transaction ignored files are now concentrated in later
+semantic waves:
 
-- object/reference model: `tstruct.wast`, `tarray*.wast`, `textern.wast`,
-  `tref_eq.wast`, `tref_test.wast`, `tref_cast.wast`,
-  `br_on_tcast*.wast`, `ttype-*.wast`
-- structured failure/concurrency: `ttry-abort-commit.wast`,
-  `tconflict-basic.wast`, `tconflict-tmemory_1.wast`
+- conflict/concurrency: `tconflict-basic.wast`, `tconflict-tmemory_1.wast`
 
 There are no ignored files outside `simple-transactions` in the current
 proposal harness run.
@@ -91,9 +87,76 @@ proposal harness run.
   changing Wasmtime's ordinary GC representation.
 - Promoted `ti31.wast` onto the real parser/runtime path by accepting
   `tref.ti31` in const expressions as an alias of ordinary `ref.i31`.
-- Full `tstruct.wast` remains ignored because global initializers still hit
-  const-expression `TStructNew` and persistent-object allocation/abort logging
-  is not complete.
+- At that checkpoint, full `tstruct.wast` still remained ignored because global
+  initializers hit const-expression `TStructNew` and persistent-object
+  allocation/abort logging was not complete. It is moved in the later
+  object/reference completion update below.
+
+2026-06-07 object bridge update:
+
+- Moved `tarray.wast` onto the real parser/runtime path without WAST edits.
+- Added transaction-aware `tarray.new_data` and `tarray.new_elem` recording so
+  new arrays are associated with stable `ObjectId`s after ordinary Wasmtime GC
+  allocation.
+- Allowed non-i31 GC reference array elements through the temporary
+  `VMGcRef -> ObjectId` bridge. Function-reference payloads are moved through a
+  volatile `VMFuncRef -> ObjectId` bridge in the later object/reference
+  completion update; the final persistent function-object path still needs
+  durable `ObjectId` records.
+
+2026-06-07 object permission update:
+
+- Moved `tarray_fill.wast` onto the real parser/runtime path without WAST
+  edits.
+- The local parser fork now carries `tref none/read/write` as validator
+  type-state. `tref.cast_read/write` are distinct parser operators, but
+  Wasmtime lowers them as identity because permission is transaction state, not
+  reference identity.
+- `tarray.fill` now stages array payload changes through the transaction
+  `ObjectId` bridge and aborts the active transaction on runtime errors.
+- `tref.null` validates as permission-top type-state because null has no object
+  granule to acquire.
+
+2026-06-07 object array-copy update:
+
+- Moved `tarray_copy.wast` onto the real parser/runtime path without WAST
+  edits.
+- `TArrayCopy` now uses a transaction-specific lowering and libcall instead of
+  the ordinary Wasmtime GC array-copy path.
+- Runtime copy resolves source/destination `VMGcRef`s through the temporary
+  `ObjectId` bridge, stages the destination array payload through object COW,
+  and preserves overlap semantics by copying through an intermediate vector.
+- At that checkpoint, proposal verification was `157 passed; 0 failed; 16 ignored`,
+  with all ignored files still under `simple-transactions`.
+
+2026-06-07 object array-init-data update:
+
+- Moved `tarray_init_data.wast` onto the real parser/runtime path without WAST
+  edits.
+- `TArrayInitData` now uses transaction-specific lowering and a libcall that
+  stages decoded data bytes into the object COW payload.
+- The runtime checks destination tarray bounds before source data bounds and
+  treats the data source offset as a byte offset.
+- At that checkpoint, proposal verification was `158 passed; 0 failed; 15 ignored`,
+  with all ignored files still under `simple-transactions`.
+
+2026-06-07 object/reference completion update:
+
+- Moved `tarray_init_elem.wast`, `tstruct.wast`, `tref_eq.wast`,
+  `textern.wast`, `tref_test.wast`, `tref_cast.wast`,
+  `br_on_tcast.wast`, `br_on_tcast_fail.wast`, and the `ttype-*.wast`
+  object/type fixtures onto the real parser/runtime path without WAST edits.
+- Added the transaction-specific `TArrayInitElem` lowering/libcall. It decodes
+  passive element-segment `ValRaw` entries, stages reference array payloads
+  through object COW, and preserves proposal trap ordering.
+- Added a volatile `VMFuncRef -> ObjectId` bridge for function references in
+  transactional object payloads. This keeps the payload identity in
+  `ObjectId` form while compiled Wasmtime calls still require the raw
+  `VMFuncRef` pointer.
+- `ttry-abort-commit.wast` now runs on the real parser/runtime path with
+  structured `tfail` rollback and staged table/memory growth.
+- Current proposal verification is `171 passed; 0 failed; 2 ignored`, with all
+  ignored files still under `simple-transactions`.
 
 ## Ground Rules
 
