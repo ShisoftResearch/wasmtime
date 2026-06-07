@@ -2,6 +2,19 @@
 
 Date: 2026-06-04
 
+## Feature Switch Policy
+
+All transactional Wasm and persistence work on this branch is guarded by the
+Cargo feature named `transaction`. The feature is intentionally default-on on
+the research `transaction` branch so future transaction work does not need
+extra local build flags. Before any public or upstream-facing cleanup, this
+default can be flipped off while preserving the same feature boundary.
+
+Future transaction and persistence changes must stay behind this switch. That
+includes parser/lowering bridges, runtime state, `tmemory` backends,
+transactional object storage, persistent object identity, persistent GC work,
+spectest helpers, and WAST harness transaction-proposal support.
+
 ## Goal
 
 Replace the current mock transaction runtime with a Wizard-style runtime core for

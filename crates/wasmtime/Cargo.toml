@@ -157,10 +157,23 @@ default = [
   'debug',
   'compile-time-builtins',
   'wit-parser',
+  'transaction',
 ]
 
 # Enables conversion helpers between `anyhow::Error` and `wasmtime::Error`.
 anyhow = ["wasmtime-environ/anyhow"]
+
+# Enables the Shisoft transactional Wasm research extension. This is default-on
+# on the transaction branch so follow-up transaction/persistence work can build
+# without extra flags; keep all future transaction and persistence code behind
+# this feature so the branch can flip it off before public/upstream-facing use.
+transaction = [
+  "runtime",
+  "std",
+  "gc",
+  "wasmtime-environ/transaction",
+  "wasmtime-cranelift?/transaction",
+]
 
 # Enables backtrace capturing in `wasmtime::Error`.
 backtrace = ["std", "wasmtime-environ/backtrace"]

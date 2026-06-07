@@ -84,6 +84,7 @@ compile = [
 ]
 stack-switching = []
 threads = ['std']
+transaction = []
 wmemcheck = ['std']
 std = [
   'anyhow/std',

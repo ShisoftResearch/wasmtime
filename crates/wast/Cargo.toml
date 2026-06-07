@@ -24,5 +24,7 @@ serde_json = { workspace = true }
 object = { workspace = true, features = ['unaligned'] }
 
 [features]
+default = ['transaction']
 component-model = ['wasmtime/component-model']
 component-model-async = ['wasmtime/component-model-async']
+transaction = ['wasmtime/transaction']

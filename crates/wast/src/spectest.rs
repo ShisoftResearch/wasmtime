@@ -1,4 +1,6 @@
+#[cfg(feature = "transaction")]
 use std::collections::BTreeSet;
+#[cfg(feature = "transaction")]
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
@@ -53,33 +55,41 @@ pub fn link_spectest<T>(
             println!("{f2}: f64");
         }
     })?;
+
+    #[cfg(feature = "transaction")]
     linker.func_wrap("spectest", "tprint", || {})?;
+    #[cfg(feature = "transaction")]
     linker.func_wrap("spectest", "tprint_i32", move |val: i32| {
         if !suppress {
             println!("{val}: i32")
         }
     })?;
+    #[cfg(feature = "transaction")]
     linker.func_wrap("spectest", "tprint_i64", move |val: i64| {
         if !suppress {
             println!("{val}: i64")
         }
     })?;
+    #[cfg(feature = "transaction")]
     linker.func_wrap("spectest", "tprint_f32", move |val: f32| {
         if !suppress {
             println!("{val}: f32")
         }
     })?;
+    #[cfg(feature = "transaction")]
     linker.func_wrap("spectest", "tprint_f64", move |val: f64| {
         if !suppress {
             println!("{val}: f64")
         }
     })?;
+    #[cfg(feature = "transaction")]
     linker.func_wrap("spectest", "tprint_i32_f32", move |i: i32, f: f32| {
         if !suppress {
             println!("{i}: i32");
             println!("{f}: f32");
         }
     })?;
+    #[cfg(feature = "transaction")]
     linker.func_wrap("spectest", "tprint_f64_f64", move |f1: f64, f2: f64| {
         if !suppress {
             println!("{f1}: f64");
@@ -90,26 +100,31 @@ pub fn link_spectest<T>(
     let ty = GlobalType::new(ValType::I32, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::I32(666))?;
     linker.define(&mut *store, "spectest", "global_i32", g)?;
+    #[cfg(feature = "transaction")]
     linker.define(&mut *store, "spectest", "tglobal_i32", g)?;
 
     let ty = GlobalType::new(ValType::I64, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::I64(666))?;
     linker.define(&mut *store, "spectest", "global_i64", g)?;
+    #[cfg(feature = "transaction")]
     linker.define(&mut *store, "spectest", "tglobal_i64", g)?;
 
     let ty = GlobalType::new(ValType::F32, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::F32(0x4426_a666))?;
     linker.define(&mut *store, "spectest", "global_f32", g)?;
+    #[cfg(feature = "transaction")]
     linker.define(&mut *store, "spectest", "tglobal_f32", g)?;
 
     let ty = GlobalType::new(ValType::F64, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::F64(0x4084_d4cc_cccc_cccd))?;
     linker.define(&mut *store, "spectest", "global_f64", g)?;
+    #[cfg(feature = "transaction")]
     linker.define(&mut *store, "spectest", "tglobal_f64", g)?;
 
     let ty = TableType::new(RefType::FUNCREF, 10, Some(20));
     let table = Table::new(&mut *store, ty, Ref::Func(None))?;
     linker.define(&mut *store, "spectest", "table", table)?;
+    #[cfg(feature = "transaction")]
     linker.define(&mut *store, "spectest", "ttable", table)?;
 
     let ty = TableType::new64(RefType::FUNCREF, 10, Some(20));
@@ -120,17 +135,25 @@ pub fn link_spectest<T>(
     let memory = Memory::new(&mut *store, ty)?;
     linker.define(&mut *store, "spectest", "memory", memory)?;
 
-    let transaction_memory = Module::new(
-        store.engine(),
-        r#"(module (tmemory (export "tmemory") 1 2))"#,
-    )?;
-    let transaction_memory = Instance::new(&mut *store, &transaction_memory, &[])?;
-    let transaction_memory = transaction_memory
-        .get_memory(&mut *store, "tmemory")
-        .expect("transaction memory module exports tmemory");
-    linker.define(&mut *store, "spectest", "tmemory", transaction_memory)?;
+    #[cfg(feature = "transaction")]
+    {
+        let transaction_memory = Module::new(
+            store.engine(),
+            r#"(module (tmemory (export "tmemory") 1 2))"#,
+        )?;
+        let transaction_memory = Instance::new(&mut *store, &transaction_memory, &[])?;
+        let transaction_memory = transaction_memory
+            .get_memory(&mut *store, "tmemory")
+            .expect("transaction memory module exports tmemory");
+        linker.define(&mut *store, "spectest", "tmemory", transaction_memory)?;
+    }
 
     if config.transaction_helpers {
+        #[cfg(not(feature = "transaction"))]
+        return Err(Error::msg(
+            "transaction spectest helpers require the `transaction` feature",
+        ));
+        #[cfg(feature = "transaction")]
         link_transaction_spectest_helpers(linker, store)?;
     }
 
@@ -143,6 +166,7 @@ pub fn link_spectest<T>(
     Ok(())
 }
 
+#[cfg(feature = "transaction")]
 #[derive(Default)]
 struct TransactionSpectestState {
     active: BTreeSet<i32>,
@@ -152,6 +176,7 @@ struct TransactionSpectestState {
     next_current_tid: i32,
 }
 
+#[cfg(feature = "transaction")]
 impl TransactionSpectestState {
     fn current_tid(&self) -> i32 {
         0
@@ -198,6 +223,7 @@ impl TransactionSpectestState {
     }
 }
 
+#[cfg(feature = "transaction")]
 fn with_transaction_spectest_state(
     state: &Arc<Mutex<TransactionSpectestState>>,
     f: impl FnOnce(&mut TransactionSpectestState) -> i32,
@@ -212,6 +238,7 @@ fn with_transaction_spectest_state(
 // This is a deterministic harness scaffold, not the real Wizard scheduler. It
 // lets proposal WAST instantiate while real transaction concurrency control and
 // object-table ownership move into runtime paths.
+#[cfg(feature = "transaction")]
 fn link_transaction_spectest_helpers<T>(linker: &mut Linker<T>, store: &mut Store<T>) -> Result<()>
 where
     T: 'static,
@@ -353,6 +380,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "transaction")]
 fn transaction_spectest_tid(tid: i32) -> Option<u64> {
     u64::try_from(tid).ok().filter(|tid| *tid != 0)
 }

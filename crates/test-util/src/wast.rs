@@ -44,7 +44,8 @@ pub struct TestDiscoveryConfig {
 impl Default for TestDiscoveryConfig {
     fn default() -> Self {
         Self {
-            transaction_proposal: std::env::var_os("WASMTIME_TEST_TRANSACTION_WAST").is_some(),
+            transaction_proposal: cfg!(feature = "transaction")
+                && std::env::var_os("WASMTIME_TEST_TRANSACTION_WAST").is_some(),
         }
     }
 }
@@ -1368,6 +1369,14 @@ mod tests {
             path: std::env::temp_dir()
                 .join(format!("wasmtime-{label}-{unique}-{}", std::process::id())),
         }
+    }
+
+    #[test]
+    fn transaction_feature_is_default_enabled_on_research_branch() {
+        assert!(
+            cfg!(feature = "transaction"),
+            "the transaction branch keeps the transaction feature default-on"
+        );
     }
 
     #[test]

@@ -38,6 +38,11 @@ wasmprinter = { workspace = true, features = ['component-model'] }
 arbtest = { workspace = true }
 
 [features]
+default = ['transaction']
+transaction = [
+  'wasmtime-environ/transaction',
+  'wasmtime?/transaction',
+]
 wast = [
   'dep:serde',
   'dep:toml',
@@ -46,6 +51,7 @@ wast = [
 wasmtime-wast = [
   'wast',
   'dep:wasmtime',
+  'wasmtime/transaction',
   'wasmtime/cranelift',
   'wasmtime/winch',
   'wasmtime/gc-drc',
