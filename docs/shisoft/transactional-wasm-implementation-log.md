@@ -142,7 +142,9 @@ Current tagged mock categories:
 - Transaction state/config scaffold in
   `crates/wasmtime/src/runtime/transaction.rs`. Backend, durability,
   conflict-policy, and concurrency-control selection have the future shape,
-  but only store-local `LockBased` and volatile `VMemory` behavior are active.
+  with store-local `LockBased` active, `VMemory` remaining the default backend,
+  and opt-in `NVMemory`/`FileBackedMemory` backend paths available while durable
+  restart recovery remains deferred.
 - Table bulk and element-object gaps in Cranelift/runtime lowering are narrowed
   to final persistent reference/object table semantics. The current funcref
   `ttable` paths acquire `TTable`/`TTableSize` ownership and the enabled table
