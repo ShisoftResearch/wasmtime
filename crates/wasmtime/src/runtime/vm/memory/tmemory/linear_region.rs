@@ -5,8 +5,9 @@
 use crate::prelude::*;
 
 use super::block_region::{
-    BLOCK_SIZE, BlockRegionBackend, ChunkList, IMMIX_LINE_SIZE, NVMemoryBlockRegion,
-    PersistenceMode, VMemoryBlockRegion,
+    BLOCK_SIZE, BlockRegionBackend, ChunkList, FileBackedMemoryBlockRegion,
+    FileBackedRegionMode, IMMIX_LINE_SIZE, NVMemoryBlockRegion, PersistenceMode,
+    VMemoryBlockRegion,
 };
 
 pub(super) trait LinearRegionBackend:
@@ -39,6 +40,23 @@ impl TMemoryRegion {
     pub(super) fn new_nvmemory(byte_capacity: usize, mode: PersistenceMode) -> Result<Self> {
         let block_count = byte_capacity.div_ceil(BLOCK_SIZE);
         let mut backend = NVMemoryBlockRegion::new(block_count, mode)?;
+        let chunks = if block_count == 0 {
+            Vec::new()
+        } else {
+            vec![backend.alloc_chunk(block_count)?]
+        };
+        let chunks = ChunkList::from_chunks(chunks)?;
+        Ok(Self {
+            linear: MappedLinearRegion::new(Box::new(backend), chunks),
+        })
+    }
+
+    pub(super) fn new_file_backed(
+        byte_capacity: usize,
+        mode: FileBackedRegionMode,
+    ) -> Result<Self> {
+        let block_count = byte_capacity.div_ceil(BLOCK_SIZE);
+        let mut backend = FileBackedMemoryBlockRegion::new(block_count, mode)?;
         let chunks = if block_count == 0 {
             Vec::new()
         } else {
@@ -208,7 +226,8 @@ struct LogicalSegment {
 mod tests {
     use super::*;
     use crate::runtime::vm::memory::tmemory::block_region::{
-        BLOCK_SIZE, ChunkList, NVMemoryBlockRegion, PersistenceMode, VMemoryBlockRegion,
+        BLOCK_SIZE, ChunkList, FileBackedRegionMode, NVMemoryBlockRegion, PersistenceMode,
+        VMemoryBlockRegion,
     };
     use core::ops::Range;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -457,5 +476,31 @@ mod tests {
 
         let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
         assert!(error.contains("transactional linear flush range out of bounds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reports_backend_line_mark_count() {
+        let empty = TMemoryRegion::new_file_backed(0, FileBackedRegionMode::Temp).unwrap();
+        assert_eq!(empty.line_mark_count_for_test(), 0);
+
+        let one_byte = TMemoryRegion::new_file_backed(1, FileBackedRegionMode::Temp).unwrap();
+        assert_eq!(
+            one_byte.line_mark_count_for_test(),
+            BLOCK_SIZE / IMMIX_LINE_SIZE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_flush_and_fence_paths_are_supported() {
+        let mut region =
+            TMemoryRegion::new_file_backed(BLOCK_SIZE, FileBackedRegionMode::Temp).unwrap();
+
+        region.write(0, &[1, 2, 3, 4]).unwrap();
+        region.flush(0, 4).unwrap();
+        region.fence().unwrap();
+
+        assert_eq!(region.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
     }
 }
