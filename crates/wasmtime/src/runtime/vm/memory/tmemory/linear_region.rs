@@ -5,9 +5,8 @@
 use crate::prelude::*;
 
 use super::block_region::{
-    BLOCK_SIZE, BlockRegionBackend, ChunkList, FileBackedMemoryBlockRegion,
-    FileBackedRegionMode, IMMIX_LINE_SIZE, NVMemoryBlockRegion, PersistenceMode,
-    VMemoryBlockRegion,
+    BLOCK_SIZE, BlockRegionBackend, ChunkList, FileBackedMemoryBlockRegion, FileBackedRegionMode,
+    IMMIX_LINE_SIZE, NVMemoryBlockRegion, PersistenceMode, VMemoryBlockRegion,
 };
 
 pub(super) trait LinearRegionBackend:
