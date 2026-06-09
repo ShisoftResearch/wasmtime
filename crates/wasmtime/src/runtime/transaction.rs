@@ -4079,11 +4079,7 @@ mod tests {
 
         let error =
             TransactionConfig::with_tmemory_backend(TMemoryBackend::FileBackedMemory).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires explicit file backing")
-        );
+        assert!(error.to_string().contains("requires explicit file backing"));
     }
 
     #[test]
@@ -4091,7 +4087,10 @@ mod tests {
         let config = TransactionConfig::with_file_backed_tmemory_temp().unwrap();
 
         assert_eq!(config.tmemory_backend(), TMemoryBackend::FileBackedMemory);
-        assert_eq!(config.tmemory_file_backing(), Some(TMemoryFileBacking::Temp));
+        assert_eq!(
+            config.tmemory_file_backing(),
+            Some(TMemoryFileBacking::Temp)
+        );
         assert!(!config.is_vmemory_only());
     }
 
