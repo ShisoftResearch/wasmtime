@@ -593,6 +593,8 @@ impl NVMemory {
         if self.byte_len > 0 {
             let old = self.region.read(0, self.byte_len)?;
             region.write(0, &old)?;
+            region.flush(0, self.byte_len)?;
+            region.fence()?;
         }
 
         let new_granule_capacity = granules_for_bytes(new_byte_capacity);
@@ -879,6 +881,20 @@ mod tests {
     }
 
     #[test]
+    fn nvmemory_direct_constructor_with_limits_reserves_capacity_and_grows() {
+        let mut memory = TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(2))
+            .unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
+
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE * 2);
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
+    }
+
+    #[test]
     fn vmemory_unbounded_constructor_does_not_eagerly_reserve_default_wasm_capacity() {
         let mut memory = TMemory::new_vmemory_with_limits(0, None).unwrap();
 
@@ -910,6 +926,30 @@ mod tests {
         assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
         assert_eq!(memory.read_committed(0..4).unwrap(), vec![1, 2, 3, 4]);
         assert_eq!(memory.granule_info(0).unwrap(), info);
+    }
+
+    #[test]
+    fn nvmemory_grow_beyond_capacity_preserves_bytes_and_granule_metadata() {
+        let mut memory = TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, None)
+            .unwrap();
+        memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+        let mut info = memory.granule_info(0).unwrap();
+        info.owner = 7;
+        info.hash = 99;
+        memory.set_granule_info(0, info).unwrap();
+
+        assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE);
+
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(memory.byte_len(), 2 * WASM_PAGE_SIZE);
+        assert_eq!(memory.byte_capacity(), 2 * WASM_PAGE_SIZE);
+        assert_eq!(memory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(memory.granule_info(0).unwrap(), info);
+        assert_eq!(
+            memory.granule_info(GRANULES_PER_WASM_PAGE).unwrap(),
+            TMemoryGranuleInfo::default()
+        );
     }
 
     #[test]

@@ -204,6 +204,9 @@ struct LogicalSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::ops::Range;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use crate::runtime::vm::memory::tmemory::block_region::{
         BLOCK_SIZE, ChunkList, NVMemoryBlockRegion, PersistenceMode, VMemoryBlockRegion,
     };
@@ -251,6 +254,74 @@ mod tests {
         }
 
         fn fence(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingBackend {
+        inner: VMemoryBlockRegion,
+        flushes: Arc<Mutex<Vec<Range<usize>>>>,
+        fence_count: Arc<AtomicUsize>,
+    }
+
+    impl RecordingBackend {
+        fn new(
+            num_blocks: usize,
+        ) -> Result<(Self, Arc<Mutex<Vec<Range<usize>>>>, Arc<AtomicUsize>)> {
+            let flushes = Arc::new(Mutex::new(Vec::new()));
+            let fence_count = Arc::new(AtomicUsize::new(0));
+            Ok((
+                Self {
+                    inner: VMemoryBlockRegion::new(num_blocks)?,
+                    flushes: Arc::clone(&flushes),
+                    fence_count: Arc::clone(&fence_count),
+                },
+                flushes,
+                fence_count,
+            ))
+        }
+    }
+
+    impl BlockRegionBackend for RecordingBackend {
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+
+        fn num_blocks(&self) -> usize {
+            self.inner.num_blocks()
+        }
+
+        fn bytes_len(&self) -> usize {
+            self.inner.bytes_len()
+        }
+
+        fn line_mark_count(&self) -> usize {
+            self.inner.line_mark_count()
+        }
+
+        fn alloc_chunk(
+            &mut self,
+            block_count: usize,
+        ) -> Result<super::super::block_region::RegionChunk> {
+            self.inner.alloc_chunk(block_count)
+        }
+
+        fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+            self.inner.read(offset, len)
+        }
+
+        fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+            self.inner.write(offset, bytes)
+        }
+
+        fn flush(&self, offset: usize, len: usize) -> Result<()> {
+            self.flushes.lock().unwrap().push(offset..offset + len);
+            Ok(())
+        }
+
+        fn fence(&self) -> Result<()> {
+            self.fence_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -303,6 +374,50 @@ mod tests {
     }
 
     #[test]
+    fn mapped_linear_region_flushes_across_chunk_boundaries() {
+        let (mut backend, flushes, _) = RecordingBackend::new(4).unwrap();
+        let first = backend.alloc_chunk(1).unwrap();
+        let _gap = backend.alloc_chunk(1).unwrap();
+        let second = backend.alloc_chunk(1).unwrap();
+        let expected = vec![
+            (BLOCK_SIZE - 2)..BLOCK_SIZE,
+            (2 * BLOCK_SIZE)..(2 * BLOCK_SIZE + 2),
+        ];
+        let chunks = ChunkList::from_chunks(vec![first, second]).unwrap();
+        let region = MappedLinearRegion::new(Box::new(backend), chunks);
+
+        region.flush(BLOCK_SIZE - 2, 4).unwrap();
+
+        assert_eq!(*flushes.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn mapped_linear_region_flush_zero_len_and_fence_are_forwarded() {
+        let (mut backend, flushes, fence_count) = RecordingBackend::new(1).unwrap();
+        let chunk = backend.alloc_chunk(1).unwrap();
+        let chunks = ChunkList::from_chunks(vec![chunk]).unwrap();
+        let region = MappedLinearRegion::new(Box::new(backend), chunks);
+
+        region.flush(BLOCK_SIZE, 0).unwrap();
+        region.fence().unwrap();
+
+        assert!(flushes.lock().unwrap().is_empty());
+        assert_eq!(fence_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mapped_linear_region_rejects_out_of_bounds_flush() {
+        let (mut backend, _, _) = RecordingBackend::new(1).unwrap();
+        let chunk = backend.alloc_chunk(1).unwrap();
+        let chunks = ChunkList::from_chunks(vec![chunk]).unwrap();
+        let region = MappedLinearRegion::new(Box::new(backend), chunks);
+
+        let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
+
+        assert!(error.contains("transactional linear flush range out of bounds"));
+    }
+
+    #[test]
     fn vmemory_region_reports_backend_line_mark_count() {
         let empty = TMemoryRegion::new(0).unwrap();
         assert_eq!(empty.line_mark_count_for_test(), 0);
@@ -319,5 +434,20 @@ mod tests {
         let one_byte =
             TMemoryRegion::new_nvmemory(1, PersistenceMode::ResearchPretendPmem).unwrap();
         assert_eq!(one_byte.line_mark_count_for_test(), BLOCK_SIZE / IMMIX_LINE_SIZE);
+    }
+
+    #[test]
+    fn nvmemory_region_flush_and_fence_paths_are_supported() {
+        let mut region =
+            TMemoryRegion::new_nvmemory(BLOCK_SIZE, PersistenceMode::ResearchPretendPmem)
+                .unwrap();
+
+        region.write(0, &[1, 2, 3, 4]).unwrap();
+        region.flush(0, 4).unwrap();
+        region.flush(BLOCK_SIZE, 0).unwrap();
+        region.fence().unwrap();
+
+        let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
+        assert!(error.contains("transactional linear flush range out of bounds"));
     }
 }
