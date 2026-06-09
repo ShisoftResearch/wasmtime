@@ -8,7 +8,8 @@
 
 use crate::prelude::*;
 use crate::runtime::transaction::{
-    TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TransactionConfig,
+    TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryPersistenceMode,
+    TransactionConfig,
 };
 use wasmtime_environ::MemoryIndex;
 
@@ -86,7 +87,12 @@ impl TMemory {
         min_pages: u64,
         max_pages: Option<u64>,
     ) -> Result<Self> {
-        Self::new_with_backend_limits(config.tmemory_backend(), min_pages, max_pages)
+        Self::new_for_backend(
+            config.tmemory_backend(),
+            config.tmemory_persistence_mode(),
+            min_pages,
+            max_pages,
+        )
     }
 
     pub(crate) fn new_with_backend(backend: TMemoryBackend, min_pages: u64) -> Result<Self> {
@@ -98,7 +104,12 @@ impl TMemory {
         min_pages: u64,
         max_pages: Option<u64>,
     ) -> Result<Self> {
-        Self::new_for_backend(backend, min_pages, max_pages)
+        Self::new_for_backend(
+            backend,
+            TMemoryPersistenceMode::ResearchPretendPmem,
+            min_pages,
+            max_pages,
+        )
     }
 
     pub(crate) fn new_vmemory(min_pages: u64) -> Result<Self> {
@@ -204,12 +215,17 @@ impl TMemory {
 
     fn new_for_backend(
         backend: TMemoryBackend,
+        persistence_mode: TMemoryPersistenceMode,
         min_pages: u64,
         max_pages: Option<u64>,
     ) -> Result<Self> {
         let storage: Box<dyn TMemoryBackendStorage> = match backend {
             TMemoryBackend::VMemory => Box::new(VMemory::new(min_pages, max_pages)?),
-            TMemoryBackend::NVMemory => Box::new(NVMemory::new(min_pages, max_pages)?),
+            TMemoryBackend::NVMemory => Box::new(NVMemory::new_with_persistence_mode(
+                min_pages,
+                max_pages,
+                persistence_mode,
+            )?),
             TMemoryBackend::FileBackedMemory => return Err(unsupported_backend_error(backend)),
         };
         Ok(Self { storage })
@@ -484,6 +500,7 @@ impl TMemoryBackendStorage for VMemory {
 #[derive(Debug)]
 pub(crate) struct NVMemory {
     region: TMemoryRegion,
+    persistence_mode: block_region::PersistenceMode,
     granules: Vec<TMemoryGranuleInfo>,
     byte_len: usize,
     byte_capacity: usize,
@@ -492,6 +509,18 @@ pub(crate) struct NVMemory {
 
 impl NVMemory {
     pub(crate) fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
+        Self::new_with_persistence_mode(
+            min_pages,
+            max_pages,
+            TMemoryPersistenceMode::ResearchPretendPmem,
+        )
+    }
+
+    pub(crate) fn new_with_persistence_mode(
+        min_pages: u64,
+        max_pages: Option<u64>,
+        persistence_mode: TMemoryPersistenceMode,
+    ) -> Result<Self> {
         let requested_max_pages = max_pages;
         let max_pages = max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES);
         ensure!(min_pages <= max_pages, "tmemory minimum exceeds maximum");
@@ -502,12 +531,11 @@ impl NVMemory {
         };
 
         let granule_capacity = granules_for_bytes(byte_capacity);
+        let persistence_mode = block_region_persistence_mode(persistence_mode);
 
         Ok(Self {
-            region: TMemoryRegion::new_nvmemory(
-                byte_capacity,
-                block_region::PersistenceMode::ResearchPretendPmem,
-            )?,
+            region: TMemoryRegion::new_nvmemory(byte_capacity, persistence_mode)?,
+            persistence_mode,
             granules: vec![TMemoryGranuleInfo::default(); granule_capacity],
             byte_len,
             byte_capacity,
@@ -586,10 +614,7 @@ impl NVMemory {
             return Ok(());
         }
 
-        let mut region = TMemoryRegion::new_nvmemory(
-            new_byte_capacity,
-            block_region::PersistenceMode::ResearchPretendPmem,
-        )?;
+        let mut region = TMemoryRegion::new_nvmemory(new_byte_capacity, self.persistence_mode)?;
         if self.byte_len > 0 {
             let old = self.region.read(0, self.byte_len)?;
             region.write(0, &old)?;
@@ -619,6 +644,19 @@ impl NVMemory {
     #[cfg(test)]
     pub(crate) fn line_mark_count_for_test(&self) -> usize {
         self.region.line_mark_count_for_test()
+    }
+}
+
+fn block_region_persistence_mode(
+    persistence_mode: TMemoryPersistenceMode,
+) -> block_region::PersistenceMode {
+    match persistence_mode {
+        TMemoryPersistenceMode::ResearchPretendPmem => {
+            block_region::PersistenceMode::ResearchPretendPmem
+        }
+        TMemoryPersistenceMode::RequireHardwarePmem => {
+            block_region::PersistenceMode::RequireHardwarePmem
+        }
     }
 }
 
@@ -728,8 +766,8 @@ mod tests {
 
     #[test]
     fn tmemory_can_construct_nvmemory_in_research_mode() {
-        let memory = TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1))
-            .unwrap();
+        let memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
 
         assert_eq!(memory.backend(), TMemoryBackend::NVMemory);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
@@ -882,8 +920,8 @@ mod tests {
 
     #[test]
     fn nvmemory_direct_constructor_with_limits_reserves_capacity_and_grows() {
-        let mut memory = TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(2))
-            .unwrap();
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(2)).unwrap();
 
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
         assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
@@ -930,8 +968,8 @@ mod tests {
 
     #[test]
     fn nvmemory_grow_beyond_capacity_preserves_bytes_and_granule_metadata() {
-        let mut memory = TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, None)
-            .unwrap();
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, None).unwrap();
         memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
         let mut info = memory.granule_info(0).unwrap();
         info.owner = 7;
@@ -950,6 +988,32 @@ mod tests {
             memory.granule_info(GRANULES_PER_WASM_PAGE).unwrap(),
             TMemoryGranuleInfo::default()
         );
+    }
+
+    #[test]
+    fn nvmemory_hardware_pmem_mode_is_reachable_from_transaction_config() {
+        let config = TransactionConfig::with_nvmemory_persistence_mode(
+            TMemoryPersistenceMode::RequireHardwarePmem,
+        )
+        .unwrap();
+        let result = TMemory::new(config, 1, Some(1));
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if block_region::PersistEngine::hardware_flush_available() {
+                let memory = result.unwrap();
+                assert_eq!(memory.backend(), TMemoryBackend::NVMemory);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("CLWB"));
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("NVMemory is unsupported"));
+        }
     }
 
     #[test]

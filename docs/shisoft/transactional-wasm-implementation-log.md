@@ -22,7 +22,10 @@ Date: 2026-06-09
 `NVMemory` now exists as the first PMEM-shaped transactional memory backend.
 It shares the block/chunk storage abstraction with `VMemory`, uses the normal
 copy-on-write transaction commit path, and flushes committed ranges through the
-PMEM persistence engine. The default backend remains `VMemory`.
+PMEM persistence engine. The default backend remains `VMemory`; when
+`NVMemory` is selected, research pretend-PMEM mode remains the default and
+hardware CLWB/SFENCE mode is explicitly selectable through transaction
+configuration for experiments.
 
 Real restart/power-fail persistence tests remain gated behind
 `WASMTIME_TEST_REAL_PMEM=1` until durable recovery metadata and PMEM hardware

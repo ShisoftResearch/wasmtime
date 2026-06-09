@@ -11,7 +11,7 @@ use core::{cell::Cell, mem, ops::Range};
 mod object_heap;
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
-// store-local transaction state, `VMemory` and research `NVMemory`
+// store-local transaction state, `VMemory` and configurable `NVMemory`
 // transactional memory storage, and real `tmemory` sidecars. Remaining
 // `SHISOFT-TWASM-MOCK` tags in this file identify policy selection and
 // object-table gaps.
@@ -22,14 +22,25 @@ mod object_heap;
 /// `TransactionConfig` accepts the implemented in-tree backends.
 ///
 /// Milestone runtime support currently implements `VMemory` and research
-/// `NVMemory`. `FileBackedMemory` remains represented so transaction
-/// configuration keeps its later persistence shape without changing ordinary
-/// Wasmtime memories.
+/// `NVMemory` by default, with hardware-PMEM mode selectable for experiments.
+/// `FileBackedMemory` remains represented so transaction configuration keeps
+/// its later persistence shape without changing ordinary Wasmtime memories.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TMemoryBackend {
     VMemory,
     FileBackedMemory,
     NVMemory,
+}
+
+/// Persistence behavior for `NVMemory` block regions.
+///
+/// The research mode is the default so normal tests do not require PMEM
+/// hardware. `RequireHardwarePmem` routes NVMemory through the CLWB/SFENCE
+/// persistence engine and fails construction when the host cannot provide it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TMemoryPersistenceMode {
+    ResearchPretendPmem,
+    RequireHardwarePmem,
 }
 
 /// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. `LockBased` is the
@@ -57,6 +68,7 @@ pub(crate) enum ConflictPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TransactionConfig {
     tmemory_backend: TMemoryBackend,
+    tmemory_persistence_mode: TMemoryPersistenceMode,
     concurrency_control: ConcurrencyControl,
     durability_policy: DurabilityPolicy,
     conflict_policy: ConflictPolicy,
@@ -66,6 +78,7 @@ impl Default for TransactionConfig {
     fn default() -> Self {
         Self {
             tmemory_backend: TMemoryBackend::VMemory,
+            tmemory_persistence_mode: TMemoryPersistenceMode::ResearchPretendPmem,
             concurrency_control: ConcurrencyControl::LockBased,
             durability_policy: DurabilityPolicy::VolatileRollbackOnly,
             conflict_policy: ConflictPolicy::AbortOrWizardDefault,
@@ -80,8 +93,20 @@ impl TransactionConfig {
         Ok(config)
     }
 
+    pub(crate) fn with_nvmemory_persistence_mode(
+        tmemory_persistence_mode: TMemoryPersistenceMode,
+    ) -> Result<Self> {
+        let mut config = Self::default();
+        config.set_nvmemory_persistence_mode(tmemory_persistence_mode)?;
+        Ok(config)
+    }
+
     pub(crate) fn tmemory_backend(&self) -> TMemoryBackend {
         self.tmemory_backend
+    }
+
+    pub(crate) fn tmemory_persistence_mode(&self) -> TMemoryPersistenceMode {
+        self.tmemory_persistence_mode
     }
 
     pub(crate) fn concurrency_control(&self) -> ConcurrencyControl {
@@ -110,6 +135,15 @@ impl TransactionConfig {
                 bail!("tmemory backend is not implemented: {tmemory_backend:?}")
             }
         }
+    }
+
+    fn set_nvmemory_persistence_mode(
+        &mut self,
+        tmemory_persistence_mode: TMemoryPersistenceMode,
+    ) -> Result<()> {
+        self.tmemory_backend = TMemoryBackend::NVMemory;
+        self.tmemory_persistence_mode = tmemory_persistence_mode;
+        Ok(())
     }
 }
 
@@ -3983,6 +4017,10 @@ mod tests {
         let config = TransactionConfig::default();
 
         assert_eq!(config.tmemory_backend(), TMemoryBackend::VMemory);
+        assert_eq!(
+            config.tmemory_persistence_mode(),
+            TMemoryPersistenceMode::ResearchPretendPmem
+        );
         assert_eq!(config.concurrency_control(), ConcurrencyControl::LockBased);
         assert_eq!(
             config.durability_policy(),
@@ -4016,6 +4054,25 @@ mod tests {
         let config = TransactionConfig::with_tmemory_backend(TMemoryBackend::NVMemory).unwrap();
 
         assert_eq!(config.tmemory_backend(), TMemoryBackend::NVMemory);
+        assert_eq!(
+            config.tmemory_persistence_mode(),
+            TMemoryPersistenceMode::ResearchPretendPmem
+        );
+        assert!(!config.is_vmemory_only());
+    }
+
+    #[test]
+    fn transaction_config_accepts_nvmemory_hardware_persistence_mode() {
+        let config = TransactionConfig::with_nvmemory_persistence_mode(
+            TMemoryPersistenceMode::RequireHardwarePmem,
+        )
+        .unwrap();
+
+        assert_eq!(config.tmemory_backend(), TMemoryBackend::NVMemory);
+        assert_eq!(
+            config.tmemory_persistence_mode(),
+            TMemoryPersistenceMode::RequireHardwarePmem
+        );
         assert!(!config.is_vmemory_only());
     }
 

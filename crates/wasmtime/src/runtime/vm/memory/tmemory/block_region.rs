@@ -3,7 +3,11 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
-use core::{mem::size_of, ops::Range};
+use core::{
+    mem::size_of,
+    ops::Range,
+    sync::atomic::{Ordering, compiler_fence},
+};
 
 pub(crate) const BLOCK_SIZE: usize = 512 * 1024;
 pub(crate) const IMMIX_LINE_SIZE: usize = 256;
@@ -95,6 +99,11 @@ unsafe fn flush_clwb_range(ptr: core::ptr::NonNull<u8>, len: usize) -> Result<()
         .checked_add(len)
         .context("pmem flush range overflow")?;
     let mut cursor = start & !(PMEM_CACHE_LINE_SIZE - 1);
+
+    // Keep ordinary stores ordered before the persistence flush loop. Rust
+    // `asm!` is side-effecting unless marked `pure`/`nomem`/`readonly`; the
+    // compiler fences make the intended PMEM publication boundary explicit.
+    compiler_fence(Ordering::SeqCst);
     while cursor < end {
         unsafe {
             core::arch::asm!(
@@ -107,6 +116,7 @@ unsafe fn flush_clwb_range(ptr: core::ptr::NonNull<u8>, len: usize) -> Result<()
             .checked_add(PMEM_CACHE_LINE_SIZE)
             .context("pmem flush cursor overflow")?;
     }
+    compiler_fence(Ordering::SeqCst);
     Ok(())
 }
 
@@ -117,9 +127,11 @@ unsafe fn flush_clwb_range(_ptr: core::ptr::NonNull<u8>, _len: usize) -> Result<
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn sfence() -> Result<()> {
+    compiler_fence(Ordering::SeqCst);
     unsafe {
         core::arch::asm!("sfence", options(nostack, preserves_flags));
     }
+    compiler_fence(Ordering::SeqCst);
     Ok(())
 }
 
@@ -669,7 +681,9 @@ mod tests {
         let engine = PersistEngine::for_mode(PersistenceMode::ResearchPretendPmem).unwrap();
 
         assert_eq!(engine.mode(), PersistenceMode::ResearchPretendPmem);
-        engine.flush(core::ptr::NonNull::<u8>::dangling(), 0).unwrap();
+        engine
+            .flush(core::ptr::NonNull::<u8>::dangling(), 0)
+            .unwrap();
         engine.fence().unwrap();
     }
 

@@ -9,7 +9,10 @@ use super::block_region::{
     PersistenceMode, VMemoryBlockRegion,
 };
 
-pub(super) trait LinearRegionBackend: BlockRegionBackend + core::fmt::Debug + Send + Sync {}
+pub(super) trait LinearRegionBackend:
+    BlockRegionBackend + core::fmt::Debug + Send + Sync
+{
+}
 
 impl<T> LinearRegionBackend for T where T: BlockRegionBackend + core::fmt::Debug + Send + Sync {}
 
@@ -204,12 +207,12 @@ struct LogicalSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::ops::Range;
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use crate::runtime::vm::memory::tmemory::block_region::{
         BLOCK_SIZE, ChunkList, NVMemoryBlockRegion, PersistenceMode, VMemoryBlockRegion,
     };
+    use core::ops::Range;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
     struct TestBackend {
@@ -423,7 +426,10 @@ mod tests {
         assert_eq!(empty.line_mark_count_for_test(), 0);
 
         let one_byte = TMemoryRegion::new(1).unwrap();
-        assert_eq!(one_byte.line_mark_count_for_test(), BLOCK_SIZE / IMMIX_LINE_SIZE);
+        assert_eq!(
+            one_byte.line_mark_count_for_test(),
+            BLOCK_SIZE / IMMIX_LINE_SIZE
+        );
     }
 
     #[test]
@@ -433,14 +439,16 @@ mod tests {
 
         let one_byte =
             TMemoryRegion::new_nvmemory(1, PersistenceMode::ResearchPretendPmem).unwrap();
-        assert_eq!(one_byte.line_mark_count_for_test(), BLOCK_SIZE / IMMIX_LINE_SIZE);
+        assert_eq!(
+            one_byte.line_mark_count_for_test(),
+            BLOCK_SIZE / IMMIX_LINE_SIZE
+        );
     }
 
     #[test]
     fn nvmemory_region_flush_and_fence_paths_are_supported() {
         let mut region =
-            TMemoryRegion::new_nvmemory(BLOCK_SIZE, PersistenceMode::ResearchPretendPmem)
-                .unwrap();
+            TMemoryRegion::new_nvmemory(BLOCK_SIZE, PersistenceMode::ResearchPretendPmem).unwrap();
 
         region.write(0, &[1, 2, 3, 4]).unwrap();
         region.flush(0, 4).unwrap();
