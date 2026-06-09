@@ -954,6 +954,145 @@ impl BlockRegionBackend for NVMemoryBlockRegion {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FileBackedMemoryBlockRegion {
+    mapping: FileBackedMapping,
+    block_entries: Vec<BlockEntry>,
+    line_marks: Vec<LineMark>,
+}
+
+impl FileBackedMemoryBlockRegion {
+    pub(crate) fn new(num_blocks: usize, mode: FileBackedRegionMode) -> Result<Self> {
+        let bytes_len = num_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional FileBackedMemory block region size overflow")?;
+        let line_count = bytes_len / IMMIX_LINE_SIZE;
+        Ok(Self {
+            mapping: FileBackedMapping::new(mode, bytes_len)?,
+            block_entries: vec![BlockEntry::default(); num_blocks],
+            line_marks: vec![
+                LineMark {
+                    mark: IMMIX_LINE_MARK_RESET_VALUE,
+                };
+                line_count
+            ],
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(num_blocks: usize, mode: FileBackedRegionMode) -> Result<Self> {
+        Self::new(num_blocks, mode)
+    }
+
+    pub(crate) fn block_size(&self) -> usize {
+        BLOCK_SIZE
+    }
+
+    pub(crate) fn num_blocks(&self) -> usize {
+        self.block_entries.len()
+    }
+
+    pub(crate) fn bytes_len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    pub(crate) fn line_count(&self) -> usize {
+        self.line_marks.len()
+    }
+
+    pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        ensure!(
+            block_count > 0,
+            "transactional FileBackedMemory chunk must contain a block"
+        );
+        ensure!(
+            block_count <= self.num_blocks(),
+            "transactional FileBackedMemory chunk exceeds region size"
+        );
+
+        let last_start = self.num_blocks() - block_count;
+        for start in 0..=last_start {
+            let end = start + block_count;
+            if self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0)
+            {
+                for entry in &mut self.block_entries[start..end] {
+                    entry.used = 1;
+                    entry.list_num = ListKind::Used as i16;
+                }
+                return Ok(RegionChunk {
+                    start_block: start,
+                    block_count,
+                });
+            }
+        }
+
+        bail!("transactional FileBackedMemory block region is out of contiguous chunks")
+    }
+
+    pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.mapping.read(offset, len)
+    }
+
+    pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.mapping.write(offset, bytes)
+    }
+
+    pub(crate) fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .context("transactional FileBackedMemory block flush range overflow")?;
+        ensure!(
+            end <= self.mapping.len(),
+            "transactional FileBackedMemory block flush range out of bounds"
+        );
+        self.mapping.flush(offset, len)
+    }
+
+    pub(crate) fn fence(&self) -> Result<()> {
+        self.mapping.fence_data()
+    }
+}
+
+impl BlockRegionBackend for FileBackedMemoryBlockRegion {
+    fn block_size(&self) -> usize {
+        self.block_size()
+    }
+
+    fn num_blocks(&self) -> usize {
+        self.num_blocks()
+    }
+
+    fn bytes_len(&self) -> usize {
+        self.bytes_len()
+    }
+
+    fn line_mark_count(&self) -> usize {
+        self.line_count()
+    }
+
+    fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        self.alloc_chunk(block_count)
+    }
+
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.read(offset, len)
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.write(offset, bytes)
+    }
+
+    fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        self.flush(offset, len)
+    }
+
+    fn fence(&self) -> Result<()> {
+        self.fence()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,6 +1209,33 @@ mod tests {
     fn nvmemory_block_region_rejects_out_of_bounds_flush() {
         let region =
             NVMemoryBlockRegion::new_for_test(1, PersistenceMode::ResearchPretendPmem).unwrap();
+
+        let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
+        assert!(error.contains("flush range out of bounds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_block_region_allocates_and_flushes_writes() {
+        let mut region =
+            FileBackedMemoryBlockRegion::new_for_test(2, FileBackedRegionMode::Temp).unwrap();
+        let chunk = region.alloc_chunk(1).unwrap();
+        let range = chunk.byte_range();
+
+        region.write(range.start + 8, &[5, 6, 7, 8]).unwrap();
+        region.flush(range.start + 8, 4).unwrap();
+        region.fence().unwrap();
+
+        assert_eq!(region.read(range.start + 8, 4).unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(region.block_size(), BLOCK_SIZE);
+        assert_eq!(region.num_blocks(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_block_region_rejects_out_of_bounds_flush() {
+        let region =
+            FileBackedMemoryBlockRegion::new_for_test(1, FileBackedRegionMode::Temp).unwrap();
 
         let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
         assert!(error.contains("flush range out of bounds"));
