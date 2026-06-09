@@ -1,15 +1,15 @@
 //! Wizard-style storage for transactional memories.
 //!
 //! This module backs per-instance `tmemory` sidecars with volatile and research
-//! NVMemory block/chunk backends. `FileBackedMemory` remains represented in
-//! configuration, but is not implemented yet.
+//! NVMemory block/chunk backends, plus filesystem-backed transactional
+//! `FileBackedMemory`.
 
 #![allow(dead_code)]
 
 use crate::prelude::*;
 use crate::runtime::transaction::{
-    TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryPersistenceMode,
-    TransactionConfig,
+    TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryFileBacking,
+    TMemoryPersistenceMode, TransactionConfig,
 };
 use wasmtime_environ::MemoryIndex;
 
@@ -90,6 +90,7 @@ impl TMemory {
         Self::new_for_backend(
             config.tmemory_backend(),
             config.tmemory_persistence_mode(),
+            config.tmemory_file_backing(),
             min_pages,
             max_pages,
         )
@@ -107,6 +108,7 @@ impl TMemory {
         Self::new_for_backend(
             backend,
             TMemoryPersistenceMode::ResearchPretendPmem,
+            None,
             min_pages,
             max_pages,
         )
@@ -216,6 +218,7 @@ impl TMemory {
     fn new_for_backend(
         backend: TMemoryBackend,
         persistence_mode: TMemoryPersistenceMode,
+        file_backing: Option<TMemoryFileBacking>,
         min_pages: u64,
         max_pages: Option<u64>,
     ) -> Result<Self> {
@@ -226,7 +229,11 @@ impl TMemory {
                 max_pages,
                 persistence_mode,
             )?),
-            TMemoryBackend::FileBackedMemory => return Err(unsupported_backend_error(backend)),
+            TMemoryBackend::FileBackedMemory => {
+                let file_backing = file_backing
+                    .context("FileBackedMemory requires explicit file backing configuration")?;
+                Box::new(FileBackedMemory::new(min_pages, max_pages, file_backing)?)
+            }
         };
         Ok(Self { storage })
     }
@@ -723,6 +730,232 @@ impl TMemoryBackendStorage for NVMemory {
     }
 }
 
+/// Filesystem-backed transactional storage backed by a file-mapped block region.
+#[derive(Debug)]
+pub(crate) struct FileBackedMemory {
+    region: TMemoryRegion,
+    file_backing: TMemoryFileBacking,
+    granules: Vec<TMemoryGranuleInfo>,
+    byte_len: usize,
+    byte_capacity: usize,
+    max_pages: u64,
+}
+
+impl FileBackedMemory {
+    pub(crate) fn new(
+        min_pages: u64,
+        max_pages: Option<u64>,
+        file_backing: TMemoryFileBacking,
+    ) -> Result<Self> {
+        let requested_max_pages = max_pages;
+        let max_pages = max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES);
+        ensure!(min_pages <= max_pages, "tmemory minimum exceeds maximum");
+        let byte_len = pages_to_bytes(min_pages)?;
+        let byte_capacity = match requested_max_pages {
+            Some(max_pages) => pages_to_bytes(max_pages)?,
+            None => byte_len,
+        };
+        let granule_capacity = granules_for_bytes(byte_capacity);
+
+        Ok(Self {
+            region: TMemoryRegion::new_file_backed(
+                byte_capacity,
+                file_backed_region_mode(&file_backing),
+            )?,
+            file_backing,
+            granules: vec![TMemoryGranuleInfo::default(); granule_capacity],
+            byte_len,
+            byte_capacity,
+            max_pages,
+        })
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub(crate) fn granule_len(&self) -> usize {
+        granules_for_bytes(self.byte_len)
+    }
+
+    pub(crate) fn read(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        ensure!(range.start <= range.end, "tmemory read invalid range");
+        ensure!(range.end <= self.byte_len, "tmemory read out of bounds");
+        self.region.read(range.start, range.end - range.start)
+    }
+
+    pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        ensure!(
+            new_pages <= self.max_pages,
+            "tmemory growth exceeds maximum size"
+        );
+        let new_byte_len = pages_to_bytes(new_pages)?;
+        if new_byte_len < self.byte_len {
+            bail!("tmemory grow cannot shrink");
+        }
+        if new_byte_len == self.byte_len {
+            return Ok(());
+        }
+        if new_byte_len > self.byte_capacity {
+            self.reserve_capacity_to_pages(new_pages)?;
+        }
+
+        self.byte_len = new_byte_len;
+        Ok(())
+    }
+
+    pub(crate) fn can_grow_to_pages(&self, new_pages: u64) -> bool {
+        if new_pages > self.max_pages {
+            return false;
+        }
+        let Ok(new_byte_len) = pages_to_bytes(new_pages) else {
+            return false;
+        };
+        new_byte_len >= self.byte_len
+    }
+
+    fn reserve_capacity_to_pages(&mut self, new_capacity_pages: u64) -> Result<()> {
+        let new_byte_capacity = pages_to_bytes(new_capacity_pages)?;
+        ensure!(
+            new_byte_capacity >= self.byte_len,
+            "tmemory capacity cannot shrink below live size"
+        );
+        if new_byte_capacity <= self.byte_capacity {
+            return Ok(());
+        }
+
+        let old = if self.byte_len > 0 {
+            self.region.read(0, self.byte_len)?
+        } else {
+            Vec::new()
+        };
+        let mut region = TMemoryRegion::new_file_backed(
+            new_byte_capacity,
+            file_backed_region_mode(&self.file_backing),
+        )?;
+        if !old.is_empty() {
+            region.write(0, &old)?;
+            region.flush(0, old.len())?;
+            region.fence()?;
+        }
+
+        let new_granule_capacity = granules_for_bytes(new_byte_capacity);
+        self.granules
+            .resize(new_granule_capacity, TMemoryGranuleInfo::default());
+
+        self.region = region;
+        self.byte_capacity = new_byte_capacity;
+        Ok(())
+    }
+
+    pub(crate) fn txn_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        Ok(self.granules[granule])
+    }
+
+    pub(crate) fn set_txn_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        self.granules[granule] = info;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_region_block_size_for_test(&self) -> usize {
+        self.region.block_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn immix_line_size_for_test(&self) -> usize {
+        self.region.immix_line_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn line_mark_count_for_test(&self) -> usize {
+        self.region.line_mark_count_for_test()
+    }
+}
+
+fn file_backed_region_mode(
+    file_backing: &TMemoryFileBacking,
+) -> block_region::FileBackedRegionMode {
+    match file_backing {
+        TMemoryFileBacking::Temp => block_region::FileBackedRegionMode::Temp,
+        TMemoryFileBacking::Path(path) => block_region::FileBackedRegionMode::Path(path.clone()),
+    }
+}
+
+impl TMemoryBackendStorage for FileBackedMemory {
+    fn backend_kind(&self) -> TMemoryBackend {
+        TMemoryBackend::FileBackedMemory
+    }
+
+    fn byte_len(&self) -> usize {
+        self.byte_len()
+    }
+
+    fn byte_capacity(&self) -> usize {
+        self.byte_capacity
+    }
+
+    fn granule_count(&self) -> usize {
+        self.granule_len()
+    }
+
+    fn read_committed(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        self.read(range)
+    }
+
+    fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
+        let end = addr
+            .checked_add(bytes.len())
+            .context("tmemory write address overflow")?;
+        ensure!(end <= self.byte_len, "out of bounds tmemory access");
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.region.write(addr, bytes)?;
+        self.region.flush(addr, bytes.len())?;
+        self.region.fence()
+    }
+
+    fn can_grow_to_pages(&self, new_pages: u64) -> bool {
+        FileBackedMemory::can_grow_to_pages(self, new_pages)
+    }
+
+    fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        FileBackedMemory::grow_to_pages(self, new_pages)
+    }
+
+    fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        self.txn_info(granule)
+    }
+
+    fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
+        self.set_txn_info(granule, info)
+    }
+
+    #[cfg(test)]
+    fn block_region_block_size_for_test(&self) -> usize {
+        self.block_region_block_size_for_test()
+    }
+
+    #[cfg(test)]
+    fn immix_line_size_for_test(&self) -> usize {
+        self.immix_line_size_for_test()
+    }
+
+    #[cfg(test)]
+    fn line_mark_count_for_test(&self) -> usize {
+        self.line_mark_count_for_test()
+    }
+}
+
 fn pages_to_bytes(pages: u64) -> Result<usize> {
     let pages = usize::try_from(pages).context("tmemory page count does not fit host usize")?;
     pages
@@ -732,10 +965,6 @@ fn pages_to_bytes(pages: u64) -> Result<usize> {
 
 fn granules_for_bytes(bytes: usize) -> usize {
     bytes.div_ceil(TMEMORY_GRANULE_SIZE)
-}
-
-fn unsupported_backend_error(backend: TMemoryBackend) -> Error {
-    Error::msg(format!("tmemory backend is not implemented: {backend:?}"))
 }
 
 #[cfg(test)]
@@ -990,6 +1219,59 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tmemory_can_construct_file_backed_temp_backend() {
+        let config = TransactionConfig::with_file_backed_tmemory_temp().unwrap();
+        let memory = TMemory::new(config, 1, Some(1)).unwrap();
+
+        assert_eq!(memory.backend(), TMemoryBackend::FileBackedMemory);
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(
+            memory.block_region_block_size_for_test(),
+            block_region::BLOCK_SIZE
+        );
+        assert_eq!(
+            memory.immix_line_size_for_test(),
+            block_region::IMMIX_LINE_SIZE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_commit_range_writes_and_versions_granules() {
+        let config = TransactionConfig::with_file_backed_tmemory_temp().unwrap();
+        let mut memory = TMemory::new(config, 1, Some(1)).unwrap();
+
+        memory.commit_range(4, &[10, 11, 12, 13]).unwrap();
+
+        assert_eq!(memory.read_committed(4..8).unwrap(), vec![10, 11, 12, 13]);
+        assert_eq!(memory.granule_version(0).unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_grow_beyond_capacity_preserves_bytes_and_metadata() {
+        let config = TransactionConfig::with_file_backed_tmemory_temp().unwrap();
+        let mut memory = TMemory::new(config, 1, None).unwrap();
+        memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+        let mut info = memory.granule_info(0).unwrap();
+        info.owner = 7;
+        info.hash = 99;
+        memory.set_granule_info(0, info).unwrap();
+
+        memory.grow_to_pages(2).unwrap();
+
+        assert_eq!(memory.byte_len(), 2 * WASM_PAGE_SIZE);
+        assert_eq!(memory.byte_capacity(), 2 * WASM_PAGE_SIZE);
+        assert_eq!(memory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(memory.granule_info(0).unwrap(), info);
+        assert_eq!(
+            memory.granule_info(GRANULES_PER_WASM_PAGE).unwrap(),
+            TMemoryGranuleInfo::default()
+        );
+    }
+
     #[test]
     fn nvmemory_hardware_pmem_mode_is_reachable_from_transaction_config() {
         let config = TransactionConfig::with_nvmemory_persistence_mode(
@@ -1048,13 +1330,12 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_memory_remains_explicitly_unsupported() {
+    fn generic_file_backed_constructor_remains_explicitly_unsupported() {
         let error = TMemory::new_with_backend(TMemoryBackend::FileBackedMemory, 1)
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("FileBackedMemory"));
-        assert!(error.contains("not implemented"));
+        assert!(error.contains("FileBackedMemory requires explicit file backing"));
     }
 
     #[test]
