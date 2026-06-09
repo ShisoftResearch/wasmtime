@@ -31,6 +31,21 @@ Real restart/power-fail persistence tests remain gated behind
 `WASMTIME_TEST_REAL_PMEM=1` until durable recovery metadata and PMEM hardware
 are available.
 
+## FileBackedMemory Backend Implementation
+
+Date: 2026-06-09
+
+`FileBackedMemory` now exists as the filesystem-backed transactional memory
+backend. It uses the same block/chunk and copy-on-write commit path as
+`VMemory` and `NVMemory`, publishes committed bytes into a shared writable file
+mapping, and flushes/fences through filesystem durability APIs. The default
+backend remains `VMemory`; file-backed temp-file and explicit-path modes are
+both opt-in transaction configuration choices.
+
+Restart/power-fail recovery remains gated behind
+`WASMTIME_TEST_FILE_BACKED_TMEMORY_RECOVERY=1` until durable region headers,
+commit metadata, and recovery loading are implemented.
+
 ## Transactional Grow Ordering Follow-Up
 
 Date: 2026-06-09
@@ -46,14 +61,13 @@ case should get a focused regression test before changing commit ordering.
 
 Date: 2026-06-09
 
-The next durable backend workstream starts with `NVMemory`, not
-`FileBackedMemory`. `NVMemory` should be a real PMEM-shaped backend: it uses the
-shared block/chunk region model, writes committed COW ranges into the backend,
-flushes cache lines with CLWB on supported x86-64 hardware, and fences with
-SFENCE before publishing metadata. Development may run this backend on ordinary
-mapped storage while pretending the storage is PMEM, but tests that require
-actual power-fail persistence or post-restart recovery remain ignored or gated
-until a real PMEM machine is available.
+This section recorded the sequencing decision to start durable backend work
+with `NVMemory` before `FileBackedMemory`. That sequencing is now complete:
+`FileBackedMemory` has landed as the filesystem-backed backend, while
+`NVMemory` remains the PMEM-shaped backend for CLWB/SFENCE durability
+experiments. Tests that require actual power-fail persistence or post-restart
+recovery remain ignored or gated until a real PMEM machine and durable
+recovery metadata are available.
 
 Detailed design:
 `docs/shisoft/transactional-wasm-nvmemory-pmem-design.md`.
@@ -203,7 +217,8 @@ Remaining tagged mock boundaries:
   execution, but it is not the final persistent object model.
 - Full proposal binary validation beyond the current WAST fixtures, including
   hardened diagnostics for every transactional type/ref encoding.
-- Durable `FileBackedMemory` and `NVMemory` backends.
+- Durable restart/recovery metadata and loading for `FileBackedMemory` and
+  `NVMemory` backends.
 
 Verification:
 
