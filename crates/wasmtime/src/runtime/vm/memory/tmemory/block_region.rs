@@ -452,6 +452,162 @@ impl BlockRegionBackend for VMemoryBlockRegion {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct NVMemoryBlockRegion {
+    data: Vec<u8>,
+    block_entries: Vec<BlockEntry>,
+    line_marks: Vec<LineMark>,
+    persist: PersistEngine,
+}
+
+impl NVMemoryBlockRegion {
+    pub(crate) fn new(num_blocks: usize, mode: PersistenceMode) -> Result<Self> {
+        let bytes_len = num_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional NVMemory block region size overflow")?;
+        let line_count = bytes_len / IMMIX_LINE_SIZE;
+        Ok(Self {
+            data: vec![0; bytes_len],
+            block_entries: vec![BlockEntry::default(); num_blocks],
+            line_marks: vec![
+                LineMark {
+                    mark: IMMIX_LINE_MARK_RESET_VALUE,
+                };
+                line_count
+            ],
+            persist: PersistEngine::for_mode(mode)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(num_blocks: usize, mode: PersistenceMode) -> Result<Self> {
+        Self::new(num_blocks, mode)
+    }
+
+    pub(crate) fn block_size(&self) -> usize {
+        BLOCK_SIZE
+    }
+
+    pub(crate) fn num_blocks(&self) -> usize {
+        self.block_entries.len()
+    }
+
+    pub(crate) fn bytes_len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub(crate) fn line_count(&self) -> usize {
+        self.line_marks.len()
+    }
+
+    pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        ensure!(
+            block_count > 0,
+            "transactional NVMemory chunk must contain a block"
+        );
+        ensure!(
+            block_count <= self.num_blocks(),
+            "transactional NVMemory chunk exceeds region size"
+        );
+
+        let last_start = self.num_blocks() - block_count;
+        for start in 0..=last_start {
+            let end = start + block_count;
+            if self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0)
+            {
+                for entry in &mut self.block_entries[start..end] {
+                    entry.used = 1;
+                    entry.list_num = ListKind::Used as i16;
+                }
+                return Ok(RegionChunk {
+                    start_block: start,
+                    block_count,
+                });
+            }
+        }
+
+        bail!("transactional NVMemory block region is out of contiguous chunks")
+    }
+
+    pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let end = offset
+            .checked_add(len)
+            .context("transactional NVMemory block read range overflow")?;
+        ensure!(
+            end <= self.data.len(),
+            "transactional NVMemory block read range out of bounds"
+        );
+        Ok(self.data[offset..end].to_vec())
+    }
+
+    pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .context("transactional NVMemory block write range overflow")?;
+        ensure!(
+            end <= self.data.len(),
+            "transactional NVMemory block write range out of bounds"
+        );
+        self.data[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .context("transactional NVMemory block flush range overflow")?;
+        ensure!(
+            end <= self.data.len(),
+            "transactional NVMemory block flush range out of bounds"
+        );
+        if len == 0 {
+            return Ok(());
+        }
+        let ptr = core::ptr::NonNull::from(&self.data[offset]).cast::<u8>();
+        self.persist.flush(ptr, len)
+    }
+
+    pub(crate) fn fence(&self) -> Result<()> {
+        self.persist.fence()
+    }
+}
+
+impl BlockRegionBackend for NVMemoryBlockRegion {
+    fn block_size(&self) -> usize {
+        self.block_size()
+    }
+
+    fn num_blocks(&self) -> usize {
+        self.num_blocks()
+    }
+
+    fn bytes_len(&self) -> usize {
+        self.bytes_len()
+    }
+
+    fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        self.alloc_chunk(block_count)
+    }
+
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.read(offset, len)
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.write(offset, bytes)
+    }
+
+    fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        self.flush(offset, len)
+    }
+
+    fn fence(&self) -> Result<()> {
+        self.fence()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +694,30 @@ mod tests {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("NVMemory is unsupported"));
         }
+    }
+
+    #[test]
+    fn nvmemory_block_region_allocates_and_persists_writes_in_research_mode() {
+        let mut region =
+            NVMemoryBlockRegion::new_for_test(2, PersistenceMode::ResearchPretendPmem).unwrap();
+        let chunk = region.alloc_chunk(1).unwrap();
+        let range = chunk.byte_range();
+
+        region.write(range.start, &[1, 2, 3, 4]).unwrap();
+        region.flush(range.start, 4).unwrap();
+        region.fence().unwrap();
+
+        assert_eq!(region.read(range.start, 4).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(region.block_size(), BLOCK_SIZE);
+        assert_eq!(region.num_blocks(), 2);
+    }
+
+    #[test]
+    fn nvmemory_block_region_rejects_out_of_bounds_flush() {
+        let region =
+            NVMemoryBlockRegion::new_for_test(1, PersistenceMode::ResearchPretendPmem).unwrap();
+
+        let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
+        assert!(error.contains("flush range out of bounds"));
     }
 }
