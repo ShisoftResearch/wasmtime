@@ -953,6 +953,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires real PMEM hardware and WASMTIME_TEST_REAL_PMEM=1"]
+    fn nvmemory_requires_real_pmem_for_restart_persistence() {
+        if std::env::var_os("WASMTIME_TEST_REAL_PMEM").is_none() {
+            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 on a PMEM machine to run this test");
+            return;
+        }
+
+        panic!("real PMEM restart recovery test is not implemented in this backend wave");
+    }
+
+    #[test]
     fn vmemory_grow_initializes_new_granule_metadata() {
         let mut memory = TMemory::new(TransactionConfig::default(), 1, Some(2)).unwrap();
 
