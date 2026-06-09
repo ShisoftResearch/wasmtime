@@ -3,15 +3,21 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
+use crate::runtime::vm::SendSyncPtr;
 use core::{
     mem::size_of,
     ops::Range,
+    ptr::NonNull,
     sync::atomic::{Ordering, compiler_fence},
 };
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub(crate) const BLOCK_SIZE: usize = 512 * 1024;
 pub(crate) const IMMIX_LINE_SIZE: usize = 256;
 pub(crate) const PMEM_CACHE_LINE_SIZE: usize = 64;
+static FILE_BACKED_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const PW_REGION_HEADER_SIZE: usize = size_of::<PWRegionHeader>();
 pub(crate) const META_DATA_DESC_SIZE: usize = size_of::<MetaDataDesc>();
@@ -23,6 +29,258 @@ pub(crate) const LINE_MARK_SIZE: usize = size_of::<LineMark>();
 pub(crate) enum PersistenceMode {
     ResearchPretendPmem,
     RequireHardwarePmem,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FileBackedRegionMode {
+    Temp,
+    Path(PathBuf),
+}
+
+#[derive(Debug)]
+pub(crate) struct FileBackedMapping {
+    file: File,
+    path: PathBuf,
+    unlink_on_drop: bool,
+    memory: SendSyncPtr<[u8]>,
+}
+
+impl FileBackedMapping {
+    pub(crate) fn new(mode: FileBackedRegionMode, len: usize) -> Result<Self> {
+        match mode {
+            FileBackedRegionMode::Temp => Self::new_temp(len),
+            FileBackedRegionMode::Path(path) => Self::new_path(path, len),
+        }
+    }
+
+    pub(crate) fn new_temp(len: usize) -> Result<Self> {
+        let path = unique_temp_file_path();
+        let mapping = Self::new_path_with_unlink(path, len, true)?;
+        Ok(mapping)
+    }
+
+    pub(crate) fn new_path(path: PathBuf, len: usize) -> Result<Self> {
+        Self::new_path_with_unlink(path, len, false)
+    }
+
+    fn new_path_with_unlink(path: PathBuf, len: usize, unlink_on_drop: bool) -> Result<Self> {
+        new_file_backed_mapping(path, len, unlink_on_drop)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.memory.len()
+    }
+
+    pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let end = offset
+            .checked_add(len)
+            .context("file-backed mapping read range overflow")?;
+        ensure!(
+            end <= self.len(),
+            "file-backed mapping read range out of bounds"
+        );
+        let slice = unsafe { self.memory.as_ref() };
+        Ok(slice[offset..end].to_vec())
+    }
+
+    pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .context("file-backed mapping write range overflow")?;
+        ensure!(
+            end <= self.len(),
+            "file-backed mapping write range out of bounds"
+        );
+        let slice = unsafe { self.memory.as_mut() };
+        slice[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .context("file-backed mapping flush range overflow")?;
+        ensure!(
+            end <= self.len(),
+            "file-backed mapping flush range out of bounds"
+        );
+        if len == 0 {
+            return Ok(());
+        }
+        flush_file_backed_mapping(self.memory, offset, len)
+    }
+
+    pub(crate) fn fence_data(&self) -> Result<()> {
+        self.file
+            .sync_data()
+            .context("failed to sync_data file-backed tmemory")
+    }
+
+    pub(crate) fn fence_all(&self) -> Result<()> {
+        self.file
+            .sync_all()
+            .context("failed to sync_all file-backed tmemory")
+    }
+
+    pub(crate) fn remap_len(&mut self, new_len: usize) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.file
+                .set_len(u64::try_from(new_len).context("file-backed tmemory length overflow")?)
+                .with_context(|| {
+                    format!(
+                        "failed to resize file-backed tmemory file {}",
+                        self.path.display()
+                    )
+                })?;
+            let old_memory = self.memory;
+            self.memory = empty_mapping_memory();
+            unsafe { unmap_shared_file(old_memory)? };
+            self.memory = unsafe { map_shared_file(&self.file, new_len)? };
+            self.fence_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = new_len;
+            bail!("FileBackedMemory remap is unsupported on this target")
+        }
+    }
+}
+
+impl Drop for FileBackedMapping {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            let _ = unmap_shared_file(self.memory);
+        }
+        if self.unlink_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn unique_temp_file_path() -> PathBuf {
+    let counter = FILE_BACKED_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "wasmtime-transaction-tmemory-{}-{counter}.bin",
+        std::process::id()
+    ))
+}
+
+fn empty_mapping_memory() -> SendSyncPtr<[u8]> {
+    SendSyncPtr::new(NonNull::slice_from_raw_parts(NonNull::<u8>::dangling(), 0))
+}
+
+#[cfg(unix)]
+fn new_file_backed_mapping(
+    path: PathBuf,
+    len: usize,
+    unlink_on_drop: bool,
+) -> Result<FileBackedMapping> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("failed to open file-backed tmemory file {}", path.display()))?;
+    file.set_len(u64::try_from(len).context("file-backed tmemory length overflow")?)
+        .with_context(|| {
+            format!(
+                "failed to resize file-backed tmemory file {}",
+                path.display()
+            )
+        })?;
+    let memory = unsafe { map_shared_file(&file, len)? };
+    Ok(FileBackedMapping {
+        file,
+        path,
+        unlink_on_drop,
+        memory,
+    })
+}
+
+#[cfg(unix)]
+unsafe fn map_shared_file(file: &File, len: usize) -> Result<SendSyncPtr<[u8]>> {
+    if len == 0 {
+        return Ok(empty_mapping_memory());
+    }
+    let ptr = unsafe {
+        rustix::mm::mmap(
+            core::ptr::null_mut(),
+            len,
+            rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+            rustix::mm::MapFlags::SHARED,
+            file,
+            0,
+        )
+        .context("failed to mmap shared file-backed tmemory region")?
+    };
+    let slice = core::ptr::slice_from_raw_parts_mut(ptr.cast::<u8>(), len);
+    Ok(SendSyncPtr::new(NonNull::new(slice).unwrap()))
+}
+
+#[cfg(unix)]
+unsafe fn unmap_shared_file(memory: SendSyncPtr<[u8]>) -> Result<()> {
+    let len = memory.len();
+    if len == 0 {
+        return Ok(());
+    }
+    unsafe {
+        rustix::mm::munmap(memory.as_non_null().cast::<u8>().as_ptr().cast(), len)
+            .context("failed to munmap file-backed tmemory region")?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn flush_file_backed_mapping(memory: SendSyncPtr<[u8]>, offset: usize, len: usize) -> Result<()> {
+    let page_size = rustix::param::page_size();
+    let aligned_start = offset & !(page_size - 1);
+    let end = offset
+        .checked_add(len)
+        .context("file-backed mapping flush range overflow")?;
+    let aligned_end = end
+        .checked_add(page_size - 1)
+        .context("file-backed mapping flush alignment overflow")?
+        & !(page_size - 1);
+    let aligned_len = aligned_end - aligned_start;
+    unsafe {
+        rustix::mm::msync(
+            memory
+                .as_non_null()
+                .cast::<u8>()
+                .as_ptr()
+                .add(aligned_start)
+                .cast(),
+            aligned_len,
+            rustix::mm::MsyncFlags::SYNC,
+        )
+        .context("failed to msync file-backed tmemory range")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn new_file_backed_mapping(
+    _path: PathBuf,
+    _len: usize,
+    _unlink_on_drop: bool,
+) -> Result<FileBackedMapping> {
+    bail!(
+        "FileBackedMemory is unsupported on this target until shared writable mmap support exists"
+    )
+}
+
+#[cfg(not(unix))]
+fn flush_file_backed_mapping(
+    _memory: SendSyncPtr<[u8]>,
+    _offset: usize,
+    _len: usize,
+) -> Result<()> {
+    bail!(
+        "FileBackedMemory is unsupported on this target until shared writable mmap support exists"
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -742,5 +1000,52 @@ mod tests {
 
         let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
         assert!(error.contains("flush range out of bounds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_writes_through_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapping.tmemory");
+        let mut mapping = FileBackedMapping::new_path(path.clone(), 4096).unwrap();
+
+        mapping.write(16, &[1, 2, 3, 4]).unwrap();
+        mapping.flush(16, 4).unwrap();
+        mapping.fence_data().unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[16..20], &[1, 2, 3, 4]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_rejects_out_of_bounds_flush() {
+        let mapping = FileBackedMapping::new_temp(4096).unwrap();
+
+        let error = mapping.flush(4096, 1).unwrap_err().to_string();
+        assert!(error.contains("file-backed mapping flush range out of bounds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_remap_preserves_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remap.tmemory");
+        let mut mapping = FileBackedMapping::new_path(path.clone(), 4096).unwrap();
+
+        mapping.write(32, &[9, 8, 7, 6]).unwrap();
+        mapping.flush(32, 4).unwrap();
+        mapping.fence_data().unwrap();
+        mapping.remap_len(8192).unwrap();
+
+        assert_eq!(mapping.read(32, 4).unwrap(), vec![9, 8, 7, 6]);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 8192);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn file_backed_shared_mapping_is_unsupported_on_non_unix() {
+        let error = FileBackedMapping::new_temp(4096).unwrap_err().to_string();
+        assert!(error.contains("unsupported"));
     }
 }
