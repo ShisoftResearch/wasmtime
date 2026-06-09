@@ -54,9 +54,7 @@ impl FileBackedMapping {
     }
 
     pub(crate) fn new_temp(len: usize) -> Result<Self> {
-        let path = unique_temp_file_path();
-        let mapping = Self::new_path_with_unlink(path, len, true)?;
-        Ok(mapping)
+        new_temp_file_backed_mapping(len)
     }
 
     pub(crate) fn new_path(path: PathBuf, len: usize) -> Result<Self> {
@@ -133,10 +131,9 @@ impl FileBackedMapping {
                         self.path.display()
                     )
                 })?;
-            let old_memory = self.memory;
-            self.memory = empty_mapping_memory();
+            let new_memory = unsafe { map_shared_file(&self.file, new_len)? };
+            let old_memory = core::mem::replace(&mut self.memory, new_memory);
             unsafe { unmap_shared_file(old_memory)? };
-            self.memory = unsafe { map_shared_file(&self.file, new_len)? };
             self.fence_all()
         }
         #[cfg(not(unix))]
@@ -184,14 +181,67 @@ fn new_file_backed_mapping(
         .truncate(true)
         .open(&path)
         .with_context(|| format!("failed to open file-backed tmemory file {}", path.display()))?;
-    file.set_len(u64::try_from(len).context("file-backed tmemory length overflow")?)
+    finish_file_backed_mapping(file, path, len, unlink_on_drop)
+}
+
+#[cfg(unix)]
+fn new_temp_file_backed_mapping(len: usize) -> Result<FileBackedMapping> {
+    const MAX_ATTEMPTS: usize = 16;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let path = unique_temp_file_path();
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return finish_file_backed_mapping(file, path, len, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create temp file-backed tmemory file {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    bail!("failed to create unique temp file-backed tmemory file after {MAX_ATTEMPTS} attempts")
+}
+
+#[cfg(unix)]
+fn finish_file_backed_mapping(
+    file: File,
+    path: PathBuf,
+    len: usize,
+    unlink_on_drop: bool,
+) -> Result<FileBackedMapping> {
+    if let Err(error) = file
+        .set_len(u64::try_from(len).context("file-backed tmemory length overflow")?)
         .with_context(|| {
             format!(
                 "failed to resize file-backed tmemory file {}",
                 path.display()
             )
-        })?;
-    let memory = unsafe { map_shared_file(&file, len)? };
+        })
+    {
+        if unlink_on_drop {
+            let _ = std::fs::remove_file(&path);
+        }
+        return Err(error);
+    }
+    let memory = match unsafe { map_shared_file(&file, len) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            if unlink_on_drop {
+                let _ = std::fs::remove_file(&path);
+            }
+            return Err(error);
+        }
+    };
     Ok(FileBackedMapping {
         file,
         path,
@@ -236,15 +286,8 @@ unsafe fn unmap_shared_file(memory: SendSyncPtr<[u8]>) -> Result<()> {
 #[cfg(unix)]
 fn flush_file_backed_mapping(memory: SendSyncPtr<[u8]>, offset: usize, len: usize) -> Result<()> {
     let page_size = rustix::param::page_size();
-    let aligned_start = offset & !(page_size - 1);
-    let end = offset
-        .checked_add(len)
-        .context("file-backed mapping flush range overflow")?;
-    let aligned_end = end
-        .checked_add(page_size - 1)
-        .context("file-backed mapping flush alignment overflow")?
-        & !(page_size - 1);
-    let aligned_len = aligned_end - aligned_start;
+    let (aligned_start, aligned_len) =
+        file_backed_flush_range(memory.len(), offset, len, page_size)?;
     unsafe {
         rustix::mm::msync(
             memory
@@ -259,6 +302,30 @@ fn flush_file_backed_mapping(memory: SendSyncPtr<[u8]>, offset: usize, len: usiz
         .context("failed to msync file-backed tmemory range")?;
     }
     Ok(())
+}
+
+fn file_backed_flush_range(
+    mapping_len: usize,
+    offset: usize,
+    len: usize,
+    page_size: usize,
+) -> Result<(usize, usize)> {
+    ensure!(
+        page_size > 0,
+        "file-backed mapping page size must be nonzero"
+    );
+    let end = offset
+        .checked_add(len)
+        .context("file-backed mapping flush range overflow")?;
+    ensure!(
+        end <= mapping_len,
+        "file-backed mapping flush range out of bounds"
+    );
+    if len == 0 {
+        return Ok((offset, 0));
+    }
+    let aligned_start = (offset / page_size) * page_size;
+    Ok((aligned_start, end - aligned_start))
 }
 
 #[cfg(not(unix))]
@@ -890,6 +957,12 @@ impl BlockRegionBackend for NVMemoryBlockRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn file_backed_temp_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn vmemory_block_region_allocates_single_and_multi_block_chunks() {
@@ -1020,6 +1093,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn file_backed_shared_mapping_rejects_out_of_bounds_flush() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mapping = FileBackedMapping::new_temp(4096).unwrap();
 
         let error = mapping.flush(4096, 1).unwrap_err().to_string();
@@ -1040,6 +1116,70 @@ mod tests {
 
         assert_eq!(mapping.read(32, 4).unwrap(), vec![9, 8, 7, 6]);
         assert_eq!(std::fs::metadata(path).unwrap().len(), 8192);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_tail_flush_range_stays_within_mapping() {
+        let page_size = rustix::param::page_size();
+        let (aligned_start, aligned_len) =
+            file_backed_flush_range(4097, 4096, 1, page_size).unwrap();
+
+        assert_eq!(aligned_start, 4096);
+        assert_eq!(aligned_len, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_flushes_tail_of_non_page_aligned_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail-flush.tmemory");
+        let mut mapping = FileBackedMapping::new_path(path.clone(), 4097).unwrap();
+
+        mapping.write(4096, &[0x5a]).unwrap();
+        mapping.flush(4096, 1).unwrap();
+        mapping.fence_data().unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len(), 4097);
+        assert_eq!(bytes[4096], 0x5a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_zero_len_supports_empty_operations() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut mapping = FileBackedMapping::new_temp(0).unwrap();
+
+        assert_eq!(mapping.len(), 0);
+        assert_eq!(mapping.read(0, 0).unwrap(), Vec::<u8>::new());
+        mapping.write(0, &[]).unwrap();
+        mapping.flush(0, 0).unwrap();
+        mapping.fence_data().unwrap();
+        mapping.fence_all().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_temp_mode_does_not_clobber_existing_file() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let counter = FILE_BACKED_TEMP_COUNTER.load(AtomicOrdering::Relaxed);
+        let stale_path = std::env::temp_dir().join(format!(
+            "wasmtime-transaction-tmemory-{}-{counter}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&stale_path, b"stale-bytes").unwrap();
+
+        let mapping = FileBackedMapping::new_temp(16).unwrap();
+
+        assert_ne!(mapping.path, stale_path);
+        assert_eq!(std::fs::read(&stale_path).unwrap(), b"stale-bytes");
+
+        std::fs::remove_file(stale_path).unwrap();
     }
 
     #[cfg(not(unix))]
