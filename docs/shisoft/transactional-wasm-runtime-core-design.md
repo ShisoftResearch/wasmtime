@@ -185,9 +185,11 @@ path.
 
 The runtime defines a `TMemoryRegion` frontend over the shared block/chunk
 storage layer. The first implemented backend is `VMemory`, an anonymous
-mmap-backed volatile block region. `FileBackedMemory` and `NVMemory` stay
-represented in configuration but are rejected until their block-region backends
-exist.
+mmap-backed volatile block region. The first persistent backend should be
+`NVMemory`, not `FileBackedMemory`: it uses the same block/chunk shape but
+publishes committed ranges through a PMEM-style flush/fence path based on CLWB
+and SFENCE on supported x86-64 systems. `FileBackedMemory` remains a later
+compatibility backend.
 
 A linear `tmemory` is physically backed by a possibly discontiguous chunk list.
 For execution, it reserves a contiguous virtual address range for the running
@@ -209,6 +211,13 @@ The `TMemoryRegion` frontend must support:
 The frontend must not encode a specific persistence model. `VMemory`,
 `FileBackedMemory`, and `NVMemory` should be interchangeable behind the shared
 block-region API.
+
+`NVMemory` is allowed to run in a research mode on ordinary mapped storage while
+still executing the PMEM-shaped persistence protocol. Tests that require actual
+power-fail persistence or post-restart recovery stay ignored or gated until a
+real PMEM machine is available. See
+`docs/shisoft/transactional-wasm-nvmemory-pmem-design.md` for the detailed
+backend design.
 
 ## Copy-On-Write Workspace
 
@@ -586,7 +595,8 @@ order:
 8. Implement `ttry`/`tfail` structured failure semantics after transaction entry,
    object COW, promotion, and ownership are stable.
 9. Add the first non-moving persistent `ObjectId` mark/sweep collector.
-10. Add file-backed and NVMemory backends behind the same block/chunk interfaces.
+10. Add the NVMemory backend first, then defer FileBackedMemory behind
+    the same block/chunk interfaces.
 
 This order keeps ordinary Wasmtime GC isolated while the persistent object heap
 is brought online, then adds persistent reachability collection after the

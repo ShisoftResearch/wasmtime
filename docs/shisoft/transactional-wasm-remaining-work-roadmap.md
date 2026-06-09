@@ -904,7 +904,10 @@ git commit -m "Add persistent ObjectId mark sweep collector"
 ## Wave 10: Durable Backends
 
 **Purpose:** add the selectable storage backends needed for the thesis system
-after WAST-visible semantics are stable.
+after WAST-visible semantics are stable. The next backend is `NVMemory`, a real
+PMEM-shaped backend that uses CLWB/SFENCE on supported x86-64 hardware even
+when development runs on non-PMEM storage. True durability and recovery tests
+remain ignored or gated until a PMEM machine is available.
 
 **Files:**
 
@@ -920,25 +923,33 @@ after WAST-visible semantics are stable.
 Add tests for:
 
 - `VMemory` remains the default.
-- `FileBackedMemory` can be selected with a path and creates a file-backed
-  block region.
-- `NVMemory` can be selected only when the platform configuration provides a
-  valid PMEM path or device abstraction.
+- `NVMemory` can be selected with a path/device abstraction and creates a
+  PMEM-shaped block region.
+- `NVMemory` rejects unsupported targets or missing CLWB support unless the
+  test explicitly selects a non-durable research mode.
+- real PMEM restart/recovery tests are gated with `WASMTIME_TEST_REAL_PMEM=1`.
+- `FileBackedMemory` remains represented but is deferred behind `NVMemory`.
 - ordinary Wasmtime memories are unaffected by transaction backend selection.
 
-- [ ] **Step 2: Implement file-backed block region**
+- [ ] **Step 2: Implement NVMemory block region**
 
-Implement block allocation, mmap, flush, and fence hooks for
-`FileBackedMemory`. Keep the same `BlockRegionBackend` interface used by
-`VMemory`.
+Implement block allocation, mmap, CLWB-backed flush, and SFENCE hooks for
+`NVMemory`. Keep the same `BlockRegionBackend` interface used by `VMemory`.
+The first implementation may map ordinary storage while still following the
+PMEM-shaped persistence protocol; do not claim crash persistence from that mode.
 
 - [ ] **Step 3: Implement NVMemory configuration shell**
 
 Add the configuration and error boundaries for `NVMemory`. The first NVMemory
-implementation should use the same block/chunk API and make unsupported
-platforms fail with an explicit backend-selection error.
+implementation should use the same block/chunk API, name a PMEM path/device,
+and make unsupported platforms fail with an explicit backend-selection error.
 
-- [ ] **Step 4: Verify**
+- [ ] **Step 4: Defer FileBackedMemory**
+
+Keep `FileBackedMemory` in the enum and configuration story, but leave it
+unsupported until after the thesis-specific `NVMemory` path exists.
+
+- [ ] **Step 5: Verify**
 
 Run:
 
@@ -948,7 +959,7 @@ cargo test -p wasmtime --lib transaction_backend -- --format terse
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 Run:
 

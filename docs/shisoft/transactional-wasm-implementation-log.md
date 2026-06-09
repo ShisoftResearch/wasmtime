@@ -15,6 +15,22 @@ Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
 work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
 or object-model sequencing have drifted.
 
+## NVMemory PMEM Backend Decision
+
+Date: 2026-06-09
+
+The next durable backend workstream starts with `NVMemory`, not
+`FileBackedMemory`. `NVMemory` should be a real PMEM-shaped backend: it uses the
+shared block/chunk region model, writes committed COW ranges into the backend,
+flushes cache lines with CLWB on supported x86-64 hardware, and fences with
+SFENCE before publishing metadata. Development may run this backend on ordinary
+mapped storage while pretending the storage is PMEM, but tests that require
+actual power-fail persistence or post-restart recovery remain ignored or gated
+until a real PMEM machine is available.
+
+Detailed design:
+`docs/shisoft/transactional-wasm-nvmemory-pmem-design.md`.
+
 ## Transaction Proposal WAST Closure
 
 Date: 2026-06-07
