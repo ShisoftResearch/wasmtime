@@ -4,7 +4,14 @@
 
 use crate::prelude::*;
 
-use super::block_region::{BLOCK_SIZE, ChunkList, IMMIX_LINE_SIZE, VMemoryBlockRegion};
+use super::block_region::{
+    BLOCK_SIZE, BlockRegionBackend, ChunkList, IMMIX_LINE_SIZE, NVMemoryBlockRegion,
+    PersistenceMode, VMemoryBlockRegion,
+};
+
+pub(super) trait LinearRegionBackend: BlockRegionBackend + core::fmt::Debug + Send + Sync {}
+
+impl<T> LinearRegionBackend for T where T: BlockRegionBackend + core::fmt::Debug + Send + Sync {}
 
 #[derive(Debug)]
 pub(super) struct TMemoryRegion {
@@ -22,7 +29,21 @@ impl TMemoryRegion {
         };
         let chunks = ChunkList::from_chunks(chunks)?;
         Ok(Self {
-            linear: MappedLinearRegion::new(backend, chunks),
+            linear: MappedLinearRegion::new(Box::new(backend), chunks),
+        })
+    }
+
+    pub(super) fn new_nvmemory(byte_capacity: usize, mode: PersistenceMode) -> Result<Self> {
+        let block_count = byte_capacity.div_ceil(BLOCK_SIZE);
+        let mut backend = NVMemoryBlockRegion::new(block_count, mode)?;
+        let chunks = if block_count == 0 {
+            Vec::new()
+        } else {
+            vec![backend.alloc_chunk(block_count)?]
+        };
+        let chunks = ChunkList::from_chunks(chunks)?;
+        Ok(Self {
+            linear: MappedLinearRegion::new(Box::new(backend), chunks),
         })
     }
 
@@ -61,12 +82,12 @@ impl TMemoryRegion {
 
 #[derive(Debug)]
 pub(super) struct MappedLinearRegion {
-    backend: VMemoryBlockRegion,
+    backend: Box<dyn LinearRegionBackend>,
     chunks: ChunkList,
 }
 
 impl MappedLinearRegion {
-    pub(super) fn new(backend: VMemoryBlockRegion, chunks: ChunkList) -> Self {
+    pub(super) fn new(backend: Box<dyn LinearRegionBackend>, chunks: ChunkList) -> Self {
         Self { backend, chunks }
     }
 
@@ -75,7 +96,7 @@ impl MappedLinearRegion {
     }
 
     pub(super) fn line_mark_count_for_test(&self) -> usize {
-        self.backend.line_count()
+        self.backend.bytes_len() / IMMIX_LINE_SIZE
     }
 
     pub(super) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -155,7 +176,7 @@ struct LogicalSegment {
 mod tests {
     use super::*;
     use crate::runtime::vm::memory::tmemory::block_region::{
-        BLOCK_SIZE, ChunkList, VMemoryBlockRegion,
+        BLOCK_SIZE, ChunkList, NVMemoryBlockRegion, PersistenceMode, VMemoryBlockRegion,
     };
 
     #[test]
@@ -165,7 +186,7 @@ mod tests {
         let _gap = backend.alloc_chunk(1).unwrap();
         let second = backend.alloc_chunk(1).unwrap();
         let chunks = ChunkList::from_chunks(vec![first, second]).unwrap();
-        let mut region = MappedLinearRegion::new(backend, chunks);
+        let mut region = MappedLinearRegion::new(Box::new(backend), chunks);
 
         region.write(0, &[1, 2, 3]).unwrap();
         region.write(BLOCK_SIZE - 2, &[4, 5, 6, 7]).unwrap();
@@ -173,5 +194,17 @@ mod tests {
         assert_eq!(region.logical_len(), 2 * BLOCK_SIZE);
         assert_eq!(region.read(0, 3).unwrap(), vec![1, 2, 3]);
         assert_eq!(region.read(BLOCK_SIZE - 2, 4).unwrap(), vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn mapped_linear_region_supports_nvmemory_backend() {
+        let mut backend =
+            NVMemoryBlockRegion::new_for_test(2, PersistenceMode::ResearchPretendPmem).unwrap();
+        let chunk = backend.alloc_chunk(1).unwrap();
+        let chunks = ChunkList::from_chunks(vec![chunk]).unwrap();
+        let mut region = MappedLinearRegion::new(Box::new(backend), chunks);
+
+        region.write(0, &[9, 8, 7]).unwrap();
+        assert_eq!(region.read(0, 3).unwrap(), vec![9, 8, 7]);
     }
 }
