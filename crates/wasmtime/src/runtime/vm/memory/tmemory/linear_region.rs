@@ -96,7 +96,7 @@ impl MappedLinearRegion {
     }
 
     pub(super) fn line_mark_count_for_test(&self) -> usize {
-        self.backend.bytes_len() / IMMIX_LINE_SIZE
+        self.backend.line_mark_count()
     }
 
     pub(super) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -179,6 +179,53 @@ mod tests {
         BLOCK_SIZE, ChunkList, NVMemoryBlockRegion, PersistenceMode, VMemoryBlockRegion,
     };
 
+    #[derive(Debug)]
+    struct TestBackend {
+        bytes_len: usize,
+        line_mark_count: usize,
+    }
+
+    impl BlockRegionBackend for TestBackend {
+        fn block_size(&self) -> usize {
+            BLOCK_SIZE
+        }
+
+        fn num_blocks(&self) -> usize {
+            self.bytes_len.div_ceil(BLOCK_SIZE)
+        }
+
+        fn bytes_len(&self) -> usize {
+            self.bytes_len
+        }
+
+        fn line_mark_count(&self) -> usize {
+            self.line_mark_count
+        }
+
+        fn alloc_chunk(
+            &mut self,
+            _block_count: usize,
+        ) -> Result<super::super::block_region::RegionChunk> {
+            unreachable!("test backend does not allocate chunks")
+        }
+
+        fn read(&self, _offset: usize, _len: usize) -> Result<Vec<u8>> {
+            unreachable!("test backend does not read data")
+        }
+
+        fn write(&mut self, _offset: usize, _bytes: &[u8]) -> Result<()> {
+            unreachable!("test backend does not write data")
+        }
+
+        fn flush(&self, _offset: usize, _len: usize) -> Result<()> {
+            Ok(())
+        }
+
+        fn fence(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn mapped_linear_region_reads_across_non_contiguous_chunks() {
         let mut backend = VMemoryBlockRegion::new(4).unwrap();
@@ -206,5 +253,42 @@ mod tests {
 
         region.write(0, &[9, 8, 7]).unwrap();
         assert_eq!(region.read(0, 3).unwrap(), vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn mapped_linear_region_reports_backend_owned_line_mark_count() {
+        let chunk = VMemoryBlockRegion::new(1).unwrap().alloc_chunk(1).unwrap();
+        let chunks = ChunkList::from_chunks(vec![chunk]).unwrap();
+        let region = MappedLinearRegion::new(
+            Box::new(TestBackend {
+                bytes_len: BLOCK_SIZE,
+                line_mark_count: (BLOCK_SIZE / IMMIX_LINE_SIZE) - 1,
+            }),
+            chunks,
+        );
+
+        assert_eq!(
+            region.line_mark_count_for_test(),
+            (BLOCK_SIZE / IMMIX_LINE_SIZE) - 1
+        );
+    }
+
+    #[test]
+    fn vmemory_region_reports_backend_line_mark_count() {
+        let empty = TMemoryRegion::new(0).unwrap();
+        assert_eq!(empty.line_mark_count_for_test(), 0);
+
+        let one_byte = TMemoryRegion::new(1).unwrap();
+        assert_eq!(one_byte.line_mark_count_for_test(), BLOCK_SIZE / IMMIX_LINE_SIZE);
+    }
+
+    #[test]
+    fn nvmemory_region_reports_backend_line_mark_count() {
+        let empty = TMemoryRegion::new_nvmemory(0, PersistenceMode::ResearchPretendPmem).unwrap();
+        assert_eq!(empty.line_mark_count_for_test(), 0);
+
+        let one_byte =
+            TMemoryRegion::new_nvmemory(1, PersistenceMode::ResearchPretendPmem).unwrap();
+        assert_eq!(one_byte.line_mark_count_for_test(), BLOCK_SIZE / IMMIX_LINE_SIZE);
     }
 }

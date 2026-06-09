@@ -203,6 +203,7 @@ pub(crate) trait BlockRegionBackend {
     fn block_size(&self) -> usize;
     fn num_blocks(&self) -> usize;
     fn bytes_len(&self) -> usize;
+    fn line_mark_count(&self) -> usize;
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk>;
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
@@ -431,6 +432,10 @@ impl BlockRegionBackend for VMemoryBlockRegion {
         self.bytes_len()
     }
 
+    fn line_mark_count(&self) -> usize {
+        self.line_count()
+    }
+
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
         self.alloc_chunk(block_count)
     }
@@ -585,6 +590,10 @@ impl BlockRegionBackend for NVMemoryBlockRegion {
 
     fn bytes_len(&self) -> usize {
         self.bytes_len()
+    }
+
+    fn line_mark_count(&self) -> usize {
+        self.line_count()
     }
 
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
