@@ -11,18 +11,20 @@ use core::{cell::Cell, mem, ops::Range};
 mod object_heap;
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
-// store-local transaction state, `VMemory`-only transactional memory storage,
-// and real `tmemory` sidecars. Remaining `SHISOFT-TWASM-MOCK` tags in this
-// file identify policy/backend selection and object-table gaps.
+// store-local transaction state, `VMemory` and research `NVMemory`
+// transactional memory storage, and real `tmemory` sidecars. Remaining
+// `SHISOFT-TWASM-MOCK` tags in this file identify policy selection and
+// object-table gaps.
 
 /// Storage backend selected for transactional memories.
 ///
-/// SHISOFT-TWASM-MOCK: selectable backend shape is present, but only `VMemory`
-/// is currently accepted by `TransactionConfig`.
+/// SHISOFT-TWASM-MOCK: selectable backend shape is present and
+/// `TransactionConfig` accepts the implemented in-tree backends.
 ///
-/// Milestone 1 only implements `VMemory`. The other variants are represented
-/// now so transaction configuration has the right shape for later persistence
-/// experiments without changing ordinary Wasmtime memories.
+/// Milestone runtime support currently implements `VMemory` and research
+/// `NVMemory`. `FileBackedMemory` remains represented so transaction
+/// configuration keeps its later persistence shape without changing ordinary
+/// Wasmtime memories.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TMemoryBackend {
     VMemory,
@@ -37,8 +39,9 @@ pub(crate) enum ConcurrencyControl {
     LockBased,
 }
 
-/// SHISOFT-TWASM-MOCK: durability is volatile rollback-only until tmemory can
-/// select FileBackedMemory or NVMemory storage.
+/// SHISOFT-TWASM-MOCK: durability is still volatile rollback-only; research
+/// `NVMemory` can model PMEM-style flush/fence behavior, but true durability
+/// and crash recovery are future work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DurabilityPolicy {
     VolatileRollbackOnly,
@@ -99,11 +102,11 @@ impl TransactionConfig {
 
     fn set_tmemory_backend(&mut self, tmemory_backend: TMemoryBackend) -> Result<()> {
         match tmemory_backend {
-            TMemoryBackend::VMemory => {
+            TMemoryBackend::VMemory | TMemoryBackend::NVMemory => {
                 self.tmemory_backend = tmemory_backend;
                 Ok(())
             }
-            TMemoryBackend::FileBackedMemory | TMemoryBackend::NVMemory => {
+            TMemoryBackend::FileBackedMemory => {
                 bail!("tmemory backend is not implemented: {tmemory_backend:?}")
             }
         }
@@ -3992,21 +3995,28 @@ mod tests {
     }
 
     #[test]
-    fn transaction_config_accepts_only_vmemory_backend_for_milestone_1() {
+    fn transaction_config_rejects_unimplemented_file_backed_backend() {
         assert!(
             TransactionConfig::with_tmemory_backend(TMemoryBackend::VMemory)
                 .unwrap()
                 .is_vmemory_only()
         );
 
-        for backend in [TMemoryBackend::FileBackedMemory, TMemoryBackend::NVMemory] {
-            let error = TransactionConfig::with_tmemory_backend(backend).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("tmemory backend is not implemented")
-            );
-        }
+        let error =
+            TransactionConfig::with_tmemory_backend(TMemoryBackend::FileBackedMemory).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tmemory backend is not implemented")
+        );
+    }
+
+    #[test]
+    fn transaction_config_accepts_nvmemory_backend() {
+        let config = TransactionConfig::with_tmemory_backend(TMemoryBackend::NVMemory).unwrap();
+
+        assert_eq!(config.tmemory_backend(), TMemoryBackend::NVMemory);
+        assert!(!config.is_vmemory_only());
     }
 
     #[test]
