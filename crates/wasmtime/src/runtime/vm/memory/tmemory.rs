@@ -824,26 +824,13 @@ impl FileBackedMemory {
             return Ok(());
         }
 
-        let old = if self.byte_len > 0 {
-            self.region.read(0, self.byte_len)?
-        } else {
-            Vec::new()
-        };
-        let mut region = TMemoryRegion::new_file_backed(
-            new_byte_capacity,
-            file_backed_region_mode(&self.file_backing),
-        )?;
-        if !old.is_empty() {
-            region.write(0, &old)?;
-            region.flush(0, old.len())?;
-            region.fence()?;
-        }
+        self.region
+            .reserve_file_backed_capacity(new_byte_capacity)?;
 
         let new_granule_capacity = granules_for_bytes(new_byte_capacity);
         self.granules
             .resize(new_granule_capacity, TMemoryGranuleInfo::default());
 
-        self.region = region;
         self.byte_capacity = new_byte_capacity;
         Ok(())
     }
@@ -1283,6 +1270,38 @@ mod tests {
         assert_eq!(
             memory.granule_info(GRANULES_PER_WASM_PAGE).unwrap(),
             TMemoryGranuleInfo::default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_explicit_path_grow_extends_existing_file_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit-grow.tmemory");
+        let config = TransactionConfig::with_file_backed_tmemory_path(path.clone()).unwrap();
+        let mut memory = TMemory::new(config, 1, None).unwrap();
+
+        memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+        memory.grow_to_pages(9).unwrap();
+        memory
+            .commit_range(block_region::BLOCK_SIZE + 8, &[5, 6, 7, 8])
+            .unwrap();
+
+        assert_eq!(memory.byte_len(), 9 * WASM_PAGE_SIZE);
+        assert_eq!(memory.byte_capacity(), 9 * WASM_PAGE_SIZE);
+        assert_eq!(memory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            memory
+                .read_committed(block_region::BLOCK_SIZE + 8..block_region::BLOCK_SIZE + 12)
+                .unwrap(),
+            vec![5, 6, 7, 8]
+        );
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[8..12], &[1, 2, 3, 4]);
+        assert_eq!(
+            &bytes[block_region::BLOCK_SIZE + 8..block_region::BLOCK_SIZE + 12],
+            &[5, 6, 7, 8]
         );
     }
 

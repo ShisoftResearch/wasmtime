@@ -11,6 +11,8 @@ use core::{
     sync::atomic::{Ordering, compiler_fence},
 };
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -194,9 +196,20 @@ fn new_temp_file_backed_mapping(len: usize) -> Result<FileBackedMapping> {
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
         {
-            Ok(file) => return finish_file_backed_mapping(file, path, len, true),
+            Ok(file) => {
+                let mut mapping = finish_file_backed_mapping(file, path, len, true)?;
+                std::fs::remove_file(&mapping.path).with_context(|| {
+                    format!(
+                        "failed to unlink temp file-backed tmemory file {}",
+                        mapping.path.display()
+                    )
+                })?;
+                mapping.unlink_on_drop = false;
+                return Ok(mapping);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -334,6 +347,13 @@ fn new_file_backed_mapping(
     _len: usize,
     _unlink_on_drop: bool,
 ) -> Result<FileBackedMapping> {
+    bail!(
+        "FileBackedMemory is unsupported on this target until shared writable mmap support exists"
+    )
+}
+
+#[cfg(not(unix))]
+fn new_temp_file_backed_mapping(_len: usize) -> Result<FileBackedMapping> {
     bail!(
         "FileBackedMemory is unsupported on this target until shared writable mmap support exists"
     )
@@ -546,6 +566,9 @@ pub(crate) trait BlockRegionBackend {
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
     fn flush(&self, offset: usize, len: usize) -> Result<()>;
     fn fence(&self) -> Result<()>;
+    fn grow_to_blocks(&mut self, _new_block_count: usize) -> Result<Option<RegionChunk>> {
+        bail!("transactional block region backend cannot grow")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1053,6 +1076,43 @@ impl FileBackedMemoryBlockRegion {
     pub(crate) fn fence(&self) -> Result<()> {
         self.mapping.fence_data()
     }
+
+    pub(crate) fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
+        let old_block_count = self.num_blocks();
+        ensure!(
+            new_block_count >= old_block_count,
+            "transactional FileBackedMemory block region cannot shrink"
+        );
+        if new_block_count == old_block_count {
+            return Ok(None);
+        }
+
+        let bytes_len = new_block_count
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional FileBackedMemory block region size overflow")?;
+        self.mapping.remap_len(bytes_len)?;
+
+        let additional_blocks = new_block_count - old_block_count;
+        self.block_entries
+            .resize(new_block_count, BlockEntry::default());
+        for entry in &mut self.block_entries[old_block_count..new_block_count] {
+            entry.used = 1;
+            entry.list_num = ListKind::Used as i16;
+        }
+
+        let line_count = bytes_len / IMMIX_LINE_SIZE;
+        self.line_marks.resize(
+            line_count,
+            LineMark {
+                mark: IMMIX_LINE_MARK_RESET_VALUE,
+            },
+        );
+
+        Ok(Some(RegionChunk {
+            start_block: old_block_count,
+            block_count: additional_blocks,
+        }))
+    }
 }
 
 impl BlockRegionBackend for FileBackedMemoryBlockRegion {
@@ -1090,6 +1150,10 @@ impl BlockRegionBackend for FileBackedMemoryBlockRegion {
 
     fn fence(&self) -> Result<()> {
         self.fence()
+    }
+
+    fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
+        self.grow_to_blocks(new_block_count)
     }
 }
 
@@ -1243,6 +1307,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn file_backed_block_region_grows_existing_mapping_and_preserves_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grow-block-region.tmemory");
+        let mut region =
+            FileBackedMemoryBlockRegion::new_for_test(1, FileBackedRegionMode::Path(path.clone()))
+                .unwrap();
+        let chunk = region.alloc_chunk(1).unwrap();
+        let range = chunk.byte_range();
+
+        region.write(range.start + 16, &[1, 2, 3, 4]).unwrap();
+        region.flush(range.start + 16, 4).unwrap();
+        region.fence().unwrap();
+
+        let grown = region.grow_to_blocks(2).unwrap().unwrap();
+
+        assert_eq!(grown.byte_range(), BLOCK_SIZE..(2 * BLOCK_SIZE));
+        assert_eq!(region.num_blocks(), 2);
+        assert_eq!(region.bytes_len(), 2 * BLOCK_SIZE);
+        assert_eq!(region.read(range.start + 16, 4).unwrap(), vec![1, 2, 3, 4]);
+
+        region
+            .write(grown.byte_range().start, &[5, 6, 7, 8])
+            .unwrap();
+        region.flush(grown.byte_range().start, 4).unwrap();
+        region.fence().unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[range.start + 16..range.start + 20], &[1, 2, 3, 4]);
+        assert_eq!(
+            &bytes[grown.byte_range().start..grown.byte_range().start + 4],
+            &[5, 6, 7, 8]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn file_backed_shared_mapping_writes_through_to_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mapping.tmemory");
@@ -1346,6 +1446,22 @@ mod tests {
         assert_eq!(std::fs::read(&stale_path).unwrap(), b"stale-bytes");
 
         std::fs::remove_file(stale_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_shared_mapping_temp_mode_unlinks_file_immediately() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut mapping = FileBackedMapping::new_temp(16).unwrap();
+
+        assert!(!mapping.path.exists());
+
+        mapping.write(0, &[1, 2, 3, 4]).unwrap();
+        mapping.flush(0, 4).unwrap();
+        mapping.fence_data().unwrap();
+        assert_eq!(mapping.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[cfg(not(unix))]

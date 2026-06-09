@@ -95,6 +95,10 @@ impl TMemoryRegion {
         self.linear.write(range.start, &vec![byte; len])
     }
 
+    pub(super) fn reserve_file_backed_capacity(&mut self, byte_capacity: usize) -> Result<()> {
+        self.linear.reserve_file_backed_capacity(byte_capacity)
+    }
+
     pub(super) fn block_size_for_test(&self) -> usize {
         BLOCK_SIZE
     }
@@ -184,6 +188,25 @@ impl MappedLinearRegion {
 
     pub(super) fn fence(&self) -> Result<()> {
         self.backend.fence()
+    }
+
+    pub(super) fn reserve_file_backed_capacity(&mut self, byte_capacity: usize) -> Result<()> {
+        let new_block_count = byte_capacity.div_ceil(BLOCK_SIZE);
+        ensure!(
+            new_block_count >= self.backend.num_blocks(),
+            "transactional linear file-backed reserve cannot shrink"
+        );
+        if new_block_count == self.backend.num_blocks() {
+            return Ok(());
+        }
+
+        if let Some(chunk) = self.backend.grow_to_blocks(new_block_count)? {
+            let mut chunks = self.chunks.chunks().to_vec();
+            chunks.push(chunk);
+            self.chunks = ChunkList::from_chunks(chunks)?;
+        }
+
+        Ok(())
     }
 
     fn check_range(&self, offset: usize, len: usize, op: &str) -> Result<()> {
@@ -501,5 +524,33 @@ mod tests {
         region.fence().unwrap();
 
         assert_eq!(region.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reserve_capacity_extends_existing_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linear-grow.tmemory");
+        let mut region =
+            TMemoryRegion::new_file_backed(BLOCK_SIZE, FileBackedRegionMode::Path(path.clone()))
+                .unwrap();
+
+        region.write(16, &[1, 2, 3, 4]).unwrap();
+        region.flush(16, 4).unwrap();
+        region.reserve_file_backed_capacity(2 * BLOCK_SIZE).unwrap();
+
+        assert_eq!(
+            region.line_mark_count_for_test(),
+            2 * (BLOCK_SIZE / IMMIX_LINE_SIZE)
+        );
+        assert_eq!(region.read(16, 4).unwrap(), vec![1, 2, 3, 4]);
+
+        region.write(BLOCK_SIZE, &[5, 6, 7, 8]).unwrap();
+        region.flush(BLOCK_SIZE, 4).unwrap();
+        region.fence().unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[16..20], &[1, 2, 3, 4]);
+        assert_eq!(&bytes[BLOCK_SIZE..BLOCK_SIZE + 4], &[5, 6, 7, 8]);
     }
 }
