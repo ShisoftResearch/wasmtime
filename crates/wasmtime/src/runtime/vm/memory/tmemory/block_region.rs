@@ -7,12 +7,126 @@ use core::{mem::size_of, ops::Range};
 
 pub(crate) const BLOCK_SIZE: usize = 512 * 1024;
 pub(crate) const IMMIX_LINE_SIZE: usize = 256;
+pub(crate) const PMEM_CACHE_LINE_SIZE: usize = 64;
 
 pub(crate) const PW_REGION_HEADER_SIZE: usize = size_of::<PWRegionHeader>();
 pub(crate) const META_DATA_DESC_SIZE: usize = size_of::<MetaDataDesc>();
 pub(crate) const BLOCK_ENTRY_SIZE: usize = size_of::<BlockEntry>();
 pub(crate) const CHUNK_HEADER_SIZE: usize = size_of::<ChunkHeader>();
 pub(crate) const LINE_MARK_SIZE: usize = size_of::<LineMark>();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PersistenceMode {
+    ResearchPretendPmem,
+    RequireHardwarePmem,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistFlushKind {
+    NoopResearch,
+    X86Clwb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PersistEngine {
+    mode: PersistenceMode,
+    flush_kind: PersistFlushKind,
+}
+
+impl PersistEngine {
+    pub(crate) fn for_mode(mode: PersistenceMode) -> Result<Self> {
+        let flush_kind = match mode {
+            PersistenceMode::ResearchPretendPmem => PersistFlushKind::NoopResearch,
+            PersistenceMode::RequireHardwarePmem => hardware_flush_kind()?,
+        };
+        Ok(Self { mode, flush_kind })
+    }
+
+    pub(crate) fn mode(&self) -> PersistenceMode {
+        self.mode
+    }
+
+    pub(crate) fn flush(&self, ptr: core::ptr::NonNull<u8>, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        match self.flush_kind {
+            PersistFlushKind::NoopResearch => Ok(()),
+            PersistFlushKind::X86Clwb => unsafe { flush_clwb_range(ptr, len) },
+        }
+    }
+
+    pub(crate) fn fence(&self) -> Result<()> {
+        match self.flush_kind {
+            PersistFlushKind::NoopResearch => Ok(()),
+            PersistFlushKind::X86Clwb => unsafe { sfence() },
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn hardware_flush_available() -> bool {
+        let leaf = core::arch::x86_64::__cpuid_count(7, 0);
+        leaf.ebx & (1 << 24) != 0
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn hardware_flush_available() -> bool {
+        false
+    }
+}
+
+fn hardware_flush_kind() -> Result<PersistFlushKind> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if PersistEngine::hardware_flush_available() {
+            return Ok(PersistFlushKind::X86Clwb);
+        }
+        bail!("NVMemory requires CLWB support for hardware PMEM mode");
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    bail!("NVMemory is unsupported on this target until a PMEM flush implementation exists")
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn flush_clwb_range(ptr: core::ptr::NonNull<u8>, len: usize) -> Result<()> {
+    let start = ptr.as_ptr() as usize;
+    let end = start
+        .checked_add(len)
+        .context("pmem flush range overflow")?;
+    let mut cursor = start & !(PMEM_CACHE_LINE_SIZE - 1);
+    while cursor < end {
+        unsafe {
+            core::arch::asm!(
+                "clwb [{}]",
+                in(reg) cursor as *const u8,
+                options(nostack, preserves_flags)
+            );
+        }
+        cursor = cursor
+            .checked_add(PMEM_CACHE_LINE_SIZE)
+            .context("pmem flush cursor overflow")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn flush_clwb_range(_ptr: core::ptr::NonNull<u8>, _len: usize) -> Result<()> {
+    bail!("NVMemory CLWB flush is unsupported on this target")
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn sfence() -> Result<()> {
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn sfence() -> Result<()> {
+    bail!("NVMemory SFENCE is unsupported on this target")
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -383,5 +497,35 @@ mod tests {
 
         region.flush(0, 64).unwrap();
         region.fence().unwrap();
+    }
+
+    #[test]
+    fn pmem_research_mode_allows_non_durable_flush_engine() {
+        let engine = PersistEngine::for_mode(PersistenceMode::ResearchPretendPmem).unwrap();
+
+        assert_eq!(engine.mode(), PersistenceMode::ResearchPretendPmem);
+        engine.flush(core::ptr::NonNull::<u8>::dangling(), 0).unwrap();
+        engine.fence().unwrap();
+    }
+
+    #[test]
+    fn pmem_real_mode_reports_platform_availability() {
+        let result = PersistEngine::for_mode(PersistenceMode::RequireHardwarePmem);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if PersistEngine::hardware_flush_available() {
+                assert!(result.is_ok());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("CLWB"));
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("NVMemory is unsupported"));
+        }
     }
 }
