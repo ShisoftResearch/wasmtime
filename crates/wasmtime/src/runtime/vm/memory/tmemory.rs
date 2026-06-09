@@ -1251,6 +1251,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn file_backed_explicit_path_publishes_committed_bytes_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.tmemory");
+        let config = TransactionConfig::with_file_backed_tmemory_path(path.clone()).unwrap();
+        let mut memory = TMemory::new(config, 1, Some(1)).unwrap();
+
+        memory.commit_range(64, &[42, 43, 44, 45]).unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[64..68], &[42, 43, 44, 45]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn file_backed_grow_beyond_capacity_preserves_bytes_and_metadata() {
         let config = TransactionConfig::with_file_backed_tmemory_temp().unwrap();
         let mut memory = TMemory::new(config, 1, None).unwrap();
@@ -1307,6 +1321,19 @@ mod tests {
         }
 
         panic!("real PMEM restart recovery test is not implemented in this backend wave");
+    }
+
+    #[test]
+    #[ignore = "requires restart recovery metadata and WASMTIME_TEST_FILE_BACKED_TMEMORY_RECOVERY=1"]
+    fn file_backed_memory_restart_recovery_is_not_implemented_yet() {
+        if std::env::var_os("WASMTIME_TEST_FILE_BACKED_TMEMORY_RECOVERY").is_none() {
+            eprintln!(
+                "set WASMTIME_TEST_FILE_BACKED_TMEMORY_RECOVERY=1 after durable recovery metadata exists"
+            );
+            return;
+        }
+
+        panic!("file-backed tmemory restart recovery is not implemented in this backend wave");
     }
 
     #[test]
