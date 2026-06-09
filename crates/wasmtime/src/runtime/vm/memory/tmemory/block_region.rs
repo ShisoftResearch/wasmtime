@@ -509,6 +509,17 @@ mod tests {
     }
 
     #[test]
+    fn pmem_research_mode_allows_nonzero_non_durable_flush() {
+        let engine = PersistEngine::for_mode(PersistenceMode::ResearchPretendPmem).unwrap();
+        let mut bytes = [1u8, 2, 3, 4];
+        let ptr = core::ptr::NonNull::from(&mut bytes[0]);
+
+        engine.flush(ptr, bytes.len()).unwrap();
+        engine.fence().unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+
+    #[test]
     fn pmem_real_mode_reports_platform_availability() {
         let result = PersistEngine::for_mode(PersistenceMode::RequireHardwarePmem);
 
