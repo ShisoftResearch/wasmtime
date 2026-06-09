@@ -55,6 +55,14 @@ impl TMemoryRegion {
         self.linear.write(offset, bytes)
     }
 
+    pub(super) fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        self.linear.flush(offset, len)
+    }
+
+    pub(super) fn fence(&self) -> Result<()> {
+        self.linear.fence()
+    }
+
     pub(super) fn fill(&mut self, range: core::ops::Range<usize>, byte: u8) -> Result<()> {
         ensure!(
             range.start <= range.end,
@@ -135,6 +143,27 @@ impl MappedLinearRegion {
         }
 
         Ok(())
+    }
+
+    pub(super) fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        self.check_range(offset, len, "flush")?;
+        let mut cursor = offset;
+        let end = offset + len;
+
+        while cursor < end {
+            let segment = self
+                .logical_segment(cursor)
+                .context("transactional linear flush segment missing")?;
+            let take = segment.available.min(end - cursor);
+            self.backend.flush(segment.backend_offset, take)?;
+            cursor += take;
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn fence(&self) -> Result<()> {
+        self.backend.fence()
     }
 
     fn check_range(&self, offset: usize, len: usize, op: &str) -> Result<()> {

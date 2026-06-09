@@ -1,8 +1,8 @@
 //! Wizard-style storage for transactional memories.
 //!
-//! This module backs per-instance `tmemory` sidecars with the first volatile
-//! block/chunk backend. `FileBackedMemory` and `NVMemory` remain represented in
-//! configuration, but are not implemented yet.
+//! This module backs per-instance `tmemory` sidecars with volatile and research
+//! NVMemory block/chunk backends. `FileBackedMemory` remains represented in
+//! configuration, but is not implemented yet.
 
 #![allow(dead_code)]
 
@@ -209,9 +209,8 @@ impl TMemory {
     ) -> Result<Self> {
         let storage: Box<dyn TMemoryBackendStorage> = match backend {
             TMemoryBackend::VMemory => Box::new(VMemory::new(min_pages, max_pages)?),
-            TMemoryBackend::FileBackedMemory | TMemoryBackend::NVMemory => {
-                return Err(unsupported_backend_error(backend));
-            }
+            TMemoryBackend::NVMemory => Box::new(NVMemory::new(min_pages, max_pages)?),
+            TMemoryBackend::FileBackedMemory => return Err(unsupported_backend_error(backend)),
         };
         Ok(Self { storage })
     }
@@ -481,6 +480,209 @@ impl TMemoryBackendStorage for VMemory {
     }
 }
 
+/// Research NVMemory transactional storage backed by a PMEM-capable block region.
+#[derive(Debug)]
+pub(crate) struct NVMemory {
+    region: TMemoryRegion,
+    granules: Vec<TMemoryGranuleInfo>,
+    byte_len: usize,
+    byte_capacity: usize,
+    max_pages: u64,
+}
+
+impl NVMemory {
+    pub(crate) fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
+        let requested_max_pages = max_pages;
+        let max_pages = max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES);
+        ensure!(min_pages <= max_pages, "tmemory minimum exceeds maximum");
+        let byte_len = pages_to_bytes(min_pages)?;
+        let byte_capacity = match requested_max_pages {
+            Some(max_pages) => pages_to_bytes(max_pages)?,
+            None => byte_len,
+        };
+
+        let granule_capacity = granules_for_bytes(byte_capacity);
+
+        Ok(Self {
+            region: TMemoryRegion::new_nvmemory(
+                byte_capacity,
+                block_region::PersistenceMode::ResearchPretendPmem,
+            )?,
+            granules: vec![TMemoryGranuleInfo::default(); granule_capacity],
+            byte_len,
+            byte_capacity,
+            max_pages,
+        })
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub(crate) fn granule_len(&self) -> usize {
+        granules_for_bytes(self.byte_len)
+    }
+
+    pub(crate) fn txn_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        Ok(self.granules[granule])
+    }
+
+    pub(crate) fn set_txn_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
+        ensure!(
+            granule < self.granule_len(),
+            "tmemory granule out of bounds"
+        );
+        self.granules[granule] = info;
+        Ok(())
+    }
+
+    pub(crate) fn read(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        ensure!(range.start <= range.end, "tmemory read invalid range");
+        ensure!(range.end <= self.byte_len, "tmemory read out of bounds");
+        self.region.read(range.start, range.end - range.start)
+    }
+
+    pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        ensure!(
+            new_pages <= self.max_pages,
+            "tmemory growth exceeds maximum size"
+        );
+        let new_byte_len = pages_to_bytes(new_pages)?;
+        if new_byte_len < self.byte_len {
+            bail!("tmemory grow cannot shrink");
+        }
+        if new_byte_len == self.byte_len {
+            return Ok(());
+        }
+        if new_byte_len > self.byte_capacity {
+            self.reserve_capacity_to_pages(new_pages)?;
+        }
+
+        self.byte_len = new_byte_len;
+        Ok(())
+    }
+
+    pub(crate) fn can_grow_to_pages(&self, new_pages: u64) -> bool {
+        if new_pages > self.max_pages {
+            return false;
+        }
+        let Ok(new_byte_len) = pages_to_bytes(new_pages) else {
+            return false;
+        };
+        new_byte_len >= self.byte_len
+    }
+
+    fn reserve_capacity_to_pages(&mut self, new_capacity_pages: u64) -> Result<()> {
+        let new_byte_capacity = pages_to_bytes(new_capacity_pages)?;
+        ensure!(
+            new_byte_capacity >= self.byte_len,
+            "tmemory capacity cannot shrink below live size"
+        );
+        if new_byte_capacity <= self.byte_capacity {
+            return Ok(());
+        }
+
+        let mut region = TMemoryRegion::new_nvmemory(
+            new_byte_capacity,
+            block_region::PersistenceMode::ResearchPretendPmem,
+        )?;
+        if self.byte_len > 0 {
+            let old = self.region.read(0, self.byte_len)?;
+            region.write(0, &old)?;
+        }
+
+        let new_granule_capacity = granules_for_bytes(new_byte_capacity);
+        self.granules
+            .resize(new_granule_capacity, TMemoryGranuleInfo::default());
+
+        self.region = region;
+        self.byte_capacity = new_byte_capacity;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_region_block_size_for_test(&self) -> usize {
+        self.region.block_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn immix_line_size_for_test(&self) -> usize {
+        self.region.immix_line_size_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn line_mark_count_for_test(&self) -> usize {
+        self.region.line_mark_count_for_test()
+    }
+}
+
+impl TMemoryBackendStorage for NVMemory {
+    fn backend_kind(&self) -> TMemoryBackend {
+        TMemoryBackend::NVMemory
+    }
+
+    fn byte_len(&self) -> usize {
+        self.byte_len()
+    }
+
+    fn byte_capacity(&self) -> usize {
+        self.byte_capacity
+    }
+
+    fn granule_count(&self) -> usize {
+        self.granule_len()
+    }
+
+    fn read_committed(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        self.read(range)
+    }
+
+    fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
+        let end = addr
+            .checked_add(bytes.len())
+            .context("tmemory write address overflow")?;
+        ensure!(end <= self.byte_len, "out of bounds tmemory access");
+        self.region.write(addr, bytes)?;
+        self.region.flush(addr, bytes.len())?;
+        self.region.fence()
+    }
+
+    fn can_grow_to_pages(&self, new_pages: u64) -> bool {
+        NVMemory::can_grow_to_pages(self, new_pages)
+    }
+
+    fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        NVMemory::grow_to_pages(self, new_pages)
+    }
+
+    fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        self.txn_info(granule)
+    }
+
+    fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
+        self.set_txn_info(granule, info)
+    }
+
+    #[cfg(test)]
+    fn block_region_block_size_for_test(&self) -> usize {
+        self.block_region_block_size_for_test()
+    }
+
+    #[cfg(test)]
+    fn immix_line_size_for_test(&self) -> usize {
+        self.immix_line_size_for_test()
+    }
+
+    #[cfg(test)]
+    fn line_mark_count_for_test(&self) -> usize {
+        self.line_mark_count_for_test()
+    }
+}
+
 fn pages_to_bytes(pages: u64) -> Result<usize> {
     let pages = usize::try_from(pages).context("tmemory page count does not fit host usize")?;
     pages
@@ -518,6 +720,16 @@ mod tests {
         let memory = TMemory::new(TransactionConfig::default(), 1, Some(1)).unwrap();
 
         assert_eq!(memory.backend(), TMemoryBackend::VMemory);
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE);
+    }
+
+    #[test]
+    fn tmemory_can_construct_nvmemory_in_research_mode() {
+        let memory = TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1))
+            .unwrap();
+
+        assert_eq!(memory.backend(), TMemoryBackend::NVMemory);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
         assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE);
     }
@@ -575,6 +787,17 @@ mod tests {
             memory.read_committed(6..14).unwrap(),
             vec![0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn nvmemory_commit_range_writes_and_versions_granules() {
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+
+        memory.commit_range(4, &[10, 11, 12, 13]).unwrap();
+
+        assert_eq!(memory.read_committed(4..8).unwrap(), vec![10, 11, 12, 13]);
+        assert_eq!(memory.granule_version(0).unwrap(), 1);
     }
 
     #[test]
@@ -710,15 +933,13 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_and_nv_backends_are_explicitly_unsupported() {
-        for backend in [TMemoryBackend::FileBackedMemory, TMemoryBackend::NVMemory] {
-            let error = TMemory::new_with_backend(backend, 1).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("tmemory backend is not implemented")
-            );
-        }
+    fn file_backed_memory_remains_explicitly_unsupported() {
+        let error = TMemory::new_with_backend(TMemoryBackend::FileBackedMemory, 1)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("FileBackedMemory"));
+        assert!(error.contains("not implemented"));
     }
 
     #[test]
