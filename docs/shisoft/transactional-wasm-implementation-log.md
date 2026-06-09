@@ -15,6 +15,19 @@ Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
 work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
 or object-model sequencing have drifted.
 
+## NVMemory Backend Implementation
+
+Date: 2026-06-09
+
+`NVMemory` now exists as the first PMEM-shaped transactional memory backend.
+It shares the block/chunk storage abstraction with `VMemory`, uses the normal
+copy-on-write transaction commit path, and flushes committed ranges through the
+PMEM persistence engine. The default backend remains `VMemory`.
+
+Real restart/power-fail persistence tests remain gated behind
+`WASMTIME_TEST_REAL_PMEM=1` until durable recovery metadata and PMEM hardware
+are available.
+
 ## NVMemory PMEM Backend Decision
 
 Date: 2026-06-09
