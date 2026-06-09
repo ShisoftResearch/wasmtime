@@ -31,6 +31,17 @@ Real restart/power-fail persistence tests remain gated behind
 `WASMTIME_TEST_REAL_PMEM=1` until durable recovery metadata and PMEM hardware
 are available.
 
+## Transactional Grow Ordering Follow-Up
+
+Date: 2026-06-09
+
+Same-transaction `tmemory.grow` followed by accesses into the newly grown range
+needs a dedicated semantics pass. The current staged-record commit path can
+apply memory-granule records before the staged memory-size record, so this
+ordering should be corrected independently of the `NVMemory` PMEM backend
+workstream. Existing transaction-proposal WAST coverage still passes, but this
+case should get a focused regression test before changing commit ordering.
+
 ## NVMemory PMEM Backend Decision
 
 Date: 2026-06-09
