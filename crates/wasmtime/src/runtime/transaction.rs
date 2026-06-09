@@ -6,6 +6,7 @@ use crate::runtime::vm::TMemory;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::{cell::Cell, mem, ops::Range};
+use std::path::PathBuf;
 
 #[path = "transaction/object_heap.rs"]
 mod object_heap;
@@ -43,6 +44,12 @@ pub(crate) enum TMemoryPersistenceMode {
     RequireHardwarePmem,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TMemoryFileBacking {
+    Temp,
+    Path(PathBuf),
+}
+
 /// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. `LockBased` is the
 /// only implemented policy today and remains store-local.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,10 +72,11 @@ pub(crate) enum ConflictPolicy {
     AbortOrWizardDefault,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TransactionConfig {
     tmemory_backend: TMemoryBackend,
     tmemory_persistence_mode: TMemoryPersistenceMode,
+    tmemory_file_backing: Option<TMemoryFileBacking>,
     concurrency_control: ConcurrencyControl,
     durability_policy: DurabilityPolicy,
     conflict_policy: ConflictPolicy,
@@ -79,6 +87,7 @@ impl Default for TransactionConfig {
         Self {
             tmemory_backend: TMemoryBackend::VMemory,
             tmemory_persistence_mode: TMemoryPersistenceMode::ResearchPretendPmem,
+            tmemory_file_backing: None,
             concurrency_control: ConcurrencyControl::LockBased,
             durability_policy: DurabilityPolicy::VolatileRollbackOnly,
             conflict_policy: ConflictPolicy::AbortOrWizardDefault,
@@ -101,12 +110,32 @@ impl TransactionConfig {
         Ok(config)
     }
 
+    pub(crate) fn with_file_backed_tmemory_temp() -> Result<Self> {
+        let mut config = Self::default();
+        config.set_file_backed_tmemory(TMemoryFileBacking::Temp)?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_file_backed_tmemory_path(path: PathBuf) -> Result<Self> {
+        ensure!(
+            !path.as_os_str().is_empty(),
+            "file-backed tmemory path cannot be empty"
+        );
+        let mut config = Self::default();
+        config.set_file_backed_tmemory(TMemoryFileBacking::Path(path))?;
+        Ok(config)
+    }
+
     pub(crate) fn tmemory_backend(&self) -> TMemoryBackend {
         self.tmemory_backend
     }
 
     pub(crate) fn tmemory_persistence_mode(&self) -> TMemoryPersistenceMode {
         self.tmemory_persistence_mode
+    }
+
+    pub(crate) fn tmemory_file_backing(&self) -> Option<TMemoryFileBacking> {
+        self.tmemory_file_backing.clone()
     }
 
     pub(crate) fn concurrency_control(&self) -> ConcurrencyControl {
@@ -129,10 +158,11 @@ impl TransactionConfig {
         match tmemory_backend {
             TMemoryBackend::VMemory | TMemoryBackend::NVMemory => {
                 self.tmemory_backend = tmemory_backend;
+                self.tmemory_file_backing = None;
                 Ok(())
             }
             TMemoryBackend::FileBackedMemory => {
-                bail!("tmemory backend is not implemented: {tmemory_backend:?}")
+                bail!("FileBackedMemory requires explicit file backing configuration")
             }
         }
     }
@@ -143,6 +173,13 @@ impl TransactionConfig {
     ) -> Result<()> {
         self.tmemory_backend = TMemoryBackend::NVMemory;
         self.tmemory_persistence_mode = tmemory_persistence_mode;
+        self.tmemory_file_backing = None;
+        Ok(())
+    }
+
+    fn set_file_backed_tmemory(&mut self, file_backing: TMemoryFileBacking) -> Result<()> {
+        self.tmemory_backend = TMemoryBackend::FileBackedMemory;
+        self.tmemory_file_backing = Some(file_backing);
         Ok(())
     }
 }
@@ -4033,7 +4070,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_config_rejects_unimplemented_file_backed_backend() {
+    fn transaction_config_rejects_generic_file_backed_backend_selection() {
         assert!(
             TransactionConfig::with_tmemory_backend(TMemoryBackend::VMemory)
                 .unwrap()
@@ -4045,8 +4082,37 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("tmemory backend is not implemented")
+                .contains("requires explicit file backing")
         );
+    }
+
+    #[test]
+    fn transaction_config_accepts_file_backed_temp_mode() {
+        let config = TransactionConfig::with_file_backed_tmemory_temp().unwrap();
+
+        assert_eq!(config.tmemory_backend(), TMemoryBackend::FileBackedMemory);
+        assert_eq!(config.tmemory_file_backing(), Some(TMemoryFileBacking::Temp));
+        assert!(!config.is_vmemory_only());
+    }
+
+    #[test]
+    fn transaction_config_accepts_file_backed_path_mode() {
+        let path = std::path::PathBuf::from("/tmp/wasmtime-transaction-file-backed-test.tmemory");
+        let config = TransactionConfig::with_file_backed_tmemory_path(path.clone()).unwrap();
+
+        assert_eq!(config.tmemory_backend(), TMemoryBackend::FileBackedMemory);
+        assert_eq!(
+            config.tmemory_file_backing(),
+            Some(TMemoryFileBacking::Path(path))
+        );
+        assert!(!config.is_vmemory_only());
+    }
+
+    #[test]
+    fn generic_file_backed_backend_selection_still_requires_file_mode() {
+        let error =
+            TransactionConfig::with_tmemory_backend(TMemoryBackend::FileBackedMemory).unwrap_err();
+        assert!(error.to_string().contains("requires explicit file backing"));
     }
 
     #[test]
