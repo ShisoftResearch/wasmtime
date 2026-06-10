@@ -147,15 +147,13 @@ fn replay_stream(
     for &log_block in &stream.log_blocks {
         let entries = region.log_block_entries(log_block)?;
         for entry in entries {
+            ensure!(
+                entry.validate_crc32(),
+                "transactional recovery found corrupt log entry in stream {} block {}",
+                stream.stream_id,
+                log_block
+            );
             let txid = txid(entry);
-            if is_final_lp(entry) {
-                ensure!(
-                    entry.validate_crc32(),
-                    "transactional recovery found corrupt final LP in stream {} block {}",
-                    stream.stream_id,
-                    log_block
-                );
-            }
 
             if pending.as_ref().is_some_and(|txn| txn.txid != txid) {
                 pending = None;
@@ -223,6 +221,13 @@ mod tests {
         assert_eq!(recovered.winners[0].version, 9);
     }
 
+    #[test]
+    fn recovery_rejects_corrupt_non_final_log_entry() {
+        let region = sample_region_with_corrupt_non_final_log_entry();
+        let err = recover_region_for_test(&region).unwrap_err();
+        assert!(err.to_string().contains("corrupt log entry"));
+    }
+
     fn sample_region_with_two_streams() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream1 = region.alloc_stream(1).unwrap();
@@ -246,6 +251,36 @@ mod tests {
         let stream2 = region.alloc_stream(2).unwrap();
         append_committed_update(&mut region, 1, stream1, 0, 0x1000, 7, 11);
         append_committed_update(&mut region, 2, stream2, 0, 0x1000, 9, 22);
+        region
+    }
+
+    fn sample_region_with_corrupt_non_final_log_entry() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+
+        let first = append_publication_record(&mut region, 1, stream, 0, 0x1000, 1, 11);
+        let second = append_publication_record(&mut region, 1, stream, 0, 0x1001, 1, 22);
+
+        let mut ordinary = TxLogEntry::new(
+            0x1000,
+            1,
+            1 << 1,
+            first.1.data_block,
+            first.1.data_offset,
+        );
+        ordinary.seal_crc32();
+
+        let mut final_lp = TxLogEntry::new(
+            0x1001,
+            1,
+            (1 << 1) | 1,
+            second.1.data_block,
+            second.1.data_offset,
+        );
+        final_lp.seal_crc32();
+
+        write_log_entries(&mut region, first.0, &[ordinary, final_lp]);
+        corrupt_log_entry_data_block(&mut region, first.0, 0);
         region
     }
 
@@ -284,14 +319,14 @@ mod tests {
         let (log_block, location) = append_publication_record(
             region, stream_id, stream, block_seq, logical_id, version, fill,
         );
-        let entry = TMemory::publication_log_entry(
+        let mut entry = TxLogEntry::new(
             logical_id,
             version,
             stream_id << 1,
             location.data_block,
             location.data_offset,
-            false,
         );
+        entry.seal_crc32();
         write_log_entries(region, log_block, &[entry]);
     }
 
@@ -339,5 +374,15 @@ mod tests {
         bytes[24..28].copy_from_slice(&entry.crc32.to_le_bytes());
         bytes[28..32].copy_from_slice(&entry.reserved.to_le_bytes());
         bytes
+    }
+
+    fn corrupt_log_entry_data_block(region: &mut VMemoryBlockRegion, start_block: u32, entry_index: usize) {
+        let entry_offset = usize::try_from(start_block).unwrap() * BLOCK_SIZE
+            + size_of::<LogBlockHeader>()
+            + entry_index * size_of::<TxLogEntry>();
+        let field_offset = entry_offset + 16;
+        let mut bytes = region.read(field_offset, 4).unwrap();
+        bytes[0] ^= 0x01;
+        region.write(field_offset, &bytes).unwrap();
     }
 }
