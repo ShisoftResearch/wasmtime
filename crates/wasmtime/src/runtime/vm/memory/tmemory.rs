@@ -8,9 +8,13 @@
 
 use crate::prelude::*;
 use crate::runtime::transaction::{
+    DataRecordLocation as TransactionDataRecordLocation, DurableSink, TxLogEntry,
+};
+use crate::runtime::transaction::{
     TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryFileBacking,
     TMemoryPersistenceMode, TransactionConfig,
 };
+use alloc::collections::BTreeMap;
 use wasmtime_environ::MemoryIndex;
 
 pub(crate) mod block_region;
@@ -68,6 +72,24 @@ pub(crate) trait TMemoryBackendStorage: core::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub(crate) struct TMemory {
     storage: Box<dyn TMemoryBackendStorage>,
+    durability: TMemoryDurability,
+}
+
+#[derive(Debug, Default)]
+struct TMemoryDurability {
+    streams: BTreeMap<u32, DurableStreamState>,
+}
+
+#[derive(Debug, Default)]
+struct DurableStreamState {
+    data_records: Vec<Vec<u8>>,
+    log_entries: Vec<TxLogEntry>,
+    next_data_block: u32,
+}
+
+pub(crate) struct TMemoryDurableSink<'a> {
+    tmemory: &'a mut TMemory,
+    stream_id: u32,
 }
 
 /// Per-instance transactional memories keyed by raw module-level `MemoryIndex`.
@@ -137,6 +159,14 @@ impl TMemory {
 
     pub(crate) fn new_vmemory_with_limits(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
         Self::new_with_backend_limits(TMemoryBackend::VMemory, min_pages, max_pages)
+    }
+
+    pub(crate) fn durable_sink(&mut self, stream_id: u32) -> TMemoryDurableSink<'_> {
+        self.durability.streams.entry(stream_id).or_default();
+        TMemoryDurableSink {
+            tmemory: self,
+            stream_id,
+        }
     }
 
     pub(crate) fn backend(&self) -> TMemoryBackend {
@@ -252,7 +282,49 @@ impl TMemory {
                 Box::new(FileBackedMemory::new(min_pages, max_pages, file_backing)?)
             }
         };
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            durability: TMemoryDurability::default(),
+        })
+    }
+
+    fn durable_stream_state_mut(&mut self, stream_id: u32) -> &mut DurableStreamState {
+        self.durability.streams.entry(stream_id).or_default()
+    }
+}
+
+impl DurableSink for TMemoryDurableSink<'_> {
+    fn append_data_record(&mut self, record: &[u8]) -> Result<TransactionDataRecordLocation> {
+        let state = self.tmemory.durable_stream_state_mut(self.stream_id);
+        state.data_records.push(record.to_vec());
+        let location = TransactionDataRecordLocation {
+            chunk_start_block: state.next_data_block,
+            data_block: state.next_data_block,
+            data_offset: 0,
+        };
+        state.next_data_block = state
+            .next_data_block
+            .checked_add(1)
+            .context("tmemory durable data block overflow")?;
+        Ok(location)
+    }
+
+    fn append_log_entry(&mut self, entry: &TxLogEntry) -> Result<()> {
+        let state = self.tmemory.durable_stream_state_mut(self.stream_id);
+        state.log_entries.push(*entry);
+        Ok(())
+    }
+
+    fn flush_data(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn flush_log(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn fence(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 

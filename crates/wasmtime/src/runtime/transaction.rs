@@ -10,6 +10,9 @@ use std::path::PathBuf;
 
 #[path = "transaction/object_heap.rs"]
 mod object_heap;
+#[path = "transaction/persist.rs"]
+mod persist;
+pub(crate) use persist::{DataRecordLocation, DurableSink, TxLogEntry};
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
 // store-local transaction state, `VMemory` and configurable `NVMemory`
