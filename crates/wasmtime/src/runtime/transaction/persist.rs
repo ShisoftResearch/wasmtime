@@ -11,6 +11,29 @@ pub(crate) struct PendingPublication {
     pub(crate) payload: Vec<u8>,
 }
 
+pub(crate) fn encode_data_record(pub_: &PendingPublication) -> Result<Vec<u8>> {
+    TMemory::encode_publication_data_record(
+        pub_.logical_id,
+        pub_.version,
+        pub_.kind,
+        pub_.type_info,
+        &pub_.payload,
+    )
+}
+
+#[cfg(test)]
+impl PendingPublication {
+    fn tmemory_for_test(logical_id: u64, version: u32, payload: &[u8]) -> Self {
+        Self {
+            logical_id,
+            version,
+            kind: 1,
+            type_info: 0,
+            payload: payload.to_vec(),
+        }
+    }
+}
+
 pub(crate) trait DurableSink {
     fn append_data_record(&mut self, record: &[u8]) -> Result<(u32, u32)>;
     fn append_log_entry(
@@ -50,13 +73,7 @@ where
 
         let mut ordinary = Vec::new();
         for pub_ in pubs {
-            let record = TMemory::encode_publication_data_record(
-                pub_.logical_id,
-                pub_.version,
-                pub_.kind,
-                pub_.type_info,
-                &pub_.payload,
-            )?;
+            let record = encode_data_record(pub_)?;
             let (data_block, data_offset) = self.sink.append_data_record(&record)?;
             ordinary.push((
                 pub_.logical_id,
@@ -222,6 +239,8 @@ fn sample_publications() -> Vec<PendingPublication> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::transaction::object_heap::encode_object_record_for_test;
+    use crate::runtime::transaction::object_heap::TxObjectHeader;
 
     #[test]
     fn commit_publishes_only_the_last_entry_with_lp() {
@@ -253,5 +272,24 @@ mod tests {
         let mut publisher = StreamPublisher::new_for_test(&mut recorder, 5, 12);
         publisher.abort_transaction(&sample_publications()).unwrap();
         assert_eq!(recorder.final_lp_count(), 0);
+    }
+
+    #[test]
+    fn encodes_tmemory_granule_record() {
+        let publication =
+            PendingPublication::tmemory_for_test(0x1000_0000_0000_0001, 5, &[1, 2, 3, 4]);
+        let bytes = encode_data_record(&publication).unwrap();
+        assert_eq!(u16::from_le_bytes(bytes[12..14].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 4);
+    }
+
+    #[test]
+    fn encodes_object_record_with_tx_object_header() {
+        let bytes = encode_object_record_for_test(41, 7, 12, &[9, 8, 7]).unwrap();
+        let header = TxObjectHeader::read_from_prefix(&bytes).unwrap();
+        assert_eq!(header.object_id, 41);
+        assert_eq!(header.version, 7);
+        assert_eq!(header.type_index, 12);
     }
 }

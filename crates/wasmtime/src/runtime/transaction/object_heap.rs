@@ -17,9 +17,40 @@ pub(crate) struct TxRecordHandle(u64);
 pub(crate) struct TxObjectHeader {
     pub(crate) record_len: u64,
     pub(crate) object_id: u64,
+    pub(crate) version: u32,
     pub(crate) kind: u16,
     pub(crate) flags: u16,
     pub(crate) type_index: u32,
+}
+
+impl TxObjectHeader {
+    const BYTE_LEN: usize = size_of::<Self>();
+
+    pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..8].copy_from_slice(&self.record_len.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.object_id.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.version.to_le_bytes());
+        bytes[20..22].copy_from_slice(&self.kind.to_le_bytes());
+        bytes[22..24].copy_from_slice(&self.flags.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.type_index.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn read_from_prefix(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() >= Self::BYTE_LEN,
+            "transaction object header prefix is shorter than expected"
+        );
+        Ok(Self {
+            record_len: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            object_id: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            version: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            kind: u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
+            flags: u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+            type_index: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        })
+    }
 }
 
 #[repr(C)]
@@ -73,6 +104,7 @@ impl ObjectHeap {
     pub(crate) fn allocate_record(
         &mut self,
         object_id: ObjectId,
+        version: u32,
         kind: ObjectKind,
         flags: u16,
         type_index: u32,
@@ -93,6 +125,7 @@ impl ObjectHeap {
         let header = TxObjectHeader {
             record_len,
             object_id: object_id.object_index,
+            version,
             kind: kind as u16,
             flags,
             type_index,
@@ -184,6 +217,17 @@ impl ObjectHeap {
         })
     }
 
+    pub(crate) fn published_records(
+        &self,
+    ) -> impl Iterator<Item = (TxRecordHandle, TxObjectHeader)> + '_ {
+        self.records.iter().enumerate().map(|(index, record)| {
+            (
+                TxRecordHandle(u64::try_from(index + 1).unwrap()),
+                record.header,
+            )
+        })
+    }
+
     fn record(&self, handle: TxRecordHandle) -> Result<&ObjectRecord> {
         let index = record_index(handle)?;
         self.records
@@ -229,6 +273,41 @@ impl ObjectHeap {
         let offset = self.record(handle)?.offset;
         self.region()?.line_mark_for_offset(offset)
     }
+}
+
+pub(crate) fn encode_object_record(
+    object_id: u64,
+    version: u32,
+    kind: u16,
+    type_index: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let record_len = size_of::<TxObjectHeader>()
+        .checked_add(payload.len())
+        .context("object record length overflow")?;
+    let header = TxObjectHeader {
+        record_len: u64::try_from(record_len).context("object record length does not fit u64")?,
+        object_id,
+        version,
+        kind,
+        flags: 0,
+        type_index,
+    };
+
+    let mut bytes = Vec::with_capacity(record_len);
+    bytes.extend_from_slice(&header.as_bytes());
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_object_record_for_test(
+    object_id: u64,
+    version: u32,
+    type_index: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    encode_object_record(object_id, version, ObjectKind::Struct as u16, type_index, payload)
 }
 
 #[derive(Debug)]
@@ -338,7 +417,7 @@ fn serialize_record(
     let record_len =
         usize::try_from(header.record_len).context("record length does not fit usize")?;
     let mut bytes = Vec::with_capacity(record_len);
-    append_object_header_bytes(&mut bytes, header);
+    bytes.extend_from_slice(&header.as_bytes());
     if let Some(length) = array_length {
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.resize(size_of::<TxArrayHeader>(), 0);
@@ -351,14 +430,6 @@ fn serialize_record(
         "serialized object record length mismatch"
     );
     Ok(bytes)
-}
-
-fn append_object_header_bytes(bytes: &mut Vec<u8>, header: &TxObjectHeader) {
-    bytes.extend_from_slice(&header.record_len.to_le_bytes());
-    bytes.extend_from_slice(&header.object_id.to_le_bytes());
-    bytes.extend_from_slice(&header.kind.to_le_bytes());
-    bytes.extend_from_slice(&header.flags.to_le_bytes());
-    bytes.extend_from_slice(&header.type_index.to_le_bytes());
 }
 
 fn append_payload_bytes(bytes: &mut Vec<u8>, payload: &ObjectPayload) -> Result<()> {

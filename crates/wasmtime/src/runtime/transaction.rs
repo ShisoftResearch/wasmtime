@@ -75,6 +75,12 @@ pub(crate) enum ConflictPolicy {
     AbortOrWizardDefault,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectIndexPersistencePolicy {
+    RebuildOnRecovery,
+    PersistentIndex,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TransactionConfig {
     tmemory_backend: TMemoryBackend,
@@ -83,6 +89,7 @@ pub(crate) struct TransactionConfig {
     concurrency_control: ConcurrencyControl,
     durability_policy: DurabilityPolicy,
     conflict_policy: ConflictPolicy,
+    object_index_persistence_policy: ObjectIndexPersistencePolicy,
 }
 
 impl Default for TransactionConfig {
@@ -94,6 +101,7 @@ impl Default for TransactionConfig {
             concurrency_control: ConcurrencyControl::LockBased,
             durability_policy: DurabilityPolicy::VolatileRollbackOnly,
             conflict_policy: ConflictPolicy::AbortOrWizardDefault,
+            object_index_persistence_policy: ObjectIndexPersistencePolicy::RebuildOnRecovery,
         }
     }
 }
@@ -129,6 +137,14 @@ impl TransactionConfig {
         Ok(config)
     }
 
+    pub(crate) fn with_object_index_persistence_policy(
+        object_index_persistence_policy: ObjectIndexPersistencePolicy,
+    ) -> Result<Self> {
+        let mut config = Self::default();
+        config.set_object_index_persistence_policy(object_index_persistence_policy)?;
+        Ok(config)
+    }
+
     pub(crate) fn tmemory_backend(&self) -> TMemoryBackend {
         self.tmemory_backend
     }
@@ -151,6 +167,10 @@ impl TransactionConfig {
 
     pub(crate) fn conflict_policy(&self) -> ConflictPolicy {
         self.conflict_policy
+    }
+
+    pub(crate) fn object_index_persistence_policy(&self) -> ObjectIndexPersistencePolicy {
+        self.object_index_persistence_policy
     }
 
     pub(crate) fn is_vmemory_only(&self) -> bool {
@@ -184,6 +204,21 @@ impl TransactionConfig {
         self.tmemory_backend = TMemoryBackend::FileBackedMemory;
         self.tmemory_file_backing = Some(file_backing);
         Ok(())
+    }
+
+    fn set_object_index_persistence_policy(
+        &mut self,
+        object_index_persistence_policy: ObjectIndexPersistencePolicy,
+    ) -> Result<()> {
+        match object_index_persistence_policy {
+            ObjectIndexPersistencePolicy::RebuildOnRecovery => {
+                self.object_index_persistence_policy = object_index_persistence_policy;
+                Ok(())
+            }
+            ObjectIndexPersistencePolicy::PersistentIndex => {
+                bail!("PersistentIndex object-table policy is not implemented yet")
+            }
+        }
     }
 }
 
@@ -542,6 +577,17 @@ impl ObjectPayload {
     }
 }
 
+fn object_kind_from_u16(raw: u16) -> Result<ObjectKind> {
+    match raw {
+        x if x == ObjectKind::Struct as u16 => Ok(ObjectKind::Struct),
+        x if x == ObjectKind::Array as u16 => Ok(ObjectKind::Array),
+        x if x == ObjectKind::I31 as u16 => Ok(ObjectKind::I31),
+        x if x == ObjectKind::Extern as u16 => Ok(ObjectKind::Extern),
+        x if x == ObjectKind::Func as u16 => Ok(ObjectKind::Func),
+        _ => bail!("unknown object kind tag in persistent record header: {raw}"),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct ObjectTableSlot {
     kind: ObjectKind,
@@ -565,6 +611,7 @@ pub(crate) struct ObjectTable {
     func_ref_to_object: BTreeMap<u64, ObjectId>,
     object_to_func_ref: BTreeMap<ObjectId, u64>,
     next_version: u64,
+    next_record_version: u32,
     live_count: usize,
     heap: object_heap::ObjectHeap,
 }
@@ -656,7 +703,10 @@ impl ObjectTable {
             "object table freelist entry points at a live slot"
         );
         let kind = payload.kind();
-        let record = self.heap.allocate_record(object_id, kind, 0, 0, &payload)?;
+        let record_version = self.bump_record_version()?;
+        let record = self
+            .heap
+            .allocate_record(object_id, record_version, kind, 0, 0, &payload)?;
         let version = self.bump_object_version()?;
         if reused_slot.is_some() {
             let _ = self.free_list.pop();
@@ -784,9 +834,15 @@ impl ObjectTable {
             "object payload kind does not match object table slot kind"
         );
         let type_index = self.live_slot(object_id)?.type_index;
-        let record = self
-            .heap
-            .allocate_record(object_id, kind, 0, type_index, &payload)?;
+        let record_version = self.bump_record_version()?;
+        let record = self.heap.allocate_record(
+            object_id,
+            record_version,
+            kind,
+            0,
+            type_index,
+            &payload,
+        )?;
         let version = self.bump_object_version()?;
         self.slots[index] = Some(ObjectTableSlot {
             kind,
@@ -845,6 +901,71 @@ impl ObjectTable {
             .checked_add(1)
             .context("object table version overflow")?;
         Ok(self.next_version)
+    }
+
+    fn bump_record_version(&mut self) -> Result<u32> {
+        self.next_record_version = self
+            .next_record_version
+            .checked_add(1)
+            .context("object record version overflow")?;
+        Ok(self.next_record_version)
+    }
+
+    fn rebuild_volatile_index_from_heap(&mut self) -> Result<()> {
+        self.slots.clear();
+        self.free_list.clear();
+        self.gc_ref_to_object.clear();
+        self.object_to_gc_ref.clear();
+        self.func_ref_to_object.clear();
+        self.object_to_func_ref.clear();
+        self.live_count = 0;
+        self.next_version = 0;
+        self.next_record_version = 0;
+
+        let mut latest_by_object = BTreeMap::<ObjectId, (object_heap::TxRecordHandle, object_heap::TxObjectHeader)>::new();
+        for (handle, header) in self.heap.published_records() {
+            let object_id = ObjectId {
+                object_index: header.object_id,
+            };
+            self.next_record_version = self.next_record_version.max(header.version);
+            match latest_by_object.get(&object_id) {
+                Some((_, current)) if current.version >= header.version => {}
+                _ => {
+                    latest_by_object.insert(object_id, (handle, header));
+                }
+            }
+        }
+
+        if let Some(max_object_id) = latest_by_object.keys().map(|id| id.object_index).max() {
+            let slot_len = usize::try_from(max_object_id.checked_add(1).context("object slot range overflow")?)
+                .context("object slot range does not fit usize")?;
+            self.slots.resize(slot_len, None);
+        }
+
+        for (object_id, (handle, header)) in latest_by_object {
+            let index = object_slot_index(object_id)?;
+            let kind = object_kind_from_u16(header.kind)?;
+            let version = self.bump_object_version()?;
+            self.slots[index] = Some(ObjectTableSlot {
+                kind,
+                version,
+                type_index: header.type_index,
+                current_record: handle,
+            });
+            self.live_count = self
+                .live_count
+                .checked_add(1)
+                .context("object table live count overflow during rebuild")?;
+        }
+
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.is_none() {
+                self.free_list.push(ObjectId {
+                    object_index: u64::try_from(index).context("slot index does not fit u64")?,
+                });
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -4070,6 +4191,10 @@ mod tests {
             config.conflict_policy(),
             ConflictPolicy::AbortOrWizardDefault
         );
+        assert_eq!(
+            config.object_index_persistence_policy(),
+            ObjectIndexPersistencePolicy::RebuildOnRecovery
+        );
     }
 
     #[test]
@@ -4142,6 +4267,24 @@ mod tests {
             TMemoryPersistenceMode::RequireHardwarePmem
         );
         assert!(!config.is_vmemory_only());
+    }
+
+    #[test]
+    fn transaction_config_defaults_to_rebuild_on_recovery_object_index_policy() {
+        let config = TransactionConfig::default();
+        assert_eq!(
+            config.object_index_persistence_policy(),
+            ObjectIndexPersistencePolicy::RebuildOnRecovery
+        );
+    }
+
+    #[test]
+    fn transaction_config_rejects_persistent_index_policy_for_now() {
+        let error = TransactionConfig::with_object_index_persistence_policy(
+            ObjectIndexPersistencePolicy::PersistentIndex,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("PersistentIndex"));
     }
 
     #[test]
@@ -5690,11 +5833,12 @@ mod tests {
         ]);
 
         let handle = heap
-            .allocate_record(object_id, ObjectKind::Struct, 0x23, 41, &payload)
+            .allocate_record(object_id, 1, ObjectKind::Struct, 0x23, 41, &payload)
             .unwrap();
         let header = heap.header(handle).unwrap();
 
         assert_eq!(header.object_id, object_id.object_index);
+        assert_eq!(header.version, 1);
         assert_eq!(header.kind, ObjectKind::Struct as u16);
         assert_eq!(header.flags, 0x23);
         assert_eq!(header.type_index, 41);
@@ -5712,11 +5856,12 @@ mod tests {
         ]);
 
         let handle = heap
-            .allocate_record(object_id, ObjectKind::Array, 0, 7, &payload)
+            .allocate_record(object_id, 2, ObjectKind::Array, 0, 7, &payload)
             .unwrap();
         let header = heap.array_header(handle).unwrap();
 
         assert_eq!(header.base.object_id, object_id.object_index);
+        assert_eq!(header.base.version, 2);
         assert_eq!(header.base.kind, ObjectKind::Array as u16);
         assert_eq!(header.base.type_index, 7);
         assert_eq!(header.length, 3);
@@ -5731,6 +5876,7 @@ mod tests {
         let handle = heap
             .allocate_record(
                 ObjectId { object_index: 17 },
+                3,
                 ObjectKind::Struct,
                 0x23,
                 41,
@@ -5747,11 +5893,15 @@ mod tests {
         );
         assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 17);
         assert_eq!(
-            u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
             ObjectKind::Struct as u16
         );
-        assert_eq!(u16::from_le_bytes(bytes[18..20].try_into().unwrap()), 0x23);
-        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 41);
+        assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 0x23);
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 41);
         assert_eq!(
             i32::from_le_bytes(
                 bytes[payload_offset..payload_offset + 4]
@@ -5768,6 +5918,7 @@ mod tests {
         let handle = heap
             .allocate_record(
                 ObjectId { object_index: 3 },
+                4,
                 ObjectKind::Struct,
                 0,
                 0,
@@ -5809,11 +5960,87 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_records_serialize_version() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+            .unwrap();
+
+        let first_handle = objects.current_record_handle_for_test(object).unwrap();
+        let first_bytes = objects.heap.record_bytes_for_test(first_handle).unwrap();
+        let first_version = u32::from_le_bytes(first_bytes[16..20].try_into().unwrap());
+
+        objects
+            .update_payload(
+                object,
+                ObjectPayload::Struct(vec![
+                    ObjectValue::I32(2),
+                    ObjectValue::Ref(Some(ObjectId { object_index: 99 })),
+                ]),
+            )
+            .unwrap();
+
+        let second_handle = objects.current_record_handle_for_test(object).unwrap();
+        let second_bytes = objects.heap.record_bytes_for_test(second_handle).unwrap();
+        let second_version = u32::from_le_bytes(second_bytes[16..20].try_into().unwrap());
+
+        assert_eq!(first_version, 1);
+        assert_eq!(second_version, 2);
+    }
+
+    #[test]
+    fn object_table_rebuilds_latest_slots_from_heap_publication_metadata() {
+        let mut objects = ObjectTable::default();
+        let first = objects
+            .allocate_struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+            .unwrap();
+        let second = objects
+            .allocate_array(vec![ObjectValue::Ref(Some(first)), ObjectValue::I64(7)])
+            .unwrap();
+
+        objects
+            .update_payload(
+                first,
+                ObjectPayload::Struct(vec![
+                    ObjectValue::I32(2),
+                    ObjectValue::Ref(Some(second)),
+                ]),
+            )
+            .unwrap();
+
+        let first_latest_handle = objects.current_record_handle_for_test(first).unwrap();
+        let second_latest_handle = objects.current_record_handle_for_test(second).unwrap();
+        let first_latest_payload = objects.payload(first).unwrap();
+        let second_latest_payload = objects.payload(second).unwrap();
+
+        objects.slots.clear();
+        objects.free_list.clear();
+        objects.gc_ref_to_object.clear();
+        objects.object_to_gc_ref.clear();
+        objects.func_ref_to_object.clear();
+        objects.object_to_func_ref.clear();
+        objects.next_version = 0;
+        objects.live_count = 0;
+
+        objects.rebuild_volatile_index_from_heap().unwrap();
+
+        assert_eq!(objects.current_record_handle_for_test(first).unwrap(), first_latest_handle);
+        assert_eq!(
+            objects.current_record_handle_for_test(second).unwrap(),
+            second_latest_handle
+        );
+        assert_eq!(objects.payload(first).unwrap(), first_latest_payload);
+        assert_eq!(objects.payload(second).unwrap(), second_latest_payload);
+        assert_eq!(objects.live_count(), 2);
+    }
+
+    #[test]
     fn transaction_object_scanner_returns_embedded_refs_from_struct_and_array_payloads() {
         let mut struct_heap = object_heap::ObjectHeap::default();
         let struct_handle = struct_heap
             .allocate_record(
                 ObjectId { object_index: 1 },
+                5,
                 ObjectKind::Struct,
                 0,
                 3,
@@ -5836,6 +6063,7 @@ mod tests {
         let array_handle = array_heap
             .allocate_record(
                 ObjectId { object_index: 2 },
+                6,
                 ObjectKind::Array,
                 0,
                 4,
@@ -5860,6 +6088,7 @@ mod tests {
         let handle = heap
             .allocate_record(
                 ObjectId { object_index: 3 },
+                7,
                 ObjectKind::Array,
                 0,
                 8,
