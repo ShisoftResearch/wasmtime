@@ -976,12 +976,28 @@ mod tests {
 
     #[test]
     fn durable_header_sizes_match_design() {
+        let _ = LogBlockHeader {
+            magic: LOG_BLOCK_MAGIC,
+            stream_id: 7,
+            block_seq: 3,
+            next_block: NO_NEXT_BLOCK,
+            entry_count: 19,
+        };
+        let _ = DataChunkHeader {
+            magic: DATA_CHUNK_MAGIC,
+            stream_id: 7,
+            chunk_seq: 4,
+            next_chunk: NO_NEXT_BLOCK,
+            chunk_blocks: 2,
+            tail_block_delta: 1,
+            tail_in_block: 96,
+        };
         assert_eq!(size_of::<RegionHeader>(), 32);
         assert_eq!(size_of::<LogBlockHeader>(), 20);
         assert_eq!(size_of::<DataChunkHeader>(), 28);
         assert_eq!(size_of::<TxLogEntry>(), 32);
         assert_eq!(align_of::<TxLogEntry>(), 32);
-        assert_eq!(size_of::<TxDataRecordHeader>(), 20);
+        assert_eq!(size_of::<TxDataRecordHeader>(), 24);
     }
 
     #[test]
@@ -1000,8 +1016,8 @@ mod tests {
             version: 3,
             kind: PackedGranuleDomain::TMemory as u16,
             reserved: 0,
-            payload_len: 256,
-            type_info: 0,
+            payload_len: 0x0001_0203,
+            type_info: 0x8001_0002,
         };
         let bytes = header.as_bytes();
         let decoded = TxDataRecordHeader::from_bytes(bytes).unwrap();

@@ -26,22 +26,22 @@ pub(crate) struct RegionHeader {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LogBlockHeader {
     pub(crate) magic: u32,
+    pub(crate) stream_id: u32,
+    pub(crate) block_seq: u32,
     pub(crate) next_block: u32,
     pub(crate) entry_count: u32,
-    pub(crate) entries_offset: u32,
-    pub(crate) sealed_tx: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DataChunkHeader {
     pub(crate) magic: u32,
-    pub(crate) next_block: u32,
-    pub(crate) payload_offset: u32,
-    pub(crate) payload_len: u32,
-    pub(crate) record_count: u32,
-    pub(crate) tx_ordinal: u32,
-    pub(crate) reserved: u32,
+    pub(crate) stream_id: u32,
+    pub(crate) chunk_seq: u32,
+    pub(crate) next_chunk: u32,
+    pub(crate) chunk_blocks: u32,
+    pub(crate) tail_block_delta: u32,
+    pub(crate) tail_in_block: u32,
 }
 
 #[repr(C, align(32))]
@@ -101,19 +101,19 @@ pub(crate) enum PackedGranuleDomain {
     TMemory = 1,
 }
 
-#[repr(C, packed(4))]
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TxDataRecordHeader {
     pub(crate) logical_id: u64,
     pub(crate) version: u32,
     pub(crate) kind: u16,
     pub(crate) reserved: u16,
-    pub(crate) payload_len: u16,
-    pub(crate) type_info: u16,
+    pub(crate) payload_len: u32,
+    pub(crate) type_info: u32,
 }
 
 impl TxDataRecordHeader {
-    const BYTE_LEN: usize = 20;
+    const BYTE_LEN: usize = 24;
 
     pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
         let logical_id = self.logical_id;
@@ -128,8 +128,8 @@ impl TxDataRecordHeader {
         bytes[8..12].copy_from_slice(&version.to_le_bytes());
         bytes[12..14].copy_from_slice(&kind.to_le_bytes());
         bytes[14..16].copy_from_slice(&reserved.to_le_bytes());
-        bytes[16..18].copy_from_slice(&payload_len.to_le_bytes());
-        bytes[18..20].copy_from_slice(&type_info.to_le_bytes());
+        bytes[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        bytes[20..24].copy_from_slice(&type_info.to_le_bytes());
         bytes
     }
 
@@ -145,8 +145,8 @@ impl TxDataRecordHeader {
             version: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
             kind: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
             reserved: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
-            payload_len: u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
-            type_info: u16::from_le_bytes(bytes[18..20].try_into().unwrap()),
+            payload_len: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            type_info: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
         })
     }
 }
