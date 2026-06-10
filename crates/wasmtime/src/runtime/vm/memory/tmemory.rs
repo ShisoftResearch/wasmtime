@@ -14,8 +14,10 @@ use crate::runtime::transaction::{
 use wasmtime_environ::MemoryIndex;
 
 pub(crate) mod block_region;
+mod durable_log;
 mod linear_region;
 
+pub(crate) use durable_log::*;
 use self::linear_region::TMemoryRegion;
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
@@ -957,6 +959,7 @@ fn granules_for_bytes(bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem::{align_of, size_of};
 
     const GRANULES_PER_WASM_PAGE: usize = WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE;
 
@@ -969,6 +972,40 @@ mod tests {
         assert_eq!(block_region::BLOCK_ENTRY_SIZE, 40);
         assert_eq!(block_region::CHUNK_HEADER_SIZE, 32);
         assert_eq!(block_region::LINE_MARK_SIZE, 1);
+    }
+
+    #[test]
+    fn durable_header_sizes_match_design() {
+        assert_eq!(size_of::<RegionHeader>(), 32);
+        assert_eq!(size_of::<LogBlockHeader>(), 20);
+        assert_eq!(size_of::<DataChunkHeader>(), 28);
+        assert_eq!(size_of::<TxLogEntry>(), 32);
+        assert_eq!(align_of::<TxLogEntry>(), 32);
+        assert_eq!(size_of::<TxDataRecordHeader>(), 20);
+    }
+
+    #[test]
+    fn tx_log_entry_crc_detects_bitflip() {
+        let mut entry = TxLogEntry::new(0x6000_0000_0000_002a, 7, (11 << 1) | 1, 19, 96);
+        entry.seal_crc32();
+        assert!(entry.validate_crc32());
+        entry.data_offset ^= 0x10;
+        assert!(!entry.validate_crc32());
+    }
+
+    #[test]
+    fn tx_data_record_header_roundtrips() {
+        let header = TxDataRecordHeader {
+            logical_id: 0x1000_0000_0000_0007,
+            version: 3,
+            kind: PackedGranuleDomain::TMemory as u16,
+            reserved: 0,
+            payload_len: 256,
+            type_info: 0,
+        };
+        let bytes = header.as_bytes();
+        let decoded = TxDataRecordHeader::from_bytes(bytes).unwrap();
+        assert_eq!(decoded, header);
     }
 
     #[test]
