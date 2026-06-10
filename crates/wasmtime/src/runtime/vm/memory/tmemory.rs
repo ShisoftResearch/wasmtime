@@ -17,11 +17,26 @@ pub(crate) mod block_region;
 mod durable_log;
 mod linear_region;
 
-pub(crate) use durable_log::*;
 use self::linear_region::TMemoryRegion;
+pub(crate) use durable_log::*;
 
 pub(crate) const WASM_PAGE_SIZE: usize = 64 * 1024;
 const DEFAULT_MAX_WASM_PAGES: u64 = 1 << 16;
+pub(crate) const SMALL_DATA_LIMIT: usize = block_region::IMMIX_LINE_SIZE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DataChunkClass {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataRecordLocation {
+    pub(crate) chunk_start_block: u32,
+    pub(crate) data_block: u32,
+    pub(crate) data_offset: u32,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TMemoryGranuleInfo {
