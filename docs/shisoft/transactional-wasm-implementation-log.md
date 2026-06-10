@@ -43,8 +43,10 @@ backend remains `VMemory`; file-backed temp-file and explicit-path modes are
 both opt-in transaction configuration choices.
 
 Restart/power-fail recovery remains gated behind
-`WASMTIME_TEST_FILE_BACKED_TMEMORY_RECOVERY=1` until durable region headers,
-commit metadata, and recovery loading are implemented.
+`WASMTIME_TEST_FILE_BACKED_TMEMORY_RECOVERY=1` for full end-to-end `TMemory`
+restart wiring, but the durable region/log/data substrate can now reopen
+file-backed region images and rebuild stream/block state through chunk-start
+scan plus log replay.
 
 ## Transactional Grow Ordering Follow-Up
 

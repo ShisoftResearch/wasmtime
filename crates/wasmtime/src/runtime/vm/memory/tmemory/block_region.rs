@@ -4,7 +4,8 @@
 
 use super::{
     DATA_CHUNK_MAGIC, DataChunkClass, DataChunkHeader, DataRecordLocation, LOG_BLOCK_MAGIC,
-    LogBlockHeader, NO_NEXT_BLOCK, SMALL_DATA_LIMIT, TxLogEntry,
+    LogBlockHeader, NO_NEXT_BLOCK, PackedGranuleDomain, REGION_MAGIC, RegionHeader,
+    SMALL_DATA_LIMIT, TMemory, TxLogEntry,
 };
 use crate::prelude::*;
 use crate::runtime::vm::SendSyncPtr;
@@ -18,7 +19,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub(crate) const BLOCK_SIZE: usize = 512 * 1024;
@@ -66,6 +67,10 @@ impl FileBackedMapping {
 
     pub(crate) fn new_path(path: PathBuf, len: usize) -> Result<Self> {
         Self::new_path_with_unlink(path, len, false)
+    }
+
+    pub(crate) fn open_existing_path(path: PathBuf) -> Result<Self> {
+        open_existing_file_backed_mapping(path)
     }
 
     fn new_path_with_unlink(path: PathBuf, len: usize, unlink_on_drop: bool) -> Result<Self> {
@@ -231,6 +236,38 @@ fn new_temp_file_backed_mapping(len: usize) -> Result<FileBackedMapping> {
 }
 
 #[cfg(unix)]
+fn open_existing_file_backed_mapping(path: PathBuf) -> Result<FileBackedMapping> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "failed to open existing file-backed tmemory file {}",
+                path.display()
+            )
+        })?;
+    let len = usize::try_from(
+        file.metadata()
+            .with_context(|| {
+                format!(
+                    "failed to stat file-backed tmemory file {}",
+                    path.display()
+                )
+            })?
+            .len(),
+    )
+    .context("file-backed tmemory file length overflow")?;
+    let memory = unsafe { map_shared_file(&file, len)? };
+    Ok(FileBackedMapping {
+        file,
+        path,
+        unlink_on_drop: false,
+        memory,
+    })
+}
+
+#[cfg(unix)]
 fn finish_file_backed_mapping(
     file: File,
     path: PathBuf,
@@ -359,6 +396,13 @@ fn new_file_backed_mapping(
 
 #[cfg(not(unix))]
 fn new_temp_file_backed_mapping(_len: usize) -> Result<FileBackedMapping> {
+    bail!(
+        "FileBackedMemory is unsupported on this target until shared writable mmap support exists"
+    )
+}
+
+#[cfg(not(unix))]
+fn open_existing_file_backed_mapping(_path: PathBuf) -> Result<FileBackedMapping> {
     bail!(
         "FileBackedMemory is unsupported on this target until shared writable mmap support exists"
     )
@@ -1335,6 +1379,7 @@ pub(crate) struct FileBackedMemoryBlockRegion {
     mapping: FileBackedMapping,
     block_entries: Vec<BlockEntry>,
     line_marks: Vec<LineMark>,
+    streams: BTreeMap<u32, StreamState>,
 }
 
 impl FileBackedMemoryBlockRegion {
@@ -1352,6 +1397,7 @@ impl FileBackedMemoryBlockRegion {
                 };
                 line_count
             ],
+            streams: BTreeMap::new(),
         })
     }
 
@@ -1378,6 +1424,45 @@ impl FileBackedMemoryBlockRegion {
 
     pub(crate) fn line_count(&self) -> usize {
         self.line_marks.len()
+    }
+
+    pub(crate) fn create_for_test(path: &Path, num_blocks: u32) -> Result<Self> {
+        let num_blocks =
+            usize::try_from(num_blocks).context("transactional file-backed region size overflow")?;
+        ensure!(num_blocks > 0, "transactional file-backed region must have at least one block");
+        let mut region = Self::new(num_blocks, FileBackedRegionMode::Path(path.to_path_buf()))?;
+        region.initialize_region_image()?;
+        Ok(region)
+    }
+
+    pub(crate) fn open_for_test(path: &Path) -> Result<Self> {
+        let mapping = FileBackedMapping::open_existing_path(path.to_path_buf())?;
+        ensure!(
+            mapping.len() >= BLOCK_SIZE,
+            "transactional file-backed region image is smaller than one block"
+        );
+        ensure!(
+            mapping.len() % BLOCK_SIZE == 0,
+            "transactional file-backed region image length is not block-aligned"
+        );
+
+        let num_blocks = mapping.len() / BLOCK_SIZE;
+        let line_count = mapping.len() / IMMIX_LINE_SIZE;
+        let mut region = Self {
+            mapping,
+            block_entries: vec![BlockEntry::default(); num_blocks],
+            line_marks: vec![
+                LineMark {
+                    mark: IMMIX_LINE_MARK_RESET_VALUE,
+                };
+                line_count
+            ],
+            streams: BTreeMap::new(),
+        };
+        let header = region.region_header()?;
+        region.validate_region_header(header)?;
+        region.rebuild_state_from_image()?;
+        Ok(region)
     }
 
     pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
@@ -1409,6 +1494,134 @@ impl FileBackedMemoryBlockRegion {
         }
 
         bail!("transactional FileBackedMemory block region is out of contiguous chunks")
+    }
+
+    pub(crate) fn alloc_log_block(&mut self, stream_id: u32, block_seq: u32) -> Result<u32> {
+        let chunk = self.alloc_chunk(1)?;
+        let start_block = u32::try_from(chunk.start_block())
+            .context("transactional log block start block overflow")?;
+        let header = LogBlockHeader {
+            magic: LOG_BLOCK_MAGIC,
+            stream_id,
+            block_seq,
+            next_block: NO_NEXT_BLOCK,
+            entry_count: 0,
+        };
+        self.write_log_block_header(start_block, header)?;
+        Ok(start_block)
+    }
+
+    pub(crate) fn alloc_data_chunk(
+        &mut self,
+        stream_id: u32,
+        chunk_seq: u32,
+        total_bytes: usize,
+    ) -> Result<u32> {
+        let class = if total_bytes <= SMALL_DATA_LIMIT {
+            DataChunkClass::Small
+        } else if total_bytes <= self.block_payload_capacity() {
+            DataChunkClass::Medium
+        } else {
+            DataChunkClass::Large
+        };
+        self.alloc_data_chunk_for_class(stream_id, chunk_seq, class, total_bytes)
+    }
+
+    pub(crate) fn alloc_stream(&mut self, stream_id: u32) -> Result<StreamCursor> {
+        ensure!(
+            !self.streams.contains_key(&stream_id),
+            "transactional stream {stream_id} already exists"
+        );
+        self.streams.insert(stream_id, StreamState::default());
+        Ok(StreamCursor { stream_id })
+    }
+
+    pub(crate) fn append_data_record(
+        &mut self,
+        stream: StreamCursor,
+        bytes: &[u8],
+    ) -> Result<DataRecordLocation> {
+        let mut state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+
+        let chunk_start_block = if let Some(start_block) = state.current_data_chunk_start {
+            let header = self.data_chunk_header(start_block)?;
+            if self.chunk_remaining_capacity(header)? >= bytes.len() {
+                start_block
+            } else {
+                let next_chunk_start = self.alloc_data_chunk(
+                    stream.stream_id,
+                    state.next_data_chunk_seq,
+                    bytes.len(),
+                )?;
+                let mut previous = header;
+                previous.next_chunk = next_chunk_start;
+                self.write_data_chunk_header(start_block, previous)?;
+                state.next_data_chunk_seq = state
+                    .next_data_chunk_seq
+                    .checked_add(1)
+                    .context("transactional data chunk sequence overflow")?;
+                state.current_data_chunk_start = Some(next_chunk_start);
+                next_chunk_start
+            }
+        } else {
+            let start_block =
+                self.alloc_data_chunk(stream.stream_id, state.next_data_chunk_seq, bytes.len())?;
+            state.next_data_chunk_seq = state
+                .next_data_chunk_seq
+                .checked_add(1)
+                .context("transactional data chunk sequence overflow")?;
+            state.current_data_chunk_start = Some(start_block);
+            start_block
+        };
+
+        let mut header = self.data_chunk_header(chunk_start_block)?;
+        let record_start = self.chunk_tail_offset(header)?;
+        let record_end = record_start
+            .checked_add(bytes.len())
+            .context("transactional data record length overflow")?;
+        ensure!(
+            record_end <= self.chunk_capacity_bytes(header)?,
+            "transactional data record crosses chunk boundary"
+        );
+        let write_offset = self
+            .block_offset(chunk_start_block)?
+            .checked_add(record_start)
+            .context("transactional data record write offset overflow")?;
+        self.write(write_offset, bytes)?;
+        header.tail_block_delta = u32::try_from(record_end / BLOCK_SIZE)
+            .context("transactional data chunk tail block delta overflow")?;
+        header.tail_in_block = u32::try_from(record_end % BLOCK_SIZE)
+            .context("transactional data chunk tail offset overflow")?;
+        self.write_data_chunk_header(chunk_start_block, header)?;
+        self.streams.insert(stream.stream_id, state);
+
+        let data_block = chunk_start_block
+            .checked_add(
+                u32::try_from(record_start / BLOCK_SIZE)
+                    .context("transactional data record block delta overflow")?,
+            )
+            .context("transactional data record block index overflow")?;
+        let data_offset = u32::try_from(record_start % BLOCK_SIZE)
+            .context("transactional data record offset overflow")?;
+        Ok(DataRecordLocation {
+            chunk_start_block,
+            data_block,
+            data_offset,
+        })
+    }
+
+    pub(crate) fn log_block_header(&self, start_block: u32) -> Result<LogBlockHeader> {
+        LogBlockHeader::from_bytes(
+            self.read_header_bytes(start_block, size_of::<LogBlockHeader>())?,
+        )
+    }
+
+    pub(crate) fn data_chunk_header(&self, start_block: u32) -> Result<DataChunkHeader> {
+        DataChunkHeader::from_bytes(
+            self.read_header_bytes(start_block, size_of::<DataChunkHeader>())?,
+        )
     }
 
     pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -1470,6 +1683,240 @@ impl FileBackedMemoryBlockRegion {
             block_count: additional_blocks,
         }))
     }
+
+    fn initialize_region_image(&mut self) -> Result<()> {
+        self.reset_recovered_state();
+        self.mark_blocks_used(0, 1)?;
+        self.write_region_header(RegionHeader {
+            magic: REGION_MAGIC,
+            block_size: u32::try_from(BLOCK_SIZE).unwrap(),
+            num_blocks: u32::try_from(self.num_blocks())
+                .context("transactional file-backed region block count overflow")?,
+            block_table_start_block: 0,
+            block_table_block_count: 0,
+            metadata_descs_start_block: 0,
+            metadata_descs_block_count: 0,
+            num_descs: 0,
+        })?;
+        self.flush(0, size_of::<RegionHeader>())?;
+        self.fence()
+    }
+
+    fn region_header(&self) -> Result<RegionHeader> {
+        RegionHeader::from_bytes(self.mapping.read(0, size_of::<RegionHeader>())?)
+    }
+
+    fn write_region_header(&mut self, header: RegionHeader) -> Result<()> {
+        self.mapping.write(0, &header.as_bytes())
+    }
+
+    fn validate_region_header(&self, header: RegionHeader) -> Result<()> {
+        ensure!(
+            header.magic == REGION_MAGIC,
+            "transactional file-backed region image has invalid magic"
+        );
+        ensure!(
+            usize::try_from(header.block_size).ok() == Some(BLOCK_SIZE),
+            "transactional file-backed region image has unexpected block size"
+        );
+        ensure!(
+            header.block_table_start_block == 0
+                && header.block_table_block_count == 0
+                && header.metadata_descs_start_block == 0
+                && header.metadata_descs_block_count == 0
+                && header.num_descs == 0,
+            "transactional file-backed region image contains unsupported durable metadata tables"
+        );
+        let expected_blocks = usize::try_from(header.num_blocks)
+            .context("transactional file-backed region block count overflow")?;
+        ensure!(
+            expected_blocks == self.num_blocks(),
+            "transactional file-backed region image length does not match header"
+        );
+        Ok(())
+    }
+
+    fn rebuild_state_from_image(&mut self) -> Result<()> {
+        self.reset_recovered_state();
+        self.mark_blocks_used(0, 1)?;
+
+        let mut chunk_tails = BTreeMap::<u32, (u32, u32)>::new();
+        let mut block = 1usize;
+        while block < self.num_blocks() {
+            let start_block = u32::try_from(block).context("transactional block index overflow")?;
+            match self.block_magic(start_block)? {
+                LOG_BLOCK_MAGIC => {
+                    self.log_block_header(start_block)?;
+                    self.mark_blocks_used(block, 1)?;
+                    block += 1;
+                }
+                DATA_CHUNK_MAGIC => {
+                    let header = self.data_chunk_header(start_block)?;
+                    let chunk_blocks = usize::try_from(header.chunk_blocks)
+                        .context("transactional data chunk block count overflow")?;
+                    ensure!(
+                        chunk_blocks > 0,
+                        "transactional data chunk at block {start_block} has zero blocks"
+                    );
+                    ensure!(
+                        block + chunk_blocks <= self.num_blocks(),
+                        "transactional data chunk at block {start_block} exceeds region"
+                    );
+                    self.mark_blocks_used(block, chunk_blocks)?;
+                    let state = self.streams.entry(header.stream_id).or_default();
+                    let next_chunk_seq = header
+                        .chunk_seq
+                        .checked_add(1)
+                        .context("transactional data chunk sequence overflow")?;
+                    state.next_data_chunk_seq = state.next_data_chunk_seq.max(next_chunk_seq);
+                    match chunk_tails.get(&header.stream_id) {
+                        Some((current_seq, _)) if *current_seq >= header.chunk_seq => {}
+                        _ => {
+                            chunk_tails.insert(header.stream_id, (header.chunk_seq, start_block));
+                        }
+                    }
+                    block += chunk_blocks;
+                }
+                _ => {
+                    block += 1;
+                }
+            }
+        }
+
+        for (stream_id, (_, start_block)) in chunk_tails {
+            self.streams.entry(stream_id).or_default().current_data_chunk_start = Some(start_block);
+        }
+
+        Ok(())
+    }
+
+    fn reset_recovered_state(&mut self) {
+        for entry in &mut self.block_entries {
+            *entry = BlockEntry::default();
+        }
+        self.streams.clear();
+    }
+
+    fn mark_blocks_used(&mut self, start: usize, block_count: usize) -> Result<()> {
+        let end = start
+            .checked_add(block_count)
+            .context("transactional used-block range overflow")?;
+        ensure!(
+            end <= self.block_entries.len(),
+            "transactional used-block range out of bounds"
+        );
+        ensure!(
+            self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0),
+            "transactional used-block range overlaps existing chunk"
+        );
+        for entry in &mut self.block_entries[start..end] {
+            entry.used = 1;
+            entry.list_num = ListKind::Used as i16;
+        }
+        Ok(())
+    }
+
+    fn block_magic(&self, start_block: u32) -> Result<u32> {
+        let bytes = self.read_header_bytes(start_block, size_of::<u32>())?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn alloc_data_chunk_for_class(
+        &mut self,
+        stream_id: u32,
+        chunk_seq: u32,
+        class: DataChunkClass,
+        total_bytes: usize,
+    ) -> Result<u32> {
+        let chunk_blocks = match class {
+            DataChunkClass::Small | DataChunkClass::Medium => 1,
+            DataChunkClass::Large => self.required_data_chunk_blocks(total_bytes)?,
+        };
+        let chunk = self.alloc_chunk(chunk_blocks)?;
+        let start_block = u32::try_from(chunk.start_block())
+            .context("transactional data chunk start block overflow")?;
+        let header = DataChunkHeader {
+            magic: DATA_CHUNK_MAGIC,
+            stream_id,
+            chunk_seq,
+            next_chunk: NO_NEXT_BLOCK,
+            chunk_blocks: u32::try_from(chunk_blocks)
+                .context("transactional data chunk block count overflow")?,
+            tail_block_delta: 0,
+            tail_in_block: u32::try_from(size_of::<DataChunkHeader>())
+                .context("transactional data chunk header size overflow")?,
+        };
+        self.write_data_chunk_header(start_block, header)?;
+        Ok(start_block)
+    }
+
+    fn block_payload_capacity(&self) -> usize {
+        BLOCK_SIZE - size_of::<DataChunkHeader>()
+    }
+
+    fn required_data_chunk_blocks(&self, total_bytes: usize) -> Result<usize> {
+        let first_block_capacity = self.block_payload_capacity();
+        if total_bytes <= first_block_capacity {
+            return Ok(1);
+        }
+        let extra_bytes = total_bytes - first_block_capacity;
+        1usize
+            .checked_add(extra_bytes.div_ceil(BLOCK_SIZE))
+            .context("transactional data chunk block count overflow")
+    }
+
+    fn chunk_tail_offset(&self, header: DataChunkHeader) -> Result<usize> {
+        let block_delta = usize::try_from(header.tail_block_delta)
+            .context("transactional data chunk tail block delta conversion overflow")?;
+        let in_block = usize::try_from(header.tail_in_block)
+            .context("transactional data chunk tail offset conversion overflow")?;
+        block_delta
+            .checked_mul(BLOCK_SIZE)
+            .and_then(|offset| offset.checked_add(in_block))
+            .context("transactional data chunk tail overflow")
+    }
+
+    fn chunk_capacity_bytes(&self, header: DataChunkHeader) -> Result<usize> {
+        usize::try_from(header.chunk_blocks)
+            .context("transactional data chunk block count conversion overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional data chunk capacity overflow")
+    }
+
+    fn chunk_remaining_capacity(&self, header: DataChunkHeader) -> Result<usize> {
+        let capacity = self.chunk_capacity_bytes(header)?;
+        let tail = self.chunk_tail_offset(header)?;
+        ensure!(
+            tail <= capacity,
+            "transactional data chunk tail exceeds chunk capacity"
+        );
+        Ok(capacity - tail)
+    }
+
+    fn block_offset(&self, block: u32) -> Result<usize> {
+        let block = usize::try_from(block).context("transactional block index overflow")?;
+        ensure!(
+            block < self.num_blocks(),
+            "transactional block index out of bounds"
+        );
+        block
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional block offset overflow")
+    }
+
+    fn read_header_bytes(&self, start_block: u32, len: usize) -> Result<Vec<u8>> {
+        self.read(self.block_offset(start_block)?, len)
+    }
+
+    fn write_log_block_header(&mut self, start_block: u32, header: LogBlockHeader) -> Result<()> {
+        self.write(self.block_offset(start_block)?, &header.as_bytes())
+    }
+
+    fn write_data_chunk_header(&mut self, start_block: u32, header: DataChunkHeader) -> Result<()> {
+        self.write(self.block_offset(start_block)?, &header.as_bytes())
+    }
 }
 
 impl BlockRegionBackend for FileBackedMemoryBlockRegion {
@@ -1512,6 +1959,161 @@ impl BlockRegionBackend for FileBackedMemoryBlockRegion {
     fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
         self.grow_to_blocks(new_block_count)
     }
+}
+
+/// Narrow recovered-winner summary exported for file-backed persistence tests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionPersistenceRecoveredWinner {
+    /// Logical granule or object identifier chosen by recovery.
+    pub logical_id: u64,
+    /// Committed version chosen by recovery.
+    pub version: u32,
+}
+
+/// Narrow recovered-region summary exported for file-backed persistence tests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionPersistenceRecoveredRegion {
+    /// Winners selected by chunk-scan plus log replay recovery.
+    pub winners: Vec<TransactionPersistenceRecoveredWinner>,
+}
+
+/// Creates a file-backed durable region image for restart smoke tests.
+pub fn create_file_backed_region_image(path: &Path, num_blocks: u32) -> Result<()> {
+    let _region = FileBackedMemoryBlockRegion::create_for_test(path, num_blocks)?;
+    Ok(())
+}
+
+/// Publishes one committed tmemory update into a file-backed durable region image.
+pub fn publish_committed_tmemory_update(
+    path: &Path,
+    stream_id: u32,
+    logical_id: u64,
+    version: u32,
+    payload: &[u8],
+) -> Result<()> {
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let stream = region.alloc_stream(stream_id)?;
+    let record = TMemory::encode_publication_data_record(
+        logical_id,
+        version,
+        PackedGranuleDomain::TMemory as u16,
+        0,
+        payload,
+    )?;
+    let location = region.append_data_record(stream, &record)?;
+    let log_block = region.alloc_log_block(stream_id, 0)?;
+    let entry = TMemory::publication_log_entry(
+        logical_id,
+        version,
+        stream_id << 1,
+        location.data_block,
+        location.data_offset,
+        true,
+    );
+    write_log_entries_to_file_backed_region(&mut region, log_block, &[entry])?;
+    flush_chunk_for_recovery(&region, location.chunk_start_block)?;
+    region.flush(region.block_offset(log_block)?, BLOCK_SIZE)?;
+    region.fence()?;
+    Ok(())
+}
+
+/// Corrupts the first durable log-entry CRC in a file-backed region image.
+pub fn corrupt_first_log_crc(path: &Path) -> Result<()> {
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let mut block = 1usize;
+    while block < region.num_blocks() {
+        let start_block = u32::try_from(block).context("transactional block index overflow")?;
+        match region.block_magic(start_block)? {
+            LOG_BLOCK_MAGIC => {
+                let entry_offset = region
+                    .block_offset(start_block)?
+                    .checked_add(size_of::<LogBlockHeader>())
+                    .and_then(|offset| offset.checked_add(24))
+                    .context("transactional log crc offset overflow")?;
+                let mut crc_byte = region.read(entry_offset, 1)?;
+                crc_byte[0] ^= 0x01;
+                region.write(entry_offset, &crc_byte)?;
+                region.flush(region.block_offset(start_block)?, BLOCK_SIZE)?;
+                region.fence()?;
+                return Ok(());
+            }
+            DATA_CHUNK_MAGIC => {
+                let chunk_blocks = usize::try_from(region.data_chunk_header(start_block)?.chunk_blocks)
+                    .context("transactional data chunk block count overflow")?;
+                ensure!(
+                    chunk_blocks > 0,
+                    "transactional data chunk at block {start_block} has zero blocks"
+                );
+                block += chunk_blocks;
+            }
+            _ => {
+                block += 1;
+            }
+        }
+    }
+
+    bail!("transactional file-backed region image does not contain a log block")
+}
+
+/// Reopens a file-backed durable region image and runs region recovery.
+pub fn reopen_and_recover_file_backed_region(
+    path: &Path,
+) -> Result<TransactionPersistenceRecoveredRegion> {
+    let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let recovered = super::recovery::recover_region(&region.view())?;
+    Ok(TransactionPersistenceRecoveredRegion {
+        winners: recovered
+            .winners
+            .into_iter()
+            .map(|winner| TransactionPersistenceRecoveredWinner {
+                logical_id: winner.logical_id,
+                version: winner.version,
+            })
+            .collect(),
+    })
+}
+
+fn flush_chunk_for_recovery(region: &FileBackedMemoryBlockRegion, chunk_start_block: u32) -> Result<()> {
+    let header = region.data_chunk_header(chunk_start_block)?;
+    let chunk_blocks = usize::try_from(header.chunk_blocks)
+        .context("transactional data chunk block count overflow")?;
+    let flush_len = chunk_blocks
+        .checked_mul(BLOCK_SIZE)
+        .context("transactional data chunk flush length overflow")?;
+    region.flush(region.block_offset(chunk_start_block)?, flush_len)
+}
+
+fn write_log_entries_to_file_backed_region(
+    region: &mut FileBackedMemoryBlockRegion,
+    start_block: u32,
+    entries: &[TxLogEntry],
+) -> Result<()> {
+    let mut header = region.log_block_header(start_block)?;
+    header.entry_count = u32::try_from(entries.len()).context("transactional log entry count overflow")?;
+    let block_offset = region.block_offset(start_block)?;
+    region.write(block_offset, &header.as_bytes())?;
+    let mut offset = block_offset
+        .checked_add(size_of::<LogBlockHeader>())
+        .context("transactional log entry write offset overflow")?;
+    for entry in entries {
+        region.write(offset, &encode_tx_log_entry(*entry))?;
+        offset = offset
+            .checked_add(size_of::<TxLogEntry>())
+            .context("transactional log entry write offset overflow")?;
+    }
+    Ok(())
+}
+
+fn encode_tx_log_entry(entry: TxLogEntry) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..8].copy_from_slice(&entry.logical_id.to_le_bytes());
+    bytes[8..12].copy_from_slice(&entry.version.to_le_bytes());
+    bytes[12..16].copy_from_slice(&entry.tx_meta.to_le_bytes());
+    bytes[16..20].copy_from_slice(&entry.data_block.to_le_bytes());
+    bytes[20..24].copy_from_slice(&entry.data_offset.to_le_bytes());
+    bytes[24..28].copy_from_slice(&entry.crc32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&entry.reserved.to_le_bytes());
+    bytes
 }
 
 #[cfg(test)]

@@ -552,4 +552,12 @@ fn _assertions_lib() {
 pub mod _internal {
     // Exported just for the CLI.
     pub use crate::runtime::vm::MmapVec;
+    #[cfg(feature = "transaction")]
+    pub mod transaction_persistence {
+        pub use crate::vm::block_region::{
+            TransactionPersistenceRecoveredRegion, TransactionPersistenceRecoveredWinner,
+            corrupt_first_log_crc, create_file_backed_region_image,
+            publish_committed_tmemory_update, reopen_and_recover_file_backed_region,
+        };
+    }
 }
