@@ -7,9 +7,7 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
-use crate::runtime::transaction::{
-    DataRecordLocation as TransactionDataRecordLocation, DurableSink, TxLogEntry,
-};
+use crate::runtime::transaction::DurableSink;
 use crate::runtime::transaction::{
     TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryFileBacking,
     TMemoryPersistenceMode, TransactionConfig,
@@ -161,6 +159,52 @@ impl TMemory {
         Self::new_with_backend_limits(TMemoryBackend::VMemory, min_pages, max_pages)
     }
 
+    pub(crate) fn encode_publication_data_record(
+        logical_id: u64,
+        version: u32,
+        kind: u16,
+        type_info: u32,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let payload_len =
+            u32::try_from(payload.len()).context("publication payload length does not fit u32")?;
+        let header = TxDataRecordHeader {
+            logical_id,
+            version,
+            kind,
+            reserved: 0,
+            payload_len,
+            type_info,
+        };
+
+        let mut record = Vec::with_capacity(
+            header
+                .as_bytes()
+                .len()
+                .checked_add(payload.len())
+                .context("publication record length overflow")?,
+        );
+        record.extend_from_slice(&header.as_bytes());
+        record.extend_from_slice(payload);
+        Ok(record)
+    }
+
+    pub(crate) fn publication_log_entry(
+        logical_id: u64,
+        version: u32,
+        tx_meta: u32,
+        data_block: u32,
+        data_offset: u32,
+        is_final: bool,
+    ) -> TxLogEntry {
+        let mut entry = TxLogEntry::new(logical_id, version, tx_meta, data_block, data_offset);
+        if is_final {
+            entry.tx_meta |= 1;
+            entry.seal_crc32();
+        }
+        entry
+    }
+
     pub(crate) fn durable_sink(&mut self, stream_id: u32) -> TMemoryDurableSink<'_> {
         self.durability.streams.entry(stream_id).or_default();
         TMemoryDurableSink {
@@ -294,10 +338,10 @@ impl TMemory {
 }
 
 impl DurableSink for TMemoryDurableSink<'_> {
-    fn append_data_record(&mut self, record: &[u8]) -> Result<TransactionDataRecordLocation> {
+    fn append_data_record(&mut self, record: &[u8]) -> Result<(u32, u32)> {
         let state = self.tmemory.durable_stream_state_mut(self.stream_id);
         state.data_records.push(record.to_vec());
-        let location = TransactionDataRecordLocation {
+        let location = DataRecordLocation {
             chunk_start_block: state.next_data_block,
             data_block: state.next_data_block,
             data_offset: 0,
@@ -306,12 +350,27 @@ impl DurableSink for TMemoryDurableSink<'_> {
             .next_data_block
             .checked_add(1)
             .context("tmemory durable data block overflow")?;
-        Ok(location)
+        Ok((location.data_block, location.data_offset))
     }
 
-    fn append_log_entry(&mut self, entry: &TxLogEntry) -> Result<()> {
+    fn append_log_entry(
+        &mut self,
+        logical_id: u64,
+        version: u32,
+        tx_meta: u32,
+        data_block: u32,
+        data_offset: u32,
+        is_final: bool,
+    ) -> Result<()> {
         let state = self.tmemory.durable_stream_state_mut(self.stream_id);
-        state.log_entries.push(*entry);
+        state.log_entries.push(TMemory::publication_log_entry(
+            logical_id,
+            version,
+            tx_meta,
+            data_block,
+            data_offset,
+            is_final,
+        ));
         Ok(())
     }
 

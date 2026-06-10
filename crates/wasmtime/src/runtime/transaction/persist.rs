@@ -1,17 +1,6 @@
 use crate::prelude::*;
+use crate::runtime::vm::TMemory;
 use alloc::vec::Vec;
-
-#[path = "../vm/memory/tmemory/durable_log.rs"]
-mod durable_log_codec;
-
-pub(crate) use durable_log_codec::{TxDataRecordHeader, TxLogEntry};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DataRecordLocation {
-    pub(crate) chunk_start_block: u32,
-    pub(crate) data_block: u32,
-    pub(crate) data_offset: u32,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingPublication {
@@ -23,8 +12,16 @@ pub(crate) struct PendingPublication {
 }
 
 pub(crate) trait DurableSink {
-    fn append_data_record(&mut self, record: &[u8]) -> Result<DataRecordLocation>;
-    fn append_log_entry(&mut self, entry: &TxLogEntry) -> Result<()>;
+    fn append_data_record(&mut self, record: &[u8]) -> Result<(u32, u32)>;
+    fn append_log_entry(
+        &mut self,
+        logical_id: u64,
+        version: u32,
+        tx_meta: u32,
+        data_block: u32,
+        data_offset: u32,
+        is_final: bool,
+    ) -> Result<()>;
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
@@ -53,29 +50,49 @@ where
 
         let mut ordinary = Vec::new();
         for pub_ in pubs {
-            let record = encode_data_record(pub_)?;
-            let location = self.sink.append_data_record(&record)?;
-            ordinary.push(TxLogEntry::new(
+            let record = TMemory::encode_publication_data_record(
+                pub_.logical_id,
+                pub_.version,
+                pub_.kind,
+                pub_.type_info,
+                &pub_.payload,
+            )?;
+            let (data_block, data_offset) = self.sink.append_data_record(&record)?;
+            ordinary.push((
                 pub_.logical_id,
                 pub_.version,
                 self.txid << 1,
-                location.data_block,
-                location.data_offset,
+                data_block,
+                data_offset,
             ));
         }
 
         self.sink.flush_data()?;
         self.sink.fence()?;
 
-        for entry in ordinary.iter().take(ordinary.len().saturating_sub(1)) {
-            self.sink.append_log_entry(entry)?;
+        for &(logical_id, version, tx_meta, data_block, data_offset) in
+            ordinary.iter().take(ordinary.len().saturating_sub(1))
+        {
+            self.sink.append_log_entry(
+                logical_id,
+                version,
+                tx_meta,
+                data_block,
+                data_offset,
+                false,
+            )?;
         }
         self.sink.flush_log()?;
 
-        if let Some(last) = ordinary.last_mut() {
-            last.tx_meta |= 1;
-            last.seal_crc32();
-            self.sink.append_log_entry(last)?;
+        if let Some(&(logical_id, version, tx_meta, data_block, data_offset)) = ordinary.last() {
+            self.sink.append_log_entry(
+                logical_id,
+                version,
+                tx_meta,
+                data_block,
+                data_offset,
+                true,
+            )?;
             self.sink.flush_log()?;
             self.sink.fence()?;
         }
@@ -99,30 +116,6 @@ where
     }
 }
 
-fn encode_data_record(publication: &PendingPublication) -> Result<Vec<u8>> {
-    let payload_len = u32::try_from(publication.payload.len())
-        .context("publication payload length does not fit u32")?;
-    let header = TxDataRecordHeader {
-        logical_id: publication.logical_id,
-        version: publication.version,
-        kind: publication.kind,
-        reserved: 0,
-        payload_len,
-        type_info: publication.type_info,
-    };
-
-    let mut record = Vec::with_capacity(
-        header
-            .as_bytes()
-            .len()
-            .checked_add(publication.payload.len())
-            .context("publication record length overflow")?,
-    );
-    record.extend_from_slice(&header.as_bytes());
-    record.extend_from_slice(&publication.payload);
-    Ok(record)
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DurabilityEvent {
@@ -137,30 +130,23 @@ enum DurabilityEvent {
 #[derive(Debug, Default)]
 struct RecordingDurability {
     events: Vec<DurabilityEvent>,
-    log_entries: Vec<TxLogEntry>,
+    tx_meta: Vec<u32>,
     next_data_block: u32,
 }
 
 #[cfg(test)]
 impl RecordingDurability {
     fn final_lp_count(&self) -> usize {
-        self.log_entries
-            .iter()
-            .filter(|entry| (entry.tx_meta & 1) != 0)
-            .count()
+        self.tx_meta.iter().filter(|entry| (**entry & 1) != 0).count()
     }
 
     fn non_final_log_entries_before_final_lp(&self) -> bool {
-        let Some(final_index) = self
-            .log_entries
-            .iter()
-            .position(|entry| (entry.tx_meta & 1) != 0)
-        else {
+        let Some(final_index) = self.tx_meta.iter().position(|entry| (*entry & 1) != 0) else {
             return false;
         };
-        self.log_entries[..final_index]
+        self.tx_meta[..final_index]
             .iter()
-            .all(|entry| (entry.tx_meta & 1) == 0)
+            .all(|entry| (*entry & 1) == 0)
     }
 
     fn events(&self) -> &[DurabilityEvent] {
@@ -170,25 +156,30 @@ impl RecordingDurability {
 
 #[cfg(test)]
 impl DurableSink for RecordingDurability {
-    fn append_data_record(&mut self, _record: &[u8]) -> Result<DataRecordLocation> {
+    fn append_data_record(&mut self, _record: &[u8]) -> Result<(u32, u32)> {
         if self.events.last() != Some(&DurabilityEvent::DataWrite) {
             self.events.push(DurabilityEvent::DataWrite);
         }
-        let location = DataRecordLocation {
-            chunk_start_block: self.next_data_block,
-            data_block: self.next_data_block,
-            data_offset: 0,
-        };
+        let data_block = self.next_data_block;
         self.next_data_block = self
             .next_data_block
             .checked_add(1)
             .context("recording durability data block overflow")?;
-        Ok(location)
+        Ok((data_block, 0))
     }
 
-    fn append_log_entry(&mut self, entry: &TxLogEntry) -> Result<()> {
+    fn append_log_entry(
+        &mut self,
+        _logical_id: u64,
+        _version: u32,
+        tx_meta: u32,
+        _data_block: u32,
+        _data_offset: u32,
+        is_final: bool,
+    ) -> Result<()> {
         self.events.push(DurabilityEvent::LogWrite);
-        self.log_entries.push(*entry);
+        let stored_tx_meta = if is_final { tx_meta | 1 } else { tx_meta & !1 };
+        self.tx_meta.push(stored_tx_meta);
         Ok(())
     }
 
