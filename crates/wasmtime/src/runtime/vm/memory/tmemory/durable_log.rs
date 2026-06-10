@@ -22,6 +22,41 @@ pub(crate) struct RegionHeader {
     pub(crate) num_descs: u32,
 }
 
+impl RegionHeader {
+    const BYTE_LEN: usize = 32;
+
+    pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.block_size.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.num_blocks.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.block_table_start_block.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.block_table_block_count.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.metadata_descs_start_block.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.metadata_descs_block_count.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.num_descs.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        ensure!(
+            bytes.len() == Self::BYTE_LEN,
+            "durable region header length mismatch"
+        );
+        Ok(Self {
+            magic: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            block_size: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            num_blocks: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            block_table_start_block: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            block_table_block_count: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            metadata_descs_start_block: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            metadata_descs_block_count: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            num_descs: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LogBlockHeader {
@@ -30,6 +65,35 @@ pub(crate) struct LogBlockHeader {
     pub(crate) block_seq: u32,
     pub(crate) next_block: u32,
     pub(crate) entry_count: u32,
+}
+
+impl LogBlockHeader {
+    const BYTE_LEN: usize = 20;
+
+    pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.stream_id.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.block_seq.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.next_block.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.entry_count.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        ensure!(
+            bytes.len() == Self::BYTE_LEN,
+            "durable log block header length mismatch"
+        );
+        Ok(Self {
+            magic: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            stream_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            block_seq: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            next_block: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            entry_count: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+        })
+    }
 }
 
 #[repr(C)]
@@ -42,6 +106,39 @@ pub(crate) struct DataChunkHeader {
     pub(crate) chunk_blocks: u32,
     pub(crate) tail_block_delta: u32,
     pub(crate) tail_in_block: u32,
+}
+
+impl DataChunkHeader {
+    const BYTE_LEN: usize = 28;
+
+    pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.stream_id.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.chunk_seq.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.next_chunk.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.chunk_blocks.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.tail_block_delta.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.tail_in_block.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        ensure!(
+            bytes.len() == Self::BYTE_LEN,
+            "durable data chunk header length mismatch"
+        );
+        Ok(Self {
+            magic: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            stream_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            chunk_seq: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            next_chunk: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            chunk_blocks: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            tail_block_delta: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            tail_in_block: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        })
+    }
 }
 
 #[repr(C, align(32))]

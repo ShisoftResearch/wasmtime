@@ -976,6 +976,9 @@ mod tests {
 
     #[test]
     fn durable_header_sizes_match_design() {
+        assert_eq!(REGION_MAGIC, 0x5452_4547);
+        assert_eq!(LOG_BLOCK_MAGIC, 0x544c_4f47);
+        assert_eq!(DATA_CHUNK_MAGIC, 0x5444_4154);
         let _ = LogBlockHeader {
             magic: LOG_BLOCK_MAGIC,
             stream_id: 7,
@@ -1001,6 +1004,53 @@ mod tests {
     }
 
     #[test]
+    fn region_header_roundtrips() {
+        let header = RegionHeader {
+            magic: REGION_MAGIC,
+            block_size: 512 * 1024,
+            num_blocks: 17,
+            block_table_start_block: 1,
+            block_table_block_count: 2,
+            metadata_descs_start_block: 3,
+            metadata_descs_block_count: 4,
+            num_descs: 9,
+        };
+        let bytes = header.as_bytes();
+        let decoded = RegionHeader::from_bytes(bytes).unwrap();
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn log_block_header_roundtrips() {
+        let header = LogBlockHeader {
+            magic: LOG_BLOCK_MAGIC,
+            stream_id: 5,
+            block_seq: 11,
+            next_block: NO_NEXT_BLOCK,
+            entry_count: 23,
+        };
+        let bytes = header.as_bytes();
+        let decoded = LogBlockHeader::from_bytes(bytes).unwrap();
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn data_chunk_header_roundtrips() {
+        let header = DataChunkHeader {
+            magic: DATA_CHUNK_MAGIC,
+            stream_id: 7,
+            chunk_seq: 13,
+            next_chunk: NO_NEXT_BLOCK,
+            chunk_blocks: 4,
+            tail_block_delta: 2,
+            tail_in_block: 128,
+        };
+        let bytes = header.as_bytes();
+        let decoded = DataChunkHeader::from_bytes(bytes).unwrap();
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
     fn tx_log_entry_crc_detects_bitflip() {
         let mut entry = TxLogEntry::new(0x6000_0000_0000_002a, 7, (11 << 1) | 1, 19, 96);
         entry.seal_crc32();
@@ -1022,6 +1072,15 @@ mod tests {
         let bytes = header.as_bytes();
         let decoded = TxDataRecordHeader::from_bytes(bytes).unwrap();
         assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn tx_data_record_header_rejects_wrong_len() {
+        let err = TxDataRecordHeader::from_bytes([0u8; 23]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("durable tx data record header length mismatch")
+        );
     }
 
     #[test]
