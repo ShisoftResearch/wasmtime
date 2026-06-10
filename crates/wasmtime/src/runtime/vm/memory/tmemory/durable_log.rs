@@ -196,8 +196,26 @@ impl TxLogEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackedGranuleDomain {
     TMemory = 1,
+    TMemorySize = 2,
+    TGlobal = 3,
+    TTable = 4,
+    TTableSize = 5,
     TStruct = 6,
     TArray = 7,
+}
+
+pub(crate) fn packed_granule_domain(logical_id: u64) -> Result<PackedGranuleDomain> {
+    let domain_bits = u16::try_from(logical_id >> 60).unwrap();
+    Ok(match domain_bits {
+        1 => PackedGranuleDomain::TMemory,
+        2 => PackedGranuleDomain::TMemorySize,
+        3 => PackedGranuleDomain::TGlobal,
+        4 => PackedGranuleDomain::TTable,
+        5 => PackedGranuleDomain::TTableSize,
+        6 => PackedGranuleDomain::TStruct,
+        7 => PackedGranuleDomain::TArray,
+        _ => bail!("unknown packed granule domain {domain_bits}"),
+    })
 }
 
 pub(crate) fn pack_object_granule_id(domain: PackedGranuleDomain, object_id: u64) -> Result<u64> {
@@ -214,13 +232,15 @@ pub(crate) fn pack_object_granule_id(domain: PackedGranuleDomain, object_id: u64
 }
 
 pub(crate) fn unpack_object_granule_id(logical_id: u64) -> Result<(PackedGranuleDomain, u64)> {
-    let domain_bits = u16::try_from(logical_id >> 60).unwrap();
     let object_id = logical_id & ((1u64 << 60) - 1);
-    let domain = match domain_bits {
-        6 => PackedGranuleDomain::TStruct,
-        7 => PackedGranuleDomain::TArray,
-        _ => bail!("logical id {logical_id:#x} is not an object granule"),
-    };
+    let domain = packed_granule_domain(logical_id)?;
+    ensure!(
+        matches!(
+            domain,
+            PackedGranuleDomain::TStruct | PackedGranuleDomain::TArray
+        ),
+        "logical id {logical_id:#x} is not an object granule"
+    );
     Ok((domain, object_id))
 }
 

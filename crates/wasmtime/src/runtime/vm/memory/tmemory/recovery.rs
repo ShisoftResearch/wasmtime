@@ -1,6 +1,7 @@
 use super::block_region::BlockRegionBackendView;
 use super::{
-    DATA_CHUNK_MAGIC, LOG_BLOCK_MAGIC, TxDataRecordHeader, TxLogEntry, unpack_object_granule_id,
+    DATA_CHUNK_MAGIC, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader, TxLogEntry,
+    packed_granule_domain, unpack_object_granule_id,
 };
 use crate::prelude::*;
 use crate::runtime::transaction::TxObjectHeader;
@@ -33,6 +34,7 @@ pub(crate) struct RecoveredRegion {
     pub(crate) streams: Vec<RecoveredStream>,
     pub(crate) winners: Vec<RecoveryWinner>,
     pub(crate) object_winners: Vec<RecoveredObjectWinner>,
+    pub(crate) root_object_ids: Vec<u64>,
     pub(crate) next_stream_id: u32,
 }
 
@@ -88,6 +90,7 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
 
     let winners = winners.into_values().collect::<Vec<_>>();
     let object_winners = replay_object_winners(region, &winners)?;
+    let root_object_ids = replay_root_object_ids(region, &winners)?;
 
     Ok(RecoveredRegion {
         next_stream_id: streams
@@ -99,6 +102,7 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
         streams,
         winners,
         object_winners,
+        root_object_ids,
     })
 }
 
@@ -106,6 +110,70 @@ impl RecoveredRegion {
     pub(crate) fn committed_object_winners(&self) -> Result<Vec<RecoveredObjectWinner>> {
         Ok(self.object_winners.clone())
     }
+}
+
+fn replay_root_object_ids(
+    region: &BlockRegionBackendView<'_>,
+    winners: &[RecoveryWinner],
+) -> Result<Vec<u64>> {
+    let mut roots = Vec::new();
+
+    for winner in winners {
+        let Ok(domain) = packed_granule_domain(winner.logical_id) else {
+            continue;
+        };
+        match domain {
+            PackedGranuleDomain::TGlobal => {
+                let payload = load_root_publication_payload(region, winner, domain)?;
+                roots.extend(decode_root_object_refs(&payload)?.into_iter().take(1));
+            }
+            PackedGranuleDomain::TTable => {
+                let payload = load_root_publication_payload(region, winner, domain)?;
+                roots.extend(decode_root_object_refs(&payload)?);
+            }
+            _ => {}
+        }
+    }
+
+    roots.sort_unstable();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn load_root_publication_payload(
+    region: &BlockRegionBackendView<'_>,
+    winner: &RecoveryWinner,
+    expected_domain: PackedGranuleDomain,
+) -> Result<Vec<u8>> {
+    let (data_header, payload) =
+        load_publication_payload(region, winner.data_block, winner.data_offset)?;
+    ensure!(
+        data_header.logical_id == winner.logical_id,
+        "recovered root publication logical id does not match log winner"
+    );
+    ensure!(
+        data_header.version == winner.version,
+        "recovered root publication version does not match log winner"
+    );
+    ensure!(
+        data_header.kind == expected_domain as u16,
+        "recovered root publication kind does not match granule domain"
+    );
+    Ok(payload)
+}
+
+fn decode_root_object_refs(payload: &[u8]) -> Result<Vec<u64>> {
+    ensure!(
+        payload.len() % size_of::<u64>() == 0,
+        "root object reference payload is not u64-aligned"
+    );
+    Ok(payload
+        .chunks_exact(size_of::<u64>())
+        .filter_map(|bytes| {
+            let raw = u64::from_le_bytes(bytes.try_into().unwrap());
+            raw.checked_sub(1)
+        })
+        .collect::<Vec<_>>())
 }
 
 fn replay_object_winners(
@@ -369,6 +437,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_rebuilds_persistent_object_root_from_tglobal() {
+        let region = sample_region_with_object_rooted_by_global();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.root_object_ids, vec![41]);
+    }
+
+    #[test]
+    fn recovery_rebuilds_persistent_object_roots_from_ttable() {
+        let region = sample_region_with_object_rooted_by_table();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.root_object_ids, vec![41, 42]);
+    }
+
     fn sample_region_with_two_streams() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream1 = region.alloc_stream(1).unwrap();
@@ -474,6 +558,81 @@ mod tests {
             ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
         );
         region
+    }
+
+    fn sample_region_with_object_rooted_by_global() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        append_committed_root_update(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_test_granule_id(PackedGranuleDomain::TGlobal, 1),
+            1,
+            &[Some(41)],
+        );
+        region
+    }
+
+    fn sample_region_with_object_rooted_by_table() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        append_committed_root_update(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_test_granule_id(PackedGranuleDomain::TTable, 1),
+            1,
+            &[None, Some(42), Some(41), Some(41)],
+        );
+        region
+    }
+
+    fn append_committed_root_update(
+        region: &mut VMemoryBlockRegion,
+        stream_id: u32,
+        stream: StreamCursor,
+        block_seq: u32,
+        logical_id: u64,
+        version: u32,
+        object_ids: &[Option<u64>],
+    ) {
+        let domain = packed_granule_domain(logical_id).unwrap();
+        let payload = encode_root_object_refs(object_ids);
+        let record = TMemory::encode_publication_data_record(
+            logical_id,
+            version,
+            domain as u16,
+            0,
+            &payload,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
+        let entry = TMemory::publication_log_entry(
+            logical_id,
+            version,
+            stream_id << 1,
+            location.data_block,
+            location.data_offset,
+            true,
+        );
+        write_log_entries(region, log_block, &[entry]);
+    }
+
+    fn encode_root_object_refs(object_ids: &[Option<u64>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for object_id in object_ids {
+            let raw = object_id.map(|id| id + 1).unwrap_or(0);
+            bytes.extend_from_slice(&raw.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn pack_test_granule_id(domain: PackedGranuleDomain, payload: u64) -> u64 {
+        ((domain as u64) << 60) | payload
     }
 
     fn append_committed_object_update(
