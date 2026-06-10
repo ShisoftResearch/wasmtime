@@ -249,12 +249,7 @@ fn open_existing_file_backed_mapping(path: PathBuf) -> Result<FileBackedMapping>
         })?;
     let len = usize::try_from(
         file.metadata()
-            .with_context(|| {
-                format!(
-                    "failed to stat file-backed tmemory file {}",
-                    path.display()
-                )
-            })?
+            .with_context(|| format!("failed to stat file-backed tmemory file {}", path.display()))?
             .len(),
     )
     .context("file-backed tmemory file length overflow")?;
@@ -652,6 +647,10 @@ impl<'a> BlockRegionBackendView<'a> {
         DataChunkHeader::from_bytes(
             self.read_header_bytes(start_block, size_of::<DataChunkHeader>())?,
         )
+    }
+
+    pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.backend.read(offset, len)
     }
 
     pub(crate) fn log_block_entries(&self, start_block: u32) -> Result<Vec<TxLogEntry>> {
@@ -1427,9 +1426,12 @@ impl FileBackedMemoryBlockRegion {
     }
 
     pub(crate) fn create_for_test(path: &Path, num_blocks: u32) -> Result<Self> {
-        let num_blocks =
-            usize::try_from(num_blocks).context("transactional file-backed region size overflow")?;
-        ensure!(num_blocks > 0, "transactional file-backed region must have at least one block");
+        let num_blocks = usize::try_from(num_blocks)
+            .context("transactional file-backed region size overflow")?;
+        ensure!(
+            num_blocks > 0,
+            "transactional file-backed region must have at least one block"
+        );
         let mut region = Self::new(num_blocks, FileBackedRegionMode::Path(path.to_path_buf()))?;
         region.initialize_region_image()?;
         Ok(region)
@@ -1784,7 +1786,10 @@ impl FileBackedMemoryBlockRegion {
         }
 
         for (stream_id, (_, start_block)) in chunk_tails {
-            self.streams.entry(stream_id).or_default().current_data_chunk_start = Some(start_block);
+            self.streams
+                .entry(stream_id)
+                .or_default()
+                .current_data_chunk_start = Some(start_block);
         }
 
         Ok(())
@@ -2038,8 +2043,9 @@ pub fn corrupt_first_log_crc(path: &Path) -> Result<()> {
                 return Ok(());
             }
             DATA_CHUNK_MAGIC => {
-                let chunk_blocks = usize::try_from(region.data_chunk_header(start_block)?.chunk_blocks)
-                    .context("transactional data chunk block count overflow")?;
+                let chunk_blocks =
+                    usize::try_from(region.data_chunk_header(start_block)?.chunk_blocks)
+                        .context("transactional data chunk block count overflow")?;
                 ensure!(
                     chunk_blocks > 0,
                     "transactional data chunk at block {start_block} has zero blocks"
@@ -2073,7 +2079,10 @@ pub fn reopen_and_recover_file_backed_region(
     })
 }
 
-fn flush_chunk_for_recovery(region: &FileBackedMemoryBlockRegion, chunk_start_block: u32) -> Result<()> {
+fn flush_chunk_for_recovery(
+    region: &FileBackedMemoryBlockRegion,
+    chunk_start_block: u32,
+) -> Result<()> {
     let header = region.data_chunk_header(chunk_start_block)?;
     let chunk_blocks = usize::try_from(header.chunk_blocks)
         .context("transactional data chunk block count overflow")?;
@@ -2089,7 +2098,8 @@ fn write_log_entries_to_file_backed_region(
     entries: &[TxLogEntry],
 ) -> Result<()> {
     let mut header = region.log_block_header(start_block)?;
-    header.entry_count = u32::try_from(entries.len()).context("transactional log entry count overflow")?;
+    header.entry_count =
+        u32::try_from(entries.len()).context("transactional log entry count overflow")?;
     let block_offset = region.block_offset(start_block)?;
     region.write(block_offset, &header.as_bytes())?;
     let mut offset = block_offset

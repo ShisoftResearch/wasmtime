@@ -109,8 +109,14 @@ pub use crate::runtime::vm::instance::{
 pub use crate::runtime::vm::interpreter::*;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::TMemory;
+#[cfg(all(has_virtual_memory, test))]
+pub(crate) use crate::runtime::vm::memory::tmemory::TxLogEntry;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::block_region;
+#[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredObjectWinner;
+#[cfg(all(has_virtual_memory, test))]
+pub(crate) use crate::runtime::vm::memory::tmemory::recovery::recover_region_for_test;
 #[cfg(all(has_virtual_memory, test))]
 pub(crate) use crate::runtime::vm::memory::tmemory::{
     PackedGranuleDomain, pack_object_granule_id, unpack_object_granule_id,

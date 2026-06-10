@@ -1,4 +1,4 @@
-use super::{ObjectId, ObjectKind, ObjectPayload, ObjectRefValue, ObjectValue};
+use super::{ObjectId, ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi};
 use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::vm::block_region::{BLOCK_SIZE, LINE_MARKED};
@@ -8,6 +8,7 @@ use core::mem::size_of;
 
 const DEFAULT_OBJECT_HEAP_BLOCKS: usize = 4;
 const OBJECT_RECORD_ALIGN: usize = 8;
+const OBJECT_VALUE_RECORD_LEN: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TxRecordHandle(u64);
@@ -136,6 +137,39 @@ impl ObjectHeap {
             header,
             array_length,
             payload: payload.clone(),
+            offset,
+        });
+        let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
+        Ok(TxRecordHandle(handle))
+    }
+
+    pub(crate) fn install_record_bytes(&mut self, bytes: &[u8]) -> Result<TxRecordHandle> {
+        let header = TxObjectHeader::read_from_prefix(bytes)?;
+        let record_len =
+            usize::try_from(header.record_len).context("record length does not fit usize")?;
+        ensure!(
+            record_len == bytes.len(),
+            "serialized object record length does not match header"
+        );
+        let array_length = if header.kind == ObjectKind::Array as u16 {
+            ensure!(
+                bytes.len() >= size_of::<TxArrayHeader>(),
+                "serialized array record is shorter than expected"
+            );
+            Some(u32::from_le_bytes(
+                bytes[TxObjectHeader::BYTE_LEN..TxObjectHeader::BYTE_LEN + size_of::<u32>()]
+                    .try_into()
+                    .unwrap(),
+            ))
+        } else {
+            None
+        };
+        let payload = decode_payload_bytes(header, array_length, bytes)?;
+        let offset = self.region_mut()?.allocate(bytes)?;
+        self.records.push(ObjectRecord {
+            header,
+            array_length,
+            payload,
             offset,
         });
         let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
@@ -291,13 +325,17 @@ pub(crate) fn encode_object_record(
     version: u32,
     kind: u16,
     type_index: u32,
-    payload: &[u8],
+    payload: &ObjectPayload,
 ) -> Result<Vec<u8>> {
-    let record_len = size_of::<TxObjectHeader>()
-        .checked_add(payload.len())
-        .context("object record length overflow")?;
+    let array_length = match payload {
+        ObjectPayload::Array(elements) => {
+            Some(u32::try_from(elements.len()).context("array payload length does not fit u32")?)
+        }
+        _ => None,
+    };
+    let record_len = logical_record_len(payload, array_length)?;
     let header = TxObjectHeader {
-        record_len: u64::try_from(record_len).context("object record length does not fit u64")?,
+        record_len,
         object_id,
         version,
         kind,
@@ -305,10 +343,7 @@ pub(crate) fn encode_object_record(
         type_index,
     };
 
-    let mut bytes = Vec::with_capacity(record_len);
-    bytes.extend_from_slice(&header.as_bytes());
-    bytes.extend_from_slice(payload);
-    Ok(bytes)
+    serialize_record(&header, array_length, payload)
 }
 
 #[cfg(test)]
@@ -316,12 +351,12 @@ pub(crate) fn encode_object_record_for_test(
     object_id: u64,
     version: u32,
     type_index: u32,
-    payload: &[u8],
+    payload: &ObjectPayload,
 ) -> Result<Vec<u8>> {
     encode_object_record(
         object_id,
         version,
-        ObjectKind::Struct as u16,
+        payload.kind() as u16,
         type_index,
         payload,
     )
@@ -403,10 +438,11 @@ fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Res
         None => size_of::<TxObjectHeader>(),
     };
     let payload_len = match payload {
-        ObjectPayload::Struct(fields) | ObjectPayload::Array(fields) => fields
-            .iter()
-            .map(logical_object_value_len)
-            .sum::<Result<u64>>()?,
+        ObjectPayload::Struct(fields) | ObjectPayload::Array(fields) => {
+            u64::try_from(fields.len()).context("object payload field count overflow")?
+                * u64::try_from(OBJECT_VALUE_RECORD_LEN)
+                    .context("object value ABI size does not fit u64")?
+        }
         ObjectPayload::I31(_) => 4,
         ObjectPayload::Extern(_) => 8,
         ObjectPayload::Func(_) => 8,
@@ -415,15 +451,6 @@ fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Res
     header_len
         .checked_add(payload_len)
         .context("record length overflow")
-}
-
-fn logical_object_value_len(value: &ObjectValue) -> Result<u64> {
-    Ok(match value {
-        ObjectValue::I32(_) | ObjectValue::F32(_) => 4,
-        ObjectValue::I64(_) | ObjectValue::F64(_) => 8,
-        ObjectValue::V128(_) => 16,
-        ObjectValue::Ref(_) => 8,
-    })
 }
 
 fn serialize_record(
@@ -464,21 +491,92 @@ fn append_payload_bytes(bytes: &mut Vec<u8>, payload: &ObjectPayload) -> Result<
 }
 
 fn append_object_value_bytes(bytes: &mut Vec<u8>, value: &ObjectValue) -> Result<()> {
-    match value {
-        ObjectValue::I32(value) => bytes.extend_from_slice(&value.to_le_bytes()),
-        ObjectValue::I64(value) => bytes.extend_from_slice(&value.to_le_bytes()),
-        ObjectValue::F32(value) => bytes.extend_from_slice(&value.to_le_bytes()),
-        ObjectValue::F64(value) => bytes.extend_from_slice(&value.to_le_bytes()),
-        ObjectValue::V128(value) => bytes.extend_from_slice(value),
-        ObjectValue::Ref(object_id) => {
-            bytes.extend_from_slice(
-                &ObjectRefValue::from_optional_object_id(*object_id)?
-                    .as_raw()
-                    .to_le_bytes(),
-            );
-        }
-    }
+    let abi = ObjectValueAbi::from_object_value(value)?;
+    let (tag, low, high) = abi.as_parts();
+    bytes.extend_from_slice(&tag.to_le_bytes());
+    bytes.extend_from_slice(&low.to_le_bytes());
+    bytes.extend_from_slice(&high.to_le_bytes());
     Ok(())
+}
+
+fn decode_payload_bytes(
+    header: TxObjectHeader,
+    array_length: Option<u32>,
+    bytes: &[u8],
+) -> Result<ObjectPayload> {
+    let payload_start = match array_length {
+        Some(_) => size_of::<TxArrayHeader>(),
+        None => size_of::<TxObjectHeader>(),
+    };
+    ensure!(
+        bytes.len() >= payload_start,
+        "serialized object record is shorter than expected"
+    );
+    let payload_bytes = &bytes[payload_start..];
+    Ok(match header.kind {
+        x if x == ObjectKind::Struct as u16 => {
+            ensure!(
+                payload_bytes.len() % OBJECT_VALUE_RECORD_LEN == 0,
+                "serialized struct payload length is not a multiple of object ABI size"
+            );
+            ObjectPayload::Struct(decode_object_values(payload_bytes)?)
+        }
+        x if x == ObjectKind::Array as u16 => {
+            let length =
+                usize::try_from(array_length.context("serialized array record is missing length")?)
+                    .context("serialized array length does not fit usize")?;
+            let expected_len = length
+                .checked_mul(OBJECT_VALUE_RECORD_LEN)
+                .context("serialized array payload length overflow")?;
+            ensure!(
+                payload_bytes.len() == expected_len,
+                "serialized array payload length does not match array length"
+            );
+            ObjectPayload::Array(decode_object_values(payload_bytes)?)
+        }
+        x if x == ObjectKind::I31 as u16 => {
+            ensure!(
+                payload_bytes.len() == 4,
+                "serialized i31 payload length is invalid"
+            );
+            ObjectPayload::I31(i32::from_le_bytes(payload_bytes.try_into().unwrap()))
+        }
+        x if x == ObjectKind::Extern as u16 => {
+            ensure!(
+                payload_bytes.len() == 8,
+                "serialized extern payload length is invalid"
+            );
+            ObjectPayload::Extern(u64::from_le_bytes(payload_bytes.try_into().unwrap()))
+        }
+        x if x == ObjectKind::Func as u16 => {
+            ensure!(
+                payload_bytes.len() == 8,
+                "serialized func payload length is invalid"
+            );
+            ObjectPayload::Func(u64::from_le_bytes(payload_bytes.try_into().unwrap()))
+        }
+        _ => bail!(
+            "unknown object kind tag in persistent record header: {}",
+            header.kind
+        ),
+    })
+}
+
+fn decode_object_values(bytes: &[u8]) -> Result<Vec<ObjectValue>> {
+    let abi_size = OBJECT_VALUE_RECORD_LEN;
+    ensure!(
+        bytes.len() % abi_size == 0,
+        "serialized object value payload length is not a multiple of object ABI size"
+    );
+    bytes
+        .chunks_exact(abi_size)
+        .map(|chunk| {
+            let tag = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let low = u64::from_le_bytes(chunk[4..12].try_into().unwrap());
+            let high = u64::from_le_bytes(chunk[12..20].try_into().unwrap());
+            ObjectValueAbi::from_parts(tag, low, high)?.to_object_value()
+        })
+        .collect()
 }
 
 fn trace_value_kind(value: &ObjectValue) -> TraceValueKind {
@@ -519,4 +617,8 @@ fn object_value_offset(values: &[ObjectValue], field_index: usize) -> Result<u32
         .map(logical_object_value_len)
         .sum::<Result<u64>>()?;
     u32::try_from(offset).context("field offset does not fit u32")
+}
+
+fn logical_object_value_len(_value: &ObjectValue) -> Result<u64> {
+    u64::try_from(OBJECT_VALUE_RECORD_LEN).context("object value record length overflow")
 }

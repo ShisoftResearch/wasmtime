@@ -1,6 +1,9 @@
 use super::block_region::BlockRegionBackendView;
-use super::{DATA_CHUNK_MAGIC, LOG_BLOCK_MAGIC, TxLogEntry};
+use super::{
+    DATA_CHUNK_MAGIC, LOG_BLOCK_MAGIC, TxDataRecordHeader, TxLogEntry, unpack_object_granule_id,
+};
 use crate::prelude::*;
+use crate::runtime::transaction::TxObjectHeader;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -8,7 +11,6 @@ use alloc::vec::Vec;
 use super::block_region::{BLOCK_SIZE, StreamCursor, VMemoryBlockRegion};
 #[cfg(test)]
 use super::{DataRecordLocation, LogBlockHeader, TMemory};
-#[cfg(test)]
 use core::mem::size_of;
 
 #[derive(Debug)]
@@ -30,7 +32,17 @@ pub(crate) struct RecoveryWinner {
 pub(crate) struct RecoveredRegion {
     pub(crate) streams: Vec<RecoveredStream>,
     pub(crate) winners: Vec<RecoveryWinner>,
+    pub(crate) object_winners: Vec<RecoveredObjectWinner>,
     pub(crate) next_stream_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveredObjectWinner {
+    pub(crate) object_id: u64,
+    pub(crate) version: u32,
+    pub(crate) kind: u16,
+    pub(crate) type_index: u32,
+    pub(crate) record_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +66,13 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
             match winners.get(&update.logical_id) {
                 Some(current) if current.version > update.version => {}
                 Some(current) if current.version == update.version => {
+                    if let Ok((_, object_id)) = unpack_object_granule_id(update.logical_id) {
+                        bail!(
+                            "duplicate committed object version {} for object id {}",
+                            update.version,
+                            object_id
+                        );
+                    }
                     bail!(
                         "duplicate committed version {} for logical id {}",
                         update.version,
@@ -67,11 +86,104 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
         }
     }
 
+    let winners = winners.into_values().collect::<Vec<_>>();
+    let object_winners = replay_object_winners(region, &winners)?;
+
     Ok(RecoveredRegion {
-        next_stream_id: streams.iter().map(|stream| stream.stream_id).max().unwrap_or(0) + 1,
+        next_stream_id: streams
+            .iter()
+            .map(|stream| stream.stream_id)
+            .max()
+            .unwrap_or(0)
+            + 1,
         streams,
-        winners: winners.into_values().collect(),
+        winners,
+        object_winners,
     })
+}
+
+impl RecoveredRegion {
+    pub(crate) fn committed_object_winners(&self) -> Result<Vec<RecoveredObjectWinner>> {
+        Ok(self.object_winners.clone())
+    }
+}
+
+fn replay_object_winners(
+    region: &BlockRegionBackendView<'_>,
+    winners: &[RecoveryWinner],
+) -> Result<Vec<RecoveredObjectWinner>> {
+    let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
+
+    for winner in winners {
+        let Ok((domain, object_id)) = unpack_object_granule_id(winner.logical_id) else {
+            continue;
+        };
+        let (data_header, record_bytes) =
+            load_publication_payload(region, winner.data_block, winner.data_offset)?;
+        ensure!(
+            data_header.logical_id == winner.logical_id,
+            "recovered object publication logical id does not match log winner"
+        );
+        ensure!(
+            data_header.version == winner.version,
+            "recovered object publication version does not match log winner"
+        );
+        ensure!(
+            data_header.kind == domain as u16,
+            "recovered object publication kind does not match object domain"
+        );
+        let object_header = TxObjectHeader::read_from_prefix(&record_bytes)?;
+        ensure!(
+            object_header.object_id == object_id,
+            "recovered object record id does not match logical id"
+        );
+        ensure!(
+            object_header.version == winner.version,
+            "recovered object record version does not match log winner"
+        );
+        let candidate = RecoveredObjectWinner {
+            object_id,
+            version: winner.version,
+            kind: object_header.kind,
+            type_index: object_header.type_index,
+            record_bytes,
+        };
+        match object_winners.get(&object_id) {
+            Some(current) if current.version > candidate.version => {}
+            Some(current) if current.version == candidate.version => {
+                bail!(
+                    "duplicate committed object version {} for object id {}",
+                    candidate.version,
+                    object_id
+                );
+            }
+            _ => {
+                object_winners.insert(object_id, candidate);
+            }
+        }
+    }
+
+    Ok(object_winners.into_values().collect())
+}
+
+fn load_publication_payload(
+    region: &BlockRegionBackendView<'_>,
+    data_block: u32,
+    data_offset: u32,
+) -> Result<(TxDataRecordHeader, Vec<u8>)> {
+    let block = usize::try_from(data_block).context("publication data block overflow")?;
+    let in_block = usize::try_from(data_offset).context("publication data offset overflow")?;
+    let record_offset = block
+        .checked_mul(region.block_size())
+        .and_then(|offset| offset.checked_add(in_block))
+        .context("publication data record offset overflow")?;
+    let header = TxDataRecordHeader::from_bytes(
+        region.read(record_offset, size_of::<TxDataRecordHeader>())?,
+    )?;
+    let payload_len =
+        usize::try_from(header.payload_len).context("publication payload length overflow")?;
+    let payload = region.read(record_offset + size_of::<TxDataRecordHeader>(), payload_len)?;
+    Ok((header, payload))
 }
 
 fn discover_streams(region: &BlockRegionBackendView<'_>) -> Result<Vec<RecoveredStream>> {
@@ -197,6 +309,10 @@ pub(crate) fn recover_region_for_test(region: &VMemoryBlockRegion) -> Result<Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::transaction::{
+        ObjectPayload, ObjectValue, encode_object_record_for_recovery_test,
+    };
+    use crate::runtime::vm::{PackedGranuleDomain, pack_object_granule_id};
 
     #[test]
     fn recovery_discovers_streams_from_chunk_starts() {
@@ -226,6 +342,31 @@ mod tests {
         let region = sample_region_with_corrupt_non_final_log_entry();
         let err = recover_region_for_test(&region).unwrap_err();
         assert!(err.to_string().contains("corrupt log entry"));
+    }
+
+    #[test]
+    fn recovery_replays_latest_object_record_per_object_id() {
+        let region = sample_region_with_competing_object_updates();
+        let recovered = recover_region_for_test(&region).unwrap();
+        let objects = recovered.committed_object_winners().unwrap();
+
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].object_id, 41);
+        assert_eq!(objects[0].version, 9);
+        assert_eq!(
+            objects[0].kind,
+            crate::runtime::transaction::ObjectKind::Struct as u16
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_committed_object_version() {
+        let region = sample_region_with_duplicate_object_version();
+        let err = recover_region_for_test(&region).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate committed object version")
+        );
     }
 
     fn sample_region_with_two_streams() -> VMemoryBlockRegion {
@@ -261,13 +402,8 @@ mod tests {
         let first = append_publication_record(&mut region, 1, stream, 0, 0x1000, 1, 11);
         let second = append_publication_record(&mut region, 1, stream, 0, 0x1001, 1, 22);
 
-        let mut ordinary = TxLogEntry::new(
-            0x1000,
-            1,
-            1 << 1,
-            first.1.data_block,
-            first.1.data_offset,
-        );
+        let mut ordinary =
+            TxLogEntry::new(0x1000, 1, 1 << 1, first.1.data_block, first.1.data_offset);
         ordinary.seal_crc32();
 
         let mut final_lp = TxLogEntry::new(
@@ -282,6 +418,97 @@ mod tests {
         write_log_entries(&mut region, first.0, &[ordinary, final_lp]);
         corrupt_log_entry_data_block(&mut region, first.0, 0);
         region
+    }
+
+    fn sample_region_with_competing_object_updates() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream1 = region.alloc_stream(1).unwrap();
+        let stream2 = region.alloc_stream(2).unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream1,
+            0,
+            logical_id,
+            7,
+            11,
+            ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+        );
+        append_committed_object_update(
+            &mut region,
+            2,
+            stream2,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        region
+    }
+
+    fn sample_region_with_duplicate_object_version() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream1 = region.alloc_stream(1).unwrap();
+        let stream2 = region.alloc_stream(2).unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream1,
+            0,
+            logical_id,
+            9,
+            11,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        append_committed_object_update(
+            &mut region,
+            2,
+            stream2,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        region
+    }
+
+    fn append_committed_object_update(
+        region: &mut VMemoryBlockRegion,
+        stream_id: u32,
+        stream: StreamCursor,
+        block_seq: u32,
+        logical_id: u64,
+        version: u32,
+        type_index: u32,
+        payload: ObjectPayload,
+    ) {
+        let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
+        let object_record =
+            encode_object_record_for_recovery_test(object_id, version, type_index, &payload)
+                .unwrap();
+        let publication = TMemory::encode_publication_data_record(
+            logical_id,
+            version,
+            domain as u16,
+            type_index,
+            &object_record,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &publication).unwrap();
+        let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
+        let entry = TMemory::publication_log_entry(
+            logical_id,
+            version,
+            stream_id << 1,
+            location.data_block,
+            location.data_offset,
+            true,
+        );
+        write_log_entries(region, log_block, &[entry]);
     }
 
     fn append_committed_update(
@@ -352,7 +579,11 @@ mod tests {
         (log_block, location)
     }
 
-    fn write_log_entries(region: &mut VMemoryBlockRegion, start_block: u32, entries: &[TxLogEntry]) {
+    fn write_log_entries(
+        region: &mut VMemoryBlockRegion,
+        start_block: u32,
+        entries: &[TxLogEntry],
+    ) {
         let mut header = region.log_block_header(start_block).unwrap();
         header.entry_count = u32::try_from(entries.len()).unwrap();
         let block_offset = usize::try_from(start_block).unwrap() * BLOCK_SIZE;
@@ -376,7 +607,11 @@ mod tests {
         bytes
     }
 
-    fn corrupt_log_entry_data_block(region: &mut VMemoryBlockRegion, start_block: u32, entry_index: usize) {
+    fn corrupt_log_entry_data_block(
+        region: &mut VMemoryBlockRegion,
+        start_block: u32,
+        entry_index: usize,
+    ) {
         let entry_offset = usize::try_from(start_block).unwrap() * BLOCK_SIZE
             + size_of::<LogBlockHeader>()
             + entry_index * size_of::<TxLogEntry>();

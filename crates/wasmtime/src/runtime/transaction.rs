@@ -12,6 +12,9 @@ use std::path::PathBuf;
 mod object_heap;
 #[path = "transaction/persist.rs"]
 mod persist;
+pub(crate) use object_heap::TxObjectHeader;
+#[cfg(test)]
+pub(crate) use object_heap::encode_object_record_for_test as encode_object_record_for_recovery_test;
 pub(crate) use persist::DurableSink;
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -926,16 +929,32 @@ impl ObjectTable {
         Ok(self.next_record_version)
     }
 
-    fn rebuild_volatile_index_from_heap(&mut self) -> Result<()> {
+    fn clear_volatile_index(&mut self) {
         self.slots.clear();
         self.free_list.clear();
         self.gc_ref_to_object.clear();
         self.object_to_gc_ref.clear();
         self.func_ref_to_object.clear();
         self.object_to_func_ref.clear();
-        self.live_count = 0;
         self.next_version = 0;
         self.next_record_version = 0;
+        self.live_count = 0;
+    }
+
+    fn rebuild_free_list_holes(&mut self) -> Result<()> {
+        self.free_list.clear();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.is_none() {
+                self.free_list.push(ObjectId {
+                    object_index: u64::try_from(index).context("slot index does not fit u64")?,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_volatile_index_from_heap(&mut self) -> Result<()> {
+        self.clear_volatile_index();
 
         let mut latest_by_object =
             BTreeMap::<ObjectId, (object_heap::TxRecordHandle, object_heap::TxObjectHeader)>::new();
@@ -978,13 +997,77 @@ impl ObjectTable {
                 .context("object table live count overflow during rebuild")?;
         }
 
-        for (index, slot) in self.slots.iter().enumerate() {
-            if slot.is_none() {
-                self.free_list.push(ObjectId {
-                    object_index: u64::try_from(index).context("slot index does not fit u64")?,
-                });
-            }
+        self.rebuild_free_list_holes()?;
+        Ok(())
+    }
+
+    fn rebuild_from_recovered_object_winners(
+        &mut self,
+        winners: &[crate::runtime::vm::RecoveredObjectWinner],
+    ) -> Result<()> {
+        self.clear_volatile_index();
+        self.heap = object_heap::ObjectHeap::default();
+
+        if let Some(max_object_id) = winners.iter().map(|winner| winner.object_id).max() {
+            let slot_len = usize::try_from(
+                max_object_id
+                    .checked_add(1)
+                    .context("object slot range overflow")?,
+            )
+            .context("object slot range does not fit usize")?;
+            self.slots.resize(slot_len, None);
         }
+
+        for winner in winners {
+            let object_id = ObjectId {
+                object_index: winner.object_id,
+            };
+            let index = object_slot_index(object_id)?;
+            ensure!(
+                self.slots.get(index).is_some(),
+                "recovered object slot is outside slot range"
+            );
+            ensure!(
+                self.slots[index].is_none(),
+                "recovered object slot is already occupied"
+            );
+
+            let handle = self.heap.install_record_bytes(&winner.record_bytes)?;
+            let header = self.heap.header(handle)?;
+            let kind = object_kind_from_u16(header.kind)?;
+
+            ensure!(
+                header.object_id == winner.object_id,
+                "recovered object record id does not match winner"
+            );
+            ensure!(
+                header.version == winner.version,
+                "recovered object record version does not match winner"
+            );
+            ensure!(
+                header.kind == winner.kind,
+                "recovered object record kind does not match winner"
+            );
+            ensure!(
+                header.type_index == winner.type_index,
+                "recovered object record type index does not match winner"
+            );
+
+            self.next_record_version = self.next_record_version.max(header.version);
+            let version = self.bump_object_version()?;
+            self.slots[index] = Some(ObjectTableSlot {
+                kind,
+                version,
+                type_index: header.type_index,
+                current_record: handle,
+            });
+            self.live_count = self
+                .live_count
+                .checked_add(1)
+                .context("object table live count overflow during recovery rebuild")?;
+        }
+
+        self.rebuild_free_list_holes()?;
         Ok(())
     }
 
@@ -1002,6 +1085,14 @@ impl ObjectTable {
         object_id: ObjectId,
     ) -> Result<persist::PendingPublication> {
         self.object_pending_publication(object_id)
+    }
+
+    #[cfg(test)]
+    fn rebuild_from_recovery_for_test(
+        &mut self,
+        winners: &[crate::runtime::vm::RecoveredObjectWinner],
+    ) -> Result<()> {
+        self.rebuild_from_recovered_object_winners(winners)
     }
 }
 
@@ -5951,12 +6042,27 @@ mod tests {
         assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 0x23);
         assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 41);
         assert_eq!(
-            i32::from_le_bytes(
-                bytes[payload_offset..payload_offset + 4]
-                    .try_into()
-                    .unwrap()
-            ),
-            0x1122_3344
+            ObjectValueAbi::from_parts(
+                u32::from_le_bytes(
+                    bytes[payload_offset..payload_offset + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                u64::from_le_bytes(
+                    bytes[payload_offset + 4..payload_offset + 12]
+                        .try_into()
+                        .unwrap()
+                ),
+                u64::from_le_bytes(
+                    bytes[payload_offset + 12..payload_offset + 20]
+                        .try_into()
+                        .unwrap()
+                ),
+            )
+            .unwrap()
+            .to_object_value()
+            .unwrap(),
+            ObjectValue::I32(0x1122_3344)
         );
     }
 
@@ -6111,6 +6217,37 @@ mod tests {
     }
 
     #[test]
+    fn object_index_rebuilds_from_recovered_object_winners() {
+        let region = sample_region_with_two_object_winners();
+        let recovered = crate::runtime::vm::recover_region_for_test(&region).unwrap();
+        let winners = recovered.committed_object_winners().unwrap();
+        let mut objects = ObjectTable::default();
+
+        objects.rebuild_from_recovery_for_test(&winners).unwrap();
+
+        assert_eq!(objects.live_count(), 2);
+        assert_eq!(
+            objects.kind(ObjectId { object_index: 41 }).unwrap(),
+            ObjectKind::Struct
+        );
+        assert_eq!(
+            objects.payload(ObjectId { object_index: 41 }).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+        );
+        assert_eq!(
+            objects.kind(ObjectId { object_index: 42 }).unwrap(),
+            ObjectKind::Array
+        );
+        assert_eq!(
+            objects.payload(ObjectId { object_index: 42 }).unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::Ref(Some(ObjectId { object_index: 41 })),
+                ObjectValue::I64(9),
+            ])
+        );
+    }
+
+    #[test]
     fn transaction_object_scanner_returns_embedded_refs_from_struct_and_array_payloads() {
         let mut struct_heap = object_heap::ObjectHeap::default();
         let struct_handle = struct_heap
@@ -6156,6 +6293,112 @@ mod tests {
             array_heap.trace_object_ids(array_handle).unwrap(),
             vec![ObjectId { object_index: 21 }, ObjectId { object_index: 22 }]
         );
+    }
+
+    fn sample_region_with_two_object_winners()
+    -> crate::runtime::vm::block_region::VMemoryBlockRegion {
+        let mut region =
+            crate::runtime::vm::block_region::VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream1 = region.alloc_stream(1).unwrap();
+        let stream2 = region.alloc_stream(2).unwrap();
+
+        let first = encoded_object_publication_for_recovery_test(
+            41,
+            1,
+            7,
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)]),
+        );
+        let second = encoded_object_publication_for_recovery_test(
+            42,
+            1,
+            9,
+            ObjectPayload::Array(vec![
+                ObjectValue::Ref(Some(ObjectId { object_index: 41 })),
+                ObjectValue::I64(9),
+            ]),
+        );
+
+        append_committed_object_winner(&mut region, 1, stream1, 0, &first);
+        append_committed_object_winner(&mut region, 2, stream2, 0, &second);
+
+        region
+    }
+
+    fn encoded_object_publication_for_recovery_test(
+        object_id: u64,
+        version: u32,
+        type_index: u32,
+        payload: ObjectPayload,
+    ) -> persist::PendingPublication {
+        persist::PendingPublication::persistent_object(
+            match payload.kind() {
+                ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
+                ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
+                _ => unreachable!(),
+            },
+            object_id,
+            version,
+            type_index,
+            encode_object_record_for_recovery_test(object_id, version, type_index, &payload)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn append_committed_object_winner(
+        region: &mut crate::runtime::vm::block_region::VMemoryBlockRegion,
+        stream_id: u32,
+        stream: crate::runtime::vm::block_region::StreamCursor,
+        block_seq: u32,
+        publication: &persist::PendingPublication,
+    ) {
+        let record = TMemory::encode_publication_data_record(
+            publication.logical_id,
+            publication.version,
+            publication.kind,
+            publication.type_info,
+            &publication.payload,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
+        let entry = TMemory::publication_log_entry(
+            publication.logical_id,
+            publication.version,
+            stream_id << 1,
+            location.data_block,
+            location.data_offset,
+            true,
+        );
+        write_log_entry_for_recovery_test(region, log_block, entry);
+    }
+
+    fn write_log_entry_for_recovery_test(
+        region: &mut crate::runtime::vm::block_region::VMemoryBlockRegion,
+        start_block: u32,
+        entry: crate::runtime::vm::TxLogEntry,
+    ) {
+        let mut header = region.log_block_header(start_block).unwrap();
+        header.entry_count = 1;
+        let block_offset =
+            usize::try_from(start_block).unwrap() * crate::runtime::vm::block_region::BLOCK_SIZE;
+        region.write(block_offset, &header.as_bytes()).unwrap();
+        let offset = block_offset + header.as_bytes().len();
+        region
+            .write(offset, &encode_tx_log_entry_for_recovery_test(entry))
+            .unwrap();
+    }
+
+    fn encode_tx_log_entry_for_recovery_test(entry: crate::runtime::vm::TxLogEntry) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&entry.logical_id.to_le_bytes());
+        bytes[8..12].copy_from_slice(&entry.version.to_le_bytes());
+        bytes[12..16].copy_from_slice(&entry.tx_meta.to_le_bytes());
+        bytes[16..20].copy_from_slice(&entry.data_block.to_le_bytes());
+        bytes[20..24].copy_from_slice(&entry.data_offset.to_le_bytes());
+        bytes[24..28].copy_from_slice(&entry.crc32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&entry.reserved.to_le_bytes());
+        bytes
     }
 
     #[test]

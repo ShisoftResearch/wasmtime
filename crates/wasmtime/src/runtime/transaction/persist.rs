@@ -272,8 +272,10 @@ fn sample_publications() -> Vec<PendingPublication> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::transaction::object_heap::TxObjectHeader;
-    use crate::runtime::transaction::object_heap::encode_object_record_for_test;
+    use crate::runtime::transaction::{
+        ObjectPayload, ObjectValue, object_heap::TxObjectHeader,
+        object_heap::encode_object_record_for_test,
+    };
 
     #[test]
     fn commit_publishes_only_the_last_entry_with_lp() {
@@ -323,7 +325,13 @@ mod tests {
 
     #[test]
     fn encodes_object_record_with_tx_object_header() {
-        let bytes = encode_object_record_for_test(41, 7, 12, &[9, 8, 7]).unwrap();
+        let bytes = encode_object_record_for_test(
+            41,
+            7,
+            12,
+            &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        )
+        .unwrap();
         let header = TxObjectHeader::read_from_prefix(&bytes).unwrap();
         assert_eq!(header.object_id, 41);
         assert_eq!(header.version, 7);
