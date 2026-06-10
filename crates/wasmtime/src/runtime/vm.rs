@@ -111,6 +111,10 @@ pub use crate::runtime::vm::interpreter::*;
 pub(crate) use crate::runtime::vm::memory::tmemory::TMemory;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::block_region;
+#[cfg(all(has_virtual_memory, test))]
+pub(crate) use crate::runtime::vm::memory::tmemory::{
+    PackedGranuleDomain, pack_object_granule_id, unpack_object_granule_id,
+};
 pub use crate::runtime::vm::memory::{
     Memory, MemoryBase, RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory,
 };

@@ -196,6 +196,32 @@ impl TxLogEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackedGranuleDomain {
     TMemory = 1,
+    TStruct = 6,
+    TArray = 7,
+}
+
+pub(crate) fn pack_object_granule_id(domain: PackedGranuleDomain, object_id: u64) -> Result<u64> {
+    match domain {
+        PackedGranuleDomain::TStruct | PackedGranuleDomain::TArray => {
+            ensure!(
+                object_id < (1u64 << 60),
+                "object id does not fit in packed granule id payload"
+            );
+            Ok(((domain as u64) << 60) | object_id)
+        }
+        _ => bail!("domain {domain:?} is not an object granule"),
+    }
+}
+
+pub(crate) fn unpack_object_granule_id(logical_id: u64) -> Result<(PackedGranuleDomain, u64)> {
+    let domain_bits = u16::try_from(logical_id >> 60).unwrap();
+    let object_id = logical_id & ((1u64 << 60) - 1);
+    let domain = match domain_bits {
+        6 => PackedGranuleDomain::TStruct,
+        7 => PackedGranuleDomain::TArray,
+        _ => bail!("logical id {logical_id:#x} is not an object granule"),
+    };
+    Ok((domain, object_id))
 }
 
 #[repr(C)]
@@ -245,5 +271,26 @@ impl TxDataRecordHeader {
             payload_len: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
             type_info: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_granule_id_roundtrips_struct_object_id() {
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
+        assert_eq!(domain, PackedGranuleDomain::TStruct);
+        assert_eq!(object_id, 41);
+    }
+
+    #[test]
+    fn packed_granule_id_roundtrips_array_object_id() {
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TArray, 99).unwrap();
+        let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
+        assert_eq!(domain, PackedGranuleDomain::TArray);
+        assert_eq!(object_id, 99);
     }
 }

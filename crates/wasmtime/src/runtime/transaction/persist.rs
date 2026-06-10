@@ -1,5 +1,7 @@
 use crate::prelude::*;
 use crate::runtime::vm::TMemory;
+#[cfg(test)]
+use crate::runtime::vm::{PackedGranuleDomain, pack_object_granule_id, unpack_object_granule_id};
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,22 @@ impl PendingPublication {
             version,
             kind: 1,
             type_info: 0,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn persistent_object_for_test(
+        domain: PackedGranuleDomain,
+        object_id: u64,
+        version: u32,
+        type_info: u32,
+        payload: &[u8],
+    ) -> Self {
+        Self {
+            logical_id: pack_object_granule_id(domain, object_id).unwrap(),
+            version,
+            kind: domain as u16,
+            type_info,
             payload: payload.to_vec(),
         }
     }
@@ -154,7 +172,10 @@ struct RecordingDurability {
 #[cfg(test)]
 impl RecordingDurability {
     fn final_lp_count(&self) -> usize {
-        self.tx_meta.iter().filter(|entry| (**entry & 1) != 0).count()
+        self.tx_meta
+            .iter()
+            .filter(|entry| (**entry & 1) != 0)
+            .count()
     }
 
     fn non_final_log_entries_before_final_lp(&self) -> bool {
@@ -239,14 +260,16 @@ fn sample_publications() -> Vec<PendingPublication> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::transaction::object_heap::encode_object_record_for_test;
     use crate::runtime::transaction::object_heap::TxObjectHeader;
+    use crate::runtime::transaction::object_heap::encode_object_record_for_test;
 
     #[test]
     fn commit_publishes_only_the_last_entry_with_lp() {
         let mut recorder = RecordingDurability::default();
         let mut publisher = StreamPublisher::new_for_test(&mut recorder, 4, 21);
-        publisher.publish_transaction(&sample_publications()).unwrap();
+        publisher
+            .publish_transaction(&sample_publications())
+            .unwrap();
 
         assert_eq!(recorder.final_lp_count(), 1);
         assert!(recorder.non_final_log_entries_before_final_lp());
@@ -256,7 +279,9 @@ mod tests {
     fn commit_orders_data_before_final_lp() {
         let mut recorder = RecordingDurability::default();
         let mut publisher = StreamPublisher::new_for_test(&mut recorder, 4, 99);
-        publisher.publish_transaction(&sample_publications()).unwrap();
+        publisher
+            .publish_transaction(&sample_publications())
+            .unwrap();
 
         assert!(recorder.events().starts_with(&[
             DurabilityEvent::DataWrite,
@@ -291,5 +316,21 @@ mod tests {
         assert_eq!(header.object_id, 41);
         assert_eq!(header.version, 7);
         assert_eq!(header.type_index, 12);
+    }
+
+    #[test]
+    fn object_publication_builds_object_logical_id() {
+        let pub_ = PendingPublication::persistent_object_for_test(
+            PackedGranuleDomain::TStruct,
+            41,
+            7,
+            12,
+            &[1, 2, 3],
+        );
+        let (domain, object_id) = unpack_object_granule_id(pub_.logical_id).unwrap();
+        assert_eq!(domain, PackedGranuleDomain::TStruct);
+        assert_eq!(object_id, 41);
+        assert_eq!(pub_.version, 7);
+        assert_eq!(pub_.type_info, 12);
     }
 }
