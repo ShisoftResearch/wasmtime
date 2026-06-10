@@ -4,7 +4,7 @@
 
 use super::{
     DATA_CHUNK_MAGIC, DataChunkClass, DataChunkHeader, DataRecordLocation, LOG_BLOCK_MAGIC,
-    LogBlockHeader, NO_NEXT_BLOCK, SMALL_DATA_LIMIT,
+    LogBlockHeader, NO_NEXT_BLOCK, SMALL_DATA_LIMIT, TxLogEntry,
 };
 use crate::prelude::*;
 use crate::runtime::vm::SendSyncPtr;
@@ -576,6 +576,105 @@ pub(crate) trait BlockRegionBackend {
     }
 }
 
+pub(crate) struct BlockRegionBackendView<'a> {
+    backend: &'a dyn BlockRegionBackend,
+}
+
+impl<'a> BlockRegionBackendView<'a> {
+    pub(crate) fn new(backend: &'a dyn BlockRegionBackend) -> Self {
+        Self { backend }
+    }
+
+    pub(crate) fn block_size(&self) -> usize {
+        self.backend.block_size()
+    }
+
+    pub(crate) fn num_blocks(&self) -> usize {
+        self.backend.num_blocks()
+    }
+
+    pub(crate) fn block_magic(&self, start_block: u32) -> Result<u32> {
+        let bytes = self.read_header_bytes(start_block, size_of::<u32>())?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    pub(crate) fn log_block_header(&self, start_block: u32) -> Result<LogBlockHeader> {
+        LogBlockHeader::from_bytes(
+            self.read_header_bytes(start_block, size_of::<LogBlockHeader>())?,
+        )
+    }
+
+    pub(crate) fn data_chunk_header(&self, start_block: u32) -> Result<DataChunkHeader> {
+        DataChunkHeader::from_bytes(
+            self.read_header_bytes(start_block, size_of::<DataChunkHeader>())?,
+        )
+    }
+
+    pub(crate) fn log_block_entries(&self, start_block: u32) -> Result<Vec<TxLogEntry>> {
+        let header = self.log_block_header(start_block)?;
+        ensure!(
+            header.magic == LOG_BLOCK_MAGIC,
+            "transactional log block {start_block} has invalid magic"
+        );
+        let entry_count = usize::try_from(header.entry_count)
+            .context("transactional log block entry count overflow")?;
+        ensure!(
+            entry_count <= self.log_entry_capacity(),
+            "transactional log block {start_block} entry count exceeds capacity"
+        );
+
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut offset = self
+            .block_offset(start_block)?
+            .checked_add(size_of::<LogBlockHeader>())
+            .context("transactional log block entry area overflow")?;
+        for _ in 0..entry_count {
+            let bytes = self.backend.read(offset, size_of::<TxLogEntry>())?;
+            entries.push(decode_tx_log_entry(bytes)?);
+            offset = offset
+                .checked_add(size_of::<TxLogEntry>())
+                .context("transactional log block entry offset overflow")?;
+        }
+        Ok(entries)
+    }
+
+    fn log_entry_capacity(&self) -> usize {
+        (self.block_size() - size_of::<LogBlockHeader>()) / size_of::<TxLogEntry>()
+    }
+
+    fn block_offset(&self, block: u32) -> Result<usize> {
+        let block = usize::try_from(block).context("transactional block index overflow")?;
+        ensure!(
+            block < self.num_blocks(),
+            "transactional block index out of bounds"
+        );
+        block
+            .checked_mul(self.block_size())
+            .context("transactional block offset overflow")
+    }
+
+    fn read_header_bytes(&self, start_block: u32, len: usize) -> Result<Vec<u8>> {
+        self.backend.read(self.block_offset(start_block)?, len)
+    }
+}
+
+fn decode_tx_log_entry(bytes: impl AsRef<[u8]>) -> Result<TxLogEntry> {
+    let bytes = bytes.as_ref();
+    ensure!(
+        bytes.len() == size_of::<TxLogEntry>(),
+        "durable tx log entry length mismatch"
+    );
+    Ok(TxLogEntry {
+        logical_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+        version: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        tx_meta: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        data_block: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+        data_offset: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+        crc32: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        reserved: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionChunk {
     start_block: usize,
@@ -675,6 +774,10 @@ impl VMemoryBlockRegion {
     #[cfg(test)]
     pub(crate) fn new_for_test(num_blocks: usize) -> Result<Self> {
         Self::new(num_blocks)
+    }
+
+    pub(crate) fn view(&self) -> BlockRegionBackendView<'_> {
+        BlockRegionBackendView::new(self)
     }
 
     pub(crate) fn block_size(&self) -> usize {
@@ -1095,6 +1198,10 @@ impl NVMemoryBlockRegion {
         Self::new(num_blocks, mode)
     }
 
+    pub(crate) fn view(&self) -> BlockRegionBackendView<'_> {
+        BlockRegionBackendView::new(self)
+    }
+
     pub(crate) fn block_size(&self) -> usize {
         BLOCK_SIZE
     }
@@ -1251,6 +1358,10 @@ impl FileBackedMemoryBlockRegion {
     #[cfg(test)]
     pub(crate) fn new_for_test(num_blocks: usize, mode: FileBackedRegionMode) -> Result<Self> {
         Self::new(num_blocks, mode)
+    }
+
+    pub(crate) fn view(&self) -> BlockRegionBackendView<'_> {
+        BlockRegionBackendView::new(self)
     }
 
     pub(crate) fn block_size(&self) -> usize {
