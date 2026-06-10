@@ -555,9 +555,11 @@ pub mod _internal {
     #[cfg(feature = "transaction")]
     pub mod transaction_persistence {
         pub use crate::vm::block_region::{
-            TransactionPersistenceRecoveredRegion, TransactionPersistenceRecoveredWinner,
-            corrupt_first_log_crc, create_file_backed_region_image,
-            publish_committed_tmemory_update, reopen_and_recover_file_backed_region,
+            TransactionPersistenceRecoveredObjectWinner, TransactionPersistenceRecoveredRegion,
+            TransactionPersistenceRecoveredWinner, corrupt_first_log_crc,
+            create_file_backed_region_image, publish_committed_global_object_root,
+            publish_committed_struct_object, publish_committed_tmemory_update,
+            reopen_and_recover_file_backed_region,
         };
     }
 }

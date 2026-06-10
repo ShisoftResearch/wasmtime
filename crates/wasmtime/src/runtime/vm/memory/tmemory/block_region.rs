@@ -5,9 +5,12 @@
 use super::{
     DATA_CHUNK_MAGIC, DataChunkClass, DataChunkHeader, DataRecordLocation, LOG_BLOCK_MAGIC,
     LogBlockHeader, NO_NEXT_BLOCK, PackedGranuleDomain, REGION_MAGIC, RegionHeader,
-    SMALL_DATA_LIMIT, TMemory, TxLogEntry,
+    SMALL_DATA_LIMIT, TMemory, TxLogEntry, pack_object_granule_id,
 };
 use crate::prelude::*;
+use crate::runtime::transaction::{
+    ObjectKind, ObjectPayload, ObjectValue, encode_object_record_for_recovery,
+};
 use crate::runtime::vm::SendSyncPtr;
 use core::{
     mem::size_of,
@@ -1975,11 +1978,24 @@ pub struct TransactionPersistenceRecoveredWinner {
     pub version: u32,
 }
 
+/// Narrow recovered object-winner summary exported for file-backed persistence tests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionPersistenceRecoveredObjectWinner {
+    /// Persistent object identity selected by recovery.
+    pub object_id: u64,
+    /// Committed object version selected by recovery.
+    pub version: u32,
+}
+
 /// Narrow recovered-region summary exported for file-backed persistence tests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionPersistenceRecoveredRegion {
     /// Winners selected by chunk-scan plus log replay recovery.
     pub winners: Vec<TransactionPersistenceRecoveredWinner>,
+    /// Persistent object winners selected by recovery.
+    pub object_winners: Vec<TransactionPersistenceRecoveredObjectWinner>,
+    /// Persistent object ids recovered from root-bearing globals/tables.
+    pub root_object_ids: Vec<u64>,
 }
 
 /// Creates a file-backed durable region image for restart smoke tests.
@@ -1996,15 +2012,85 @@ pub fn publish_committed_tmemory_update(
     version: u32,
     payload: &[u8],
 ) -> Result<()> {
-    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
-    let stream = region.alloc_stream(stream_id)?;
-    let record = TMemory::encode_publication_data_record(
+    publish_committed_data_record(
+        path,
+        stream_id,
         logical_id,
         version,
         PackedGranuleDomain::TMemory as u16,
         0,
         payload,
+    )
+}
+
+/// Publishes one committed persistent struct object into a file-backed region.
+pub fn publish_committed_struct_object(
+    path: &Path,
+    stream_id: u32,
+    object_id: u64,
+    version: u32,
+    type_info: u32,
+    payload: &[u8],
+) -> Result<()> {
+    let fields = payload
+        .iter()
+        .map(|byte| ObjectValue::I32(i32::from(*byte)))
+        .collect::<Vec<_>>();
+    let object_record = encode_object_record_for_recovery(
+        object_id,
+        version,
+        ObjectKind::Struct as u16,
+        type_info,
+        &ObjectPayload::Struct(fields),
     )?;
+    publish_committed_data_record(
+        path,
+        stream_id,
+        pack_object_granule_id(PackedGranuleDomain::TStruct, object_id)?,
+        version,
+        PackedGranuleDomain::TStruct as u16,
+        type_info,
+        &object_record,
+    )
+}
+
+/// Publishes one committed global root pointing at a persistent object.
+pub fn publish_committed_global_object_root(
+    path: &Path,
+    stream_id: u32,
+    object_id: u64,
+) -> Result<()> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(
+        &object_id
+            .checked_add(1)
+            .context("object root encoding overflow")?
+            .to_le_bytes(),
+    );
+    publish_committed_data_record(
+        path,
+        stream_id,
+        (PackedGranuleDomain::TGlobal as u64) << 60,
+        1,
+        PackedGranuleDomain::TGlobal as u16,
+        0,
+        &payload,
+    )
+}
+
+fn publish_committed_data_record(
+    path: &Path,
+    stream_id: u32,
+    logical_id: u64,
+    version: u32,
+    kind: u16,
+    type_info: u32,
+    payload: &[u8],
+) -> Result<()> {
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let stream = region.alloc_stream(stream_id)?;
+    let record =
+        TMemory::encode_publication_data_record(logical_id, version, kind, type_info, payload)?;
     let location = region.append_data_record(stream, &record)?;
     let log_block = region.alloc_log_block(stream_id, 0)?;
     let entry = TMemory::publication_log_entry(
@@ -2076,6 +2162,15 @@ pub fn reopen_and_recover_file_backed_region(
                 version: winner.version,
             })
             .collect(),
+        object_winners: recovered
+            .object_winners
+            .into_iter()
+            .map(|winner| TransactionPersistenceRecoveredObjectWinner {
+                object_id: winner.object_id,
+                version: winner.version,
+            })
+            .collect(),
+        root_object_ids: recovered.root_object_ids,
     })
 }
 

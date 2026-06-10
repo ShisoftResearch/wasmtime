@@ -118,9 +118,9 @@ pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredObjectWin
 #[cfg(all(has_virtual_memory, test))]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::recover_region_for_test;
 #[cfg(all(has_virtual_memory, test))]
-pub(crate) use crate::runtime::vm::memory::tmemory::{
-    PackedGranuleDomain, pack_object_granule_id, unpack_object_granule_id,
-};
+pub(crate) use crate::runtime::vm::memory::tmemory::unpack_object_granule_id;
+#[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::{PackedGranuleDomain, pack_object_granule_id};
 pub use crate::runtime::vm::memory::{
     Memory, MemoryBase, RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory,
 };

@@ -377,9 +377,7 @@ pub(crate) fn recover_region_for_test(region: &VMemoryBlockRegion) -> Result<Rec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::transaction::{
-        ObjectPayload, ObjectValue, encode_object_record_for_recovery_test,
-    };
+    use crate::runtime::transaction::{ObjectPayload, ObjectValue, encode_object_record_for_test};
     use crate::runtime::vm::{PackedGranuleDomain, pack_object_granule_id};
 
     #[test]
@@ -647,8 +645,7 @@ mod tests {
     ) {
         let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
         let object_record =
-            encode_object_record_for_recovery_test(object_id, version, type_index, &payload)
-                .unwrap();
+            encode_object_record_for_test(object_id, version, type_index, &payload).unwrap();
         let publication = TMemory::encode_publication_data_record(
             logical_id,
             version,

@@ -13,8 +13,9 @@ mod object_heap;
 #[path = "transaction/persist.rs"]
 mod persist;
 pub(crate) use object_heap::TxObjectHeader;
+pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
-pub(crate) use object_heap::encode_object_record_for_test as encode_object_record_for_recovery_test;
+pub(crate) use object_heap::encode_object_record_for_test;
 pub(crate) use persist::DurableSink;
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -6339,8 +6340,7 @@ mod tests {
             object_id,
             version,
             type_index,
-            encode_object_record_for_recovery_test(object_id, version, type_index, &payload)
-                .unwrap(),
+            encode_object_record_for_test(object_id, version, type_index, &payload).unwrap(),
         )
         .unwrap()
     }
