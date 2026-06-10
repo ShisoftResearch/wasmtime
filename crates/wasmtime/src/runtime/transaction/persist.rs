@@ -1,7 +1,7 @@
 use crate::prelude::*;
-use crate::runtime::vm::TMemory;
 #[cfg(test)]
-use crate::runtime::vm::{PackedGranuleDomain, pack_object_granule_id, unpack_object_granule_id};
+use crate::runtime::vm::unpack_object_granule_id;
+use crate::runtime::vm::{PackedGranuleDomain, TMemory, pack_object_granule_id};
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone)]
@@ -23,6 +23,24 @@ pub(crate) fn encode_data_record(pub_: &PendingPublication) -> Result<Vec<u8>> {
     )
 }
 
+impl PendingPublication {
+    pub(crate) fn persistent_object(
+        domain: PackedGranuleDomain,
+        object_id: u64,
+        version: u32,
+        type_info: u32,
+        payload: Vec<u8>,
+    ) -> Result<Self> {
+        Ok(Self {
+            logical_id: pack_object_granule_id(domain, object_id)?,
+            version,
+            kind: domain as u16,
+            type_info,
+            payload,
+        })
+    }
+}
+
 #[cfg(test)]
 impl PendingPublication {
     fn tmemory_for_test(logical_id: u64, version: u32, payload: &[u8]) -> Self {
@@ -42,13 +60,7 @@ impl PendingPublication {
         type_info: u32,
         payload: &[u8],
     ) -> Self {
-        Self {
-            logical_id: pack_object_granule_id(domain, object_id).unwrap(),
-            version,
-            kind: domain as u16,
-            type_info,
-            payload: payload.to_vec(),
-        }
+        Self::persistent_object(domain, object_id, version, type_info, payload.to_vec()).unwrap()
     }
 }
 

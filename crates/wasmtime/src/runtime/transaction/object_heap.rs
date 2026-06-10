@@ -167,6 +167,17 @@ impl ObjectHeap {
             .read(record.offset, usize::try_from(record.header.record_len)?)
     }
 
+    pub(crate) fn publication_record(
+        &self,
+        handle: TxRecordHandle,
+    ) -> Result<(TxObjectHeader, Vec<u8>)> {
+        let record = self.record(handle)?;
+        let bytes = self
+            .region()?
+            .read(record.offset, usize::try_from(record.header.record_len)?)?;
+        Ok((record.header, bytes))
+    }
+
     pub(crate) fn payload(&self, handle: TxRecordHandle) -> Result<&ObjectPayload> {
         Ok(&self.record(handle)?.payload)
     }
@@ -307,7 +318,13 @@ pub(crate) fn encode_object_record_for_test(
     type_index: u32,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
-    encode_object_record(object_id, version, ObjectKind::Struct as u16, type_index, payload)
+    encode_object_record(
+        object_id,
+        version,
+        ObjectKind::Struct as u16,
+        type_index,
+        payload,
+    )
 }
 
 #[derive(Debug)]

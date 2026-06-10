@@ -835,14 +835,9 @@ impl ObjectTable {
         );
         let type_index = self.live_slot(object_id)?.type_index;
         let record_version = self.bump_record_version()?;
-        let record = self.heap.allocate_record(
-            object_id,
-            record_version,
-            kind,
-            0,
-            type_index,
-            &payload,
-        )?;
+        let record =
+            self.heap
+                .allocate_record(object_id, record_version, kind, 0, type_index, &payload)?;
         let version = self.bump_object_version()?;
         self.slots[index] = Some(ObjectTableSlot {
             kind,
@@ -861,6 +856,26 @@ impl ObjectTable {
                 bail!("object kind does not have a transactional granule yet")
             }
         }
+    }
+
+    fn object_pending_publication(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<persist::PendingPublication> {
+        let handle = self.live_slot(object_id)?.current_record;
+        let (header, payload) = self.heap.publication_record(handle)?;
+        let domain = match object_kind_from_u16(header.kind)? {
+            ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
+            ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
+            other => bail!("object kind {other:?} is not a persistent object granule"),
+        };
+        persist::PendingPublication::persistent_object(
+            domain,
+            header.object_id,
+            header.version,
+            header.type_index,
+            payload,
+        )
     }
 
     pub(crate) fn free(&mut self, object_id: ObjectId) -> Result<bool> {
@@ -922,7 +937,8 @@ impl ObjectTable {
         self.next_version = 0;
         self.next_record_version = 0;
 
-        let mut latest_by_object = BTreeMap::<ObjectId, (object_heap::TxRecordHandle, object_heap::TxObjectHeader)>::new();
+        let mut latest_by_object =
+            BTreeMap::<ObjectId, (object_heap::TxRecordHandle, object_heap::TxObjectHeader)>::new();
         for (handle, header) in self.heap.published_records() {
             let object_id = ObjectId {
                 object_index: header.object_id,
@@ -937,8 +953,12 @@ impl ObjectTable {
         }
 
         if let Some(max_object_id) = latest_by_object.keys().map(|id| id.object_index).max() {
-            let slot_len = usize::try_from(max_object_id.checked_add(1).context("object slot range overflow")?)
-                .context("object slot range does not fit usize")?;
+            let slot_len = usize::try_from(
+                max_object_id
+                    .checked_add(1)
+                    .context("object slot range overflow")?,
+            )
+            .context("object slot range does not fit usize")?;
             self.slots.resize(slot_len, None);
         }
 
@@ -974,6 +994,14 @@ impl ObjectTable {
         object_id: ObjectId,
     ) -> Result<object_heap::TxRecordHandle> {
         Ok(self.live_slot(object_id)?.current_record)
+    }
+
+    #[cfg(test)]
+    fn pending_publication_for_test(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<persist::PendingPublication> {
+        self.object_pending_publication(object_id)
     }
 }
 
@@ -2547,6 +2575,28 @@ impl TransactionState {
         &mut self,
         object_table: &mut ObjectTable,
     ) -> Result<bool> {
+        self.commit_object_payloads_with(object_table, |_| Ok(()))
+    }
+
+    pub(crate) fn commit_object_payloads_into(
+        &mut self,
+        object_table: &mut ObjectTable,
+        pending_publications: &mut Vec<persist::PendingPublication>,
+    ) -> Result<bool> {
+        self.commit_object_payloads_with(object_table, |publication| {
+            pending_publications.push(publication);
+            Ok(())
+        })
+    }
+
+    fn commit_object_payloads_with<F>(
+        &mut self,
+        object_table: &mut ObjectTable,
+        mut publish: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(persist::PendingPublication) -> Result<()>,
+    {
         self.ensure_active()?;
         self.validate_active_object_reads(object_table)?;
         if self.staged_objects.is_empty() {
@@ -2565,6 +2615,7 @@ impl TransactionState {
             .collect::<Result<Vec<_>>>()?;
         for (object_id, payload) in updates {
             object_table.update_payload(object_id, payload)?;
+            publish(object_table.object_pending_publication(object_id)?)?;
         }
         self.staged_objects.clear();
         Ok(true)
@@ -5892,10 +5943,7 @@ mod tests {
             heap.record_len(handle).unwrap()
         );
         assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 17);
-        assert_eq!(
-            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            3
-        );
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 3);
         assert_eq!(
             u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
             ObjectKind::Struct as u16
@@ -5989,6 +6037,34 @@ mod tests {
     }
 
     #[test]
+    fn commit_publishes_struct_object_update() {
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+
+        let pub_ = objects.pending_publication_for_test(object).unwrap();
+        let (domain, object_id) =
+            crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
+        assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TStruct);
+        assert_eq!(object_id, object.object_index);
+        assert_eq!(pub_.version, 1);
+    }
+
+    #[test]
+    fn commit_publishes_array_object_update() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_array(vec![ObjectValue::Ref(None), ObjectValue::I64(9)])
+            .unwrap();
+
+        let pub_ = objects.pending_publication_for_test(object).unwrap();
+        let (domain, object_id) =
+            crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
+        assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TArray);
+        assert_eq!(object_id, object.object_index);
+        assert_eq!(pub_.version, 1);
+    }
+
+    #[test]
     fn object_table_rebuilds_latest_slots_from_heap_publication_metadata() {
         let mut objects = ObjectTable::default();
         let first = objects
@@ -6001,10 +6077,7 @@ mod tests {
         objects
             .update_payload(
                 first,
-                ObjectPayload::Struct(vec![
-                    ObjectValue::I32(2),
-                    ObjectValue::Ref(Some(second)),
-                ]),
+                ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(Some(second))]),
             )
             .unwrap();
 
@@ -6024,7 +6097,10 @@ mod tests {
 
         objects.rebuild_volatile_index_from_heap().unwrap();
 
-        assert_eq!(objects.current_record_handle_for_test(first).unwrap(), first_latest_handle);
+        assert_eq!(
+            objects.current_record_handle_for_test(first).unwrap(),
+            first_latest_handle
+        );
         assert_eq!(
             objects.current_record_handle_for_test(second).unwrap(),
             second_latest_handle
