@@ -60,6 +60,13 @@ Changes in this slice:
 - Added participant collection in the commit path so staged memory granules are
   grouped by owning instance and memory index before durable logging and
   in-place application.
+- Added a file-backed `TxDurableLog` storage variant. It uses the existing
+  block-region layout for data chunks and fixed-size log entries, flushes data
+  and log blocks through the file-backed mmap backend, and can be reopened by
+  recovery to distinguish committed undo records from loose-end rollback
+  records.
+- Extended file-backed recovery summaries to expose recovered `TMemoryUndo`
+  rollback records for tests and later restart integration.
 
 Still deferred:
 
@@ -69,9 +76,12 @@ Still deferred:
 - Full process restart recovery does not yet discover the correct reopened
   `TMemory` instance/backing file and invoke
   `apply_recovered_tmemory_undo_rollbacks`; the apply helper is present.
-- The unified durable stream is still an in-memory research scaffold. A real
-  PMEM/file-backed transaction log manager still needs to replace it at the
-  transaction/store layer for process-restart durability.
+- Ordinary store construction still defaults to the in-memory durable-log
+  variant. The file-backed transaction-log backend exists, but it still needs
+  configuration plumbing and full process-restart dispatch into reopened
+  `TMemory` instances.
+- Hardware-PMEM validation remains future work; the file-backed backend uses
+  `msync`/`sync_data` as the current persistence analogue.
 
 ## Zen-First Object Publication Metadata
 

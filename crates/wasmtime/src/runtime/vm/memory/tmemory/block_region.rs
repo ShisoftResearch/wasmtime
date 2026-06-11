@@ -794,6 +794,8 @@ pub(crate) struct StreamCursor {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StreamState {
+    next_log_block_seq: u32,
+    current_log_block_start: Option<u32>,
     next_data_chunk_seq: u32,
     current_data_chunk_start: Option<u32>,
 }
@@ -960,6 +962,82 @@ impl VMemoryBlockRegion {
             data_block,
             data_offset,
         })
+    }
+
+    pub(crate) fn append_log_entry(
+        &mut self,
+        stream: StreamCursor,
+        entry: TxLogEntry,
+    ) -> Result<u32> {
+        let mut state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+
+        let log_block = if let Some(start_block) = state.current_log_block_start {
+            let header = self.log_block_header(start_block)?;
+            if usize::try_from(header.entry_count)
+                .context("transactional log entry count overflow")?
+                < self.log_entry_capacity()
+            {
+                start_block
+            } else {
+                let next_block =
+                    self.alloc_log_block(stream.stream_id, state.next_log_block_seq)?;
+                let mut previous = header;
+                previous.next_block = next_block;
+                self.write_log_block_header(start_block, previous)?;
+                state.next_log_block_seq = state
+                    .next_log_block_seq
+                    .checked_add(1)
+                    .context("transactional log block sequence overflow")?;
+                state.current_log_block_start = Some(next_block);
+                next_block
+            }
+        } else {
+            let start_block = self.alloc_log_block(stream.stream_id, state.next_log_block_seq)?;
+            state.next_log_block_seq = state
+                .next_log_block_seq
+                .checked_add(1)
+                .context("transactional log block sequence overflow")?;
+            state.current_log_block_start = Some(start_block);
+            start_block
+        };
+
+        let mut header = self.log_block_header(log_block)?;
+        let entry_index = usize::try_from(header.entry_count)
+            .context("transactional log entry count overflow")?;
+        ensure!(
+            entry_index < self.log_entry_capacity(),
+            "transactional log block is full"
+        );
+        let write_offset = self
+            .block_offset(log_block)?
+            .checked_add(size_of::<LogBlockHeader>())
+            .and_then(|offset| offset.checked_add(entry_index * size_of::<TxLogEntry>()))
+            .context("transactional log entry write offset overflow")?;
+        self.write(write_offset, &encode_tx_log_entry(entry))?;
+        header.entry_count = header
+            .entry_count
+            .checked_add(1)
+            .context("transactional log entry count overflow")?;
+        self.write_log_block_header(log_block, header)?;
+        self.streams.insert(stream.stream_id, state);
+
+        Ok(log_block)
+    }
+
+    pub(crate) fn flush_data_chunk(&self, chunk_start_block: u32) -> Result<()> {
+        let header = self.data_chunk_header(chunk_start_block)?;
+        let chunk_blocks = usize::try_from(header.chunk_blocks)
+            .context("transactional data chunk block count overflow")?;
+        let flush_len = chunk_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional data chunk flush length overflow")?;
+        self.flush(self.block_offset(chunk_start_block)?, flush_len)
+    }
+
+    pub(crate) fn flush_log_block(&self, log_block: u32) -> Result<()> {
+        self.flush(self.block_offset(log_block)?, BLOCK_SIZE)
     }
 
     pub(crate) fn log_block_header(&self, start_block: u32) -> Result<LogBlockHeader> {
@@ -1148,6 +1226,10 @@ impl VMemoryBlockRegion {
             "transactional data chunk tail exceeds chunk capacity"
         );
         Ok(capacity - tail)
+    }
+
+    fn log_entry_capacity(&self) -> usize {
+        (BLOCK_SIZE - size_of::<LogBlockHeader>()) / size_of::<TxLogEntry>()
     }
 
     fn block_offset(&self, block: u32) -> Result<usize> {
@@ -1617,6 +1699,82 @@ impl FileBackedMemoryBlockRegion {
         })
     }
 
+    pub(crate) fn append_log_entry(
+        &mut self,
+        stream: StreamCursor,
+        entry: TxLogEntry,
+    ) -> Result<u32> {
+        let mut state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+
+        let log_block = if let Some(start_block) = state.current_log_block_start {
+            let header = self.log_block_header(start_block)?;
+            if usize::try_from(header.entry_count)
+                .context("transactional log entry count overflow")?
+                < self.log_entry_capacity()
+            {
+                start_block
+            } else {
+                let next_block =
+                    self.alloc_log_block(stream.stream_id, state.next_log_block_seq)?;
+                let mut previous = header;
+                previous.next_block = next_block;
+                self.write_log_block_header(start_block, previous)?;
+                state.next_log_block_seq = state
+                    .next_log_block_seq
+                    .checked_add(1)
+                    .context("transactional log block sequence overflow")?;
+                state.current_log_block_start = Some(next_block);
+                next_block
+            }
+        } else {
+            let start_block = self.alloc_log_block(stream.stream_id, state.next_log_block_seq)?;
+            state.next_log_block_seq = state
+                .next_log_block_seq
+                .checked_add(1)
+                .context("transactional log block sequence overflow")?;
+            state.current_log_block_start = Some(start_block);
+            start_block
+        };
+
+        let mut header = self.log_block_header(log_block)?;
+        let entry_index = usize::try_from(header.entry_count)
+            .context("transactional log entry count overflow")?;
+        ensure!(
+            entry_index < self.log_entry_capacity(),
+            "transactional log block is full"
+        );
+        let write_offset = self
+            .block_offset(log_block)?
+            .checked_add(size_of::<LogBlockHeader>())
+            .and_then(|offset| offset.checked_add(entry_index * size_of::<TxLogEntry>()))
+            .context("transactional log entry write offset overflow")?;
+        self.write(write_offset, &encode_tx_log_entry(entry))?;
+        header.entry_count = header
+            .entry_count
+            .checked_add(1)
+            .context("transactional log entry count overflow")?;
+        self.write_log_block_header(log_block, header)?;
+        self.streams.insert(stream.stream_id, state);
+
+        Ok(log_block)
+    }
+
+    pub(crate) fn flush_data_chunk(&self, chunk_start_block: u32) -> Result<()> {
+        let header = self.data_chunk_header(chunk_start_block)?;
+        let chunk_blocks = usize::try_from(header.chunk_blocks)
+            .context("transactional data chunk block count overflow")?;
+        let flush_len = chunk_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional data chunk flush length overflow")?;
+        self.flush(self.block_offset(chunk_start_block)?, flush_len)
+    }
+
+    pub(crate) fn flush_log_block(&self, log_block: u32) -> Result<()> {
+        self.flush(self.block_offset(log_block)?, BLOCK_SIZE)
+    }
+
     pub(crate) fn log_block_header(&self, start_block: u32) -> Result<LogBlockHeader> {
         LogBlockHeader::from_bytes(
             self.read_header_bytes(start_block, size_of::<LogBlockHeader>())?,
@@ -1627,6 +1785,10 @@ impl FileBackedMemoryBlockRegion {
         DataChunkHeader::from_bytes(
             self.read_header_bytes(start_block, size_of::<DataChunkHeader>())?,
         )
+    }
+
+    fn log_entry_capacity(&self) -> usize {
+        (BLOCK_SIZE - size_of::<LogBlockHeader>()) / size_of::<TxLogEntry>()
     }
 
     pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -1746,13 +1908,26 @@ impl FileBackedMemoryBlockRegion {
         self.mark_blocks_used(0, 1)?;
 
         let mut chunk_tails = BTreeMap::<u32, (u32, u32)>::new();
+        let mut log_tails = BTreeMap::<u32, (u32, u32)>::new();
         let mut block = 1usize;
         while block < self.num_blocks() {
             let start_block = u32::try_from(block).context("transactional block index overflow")?;
             match self.block_magic(start_block)? {
                 LOG_BLOCK_MAGIC => {
-                    self.log_block_header(start_block)?;
+                    let header = self.log_block_header(start_block)?;
                     self.mark_blocks_used(block, 1)?;
+                    let state = self.streams.entry(header.stream_id).or_default();
+                    let next_log_seq = header
+                        .block_seq
+                        .checked_add(1)
+                        .context("transactional log block sequence overflow")?;
+                    state.next_log_block_seq = state.next_log_block_seq.max(next_log_seq);
+                    match log_tails.get(&header.stream_id) {
+                        Some((current_seq, _)) if *current_seq >= header.block_seq => {}
+                        _ => {
+                            log_tails.insert(header.stream_id, (header.block_seq, start_block));
+                        }
+                    }
                     block += 1;
                 }
                 DATA_CHUNK_MAGIC => {
@@ -1793,6 +1968,12 @@ impl FileBackedMemoryBlockRegion {
                 .entry(stream_id)
                 .or_default()
                 .current_data_chunk_start = Some(start_block);
+        }
+        for (stream_id, (_, start_block)) in log_tails {
+            self.streams
+                .entry(stream_id)
+                .or_default()
+                .current_log_block_start = Some(start_block);
         }
 
         Ok(())
@@ -1987,6 +2168,18 @@ pub struct TransactionPersistenceRecoveredObjectWinner {
     pub version: u32,
 }
 
+/// Narrow recovered linear-memory undo rollback summary exported for
+/// file-backed persistence tests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionPersistenceRecoveredTMemoryUndoRollback {
+    /// Logical tmemory granule identifier selected for rollback.
+    pub logical_id: u64,
+    /// Undo-record version selected for rollback.
+    pub version: u32,
+    /// Old committed granule bytes that should be restored.
+    pub old_granule_bytes: Vec<u8>,
+}
+
 /// Narrow recovered-region summary exported for file-backed persistence tests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionPersistenceRecoveredRegion {
@@ -1996,6 +2189,8 @@ pub struct TransactionPersistenceRecoveredRegion {
     pub object_winners: Vec<TransactionPersistenceRecoveredObjectWinner>,
     /// Persistent object ids recovered from root-bearing globals/tables.
     pub root_object_ids: Vec<u64>,
+    /// TMemory undo records from transactions that did not publish LP.
+    pub tmemory_undo_rollbacks: Vec<TransactionPersistenceRecoveredTMemoryUndoRollback>,
 }
 
 /// Creates a file-backed durable region image for restart smoke tests.
@@ -2171,6 +2366,17 @@ pub fn reopen_and_recover_file_backed_region(
             })
             .collect(),
         root_object_ids: recovered.root_object_ids,
+        tmemory_undo_rollbacks: recovered
+            .tmemory_undo_rollbacks
+            .into_iter()
+            .map(
+                |rollback| TransactionPersistenceRecoveredTMemoryUndoRollback {
+                    logical_id: rollback.logical_id,
+                    version: rollback.version,
+                    old_granule_bytes: rollback.old_granule_bytes,
+                },
+            )
+            .collect(),
     })
 }
 

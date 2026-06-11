@@ -4,8 +4,9 @@ use crate::runtime::vm::unpack_object_granule_id;
 use crate::runtime::vm::{
     PackedGranuleDomain, TMemory, TxLogEntry, TxLogEntryRole, pack_object_granule_id,
 };
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingPublication {
@@ -124,8 +125,19 @@ pub(crate) trait DurableSink {
     fn fence(&mut self) -> Result<()>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TxDurableLog {
+    storage: TxDurableLogStorage,
+}
+
+#[derive(Debug)]
+enum TxDurableLogStorage {
+    InMemory(InMemoryTxDurableLog),
+    FileBacked(FileBackedTxDurableLog),
+}
+
+#[derive(Debug, Default)]
+struct InMemoryTxDurableLog {
     streams: BTreeMap<u32, TxDurableStreamState>,
 }
 
@@ -136,14 +148,29 @@ struct TxDurableStreamState {
     next_data_block: u32,
 }
 
+#[derive(Debug)]
+struct FileBackedTxDurableLog {
+    region: crate::runtime::vm::block_region::FileBackedMemoryBlockRegion,
+    streams: BTreeMap<u32, crate::runtime::vm::block_region::StreamCursor>,
+    pending_data_chunks: BTreeSet<u32>,
+    pending_log_blocks: BTreeSet<u32>,
+}
+
 pub(crate) struct TxDurableLogSink<'a> {
     log: &'a mut TxDurableLog,
     stream_id: u32,
 }
 
+impl Default for TxDurableLog {
+    fn default() -> Self {
+        Self {
+            storage: TxDurableLogStorage::InMemory(InMemoryTxDurableLog::default()),
+        }
+    }
+}
+
 impl TxDurableLog {
     pub(crate) fn stream_sink(&mut self, stream_id: u32) -> TxDurableLogSink<'_> {
-        self.streams.entry(stream_id).or_default();
         TxDurableLogSink {
             log: self,
             stream_id,
@@ -151,28 +178,110 @@ impl TxDurableLog {
     }
 
     fn stream_state_mut(&mut self, stream_id: u32) -> &mut TxDurableStreamState {
-        self.streams.entry(stream_id).or_default()
+        match &mut self.storage {
+            TxDurableLogStorage::InMemory(log) => log.streams.entry(stream_id).or_default(),
+            TxDurableLogStorage::FileBacked(_) => {
+                unreachable!("file-backed transaction log does not use in-memory stream state")
+            }
+        }
+    }
+
+    fn file_backed_stream_cursor(
+        log: &mut FileBackedTxDurableLog,
+        stream_id: u32,
+    ) -> Result<crate::runtime::vm::block_region::StreamCursor> {
+        if let Some(stream) = log.streams.get(&stream_id).copied() {
+            return Ok(stream);
+        }
+        let stream = log.region.alloc_stream(stream_id)?;
+        log.streams.insert(stream_id, stream);
+        Ok(stream)
     }
 
     #[cfg(test)]
     pub(crate) fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry> {
-        self.streams
-            .get(&stream_id)
-            .map(|stream| stream.log_entries.clone())
-            .unwrap_or_default()
+        match &self.storage {
+            TxDurableLogStorage::InMemory(log) => log
+                .streams
+                .get(&stream_id)
+                .map(|stream| stream.log_entries.clone())
+                .unwrap_or_default(),
+            TxDurableLogStorage::FileBacked(log) => {
+                let mut entries = Vec::new();
+                let view = log.region.view();
+                for block in 1..view.num_blocks() {
+                    let Ok(block) = u32::try_from(block) else {
+                        break;
+                    };
+                    let Ok(header) = view.log_block_header(block) else {
+                        continue;
+                    };
+                    if header.stream_id == stream_id {
+                        if let Ok(block_entries) = view.log_block_entries(block) {
+                            entries.extend(block_entries);
+                        }
+                    }
+                }
+                entries
+            }
+        }
+    }
+
+    pub(crate) fn create_file_backed(path: &Path, num_blocks: u32) -> Result<Self> {
+        let region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(
+                path, num_blocks,
+            )?;
+        Ok(Self::from_file_backed_region(region))
+    }
+
+    pub(crate) fn open_file_backed(path: &Path) -> Result<Self> {
+        let region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
+        Ok(Self::from_file_backed_region(region))
+    }
+
+    fn from_file_backed_region(
+        region: crate::runtime::vm::block_region::FileBackedMemoryBlockRegion,
+    ) -> Self {
+        Self {
+            storage: TxDurableLogStorage::FileBacked(FileBackedTxDurableLog {
+                region,
+                streams: BTreeMap::new(),
+                pending_data_chunks: BTreeSet::new(),
+                pending_log_blocks: BTreeSet::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recover_file_backed_for_test(
+        path: &Path,
+    ) -> Result<crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion> {
+        crate::runtime::vm::block_region::reopen_and_recover_file_backed_region(path)
     }
 }
 
 impl DurableSink for TxDurableLogSink<'_> {
     fn append_data_record(&mut self, record: &[u8]) -> Result<(u32, u32)> {
-        let state = self.log.stream_state_mut(self.stream_id);
-        state.data_records.push(record.to_vec());
-        let data_block = state.next_data_block;
-        state.next_data_block = state
-            .next_data_block
-            .checked_add(1)
-            .context("transaction durable data block overflow")?;
-        Ok((data_block, 0))
+        match &mut self.log.storage {
+            TxDurableLogStorage::InMemory(log) => {
+                let state = log.streams.entry(self.stream_id).or_default();
+                state.data_records.push(record.to_vec());
+                let data_block = state.next_data_block;
+                state.next_data_block = state
+                    .next_data_block
+                    .checked_add(1)
+                    .context("transaction durable data block overflow")?;
+                Ok((data_block, 0))
+            }
+            TxDurableLogStorage::FileBacked(log) => {
+                let stream = TxDurableLog::file_backed_stream_cursor(log, self.stream_id)?;
+                let location = log.region.append_data_record(stream, record)?;
+                log.pending_data_chunks.insert(location.chunk_start_block);
+                Ok((location.data_block, location.data_offset))
+            }
+        }
     }
 
     fn append_log_entry(
@@ -185,7 +294,6 @@ impl DurableSink for TxDurableLogSink<'_> {
         is_final: bool,
         role: TxLogEntryRole,
     ) -> Result<()> {
-        let state = self.log.stream_state_mut(self.stream_id);
         let mut entry = TMemory::publication_log_entry(
             logical_id,
             version,
@@ -196,20 +304,50 @@ impl DurableSink for TxDurableLogSink<'_> {
         );
         entry.set_role(role);
         entry.seal_crc32();
-        state.log_entries.push(entry);
-        Ok(())
+        match &mut self.log.storage {
+            TxDurableLogStorage::InMemory(log) => {
+                let state = log.streams.entry(self.stream_id).or_default();
+                state.log_entries.push(entry);
+                Ok(())
+            }
+            TxDurableLogStorage::FileBacked(log) => {
+                let stream = TxDurableLog::file_backed_stream_cursor(log, self.stream_id)?;
+                let log_block = log.region.append_log_entry(stream, entry)?;
+                log.pending_log_blocks.insert(log_block);
+                Ok(())
+            }
+        }
     }
 
     fn flush_data(&mut self) -> Result<()> {
-        Ok(())
+        match &mut self.log.storage {
+            TxDurableLogStorage::InMemory(_) => Ok(()),
+            TxDurableLogStorage::FileBacked(log) => {
+                for chunk in core::mem::take(&mut log.pending_data_chunks) {
+                    log.region.flush_data_chunk(chunk)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn flush_log(&mut self) -> Result<()> {
-        Ok(())
+        match &mut self.log.storage {
+            TxDurableLogStorage::InMemory(_) => Ok(()),
+            TxDurableLogStorage::FileBacked(log) => {
+                for block in core::mem::take(&mut log.pending_log_blocks) {
+                    log.region.flush_log_block(block)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn fence(&mut self) -> Result<()> {
-        Ok(())
+        match &mut self.log.storage {
+            TxDurableLogStorage::InMemory(_) => Ok(()),
+            TxDurableLogStorage::FileBacked(log) => log.region.fence(),
+        }
     }
 }
 
@@ -595,6 +733,96 @@ mod tests {
             1
         );
         assert!(entries.iter().all(TxLogEntry::validate_crc32));
+    }
+
+    #[test]
+    fn file_backed_transaction_log_recovers_committed_tmemory_undo_as_no_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let first = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
+        let second = PendingGranuleUndo::tmemory(0x1000_0000_1000_002a, 8, vec![5, 6, 7, 8]);
+
+        let final_marker = {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&first)
+                .unwrap();
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&second)
+                .unwrap()
+        };
+        {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher.publish_commit_lp(final_marker).unwrap();
+        }
+        drop(log);
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+        assert!(recovered.tmemory_undo_rollbacks.is_empty());
+    }
+
+    #[test]
+    fn file_backed_transaction_log_recovers_loose_tmemory_undo_as_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
+
+        {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap();
+        }
+        drop(log);
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+        assert_eq!(
+            recovered.tmemory_undo_rollbacks[0].old_granule_bytes,
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn file_backed_transaction_log_reopens_and_appends_to_existing_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let first = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
+        {
+            let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&first)
+                .unwrap();
+        }
+
+        let second = PendingGranuleUndo::tmemory(0x1000_0000_1000_002a, 8, vec![5, 6, 7, 8]);
+        {
+            let mut log = TxDurableLog::open_file_backed(&path).unwrap();
+            let final_marker = {
+                let mut sink = log.stream_sink(13);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+                publisher
+                    .publish_tmemory_undo_before_in_place_write(&second)
+                    .unwrap()
+            };
+            let mut sink = log.stream_sink(13);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+            publisher.publish_commit_lp(final_marker).unwrap();
+        }
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+        assert_eq!(
+            recovered.tmemory_undo_rollbacks[0].old_granule_bytes,
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[test]

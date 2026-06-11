@@ -463,17 +463,22 @@ persistent `tmemory` undo entries. `TMemory` does not own transaction log
 streams; it is a participant that can prepare undo records from committed
 bytes, apply staged granules in place through its backend, and rely on the
 backend commit path to flush/fence persistent data writes. `TransactionState`
-owns the current in-memory durable-log scaffold. During commit, the transaction
-layer appends all persistent `TMemoryUndo` records into that stream before any
+owns the unified durable-log object. During commit, the transaction layer
+appends all persistent `TMemoryUndo` records into that stream before any
 persistent in-place memory write, applies every touched `tmemory` participant,
 and then publishes one LP marker for the whole transaction.
 
 This removes the earlier conservative rejection for transactions that touch
-more than one persistent `tmemory` participant. The remaining limitation is
-storage durability, not commit semantics: the current unified stream is still
-an in-memory research scaffold. The later PMEM/file-backed durable log manager
-should replace that scaffold at the transaction/store layer without moving log
-ownership back into `TMemory`.
+more than one persistent `tmemory` participant. The durable-log owner now has
+two storage variants: the original in-memory research scaffold and a
+file-backed block-region sink that writes data chunks and fixed-size log
+entries through the existing region layout, flushes them with
+`msync`/`sync_data`, and can be scanned by restart recovery. The remaining
+runtime limitation is selection and integration: ordinary store construction
+still defaults to the in-memory variant until transaction-log backing is wired
+through configuration. Future hardware-PMEM validation should replace the
+file-backed flush analogue with CLWB/SFENCE-backed storage at the same
+transaction/store boundary, without moving log ownership back into `TMemory`.
 
 ## Copy-On-Write Workspace
 
