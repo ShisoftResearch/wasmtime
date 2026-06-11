@@ -1,6 +1,7 @@
 # Transactional Wasm Runtime Core Design
 
 Date: 2026-06-04
+Last updated: 2026-06-11
 
 ## Feature Switch Policy
 
@@ -20,19 +21,23 @@ spectest helpers, and WAST harness transaction-proposal support.
 Replace the current mock transaction runtime with a Wizard-style runtime core for
 Wasmtime, then extend it into a transactional persistent object system. This
 design keeps ordinary Wasmtime memory and ordinary Wasmtime GC unchanged, and
-puts transactional persistence behind separate transaction memory, object-table,
-object-heap, and persistent-reachability components.
+puts transactional persistence behind separate transactional memory,
+transactional object heap, volatile recovery-time object index, durable
+log/data publication, and persistent-reachability components.
 
 The executable runtime core includes:
 
 - `tfunc` transaction entry and exit semantics.
-- `VMemory`-backed `tmemory` separate from ordinary Wasmtime `memory`.
+- `tmemory` separate from ordinary Wasmtime `memory`, with `VMemory`,
+  PMEM-shaped `NVMemory`, and explicit `FileBackedMemory` backends.
 - Per-transaction copy-on-write workspace.
 - Wizard-style `GranuleId` ownership.
 - Configurable transaction runtime shape with `LockBased` as the first
   implementation.
 - Transactional table/global/memory runtime paths using `TTable`, `TTableSize`,
   `TGlobal`, `TMemory`, and `TMemorySize` granule ownership.
+- Real text parsing/lowering/runtime coverage for the current
+  `simple-transactions` proposal WAST tranche.
 
 The persistent object direction adds:
 
@@ -40,14 +45,18 @@ The persistent object direction adds:
 - `ObjectId` as the persistent identity for transactional function objects and
   persistent function references.
 - A persistent transactional object heap separate from ordinary Wasmtime GC.
+- A volatile object table/index that is rebuilt from committed object log
+  winners during recovery, rather than a persisted object-table log.
 - Backend object records with explicit object headers.
+- Zen-style fixed-size transaction log entries plus append-only variable data
+  records for `tmemory`, globals, tables, and object records.
 - Commit-time promotion from transaction-local volatile objects into persistent
   objects when persistent reachability requires it.
 - Persistent reachability over durable roots and `ObjectId` edges.
 
-`ttry` and `tfail` are intentionally deferred to a later workstream. They stay
-out of the first real runtime core except where existing tests remain disabled
-or explicitly marked as pending.
+`ttry` and `tfail` now have an executable structured-failure path for the current
+WAST tranche, but they remain a later cleanup workstream for proposal-complete
+semantics and diagnostics.
 
 ## Source Of Truth
 
@@ -72,24 +81,31 @@ Important Wizard behavior observed for this design:
 - Lock-based concurrency supports optimistic reads and pessimistic writes.
 - Transaction abort releases ownership and discards uncommitted data.
 
-Additional design clarification from Eliot Moss, June 5, 2026:
+Storage clarification from Eliot Moss, June 5, 2026:
 
 - Persistent storage is organized as a region of fixed-size aligned blocks.
   Blocks are grouped into chunks, where each chunk is a contiguous run of one
   or more blocks.
-- The persistent object heap, persistent object table, and persistent linear
-  memories are separate logical consumers of the same block/chunk storage
-  substrate.
+- The persistent object heap and persistent linear memories are separate logical
+  consumers of the same block/chunk storage substrate.
 - A linear `tmemory` is physically backed by a possibly discontiguous chunk
   list, but it is mapped into one contiguous virtual address reservation for
   the running VM.
-- The persistent object table is also physically chunk-backed and virtually
-  contiguous, so `ObjectId` can index directly into the table. DRAM object-table
-  space can use large anonymous mmap reservations with inaccessible gaps for
-  shared non-transactional objects and transaction-local objects.
 - `ObjectId` is the granule identity for object-model transaction conflicts,
   together with the fact that the granule is an object rather than a linear
   memory, table, or other object space.
+
+Later Zen-style persistence clarification:
+
+- The default recovery model does not persist an object table. Persistent
+  object updates go through the ordinary transaction log/data publication path,
+  and recovery rebuilds the volatile object table/index from committed object
+  winners.
+- `ObjectId` remains persistent identity because it is stored in each object
+  record header and embedded in object granule logical ids.
+- A persistent object-table or persistent-index mode may be added behind a
+  separate future feature/configuration switch if recovery time proves too
+  expensive, but it is not the default branch direction.
 
 ## Transaction Boundaries
 
@@ -112,6 +128,13 @@ ordinary functions. Validation should reject mismatches when enough metadata is
 available; runtime checks should remain defensive.
 
 ## Active Transaction Requirement
+
+Runtime transaction state is store-local and mirrored in a thread-local current
+transaction id. A normal execution thread processes at most one active
+transaction at a time. The spectest conflict helpers may suspend and restore
+transaction workspaces to model multiple transaction ids in one test thread,
+but production execution should keep the one-thread/one-active-transaction
+invariant.
 
 All transaction-prefixed object and memory operations require an active
 transaction:
@@ -140,20 +163,43 @@ shared block/chunk region layer that can back multiple logical consumers:
 
 - `TMemoryRegion` for linear transactional memories.
 - `ObjectHeapRegion` for transactional Wasm heap objects.
-- `ObjectTableRegion` for persistent object-table entries.
+- Durable log streams for fixed-size transaction log entries.
+- Durable data streams for append-only variable-size data records.
 - Future transactional table, element, data, and minor runtime-state regions.
+- Optional future `ObjectTableRegion` only if a persistent-index mode is added.
 
 A region is divided into fixed-size aligned blocks. A chunk is a contiguous run
-of blocks. Block size is a backend policy. The first Wasmtime implementation
-should copy Wizard's x86-64 Immix region default of 512 KiB blocks. That is a
-multiple of the 64 KiB Wasm page size and sits within Eliot's suggested
-256 KiB to 1 MiB range. A chunk list records the logical order in which chunks
-make up a higher-level region.
+of blocks. All blocks in a region use the same fixed size to avoid
+fragmentation between region users. The first Wasmtime implementation copies
+Wizard's x86-64 Immix region default of 512 KiB blocks. That is a multiple of
+the 64 KiB Wasm page size and sits within Eliot's suggested 256 KiB to 1 MiB
+range. A chunk list records the logical order in which chunks make up a
+higher-level region.
 
-The first volatile backend may implement the same shape with anonymous mmap
-rather than durable storage. `FileBackedMemory` and `NVMemory` later replace
-the allocation and flush/fence behavior without changing the logical region
-frontends.
+Blocks are allocated from a global block allocator. Transaction log and data
+streams are thread-local at execution time, but they do not own fixed lanes:
+threads request log/data blocks from the global allocator, and blocks from
+ended threads can return to a global free list. Recovery recomputes allocator
+tail/free knowledge from chunk-start scans and committed log records instead of
+persisting allocator counters just to reduce recovery work.
+
+Chunks are contiguous runs of one or more blocks. The first block of a chunk is
+the chunk-start block and carries the chunk header. Continuation blocks in the
+same chunk are raw payload blocks and do not repeat the chunk header. Recovery
+scans chunk-start blocks, not every continuation block. Stream replay should be
+structured so independent streams can be replayed in parallel.
+
+Data records are dispatched by payload size:
+
+- small records: multiple records packed into one data block/chunk
+- medium records: one or more records within a block-sized chunk
+- large records: one record spanning a multi-block chunk
+
+Log entries are fixed size and never require multi-block records.
+
+The volatile backend implements the same shape with anonymous mmap. `NVMemory`
+and `FileBackedMemory` replace allocation flush/fence behavior without changing
+the logical region frontends.
 
 ### Wizard Region Layout To Copy
 
@@ -184,12 +230,17 @@ Ordinary Wasmtime `memory` remains unchanged. `tmemory` uses its own storage
 path.
 
 The runtime defines a `TMemoryRegion` frontend over the shared block/chunk
-storage layer. The first implemented backend is `VMemory`, an anonymous
-mmap-backed volatile block region. The first persistent backend should be
-`NVMemory`, not `FileBackedMemory`: it uses the same block/chunk shape but
-publishes committed ranges through a PMEM-style flush/fence path based on CLWB
-and SFENCE on supported x86-64 systems. `FileBackedMemory` remains a later
-compatibility backend.
+storage layer. Current backend roles are:
+
+- `VMemory`: default volatile anonymous-mmap block/chunk storage with no-op
+  flush/fence behavior.
+- `NVMemory`: PMEM-shaped block/chunk storage. In
+  `ResearchPretendPmem` mode it runs on ordinary mapped storage while preserving
+  the PMEM publication shape; in `RequireHardwarePmem` mode it requires the
+  target flush implementation, currently x86-64 `CLWB` plus `SFENCE`.
+- `FileBackedMemory`: explicit filesystem-backed storage using a shared
+  writable mapping, `msync(MS_SYNC)` for range flush, and `File::sync_data()`
+  or `File::sync_all()` as the fence/metadata durability analogue.
 
 A linear `tmemory` is physically backed by a possibly discontiguous chunk list.
 For execution, it reserves a contiguous virtual address range for the running
@@ -198,7 +249,7 @@ research target. Unused virtual space remains inaccessible. Active chunks are
 mapped read-write into their logical offsets inside that reservation, so
 compiled code and runtime helpers still see a contiguous linear memory.
 
-The `TMemoryRegion` frontend must support:
+The `TMemoryRegion` frontend supports:
 
 - current byte length and page length
 - capacity and grow
@@ -207,17 +258,152 @@ The `TMemoryRegion` frontend must support:
 - resolving granule metadata for ownership and version checks
 - mapping a chunk list into the linear virtual reservation
 - growing by attaching or allocating additional chunks
+- backend-specific range flush and fence hooks
 
 The frontend must not encode a specific persistence model. `VMemory`,
 `FileBackedMemory`, and `NVMemory` should be interchangeable behind the shared
 block-region API.
 
 `NVMemory` is allowed to run in a research mode on ordinary mapped storage while
-still executing the PMEM-shaped persistence protocol. Tests that require actual
-power-fail persistence or post-restart recovery stay ignored or gated until a
-real PMEM machine is available. See
-`docs/shisoft/transactional-wasm-nvmemory-pmem-design.md` for the detailed
-backend design.
+still executing the PMEM-shaped persistence protocol. `FileBackedMemory` is the
+filesystem analogue, not a PMEM replacement. Tests that require actual
+power-fail persistence, real PMEM media, or restart recovery stay ignored or
+environment-gated until the required durable metadata and hardware are
+available. See:
+
+- `docs/shisoft/transactional-wasm-nvmemory-pmem-design.md`
+- `docs/shisoft/transactional-wasm-file-backed-memory-design.md`
+
+## Durable Log And Data Records
+
+Durable publication uses two append-only surfaces:
+
+- Fixed-size log entries for recovery scanning and transaction commit
+  recognition.
+- Variable-size data records for object/granule payload bytes.
+
+The log is unified across granule domains. `tmemory`, `tglobal`, `ttable`,
+`TStruct`, and `TArray` updates all publish through the same transaction log
+entry shape, distinguished by packed logical ids. Object metadata does not have
+a separate object-table log in the default Zen-style mode.
+
+Durable region metadata is block-derived, not byte-derived. Persistent headers
+store block counts and block indices as `u32` values because block size is fixed
+inside a region. This keeps the on-media headers compact while allowing large
+regions without treating every offset as a byte address. The no-next sentinel is
+`u32::MAX`.
+
+The current durable headers are:
+
+```rust
+#[repr(C)]
+struct RegionHeader {
+    magic: u32,
+    block_size: u32,
+    num_blocks: u32,
+    block_table_start_block: u32,
+    block_table_block_count: u32,
+    metadata_descs_start_block: u32,
+    metadata_descs_block_count: u32,
+    num_descs: u32,
+}
+
+#[repr(C)]
+struct LogBlockHeader {
+    magic: u32,
+    stream_id: u32,
+    block_seq: u32,
+    next_block: u32,
+    entry_count: u32,
+}
+
+#[repr(C)]
+struct DataChunkHeader {
+    magic: u32,
+    stream_id: u32,
+    chunk_seq: u32,
+    next_chunk: u32,
+    chunk_blocks: u32,
+    tail_block_delta: u32,
+    tail_in_block: u32,
+}
+```
+
+`block_seq` is kept for validation during recovery. `tail_block_delta` and
+`tail_in_block` are recomputed/validated from data-chunk append state and do
+not imply a globally persisted allocator cursor.
+
+Each logical version is represented by one data record and one log entry. The
+commit sequence is:
+
+1. Append all data records.
+2. Flush data.
+3. Fence.
+4. Append ordinary log entries.
+5. Flush log.
+6. Append the final log entry with the LP bit set.
+7. Flush log.
+8. Fence.
+
+The final LP bit is enough for commit recognition. Recovery treats the first
+appearance of a transaction id in a stream as transaction begin. Loose entries
+without an LP are aborted. Because each thread writes to its own stream, a
+sudden transaction-id change in one stream before LP also terminates the
+previous transaction as aborted.
+
+`TxLogEntry` is fixed at 32 bytes and aligned to 32 bytes, so two entries fit in
+one 64-byte cache line:
+
+```rust
+#[repr(C, align(32))]
+struct TxLogEntry {
+    logical_id: u64,
+    version: u32,
+    tx_meta: u32,
+    data_block: u32,
+    data_offset: u32,
+    crc32: u32,
+    reserved: u32,
+}
+```
+
+`data_block` is a block index and `data_offset` is an offset within that block.
+`tx_meta` bit 0 is LP. The remaining bits carry the transaction id in the
+current implementation (`txid << 1`). Log entries carry CRC32 because recovery
+scans them directly and must reject torn or corrupt entries. Data records do
+not carry a checksum in this design: they are not scanned independently, and
+their completeness is guaranteed by data-before-log ordering, flushes, fences,
+and LP publication. Data corruption detection is left to future storage-layer
+integrity work.
+
+`TxDataRecordHeader` is a minimal 24-byte prefix before each data payload:
+
+```rust
+#[repr(C)]
+struct TxDataRecordHeader {
+    logical_id: u64,
+    version: u32,
+    kind: u16,
+    reserved: u16,
+    payload_len: u32,
+    type_info: u32,
+}
+```
+
+`kind` mirrors the packed granule domain and is just large enough for the
+transactional granule/object kinds. `reserved` intentionally replaces an
+earlier flag field; no format-version field is stored because this research
+branch does not need backward-compatible on-media formats yet.
+
+`version` is `u32` in durable log/data records and object records. Recovery
+chooses the highest committed version for each logical id. Duplicate committed
+versions for the same logical id are corruption. A higher-version delete entry
+will beat older live entries when deletion is designed with GC; deletion is not
+implemented in the current object workstream.
+
+Recovery discovers streams by scanning chunk-start blocks, validates log-entry
+CRC32 values, replays each stream, and merges winners by logical id. Stream
+replay should stay pure enough that streams can be rebuilt in parallel.
 
 ## Copy-On-Write Workspace
 
@@ -246,10 +432,11 @@ ownership for every affected granule, then write into the transaction
 workspace.
 
 Commit copies staged memory granules into committed `tmemory`, publishes staged
-object-table slot updates, and releases ownership. Object commit must complete
-promotion of any transaction-local volatile objects before publishing persistent
-object records. Abort discards the workspace, drops uncommitted object records,
-and releases ownership without copying bytes.
+object records through `PendingPublication`/durable log entries when a durable
+backend is active, updates the volatile object index, and releases ownership.
+Object commit must complete promotion of any transaction-local volatile objects
+before publishing persistent object records. Abort discards the workspace,
+drops uncommitted object records, and releases ownership without copying bytes.
 
 `tmemory.grow` grows committed storage immediately and is not rolled back on
 abort. The grow path must also grow or initialize the granule metadata needed by
@@ -281,6 +468,30 @@ Object-table phase identities carry `ObjectId` as the stable object-table slot:
 - `TStruct { object_id }`
 - `TArray { object_id }`
 
+Durable log entries encode granules as a compact `PackedGranuleId` in the
+`logical_id` field. The current encoding reserves the high 4 bits for the
+domain and the low 60 bits for the domain payload. Object granules embed
+`ObjectId` directly in that payload:
+
+```text
+logical_id = (domain << 60) | payload
+
+domains:
+  1 = TMemory
+  2 = TMemorySize
+  3 = TGlobal
+  4 = TTable
+  5 = TTableSize
+  6 = TStruct
+  7 = TArray
+
+TStruct/TArray payload = ObjectId.object_index
+```
+
+The object-id payload limit is therefore 60 bits in durable log records. Other
+domains can pack their instance/module/table/memory indices into the same low
+60-bit payload as their durable publication helpers are completed.
+
 The first in-memory `ObjectTable` foundation allocates dense stable
 `ObjectId`s, reuses freed slots, stores live-slot versions, and maps persistent
 struct and array slots to `TStruct`/`TArray` granules. It also supports staged
@@ -288,10 +499,12 @@ struct/array payload snapshots so transactions can read staged values, discard
 them on abort, apply them on commit, and validate optimistic object reads
 against current object slot versions.
 
-This in-memory table is the volatile stepping stone toward the persistent object
-table. It must preserve the final identity split: ordinary volatile objects use
-`VMGcRef`, while persistent transactional objects use `ObjectId` at runtime and
-in storage.
+This in-memory table is the volatile recovery-time index for Zen-style object
+persistence. It must preserve the final identity split: ordinary volatile
+objects use `VMGcRef`, while persistent transactional objects use `ObjectId` at
+runtime and in storage. Persistent object records store their `ObjectId` in the
+record header so recovery can rebuild the volatile table from committed log
+winners.
 
 The current `ttable` runtime writes funcref table entries directly to
 Wasmtime's table backing after acquiring `TTable` ownership. This is a
@@ -303,8 +516,8 @@ workspace must replace direct mutation so abort can discard table writes.
 Ordinary Wasmtime GC remains responsible for ordinary, volatile Wasm GC objects.
 The persistent transactional object space is a separate heap/collector path. It
 may reuse Wasmtime type, layout, cast, and validation machinery where useful, but
-it owns object identity, object-table publication, COW, recovery, and persistent
-reachability.
+it owns object identity, volatile object-index publication, COW, recovery, and
+persistent reachability.
 
 The runtime identity split is:
 
@@ -316,16 +529,17 @@ persistent transactional function identity = ObjectId
 ```
 
 `ObjectId` is used at runtime only for persistent transactional objects. It is
-also the durable object-table slot identity and the object granule used for
-transaction conflicts. `VMGcRef` remains the handle for ordinary Wasmtime GC
+the durable object identity stored in object headers and the object granule used
+for transaction conflicts. `VMGcRef` remains the handle for ordinary Wasmtime GC
 objects and must not become the persistent object identity because it is
 collector-owned, may require rooting and barriers, may move under a moving
 collector, and can encode immediate `i31ref` values that are not heap records.
 
-Transactional references are `ObjectId`-carrying runtime values, not ordinary
-GC references backed by a side table. A transitional implementation may need a
-Wasmtime-compatible wrapper while parser, lowering, and ABI plumbing are being
-replaced, but the semantic identity of a persistent `tref` is `ObjectId`.
+Transactional references should end as `ObjectId`-carrying runtime values, not
+ordinary GC references backed by a durable side table. The current branch still
+uses a volatile Wasmtime-compatible `VMGcRef -> ObjectId` bridge for some parser,
+lowering, and ABI paths. That bridge is process-local scaffolding only: the
+semantic identity of a persistent `tref` is `ObjectId`.
 
 The same rule applies to transactional function references. Wasmtime
 `FuncIndex`, `VMFuncRef`, and compiled-code handles identify executable code
@@ -336,11 +550,11 @@ signature metadata, and compiled entry stubs, but the stable reference stored in
 persistent objects, roots, tables, and transaction workspaces is the `ObjectId`.
 
 Persistent object records live in `ObjectHeapRegion` and are reached through the
-object table:
+volatile object table/index rebuilt at startup:
 
 ```text
 tref/ObjectId
-  -> object table slot
+  -> volatile object table slot
       -> current backend object record address
           -> object record header + payload bytes
 ```
@@ -353,6 +567,7 @@ can evolve with the backend, but the first shape should include at least:
 struct TxObjectHeader {
     record_len: u64,
     object_id: u64,
+    version: u32,
     kind: u16,
     flags: u16,
     type_index: u32,
@@ -367,9 +582,12 @@ struct TxArrayHeader {
 
 The `kind` field identifies the persistent object payload kind, such as struct,
 array, external object wrapper, or future persistent runtime object kinds.
+`version` is the durable object-record version used by log recovery.
 `type_index` records the Wasmtime shared type identity or a backend layout id.
-Live-slot versioning and write ownership remain attached to the stable object
-table slot because COW writes publish a new object record at commit.
+Write ownership remains attached to the stable `ObjectId` granule because COW
+writes publish a new object record at commit. The volatile table may keep
+additional live-slot versions for in-process optimistic-read validation, but it
+is not the durable source of object identity.
 
 Persistent-by-reachability is defined over durable roots and `ObjectId` edges:
 
@@ -413,7 +631,7 @@ still be persistent-GC-ready from day one.
 The current implementation direction is:
 
 - allocate persistent object records in `ObjectHeapRegion`
-- publish records through stable `ObjectId` table slots
+- publish records through stable `ObjectId` identities and volatile table slots
 - keep payloads traceable by `kind` and `type_index`
 - store persistent references as `ObjectId`
 - reject or promote volatile `VMGcRef` values before commit
@@ -431,7 +649,7 @@ The future persistent collector is an `ObjectId` graph collector:
 
 ```text
 persistent roots
-  -> ObjectId table slots
+  -> rebuilt ObjectId table slots
       -> object records
           -> ObjectId fields in payloads
 ```
@@ -443,16 +661,47 @@ Wizard-style Immix line/block reuse and durable recovery.
 
 ## Runtime Permissions
 
-Wizard permissions are modeled as read/write access modes over `GranuleId`.
-They are not limited to object references. The same permission API applies to
-`TMemory`, `TMemorySize`, `TGlobal`, `TTable`, `TTableSize`, `TStruct`, and
-`TArray` granules.
+Wizard permissions follow the meeting model: they are type-state on
+transactional reference types, not fields on reference values, objects, or all
+granules. A `tref` starts with permission `none`. Object operations require
+permissioned `tref` types: reads require `read` or `write`, and writes require
+`write`. Validation rejects object accesses whose operand type does not carry
+the required permission.
 
-The Wasm-visible `tref none/read/write` permission is the frontend type-system
-surface for transactional references. Runtime enforcement still resolves to
-granule acquisition: reads acquire optimistic read permission for the target
-granule, and writes acquire pessimistic write ownership for the target granule.
-Write ownership implies read access in the active transaction.
+`tref.cast_read` and `tref.cast_write` are the dynamic acquisition boundary.
+The cast does not change the reference identity. It performs the transaction
+check once for a known persistent object reference, records the object granule
+in the active transaction table, and returns the same reference with upgraded
+validator type-state. Later `tstruct` and `tarray` accesses rely on that
+permissioned type instead of probing the transaction table on every access.
+`tarray.len` is the current exception: the proposal text uses it without an
+explicit permission cast, so lowering performs a read acquisition before the
+runtime length helper.
+
+Only persistent objects participate in runtime object-granule locking. Objects
+created by static/global transactional initializers are persistent and are
+therefore lockable through `tref.cast_read/write`. Ordinary runtime
+`tstruct.new` and `tarray.new` allocations are volatile transaction objects for
+now: they are still indexed by the volatile object table so field/element
+helpers can find their payloads, but permission casts only update validator
+type-state and do not acquire persistent object locks for them. Future
+promotion work will turn reachable volatile objects into persistent objects at
+commit when a persistent object stores a reference to them.
+
+The runtime still uses `GranuleId` internally for concurrency control and
+commit validation. For persistent object references, `tref.cast_read/write`
+maps the reference to the object-space granule (`TStruct` or `TArray`) and
+acquires the read/write state there. Write ownership implies read access in
+the active transaction.
+
+Linear memory, globals, and tables do not gain Wasm-visible `tref`
+permissions. Their transactional operations continue to acquire and validate
+their own `GranuleId` ranges dynamically. The handle mechanism discussed in the
+meeting could hoist linear-memory range checks in a future design, but it is
+not part of the current spec or implementation.
+
+Runtime permissions are transaction-scoped. Commit, abort, trap, and `tfail`
+discard the transaction-local access records and release write ownership.
 
 ## LockBased Concurrency
 
@@ -470,7 +719,10 @@ Write path:
 - If the transaction already owns the granule for writing, continue.
 - If it only has an optimistic read record, validate the recorded version and
   upgrade to write ownership.
-- If another transaction owns the granule, abort the current transaction.
+- If another transaction owns the granule, use the deterministic
+  `TransactionId` priority rule: a lower id can abort/release a higher-id
+  owner; a higher id conflicts with the lower-id owner and aborts/fails the
+  current access path.
 - On successful acquisition, record the granule as write-owned by the active
   transaction.
 
@@ -488,14 +740,28 @@ Abort path:
 - Mark the transaction inactive.
 
 There is no automatic retry in this phase. Conflict policy can be represented
-in configuration, but the implemented default is deterministic abort of the
-current transaction.
+in configuration, but the implemented default is deterministic id-priority
+locking with no retry.
 
 ## Object Table Direction
 
-The current executable core starts with a volatile object-table foundation. The
-design target is the full persistent object table, so the volatile foundation
-must preserve these constraints.
+The current executable core uses a volatile object table/index. This is now the
+default design target, not merely a stepping stone to a persisted object table.
+Persistent object records are durable; the table that maps `ObjectId` to the
+current winning object record is reconstructed during recovery.
+
+Recovery rebuilds the object table as follows:
+
+1. Scan durable log streams and validate `TxLogEntry` CRC32 values.
+2. Keep only transactions whose stream contains an LP-marked final entry.
+3. Decode committed `TStruct` and `TArray` data records.
+4. Select the highest `version` for each object logical id; duplicate committed
+   versions are corruption.
+5. Reinstall winning object record bytes into the runtime object heap.
+6. Reconstruct volatile object table slots from `TxObjectHeader.object_id`,
+   `kind`, `version`, and `type_index`.
+7. Reconstruct phase-1 durable roots from committed `TGlobal`/`TTable`
+   root-bearing winners.
 
 Object-table-facing constraints:
 
@@ -504,37 +770,38 @@ Object-table-facing constraints:
 - Ownership/version metadata is attached to the transactional object or
   granule, not to ordinary Wasmtime memory.
 - Runtime APIs accept a transaction context and `GranuleId` rather than assuming
-  raw `VMGcRef` identity or one global store-local object map.
+  raw `VMGcRef` identity or one global durable object map.
 - The shared block/chunk backend owns physical storage; concurrency control
-  owns access policy; `TMemoryRegion`, `ObjectHeapRegion`, and
-  `ObjectTableRegion` own their logical address/object interpretations.
+  owns access policy; `TMemoryRegion`, `ObjectHeapRegion`, and durable log/data
+  streams own their logical interpretations.
 - The persistent object heap is a not-necessarily-contiguous collection of
   object chunks. Small objects usually use chunks of one block; objects larger
   than a block may use larger chunks.
-- The persistent object table is a not-necessarily-contiguous collection of
-  blocks physically, but it is mapped into contiguous virtual table space so an
-  `ObjectId` can index directly into the table.
-- The DRAM object table can be a large anonymous mmap reservation with most
-  pages inaccessible and with deliberate gaps between persistent,
-  non-transactional shared, and transaction-local object-id ranges.
 - Persistent object payloads store references as `ObjectId`s, never raw
   `VMGcRef`s, `VMFuncRef`s, process-local pointers, or PMEM addresses.
 - Persistent transactional function references are stored as `ObjectId`s whose
-  object-table payload describes the target function metadata.
+  object payload describes the target function metadata.
 - Ordinary volatile Wasmtime objects can enter the persistent graph only through
   transaction commit promotion.
 
+An optional persistent-index/object-table mode remains possible if recovery
+latency becomes unacceptable. That mode must be behind an explicit future
+feature/configuration switch and must not add object-table writes to the
+default Zen-style path.
+
 The persistent object workstream wires `TStruct` and `TArray` granules to
-persistent slot layout, function references, persistent object identity,
+durable object records, function references, persistent object identity,
 external object wrappers, commit-time promotion, and backend integration.
 Following Wizard, they start at whole-object granularity. More precise field or
 element granules are a later Wasmtime-specific extension.
 
 ## Parser, Validation, And Lowering Implications
 
-The parser must stop relying on the WAST normalization adapter as real support
-lands. Transaction text and binary forms should produce real operators and
-metadata.
+The current `simple-transactions` proposal tranche is expected to run through
+real transaction text parsing, lowering, and runtime paths without generated
+fixture replacement. Future parser work should keep removing any remaining
+normalization/scaffold paths outside that tranche. Transaction text and binary
+forms should produce real operators and metadata.
 
 Validation must enforce transaction/non-transaction call boundaries and object
 space separation:
@@ -543,8 +810,9 @@ space separation:
 - `tmemory` operators target `tmemory`, not ordinary `memory`.
 - `tglobal` operators target `tglobal`, not ordinary `global`.
 - Transaction operations require active transactional context.
-- Ordinary `ref` values use Wasmtime GC identity; persistent `tref` values use
-  `ObjectId` identity once the persistent object runtime is enabled.
+- Ordinary `ref` values use Wasmtime GC identity. Persistent `tref` values use
+  `ObjectId` identity semantically; current VMGcRef bridges are volatile ABI
+  scaffolding.
 - Persistent object writes must either store persistent `ObjectId` references or
   promote reachable volatile objects during commit.
 - Wasmtime-style equivalent diagnostics are acceptable; exact proposal strings
@@ -559,17 +827,21 @@ transactional memory operators route through the transaction memory access path.
 
 ## Mock Removal Strategy
 
-Intermediate waves may keep feature gates and ignored WAST files. Each wave
-should remove one category of `SHISOFT-TWASM-MOCK` scaffold and record the
-change in `docs/shisoft/transactional-wasm-implementation-log.md`.
+Intermediate waves may keep feature gates and ignored tests only for boundaries
+that genuinely need unavailable hardware or future subsystems, such as real
+PMEM restart tests and persistent GC/reclamation tests. Each wave should remove
+one category of `SHISOFT-TWASM-MOCK` scaffold and record the change in
+`docs/shisoft/transactional-wasm-implementation-log.md`.
 
 Final success requires:
 
 - no `transaction_proposal_adapter_mock`
 - no transaction proposal normalization adapter
 - no ordinary-memory backing stand-in for `tmemory`
-- no ignored proposal WAST tests
+- no ignored proposal WAST tests in the targeted proposal tranche
 - all proposal WAST tests using the real parser and real Wasmtime engine path
+- no durable-object recovery dependence on a persisted object table in the
+  default Zen-style mode
 
 ## Remaining Workstream Order
 
@@ -578,25 +850,27 @@ Implementation progress is tracked in
 From this design point, the remaining architecture work should proceed in this
 order:
 
-1. Keep the executable `tfunc`, `tmemory`, `tglobal`, `ttable`, and SIMD
-   transaction paths stable while removing remaining parser/harness scaffolds.
-2. Define the `ObjectId`-carrying `tref` runtime representation and ABI boundary.
+1. Keep the executable `tfunc`, `tmemory`, `tglobal`, `ttable`, SIMD, `ttry`,
+   `tfail`, object, and conflict paths stable while removing remaining parser
+   or harness scaffolds outside the current passing WAST tranche.
+2. Replace volatile `VMGcRef -> ObjectId` bridges with the final
+   `ObjectId`-carrying `tref` ABI for persistent references.
 3. Define transactional function objects so persistent `tfunc` and function
    references use `ObjectId` identity while Wasmtime function indices remain
    payload metadata.
-4. Add volatile `VMemory` object-heap records and object-table slots with the
-   explicit `TxObjectHeader` shape.
-5. Wire `tstruct` and `tarray` operators to `ObjectId`, whole-object granules,
-   and COW payload staging.
+4. Complete durable publication for every committed `tmemory`, `tglobal`,
+   `ttable`, `TStruct`, and `TArray` update through the unified log/data path.
+5. Finish recovery root reconstruction for `tglobal` and `ttable` references.
 6. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
    persistent `ObjectId` graphs.
 7. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
    metadata so persistent GC can be added without changing committed formats.
-8. Implement `ttry`/`tfail` structured failure semantics after transaction entry,
-   object COW, promotion, and ownership are stable.
+8. Decide and implement deletion/tombstone rules together with GC; do not add
+   ad hoc deletion semantics before reclamation is designed.
 9. Add the first non-moving persistent `ObjectId` mark/sweep collector.
-10. Add the NVMemory backend first, then defer FileBackedMemory behind
-    the same block/chunk interfaces.
+10. Add optional persistent-index/object-table persistence only behind an
+    explicit future feature/configuration switch if Zen-style recovery time is
+    unacceptable.
 
 This order keeps ordinary Wasmtime GC isolated while the persistent object heap
 is brought online, then adds persistent reachability collection after the
@@ -610,16 +884,37 @@ Baseline commands:
 
 ```bash
 cargo test -p wasmtime --lib transaction
-WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions -- --format terse
+CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 \
+  cargo test --test wast transaction-proposal/simple-transactions -- --format terse
 ```
 
-As mocks are removed, the focused WAST commands should target the newly real
-files first, then the full proposal set:
+The current simple-transactions gate is expected to report all enabled tests
+passing with zero ignored tests. Focused regressions should target the newly
+real file first, then the tranche:
 
 ```bash
-WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 \
+  cargo test --test wast transaction-proposal/simple-transactions/tconflict-basic.wast -- --format terse
+CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 \
+  cargo test --test wast transaction-proposal/simple-transactions/tconflict-tmemory_1.wast -- --format terse
 ```
 
-The full proposal set is complete only when it reports zero ignored
-transaction-proposal tests and no `SHISOFT-TWASM-MOCK` tags remain in executable
-transaction paths.
+As remaining proposal scopes are enabled, run the full proposal filter:
+
+```bash
+CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 \
+  cargo test --test wast transaction-proposal -- --format terse
+```
+
+Durability/recovery tests that require hardware or restart conditions stay
+explicitly gated, for example:
+
+```bash
+WASMTIME_TEST_REAL_PMEM=1 cargo test -p wasmtime --lib real_pmem -- --ignored
+WASMTIME_TEST_FILE_BACKED_TMEMORY_RECOVERY=1 \
+  cargo test -p wasmtime --lib file_backed_memory_restart_recovery_is_not_implemented_yet -- --ignored
+```
+
+The full proposal set is complete only when it reports zero unexpected ignored
+transaction-proposal tests and no `SHISOFT-TWASM-MOCK` tags remain in
+executable transaction paths.
