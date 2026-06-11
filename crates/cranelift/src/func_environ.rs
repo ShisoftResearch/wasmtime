@@ -2882,6 +2882,43 @@ impl FuncEnvironment<'_> {
         Ok(builder.ins().ushr_imm(i31ref, 1))
     }
 
+    pub fn translate_transaction_tref_cast_read(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        tref: ir::Value,
+    ) -> WasmResult<()> {
+        self.translate_transaction_tref_cast_permission(
+            builder,
+            tref,
+            BuiltinFunctionIndex::transaction_tref_cast_read(),
+        )
+    }
+
+    pub fn translate_transaction_tref_cast_write(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        tref: ir::Value,
+    ) -> WasmResult<()> {
+        self.translate_transaction_tref_cast_permission(
+            builder,
+            tref,
+            BuiltinFunctionIndex::transaction_tref_cast_write(),
+        )
+    }
+
+    fn translate_transaction_tref_cast_permission(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        tref: ir::Value,
+        builtin: BuiltinFunctionIndex,
+    ) -> WasmResult<()> {
+        let callee = self.builtin_functions.load_builtin(builder.func, builtin);
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        pos.ins().call(callee, &[vmctx, tref]);
+        Ok(())
+    }
+
     pub fn struct_fields_len(&mut self, struct_type_index: TypeIndex) -> WasmResult<usize> {
         let ty = self.module.types[struct_type_index].unwrap_module_type_index();
         match &self.types[ty].composite_type.inner {
@@ -3905,6 +3942,7 @@ impl FuncEnvironment<'_> {
         array: ir::Value,
     ) -> WasmResult<ir::Value> {
         self.trapz(builder, array, crate::TRAP_NULL_REFERENCE);
+        self.translate_transaction_tref_cast_read(builder, array)?;
         let callee = self
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_tarray_len());

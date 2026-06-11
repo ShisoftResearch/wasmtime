@@ -15,6 +15,56 @@ Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
 work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
 or object-model sequencing have drifted.
 
+## Zen-First Object Publication Metadata
+
+Date: 2026-06-09
+
+Started the first Zen-first persistent-object runtime slice.
+
+Changes in this slice:
+
+- `TxObjectHeader` now carries `version`, a monotonic record-version field for
+  committed object records. This is ordered publication metadata, not time or a
+  GC epoch.
+- `ObjectTable` now assigns increasing record versions whenever a new
+  current record is published for an `ObjectId`.
+- The object-record bytes written into the heap now serialize
+  `record_len`, `object_id`, `version`, `kind`, `flags`, and
+  `type_index`.
+- `TransactionConfig` now carries an object-index persistence-policy knob. The
+  default is `RebuildOnRecovery`; `PersistentIndex` is recognized but rejected
+  as not implemented yet.
+- Added the first recovery-style rebuild path:
+  `ObjectTable::rebuild_volatile_index_from_heap()` scans heap records, selects
+  the highest `version` per `ObjectId`, recreates the live slot map,
+  repopulates the free-list holes, and resets the runtime bridge maps.
+
+This is the first executable step toward the Zen direction where the persistent
+heap is durable and the runtime object index is rebuilt in DRAM during recovery
+instead of being persisted as a separate table.
+
+Verification:
+
+```text
+cargo test -p wasmtime --lib transaction_object_ -- --format terse
+test result: ok. 28 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction_config -- --format terse
+test result: ok. 9 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 130 passed; 0 failed; 0 ignored
+```
+
+Remaining gaps after this slice:
+
+- publication metadata is still in-memory only; there is not yet a restart path
+  for `FileBackedMemory` or `NVMemory`
+- freed/deleted persistent-object recovery semantics still need explicit durable
+  representation if object deletion becomes part of committed state
+- committed roots and promotion still need to publish only `ObjectId` edges
+- remaining `VMGcRef` and `VMFuncRef` bridges are still volatile scaffolding
+
 ## NVMemory Backend Implementation
 
 Date: 2026-06-09
@@ -999,6 +1049,26 @@ Current proposal harness result:
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
+
+## Zen-Style Object Log Recovery Smoke Path
+
+Date: 2026-06-10
+
+Added the first persistent-object recovery path over the shared transaction
+log/data substrate. Persistent `TStruct`/`TArray` updates now use ordinary
+transaction log winners instead of a separate object-table log. Recovery
+decodes the winning object data records, rebuilds the volatile object index from
+those committed winners, and reconstructs phase-1 root object ids from committed
+`TGlobal`/`TTable` root-bearing winners.
+
+File-backed restart smoke tests now cover:
+
+- committed struct object recovery after reopen
+- committed global root recovery after reopen
+- existing committed `tmemory` recovery and corrupt-log rejection paths
+
+The persistent object table remains intentionally absent. The object index is
+rebuilt in DRAM from committed log winners, matching the Zen-style direction.
 
 ## Full-WAST Cleanup: Structured `ttry`, Conflict Fixture Removal, SIMD Real Parser
 

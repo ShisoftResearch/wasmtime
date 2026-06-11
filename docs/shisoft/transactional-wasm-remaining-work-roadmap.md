@@ -2,9 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Finish the transactional Wasm research branch from the current real `tmemory`/`tglobal`/`ttable` runtime core to a proposal WAST path with no ignored transaction tests, no WAST normalization, and real persistent-object scaffolding.
+**Goal:** Advance the transactional Wasm research branch from the current
+proposal-WAST-complete runtime core to a usable persistent-object runtime with
+Zen-style recovery, durable object identity, and selectable backend/index
+policies.
 
-**Architecture:** Ordinary Wasmtime memory and ordinary Wasmtime GC remain unchanged. Transactional state lives behind `GranuleId`, `LockBased`, `VMemory`-backed regions, and a persistent-object direction where `ObjectId` is the runtime identity for persistent transactional objects. The remaining work proceeds by replacing one mock boundary at a time: first persistent-GC-ready object identity and transaction refs, then object payload operators, then table/global reference COW, structured failure, conflict harness behavior, an `ObjectId` persistent collector, and durable backends.
+**Architecture:** Ordinary Wasmtime memory and ordinary Wasmtime GC remain
+unchanged. Transactional state lives behind `GranuleId`, `LockBased`,
+block/chunk-backed `tmemory` regions, and a persistent-object direction where
+`ObjectId` is the runtime identity for persistent transactional objects. The
+current branch now has full proposal-WAST coverage; the remaining work is to
+replace volatile bridges with durable object records, Zen-style recovery that
+rebuilds a volatile object index from persistent headers, persistent roots and
+promotion, durable backends, and later an optional persistent-index mode for
+faster restart.
 
 **Tech Stack:** Rust, Wasmtime runtime internals, Cranelift translation hooks, local `wasm-tools-transaction` fork for `wasmparser`/`wast`, proposal WAST tests, `cargo test`.
 
@@ -17,45 +28,48 @@ Use the implementation log as the authoritative status file:
 - `docs/shisoft/transactional-wasm-implementation-log.md`
 - `docs/shisoft/transactional-wasm-runtime-core-design.md`
 
-The last recorded full proposal status in the implementation log is:
+The current proposal-WAST branch baseline is:
 
 ```text
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
-test result: ok. 153 passed; 0 failed; 20 ignored
+test result: ok. 173 passed; 0 failed; 0 ignored
 ```
 
-The older WAST-only roadmap has drifted in places. This roadmap supersedes it
-for remaining implementation sequencing.
+The older WAST-only roadmaps are now historical. This roadmap supersedes them
+for post-WAST persistent-object and durable-backend sequencing.
 
 Current real runtime foundations:
 
 - `VMemory` block/chunk storage for `tmemory`.
+- `FileBackedMemory` backend with shared writable mappings and explicit sync
+  plumbing.
+- `NVMemory` backend scaffold behind the same `tmemory` backend shape.
 - COW workspace for scalar transactional memory.
 - `LockBased` ownership over `GranuleId`.
 - Numeric and v128 transactional globals for defined globals.
 - Numeric imported transactional globals.
 - Transactional SIMD memory load/store families.
 - Funcref `ttable.get/set/size/grow/copy/init` smoke paths with ownership.
-- Volatile `ObjectTable` foundation with dense `ObjectId`, slot versions, and
-  staged struct/array payload helpers.
+- Volatile `ObjectTable` foundation with dense `ObjectId`, slot versions,
+  object-record publication, and staged struct/array payload helpers.
 
 Current remaining mock categories:
 
-- Path-scoped fixture replacement for `ttry-basic`.
-- `br_on_tnon_null.wast`, `br_on_tnull.wast`, `tref_as_non_null.wast`,
-  `tcall_ref.wast`, and `return_tcall_ref.wast` now run through the real
-  transaction text parser and Wasmtime reference/function-reference lowering
-  without whole-fixture replacement.
-- Text-normalization compatibility outside the current real-parser allowlists.
-- Reference/object-valued transactional global snapshots.
-- Table element COW; current table writes acquire ownership then mutate
-  Wasmtime table backing.
-- Full object-model runtime operations for `tstruct`, `tarray`, `ti31`,
-  `textern`, casts, and branch-on-ref.
-- Structured `ttry`/`tfail`.
-- Multi-transaction conflict harness semantics.
-- Binary transactional type encodings and remaining parser fork gaps.
-- Durable `FileBackedMemory` and `NVMemory` backends.
+- The runtime object path still uses volatile bridges for some Wasmtime GC and
+  function-reference integration. Persistent transactional refs must end at
+  `ObjectId`, not `VMGcRef` or `VMFuncRef`.
+- Object records need durable publication metadata and recovery scanning so the
+  volatile object index can be rebuilt after restart.
+- Persistent roots and commit-time promotion need to publish only `ObjectId`
+  edges into committed state.
+- Table/global object snapshots still need the final `ObjectId`-based durable
+  representation.
+- `ttry`/`tfail` remains a later structured-failure workstream.
+- Persistent-object GC remains future work after the durable object format and
+  recovery path are stable.
+- `FileBackedMemory` and `NVMemory` still need real recovery semantics; tests
+  that require restart durability stay gated until hardware or restart harness
+  support is ready.
 
 ## Ground Rules
 
@@ -68,6 +82,11 @@ Current remaining mock categories:
 - `VMGcRef` remains ordinary volatile Wasmtime GC identity.
 - Persistent payloads store `ObjectId` references, not raw `VMGcRef`s,
   process-local pointers, or PMEM addresses.
+- The first object-index policy is Zen-style `RebuildOnRecovery`: object
+  headers, object payloads, and durable roots are persisted; the runtime object
+  index is rebuilt in DRAM during recovery.
+- Persistent object-index maintenance is future work behind a separate policy.
+  Do not add persistent-index writes to the first Zen-style path.
 - Full persistent-object GC is a future workstream. Current object-runtime waves
   must make records traceable by `kind`, `type_index`, and `ObjectId` fields,
   but they do not need to reclaim persistent objects to pass proposal WAST.
@@ -87,8 +106,8 @@ Current remaining mock categories:
 - `docs/shisoft/transactional-wasm-implementation-log.md`
   - Append verification results and mock removals after each wave.
 - `crates/wasmtime/src/runtime/transaction.rs`
-  - `TransactionState`, `GranuleId`, `LockBased`, `ObjectId`, `ObjectTable`,
-    staged payloads, and transaction COW APIs.
+  - `TransactionState`, `GranuleId`, `LockBased`, `ObjectId`, the volatile
+    recovery-built `ObjectTable`, staged payloads, and transaction COW APIs.
 - `crates/wasmtime/src/runtime/vm/libcalls.rs`
   - Runtime entry points for transactional memory, globals, tables, refs, and
     structured failure.
@@ -115,6 +134,83 @@ Current remaining mock categories:
   - Local `wasmparser`/`wast` fork for proposal text and binary parser support.
 - `/home/shisoft/Code/Research/wizard-engine`
   - Reference semantics on branch `transactions`.
+
+## Current Direction: Zen-First Persistent Objects
+
+This section supersedes older persistent-object-table assumptions in the
+historical waves below.
+
+### Policy
+
+The runtime should expose object-index durability as a policy:
+
+```rust
+enum ObjectIndexPersistencePolicy {
+    RebuildOnRecovery,
+    PersistentIndex,
+}
+```
+
+Only `RebuildOnRecovery` is implemented in this phase.
+
+### Persistent State
+
+- object heap records with explicit durable headers
+- `ObjectId` stored in each persistent object header
+- payload bytes containing only persistent scalars/immediates and `ObjectId`
+  edges
+- durable roots
+- publication metadata sufficient to identify the latest committed record for
+  each `ObjectId`
+- backend allocation metadata needed to discover committed object records during
+  recovery
+
+### Recovered Volatile State
+
+- `ObjectId -> current record` index
+- lock ownership tables
+- free lists and allocation cursors
+- temporary Wasmtime-bridge maps needed while the final `ObjectId` ABI is still
+  being wired through all runtime paths
+
+### Post-WAST Workstreams
+
+1. **Durable object headers and publication metadata**
+   - make `TxObjectHeader` the canonical durable identity carrier
+   - add commit/publication fields needed for Zen-style visibility and recovery
+   - ensure new committed object records never require a separately persisted
+     object-index update
+
+2. **Recovery-rebuilt object index**
+   - scan persistent object storage on restart
+   - rebuild the volatile `ObjectTable` from committed object headers
+   - select the latest committed record for each `ObjectId`
+   - regenerate allocation/free metadata in DRAM where possible
+
+3. **Persistent roots and promotion**
+   - make committed `tglobal`, `ttable`, and future explicit root sets publish
+     `ObjectId` edges only
+   - promote volatile Wasmtime objects during commit when they become reachable
+     from persistent state
+
+4. **Remove remaining volatile reference bridges**
+   - replace `VMGcRef`/`VMFuncRef` scaffolding in transactional object and
+     function-reference paths with real `ObjectId` runtime values
+   - keep Wasmtime GC/type machinery only as layout/type knowledge
+
+5. **Durable backend recovery**
+   - finish FileBackedMemory restart recovery using sync-based durability
+   - finish NVMemory publication and recovery semantics with CLWB/SFENCE-shaped
+     plumbing
+
+6. **Future optional persistent index**
+   - evaluate whether Eliot's faster-restart requirement justifies persisting an
+     object index
+   - if needed, implement `PersistentIndex` as a second policy over the same
+     durable object-header/object-payload format
+
+The historical waves below remain useful for file ownership and older WAST
+milestones, but when they conflict with this section, this section wins.
 
 ## Wave 0: Refresh The Baseline And Ledger
 
@@ -187,7 +283,7 @@ Add tests under `crates/wasmtime/src/runtime/transaction.rs` or the new
 - `TxObjectHeader` stores `record_len`, `object_id`, `kind`, `flags`, and
   `type_index`.
 - `TxArrayHeader` embeds `TxObjectHeader` and stores `length`.
-- object-table slot version changes when a new object record is published.
+- volatile object-index version changes when a new object record is published.
 - `ObjectId` remains stable while the current record address changes.
 - struct and array payload records can report the `ObjectId` fields they contain
   using Wasmtime-derived type/layout metadata.
@@ -208,7 +304,7 @@ Add a volatile object heap layer with these responsibilities:
 - allocate record bytes from the existing `VMemory` block-region substrate
 - write the explicit header
 - store payload bytes separately from `ObjectTableSlot`
-- return a record handle/address that the table slot can publish
+- return a record handle/address that the volatile object index can publish
 - keep slot ownership and versioning in `ObjectTable`, not in the record header
 - store enough layout metadata to later trace embedded `ObjectId` references
 - avoid depending on `GcHeap` storage, `VMGcRef` identity, or Wasmtime GC roots
@@ -301,7 +397,7 @@ while preserving the design target:
 ```text
 null tref      = zero
 nonnull tref   = encoded ObjectId
-persistent ref = ObjectId in object-table slot space
+persistent ref = ObjectId in persistent object identity space
 ordinary ref   = not accepted as persistent tref unless promotion occurs during commit
 ```
 
@@ -393,7 +489,7 @@ Add unit tests for:
 - abort drops staged struct payloads.
 - array `get/set/len/fill/copy` obeys whole-object granule ownership.
 - `ti31` encodes immediate integer payloads without allocating a heap record
-  unless the proposal test requires object-table identity.
+  unless the proposal test requires persistent object identity.
 - unsupported `textern` promotion aborts the transaction with a clear
   Wasmtime-style error.
 
@@ -870,13 +966,14 @@ Implement a stop-the-world persistent collector over `ObjectId`:
 - reject collection while a transaction is active
 - mark from persistent roots
 - scan committed object records through `kind` and `type_index`
-- mark reachable `ObjectId` slots
-- sweep unmarked object-table slots
+- mark reachable `ObjectId`s
+- sweep unmarked volatile object-index entries
 - reclaim volatile object-record storage where the backend supports it
 - increment slot versions when slots become free
 
-Do not compact or move records in this first collector. The object table should
-remain the only place that maps `ObjectId` to current record address.
+Do not compact or move records in this first collector. The volatile object
+index should remain the only runtime structure that maps `ObjectId` to current
+record address.
 
 - [ ] **Step 4: Verify no ordinary GC coupling**
 

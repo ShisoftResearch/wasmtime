@@ -1,0 +1,653 @@
+[Hao Shi] 15:34:47
+All right.
+
+[Eliot Moss] 15:34:47
+Hello?
+
+[Hao Shi] 15:34:50
+So, I thought about being late, I was, um…
+
+[Hao Shi] 15:34:54
+I was messing around with the new…
+
+[Hao Shi] 15:34:57
+cloud model, and I forgot.
+
+[Eliot Moss] 15:35:01
+Uh, it's easy to happen. Um, I was a couple minutes late myself, so…
+
+[Eliot Moss] 15:35:06
+I wouldn't worry about it.
+
+[Eliot Moss] 15:35:09
+Uh, anyway, yeah, I was working on, um…
+
+[Eliot Moss] 15:35:14
+some modest…
+
+[Eliot Moss] 15:35:16
+revisions to the…
+
+[Eliot Moss] 15:35:19
+transactions, spec, things that, uh, Angela had found that needed fixing up.
+
+[Eliot Moss] 15:35:23
+Still trying to debug the reference interpreter. But anyway, um…
+
+[Eliot Moss] 15:35:28
+Yes, how is it going? What, uh…
+
+[Eliot Moss] 15:35:32
+What would be helpful to…
+
+[Eliot Moss] 15:35:35
+uh… go over together.
+
+[Hao Shi] 15:35:36
+Now, yeah, I thought I was reviewing, um…
+
+[Hao Shi] 15:35:40
+I was reviewing the weather engine where I totally did.
+
+[Eliot Moss] 15:35:45
+I'm sorry that… that what?
+
+[Hao Shi] 15:35:47
+Oh, I was reviewing the Watham engine, we were doing, um…
+
+[Hao Shi] 15:35:54
+And, uh, yeah, that was the email I sent you asking questions.
+
+[Hao Shi] 15:36:00
+So, uh, so another question I do have is, um…
+
+[Hao Shi] 15:36:06
+So, there are com- there are permission, uh…
+
+[Hao Shi] 15:36:11
+you know, something like lack of permission for, like,
+
+[Hao Shi] 15:36:17
+conventional objects.
+
+[Eliot Moss] 15:36:20
+transact… they're associated with transactional reference types, but yes.
+
+[Hao Shi] 15:36:24
+Yeah, yeah, they're not just objects, it can also be…
+
+[Hao Shi] 15:36:28
+key memory, just any granules, right?
+
+[Eliot Moss] 15:36:32
+No.
+
+[Hao Shi] 15:36:32
+No.
+
+[Eliot Moss] 15:36:34
+Um…
+
+[Eliot Moss] 15:36:36
+Well, the permissions…
+
+[Eliot Moss] 15:36:39
+are associated with reference types, not with reference values or with objects.
+
+[Hao Shi] 15:36:46
+Okay, so it's just types.
+
+[Eliot Moss] 15:36:50
+reference types.
+
+[Hao Shi] 15:36:51
+reference types.
+
+[Eliot Moss] 15:36:53
+Yeah.
+
+[Hao Shi] 15:36:54
+Um, so…
+
+[Eliot Moss] 15:36:55
+So, uh, the point being, if I have hold of a T-Ref,
+
+[Hao Shi] 15:36:59
+Yeah.
+
+[Eliot Moss] 15:36:59
+Without permissions, and I try to use that TREF to… let's say it's a TREF to an array.
+
+[Eliot Moss] 15:37:06
+And I try to use that TREF to do a T array GET.
+
+[Eliot Moss] 15:37:09
+is gonna fail, because I don't have the permissions.
+
+[Hao Shi] 15:37:15
+Okay.
+
+[Eliot Moss] 15:37:16
+Right? Uh, in fact, it's going to fail at validation time.
+
+[Eliot Moss] 15:37:20
+Because the type's wrong. It's a type check.
+
+[Hao Shi] 15:37:23
+I have type chat. Uh…
+
+[Eliot Moss] 15:37:25
+Right. So I have to do, for example, if I want to be able to do T array get,
+
+[Eliot Moss] 15:37:30
+that I need, uh, a reference
+
+[Eliot Moss] 15:37:33
+that has a permission type that allows reading.
+
+[Eliot Moss] 15:37:37
+So, one way I can do that, if I have permission
+
+[Eliot Moss] 15:37:41
+If I have a reference with permissions none,
+
+[Eliot Moss] 15:37:44
+Uh, that is a reference whose type
+
+[Eliot Moss] 15:37:47
+It says, permissions none. I can try to upgrade it by doing a TCAST read.
+
+[Hao Shi] 15:37:52
+Okay, so, uh…
+
+[Hao Shi] 15:37:54
+to explain what was the, uh, what was the purpose of this permission?
+
+[Hao Shi] 15:38:00
+Um…
+
+[Eliot Moss] 15:38:00
+To avoid having to do a check on every access at runtime.
+
+[Eliot Moss] 15:38:06
+Dynamically.
+
+[Hao Shi] 15:38:07
+Uh…
+
+[Hao Shi] 15:38:10
+our access.
+
+[Eliot Moss] 15:38:11
+Yep.
+
+[Hao Shi] 15:38:13
+Underworld scenario?
+
+[Eliot Moss] 15:38:15
+Well, like, every T-array get? Do I have to go check…
+
+[Eliot Moss] 15:38:18
+And see, do I have permissions to do this?
+
+[Eliot Moss] 15:38:21
+The point is, I can do… I can do the permissions check on the TCAST read,
+
+[Eliot Moss] 15:38:26
+And then I have hold of a pointer that… whose type…
+
+[Eliot Moss] 15:38:29
+says, I'm allowed to use it for reading.
+
+[Hao Shi] 15:38:35
+Okay, maybe I should add to another question. So…
+
+[Hao Shi] 15:38:39
+Uh, why… why do we even have permission to begin with? I mean…
+
+[Hao Shi] 15:38:45
+uh… what was trying to… trying to guard.
+
+[Eliot Moss] 15:38:46
+Well,
+
+[Eliot Moss] 15:38:50
+trying to guard the checks that let me access something in a transaction.
+
+[Hao Shi] 15:38:56
+Um… let me see…
+
+[Eliot Moss] 15:38:59
+If I want to use… if I want to do a T-array GET,
+
+[Hao Shi] 15:39:02
+Yeah.
+
+[Eliot Moss] 15:39:02
+then the array needs to get…
+
+[Eliot Moss] 15:39:05
+somehow get into my transaction reset, and the conflict check
+
+[Eliot Moss] 15:39:10
+has to happen.
+
+[Eliot Moss] 15:39:12
+And the idea of TCAST read is I do that check once, and then I have hold of a pointer that's validated for reading,
+
+[Eliot Moss] 15:39:20
+that I can use over and over without having to do the check over and over.
+
+[Hao Shi] 15:39:27
+Oh.
+
+[Hao Shi] 15:39:30
+Okay, does this permission…
+
+[Hao Shi] 15:39:35
+I mean, there's permissioning, they're kind of like…
+
+[Hao Shi] 15:39:40
+Uh… there are kind of different…
+
+[Hao Shi] 15:39:42
+for, uh,
+
+[Hao Shi] 15:39:44
+concurrency control, or it's kind of universal?
+
+[Eliot Moss] 15:39:51
+You mean… are you asking a question?
+
+[Eliot Moss] 15:39:52
+With the permissions be different according to the concurrency control mechanism?
+
+[Hao Shi] 15:39:56
+Yeah.
+
+[Eliot Moss] 15:39:57
+The answer is no.
+
+[Eliot Moss] 15:40:02
+what the CassRead or castrite do…
+
+[Eliot Moss] 15:40:07
+might vary according to the…
+
+[Eliot Moss] 15:40:11
+concurrency control mechanism.
+
+[Hao Shi] 15:40:14
+Okay.
+
+[Hao Shi] 15:40:16
+Okay, I see.
+
+[Eliot Moss] 15:40:19
+So if… if you have a setup which is somehow optimistic for both reads and writes,
+
+[Hao Shi] 15:40:25
+Yeah.
+
+[Eliot Moss] 15:40:27
+then you do the caster, you cast right,
+
+[Eliot Moss] 15:40:31
+gains access… gets the object into your transaction table, but it's… but it's… in those… in that scenario, it's never going to fail.
+
+[Eliot Moss] 15:40:38
+Right. Whereas in a pessimistic case, it might fail.
+
+[Hao Shi] 15:40:39
+Yeah.
+
+[Hao Shi] 15:40:42
+Okay, so it's mainly for…
+
+[Hao Shi] 15:40:48
+permission control…
+
+[Hao Shi] 15:40:50
+for the, uh, I mean, for the transaction table.
+
+[Hao Shi] 15:40:56
+of each.
+
+[Eliot Moss] 15:40:56
+Um, yeah, I guess you could…
+
+[Eliot Moss] 15:40:58
+I guess you could say that.
+
+[Hao Shi] 15:40:59
+Okay. Um…
+
+[Eliot Moss] 15:41:01
+That is, um…
+
+[Eliot Moss] 15:41:06
+If…
+
+[Eliot Moss] 15:41:09
+If I had gotten hold of, uh, some reference, and… and it's one where… and the type…
+
+[Eliot Moss] 15:41:17
+Remember, type is a static thing, it's not actually associated with a value.
+
+[Hao Shi] 15:41:20
+Right.
+
+[Eliot Moss] 15:41:21
+Um, and the type says read, or whatever.
+
+[Eliot Moss] 15:41:25
+Uh, when we flow outside of a transaction scope, that is, when the transaction commits or aborts,
+
+[Eliot Moss] 15:41:33
+We no longer have that access.
+
+[Eliot Moss] 15:41:36
+The type reverts to none.
+
+[Eliot Moss] 15:41:38
+So that if you start another transaction, you gotta check it again.
+
+[Hao Shi] 15:41:41
+Okay.
+
+[Hao Shi] 15:41:47
+I… okay, I think I understand, um…
+
+[Hao Shi] 15:41:51
+First off, promotion.
+
+[Eliot Moss] 15:41:53
+Well, it's to hoist a dynamic check out so it can be more of a static check.
+
+[Hao Shi] 15:42:02
+Yeah, I was just curious, so is this really…
+
+[Hao Shi] 15:42:07
+Another third mechanism, or it's just, like, best to have mechanism?
+
+[Eliot Moss] 15:42:14
+Um…
+
+[Eliot Moss] 15:42:16
+You could design a system that didn't do it, and then you'd have to do the check on every single access.
+
+[Hao Shi] 15:42:21
+Okay, so it… so you'd have to check.
+
+[Hao Shi] 15:42:25
+At some point.
+
+[Eliot Moss] 15:42:27
+Well, if you're going to access some transactional object,
+
+[Eliot Moss] 15:42:31
+And you want to have transactional semantics, the accesses have to be checked.
+
+[Eliot Moss] 15:42:35
+Somehow.
+
+[Hao Shi] 15:42:37
+Okay.
+
+[Eliot Moss] 15:42:39
+And this is putting…
+
+[Eliot Moss] 15:42:42
+uh… the burden of most of the checks onto the type system
+
+[Eliot Moss] 15:42:46
+So that they're static.
+
+[Hao Shi] 15:42:49
+I see.
+
+[Eliot Moss] 15:42:52
+Or put another way,
+
+[Eliot Moss] 15:42:55
+You can prove that I already have access, so I don't need to do another check.
+
+[Hao Shi] 15:43:03
+Yeah, okay. Um…
+
+[Hao Shi] 15:43:06
+Okay.
+
+[Eliot Moss] 15:43:06
+Now, the same is not true for access to memories.
+
+[Eliot Moss] 15:43:13
+every access to…
+
+[Eliot Moss] 15:43:16
+the linear memory has to be checked.
+
+[Hao Shi] 15:43:19
+Oh.
+
+[Eliot Moss] 15:43:26
+Now, I did con… I did conceive of a mechanism
+
+[Eliot Moss] 15:43:30
+That would let us…
+
+[Eliot Moss] 15:43:33
+Uh…
+
+[Eliot Moss] 15:43:35
+do some kind of, uh, hoisting of that.
+
+[Eliot Moss] 15:43:38
+onto types. But, uh…
+
+[Eliot Moss] 15:43:40
+But it's not in the spec, and it's not implemented.
+
+[Eliot Moss] 15:43:45
+So the idea there… so this is something that I called a handle.
+
+[Eliot Moss] 15:43:51
+And, you know, without getting into all the little
+
+[Eliot Moss] 15:43:57
+knobs and bells and whistles.
+
+[Eliot Moss] 15:43:58
+The idea is that a, uh…
+
+[Eliot Moss] 15:44:02
+handle…
+
+[Eliot Moss] 15:44:04
+Uh, would say…
+
+[Eliot Moss] 15:44:06
+I have already checked access to…
+
+[Eliot Moss] 15:44:11
+Uh, something that starts where the handle refers.
+
+[Eliot Moss] 15:44:14
+And runs for some…
+
+[Eliot Moss] 15:44:16
+statically known number of bytes, so this would help particularly
+
+[Eliot Moss] 15:44:20
+with checks on, you know, something that would be analogous to a struct.
+
+[Eliot Moss] 15:44:25
+some thick-sized data structure in your…
+
+[Eliot Moss] 15:44:28
+memory. So…
+
+[Eliot Moss] 15:44:31
+you would do… we'd have an operation that says, okay, here's…
+
+[Eliot Moss] 15:44:37
+An address in the memory, which of course is just an integer, but anyway, here's an address in the memory.
+
+[Eliot Moss] 15:44:42
+And I want to get a handle, starting there, for…
+
+[Eliot Moss] 15:44:46
+let's say 32 bytes, or whatever.
+
+[Eliot Moss] 15:44:49
+Okay? Then I'd have a handle…
+
+[Eliot Moss] 15:44:53
+a static size 32.
+
+[Eliot Moss] 15:44:56
+then any access I do
+
+[Eliot Moss] 15:44:58
+with that handle that's within the 32 bytes,
+
+[Eliot Moss] 15:45:02
+That's already checked, and I don't have to run another check.
+
+[Eliot Moss] 15:45:09
+So, you know, could apply the concept to other things.
+
+[Eliot Moss] 15:45:13
+Um, but…
+
+[Eliot Moss] 15:45:15
+to be able to get the, uh…
+
+[Eliot Moss] 15:45:18
+Most of the value of it.
+
+[Eliot Moss] 15:45:21
+Um…
+
+[Eliot Moss] 15:45:22
+It has to have static properties. That's why the size has… would have to be statically known.
+
+[Hao Shi] 15:45:27
+Yeah.
+
+[Eliot Moss] 15:45:29
+Now, you could probably still, you know, re…
+
+[Eliot Moss] 15:45:33
+you could reduce…
+
+[Eliot Moss] 15:45:35
+You could have it have sort of a dynamic flavor of one of those, which might be helpful for arrays.
+
+[Eliot Moss] 15:45:40
+Where you'd say, okay, let's do…
+
+[Eliot Moss] 15:45:44
+a check that, you know, happens to be, let's say, the size of a hole,
+
+[Eliot Moss] 15:45:51
+array.
+
+[Eliot Moss] 15:45:53
+And then, um…
+
+[Eliot Moss] 15:45:55
+it would do the appropriate…
+
+[Eliot Moss] 15:45:57
+gain the appropriate read or write permissions to that range of bytes, and then the handle would have…
+
+[Eliot Moss] 15:46:03
+a starting point, and a…
+
+[Eliot Moss] 15:46:05
+And it would carry with it a dynamic…
+
+[Eliot Moss] 15:46:08
+dynamically computed size.
+
+[Eliot Moss] 15:46:11
+the size that you asked for. So,
+
+[Eliot Moss] 15:46:14
+Uh, on one occasion could be, you know, 53. On another occasion, it could be 75, however many bytes.
+
+[Eliot Moss] 15:46:20
+you want, but you'd have to carry that number with it, and accesses
+
+[Eliot Moss] 15:46:25
+would have to be statically checked to lie in that range.
+
+[Eliot Moss] 15:46:29
+But all you'd have to do is the range check. You wouldn't have to go probe…
+
+[Eliot Moss] 15:46:34
+a granule table.
+
+[Hao Shi] 15:46:37
+Yeah.
+
+[Hao Shi] 15:46:39
+I see.
+
+[Eliot Moss] 15:46:40
+Right. So, you know, you… one could come up with mechanisms.
+
+[Eliot Moss] 15:46:45
+Um, but…
+
+[Eliot Moss] 15:46:49
+we're sort of biasing toward the, uh…
+
+[Eliot Moss] 15:46:53
+WASM heap objects, as opposed to the linear memory.
+
+[Hao Shi] 15:46:56
+Yeah…
+
+[Hao Shi] 15:46:58
+And I think, well, uh, I think we're already have…
+
+[Hao Shi] 15:47:03
+most of what we need for, um…
+
+[Hao Shi] 15:47:06
+linear memory, but most…
+
+[Hao Shi] 15:47:09
+interesting part is the objects.
+
+[Hao Shi] 15:47:11
+month-to-month.
+
+[Hao Shi] 15:47:13
+Right.
+
+[Eliot Moss] 15:47:13
+Well, I'm not sure… I'm not sure I understand what you mean by have most of what we need for the linear memory. I mean…
+
+[Eliot Moss] 15:47:18
+We can make it go if, uh…
+
+[Eliot Moss] 15:47:21
+If it was something that people…
+
+[Eliot Moss] 15:47:24
+used a lot and cared about a lot, then we might want to
+
+[Eliot Moss] 15:47:27
+you know, add in that handle mechanism I was talking about to improve the performance.
+
+[Hao Shi] 15:47:32
+I don't know.
+
+[Eliot Moss] 15:47:34
+But… anyway.
+
+[Hao Shi] 15:47:35
+I see

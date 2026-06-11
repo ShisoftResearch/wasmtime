@@ -597,6 +597,7 @@ struct ObjectTableSlot {
     kind: ObjectKind,
     version: u64,
     type_index: u32,
+    persistent: bool,
     current_record: object_heap::TxRecordHandle,
 }
 
@@ -629,6 +630,25 @@ impl ObjectTable {
         self.allocate_payload(ObjectPayload::Struct(fields))
     }
 
+    pub(crate) fn allocate_persistent_struct_for_gc_ref(
+        &mut self,
+        gc_ref: u32,
+        fields: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        ensure!(
+            gc_ref != 0,
+            "transactional struct object cannot use null GC ref"
+        );
+        ensure!(
+            !self.gc_ref_to_object.contains_key(&gc_ref),
+            "transactional object GC ref is already associated"
+        );
+        let object_id =
+            self.allocate_payload_with_persistence(ObjectPayload::Struct(fields), true)?;
+        self.associate_gc_ref(gc_ref, object_id)?;
+        Ok(object_id)
+    }
+
     pub(crate) fn allocate_struct_for_gc_ref(
         &mut self,
         gc_ref: u32,
@@ -649,6 +669,25 @@ impl ObjectTable {
 
     pub(crate) fn allocate_array(&mut self, elements: Vec<ObjectValue>) -> Result<ObjectId> {
         self.allocate_payload(ObjectPayload::Array(elements))
+    }
+
+    pub(crate) fn allocate_persistent_array_for_gc_ref(
+        &mut self,
+        gc_ref: u32,
+        elements: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        ensure!(
+            gc_ref != 0,
+            "transactional array object cannot use null GC ref"
+        );
+        ensure!(
+            !self.gc_ref_to_object.contains_key(&gc_ref),
+            "transactional object GC ref is already associated"
+        );
+        let object_id =
+            self.allocate_payload_with_persistence(ObjectPayload::Array(elements), true)?;
+        self.associate_gc_ref(gc_ref, object_id)?;
+        Ok(object_id)
     }
 
     pub(crate) fn allocate_array_for_gc_ref(
@@ -686,6 +725,14 @@ impl ObjectTable {
     }
 
     pub(crate) fn allocate_payload(&mut self, payload: ObjectPayload) -> Result<ObjectId> {
+        self.allocate_payload_with_persistence(payload, false)
+    }
+
+    fn allocate_payload_with_persistence(
+        &mut self,
+        payload: ObjectPayload,
+        persistent: bool,
+    ) -> Result<ObjectId> {
         let reused_slot = self.free_list.last().copied();
         let object_id = match reused_slot {
             Some(object_id) => object_id,
@@ -719,6 +766,7 @@ impl ObjectTable {
             kind,
             version,
             type_index: 0,
+            persistent,
             current_record: record,
         });
         self.live_count = self
@@ -786,6 +834,27 @@ impl ObjectTable {
             .with_context(|| format!("unknown transactional object GC ref: {gc_ref:#x}"))
     }
 
+    pub(crate) fn known_object_id_for_gc_ref(&self, gc_ref: u32) -> Option<ObjectId> {
+        if gc_ref == 0 {
+            return None;
+        }
+        self.gc_ref_to_object.get(&gc_ref).copied()
+    }
+
+    pub(crate) fn known_persistent_object_id_for_gc_ref(
+        &self,
+        gc_ref: u32,
+    ) -> Result<Option<ObjectId>> {
+        let Some(object_id) = self.known_object_id_for_gc_ref(gc_ref) else {
+            return Ok(None);
+        };
+        if self.is_persistent(object_id)? {
+            Ok(Some(object_id))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub(crate) fn gc_ref_for_object_id(&self, object_id: ObjectId) -> Result<u32> {
         self.live_slot(object_id)?;
         self.object_to_gc_ref
@@ -816,6 +885,10 @@ impl ObjectTable {
         Ok(self.live_slot(object_id)?.version)
     }
 
+    pub(crate) fn is_persistent(&self, object_id: ObjectId) -> Result<bool> {
+        Ok(self.live_slot(object_id)?.persistent)
+    }
+
     pub(crate) fn payload(&self, object_id: ObjectId) -> Result<ObjectPayload> {
         let slot = self.live_slot(object_id)?;
         Ok(self.heap.payload(slot.current_record)?.clone())
@@ -838,6 +911,7 @@ impl ObjectTable {
             "object payload kind does not match object table slot kind"
         );
         let type_index = self.live_slot(object_id)?.type_index;
+        let persistent = self.live_slot(object_id)?.persistent;
         let record_version = self.bump_record_version()?;
         let record =
             self.heap
@@ -847,6 +921,7 @@ impl ObjectTable {
             kind,
             version,
             type_index,
+            persistent,
             current_record: record,
         });
         Ok(())
@@ -990,6 +1065,7 @@ impl ObjectTable {
                 kind,
                 version,
                 type_index: header.type_index,
+                persistent: true,
                 current_record: handle,
             });
             self.live_count = self
@@ -1060,6 +1136,7 @@ impl ObjectTable {
                 kind,
                 version,
                 type_index: header.type_index,
+                persistent: true,
                 current_record: handle,
             });
             self.live_count = self
@@ -2472,12 +2549,40 @@ impl TransactionState {
         )
     }
 
+    pub(crate) fn acquire_tref_read_for_gc_ref(
+        &mut self,
+        object_table: &ObjectTable,
+        gc_ref: u32,
+    ) -> Result<bool> {
+        let Some(object_id) = object_table.known_persistent_object_id_for_gc_ref(gc_ref)? else {
+            return Ok(false);
+        };
+        self.acquire_object_read(object_table, object_id)
+    }
+
+    pub(crate) fn acquire_tref_write_for_gc_ref(
+        &mut self,
+        object_table: &ObjectTable,
+        gc_ref: u32,
+    ) -> Result<bool> {
+        let Some(object_id) = object_table.known_persistent_object_id_for_gc_ref(gc_ref)? else {
+            return Ok(false);
+        };
+        self.acquire_object_write(object_table, object_id)
+    }
+
     pub(crate) fn read_object_payload(
         &mut self,
         object_table: &ObjectTable,
         object_id: ObjectId,
     ) -> Result<ObjectPayload> {
-        self.acquire_object_read(object_table, object_id)?;
+        if object_table.is_persistent(object_id)? {
+            let granule = object_table.granule_id(object_id)?;
+            ensure!(
+                self.owns_granule_read(granule),
+                "transactional object read permission was not acquired"
+            );
+        }
         if let Some(payload) = self.staged_objects.get(&object_id) {
             return Ok(payload.clone());
         }
@@ -2494,7 +2599,13 @@ impl TransactionState {
             object_table.kind(object_id)? == payload.kind(),
             "object payload kind does not match object table slot kind"
         );
-        self.acquire_object_write(object_table, object_id)?;
+        if object_table.is_persistent(object_id)? {
+            let granule = object_table.granule_id(object_id)?;
+            ensure!(
+                self.owns_granule_write(granule),
+                "transactional object write permission was not acquired"
+            );
+        }
         Ok(self.staged_objects.insert(object_id, payload).is_none())
     }
 
@@ -5459,6 +5570,110 @@ mod tests {
     }
 
     #[test]
+    fn tref_cast_acquires_object_permission_for_known_refs() {
+        let mut objects = ObjectTable::default();
+        let struct_object = objects
+            .allocate_persistent_struct_for_gc_ref(0x11, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let array_object = objects
+            .allocate_persistent_array_for_gc_ref(0x22, vec![ObjectValue::I32(9)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        assert!(state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap());
+        assert!(state.owns_struct_read(struct_object));
+        assert!(!state.owns_struct_write(struct_object));
+
+        assert!(state.acquire_tref_write_for_gc_ref(&objects, 0x22).unwrap());
+        assert!(state.owns_array_read(array_object));
+        assert!(state.owns_array_write(array_object));
+    }
+
+    #[test]
+    fn tref_cast_ignores_null_and_unknown_refs_without_granting_access() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x11, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        assert!(!state.acquire_tref_read_for_gc_ref(&objects, 0).unwrap());
+        assert!(!state.acquire_tref_write_for_gc_ref(&objects, 0x99).unwrap());
+        assert!(!state.owns_struct_read(object));
+        assert!(!state.owns_struct_write(object));
+    }
+
+    #[test]
+    fn tref_cast_does_not_lock_volatile_gc_backed_objects() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_struct_for_gc_ref(0x11, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        assert!(!objects.is_persistent(object).unwrap());
+        assert!(!state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap());
+        assert!(!state.acquire_tref_write_for_gc_ref(&objects, 0x11).unwrap());
+        assert!(!state.owns_struct_read(object));
+        assert!(!state.owns_struct_write(object));
+        assert_eq!(
+            state.read_struct_field(&objects, object, 0).unwrap(),
+            ObjectValue::I32(7)
+        );
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
+            .unwrap();
+    }
+
+    #[test]
+    fn object_payload_access_requires_prior_tref_permission() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x11, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        let error = state.read_struct_field(&objects, object, 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transactional object read permission was not acquired")
+        );
+
+        state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap();
+        assert_eq!(
+            state.read_struct_field(&objects, object, 0).unwrap(),
+            ObjectValue::I32(7)
+        );
+
+        let error = state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transactional object write permission was not acquired")
+        );
+
+        state.acquire_tref_write_for_gc_ref(&objects, 0x11).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
+            .unwrap();
+        assert_eq!(
+            state.read_struct_field(&objects, object, 0).unwrap(),
+            ObjectValue::I32(8)
+        );
+    }
+
+    #[test]
     fn object_table_allocates_dense_stable_ids_and_reuses_freed_slots() {
         let mut objects = ObjectTable::default();
 
@@ -5642,6 +5857,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
+        state.acquire_object_write(&objects, object).unwrap();
         assert_eq!(
             state.read_object_payload(&objects, object).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
@@ -5664,6 +5880,7 @@ mod tests {
         );
 
         state.begin().unwrap();
+        state.acquire_object_write(&objects, object).unwrap();
         state
             .stage_object_payload(
                 &objects,
@@ -5689,6 +5906,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
+        state.acquire_object_write(&objects, object).unwrap();
 
         assert_eq!(
             state.read_struct_field(&objects, object, 0).unwrap(),
@@ -5728,6 +5946,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
+        state.acquire_object_write(&objects, object).unwrap();
         state
             .stage_struct_field(&objects, object, 1, ObjectValue::I32(7))
             .unwrap();
@@ -5806,6 +6025,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
+        state.acquire_object_write(&objects, object).unwrap();
 
         assert_eq!(state.read_array_len(&objects, object).unwrap(), 5);
         assert_eq!(
@@ -5875,6 +6095,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
+        state.acquire_object_write(&objects, object).unwrap();
 
         let error = state.read_array_element(&objects, object, 1).unwrap_err();
         assert!(error.to_string().contains("out of bounds array access"));
@@ -5929,6 +6150,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
+        state.acquire_object_read(&objects, object).unwrap();
         state.read_object_payload(&objects, object).unwrap();
         objects
             .update_payload(object, ObjectPayload::Struct(vec![ObjectValue::I32(2)]))

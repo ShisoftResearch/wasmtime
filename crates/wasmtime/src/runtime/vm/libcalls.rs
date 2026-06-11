@@ -440,6 +440,52 @@ fn transaction_helper_i31_for_ref(
     (value as u32).wrapping_shl(1) | 1
 }
 
+fn transaction_tref_cast_read(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+) -> Result<()> {
+    let result = transaction_tref_cast_read_impl(store, instance, gc_ref);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tref_cast_read_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    state.acquire_tref_read_for_gc_ref(object_table, gc_ref)?;
+    Ok(())
+}
+
+fn transaction_tref_cast_write(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+) -> Result<()> {
+    let result = transaction_tref_cast_write_impl(store, instance, gc_ref);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tref_cast_write_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    gc_ref: u32,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store)?;
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    state.acquire_tref_write_for_gc_ref(object_table, gc_ref)?;
+    Ok(())
+}
+
 fn transaction_tglobal_get(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -1437,7 +1483,7 @@ fn transaction_tstruct_static_new_impl(
     for abi in fields {
         values.push(object_value_from_transaction_abi(object_table, *abi)?);
     }
-    object_table.allocate_struct_for_gc_ref(gc_ref, values)?;
+    object_table.allocate_persistent_struct_for_gc_ref(gc_ref, values)?;
     Ok(())
 }
 
@@ -1578,7 +1624,7 @@ fn transaction_tarray_static_new_impl(
     let abi = ObjectValueAbi::from_parts(tag, low, high)?;
     let object_table = store.store_opaque_mut().transaction_object_table_mut();
     let value = object_value_from_transaction_abi(object_table, abi)?;
-    object_table.allocate_array_for_gc_ref(gc_ref, vec![value; len])?;
+    object_table.allocate_persistent_array_for_gc_ref(gc_ref, vec![value; len])?;
     Ok(())
 }
 
@@ -1679,7 +1725,7 @@ fn transaction_tarray_static_new_fixed_impl(
     for abi in elements {
         values.push(object_value_from_transaction_abi(object_table, *abi)?);
     }
-    object_table.allocate_array_for_gc_ref(gc_ref, values)?;
+    object_table.allocate_persistent_array_for_gc_ref(gc_ref, values)?;
     Ok(())
 }
 

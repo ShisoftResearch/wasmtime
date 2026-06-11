@@ -3083,11 +3083,14 @@ pub fn translate_operator(
             environ.trapnz(builder, is_null, crate::TRAP_NULL_REFERENCE);
             environ.stacks.push1(r);
         }
-        Operator::TRefCastRead | Operator::TRefCastWrite => {
-            // Transactional read/write casts update validator type-state only.
-            // Runtime acquisition is keyed by transaction state and granules,
-            // so the reference identity itself is unchanged here.
+        Operator::TRefCastRead => {
             let r = environ.stacks.pop1();
+            environ.translate_transaction_tref_cast_read(builder, r)?;
+            environ.stacks.push1(r);
+        }
+        Operator::TRefCastWrite => {
+            let r = environ.stacks.pop1();
+            environ.translate_transaction_tref_cast_write(builder, r)?;
             environ.stacks.push1(r);
         }
 

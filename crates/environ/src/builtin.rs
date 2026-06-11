@@ -24,6 +24,10 @@ macro_rules! foreach_builtin_function {
             transaction_failure_code(vmctx: vmctx) -> u32;
             // Compatibility helper for generated transaction fixtures that route scalar payloads through ti31.
             transaction_helper_i31_for_ref(vmctx: vmctx, gc_ref: u32) -> u32;
+            // Acquires read permission for a known persistent transactional reference.
+            transaction_tref_cast_read(vmctx: vmctx, gc_ref: u32) -> bool;
+            // Acquires write permission for a known persistent transactional reference.
+            transaction_tref_cast_write(vmctx: vmctx, gc_ref: u32) -> bool;
             // Returns a pointer to a staged transactional global cell.
             transaction_tglobal_get(vmctx: vmctx, global: u32) -> pointer;
             // Stages a transactional global write. `tag` identifies the value type.
@@ -553,6 +557,8 @@ mod tests {
             BuiltinFunctionIndex::transaction_tarray_copy(),
             BuiltinFunctionIndex::transaction_tarray_init_data(),
             BuiltinFunctionIndex::transaction_tarray_init_elem(),
+            BuiltinFunctionIndex::transaction_tref_cast_read(),
+            BuiltinFunctionIndex::transaction_tref_cast_write(),
         ] {
             assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));
         }

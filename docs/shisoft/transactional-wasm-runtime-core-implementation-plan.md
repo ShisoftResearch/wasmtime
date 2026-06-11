@@ -128,12 +128,12 @@ The next storage refactor must introduce a lower shared region layer:
   for linear-memory execution.
 - `TMemoryRegion`: linear-memory frontend over `MappedLinearRegion`, with
   transaction granules derived from the single `TMEMORY_GRANULE_SIZE`
-  constant. The current branch value is 64 bytes.
+  constant. The current Wizard-compatible branch value is 256 bytes.
 - `ObjectHeapRegion`: later object-payload frontend over the same block/chunk
   substrate.
-- `ObjectTableRegion`: later object-table frontend whose persistent chunks are
-  physically discontiguous but mapped contiguously so `ObjectId` indexes
-  directly into the table.
+- later object-index structures remain DRAM-only in the Zen-first recovery path
+  and are rebuilt during recovery rather than implemented as a persisted object
+  table region in this wave.
 
 Backend block size is a policy of `BlockRegionBackend`. The first
 implementation should copy Wizard's x86-64 Immix region default:
@@ -142,9 +142,10 @@ multiple of the 64 KiB Wasm page size. The 64 KiB Wasm page remains the
 grow/accounting unit, and `TMEMORY_GRANULE_SIZE` remains the transaction
 conflict/COW unit.
 
-Copy Wizard's block-region layout names and roles directly:
+Copy Wizard's block-region layout names and roles directly. Use `RegionHeader`
+as the Wasmtime-side name for the Wizard `PWRegionHeader` role:
 
-- `PWRegionHeader`
+- `RegionHeader`
 - `MetaDataDesc`
 - `BlockEntry`
 - `ChunkHeader`
@@ -199,11 +200,22 @@ Expected: FAIL because the constants/types do not exist.
 
 - [x] **Step 3: Implement layout constants and Rust structs**
 
-Define Rust equivalents for Wizard's `PWRegionHeader`, `MetaDataDesc`,
-`BlockEntry`, `ChunkHeader`, `ListKind`, `BlockLists`, and `LineMark`.
+Define Rust equivalents for Wizard's `PWRegionHeader`/`RegionHeader`,
+`MetaDataDesc`, `BlockEntry`, `ChunkHeader`, `ListKind`, `BlockLists`, and
+`LineMark`.
 
 Keep this first step structural only. Do not wire allocation or `TMemory`
 through it yet.
+
+The current storage-design direction also fixes these phase-1 durable header
+constraints:
+
+- `RegionHeader` uses block-derived coordinates rather than persisted byte
+  offsets.
+- log storage uses single-block log chunks with a dedicated `LogBlockHeader`.
+- data storage uses multi-block chunks with a dedicated `DataChunkHeader`.
+- continuation blocks are inferred from chunk-start metadata rather than marked
+  with a separate persisted continuation role.
 
 - [x] **Step 4: Verify and commit**
 
@@ -705,7 +717,7 @@ Make `TMemoryGranuleInfo` carry explicit owner and version fields:
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TMemoryGranuleInfo {
     pub owner: Option<crate::runtime::transaction::TransactionId>,
-    pub version: u64,
+    pub version: u32,
 }
 ```
 
@@ -1230,7 +1242,7 @@ impl LockBased {
         &mut self,
         tx: TransactionId,
         granule: GranuleId,
-        version: u64,
+        version: u32,
     ) -> anyhow::Result<()> {
         if let Some(owner) = self.owners.get(&granule) {
             anyhow::ensure!(
@@ -1246,7 +1258,7 @@ impl LockBased {
         &mut self,
         tx: TransactionId,
         granule: GranuleId,
-        current_version: u64,
+        current_version: u32,
     ) -> anyhow::Result<()> {
         if let Some(owner) = self.owners.get(&granule) {
             anyhow::ensure!(
@@ -1271,7 +1283,7 @@ impl LockBased {
         &self,
         tx: TransactionId,
         granule: GranuleId,
-        current_version: u64,
+        current_version: u32,
     ) -> anyhow::Result<()> {
         if self.owners.get(&granule).copied() == Some(tx) {
             return Ok(());
@@ -1302,7 +1314,7 @@ impl LockBased {
         &mut self,
         tx: TransactionId,
         granule: GranuleId,
-        version: u64,
+        version: u32,
     ) -> anyhow::Result<()> {
         self.record_read(tx, granule, version)
     }
@@ -1311,7 +1323,7 @@ impl LockBased {
         &mut self,
         tx: TransactionId,
         granule: GranuleId,
-        version: u64,
+        version: u32,
     ) -> anyhow::Result<()> {
         self.acquire_write(tx, granule, version)
     }
@@ -1320,7 +1332,7 @@ impl LockBased {
         &self,
         tx: TransactionId,
         granule: GranuleId,
-        version: u64,
+        version: u32,
     ) -> anyhow::Result<()> {
         self.validate_read(tx, granule, version)
     }
