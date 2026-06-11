@@ -59,13 +59,14 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue,
-    ObjectValueAbi, StagedRecord, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,
-    TableElementSnapshot, TransactionId, TransactionState, collect_tmemory_access_snapshot,
+    ObjectValueAbi, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot,
+    TransactionId, TransactionState, collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
     self, HostResultHasUnwindSentinel, TableElementType, VMStore, f32x4, f64x2, i8x16,
 };
+use alloc::collections::BTreeMap;
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
@@ -360,6 +361,8 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
             .transaction_state_mut()
             .validate_active_read(granule, current_version)?;
     }
+
+    commit_staged_tmemory_records(store, instance, &records)?;
 
     for record in &records {
         apply_staged_transaction_record(store, instance, record)?;
@@ -2402,6 +2405,151 @@ fn restore_original_table_elements(store: &mut dyn VMStore, instance: InstanceId
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TMemoryParticipant {
+    owner: InstanceId,
+    owner_instance_key: Option<InstanceId>,
+    memory_index: u32,
+}
+
+impl Ord for TMemoryParticipant {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (
+            self.owner.as_u32(),
+            self.owner_instance_key.map(InstanceId::as_u32),
+            self.memory_index,
+        )
+            .cmp(&(
+                other.owner.as_u32(),
+                other.owner_instance_key.map(InstanceId::as_u32),
+                other.memory_index,
+            ))
+    }
+}
+
+impl PartialOrd for TMemoryParticipant {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn collect_tmemory_participants(
+    instance: InstanceId,
+    records: &[StagedRecord],
+) -> BTreeMap<TMemoryParticipant, Vec<(u64, Vec<u8>)>> {
+    let mut participants = BTreeMap::new();
+
+    for record in records {
+        let StagedRecord::MemoryGranule {
+            owner_instance,
+            memory_index,
+            granule_index,
+            bytes,
+        } = record
+        else {
+            continue;
+        };
+        let participant = TMemoryParticipant {
+            owner: owner_instance.unwrap_or(instance),
+            owner_instance_key: *owner_instance,
+            memory_index: *memory_index,
+        };
+        participants
+            .entry(participant)
+            .or_insert_with(Vec::new)
+            .push((*granule_index, bytes.clone()));
+    }
+
+    participants
+}
+
+fn commit_staged_tmemory_records(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    records: &[StagedRecord],
+) -> Result<()> {
+    let participants = collect_tmemory_participants(instance, records);
+    if participants.is_empty() {
+        return Ok(());
+    }
+
+    let transaction_id = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        state.active_transaction_required_raw()?
+    };
+    let stream_id = u32::try_from(transaction_id)
+        .context("transaction id does not fit durable tmemory stream id")?;
+
+    let mut persistent_undos = Vec::new();
+    for (participant, staged) in &participants {
+        let memory_index = MemoryIndex::from_u32(participant.memory_index);
+        let backend = {
+            let instance_ref = store.instance_mut(participant.owner);
+            let instance_ref = instance_ref.as_ref();
+            let Some(tmemory) = instance_ref.get_tmemory(memory_index) else {
+                bail!("transactional memory operation targeted non-transactional memory");
+            };
+            tmemory.backend()
+        };
+
+        if backend == TMemoryBackend::VMemory {
+            continue;
+        }
+
+        let instance_ref = store.instance_mut(participant.owner);
+        let instance_ref = instance_ref.as_ref();
+        let Some(tmemory) = instance_ref.get_tmemory(memory_index) else {
+            bail!("transactional memory operation targeted non-transactional memory");
+        };
+        for (granule_index, bytes) in staged {
+            let undo = tmemory.prepare_tmemory_undo_record(
+                Some(participant.owner.as_u32()),
+                participant.memory_index,
+                *granule_index,
+                bytes,
+            )?;
+            persistent_undos.push(undo);
+        }
+    }
+
+    let mut final_marker = None;
+    for undo in &persistent_undos {
+        let marker = {
+            let state = store.store_opaque_mut().transaction_state_mut();
+            state.publish_tmemory_undo_before_in_place_write(stream_id, stream_id, undo)?
+        };
+        final_marker = Some(marker);
+    }
+
+    for (participant, staged) in &participants {
+        let memory_index = MemoryIndex::from_u32(participant.memory_index);
+        {
+            let mut instance_ref = store.instance_mut(participant.owner);
+            let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory_index) else {
+                bail!("transactional memory operation targeted non-transactional memory");
+            };
+            tmemory.commit_staged_tmemory_granules_direct(staged)?;
+        }
+    }
+
+    if let Some(marker) = final_marker {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        state.publish_commit_lp(stream_id, stream_id, marker)?;
+    }
+
+    for participant in participants.keys() {
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .remove_staged_tmemory_granules_owned(
+                participant.owner_instance_key,
+                participant.memory_index,
+            )?;
+    }
+
+    Ok(())
+}
+
 fn apply_staged_transaction_record(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -2415,10 +2563,10 @@ fn apply_staged_transaction_record(
         } => {
             let owner = owner_instance.unwrap_or(instance);
             let memory_index = MemoryIndex::from_u32(*memory_index);
-            let staged = store
-                .store_opaque_mut()
-                .transaction_state_mut()
-                .staged_tmemory_granules_owned(Some(owner), memory_index.as_u32())?;
+            let staged = {
+                let state = store.store_opaque_mut().transaction_state_mut();
+                state.staged_tmemory_granules_owned(Some(owner), memory_index.as_u32())?
+            };
             if staged.is_empty() {
                 return Ok(());
             }
@@ -2428,12 +2576,17 @@ fn apply_staged_transaction_record(
                 let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory_index) else {
                     bail!("transactional memory operation targeted non-transactional memory");
                 };
-                for (_, granule_index, bytes) in &staged {
-                    let addr = granule_index
-                        .checked_mul(TMEMORY_GRANULE_SIZE)
-                        .context("tmemory granule byte offset overflow")?;
-                    tmemory.commit_range(addr, bytes)?;
-                }
+                let staged = staged
+                    .iter()
+                    .map(|(_, granule_index, bytes)| {
+                        Ok((
+                            u64::try_from(*granule_index)
+                                .context("tmemory granule index does not fit durable log")?,
+                            bytes.clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                tmemory.commit_staged_tmemory_granules_direct(&staged)?;
             }
 
             store
@@ -3542,4 +3695,94 @@ fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
     // Avoid unused-argument warning in no-debugger builds.
     let _ = store;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_tmemory_participants_groups_granules_by_memory() {
+        let owner = InstanceId::from_u32(3);
+        let records = vec![
+            StagedRecord::MemoryGranule {
+                owner_instance: Some(owner),
+                memory_index: 7,
+                granule_index: 0,
+                bytes: vec![1, 2],
+            },
+            StagedRecord::MemoryGranule {
+                owner_instance: Some(owner),
+                memory_index: 7,
+                granule_index: 1,
+                bytes: vec![3, 4],
+            },
+        ];
+
+        let participants = collect_tmemory_participants(InstanceId::from_u32(0), &records);
+
+        let participant = TMemoryParticipant {
+            owner,
+            owner_instance_key: Some(owner),
+            memory_index: 7,
+        };
+        assert_eq!(participants.len(), 1);
+        assert_eq!(
+            participants.get(&participant).unwrap(),
+            &vec![(0, vec![1, 2]), (1, vec![3, 4])]
+        );
+    }
+
+    #[test]
+    fn collect_tmemory_participants_allows_distinct_persistent_memories() {
+        let owner = InstanceId::from_u32(3);
+        let records = vec![
+            StagedRecord::MemoryGranule {
+                owner_instance: Some(owner),
+                memory_index: 7,
+                granule_index: 0,
+                bytes: vec![1],
+            },
+            StagedRecord::MemoryGranule {
+                owner_instance: Some(owner),
+                memory_index: 8,
+                granule_index: 0,
+                bytes: vec![2],
+            },
+        ];
+
+        let participants = collect_tmemory_participants(InstanceId::from_u32(0), &records);
+
+        assert_eq!(participants.len(), 2);
+        assert!(participants.contains_key(&TMemoryParticipant {
+            owner,
+            owner_instance_key: Some(owner),
+            memory_index: 7,
+        }));
+        assert!(participants.contains_key(&TMemoryParticipant {
+            owner,
+            owner_instance_key: Some(owner),
+            memory_index: 8,
+        }));
+    }
+
+    #[test]
+    fn collect_tmemory_participants_preserves_implicit_owner_key() {
+        let default_owner = InstanceId::from_u32(9);
+        let records = vec![StagedRecord::MemoryGranule {
+            owner_instance: None,
+            memory_index: 2,
+            granule_index: 4,
+            bytes: vec![5],
+        }];
+
+        let participants = collect_tmemory_participants(default_owner, &records);
+
+        let participant = TMemoryParticipant {
+            owner: default_owner,
+            owner_instance_key: None,
+            memory_index: 2,
+        };
+        assert_eq!(participants.get(&participant).unwrap(), &vec![(4, vec![5])]);
+    }
 }

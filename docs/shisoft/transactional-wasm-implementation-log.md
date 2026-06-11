@@ -15,6 +15,64 @@ Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
 work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
 or object-model sequencing have drifted.
 
+## TMemory Undo-In-Place Durable Substrate
+
+Date: 2026-06-11
+
+Added the first durable substrate for the linear-memory ordering problem
+identified in `docs/shisoft/meeting_saved_closed_caption copy 2.txt`.
+Persistent `tmemory` should not use object-style redo publication for every
+modified granule. Objects remain COW/redo records whose data record is the
+object storage itself; linear-memory undo records are separate rollback
+material containing old granule bytes.
+
+Changes in this slice:
+
+- `TxLogEntry` now carries a CRC-covered role:
+  - `TObjectPub` for ordinary object/global/table publication records.
+  - `TMemoryUndo` for old linear-memory granule bytes.
+- `TxDataRecordHeader` now carries a matching record role in the former
+  reserved field.
+- Added `PendingGranuleUndo` and `encode_undo_data_record` so linear-memory
+  undo records are not represented as `PendingPublication`.
+- Added `StreamPublisher::publish_tmemory_undo_before_in_place_write`, which
+  enforces data write, data flush, fence, undo log write, log flush, fence
+  before any future in-place persistent write.
+- Added `StreamPublisher::publish_commit_lp` so undo-only persistent
+  `tmemory` transactions can publish a final LP without appending another data
+  record.
+- Added transaction-owned durable logging for persistent `tmemory` commits.
+  `TransactionState` owns the current unified in-memory durable stream and
+  publishes all `TMemoryUndo` records plus one final LP for the whole
+  transaction.
+- Split `TMemory` into participant operations:
+  `prepare_tmemory_undo_record`, `commit_staged_tmemory_granule`, and
+  `commit_staged_tmemory_granules_direct`. `TMemory` no longer owns transaction
+  log streams or publishes LP markers.
+- Routed runtime staged `tmemory` commits through the unified coordinator in
+  `libcalls.rs`. Transactions can now touch multiple persistent `tmemory`
+  participants without producing per-memory LP markers. `VMemory` remains on
+  the volatile no-log commit path.
+- Recovery now ignores committed `TMemoryUndo` entries and turns loose-end
+  `TMemoryUndo` entries into `RecoveredTMemoryUndoRollback` actions.
+- Added `TMemory::apply_recovered_tmemory_undo_rollbacks` so recovered rollback
+  actions can restore old base-image bytes without bumping granule versions.
+- Added participant collection in the commit path so staged memory granules are
+  grouped by owning instance and memory index before durable logging and
+  in-place application.
+
+Still deferred:
+
+- Transaction execution still uses the existing staged-memory workspace.
+  Persistent backends perform undo-before-in-place during commit, when staged
+  granules are applied to the base image.
+- Full process restart recovery does not yet discover the correct reopened
+  `TMemory` instance/backing file and invoke
+  `apply_recovered_tmemory_undo_rollbacks`; the apply helper is present.
+- The unified durable stream is still an in-memory research scaffold. A real
+  PMEM/file-backed transaction log manager still needs to replace it at the
+  transaction/store layer for process-restart durability.
+
 ## Zen-First Object Publication Metadata
 
 Date: 2026-06-09

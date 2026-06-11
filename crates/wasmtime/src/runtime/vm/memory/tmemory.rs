@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
-use crate::runtime::transaction::DurableSink;
+use crate::runtime::transaction::PendingGranuleUndo;
 use crate::runtime::transaction::{
     TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryFileBacking,
     TMemoryPersistenceMode, TransactionConfig,
@@ -71,24 +71,6 @@ pub(crate) trait TMemoryBackendStorage: core::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub(crate) struct TMemory {
     storage: Box<dyn TMemoryBackendStorage>,
-    durability: TMemoryDurability,
-}
-
-#[derive(Debug, Default)]
-struct TMemoryDurability {
-    streams: BTreeMap<u32, DurableStreamState>,
-}
-
-#[derive(Debug, Default)]
-struct DurableStreamState {
-    data_records: Vec<Vec<u8>>,
-    log_entries: Vec<TxLogEntry>,
-    next_data_block: u32,
-}
-
-pub(crate) struct TMemoryDurableSink<'a> {
-    tmemory: &'a mut TMemory,
-    stream_id: u32,
 }
 
 /// Per-instance transactional memories keyed by raw module-level `MemoryIndex`.
@@ -173,7 +155,7 @@ impl TMemory {
             logical_id,
             version,
             kind,
-            reserved: 0,
+            role: 0,
             payload_len,
             type_info,
         };
@@ -187,6 +169,37 @@ impl TMemory {
         );
         record.extend_from_slice(&header.as_bytes());
         record.extend_from_slice(payload);
+        Ok(record)
+    }
+
+    pub(crate) fn encode_granule_undo_data_record(
+        logical_id: u64,
+        version: u32,
+        kind: u16,
+        type_info: u32,
+        old_granule_bytes: &[u8],
+    ) -> Result<Vec<u8>> {
+        let payload_len = u32::try_from(old_granule_bytes.len())
+            .context("undo payload length does not fit u32")?;
+        let mut header = TxDataRecordHeader {
+            logical_id,
+            version,
+            kind,
+            role: 0,
+            payload_len,
+            type_info,
+        };
+        header.set_role(TxDataRecordRole::TMemoryUndo);
+
+        let mut record = Vec::with_capacity(
+            header
+                .as_bytes()
+                .len()
+                .checked_add(old_granule_bytes.len())
+                .context("undo record length overflow")?,
+        );
+        record.extend_from_slice(&header.as_bytes());
+        record.extend_from_slice(old_granule_bytes);
         Ok(record)
     }
 
@@ -204,14 +217,6 @@ impl TMemory {
             entry.seal_crc32();
         }
         entry
-    }
-
-    pub(crate) fn durable_sink(&mut self, stream_id: u32) -> TMemoryDurableSink<'_> {
-        self.durability.streams.entry(stream_id).or_default();
-        TMemoryDurableSink {
-            tmemory: self,
-            stream_id,
-        }
     }
 
     pub(crate) fn backend(&self) -> TMemoryBackend {
@@ -263,6 +268,94 @@ impl TMemory {
                 .checked_add(1)
                 .context("tmemory granule version overflow")?;
             self.storage.set_granule_info(granule, info)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn prepare_tmemory_undo_record(
+        &self,
+        owner_instance: Option<u32>,
+        memory_index: u32,
+        granule_index: u64,
+        bytes: &[u8],
+    ) -> Result<PendingGranuleUndo> {
+        let granule = usize::try_from(granule_index)
+            .context("tmemory granule index does not fit host usize")?;
+        let range = tmemory_granule_range(granule, self.byte_len())?;
+        ensure!(
+            bytes.len() == range.end - range.start,
+            "persistent tmemory staged granule length mismatch"
+        );
+
+        let old_bytes = self.read_committed(range)?;
+        let current_version = self.granule_version(granule)?;
+        let version = u32::try_from(
+            current_version
+                .checked_add(1)
+                .context("tmemory granule version overflow")?,
+        )
+        .context("tmemory granule version does not fit durable log")?;
+        let logical_id = pack_tmemory_granule_id(owner_instance, memory_index, granule_index)?;
+        Ok(PendingGranuleUndo::tmemory(logical_id, version, old_bytes))
+    }
+
+    pub(crate) fn commit_staged_tmemory_granule(
+        &mut self,
+        granule_index: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let granule = usize::try_from(granule_index)
+            .context("tmemory granule index does not fit host usize")?;
+        let range = tmemory_granule_range(granule, self.byte_len())?;
+        ensure!(
+            bytes.len() == range.end - range.start,
+            "tmemory staged granule length mismatch"
+        );
+        self.commit_range(range.start, bytes)
+    }
+
+    pub(crate) fn commit_staged_tmemory_granules_direct(
+        &mut self,
+        staged: &[(u64, Vec<u8>)],
+    ) -> Result<()> {
+        for (granule_index, bytes) in staged {
+            self.commit_staged_tmemory_granule(*granule_index, bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_recovered_tmemory_undo_rollbacks<I>(&mut self, rollbacks: I) -> Result<()>
+    where
+        I: IntoIterator<Item = recovery::RecoveredTMemoryUndoRollback>,
+    {
+        let mut oldest_by_granule = BTreeMap::<u64, recovery::RecoveredTMemoryUndoRollback>::new();
+        for rollback in rollbacks {
+            match oldest_by_granule.get(&rollback.logical_id) {
+                Some(current)
+                    if rollback.version == current.version
+                        && rollback.old_granule_bytes != current.old_granule_bytes =>
+                {
+                    bail!("conflicting tmemory rollback records for same logical id/version");
+                }
+                Some(current) if current.version <= rollback.version => {}
+                _ => {
+                    oldest_by_granule.insert(rollback.logical_id, rollback);
+                }
+            }
+        }
+
+        for rollback in oldest_by_granule.into_values() {
+            let (_, _, granule_index) = unpack_tmemory_granule_id(rollback.logical_id)?;
+            let granule = usize::try_from(granule_index)
+                .context("tmemory rollback granule index does not fit host usize")?;
+            let range = tmemory_granule_range(granule, self.byte_len())?;
+            ensure!(
+                rollback.old_granule_bytes.len() == range.end - range.start,
+                "tmemory rollback granule length mismatch"
+            );
+            self.storage
+                .commit_range(range.start, &rollback.old_granule_bytes)?;
         }
 
         Ok(())
@@ -327,64 +420,7 @@ impl TMemory {
                 Box::new(FileBackedMemory::new(min_pages, max_pages, file_backing)?)
             }
         };
-        Ok(Self {
-            storage,
-            durability: TMemoryDurability::default(),
-        })
-    }
-
-    fn durable_stream_state_mut(&mut self, stream_id: u32) -> &mut DurableStreamState {
-        self.durability.streams.entry(stream_id).or_default()
-    }
-}
-
-impl DurableSink for TMemoryDurableSink<'_> {
-    fn append_data_record(&mut self, record: &[u8]) -> Result<(u32, u32)> {
-        let state = self.tmemory.durable_stream_state_mut(self.stream_id);
-        state.data_records.push(record.to_vec());
-        let location = DataRecordLocation {
-            chunk_start_block: state.next_data_block,
-            data_block: state.next_data_block,
-            data_offset: 0,
-        };
-        state.next_data_block = state
-            .next_data_block
-            .checked_add(1)
-            .context("tmemory durable data block overflow")?;
-        Ok((location.data_block, location.data_offset))
-    }
-
-    fn append_log_entry(
-        &mut self,
-        logical_id: u64,
-        version: u32,
-        tx_meta: u32,
-        data_block: u32,
-        data_offset: u32,
-        is_final: bool,
-    ) -> Result<()> {
-        let state = self.tmemory.durable_stream_state_mut(self.stream_id);
-        state.log_entries.push(TMemory::publication_log_entry(
-            logical_id,
-            version,
-            tx_meta,
-            data_block,
-            data_offset,
-            is_final,
-        ));
-        Ok(())
-    }
-
-    fn flush_data(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn flush_log(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn fence(&mut self) -> Result<()> {
-        Ok(())
+        Ok(Self { storage })
     }
 }
 
@@ -1103,6 +1139,23 @@ fn granules_for_bytes(bytes: usize) -> usize {
     bytes.div_ceil(TMEMORY_GRANULE_SIZE)
 }
 
+fn tmemory_granule_addr(granule_index: u64) -> Result<usize> {
+    let granule_index =
+        usize::try_from(granule_index).context("tmemory granule index does not fit host usize")?;
+    granule_index
+        .checked_mul(TMEMORY_GRANULE_SIZE)
+        .context("tmemory granule byte offset overflow")
+}
+
+fn tmemory_granule_range(granule_index: usize, byte_len: usize) -> Result<core::ops::Range<usize>> {
+    let start = granule_index
+        .checked_mul(TMEMORY_GRANULE_SIZE)
+        .context("tmemory granule byte offset overflow")?;
+    ensure!(start < byte_len, "tmemory granule out of bounds");
+    let end = start.saturating_add(TMEMORY_GRANULE_SIZE).min(byte_len);
+    Ok(start..end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,7 +1265,7 @@ mod tests {
             logical_id: 0x1000_0000_0000_0007,
             version: 3,
             kind: PackedGranuleDomain::TMemory as u16,
-            reserved: 0,
+            role: 0,
             payload_len: 0x0001_0203,
             type_info: 0x8001_0002,
         };
@@ -1313,6 +1366,85 @@ mod tests {
 
         assert_eq!(memory.read_committed(4..8).unwrap(), vec![10, 11, 12, 13]);
         assert_eq!(memory.granule_version(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn nvmemory_prepare_undo_record_does_not_publish_or_write() {
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+        memory.commit_range(0, &[1, 2, 3, 4]).unwrap();
+
+        let undo = memory
+            .prepare_tmemory_undo_record(Some(3), 0, 0, &[9; TMEMORY_GRANULE_SIZE])
+            .unwrap();
+
+        assert_eq!(memory.read_committed(0..4).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(undo.version, 2);
+        assert_eq!(undo.old_granule_bytes[..4], [1, 2, 3, 4]);
+        assert_eq!(
+            undo.logical_id,
+            pack_tmemory_granule_id(Some(3), 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn vmemory_commit_staged_granules_keeps_volatile_commit_path() {
+        let mut memory = TMemory::new_vmemory(1).unwrap();
+
+        memory
+            .commit_staged_tmemory_granules_direct(&[(0, vec![9; TMEMORY_GRANULE_SIZE])])
+            .unwrap();
+
+        assert_eq!(memory.read_committed(0..4).unwrap(), vec![9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn recovered_tmemory_undo_rollbacks_restore_base_bytes() {
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+        memory.commit_range(0, &[9, 9, 9, 9]).unwrap();
+        let rollback = recovery::RecoveredTMemoryUndoRollback {
+            logical_id: pack_tmemory_granule_id(Some(3), 0, 0).unwrap(),
+            version: 1,
+            data_block: 0,
+            data_offset: 0,
+            old_granule_bytes: vec![1; TMEMORY_GRANULE_SIZE],
+        };
+
+        memory
+            .apply_recovered_tmemory_undo_rollbacks([rollback])
+            .unwrap();
+
+        assert_eq!(memory.read_committed(0..4).unwrap(), vec![1, 1, 1, 1]);
+        assert_eq!(memory.granule_version(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn recovered_tmemory_undo_rollbacks_choose_oldest_version_for_same_granule() {
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+        memory.commit_range(0, &[9, 9, 9, 9]).unwrap();
+        let logical_id = pack_tmemory_granule_id(Some(3), 0, 0).unwrap();
+        let older = recovery::RecoveredTMemoryUndoRollback {
+            logical_id,
+            version: 2,
+            data_block: 0,
+            data_offset: 0,
+            old_granule_bytes: vec![1; TMEMORY_GRANULE_SIZE],
+        };
+        let newer = recovery::RecoveredTMemoryUndoRollback {
+            logical_id,
+            version: 3,
+            data_block: 0,
+            data_offset: 0,
+            old_granule_bytes: vec![3; TMEMORY_GRANULE_SIZE],
+        };
+
+        memory
+            .apply_recovered_tmemory_undo_rollbacks([older, newer])
+            .unwrap();
+
+        assert_eq!(memory.read_committed(0..4).unwrap(), vec![1, 1, 1, 1]);
     }
 
     #[test]

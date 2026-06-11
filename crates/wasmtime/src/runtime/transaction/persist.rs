@@ -1,7 +1,10 @@
 use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::vm::unpack_object_granule_id;
-use crate::runtime::vm::{PackedGranuleDomain, TMemory, pack_object_granule_id};
+use crate::runtime::vm::{
+    PackedGranuleDomain, TMemory, TxLogEntry, TxLogEntryRole, pack_object_granule_id,
+};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,34 @@ pub(crate) fn encode_data_record(pub_: &PendingPublication) -> Result<Vec<u8>> {
     )
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingGranuleUndo {
+    pub(crate) logical_id: u64,
+    pub(crate) version: u32,
+    pub(crate) kind: u16,
+    pub(crate) type_info: u32,
+    pub(crate) old_granule_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PendingCommitLogEntry {
+    pub(crate) logical_id: u64,
+    pub(crate) version: u32,
+    pub(crate) data_block: u32,
+    pub(crate) data_offset: u32,
+    pub(crate) role: TxLogEntryRole,
+}
+
+pub(crate) fn encode_undo_data_record(undo: &PendingGranuleUndo) -> Result<Vec<u8>> {
+    TMemory::encode_granule_undo_data_record(
+        undo.logical_id,
+        undo.version,
+        undo.kind,
+        undo.type_info,
+        &undo.old_granule_bytes,
+    )
+}
+
 impl PendingPublication {
     pub(crate) fn persistent_object(
         domain: PackedGranuleDomain,
@@ -38,6 +69,18 @@ impl PendingPublication {
             type_info,
             payload,
         })
+    }
+}
+
+impl PendingGranuleUndo {
+    pub(crate) fn tmemory(logical_id: u64, version: u32, old_granule_bytes: Vec<u8>) -> Self {
+        Self {
+            logical_id,
+            version,
+            kind: PackedGranuleDomain::TMemory as u16,
+            type_info: 0,
+            old_granule_bytes,
+        }
     }
 }
 
@@ -74,10 +117,100 @@ pub(crate) trait DurableSink {
         data_block: u32,
         data_offset: u32,
         is_final: bool,
+        role: TxLogEntryRole,
     ) -> Result<()>;
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TxDurableLog {
+    streams: BTreeMap<u32, TxDurableStreamState>,
+}
+
+#[derive(Debug, Default)]
+struct TxDurableStreamState {
+    data_records: Vec<Vec<u8>>,
+    log_entries: Vec<TxLogEntry>,
+    next_data_block: u32,
+}
+
+pub(crate) struct TxDurableLogSink<'a> {
+    log: &'a mut TxDurableLog,
+    stream_id: u32,
+}
+
+impl TxDurableLog {
+    pub(crate) fn stream_sink(&mut self, stream_id: u32) -> TxDurableLogSink<'_> {
+        self.streams.entry(stream_id).or_default();
+        TxDurableLogSink {
+            log: self,
+            stream_id,
+        }
+    }
+
+    fn stream_state_mut(&mut self, stream_id: u32) -> &mut TxDurableStreamState {
+        self.streams.entry(stream_id).or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry> {
+        self.streams
+            .get(&stream_id)
+            .map(|stream| stream.log_entries.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl DurableSink for TxDurableLogSink<'_> {
+    fn append_data_record(&mut self, record: &[u8]) -> Result<(u32, u32)> {
+        let state = self.log.stream_state_mut(self.stream_id);
+        state.data_records.push(record.to_vec());
+        let data_block = state.next_data_block;
+        state.next_data_block = state
+            .next_data_block
+            .checked_add(1)
+            .context("transaction durable data block overflow")?;
+        Ok((data_block, 0))
+    }
+
+    fn append_log_entry(
+        &mut self,
+        logical_id: u64,
+        version: u32,
+        tx_meta: u32,
+        data_block: u32,
+        data_offset: u32,
+        is_final: bool,
+        role: TxLogEntryRole,
+    ) -> Result<()> {
+        let state = self.log.stream_state_mut(self.stream_id);
+        let mut entry = TMemory::publication_log_entry(
+            logical_id,
+            version,
+            tx_meta,
+            data_block,
+            data_offset,
+            is_final,
+        );
+        entry.set_role(role);
+        entry.seal_crc32();
+        state.log_entries.push(entry);
+        Ok(())
+    }
+
+    fn flush_data(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn flush_log(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn fence(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct StreamPublisher<'a, S> {
@@ -127,6 +260,7 @@ where
                 data_block,
                 data_offset,
                 false,
+                TxLogEntryRole::TObjectPub,
             )?;
         }
         self.sink.flush_log()?;
@@ -139,10 +273,60 @@ where
                 data_block,
                 data_offset,
                 true,
+                TxLogEntryRole::TObjectPub,
             )?;
             self.sink.flush_log()?;
             self.sink.fence()?;
         }
+
+        Ok(())
+    }
+
+    pub(crate) fn publish_tmemory_undo_before_in_place_write(
+        &mut self,
+        undo: &PendingGranuleUndo,
+    ) -> Result<PendingCommitLogEntry> {
+        let _ = self.stream_id;
+
+        let record = encode_undo_data_record(undo)?;
+        let (data_block, data_offset) = self.sink.append_data_record(&record)?;
+
+        self.sink.flush_data()?;
+        self.sink.fence()?;
+
+        self.sink.append_log_entry(
+            undo.logical_id,
+            undo.version,
+            self.txid << 1,
+            data_block,
+            data_offset,
+            false,
+            TxLogEntryRole::TMemoryUndo,
+        )?;
+        self.sink.flush_log()?;
+        self.sink.fence()?;
+
+        Ok(PendingCommitLogEntry {
+            logical_id: undo.logical_id,
+            version: undo.version,
+            data_block,
+            data_offset,
+            role: TxLogEntryRole::TMemoryUndo,
+        })
+    }
+
+    pub(crate) fn publish_commit_lp(&mut self, marker: PendingCommitLogEntry) -> Result<()> {
+        self.sink.append_log_entry(
+            marker.logical_id,
+            marker.version,
+            self.txid << 1,
+            marker.data_block,
+            marker.data_offset,
+            true,
+            marker.role,
+        )?;
+        self.sink.flush_log()?;
+        self.sink.fence()?;
 
         Ok(())
     }
@@ -178,6 +362,7 @@ enum DurabilityEvent {
 struct RecordingDurability {
     events: Vec<DurabilityEvent>,
     tx_meta: Vec<u32>,
+    roles: Vec<TxLogEntryRole>,
     next_data_block: u32,
 }
 
@@ -226,10 +411,12 @@ impl DurableSink for RecordingDurability {
         _data_block: u32,
         _data_offset: u32,
         is_final: bool,
+        role: TxLogEntryRole,
     ) -> Result<()> {
         self.events.push(DurabilityEvent::LogWrite);
         let stored_tx_meta = if is_final { tx_meta | 1 } else { tx_meta & !1 };
         self.tx_meta.push(stored_tx_meta);
+        self.roles.push(role);
         Ok(())
     }
 
@@ -314,6 +501,103 @@ mod tests {
     }
 
     #[test]
+    fn tmemory_undo_is_durable_before_in_place_write() {
+        let mut recorder = RecordingDurability::default();
+        let mut publisher = StreamPublisher::new_for_test(&mut recorder, 5, 12);
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![9, 8, 7, 6]);
+
+        publisher
+            .publish_tmemory_undo_before_in_place_write(&undo)
+            .unwrap();
+
+        assert_eq!(
+            recorder.events(),
+            &[
+                DurabilityEvent::DataWrite,
+                DurabilityEvent::DataFlush,
+                DurabilityEvent::Fence,
+                DurabilityEvent::LogWrite,
+                DurabilityEvent::LogFlush,
+                DurabilityEvent::Fence,
+            ]
+        );
+        assert_eq!(recorder.final_lp_count(), 0);
+        assert_eq!(recorder.roles, vec![TxLogEntryRole::TMemoryUndo]);
+    }
+
+    #[test]
+    fn tmemory_undo_only_commit_publishes_final_lp_without_new_data() {
+        let mut recorder = RecordingDurability::default();
+        let mut publisher = StreamPublisher::new_for_test(&mut recorder, 5, 12);
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![9, 8, 7, 6]);
+
+        let marker = publisher
+            .publish_tmemory_undo_before_in_place_write(&undo)
+            .unwrap();
+        publisher.publish_commit_lp(marker).unwrap();
+
+        assert_eq!(
+            recorder.events(),
+            &[
+                DurabilityEvent::DataWrite,
+                DurabilityEvent::DataFlush,
+                DurabilityEvent::Fence,
+                DurabilityEvent::LogWrite,
+                DurabilityEvent::LogFlush,
+                DurabilityEvent::Fence,
+                DurabilityEvent::LogWrite,
+                DurabilityEvent::LogFlush,
+                DurabilityEvent::Fence,
+            ]
+        );
+        assert_eq!(recorder.final_lp_count(), 1);
+        assert_eq!(
+            recorder.roles,
+            vec![TxLogEntryRole::TMemoryUndo, TxLogEntryRole::TMemoryUndo]
+        );
+    }
+
+    #[test]
+    fn transaction_durable_log_can_publish_multiple_undo_records_with_one_lp() {
+        let mut log = TxDurableLog::default();
+        let first = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
+        let second = PendingGranuleUndo::tmemory(0x1000_0000_1000_002a, 8, vec![5, 6, 7, 8]);
+
+        let first_marker = {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&first)
+                .unwrap()
+        };
+        let second_marker = {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&second)
+                .unwrap()
+        };
+        {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher.publish_commit_lp(second_marker).unwrap();
+        }
+
+        let entries = log.log_entries_for_test(12);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].logical_id, first_marker.logical_id);
+        assert_eq!(entries[1].logical_id, second_marker.logical_id);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.tx_meta & 1 != 0)
+                .count(),
+            1
+        );
+        assert!(entries.iter().all(TxLogEntry::validate_crc32));
+    }
+
+    #[test]
     fn encodes_tmemory_granule_record() {
         let publication =
             PendingPublication::tmemory_for_test(0x1000_0000_0000_0001, 5, &[1, 2, 3, 4]);
@@ -321,6 +605,39 @@ mod tests {
         assert_eq!(u16::from_le_bytes(bytes[12..14].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 5);
         assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 4);
+    }
+
+    #[test]
+    fn tmemory_undo_record_encodes_old_granule_bytes() {
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![9, 8, 7, 6]);
+        let bytes = encode_undo_data_record(&undo).unwrap();
+
+        assert_eq!(
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            0x1000_0000_0000_002a
+        );
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 13);
+        assert_eq!(
+            u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
+            PackedGranuleDomain::TMemory as u16
+        );
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 4);
+        assert_eq!(&bytes[24..], &[9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn tmemory_undo_record_is_not_a_publication() {
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
+        let publication = PendingPublication::tmemory_for_test(
+            undo.logical_id,
+            undo.version,
+            &undo.old_granule_bytes,
+        );
+
+        assert_ne!(
+            encode_undo_data_record(&undo).unwrap(),
+            encode_data_record(&publication).unwrap()
+        );
     }
 
     #[test]

@@ -109,8 +109,10 @@ pub use crate::runtime::vm::instance::{
 pub use crate::runtime::vm::interpreter::*;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::TMemory;
-#[cfg(all(has_virtual_memory, test))]
+#[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::TxLogEntry;
+#[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::TxLogEntryRole;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::block_region;
 #[cfg(has_virtual_memory)]

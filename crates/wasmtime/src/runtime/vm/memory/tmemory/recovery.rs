@@ -1,7 +1,7 @@
 use super::block_region::BlockRegionBackendView;
 use super::{
-    DATA_CHUNK_MAGIC, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader, TxLogEntry,
-    packed_granule_domain, unpack_object_granule_id,
+    DATA_CHUNK_MAGIC, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader, TxDataRecordRole,
+    TxLogEntry, TxLogEntryRole, packed_granule_domain, unpack_object_granule_id,
 };
 use crate::prelude::*;
 use crate::runtime::transaction::TxObjectHeader;
@@ -35,6 +35,7 @@ pub(crate) struct RecoveredRegion {
     pub(crate) winners: Vec<RecoveryWinner>,
     pub(crate) object_winners: Vec<RecoveredObjectWinner>,
     pub(crate) root_object_ids: Vec<u64>,
+    pub(crate) tmemory_undo_rollbacks: Vec<RecoveredTMemoryUndoRollback>,
     pub(crate) next_stream_id: u32,
 }
 
@@ -45,6 +46,21 @@ pub(crate) struct RecoveredObjectWinner {
     pub(crate) kind: u16,
     pub(crate) type_index: u32,
     pub(crate) record_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveredTMemoryUndoRollback {
+    pub(crate) logical_id: u64,
+    pub(crate) version: u32,
+    pub(crate) data_block: u32,
+    pub(crate) data_offset: u32,
+    pub(crate) old_granule_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct StreamReplay {
+    winners: Vec<RecoveryWinner>,
+    tmemory_undo_rollbacks: Vec<RecoveredTMemoryUndoRollback>,
 }
 
 #[derive(Debug, Default)]
@@ -62,9 +78,12 @@ struct PendingTransaction {
 pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<RecoveredRegion> {
     let streams = discover_streams(region)?;
     let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
+    let mut tmemory_undo_rollbacks = Vec::new();
 
     for stream in streams.iter() {
-        for update in replay_stream(region, stream)? {
+        let replay = replay_stream(region, stream)?;
+        tmemory_undo_rollbacks.extend(replay.tmemory_undo_rollbacks);
+        for update in replay.winners {
             match winners.get(&update.logical_id) {
                 Some(current) if current.version > update.version => {}
                 Some(current) if current.version == update.version => {
@@ -103,6 +122,7 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
         winners,
         object_winners,
         root_object_ids,
+        tmemory_undo_rollbacks,
     })
 }
 
@@ -320,8 +340,8 @@ fn discover_streams(region: &BlockRegionBackendView<'_>) -> Result<Vec<Recovered
 fn replay_stream(
     region: &BlockRegionBackendView<'_>,
     stream: &RecoveredStream,
-) -> Result<Vec<RecoveryWinner>> {
-    let mut winners = Vec::new();
+) -> Result<StreamReplay> {
+    let mut replay = StreamReplay::default();
     let mut pending: Option<PendingTransaction> = None;
 
     for &log_block in &stream.log_blocks {
@@ -336,7 +356,11 @@ fn replay_stream(
             let txid = txid(entry);
 
             if pending.as_ref().is_some_and(|txn| txn.txid != txid) {
-                pending = None;
+                if let Some(txn) = pending.take() {
+                    replay
+                        .tmemory_undo_rollbacks
+                        .extend(loose_end_tmemory_undo_rollbacks(region, txn.entries)?);
+                }
             }
             let txn = pending.get_or_insert_with(|| PendingTransaction {
                 txid,
@@ -345,12 +369,17 @@ fn replay_stream(
 
             if is_final_lp(entry) {
                 txn.entries.push(entry);
-                winners.extend(txn.entries.iter().map(|committed| RecoveryWinner {
-                    logical_id: committed.logical_id,
-                    version: committed.version,
-                    data_block: committed.data_block,
-                    data_offset: committed.data_offset,
-                }));
+                for committed in &txn.entries {
+                    if committed.role()? != TxLogEntryRole::TObjectPub {
+                        continue;
+                    }
+                    replay.winners.push(RecoveryWinner {
+                        logical_id: committed.logical_id,
+                        version: committed.version,
+                        data_block: committed.data_block,
+                        data_offset: committed.data_offset,
+                    });
+                }
                 pending = None;
             } else {
                 txn.entries.push(entry);
@@ -358,7 +387,51 @@ fn replay_stream(
         }
     }
 
-    Ok(winners)
+    if let Some(txn) = pending.take() {
+        replay
+            .tmemory_undo_rollbacks
+            .extend(loose_end_tmemory_undo_rollbacks(region, txn.entries)?);
+    }
+
+    Ok(replay)
+}
+
+fn loose_end_tmemory_undo_rollbacks(
+    region: &BlockRegionBackendView<'_>,
+    entries: Vec<TxLogEntry>,
+) -> Result<Vec<RecoveredTMemoryUndoRollback>> {
+    let mut rollbacks = Vec::new();
+    for entry in entries {
+        if entry.role()? != TxLogEntryRole::TMemoryUndo {
+            continue;
+        }
+        let (data_header, old_granule_bytes) =
+            load_publication_payload(region, entry.data_block, entry.data_offset)?;
+        ensure!(
+            data_header.role()? == TxDataRecordRole::TMemoryUndo,
+            "tmemory undo data record has non-undo role"
+        );
+        ensure!(
+            data_header.logical_id == entry.logical_id,
+            "tmemory undo logical id does not match log entry"
+        );
+        ensure!(
+            data_header.version == entry.version,
+            "tmemory undo version does not match log entry"
+        );
+        ensure!(
+            data_header.kind == PackedGranuleDomain::TMemory as u16,
+            "tmemory undo data record kind is not TMemory"
+        );
+        rollbacks.push(RecoveredTMemoryUndoRollback {
+            logical_id: entry.logical_id,
+            version: entry.version,
+            data_block: entry.data_block,
+            data_offset: entry.data_offset,
+            old_granule_bytes,
+        });
+    }
+    Ok(rollbacks)
 }
 
 fn txid(entry: TxLogEntry) -> u32 {
@@ -449,6 +522,32 @@ mod tests {
         let recovered = recover_region_for_test(&region).unwrap();
 
         assert_eq!(recovered.root_object_ids, vec![41, 42]);
+    }
+
+    #[test]
+    fn recovery_replays_tmemory_undo_for_loose_end_transaction() {
+        let region = sample_region_with_loose_end_tmemory_undo();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.winners.len(), 0);
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+        assert_eq!(
+            recovered.tmemory_undo_rollbacks[0].logical_id,
+            pack_test_granule_id(PackedGranuleDomain::TMemory, 7)
+        );
+        assert_eq!(
+            recovered.tmemory_undo_rollbacks[0].old_granule_bytes,
+            vec![9, 8, 7, 6]
+        );
+    }
+
+    #[test]
+    fn recovery_ignores_tmemory_undo_for_committed_transaction() {
+        let region = sample_region_with_committed_tmemory_undo();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.winners.len(), 0);
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 0);
     }
 
     fn sample_region_with_two_streams() -> VMemoryBlockRegion {
@@ -588,6 +687,38 @@ mod tests {
         region
     }
 
+    fn sample_region_with_loose_end_tmemory_undo() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        append_tmemory_undo_record(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_test_granule_id(PackedGranuleDomain::TMemory, 7),
+            3,
+            &[9, 8, 7, 6],
+            false,
+        );
+        region
+    }
+
+    fn sample_region_with_committed_tmemory_undo() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        append_tmemory_undo_record(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_test_granule_id(PackedGranuleDomain::TMemory, 7),
+            3,
+            &[9, 8, 7, 6],
+            true,
+        );
+        region
+    }
+
     fn append_committed_root_update(
         region: &mut VMemoryBlockRegion,
         stream_id: u32,
@@ -617,6 +748,43 @@ mod tests {
             location.data_offset,
             true,
         );
+        write_log_entries(region, log_block, &[entry]);
+    }
+
+    fn append_tmemory_undo_record(
+        region: &mut VMemoryBlockRegion,
+        stream_id: u32,
+        stream: StreamCursor,
+        block_seq: u32,
+        logical_id: u64,
+        version: u32,
+        old_granule_bytes: &[u8],
+        is_final_lp: bool,
+    ) {
+        let record = TMemory::encode_granule_undo_data_record(
+            logical_id,
+            version,
+            PackedGranuleDomain::TMemory as u16,
+            0,
+            old_granule_bytes,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
+        let tx_meta = if is_final_lp {
+            (stream_id << 1) | 1
+        } else {
+            stream_id << 1
+        };
+        let mut entry = TxLogEntry::new(
+            logical_id,
+            version,
+            tx_meta,
+            location.data_block,
+            location.data_offset,
+        );
+        entry.set_role(TxLogEntryRole::TMemoryUndo);
+        entry.seal_crc32();
         write_log_entries(region, log_block, &[entry]);
     }
 

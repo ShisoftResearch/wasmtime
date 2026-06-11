@@ -280,12 +280,28 @@ Durable publication uses two append-only surfaces:
 
 - Fixed-size log entries for recovery scanning and transaction commit
   recognition.
-- Variable-size data records for object/granule payload bytes.
+- Variable-size data records for payload bytes.
 
 The log is unified across granule domains. `tmemory`, `tglobal`, `ttable`,
 `TStruct`, and `TArray` updates all publish through the same transaction log
 entry shape, distinguished by packed logical ids. Object metadata does not have
 a separate object-table log in the default Zen-style mode.
+
+The data side is intentionally split by semantics, even when the first
+implementation reuses the same block/chunk allocator:
+
+- **Object publication data** is object storage. `TStruct` and `TArray` records
+  are new object versions; committed records are replayed by choosing the
+  highest committed version per `ObjectId`.
+- **Granule undo data** is rollback material. Linear `tmemory` undo records
+  contain old committed granule bytes saved before in-place mutation. They are
+  not object storage, are not winners, and are reclaimed by log/undo cleanup
+  rules rather than by persistent object GC.
+
+This separation matters because objects use COW/redo publication, while
+persistent linear memory uses undo-before-in-place writes. Object data records
+must be managed with object reachability; linear-memory undo records must be
+managed with transaction completion and log cleanup.
 
 Durable region metadata is block-derived, not byte-derived. Persistent headers
 store block counts and block indices as `u32` values because block size is fixed
@@ -333,8 +349,8 @@ struct DataChunkHeader {
 `tail_in_block` are recomputed/validated from data-chunk append state and do
 not imply a globally persisted allocator cursor.
 
-Each logical version is represented by one data record and one log entry. The
-commit sequence is:
+Each object/global/table logical version is represented by one publication data
+record and one publication log entry. The publication commit sequence is:
 
 1. Append all data records.
 2. Flush data.
@@ -369,11 +385,13 @@ struct TxLogEntry {
 
 `data_block` is a block index and `data_offset` is an offset within that block.
 `tx_meta` bit 0 is LP. The remaining bits carry the transaction id in the
-current implementation (`txid << 1`). Log entries carry CRC32 because recovery
-scans them directly and must reject torn or corrupt entries. Data records do
-not carry a checksum in this design: they are not scanned independently, and
-their completeness is guaranteed by data-before-log ordering, flushes, fences,
-and LP publication. Data corruption detection is left to future storage-layer
+current implementation (`txid << 1`). `reserved` carries the log-entry role:
+zero is a `TObjectPub` entry, and one is a `TMemoryUndo` entry. Log
+entries carry CRC32 because recovery scans them directly and must reject torn or
+corrupt entries. Data records do not carry a checksum in this design: they are
+not scanned independently, and their completeness is guaranteed by
+data-before-log or undo-before-write ordering, flushes, fences, and LP
+publication. Data corruption detection is left to future storage-layer
 integrity work.
 
 `TxDataRecordHeader` is a minimal 24-byte prefix before each data payload:
@@ -384,16 +402,17 @@ struct TxDataRecordHeader {
     logical_id: u64,
     version: u32,
     kind: u16,
-    reserved: u16,
+    role: u16,
     payload_len: u32,
     type_info: u32,
 }
 ```
 
 `kind` mirrors the packed granule domain and is just large enough for the
-transactional granule/object kinds. `reserved` intentionally replaces an
-earlier flag field; no format-version field is stored because this research
-branch does not need backward-compatible on-media formats yet.
+transactional granule/object kinds. The 16-bit role field is not a flag set:
+zero means `TObjectPub` data and one means `TMemoryUndo` data. No format-version
+field is stored because this research branch does not need backward-compatible
+on-media formats yet.
 
 `version` is `u32` in durable log/data records and object records. Recovery
 chooses the highest committed version for each logical id. Duplicate committed
@@ -401,9 +420,60 @@ versions for the same logical id are corruption. A higher-version delete entry
 will beat older live entries when deletion is designed with GC; deletion is not
 implemented in the current object workstream.
 
-Recovery discovers streams by scanning chunk-start blocks, validates log-entry
-CRC32 values, replays each stream, and merges winners by logical id. Stream
-replay should stay pure enough that streams can be rebuilt in parallel.
+Linear-memory undo records use a different ordering because the data record
+contains the old granule bytes, not the new bytes. The current implementation
+still stages transactional `tmemory` writes during execution; for persistent
+backends, the first in-place write happens when commit applies those staged
+granules. Before that in-place write to a persistent `tmemory` granule, the
+runtime must:
+
+1. Copy the old granule bytes into a granule-undo data record.
+2. Flush the undo data.
+3. Fence.
+4. Append a `TMemoryUndo` log entry for the same transaction and granule.
+5. Flush the undo log entry.
+6. Fence.
+7. Only then allow the in-place write to the persistent linear-memory bytes.
+
+At transaction commit, persistent backends append undo records for staged
+granules, mutate the base image in place through the backend commit path, flush
+and fence those writes, and then publish the transaction LP. After LP is
+durable, the in-place bytes are the committed state and the undo records for
+that transaction are obsolete. At transaction abort before commit, the runtime
+discards staged bytes without touching the persistent base image. At crash
+recovery, undo records in transactions without LP are replayed as rollbacks;
+undo records in transactions with LP are ignored.
+
+If a transaction only mutates persistent `tmemory` and has no object/global/table
+publication entries, commit still needs an LP. The substrate publishes that LP
+as a second final `TMemoryUndo` log entry pointing at the last undo data record;
+it does not append another data record. Recovery treats the transaction as
+committed because LP is present and ignores all undo entries for that
+transaction.
+
+Recovery discovers streams by scanning chunk-start blocks and validates
+log-entry CRC32 values. Publication records from LP-marked transactions are
+merged by logical id/version. Undo records are instead grouped by transaction:
+committed transactions discard their undo records, while loose-end transactions
+produce rollback actions. Stream replay should stay pure enough that streams
+can be rebuilt in parallel.
+
+The runtime commit path now uses one transaction-owned durable stream for
+persistent `tmemory` undo entries. `TMemory` does not own transaction log
+streams; it is a participant that can prepare undo records from committed
+bytes, apply staged granules in place through its backend, and rely on the
+backend commit path to flush/fence persistent data writes. `TransactionState`
+owns the current in-memory durable-log scaffold. During commit, the transaction
+layer appends all persistent `TMemoryUndo` records into that stream before any
+persistent in-place memory write, applies every touched `tmemory` participant,
+and then publishes one LP marker for the whole transaction.
+
+This removes the earlier conservative rejection for transactions that touch
+more than one persistent `tmemory` participant. The remaining limitation is
+storage durability, not commit semantics: the current unified stream is still
+an in-memory research scaffold. The later PMEM/file-backed durable log manager
+should replace that scaffold at the transaction/store layer without moving log
+ownership back into `TMemory`.
 
 ## Copy-On-Write Workspace
 
@@ -412,7 +482,10 @@ Each active transaction owns a private workspace.
 The current runtime indexes workspace entries by Wizard-style `GranuleId`.
 For `tmemory`, staged entries are keyed by
 `TMemory { instance, memory_index, granule_index }`. The workspace value stores
-the staged bytes for that granule.
+the staged bytes for that granule. Persistent `tmemory` keeps the same execution
+workspace and changes the commit path: durable undo records store old granule
+bytes for crash rollback, then the live persistent linear-memory bytes are
+mutated in place only after the undo record is durable.
 
 Object-backed workspace entries remain keyed by `GranuleId`. `ObjectId` is not a
 standalone `GranuleId` variant; it is the object-table slot and runtime identity
@@ -427,16 +500,22 @@ Reads spanning multiple memory granules merge staged and committed bytes by
 granule key. For object records, reads check staged object payloads before
 resolving the committed object-table slot.
 
-Writes never update committed `tmemory` immediately. They acquire write
-ownership for every affected granule, then write into the transaction
-workspace.
+Transactional `tmemory` writes acquire write ownership for every affected
+granule, then write into the transaction workspace. Volatile `VMemory` commit
+copies staged memory granules into committed `tmemory` with no durable undo
+records. Persistent `NVMemory` and `FileBackedMemory` commit durably log each
+staged granule's old bytes once, then update the linear-memory bytes in place.
+This makes commit/truncation cheaper than linear-memory redo logging: committed
+data is already in the persistent base image, and recovery only needs undo
+rollback for transactions that did not publish LP.
 
-Commit copies staged memory granules into committed `tmemory`, publishes staged
-object records through `PendingPublication`/durable log entries when a durable
-backend is active, updates the volatile object index, and releases ownership.
+Commit applies staged memory granules, publishes staged object records through
+`PendingPublication`/durable log entries when a durable backend is active,
+updates the volatile object index, and releases ownership.
 Object commit must complete promotion of any transaction-local volatile objects
 before publishing persistent object records. Abort discards the workspace,
-drops uncommitted object records, and releases ownership without copying bytes.
+drops uncommitted object records, restores persistent `tmemory` undo bytes when
+needed, and releases ownership.
 
 `tmemory.grow` grows committed storage immediately and is not rolled back on
 abort. The grow path must also grow or initialize the granule metadata needed by
@@ -858,8 +937,9 @@ order:
 3. Define transactional function objects so persistent `tfunc` and function
    references use `ObjectId` identity while Wasmtime function indices remain
    payload metadata.
-4. Complete durable publication for every committed `tmemory`, `tglobal`,
-   `ttable`, `TStruct`, and `TArray` update through the unified log/data path.
+4. Complete durable publication for committed `tglobal`, `ttable`, `TStruct`,
+   and `TArray` updates through the publication log/data path, and complete
+   durable undo-before-in-place writes for persistent `tmemory`.
 5. Finish recovery root reconstruction for `tglobal` and `ttable` references.
 6. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
    persistent `ObjectId` graphs.

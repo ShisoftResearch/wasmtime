@@ -153,6 +153,12 @@ pub(crate) struct TxLogEntry {
     pub(crate) reserved: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TxLogEntryRole {
+    TObjectPub,
+    TMemoryUndo,
+}
+
 impl TxLogEntry {
     pub(crate) fn new(
         logical_id: u64,
@@ -178,6 +184,21 @@ impl TxLogEntry {
 
     pub(crate) fn validate_crc32(&self) -> bool {
         self.crc32 == crc32fast::hash(&self.bytes_without_crc32())
+    }
+
+    pub(crate) fn role(&self) -> Result<TxLogEntryRole> {
+        Ok(match self.reserved {
+            0 => TxLogEntryRole::TObjectPub,
+            1 => TxLogEntryRole::TMemoryUndo,
+            role => bail!("unknown transaction log entry role {role}"),
+        })
+    }
+
+    pub(crate) fn set_role(&mut self, role: TxLogEntryRole) {
+        self.reserved = match role {
+            TxLogEntryRole::TObjectPub => 0,
+            TxLogEntryRole::TMemoryUndo => 1,
+        };
     }
 
     fn bytes_without_crc32(&self) -> [u8; 28] {
@@ -231,6 +252,52 @@ pub(crate) fn pack_object_granule_id(domain: PackedGranuleDomain, object_id: u64
     }
 }
 
+pub(crate) fn pack_tmemory_granule_id(
+    instance: Option<u32>,
+    memory_index: u32,
+    granule_index: u64,
+) -> Result<u64> {
+    let instance_code = match instance {
+        Some(instance) => u64::from(instance)
+            .checked_add(1)
+            .context("tmemory instance id overflow")?,
+        None => 0,
+    };
+    ensure!(
+        instance_code < (1u64 << 20),
+        "tmemory instance id does not fit in packed granule id payload"
+    );
+    ensure!(
+        memory_index < (1u32 << 12),
+        "tmemory memory index does not fit in packed granule id payload"
+    );
+    ensure!(
+        granule_index < (1u64 << 28),
+        "tmemory granule index does not fit in packed granule id payload"
+    );
+
+    let payload = (instance_code << 40) | (u64::from(memory_index) << 28) | granule_index;
+    Ok(((PackedGranuleDomain::TMemory as u64) << 60) | payload)
+}
+
+pub(crate) fn unpack_tmemory_granule_id(logical_id: u64) -> Result<(Option<u32>, u32, u64)> {
+    let domain = packed_granule_domain(logical_id)?;
+    ensure!(
+        domain == PackedGranuleDomain::TMemory,
+        "logical id {logical_id:#x} is not a tmemory granule"
+    );
+    let payload = logical_id & ((1u64 << 60) - 1);
+    let instance_code = (payload >> 40) & ((1u64 << 20) - 1);
+    let memory_index = u32::try_from((payload >> 28) & ((1u64 << 12) - 1)).unwrap();
+    let granule_index = payload & ((1u64 << 28) - 1);
+    let instance = if instance_code == 0 {
+        None
+    } else {
+        Some(u32::try_from(instance_code - 1).unwrap())
+    };
+    Ok((instance, memory_index, granule_index))
+}
+
 pub(crate) fn unpack_object_granule_id(logical_id: u64) -> Result<(PackedGranuleDomain, u64)> {
     let object_id = logical_id & ((1u64 << 60) - 1);
     let domain = packed_granule_domain(logical_id)?;
@@ -250,9 +317,15 @@ pub(crate) struct TxDataRecordHeader {
     pub(crate) logical_id: u64,
     pub(crate) version: u32,
     pub(crate) kind: u16,
-    pub(crate) reserved: u16,
+    pub(crate) role: u16,
     pub(crate) payload_len: u32,
     pub(crate) type_info: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TxDataRecordRole {
+    TObjectPub,
+    TMemoryUndo,
 }
 
 impl TxDataRecordHeader {
@@ -262,7 +335,7 @@ impl TxDataRecordHeader {
         let logical_id = self.logical_id;
         let version = self.version;
         let kind = self.kind;
-        let reserved = self.reserved;
+        let role = self.role;
         let payload_len = self.payload_len;
         let type_info = self.type_info;
 
@@ -270,7 +343,7 @@ impl TxDataRecordHeader {
         bytes[0..8].copy_from_slice(&logical_id.to_le_bytes());
         bytes[8..12].copy_from_slice(&version.to_le_bytes());
         bytes[12..14].copy_from_slice(&kind.to_le_bytes());
-        bytes[14..16].copy_from_slice(&reserved.to_le_bytes());
+        bytes[14..16].copy_from_slice(&role.to_le_bytes());
         bytes[16..20].copy_from_slice(&payload_len.to_le_bytes());
         bytes[20..24].copy_from_slice(&type_info.to_le_bytes());
         bytes
@@ -287,10 +360,25 @@ impl TxDataRecordHeader {
             logical_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
             version: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
             kind: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
-            reserved: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
+            role: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
             payload_len: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
             type_info: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
         })
+    }
+
+    pub(crate) fn role(&self) -> Result<TxDataRecordRole> {
+        Ok(match self.role {
+            0 => TxDataRecordRole::TObjectPub,
+            1 => TxDataRecordRole::TMemoryUndo,
+            role => bail!("unknown transaction data record role {role}"),
+        })
+    }
+
+    pub(crate) fn set_role(&mut self, role: TxDataRecordRole) {
+        self.role = match role {
+            TxDataRecordRole::TObjectPub => 0,
+            TxDataRecordRole::TMemoryUndo => 1,
+        };
     }
 }
 
@@ -312,5 +400,51 @@ mod tests {
         let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
         assert_eq!(domain, PackedGranuleDomain::TArray);
         assert_eq!(object_id, 99);
+    }
+
+    #[test]
+    fn pack_tmemory_granule_id_encodes_domain_and_fields() {
+        let logical_id = pack_tmemory_granule_id(Some(41), 7, 9).unwrap();
+
+        assert_eq!(
+            packed_granule_domain(logical_id).unwrap(),
+            PackedGranuleDomain::TMemory
+        );
+        assert_eq!((logical_id >> 40) & ((1 << 20) - 1), 42);
+        assert_eq!((logical_id >> 28) & ((1 << 12) - 1), 7);
+        assert_eq!(logical_id & ((1 << 28) - 1), 9);
+    }
+
+    #[test]
+    fn pack_tmemory_granule_id_rejects_out_of_range_fields() {
+        assert!(pack_tmemory_granule_id(Some((1 << 20) - 1), 0, 0).is_err());
+        assert!(pack_tmemory_granule_id(None, 1 << 12, 0).is_err());
+        assert!(pack_tmemory_granule_id(None, 0, 1 << 28).is_err());
+    }
+
+    #[test]
+    fn tmemory_undo_log_entry_role_roundtrips() {
+        let mut entry = TxLogEntry::new(0x1000_0000_0000_0003, 7, 11 << 1, 4, 32);
+        assert_eq!(entry.role().unwrap(), TxLogEntryRole::TObjectPub);
+
+        entry.set_role(TxLogEntryRole::TMemoryUndo);
+        entry.seal_crc32();
+
+        assert_eq!(entry.role().unwrap(), TxLogEntryRole::TMemoryUndo);
+        assert!(entry.validate_crc32());
+    }
+
+    #[test]
+    fn tx_data_record_role_defaults_to_tobject_pub() {
+        let header = TxDataRecordHeader {
+            logical_id: 0x1000_0000_0000_0007,
+            version: 3,
+            kind: PackedGranuleDomain::TMemory as u16,
+            role: 0,
+            payload_len: 4,
+            type_info: 0,
+        };
+
+        assert_eq!(header.role().unwrap(), TxDataRecordRole::TObjectPub);
     }
 }

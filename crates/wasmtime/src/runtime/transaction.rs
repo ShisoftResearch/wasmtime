@@ -16,7 +16,9 @@ pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
 pub(crate) use object_heap::encode_object_record_for_test;
-pub(crate) use persist::DurableSink;
+pub(crate) use persist::{
+    PendingCommitLogEntry, PendingGranuleUndo, StreamPublisher, TxDurableLog,
+};
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
 // store-local transaction state, `VMemory` and configurable `NVMemory`
@@ -286,6 +288,7 @@ pub(crate) struct TransactionState {
     write_granules: BTreeSet<GranuleId>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
+    durable_log: TxDurableLog,
 }
 
 #[derive(Debug, Default)]
@@ -326,6 +329,7 @@ impl Default for TransactionState {
             write_granules: BTreeSet::new(),
             scratch: Vec::new(),
             pending_memory_store: None,
+            durable_log: TxDurableLog::default(),
         }
     }
 }
@@ -1583,6 +1587,40 @@ impl TransactionState {
         self.active
     }
 
+    pub(crate) fn active_transaction_required_raw(&self) -> Result<u64> {
+        Ok(self.active_transaction_required()?.as_raw())
+    }
+
+    pub(crate) fn publish_tmemory_undo_before_in_place_write(
+        &mut self,
+        stream_id: u32,
+        txid: u32,
+        undo: &PendingGranuleUndo,
+    ) -> Result<PendingCommitLogEntry> {
+        let mut sink = self.durable_log.stream_sink(stream_id);
+        let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+        publisher.publish_tmemory_undo_before_in_place_write(undo)
+    }
+
+    pub(crate) fn publish_commit_lp(
+        &mut self,
+        stream_id: u32,
+        txid: u32,
+        marker: PendingCommitLogEntry,
+    ) -> Result<()> {
+        let mut sink = self.durable_log.stream_sink(stream_id);
+        let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+        publisher.publish_commit_lp(marker)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_log_entries_for_test(
+        &self,
+        stream_id: u32,
+    ) -> Vec<crate::vm::TxLogEntry> {
+        self.durable_log.log_entries_for_test(stream_id)
+    }
+
     pub(crate) fn structured_failure_pending(&self) -> bool {
         self.failed
     }
@@ -2436,11 +2474,39 @@ impl TransactionState {
             return Ok(false);
         }
 
-        for (_, granule_index, bytes) in &staged {
-            let addr = granule_index
-                .checked_mul(TMEMORY_GRANULE_SIZE)
-                .context("tmemory granule byte offset overflow")?;
-            tmemory.commit_range(addr, bytes)?;
+        let stream_id = u32::try_from(self.active_transaction_required_raw()?)
+            .context("transaction id does not fit durable tmemory stream id")?;
+        let staged = staged
+            .iter()
+            .map(|(_, granule_index, bytes)| {
+                Ok((
+                    u64::try_from(*granule_index)
+                        .context("tmemory granule index does not fit durable log")?,
+                    bytes.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if tmemory.backend() == TMemoryBackend::VMemory {
+            tmemory.commit_staged_tmemory_granules_direct(&staged)?;
+        } else {
+            let mut final_marker = None;
+            for (granule_index, bytes) in &staged {
+                let undo = tmemory.prepare_tmemory_undo_record(
+                    owner_instance.map(InstanceId::as_u32),
+                    memory_index,
+                    *granule_index,
+                    bytes,
+                )?;
+                final_marker = Some(
+                    self.publish_tmemory_undo_before_in_place_write(stream_id, stream_id, &undo)?,
+                );
+            }
+            for (granule_index, bytes) in &staged {
+                tmemory.commit_staged_tmemory_granule(*granule_index, bytes)?;
+            }
+            if let Some(marker) = final_marker {
+                self.publish_commit_lp(stream_id, stream_id, marker)?;
+            }
         }
 
         self.remove_staged_tmemory_granules_owned(owner_instance, memory_index)?;
@@ -5400,6 +5466,31 @@ mod tests {
             tmemory.read_committed(4..8).expect("read committed"),
             vec![9, 8, 7, 6]
         );
+    }
+
+    #[test]
+    fn transaction_commit_uses_persistent_tmemory_undo_for_nvmemory() {
+        let mut tmemory = crate::runtime::vm::TMemory::new_with_backend_limits(
+            TMemoryBackend::NVMemory,
+            1,
+            Some(1),
+        )
+        .expect("tmemory");
+        tmemory.commit_range(0, &[1, 2, 3, 4]).unwrap();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(12));
+
+        state
+            .stage_tmemory_write_for_test(0, 0, 4, &[9, 8, 7, 6], &tmemory)
+            .expect("stage tmemory");
+        state
+            .commit_tmemory_for_test(&mut tmemory)
+            .expect("commit tmemory");
+
+        assert_eq!(
+            tmemory.read_committed(4..8).expect("read committed"),
+            vec![9, 8, 7, 6]
+        );
+        assert_eq!(state.durable_log_entries_for_test(12).len(), 2);
     }
 
     #[test]
