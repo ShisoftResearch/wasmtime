@@ -1041,15 +1041,7 @@ mod tests {
             1,
             &[Some(41)],
         );
-        append_loose_end_root_update(
-            &mut region,
-            2,
-            loose_stream,
-            0,
-            logical_id,
-            2,
-            &[Some(42)],
-        );
+        append_loose_end_root_update(&mut region, 2, loose_stream, 0, logical_id, 2, &[Some(42)]);
         region
     }
 

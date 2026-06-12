@@ -1918,9 +1918,7 @@ mod tests {
 
             fn role(self) -> TxLogEntryRole {
                 match self {
-                    Self::TObjectPub { .. } | Self::TRootPub { .. } => {
-                        TxLogEntryRole::TObjectPub
-                    }
+                    Self::TObjectPub { .. } | Self::TRootPub { .. } => TxLogEntryRole::TObjectPub,
                     Self::TMemoryUndo { .. } => TxLogEntryRole::TMemoryUndo,
                 }
             }
