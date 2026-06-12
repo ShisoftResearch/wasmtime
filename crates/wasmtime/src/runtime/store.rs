@@ -82,7 +82,7 @@ use crate::error::OutOfMemory;
 use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
-use crate::runtime::transaction::{ObjectTable, TransactionState};
+use crate::runtime::transaction::{ObjectTable, TransactionConfig, TransactionState};
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
 #[cfg(feature = "stack-switching")]
@@ -111,6 +111,8 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 #[cfg(any(feature = "async", feature = "gc"))]
 use core::task::Poll;
+#[cfg(feature = "transaction")]
+use std::path::PathBuf;
 use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt};
 
 mod context;
@@ -478,6 +480,7 @@ pub struct StoreOpaque {
     host_globals: TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
     #[allow(dead_code)]
     transaction_state: TransactionState,
+    transaction_config: TransactionConfig,
     #[allow(dead_code)]
     transaction_object_table: ObjectTable,
     // GC-related fields.
@@ -769,6 +772,7 @@ impl<T> Store<T> {
             func_refs: FuncRefs::default(),
             host_globals: TryPrimaryMap::new(),
             transaction_state: TransactionState::default(),
+            transaction_config: TransactionConfig::default(),
             transaction_object_table: ObjectTable::default(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
@@ -878,6 +882,32 @@ impl<T> Store<T> {
         &mut self,
     ) -> (&mut TransactionState, &mut ObjectTable) {
         self.inner.transaction_state_and_object_table_mut()
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "transaction")]
+    pub fn transaction_create_file_backed_storage_for_test(
+        &mut self,
+        tmemory_path: PathBuf,
+        tx_log_path: PathBuf,
+        tx_log_blocks: u32,
+    ) -> Result<()> {
+        self.inner.transaction_create_file_backed_storage_for_test(
+            tmemory_path,
+            tx_log_path,
+            tx_log_blocks,
+        )
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "transaction")]
+    pub fn transaction_open_file_backed_storage_for_test(
+        &mut self,
+        tmemory_path: PathBuf,
+        tx_log_path: PathBuf,
+    ) -> Result<()> {
+        self.inner
+            .transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
     }
 
     /// Access the underlying `T` data owned by this `Store`.
@@ -1613,9 +1643,40 @@ impl StoreOpaque {
         &self.transaction_state
     }
 
+    pub(crate) fn transaction_config(&self) -> &TransactionConfig {
+        &self.transaction_config
+    }
+
     #[allow(dead_code)]
     pub(crate) fn transaction_state_mut(&mut self) -> &mut TransactionState {
         &mut self.transaction_state
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_create_file_backed_storage_for_test(
+        &mut self,
+        tmemory_path: PathBuf,
+        tx_log_path: PathBuf,
+        tx_log_blocks: u32,
+    ) -> Result<()> {
+        let config = TransactionConfig::with_file_backed_tmemory_path(tmemory_path)?;
+        self.transaction_state
+            .create_file_backed_durable_log(&tx_log_path, tx_log_blocks)?;
+        self.transaction_config = config;
+        Ok(())
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_open_file_backed_storage_for_test(
+        &mut self,
+        tmemory_path: PathBuf,
+        tx_log_path: PathBuf,
+    ) -> Result<()> {
+        let config = TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path)?;
+        self.transaction_state
+            .open_file_backed_durable_log(&tx_log_path)?;
+        self.transaction_config = config;
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -2849,6 +2910,38 @@ mod tests {
                 crate::runtime::transaction::ObjectValue::I32(2),
             ])
         );
+    }
+
+    #[cfg(all(feature = "transaction", unix))]
+    #[test]
+    fn store_transaction_file_backed_config_selects_existing_tmemory_path() {
+        use crate::runtime::vm::TMemory;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        store
+            .transaction_create_file_backed_storage_for_test(
+                tmemory_path.clone(),
+                tx_log_path.clone(),
+                32,
+            )
+            .unwrap();
+        let create_config = store.as_store_opaque().transaction_config().clone();
+        let mut created = TMemory::new(create_config, 1, Some(1)).unwrap();
+        created.commit_range(64, &[1, 2, 3, 4]).unwrap();
+        drop(created);
+
+        store
+            .transaction_open_file_backed_storage_for_test(tmemory_path.clone(), tx_log_path)
+            .unwrap();
+        let open_config = store.as_store_opaque().transaction_config().clone();
+        let reopened = TMemory::new(open_config, 1, Some(1)).unwrap();
+
+        assert_eq!(reopened.read_committed(64..68).unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]

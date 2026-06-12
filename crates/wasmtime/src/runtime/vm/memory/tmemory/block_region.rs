@@ -46,6 +46,7 @@ pub(crate) enum PersistenceMode {
 pub(crate) enum FileBackedRegionMode {
     Temp,
     Path(PathBuf),
+    OpenExistingPath(PathBuf),
 }
 
 #[derive(Debug)]
@@ -61,6 +62,7 @@ impl FileBackedMapping {
         match mode {
             FileBackedRegionMode::Temp => Self::new_temp(len),
             FileBackedRegionMode::Path(path) => Self::new_path(path, len),
+            FileBackedRegionMode::OpenExistingPath(path) => Self::open_existing_path(path),
         }
     }
 

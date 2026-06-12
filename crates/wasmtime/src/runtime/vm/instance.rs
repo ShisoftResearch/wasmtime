@@ -179,7 +179,7 @@ impl Instance {
         let module = req.runtime_info.env_module();
         let memory_tys = &module.memories;
         #[cfg(has_virtual_memory)]
-        let tmemory_sidecar = Self::build_tmemory_sidecar(module)?;
+        let tmemory_sidecar = Self::build_tmemory_sidecar(module, req.store.transaction_config())?;
         let mut passive_elements = TryVec::with_capacity(module.passive_elements.len())?;
 
         #[cfg(feature = "wmemcheck")]
@@ -232,6 +232,7 @@ impl Instance {
     #[cfg(has_virtual_memory)]
     fn build_tmemory_sidecar(
         module: &wasmtime_environ::Module,
+        transaction_config: &TransactionConfig,
     ) -> Result<TMemorySidecar, OutOfMemory> {
         let mut sidecar = TMemorySidecar::default();
 
@@ -253,8 +254,8 @@ impl Instance {
                 )),
                 None => None,
             };
-            let tmemory = TMemory::new(TransactionConfig::default(), min_pages, max_pages)
-                .map_err(|_| {
+            let tmemory =
+                TMemory::new(transaction_config.clone(), min_pages, max_pages).map_err(|_| {
                     let oom_size = memory
                         .maximum_byte_size()
                         .ok()

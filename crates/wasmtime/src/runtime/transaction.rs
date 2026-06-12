@@ -6,7 +6,7 @@ use crate::runtime::vm::TMemory;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::{cell::Cell, mem, ops::Range};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[path = "transaction/object_heap.rs"]
 mod object_heap;
@@ -57,6 +57,7 @@ pub(crate) enum TMemoryPersistenceMode {
 pub(crate) enum TMemoryFileBacking {
     Temp,
     Path(PathBuf),
+    ExistingPath(PathBuf),
 }
 
 /// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. `LockBased` is the
@@ -140,6 +141,16 @@ impl TransactionConfig {
         );
         let mut config = Self::default();
         config.set_file_backed_tmemory(TMemoryFileBacking::Path(path))?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_file_backed_tmemory_existing_path(path: PathBuf) -> Result<Self> {
+        ensure!(
+            !path.as_os_str().is_empty(),
+            "file-backed tmemory path cannot be empty"
+        );
+        let mut config = Self::default();
+        config.set_file_backed_tmemory(TMemoryFileBacking::ExistingPath(path))?;
         Ok(config)
     }
 
@@ -1706,6 +1717,20 @@ impl TransactionState {
 
     pub(crate) fn active_transaction_required_raw(&self) -> Result<u64> {
         Ok(self.active_transaction_required()?.as_raw())
+    }
+
+    pub(crate) fn create_file_backed_durable_log(
+        &mut self,
+        path: &Path,
+        num_blocks: u32,
+    ) -> Result<()> {
+        self.durable_log = TxDurableLog::create_file_backed(path, num_blocks)?;
+        Ok(())
+    }
+
+    pub(crate) fn open_file_backed_durable_log(&mut self, path: &Path) -> Result<()> {
+        self.durable_log = TxDurableLog::open_file_backed(path)?;
+        Ok(())
     }
 
     pub(crate) fn publish_tmemory_undo_before_in_place_write(

@@ -1078,6 +1078,9 @@ fn file_backed_region_mode(
     match file_backing {
         TMemoryFileBacking::Temp => block_region::FileBackedRegionMode::Temp,
         TMemoryFileBacking::Path(path) => block_region::FileBackedRegionMode::Path(path.clone()),
+        TMemoryFileBacking::ExistingPath(path) => {
+            block_region::FileBackedRegionMode::OpenExistingPath(path.clone())
+        }
     }
 }
 
