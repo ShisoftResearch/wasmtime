@@ -15,6 +15,48 @@ Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
 work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
 or object-model sequencing have drifted.
 
+## Transactional Object Durable Commit Path
+
+Date: 2026-06-11
+
+Persistent object payload commits now publish `TObjectPub` records through the
+transaction-owned `TxDurableLog`. The runtime commit coordinator collects
+object `PendingPublication` records from `commit_object_payloads_into`, appends
+them to the same durable stream used by persistent `tmemory` undo records, and
+publishes one final LP for the whole transaction.
+
+Changes in this slice:
+
+- Added `StreamPublisher::publish_object_publication_before_commit` for
+  non-final object publication log entries.
+- Added `TransactionState::publish_object_publications_before_commit` so object
+  commit publication is owned by the transaction state rather than by the
+  object table.
+- `commit_object_payloads_into` now filters durable publications to persistent
+  object slots. Volatile transactional object updates still commit to the
+  store-local object table but do not enter the durable log.
+- The file-backed durable log keeps one transaction log-entry stream for
+  ordering, but allocates object publication data records and linear-memory
+  undo data records from separate data streams.
+- Changed the real libcall commit path so `commit_staged_tmemory_records`
+  returns a durable marker instead of publishing LP internally.
+- Recovery now treats an exact duplicate logical/version/data pointer as an
+  idempotent LP marker while still rejecting distinct duplicate committed
+  object versions as corruption.
+- Added file-backed tests for uncommitted object publications, committed object
+  publications, and mixed object publication plus `TMemoryUndo` transactions
+  with a single LP.
+
+Still deferred:
+
+- GC-backed object identity and persistent-object promotion are not complete.
+  The durable commit path can publish object records, but creating and tracking
+  all persistent transactional objects still depends on the GC/object-model
+  workstream.
+- Store construction still defaults to the in-memory durable transaction log.
+  File-backed transaction-log selection exists at the lower layer and needs
+  system-level configuration before ordinary engine users get restart recovery.
+
 ## TMemory Undo-In-Place Durable Substrate
 
 Date: 2026-06-11

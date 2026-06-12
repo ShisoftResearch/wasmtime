@@ -59,8 +59,8 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue,
-    ObjectValueAbi, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot,
-    TransactionId, TransactionState, collect_tmemory_access_snapshot,
+    ObjectValueAbi, PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend,
+    TableElementSnapshot, TransactionId, TransactionState, collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -362,16 +362,41 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
             .validate_active_read(granule, current_version)?;
     }
 
-    commit_staged_tmemory_records(store, instance, &records)?;
+    let transaction_id = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        state.active_transaction_required_raw()?
+    };
+    let stream_id = u32::try_from(transaction_id)
+        .context("transaction id does not fit durable transaction stream id")?;
+
+    let mut final_marker = commit_staged_tmemory_records(store, instance, &records, stream_id)?;
 
     for record in &records {
         apply_staged_transaction_record(store, instance, record)?;
     }
 
+    let mut object_publications = Vec::new();
     {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
-        state.commit_object_payloads(object_table)?;
+        state.commit_object_payloads_into(object_table, &mut object_publications)?;
+    }
+    if !object_publications.is_empty() {
+        let object_marker = store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .publish_object_publications_before_commit(
+                stream_id,
+                stream_id,
+                &object_publications,
+            )?;
+        final_marker = object_marker.or(final_marker);
+    }
+    if let Some(marker) = final_marker {
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .publish_commit_lp(stream_id, stream_id, marker)?;
     }
 
     store
@@ -2467,18 +2492,12 @@ fn commit_staged_tmemory_records(
     store: &mut dyn VMStore,
     instance: InstanceId,
     records: &[StagedRecord],
-) -> Result<()> {
+    stream_id: u32,
+) -> Result<Option<PendingCommitLogEntry>> {
     let participants = collect_tmemory_participants(instance, records);
     if participants.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-
-    let transaction_id = {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        state.active_transaction_required_raw()?
-    };
-    let stream_id = u32::try_from(transaction_id)
-        .context("transaction id does not fit durable tmemory stream id")?;
 
     let mut persistent_undos = Vec::new();
     for (participant, staged) in &participants {
@@ -2532,11 +2551,6 @@ fn commit_staged_tmemory_records(
         }
     }
 
-    if let Some(marker) = final_marker {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        state.publish_commit_lp(stream_id, stream_id, marker)?;
-    }
-
     for participant in participants.keys() {
         store
             .store_opaque_mut()
@@ -2547,7 +2561,7 @@ fn commit_staged_tmemory_records(
             )?;
     }
 
-    Ok(())
+    Ok(final_marker)
 }
 
 fn apply_staged_transaction_record(

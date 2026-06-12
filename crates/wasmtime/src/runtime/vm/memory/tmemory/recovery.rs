@@ -86,6 +86,10 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
         for update in replay.winners {
             match winners.get(&update.logical_id) {
                 Some(current) if current.version > update.version => {}
+                Some(current)
+                    if current.version == update.version
+                        && current.data_block == update.data_block
+                        && current.data_offset == update.data_offset => {}
                 Some(current) if current.version == update.version => {
                     if let Ok((_, object_id)) = unpack_object_granule_id(update.logical_id) {
                         bail!(

@@ -1602,6 +1602,21 @@ impl TransactionState {
         publisher.publish_tmemory_undo_before_in_place_write(undo)
     }
 
+    pub(crate) fn publish_object_publications_before_commit(
+        &mut self,
+        stream_id: u32,
+        txid: u32,
+        publications: &[persist::PendingPublication],
+    ) -> Result<Option<PendingCommitLogEntry>> {
+        let mut sink = self.durable_log.stream_sink(stream_id);
+        let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+        let mut final_marker = None;
+        for publication in publications {
+            final_marker = Some(publisher.publish_object_publication_before_commit(publication)?);
+        }
+        Ok(final_marker)
+    }
+
     pub(crate) fn publish_commit_lp(
         &mut self,
         stream_id: u32,
@@ -2884,7 +2899,9 @@ impl TransactionState {
             .collect::<Result<Vec<_>>>()?;
         for (object_id, payload) in updates {
             object_table.update_payload(object_id, payload)?;
-            publish(object_table.object_pending_publication(object_id)?)?;
+            if object_table.is_persistent(object_id)? {
+                publish(object_table.object_pending_publication(object_id)?)?;
+            }
         }
         self.staged_objects.clear();
         Ok(true)
@@ -3356,6 +3373,15 @@ impl TransactionState {
             next_id: transaction.as_raw().saturating_add(1),
             ..Self::default()
         }
+    }
+
+    fn new_for_test_with_durable_log(
+        transaction: TransactionId,
+        durable_log: TxDurableLog,
+    ) -> Self {
+        let mut state = Self::new_for_test(transaction);
+        state.durable_log = durable_log;
+        state
     }
 
     fn stage_granule_for_test(&mut self, granule: GranuleId, bytes: Vec<u8>) {
@@ -5986,6 +6012,67 @@ mod tests {
             objects.payload(object).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)])
         );
+    }
+
+    #[test]
+    fn transaction_state_publishes_committed_object_payload_to_file_backed_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let durable_log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x100,
+                vec![ObjectValue::I32(1), ObjectValue::I64(2)],
+            )
+            .unwrap();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(12),
+            durable_log,
+        );
+
+        state.acquire_object_write(&objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+            .unwrap();
+        let mut publications = Vec::new();
+        assert!(
+            state
+                .commit_object_payloads_into(&mut objects, &mut publications)
+                .unwrap()
+        );
+        let marker = state
+            .publish_object_publications_before_commit(12, 12, &publications)
+            .unwrap()
+            .unwrap();
+        state.publish_commit_lp(12, 12, marker).unwrap();
+        drop(state);
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+        assert_eq!(recovered.object_winners.len(), 1);
+        assert_eq!(recovered.object_winners[0].object_id, object.object_index);
+        assert_eq!(recovered.object_winners[0].version, 2);
+    }
+
+    #[test]
+    fn transaction_state_does_not_publish_volatile_object_payload_to_durable_log() {
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        state.acquire_object_write(&objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+            .unwrap();
+        let mut publications = Vec::new();
+        assert!(
+            state
+                .commit_object_payloads_into(&mut objects, &mut publications)
+                .unwrap()
+        );
+
+        assert!(publications.is_empty());
     }
 
     #[test]
