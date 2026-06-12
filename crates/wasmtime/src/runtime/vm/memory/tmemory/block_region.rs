@@ -652,6 +652,14 @@ impl<'a> BlockRegionBackendView<'a> {
         )
     }
 
+    pub(crate) fn valid_data_chunk_header(
+        &self,
+        start_block: u32,
+    ) -> Result<Option<DataChunkHeader>> {
+        let header = self.data_chunk_header(start_block)?;
+        Ok((header.magic == DATA_CHUNK_MAGIC).then_some(header))
+    }
+
     pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.backend.read(offset, len)
     }

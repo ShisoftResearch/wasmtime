@@ -406,7 +406,7 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         for block in 1..view.num_blocks() {
             let chunk_start =
                 u32::try_from(block).context("transaction data block index overflow")?;
-            let Ok(header) = view.data_chunk_header(chunk_start) else {
+            let Ok(Some(header)) = view.valid_data_chunk_header(chunk_start) else {
                 continue;
             };
             let chunk_blocks = header.chunk_blocks;
@@ -2394,11 +2394,11 @@ mod tests {
             }
 
             if factory.supports_recovery() {
-                assert_file_backed_role_data_stream_separation(scenario, observation);
+                assert_file_backed_role_data_stream_ids(scenario, observation);
             }
         }
 
-        fn assert_file_backed_role_data_stream_separation(
+        fn assert_file_backed_role_data_stream_ids(
             scenario: &BackendScenario,
             observation: &BackendObservation,
         ) {
@@ -2407,24 +2407,16 @@ mod tests {
             };
 
             for tx in &scenario.transactions {
-                let has_object = tx
-                    .records
-                    .iter()
-                    .any(|record| matches!(record, BackendScenarioRecord::TObjectPub { .. }));
-                let has_tmemory = tx
-                    .records
-                    .iter()
-                    .any(|record| matches!(record, BackendScenarioRecord::TMemoryUndo { .. }));
-                if !has_object || !has_tmemory {
-                    continue;
-                }
-
                 let actual_entries = observation
                     .streams
                     .get(&tx.stream_id)
                     .unwrap_or_else(|| panic!("missing stream {}", tx.stream_id));
-                let mut object_stream_ids = BTreeSet::new();
-                let mut tmemory_stream_ids = BTreeSet::new();
+                let expected_object_stream_id = DurableDataStream::ObjectPublication
+                    .file_backed_stream_id(tx.stream_id)
+                    .unwrap();
+                let expected_tmemory_stream_id = DurableDataStream::TMemoryUndo
+                    .file_backed_stream_id(tx.stream_id)
+                    .unwrap();
 
                 for (entry_index, entry) in actual_entries.iter().enumerate() {
                     if (entry.tx_meta & 1) != 0 {
@@ -2441,37 +2433,21 @@ mod tests {
                         });
                     match entry.role().unwrap() {
                         TxLogEntryRole::TObjectPub => {
-                            object_stream_ids.insert(data_stream_id);
+                            assert_eq!(
+                                data_stream_id, expected_object_stream_id,
+                                "backend file_backed scenario {} stream {} entry {} object records should use the object publication data stream",
+                                scenario.name, tx.stream_id, entry_index,
+                            );
                         }
                         TxLogEntryRole::TMemoryUndo => {
-                            tmemory_stream_ids.insert(data_stream_id);
+                            assert_eq!(
+                                data_stream_id, expected_tmemory_stream_id,
+                                "backend file_backed scenario {} stream {} entry {} tmemory undo records should use the tmemory undo data stream",
+                                scenario.name, tx.stream_id, entry_index,
+                            );
                         }
                     }
                 }
-
-                assert_eq!(
-                    object_stream_ids.len(),
-                    1,
-                    "backend file_backed scenario {} stream {} object records should use one object data stream",
-                    scenario.name,
-                    tx.stream_id,
-                );
-                assert_eq!(
-                    tmemory_stream_ids.len(),
-                    1,
-                    "backend file_backed scenario {} stream {} tmemory records should use one tmemory data stream",
-                    scenario.name,
-                    tx.stream_id,
-                );
-
-                let object_stream_id = *object_stream_ids.iter().next().unwrap();
-                let tmemory_stream_id = *tmemory_stream_ids.iter().next().unwrap();
-
-                assert_ne!(
-                    object_stream_id, tmemory_stream_id,
-                    "backend file_backed scenario {} stream {} object and tmemory data must use distinct data streams",
-                    scenario.name, tx.stream_id,
-                );
             }
         }
 

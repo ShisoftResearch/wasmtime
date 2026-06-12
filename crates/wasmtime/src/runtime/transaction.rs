@@ -6872,6 +6872,7 @@ mod tests {
             assert_eq!(observed.len(), 2);
             assert_active_transaction_id(observed[0]);
             assert_active_transaction_id(observed[1]);
+            assert_ne!(observed[0], observed[1]);
         }
 
         #[test]
@@ -6921,6 +6922,7 @@ mod tests {
             assert_eq!(observed.len(), 2);
             assert_active_transaction_id(observed[0]);
             assert_active_transaction_id(observed[1]);
+            assert_ne!(observed[0], observed[1]);
         }
 
         #[test]
@@ -8017,6 +8019,7 @@ mod tests {
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum PermissionModelOp {
+            Begin,
             GrantRead,
             GrantWrite,
             Read,
@@ -8071,6 +8074,16 @@ mod tests {
         impl PermissionModelState {
             fn apply(&mut self, op: PermissionModelOp) -> PermissionStepOutcome {
                 match op {
+                    PermissionModelOp::Begin => {
+                        if self.snapshot.active {
+                            return PermissionStepOutcome::Unit { ok: false };
+                        }
+                        self.snapshot.active = true;
+                        self.snapshot.staged_value = None;
+                        self.snapshot.read = false;
+                        self.snapshot.write = false;
+                        PermissionStepOutcome::Unit { ok: true }
+                    }
                     PermissionModelOp::GrantRead => {
                         if !self.snapshot.active {
                             return PermissionStepOutcome::Bool {
@@ -8238,6 +8251,10 @@ mod tests {
                         ok: false,
                         value: None,
                     }),
+                },
+                PermissionModelOp::Begin => match state.begin() {
+                    Ok(_) => Ok(PermissionStepOutcome::Unit { ok: true }),
+                    Err(_) => Ok(PermissionStepOutcome::Unit { ok: false }),
                 },
                 PermissionModelOp::GrantWrite => {
                     match state.acquire_object_write(objects, object) {
@@ -8508,6 +8525,12 @@ mod tests {
                 PermissionModelOp::Write(9),
                 PermissionModelOp::Abort,
                 PermissionModelOp::Read,
+                PermissionModelOp::Begin,
+                PermissionModelOp::GrantRead,
+                PermissionModelOp::Read,
+                PermissionModelOp::GrantWrite,
+                PermissionModelOp::Write(10),
+                PermissionModelOp::Read,
             ])
             .unwrap();
 
@@ -8519,16 +8542,34 @@ mod tests {
                 }
             );
             assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit { ok: true });
+            assert_eq!(trace[4].outcome, PermissionStepOutcome::Unit { ok: true });
             assert_eq!(
-                run_permission_semantic_schedule(&[
-                    PermissionModelOp::GrantWrite,
-                    PermissionModelOp::Write(9),
-                    PermissionModelOp::Abort,
-                    PermissionModelOp::Write(10),
-                ])
-                .unwrap()[3]
-                    .outcome,
-                PermissionStepOutcome::Write { ok: false }
+                trace[5].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
+            );
+            assert_eq!(
+                trace[6].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(7),
+                }
+            );
+            assert_eq!(
+                trace[7].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
+            );
+            assert_eq!(
+                trace[9].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(10),
+                }
             );
             assert_eq!(
                 trace[3].snapshot,
@@ -8549,6 +8590,12 @@ mod tests {
                 PermissionModelOp::Write(9),
                 PermissionModelOp::CommitRelease,
                 PermissionModelOp::Read,
+                PermissionModelOp::Begin,
+                PermissionModelOp::GrantRead,
+                PermissionModelOp::Read,
+                PermissionModelOp::GrantWrite,
+                PermissionModelOp::Write(10),
+                PermissionModelOp::Read,
             ])
             .unwrap();
 
@@ -8560,16 +8607,34 @@ mod tests {
                 }
             );
             assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit { ok: true });
+            assert_eq!(trace[4].outcome, PermissionStepOutcome::Unit { ok: true });
             assert_eq!(
-                run_permission_semantic_schedule(&[
-                    PermissionModelOp::GrantWrite,
-                    PermissionModelOp::Write(9),
-                    PermissionModelOp::CommitRelease,
-                    PermissionModelOp::Write(10),
-                ])
-                .unwrap()[3]
-                    .outcome,
-                PermissionStepOutcome::Write { ok: false }
+                trace[5].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
+            );
+            assert_eq!(
+                trace[6].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(9),
+                }
+            );
+            assert_eq!(
+                trace[7].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
+            );
+            assert_eq!(
+                trace[9].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(10),
+                }
             );
             assert_eq!(
                 trace[3].snapshot,
@@ -8630,6 +8695,7 @@ mod tests {
 
         fn permission_model_op_strategy() -> impl Strategy<Value = PermissionModelOp> {
             prop_oneof![
+                Just(PermissionModelOp::Begin),
                 Just(PermissionModelOp::GrantRead),
                 Just(PermissionModelOp::GrantWrite),
                 Just(PermissionModelOp::Read),
