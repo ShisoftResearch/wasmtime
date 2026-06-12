@@ -6242,6 +6242,374 @@ mod tests {
         assert!(object_winners.is_empty());
     }
 
+    mod model_mixed_participants {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
+
+        #[derive(Clone, Debug, Default, Eq, PartialEq)]
+        struct ModelWorld {
+            tmemory_granules: BTreeMap<u32, u8>,
+            object_fields: BTreeMap<u64, i32>,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct ModelTMemoryWrite {
+            granule: u32,
+            old_byte: u8,
+            new_byte: u8,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct ModelObjectWrite {
+            object_id: u64,
+            old_value: i32,
+            new_value: i32,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct MixedModelCase {
+            tmemory_writes: Vec<ModelTMemoryWrite>,
+            object_writes: Vec<ModelObjectWrite>,
+            committed: bool,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct ActualMixedWorld {
+            world: ModelWorld,
+            object_winner_count: usize,
+        }
+
+        impl MixedModelCase {
+            fn expected_world(&self) -> ModelWorld {
+                let tmemory_granules = self
+                    .tmemory_writes
+                    .iter()
+                    .map(|write| {
+                        (
+                            write.granule,
+                            if self.committed {
+                                write.new_byte
+                            } else {
+                                write.old_byte
+                            },
+                        )
+                    })
+                    .collect();
+                let object_fields = if self.committed {
+                    self.object_writes
+                        .iter()
+                        .map(|write| (write.object_id, write.new_value))
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                };
+                ModelWorld {
+                    tmemory_granules,
+                    object_fields,
+                }
+            }
+        }
+
+        fn repeated_granule(byte: u8) -> Vec<u8> {
+            vec![byte; TMEMORY_GRANULE_SIZE]
+        }
+
+        fn file_backed_granule_byte(bytes: &[u8], granule: u32) -> Result<u8> {
+            let granule = usize::try_from(granule)
+                .context("tmemory model granule index does not fit host usize")?;
+            let start = granule
+                .checked_mul(TMEMORY_GRANULE_SIZE)
+                .context("tmemory model granule start overflow")?;
+            let end = start
+                .checked_add(TMEMORY_GRANULE_SIZE)
+                .context("tmemory model granule end overflow")?;
+            ensure!(
+                end <= bytes.len(),
+                "tmemory model granule range is out of bounds"
+            );
+            let first = *bytes[start..end]
+                .first()
+                .context("tmemory model granule is unexpectedly empty")?;
+            ensure!(
+                bytes[start..end].iter().all(|byte| *byte == first),
+                "tmemory model expected one repeated byte per granule"
+            );
+            Ok(first)
+        }
+
+        fn model_case_strategy() -> impl Strategy<Value = MixedModelCase> {
+            (
+                prop::collection::vec(any::<bool>(), 3)
+                    .prop_filter("must write at least one tmemory granule", |flags| {
+                        flags.iter().any(|flag| *flag)
+                    }),
+                prop::collection::vec(
+                    (any::<u8>(), any::<u8>())
+                        .prop_filter("old and new tmemory bytes must differ", |(old, new)| {
+                            old != new
+                        }),
+                    3,
+                ),
+                prop::collection::vec(any::<bool>(), 2),
+                prop::collection::vec((0i32..=9, 10i32..=19), 2),
+                any::<bool>(),
+            )
+                .prop_map(
+                    |(tmemory_flags, tmemory_bytes, object_flags, object_values, committed)| {
+                        let tmemory_writes = tmemory_flags
+                            .into_iter()
+                            .zip(tmemory_bytes)
+                            .enumerate()
+                            .filter_map(|(granule, (selected, (old_byte, new_byte)))| {
+                                selected.then_some(ModelTMemoryWrite {
+                                    granule: u32::try_from(granule).unwrap(),
+                                    old_byte,
+                                    new_byte,
+                                })
+                            })
+                            .collect();
+                        let object_writes = object_flags
+                            .into_iter()
+                            .zip(object_values)
+                            .enumerate()
+                            .filter_map(|(object_id, (selected, (old_value, new_value)))| {
+                                selected.then_some(ModelObjectWrite {
+                                    object_id: u64::try_from(object_id).unwrap(),
+                                    old_value,
+                                    new_value,
+                                })
+                            })
+                            .collect();
+                        MixedModelCase {
+                            tmemory_writes,
+                            object_writes,
+                            committed,
+                        }
+                    },
+                )
+        }
+
+        fn run_mixed_model_case(case: &MixedModelCase) -> Result<ActualMixedWorld> {
+            let outcome = (|| -> Result<ActualMixedWorld> {
+                let dir = tempfile::tempdir()?;
+                let tmemory_path = dir.path().join("tmemory.bin");
+                let tx_log_path = dir.path().join("tx-log.bin");
+                let mut tmemory = crate::runtime::vm::TMemory::new(
+                    TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+                    1,
+                    Some(1),
+                )?;
+
+                for write in &case.tmemory_writes {
+                    tmemory.commit_staged_tmemory_granule(
+                        u64::from(write.granule),
+                        &repeated_granule(write.old_byte),
+                    )?;
+                }
+
+                let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+                let mut state = TransactionState::new_for_test_with_durable_log(
+                    TransactionId::from_raw(71),
+                    durable_log,
+                );
+                let mut objects = ObjectTable::default();
+                let mut object_handles = Vec::new();
+                for object_id in 0..2u64 {
+                    let object = objects.allocate_persistent_struct_for_gc_ref(
+                        u32::try_from(0x200 + object_id)
+                            .context("object model gc ref does not fit u32")?,
+                        vec![ObjectValue::I32(0)],
+                    )?;
+                    assert_eq!(object.object_index, object_id);
+                    object_handles.push(object);
+                }
+                for write in &case.object_writes {
+                    let handle = object_handles
+                        .get(
+                            usize::try_from(write.object_id)
+                                .context("object model id does not fit host usize")?,
+                        )
+                        .copied()
+                        .context("object model id is outside the prepared object slots")?;
+                    objects.update_payload(
+                        handle,
+                        ObjectPayload::Struct(vec![ObjectValue::I32(write.old_value)]),
+                    )?;
+                }
+
+                let mut final_marker = None;
+                for write in &case.tmemory_writes {
+                    let new_granule = repeated_granule(write.new_byte);
+                    let marker = state.publish_tmemory_undo_before_in_place_write(
+                        71,
+                        71,
+                        &tmemory.prepare_tmemory_undo_record(
+                            Some(7),
+                            0,
+                            u64::from(write.granule),
+                            &new_granule,
+                        )?,
+                    )?;
+                    tmemory
+                        .commit_staged_tmemory_granule(u64::from(write.granule), &new_granule)?;
+                    final_marker = Some(marker);
+                }
+
+                for write in &case.object_writes {
+                    let handle = object_handles
+                        .get(
+                            usize::try_from(write.object_id)
+                                .context("object model id does not fit host usize")?,
+                        )
+                        .copied()
+                        .context("object model id is outside the prepared object slots")?;
+                    state.acquire_object_write(&objects, handle)?;
+                    state.stage_struct_field(
+                        &objects,
+                        handle,
+                        0,
+                        ObjectValue::I32(write.new_value),
+                    )?;
+                }
+
+                let mut publications = Vec::new();
+                state.commit_object_payloads_into(&mut objects, &mut publications)?;
+                if let Some(marker) =
+                    state.publish_object_publications_before_commit(71, 71, &publications)?
+                {
+                    final_marker = Some(marker);
+                }
+                if case.committed {
+                    state.publish_commit_lp(
+                        71,
+                        71,
+                        final_marker.context(
+                            "mixed model case must publish at least one tmemory or object record",
+                        )?,
+                    )?;
+                }
+                drop(state);
+
+                let recovered = TxDurableLog::recover_file_backed_for_test(&tx_log_path)?;
+                tmemory.apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
+                    recovered.tmemory_undo_rollbacks,
+                )?;
+                let tmemory_file = std::fs::read(&tmemory_path)?;
+                let mut world = ModelWorld::default();
+                for write in &case.tmemory_writes {
+                    world.tmemory_granules.insert(
+                        write.granule,
+                        file_backed_granule_byte(&tmemory_file, write.granule)?,
+                    );
+                }
+
+                let object_winners =
+                    crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+                        &tx_log_path,
+                    )?;
+                let object_winner_count = object_winners.len();
+                let mut recovered_objects = ObjectTable::default();
+                recovered_objects.rebuild_from_recovery_for_test(&object_winners)?;
+                for winner in &object_winners {
+                    let payload = recovered_objects.payload(ObjectId {
+                        object_index: winner.object_id,
+                    })?;
+                    let ObjectPayload::Struct(fields) = payload else {
+                        bail!("mixed model expected recovered object winner to be a struct");
+                    };
+                    let field = fields
+                        .first()
+                        .context("mixed model expected recovered object to have one field")?;
+                    let ObjectValue::I32(value) = field else {
+                        bail!("mixed model expected recovered object field to be i32");
+                    };
+                    world.object_fields.insert(winner.object_id, *value);
+                }
+
+                Ok(ActualMixedWorld {
+                    world,
+                    object_winner_count,
+                })
+            })();
+            clear_current_thread_transaction_for_test();
+            outcome
+        }
+
+        #[test]
+        fn model_mixed_file_backed_commit_matches_reference_world() {
+            let case = MixedModelCase {
+                tmemory_writes: vec![ModelTMemoryWrite {
+                    granule: 0,
+                    old_byte: 0x11,
+                    new_byte: 0x22,
+                }],
+                object_writes: vec![ModelObjectWrite {
+                    object_id: 0,
+                    old_value: 1,
+                    new_value: 9,
+                }],
+                committed: true,
+            };
+
+            let actual = run_mixed_model_case(&case).unwrap();
+
+            assert_eq!(actual.world, case.expected_world());
+            assert_eq!(actual.world.tmemory_granules.get(&0), Some(&0x22));
+            assert_eq!(actual.world.object_fields.get(&0), Some(&9));
+            assert_eq!(actual.object_winner_count, 1);
+        }
+
+        #[test]
+        fn model_mixed_file_backed_loose_end_matches_reference_world() {
+            let case = MixedModelCase {
+                tmemory_writes: vec![ModelTMemoryWrite {
+                    granule: 0,
+                    old_byte: 0x33,
+                    new_byte: 0x44,
+                }],
+                object_writes: vec![ModelObjectWrite {
+                    object_id: 0,
+                    old_value: 1,
+                    new_value: 9,
+                }],
+                committed: false,
+            };
+
+            let actual = run_mixed_model_case(&case).unwrap();
+
+            assert_eq!(actual.world, case.expected_world());
+            assert_eq!(actual.world.tmemory_granules.get(&0), Some(&0x33));
+            assert!(actual.world.object_fields.is_empty());
+            assert_eq!(actual.object_winner_count, 0);
+        }
+
+        #[test]
+        fn model_mixed_file_backed_generated_histories_match_reference_world() {
+            let mut runner = TestRunner::new(Config {
+                cases: 48,
+                failure_persistence: None,
+                max_shrink_iters: 256,
+                rng_seed: RngSeed::Fixed(0x5eed_0003),
+                ..Config::default()
+            });
+
+            runner
+                .run(&model_case_strategy(), |case| {
+                    let actual = run_mixed_model_case(&case)
+                        .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                    prop_assert_eq!(actual.world, case.expected_world());
+                    if case.committed {
+                        prop_assert_eq!(actual.object_winner_count, case.object_writes.len());
+                    } else {
+                        prop_assert_eq!(actual.object_winner_count, 0);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
     #[test]
     fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed_record() {
         let mut objects = ObjectTable::default();

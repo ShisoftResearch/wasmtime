@@ -21,6 +21,39 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 3: Mixed Participant Reference-World Tests
+
+Date: 2026-06-12
+
+Wave 3 of the model-checking roadmap now adds mixed file-backed participant
+tests in `crates/wasmtime/src/runtime/transaction.rs` that compare one real
+transaction against a small abstract world with explicit `tmemory` bytes and
+persistent-object field values.
+
+Changes in this slice:
+
+- Added a nested `model_mixed_participants` test module so the Wave 3 slice is
+  runnable with a focused cargo test filter.
+- Added a small `ModelWorld` reference state that records expected file-backed
+  `tmemory` granule bytes and recovered persistent-object field values.
+- Added deterministic commit coverage proving that a committed mixed
+  transaction keeps the new file-backed `tmemory` byte image and rebuilds the
+  persistent object winner with the updated field value.
+- Added deterministic loose-end coverage proving that a missing LP rolls
+  file-backed `tmemory` back to old bytes and rebuilds no object winners.
+- Added a fixed-seed generated one-transaction mixed test that produces 1 to 3
+  `tmemory` writes, 0 to 2 persistent-object writes, and a commit/loose-end
+  choice, then compares recovered real behavior against the reference world.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_mixed_participants -- --format terse
+cargo test -p wasmtime --lib transaction -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 2: Crash Cutpoint LP-Visibility Tests
 
 Date: 2026-06-12
