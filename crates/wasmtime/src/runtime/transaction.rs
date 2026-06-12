@@ -7306,18 +7306,11 @@ mod tests {
         }
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        enum PermissionErrorKind {
-            Inactive,
-            ReadDenied,
-            WriteDenied,
-        }
-
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum PermissionStepOutcome {
-            Bool(bool),
-            ReadValue(i32),
-            Unit,
-            Error(PermissionErrorKind),
+            Bool { ok: bool, value: Option<bool> },
+            Read { ok: bool, value: Option<i32> },
+            Write { ok: bool },
+            Unit { ok: bool },
         }
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7359,62 +7352,83 @@ mod tests {
                 match op {
                     PermissionModelOp::GrantRead => {
                         if !self.snapshot.active {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                            return PermissionStepOutcome::Bool {
+                                ok: false,
+                                value: None,
+                            };
                         }
                         let granted = !self.snapshot.read;
                         self.snapshot.read = true;
-                        PermissionStepOutcome::Bool(granted)
+                        PermissionStepOutcome::Bool {
+                            ok: true,
+                            value: Some(granted),
+                        }
                     }
                     PermissionModelOp::GrantWrite => {
                         if !self.snapshot.active {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                            return PermissionStepOutcome::Bool {
+                                ok: false,
+                                value: None,
+                            };
                         }
                         let granted = !self.snapshot.write;
                         self.snapshot.read = true;
                         self.snapshot.write = true;
-                        PermissionStepOutcome::Bool(granted)
+                        PermissionStepOutcome::Bool {
+                            ok: true,
+                            value: Some(granted),
+                        }
                     }
                     PermissionModelOp::Read => {
-                        if !self.snapshot.read {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied);
+                        if !self.snapshot.active || !self.snapshot.read {
+                            return PermissionStepOutcome::Read {
+                                ok: false,
+                                value: None,
+                            };
                         }
-                        PermissionStepOutcome::ReadValue(
-                            self.snapshot
-                                .staged_value
-                                .unwrap_or(self.snapshot.committed_value),
-                        )
+                        PermissionStepOutcome::Read {
+                            ok: true,
+                            value: Some(
+                                self.snapshot
+                                    .staged_value
+                                    .unwrap_or(self.snapshot.committed_value),
+                            ),
+                        }
                     }
                     PermissionModelOp::Write(value) => {
-                        if !self.snapshot.read {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied);
-                        }
-                        if !self.snapshot.write {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::WriteDenied);
+                        if !self.snapshot.active || !self.snapshot.write {
+                            return PermissionStepOutcome::Write { ok: false };
                         }
                         self.snapshot.staged_value = Some(value);
-                        PermissionStepOutcome::Unit
+                        PermissionStepOutcome::Write { ok: true }
                     }
                     PermissionModelOp::Downgrade => {
                         if !self.snapshot.active {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                            return PermissionStepOutcome::Bool {
+                                ok: false,
+                                value: None,
+                            };
                         }
                         let removed = self.snapshot.write;
                         self.snapshot.write = false;
-                        PermissionStepOutcome::Bool(removed)
+                        PermissionStepOutcome::Bool {
+                            ok: true,
+                            value: Some(removed),
+                        }
                     }
                     PermissionModelOp::Abort => {
                         if !self.snapshot.active {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                            return PermissionStepOutcome::Unit { ok: false };
                         }
                         self.snapshot.active = false;
                         self.snapshot.staged_value = None;
                         self.snapshot.read = false;
                         self.snapshot.write = false;
-                        PermissionStepOutcome::Unit
+                        PermissionStepOutcome::Unit { ok: true }
                     }
                     PermissionModelOp::CommitRelease => {
                         if !self.snapshot.active {
-                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                            return PermissionStepOutcome::Unit { ok: false };
                         }
                         if let Some(value) = self.snapshot.staged_value {
                             self.snapshot.committed_value = value;
@@ -7423,7 +7437,7 @@ mod tests {
                         self.snapshot.staged_value = None;
                         self.snapshot.read = false;
                         self.snapshot.write = false;
-                        PermissionStepOutcome::Unit
+                        PermissionStepOutcome::Unit { ok: true }
                     }
                 }
             }
@@ -7466,24 +7480,6 @@ mod tests {
             Ok(*value)
         }
 
-        fn classify_permission_error(error: Error) -> Result<PermissionStepOutcome> {
-            let message = error.to_string();
-            if message.contains("transaction operation requires an active transaction") {
-                return Ok(PermissionStepOutcome::Error(PermissionErrorKind::Inactive));
-            }
-            if message.contains("transactional object read permission was not acquired") {
-                return Ok(PermissionStepOutcome::Error(
-                    PermissionErrorKind::ReadDenied,
-                ));
-            }
-            if message.contains("transactional object write permission was not acquired") {
-                return Ok(PermissionStepOutcome::Error(
-                    PermissionErrorKind::WriteDenied,
-                ));
-            }
-            Err(error)
-        }
-
         fn downgrade_granule_write_for_test(
             state: &mut TransactionState,
             granule: GranuleId,
@@ -7513,46 +7509,68 @@ mod tests {
         ) -> Result<PermissionStepOutcome> {
             match op {
                 PermissionModelOp::GrantRead => match state.acquire_object_read(objects, object) {
-                    Ok(granted) => Ok(PermissionStepOutcome::Bool(granted)),
-                    Err(error) => classify_permission_error(error),
+                    Ok(granted) => Ok(PermissionStepOutcome::Bool {
+                        ok: true,
+                        value: Some(granted),
+                    }),
+                    Err(_) => Ok(PermissionStepOutcome::Bool {
+                        ok: false,
+                        value: None,
+                    }),
                 },
                 PermissionModelOp::GrantWrite => {
                     match state.acquire_object_write(objects, object) {
-                        Ok(granted) => Ok(PermissionStepOutcome::Bool(granted)),
-                        Err(error) => classify_permission_error(error),
+                        Ok(granted) => Ok(PermissionStepOutcome::Bool {
+                            ok: true,
+                            value: Some(granted),
+                        }),
+                        Err(_) => Ok(PermissionStepOutcome::Bool {
+                            ok: false,
+                            value: None,
+                        }),
                     }
                 }
                 PermissionModelOp::Read => match state.read_struct_field(objects, object, 0) {
-                    Ok(ObjectValue::I32(value)) => Ok(PermissionStepOutcome::ReadValue(value)),
+                    Ok(ObjectValue::I32(value)) => Ok(PermissionStepOutcome::Read {
+                        ok: true,
+                        value: Some(value),
+                    }),
                     Ok(other) => bail!("permission model expected i32 field, got {other:?}"),
-                    Err(error) => classify_permission_error(error),
+                    Err(_) => Ok(PermissionStepOutcome::Read {
+                        ok: false,
+                        value: None,
+                    }),
                 },
                 PermissionModelOp::Write(value) => {
                     match state.stage_struct_field(objects, object, 0, ObjectValue::I32(value)) {
-                        Ok(()) => Ok(PermissionStepOutcome::Unit),
-                        Err(error) => classify_permission_error(error),
+                        Ok(()) => Ok(PermissionStepOutcome::Write { ok: true }),
+                        Err(_) => Ok(PermissionStepOutcome::Write { ok: false }),
                     }
                 }
                 PermissionModelOp::Downgrade => {
                     let granule = objects.granule_id(object)?;
                     match downgrade_granule_write_for_test(state, granule) {
-                        Ok(removed) => Ok(PermissionStepOutcome::Bool(removed)),
-                        Err(error) => classify_permission_error(error),
+                        Ok(removed) => Ok(PermissionStepOutcome::Bool {
+                            ok: true,
+                            value: Some(removed),
+                        }),
+                        Err(_) => Ok(PermissionStepOutcome::Bool {
+                            ok: false,
+                            value: None,
+                        }),
                     }
                 }
                 PermissionModelOp::Abort => match state.abort() {
-                    Ok(()) => Ok(PermissionStepOutcome::Unit),
-                    Err(error) => classify_permission_error(error),
+                    Ok(()) => Ok(PermissionStepOutcome::Unit { ok: true }),
+                    Err(_) => Ok(PermissionStepOutcome::Unit { ok: false }),
                 },
-                PermissionModelOp::CommitRelease => {
-                    match state
-                        .commit_object_payloads(objects)
-                        .and_then(|_| state.complete_commit())
-                    {
-                        Ok(()) => Ok(PermissionStepOutcome::Unit),
-                        Err(error) => classify_permission_error(error),
-                    }
-                }
+                PermissionModelOp::CommitRelease => match state
+                    .commit_object_payloads(objects)
+                    .and_then(|_| state.complete_commit())
+                {
+                    Ok(()) => Ok(PermissionStepOutcome::Unit { ok: true }),
+                    Err(_) => Ok(PermissionStepOutcome::Unit { ok: false }),
+                },
             }
         }
 
@@ -7577,7 +7595,7 @@ mod tests {
             })
         }
 
-        fn run_permission_model_schedule(
+        fn run_permission_semantic_schedule(
             schedule: &[PermissionModelOp],
         ) -> Result<Vec<PermissionTraceStep>> {
             let outcome = (|| -> Result<Vec<PermissionTraceStep>> {
@@ -7637,19 +7655,37 @@ mod tests {
         }
 
         #[test]
+        fn model_permissions_write_without_permission_fails_without_mutating_state() {
+            let trace = run_permission_semantic_schedule(&[PermissionModelOp::Write(9)]).unwrap();
+
+            assert_eq!(trace.len(), 1);
+            assert_eq!(trace[0].snapshot, PermissionModelState::default().snapshot);
+            assert_eq!(trace[0].outcome, PermissionStepOutcome::Write { ok: false });
+        }
+
+        #[test]
         fn model_permissions_read_permission_allows_read_without_write() {
-            let trace = run_permission_model_schedule(&[
+            let trace = run_permission_semantic_schedule(&[
                 PermissionModelOp::GrantRead,
                 PermissionModelOp::Read,
                 PermissionModelOp::Write(9),
             ])
             .unwrap();
 
-            assert_eq!(trace[0].outcome, PermissionStepOutcome::Bool(true));
-            assert_eq!(trace[1].outcome, PermissionStepOutcome::ReadValue(7));
+            assert_eq!(trace[2].outcome, PermissionStepOutcome::Write { ok: false });
             assert_eq!(
-                trace[2].outcome,
-                PermissionStepOutcome::Error(PermissionErrorKind::WriteDenied)
+                trace[0].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
+            );
+            assert_eq!(
+                trace[1].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(7),
+                }
             );
             assert_eq!(
                 trace[2].snapshot,
@@ -7665,16 +7701,28 @@ mod tests {
 
         #[test]
         fn model_permissions_write_permission_grants_staged_mutation_and_reads_staged_value() {
-            let trace = run_permission_model_schedule(&[
+            let trace = run_permission_semantic_schedule(&[
                 PermissionModelOp::GrantWrite,
                 PermissionModelOp::Write(9),
                 PermissionModelOp::Read,
             ])
             .unwrap();
 
-            assert_eq!(trace[0].outcome, PermissionStepOutcome::Bool(true));
-            assert_eq!(trace[1].outcome, PermissionStepOutcome::Unit);
-            assert_eq!(trace[2].outcome, PermissionStepOutcome::ReadValue(9));
+            assert_eq!(
+                trace[0].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
+            );
+            assert_eq!(trace[1].outcome, PermissionStepOutcome::Write { ok: true });
+            assert_eq!(
+                trace[2].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(9),
+                }
+            );
             assert_eq!(
                 trace[2].snapshot,
                 PermissionRuntimeSnapshot {
@@ -7689,7 +7737,7 @@ mod tests {
 
         #[test]
         fn model_permissions_downgrade_rejects_future_writes_until_reacquired() {
-            let trace = run_permission_model_schedule(&[
+            let trace = run_permission_semantic_schedule(&[
                 PermissionModelOp::GrantWrite,
                 PermissionModelOp::Write(9),
                 PermissionModelOp::Downgrade,
@@ -7701,19 +7749,40 @@ mod tests {
             ])
             .unwrap();
 
-            assert_eq!(trace[2].outcome, PermissionStepOutcome::Bool(true));
-            assert_eq!(trace[3].outcome, PermissionStepOutcome::ReadValue(9));
+            assert_eq!(trace[4].outcome, PermissionStepOutcome::Write { ok: false });
             assert_eq!(
-                trace[4].outcome,
-                PermissionStepOutcome::Error(PermissionErrorKind::WriteDenied)
+                trace[2].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
             );
-            assert_eq!(trace[5].outcome, PermissionStepOutcome::Bool(true));
-            assert_eq!(trace[7].outcome, PermissionStepOutcome::ReadValue(10));
+            assert_eq!(
+                trace[3].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(9),
+                }
+            );
+            assert_eq!(
+                trace[5].outcome,
+                PermissionStepOutcome::Bool {
+                    ok: true,
+                    value: Some(true),
+                }
+            );
+            assert_eq!(
+                trace[7].outcome,
+                PermissionStepOutcome::Read {
+                    ok: true,
+                    value: Some(10),
+                }
+            );
         }
 
         #[test]
         fn model_permissions_abort_discards_state() {
-            let trace = run_permission_model_schedule(&[
+            let trace = run_permission_semantic_schedule(&[
                 PermissionModelOp::GrantWrite,
                 PermissionModelOp::Write(9),
                 PermissionModelOp::Abort,
@@ -7721,10 +7790,24 @@ mod tests {
             ])
             .unwrap();
 
-            assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit);
             assert_eq!(
                 trace[3].outcome,
-                PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied)
+                PermissionStepOutcome::Read {
+                    ok: false,
+                    value: None,
+                }
+            );
+            assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit { ok: true });
+            assert_eq!(
+                run_permission_semantic_schedule(&[
+                    PermissionModelOp::GrantWrite,
+                    PermissionModelOp::Write(9),
+                    PermissionModelOp::Abort,
+                    PermissionModelOp::Write(10),
+                ])
+                .unwrap()[3]
+                    .outcome,
+                PermissionStepOutcome::Write { ok: false }
             );
             assert_eq!(
                 trace[3].snapshot,
@@ -7740,7 +7823,7 @@ mod tests {
 
         #[test]
         fn model_permissions_commit_release_clears_permissions_and_commits_value() {
-            let trace = run_permission_model_schedule(&[
+            let trace = run_permission_semantic_schedule(&[
                 PermissionModelOp::GrantWrite,
                 PermissionModelOp::Write(9),
                 PermissionModelOp::CommitRelease,
@@ -7748,10 +7831,24 @@ mod tests {
             ])
             .unwrap();
 
-            assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit);
             assert_eq!(
                 trace[3].outcome,
-                PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied)
+                PermissionStepOutcome::Read {
+                    ok: false,
+                    value: None,
+                }
+            );
+            assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit { ok: true });
+            assert_eq!(
+                run_permission_semantic_schedule(&[
+                    PermissionModelOp::GrantWrite,
+                    PermissionModelOp::Write(9),
+                    PermissionModelOp::CommitRelease,
+                    PermissionModelOp::Write(10),
+                ])
+                .unwrap()[3]
+                    .outcome,
+                PermissionStepOutcome::Write { ok: false }
             );
             assert_eq!(
                 trace[3].snapshot,
@@ -7836,7 +7933,7 @@ mod tests {
                 .run(
                     &prop::collection::vec(permission_model_op_strategy(), 1..=10usize),
                     |schedule| {
-                        run_permission_model_schedule(&schedule)
+                        run_permission_semantic_schedule(&schedule)
                             .map_err(|error| TestCaseError::fail(error.to_string()))?;
                         Ok(())
                     },

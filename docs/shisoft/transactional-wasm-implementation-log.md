@@ -42,7 +42,7 @@ Changes in this slice:
 - Added a fixed-seed generated short-sequence test over the Wave 6 operation
   alphabet: `grant read`, `grant write`, `read`, `write`, `downgrade`,
   `abort`, and `commit/release`, with prefix-by-prefix comparison against the
-  reference machine.
+  reference machine's semantic step results plus exact post-state snapshots.
 - Added one small non-object granule check using a `TGlobal` granule so the
   tests show the transaction/granule permission state is generic and not tied
   to object payload helpers alone.
@@ -55,9 +55,13 @@ Semantic note for this slice:
   object payload. This matches the meeting design intent closely enough to
   verify that subsequent writes are rejected until write ownership is acquired
   again.
-- The object helper path currently reads the payload before checking write
-  ownership, so a bare object `write` without prior permission fails as a read
-  denial first. The reference machine matches that exact runtime behavior.
+- The permission model now checks the semantic contract rather than current
+  helper diagnostic ordering: read permission enables reads, write permission
+  enables staged mutation, write ownership implies read of the staged value,
+  and writes attempted without write ownership must fail without mutating state.
+  The tests compare runtime success/failure plus post-state and therefore do
+  not depend on whether the current object helpers report read-denied or
+  write-denied first.
 - The `commit/release` transition uses the real object commit path
   (`commit_object_payloads` plus `complete_commit`) for the object model and
   `complete_commit` for the small generic granule release check.
