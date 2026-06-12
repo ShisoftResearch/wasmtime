@@ -15,6 +15,44 @@ Use `docs/shisoft/transactional-wasm-remaining-work-roadmap.md` for remaining
 work sequencing. It supersedes the older WAST-only roadmap where the WAST counts
 or object-model sequencing have drifted.
 
+Use `docs/shisoft/transactional-wasm-model-checking-test-roadmap.md` for the
+post-WAST correctness-test workstream. It covers deterministic reference-model
+tests, generated `proptest` histories, file-backed recovery checks, bounded
+`LockBased` state-space tests, permission-state tests, and later `loom` entry
+criteria.
+
+## Model-Checking Wave 1: Durable-Log Recovery Reference Tests
+
+Date: 2026-06-12
+
+Wave 1 of the model-checking roadmap now has an executable recovery-model
+slice in `crates/wasmtime/src/runtime/transaction/persist.rs`.
+
+Changes in this slice:
+
+- Added a nested `model_recovery` test module with test-only `ModelRole` and
+  `ModelRecord` history inputs for durable transaction recovery.
+- Added a deterministic regression covering one committed transaction that
+  appends a `TMemoryUndo`, appends a `TObjectPub`, publishes LP, and recovers
+  exactly one object winner with zero `tmemory` rollbacks.
+- Added a pure `expected_recovery` reference evaluator that groups records by
+  transaction, treats `has_lp` as commit, keeps `TObjectPub` winners only from
+  committed transactions, keeps `TMemoryUndo` rollbacks only from loose-end
+  transactions, and selects the highest object version per logical id.
+- Added a fixed-seed small-history `proptest` that publishes generated model
+  records through the real file-backed `TxDurableLog` and compares recovered
+  object winners plus `tmemory` rollback summaries against the reference
+  evaluator.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_recovery -- --format terse
+cargo test -p wasmtime --lib transaction::persist -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Transactional Object Durable Commit Path
 
 Date: 2026-06-11

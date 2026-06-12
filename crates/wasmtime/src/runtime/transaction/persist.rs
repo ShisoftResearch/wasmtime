@@ -1213,4 +1213,356 @@ mod tests {
         assert_eq!(pub_.version, 7);
         assert_eq!(pub_.type_info, 12);
     }
+
+    mod model_recovery {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
+
+        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+        enum ModelRole {
+            TObjectPub,
+            TMemoryUndo,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct ModelRecord {
+            tx: u32,
+            logical_id: u64,
+            version: u32,
+            role: ModelRole,
+            payload_byte: u8,
+            has_lp: bool,
+        }
+
+        #[derive(Clone, Debug, Default, Eq, PartialEq)]
+        struct ExpectedRecovery {
+            object_winners: BTreeSet<(u64, u32)>,
+            tmemory_undo_rollback_set: BTreeSet<(u64, u32)>,
+            tmemory_undo_rollback_count: usize,
+        }
+
+        fn expected_recovery(records: &[ModelRecord]) -> ExpectedRecovery {
+            let mut records_by_tx = BTreeMap::<u32, Vec<&ModelRecord>>::new();
+            for record in records {
+                records_by_tx.entry(record.tx).or_default().push(record);
+            }
+
+            let mut object_versions = BTreeMap::<u64, u32>::new();
+            let mut tmemory_undo_rollback_set = BTreeSet::new();
+            let mut tmemory_undo_rollback_count = 0usize;
+
+            for tx_records in records_by_tx.values() {
+                let committed = tx_records.iter().any(|record| record.has_lp);
+                if committed {
+                    for record in tx_records {
+                        if record.role != ModelRole::TObjectPub {
+                            continue;
+                        }
+                        object_versions
+                            .entry(record.logical_id)
+                            .and_modify(|current| *current = (*current).max(record.version))
+                            .or_insert(record.version);
+                    }
+                    continue;
+                }
+
+                for record in tx_records {
+                    if record.role != ModelRole::TMemoryUndo {
+                        continue;
+                    }
+                    tmemory_undo_rollback_set.insert((record.logical_id, record.version));
+                    tmemory_undo_rollback_count += 1;
+                }
+            }
+
+            ExpectedRecovery {
+                object_winners: object_versions.into_iter().collect(),
+                tmemory_undo_rollback_set,
+                tmemory_undo_rollback_count,
+            }
+        }
+
+        fn object_logical_id(object_id: u64) -> u64 {
+            pack_object_granule_id(PackedGranuleDomain::TStruct, object_id).unwrap()
+        }
+
+        fn tmemory_logical_id(granule_id: u64) -> u64 {
+            0x1000_0000_0000_0000 | (granule_id << 12) | 0x2a
+        }
+
+        fn repeated_payload(byte: u8) -> Vec<u8> {
+            vec![byte; 4]
+        }
+
+        fn build_model_records(
+            tx_count: u32,
+            object_id_count: u64,
+            tmemory_id_count: u64,
+            raw_records: Vec<(u32, bool, u64, u64, u32, u8)>,
+            committed_flags: Vec<bool>,
+        ) -> Vec<ModelRecord> {
+            let mut records = raw_records
+                .into_iter()
+                .map(
+                    |(
+                        tx_zero_based,
+                        is_object,
+                        object_slot,
+                        tmemory_slot,
+                        version,
+                        payload_byte,
+                    )| {
+                        let tx = tx_zero_based
+                            .min(tx_count.saturating_sub(1))
+                            .checked_add(1)
+                            .unwrap();
+                        let (logical_id, role) = if is_object {
+                            let object_id = (object_slot % object_id_count).checked_add(1).unwrap();
+                            (object_logical_id(object_id), ModelRole::TObjectPub)
+                        } else {
+                            let granule_id =
+                                (tmemory_slot % tmemory_id_count).checked_add(1).unwrap();
+                            (tmemory_logical_id(granule_id), ModelRole::TMemoryUndo)
+                        };
+                        ModelRecord {
+                            tx,
+                            logical_id,
+                            version,
+                            role,
+                            payload_byte,
+                            has_lp: false,
+                        }
+                    },
+                )
+                .collect::<Vec<_>>();
+
+            records.sort_by_key(|record| record.tx);
+
+            for tx in 1..=tx_count {
+                if !committed_flags
+                    .get(tx.checked_sub(1).unwrap() as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Some(last_record) = records.iter_mut().rev().find(|record| record.tx == tx) {
+                    last_record.has_lp = true;
+                }
+            }
+
+            records
+        }
+
+        fn model_history_is_supported(records: &[ModelRecord]) -> bool {
+            let mut committed_object_versions = BTreeSet::new();
+            let mut records_by_tx = BTreeMap::<u32, Vec<&ModelRecord>>::new();
+            for record in records {
+                records_by_tx.entry(record.tx).or_default().push(record);
+            }
+
+            for tx_records in records_by_tx.values() {
+                if !tx_records.iter().any(|record| record.has_lp) {
+                    continue;
+                }
+                for record in tx_records {
+                    if record.role != ModelRole::TObjectPub {
+                        continue;
+                    }
+                    if !committed_object_versions.insert((record.logical_id, record.version)) {
+                        return false;
+                    }
+                }
+            }
+
+            true
+        }
+
+        fn model_history_strategy() -> impl Strategy<Value = Vec<ModelRecord>> {
+            (1u32..=4, 1usize..=8, 1u64..=3, 1u64..=3)
+                .prop_flat_map(
+                    |(tx_count, total_records, object_id_count, tmemory_id_count)| {
+                        (
+                            Just(tx_count),
+                            Just(object_id_count),
+                            Just(tmemory_id_count),
+                            prop::collection::vec(
+                                (
+                                    0u32..tx_count,
+                                    any::<bool>(),
+                                    0u64..object_id_count,
+                                    0u64..tmemory_id_count,
+                                    1u32..=4,
+                                    any::<u8>(),
+                                ),
+                                total_records,
+                            ),
+                            prop::collection::vec(any::<bool>(), tx_count as usize),
+                        )
+                            .prop_map(
+                                |(
+                                    tx_count,
+                                    object_id_count,
+                                    tmemory_id_count,
+                                    raw_records,
+                                    committed_flags,
+                                )| {
+                                    build_model_records(
+                                        tx_count,
+                                        object_id_count,
+                                        tmemory_id_count,
+                                        raw_records,
+                                        committed_flags,
+                                    )
+                                },
+                            )
+                    },
+                )
+                .prop_filter(
+                    "committed object publications must not reuse the same logical/version pair",
+                    |records| model_history_is_supported(records),
+                )
+        }
+
+        fn pending_publication_for_model(record: &ModelRecord) -> PendingPublication {
+            let (_, object_id) = unpack_object_granule_id(record.logical_id).unwrap();
+            let payload = encode_object_record_for_test(
+                object_id,
+                record.version,
+                12,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(i32::from(record.payload_byte))]),
+            )
+            .unwrap();
+            PendingPublication::persistent_object_for_test(
+                PackedGranuleDomain::TStruct,
+                object_id,
+                record.version,
+                12,
+                &payload,
+            )
+        }
+
+        fn pending_undo_for_model(record: &ModelRecord) -> PendingGranuleUndo {
+            PendingGranuleUndo::tmemory(
+                record.logical_id,
+                record.version,
+                repeated_payload(record.payload_byte),
+            )
+        }
+
+        fn recover_model_history(
+            records: &[ModelRecord],
+        ) -> Result<crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion>
+        {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("tx-log.bin");
+            let mut log = TxDurableLog::create_file_backed(&path, 64)?;
+            let mut records_by_tx = BTreeMap::<u32, Vec<&ModelRecord>>::new();
+            for record in records {
+                records_by_tx.entry(record.tx).or_default().push(record);
+            }
+
+            for (tx, tx_records) in records_by_tx {
+                let stream_id = 100 + tx;
+                let mut final_marker = None;
+                {
+                    let mut sink = log.stream_sink(stream_id);
+                    let mut publisher = StreamPublisher::new_for_test(&mut sink, stream_id, tx);
+                    for record in tx_records {
+                        let marker = match record.role {
+                            ModelRole::TObjectPub => publisher
+                                .publish_object_publication_before_commit(
+                                    &pending_publication_for_model(record),
+                                )?,
+                            ModelRole::TMemoryUndo => publisher
+                                .publish_tmemory_undo_before_in_place_write(
+                                    &pending_undo_for_model(record),
+                                )?,
+                        };
+                        if record.has_lp {
+                            final_marker = Some(marker);
+                        }
+                    }
+                }
+                if let Some(marker) = final_marker {
+                    let mut sink = log.stream_sink(stream_id);
+                    let mut publisher = StreamPublisher::new_for_test(&mut sink, stream_id, tx);
+                    publisher.publish_commit_lp(marker)?;
+                }
+            }
+
+            drop(log);
+            TxDurableLog::recover_file_backed_for_test(&path)
+        }
+
+        fn summarize_actual_recovery(
+            recovered: &crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion,
+        ) -> ExpectedRecovery {
+            ExpectedRecovery {
+                object_winners: recovered
+                    .object_winners
+                    .iter()
+                    .map(|winner| (object_logical_id(winner.object_id), winner.version))
+                    .collect(),
+                tmemory_undo_rollback_set: recovered
+                    .tmemory_undo_rollbacks
+                    .iter()
+                    .map(|rollback| (rollback.logical_id, rollback.version))
+                    .collect(),
+                tmemory_undo_rollback_count: recovered.tmemory_undo_rollbacks.len(),
+            }
+        }
+
+        #[test]
+        fn model_recovery_committed_object_pub_wins_and_committed_undo_is_ignored() {
+            let records = [
+                ModelRecord {
+                    tx: 1,
+                    logical_id: tmemory_logical_id(1),
+                    version: 1,
+                    role: ModelRole::TMemoryUndo,
+                    payload_byte: 0x0a,
+                    has_lp: false,
+                },
+                ModelRecord {
+                    tx: 1,
+                    logical_id: object_logical_id(41),
+                    version: 2,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x0b,
+                    has_lp: true,
+                },
+            ];
+            let expected = expected_recovery(&records);
+            let recovered = recover_model_history(&records).unwrap();
+            let actual = summarize_actual_recovery(&recovered);
+
+            assert_eq!(actual.object_winners.len(), 1);
+            assert_eq!(actual.tmemory_undo_rollback_count, 0);
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn model_recovery_matches_file_backed_recovery_for_small_histories() {
+            let mut runner = TestRunner::new(Config {
+                cases: 48,
+                failure_persistence: None,
+                max_shrink_iters: 256,
+                rng_seed: RngSeed::Fixed(0x5eed_0001),
+                ..Config::default()
+            });
+
+            runner
+                .run(&model_history_strategy(), |records| {
+                    let expected = expected_recovery(&records);
+                    let recovered = recover_model_history(&records)
+                        .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                    let actual = summarize_actual_recovery(&recovered);
+                    prop_assert_eq!(actual, expected);
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
 }
