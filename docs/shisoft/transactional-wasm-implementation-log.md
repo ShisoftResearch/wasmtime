@@ -21,6 +21,46 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 5: LockBased Reference-World State-Space Tests
+
+Date: 2026-06-12
+
+Wave 5 of the model-checking roadmap now adds deterministic and generated
+`LockBased` state-space tests in
+`crates/wasmtime/src/runtime/transaction.rs`.
+
+Changes in this slice:
+
+- Added a nested `model_lock_based` test module so the Wave 5 slice is runnable
+  with `cargo test -p wasmtime --lib model_lock_based -- --format terse`.
+- Added test-only `LockModelOp`, `LockModelState`, and step/error helpers that
+  mirror the current lock manager semantics for reads, writes, release, and
+  abort without using OS threads.
+- Added a deterministic regression schedule that exercises writer preemption,
+  read-to-write upgrade, multi-granule ownership, and release cleanup against
+  the reference model.
+- Added exhaustive small-schedule coverage over the full 20-operation alphabet
+  induced by txs `1/2`, granules `0/1`, versions `0/1`, plus `Abort` and
+  `Release`. The test enumerates every schedule prefix through length `5`
+  (3,368,421 total schedules) and compares the real `LockBased` state against
+  the reference state after each prefix.
+- Added fixed-seed generated `proptest` coverage for operation sequences of
+  length `0..20`, again comparing the real state and the reference state after
+  each applied prefix.
+- Added explicit post-prefix checks for the Wave 5 invariants: one owner per
+  granule, owner-map and owner-set agreement, abort/release cleanup, failed
+  conflicting writes preserving the existing owner, failed reads against an
+  incompatible writer, and optimistic read-version mismatches.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_lock_based -- --format terse
+cargo test -p wasmtime --lib transaction -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 4: Version Selection And Corruption Recovery Tests
 
 Date: 2026-06-12

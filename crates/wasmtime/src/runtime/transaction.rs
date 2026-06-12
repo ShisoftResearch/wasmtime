@@ -1263,7 +1263,7 @@ pub(crate) trait TransactionConcurrencyControl {
     fn release_transaction(&mut self, transaction: TransactionId);
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct LockBased {
     // SHISOFT-TWASM-MOCK: versioned persistent backends are still incomplete,
     // so some non-object granules feed version `0` through the lock manager.
@@ -6606,6 +6606,558 @@ mod tests {
                     }
                     Ok(())
                 })
+                .unwrap();
+        }
+    }
+
+    mod model_lock_based {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
+
+        const MODEL_LOCK_BASED_MAX_EXHAUSTIVE_LEN: usize = 5;
+        const MODEL_LOCK_BASED_EXHAUSTIVE_SCHEDULES: usize = 3_368_421;
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum LockModelOp {
+            Read { tx: u64, granule: u8, version: u64 },
+            Write { tx: u64, granule: u8, version: u64 },
+            Abort { tx: u64 },
+            Release { tx: u64 },
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum LockModelErrorKind {
+            ReadOwnedByOther,
+            ReadVersionMismatch,
+            WriteOwnedByOther,
+            WriteVersionMismatch,
+        }
+
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        struct LockModelStep {
+            error_kind: Option<LockModelErrorKind>,
+            released_owner: Option<u64>,
+        }
+
+        #[derive(Clone, Debug, Default, Eq, PartialEq)]
+        struct LockModelState {
+            owners: BTreeMap<u8, u64>,
+            owner_sets: BTreeMap<u64, BTreeSet<u8>>,
+            read_versions: BTreeMap<(u64, u8), u64>,
+        }
+
+        impl LockModelErrorKind {
+            fn message_fragment(self) -> &'static str {
+                match self {
+                    Self::ReadOwnedByOther => {
+                        "transaction read conflict: granule is owned by another transaction"
+                    }
+                    Self::ReadVersionMismatch => {
+                        "transaction read conflict: optimistic read version changed"
+                    }
+                    Self::WriteOwnedByOther => {
+                        "transaction write conflict: granule is owned by another transaction"
+                    }
+                    Self::WriteVersionMismatch => {
+                        "transaction write conflict: optimistic read version changed"
+                    }
+                }
+            }
+        }
+
+        impl LockModelState {
+            fn apply(&mut self, op: LockModelOp) -> LockModelStep {
+                match op {
+                    LockModelOp::Read {
+                        tx,
+                        granule,
+                        version,
+                    } => self.record_read(tx, granule, version),
+                    LockModelOp::Write {
+                        tx,
+                        granule,
+                        version,
+                    } => self.acquire_write(tx, granule, version),
+                    LockModelOp::Abort { tx } | LockModelOp::Release { tx } => {
+                        self.release_transaction(tx);
+                        LockModelStep::default()
+                    }
+                }
+            }
+
+            fn record_read(&mut self, tx: u64, granule: u8, version: u64) -> LockModelStep {
+                let mut step = LockModelStep::default();
+                match self.resolve_writer_conflict(tx, granule, false) {
+                    Ok(released_owner) => step.released_owner = released_owner,
+                    Err(error_kind) => {
+                        step.error_kind = Some(error_kind);
+                        return step;
+                    }
+                }
+
+                match self.read_versions.entry((tx, granule)) {
+                    alloc::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(version);
+                    }
+                    alloc::collections::btree_map::Entry::Occupied(entry) => {
+                        if *entry.get() != version {
+                            step.error_kind = Some(LockModelErrorKind::ReadVersionMismatch);
+                        }
+                    }
+                }
+
+                step
+            }
+
+            fn acquire_write(&mut self, tx: u64, granule: u8, version: u64) -> LockModelStep {
+                let mut step = LockModelStep::default();
+                match self.resolve_writer_conflict(tx, granule, true) {
+                    Ok(released_owner) => step.released_owner = released_owner,
+                    Err(error_kind) => {
+                        step.error_kind = Some(error_kind);
+                        return step;
+                    }
+                }
+
+                if self
+                    .read_versions
+                    .get(&(tx, granule))
+                    .is_some_and(|current| *current != version)
+                {
+                    step.error_kind = Some(LockModelErrorKind::WriteVersionMismatch);
+                    return step;
+                }
+
+                if let Some(previous_owner) = self.owners.insert(granule, tx) {
+                    if previous_owner != tx {
+                        self.owner_sets
+                            .get_mut(&previous_owner)
+                            .unwrap()
+                            .remove(&granule);
+                        if self
+                            .owner_sets
+                            .get(&previous_owner)
+                            .is_some_and(BTreeSet::is_empty)
+                        {
+                            self.owner_sets.remove(&previous_owner);
+                        }
+                    }
+                }
+                self.owner_sets.entry(tx).or_default().insert(granule);
+                step
+            }
+
+            fn resolve_writer_conflict(
+                &mut self,
+                tx: u64,
+                granule: u8,
+                is_write: bool,
+            ) -> core::result::Result<Option<u64>, LockModelErrorKind> {
+                let Some(owner) = self.owners.get(&granule).copied() else {
+                    return Ok(None);
+                };
+                if owner == tx {
+                    return Ok(None);
+                }
+                if tx < owner {
+                    self.release_transaction(owner);
+                    return Ok(Some(owner));
+                }
+                Err(if is_write {
+                    LockModelErrorKind::WriteOwnedByOther
+                } else {
+                    LockModelErrorKind::ReadOwnedByOther
+                })
+            }
+
+            fn release_transaction(&mut self, tx: u64) {
+                if let Some(granules) = self.owner_sets.remove(&tx) {
+                    for granule in granules {
+                        self.owners.remove(&granule);
+                    }
+                }
+                self.read_versions.retain(|(reader, _), _| *reader != tx);
+            }
+
+            fn assert_internal_invariants(&self) -> Result<()> {
+                let owner_count: usize = self.owner_sets.values().map(BTreeSet::len).sum();
+                ensure!(
+                    owner_count == self.owners.len(),
+                    "owner-set size {owner_count} does not match owner map size {}",
+                    self.owners.len()
+                );
+                for (&granule, &owner) in &self.owners {
+                    ensure!(
+                        self.owner_sets
+                            .get(&owner)
+                            .is_some_and(|granules| granules.contains(&granule)),
+                        "owner map says tx {owner} owns granule {granule}, but owner set disagrees"
+                    );
+                }
+                for (&tx, granules) in &self.owner_sets {
+                    ensure!(
+                        !granules.is_empty(),
+                        "owner set for tx {tx} should not be empty"
+                    );
+                    for &granule in granules {
+                        ensure!(
+                            self.owners.get(&granule) == Some(&tx),
+                            "owner set says tx {tx} owns granule {granule}, but owner map disagrees"
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        fn model_tx(tx: u64) -> TransactionId {
+            TransactionId::from_raw(tx)
+        }
+
+        fn model_granule(granule: u8) -> GranuleId {
+            GranuleId::TMemory {
+                instance: Some(1),
+                memory_index: 0,
+                granule_index: u64::from(granule),
+            }
+        }
+
+        fn decode_model_granule(granule: GranuleId) -> Result<u8> {
+            let GranuleId::TMemory {
+                instance: Some(1),
+                memory_index: 0,
+                granule_index,
+            } = granule
+            else {
+                bail!("unexpected lock model granule in snapshot: {granule:?}");
+            };
+            let granule =
+                u8::try_from(granule_index).context("lock model granule index does not fit u8")?;
+            ensure!(
+                granule <= 1,
+                "lock model granule index {granule} is outside the Wave 5 domain"
+            );
+            Ok(granule)
+        }
+
+        fn snapshot_lock_state(locks: &LockBased) -> Result<LockModelState> {
+            let mut state = LockModelState::default();
+            for (&granule, &owner) in &locks.owners {
+                let granule = decode_model_granule(granule)?;
+                let owner = owner.as_raw();
+                state.owners.insert(granule, owner);
+                state.owner_sets.entry(owner).or_default().insert(granule);
+            }
+            for (&(reader, granule), &version) in &locks.read_versions {
+                let reader = reader.as_raw();
+                let granule = decode_model_granule(granule)?;
+                state.read_versions.insert((reader, granule), version);
+            }
+            state.assert_internal_invariants()?;
+            Ok(state)
+        }
+
+        fn apply_lock_model_op(locks: &mut LockBased, op: LockModelOp) -> Option<String> {
+            match op {
+                LockModelOp::Read {
+                    tx,
+                    granule,
+                    version,
+                } => locks
+                    .record_read(model_tx(tx), model_granule(granule), version)
+                    .err()
+                    .map(|error| error.to_string()),
+                LockModelOp::Write {
+                    tx,
+                    granule,
+                    version,
+                } => locks
+                    .acquire_write(model_tx(tx), model_granule(granule), version)
+                    .err()
+                    .map(|error| error.to_string()),
+                LockModelOp::Abort { tx } => {
+                    locks.abort_for_test(model_tx(tx));
+                    None
+                }
+                LockModelOp::Release { tx } => {
+                    locks.release_transaction(model_tx(tx));
+                    None
+                }
+            }
+        }
+
+        fn assert_lock_step(
+            prefix: &[LockModelOp],
+            op: LockModelOp,
+            before: &LockModelState,
+            after: &LockModelState,
+            step: LockModelStep,
+            actual_error: Option<&str>,
+        ) -> Result<()> {
+            if let Some(error_kind) = step.error_kind {
+                let actual_error = actual_error
+                    .context("real LockBased op succeeded when model expected error")?;
+                ensure!(
+                    actual_error.contains(error_kind.message_fragment()),
+                    "schedule prefix {prefix:?} expected error {:?} containing {:?}, got {:?}",
+                    error_kind,
+                    error_kind.message_fragment(),
+                    actual_error
+                );
+            } else {
+                ensure!(
+                    actual_error.is_none(),
+                    "schedule prefix {prefix:?} unexpectedly failed with {:?}",
+                    actual_error
+                );
+            }
+
+            if let Some(released_owner) = step.released_owner {
+                ensure!(
+                    !after.owner_sets.contains_key(&released_owner),
+                    "schedule prefix {prefix:?} should release tx {released_owner} ownership"
+                );
+                ensure!(
+                    after.owners.values().all(|owner| *owner != released_owner),
+                    "schedule prefix {prefix:?} still shows tx {released_owner} in owner map"
+                );
+                ensure!(
+                    after
+                        .read_versions
+                        .keys()
+                        .all(|(reader, _)| *reader != released_owner),
+                    "schedule prefix {prefix:?} still shows tx {released_owner} in read set"
+                );
+            }
+
+            match op {
+                LockModelOp::Abort { tx } | LockModelOp::Release { tx } => {
+                    ensure!(
+                        !after.owner_sets.contains_key(&tx),
+                        "schedule prefix {prefix:?} should clear owner set for tx {tx}"
+                    );
+                    ensure!(
+                        after.owners.values().all(|owner| *owner != tx),
+                        "schedule prefix {prefix:?} should clear owner map entries for tx {tx}"
+                    );
+                    ensure!(
+                        after.read_versions.keys().all(|(reader, _)| *reader != tx),
+                        "schedule prefix {prefix:?} should clear read versions for tx {tx}"
+                    );
+                }
+                LockModelOp::Read { tx, granule, .. } => {
+                    if step.error_kind == Some(LockModelErrorKind::ReadOwnedByOther) {
+                        ensure!(
+                            after.owners.get(&granule) == before.owners.get(&granule),
+                            "schedule prefix {prefix:?} should not change owner on failed read conflict"
+                        );
+                    }
+                    if step.error_kind == Some(LockModelErrorKind::ReadVersionMismatch) {
+                        ensure!(
+                            before.read_versions.get(&(tx, granule))
+                                == after.read_versions.get(&(tx, granule)),
+                            "schedule prefix {prefix:?} should preserve the original read version on mismatch"
+                        );
+                    }
+                }
+                LockModelOp::Write { granule, .. } => {
+                    if step.error_kind == Some(LockModelErrorKind::WriteOwnedByOther) {
+                        ensure!(
+                            after.owners.get(&granule) == before.owners.get(&granule),
+                            "schedule prefix {prefix:?} should not steal ownership on failed write conflict"
+                        );
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        fn run_lock_model_schedule(schedule: &[LockModelOp]) -> Result<LockModelState> {
+            let mut locks = LockBased::default();
+            let mut model = LockModelState::default();
+            let mut prefix = Vec::with_capacity(schedule.len());
+
+            let actual_initial = snapshot_lock_state(&locks)?;
+            ensure!(
+                actual_initial == model,
+                "initial lock state diverged before running any schedule"
+            );
+
+            for &op in schedule {
+                prefix.push(op);
+                let before = model.clone();
+                let step = model.apply(op);
+                let actual_error = apply_lock_model_op(&mut locks, op);
+                let actual = snapshot_lock_state(&locks)?;
+                model.assert_internal_invariants()?;
+                ensure!(
+                    actual == model,
+                    "schedule prefix {prefix:?} diverged\nexpected: {model:?}\nactual:   {actual:?}"
+                );
+                assert_lock_step(&prefix, op, &before, &model, step, actual_error.as_deref())?;
+            }
+
+            Ok(model)
+        }
+
+        fn exhaustive_lock_model_alphabet() -> Vec<LockModelOp> {
+            let mut ops = Vec::new();
+            for tx in [1, 2] {
+                for granule in [0, 1] {
+                    for version in [0, 1] {
+                        ops.push(LockModelOp::Read {
+                            tx,
+                            granule,
+                            version,
+                        });
+                        ops.push(LockModelOp::Write {
+                            tx,
+                            granule,
+                            version,
+                        });
+                    }
+                }
+                ops.push(LockModelOp::Abort { tx });
+                ops.push(LockModelOp::Release { tx });
+            }
+            ops
+        }
+
+        fn run_exhaustive_lock_model_schedules(max_len: usize) -> Result<usize> {
+            fn visit(
+                prefix: &mut Vec<LockModelOp>,
+                real: &LockBased,
+                model: &LockModelState,
+                alphabet: &[LockModelOp],
+                remaining: usize,
+            ) -> Result<usize> {
+                let mut schedule_count = 1;
+                if remaining == 0 {
+                    return Ok(schedule_count);
+                }
+
+                for &op in alphabet {
+                    prefix.push(op);
+                    let mut next_real = real.clone();
+                    let mut next_model = model.clone();
+                    let step = next_model.apply(op);
+                    let actual_error = apply_lock_model_op(&mut next_real, op);
+                    let actual = snapshot_lock_state(&next_real)?;
+                    next_model.assert_internal_invariants()?;
+                    ensure!(
+                        actual == next_model,
+                        "schedule prefix {prefix:?} diverged\nexpected: {next_model:?}\nactual:   {actual:?}"
+                    );
+                    let before = model.clone();
+                    assert_lock_step(
+                        prefix,
+                        op,
+                        &before,
+                        &next_model,
+                        step,
+                        actual_error.as_deref(),
+                    )?;
+                    schedule_count +=
+                        visit(prefix, &next_real, &next_model, alphabet, remaining - 1)?;
+                    prefix.pop();
+                }
+
+                Ok(schedule_count)
+            }
+
+            let alphabet = exhaustive_lock_model_alphabet();
+            let mut prefix = Vec::new();
+            let real = LockBased::default();
+            let model = LockModelState::default();
+            visit(&mut prefix, &real, &model, &alphabet, max_len)
+        }
+
+        fn lock_model_op_strategy() -> impl Strategy<Value = LockModelOp> {
+            prop_oneof![
+                (1u64..=2, 0u8..=1, 0u64..=1).prop_map(|(tx, granule, version)| {
+                    LockModelOp::Read {
+                        tx,
+                        granule,
+                        version,
+                    }
+                }),
+                (1u64..=2, 0u8..=1, 0u64..=1).prop_map(|(tx, granule, version)| {
+                    LockModelOp::Write {
+                        tx,
+                        granule,
+                        version,
+                    }
+                }),
+                (1u64..=2).prop_map(|tx| LockModelOp::Abort { tx }),
+                (1u64..=2).prop_map(|tx| LockModelOp::Release { tx }),
+            ]
+        }
+
+        #[test]
+        fn model_lock_based_deterministic_schedule_matches_reference_world() {
+            let schedule = vec![
+                LockModelOp::Write {
+                    tx: 2,
+                    granule: 0,
+                    version: 0,
+                },
+                LockModelOp::Read {
+                    tx: 1,
+                    granule: 0,
+                    version: 0,
+                },
+                LockModelOp::Write {
+                    tx: 1,
+                    granule: 0,
+                    version: 0,
+                },
+                LockModelOp::Write {
+                    tx: 1,
+                    granule: 1,
+                    version: 1,
+                },
+                LockModelOp::Release { tx: 1 },
+            ];
+
+            let outcome = run_lock_model_schedule(&schedule).unwrap();
+
+            assert!(outcome.owners.is_empty());
+            assert!(outcome.owner_sets.is_empty());
+            assert!(outcome.read_versions.is_empty());
+        }
+
+        #[test]
+        fn model_lock_based_exhaustive_small_schedules_match_reference_world() {
+            // Wave 5 keeps the full 20-op alphabet for txs 1/2, granules 0/1, and
+            // versions 0/1. Exhaustive enumeration through length 5 covers
+            // 3,368,421 schedules, which is still tractable without OS threads.
+            let schedule_count =
+                run_exhaustive_lock_model_schedules(MODEL_LOCK_BASED_MAX_EXHAUSTIVE_LEN).unwrap();
+
+            assert_eq!(schedule_count, MODEL_LOCK_BASED_EXHAUSTIVE_SCHEDULES);
+        }
+
+        #[test]
+        fn model_lock_based_generated_schedules_match_reference_world() {
+            let mut runner = TestRunner::new(Config {
+                cases: 128,
+                failure_persistence: None,
+                max_shrink_iters: 256,
+                rng_seed: RngSeed::Fixed(0x5eed_0005),
+                ..Config::default()
+            });
+
+            runner
+                .run(
+                    &prop::collection::vec(lock_model_op_strategy(), 0..=20),
+                    |schedule| {
+                        run_lock_model_schedule(&schedule)
+                            .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                        Ok(())
+                    },
+                )
                 .unwrap();
         }
     }
