@@ -828,6 +828,36 @@ There is no automatic retry in this phase. Conflict policy can be represented
 in configuration, but the implemented default is deterministic id-priority
 locking with no retry.
 
+## Future Loom Workstream
+
+This section is documentation-only for now. The active validation strategy for
+`LockBased` remains bounded deterministic state-space/model tests over
+`GranuleId` ownership until the future shared-concurrency implementation is in
+place and the runtime state is ready for `loom`.
+
+Do not add `loom` tests for `LockBased` until all of the following are true:
+
+- lock ownership is stored in thread-safe shared runtime structures rather than
+  only in single-threaded store-local state
+- tests can exercise lock-table behavior directly without invoking Wasmtime
+  compilation
+- transaction ids are deterministic per simulated thread so `loom` schedules do
+  not hide id-priority behavior
+- tests do not depend on sleeps, wall-clock timing, or OS scheduler behavior
+
+Once those entry criteria are met, the first `loom` scenario should stay
+minimal and target the `LockBased` write-ownership rule directly:
+
+1. simulated thread 1 acquires write ownership on granule A
+2. simulated thread 2 attempts write ownership on the same granule A
+3. the final state leaves exactly one write owner for that `GranuleId`
+4. if the losing or aborted transaction had partially acquired independent
+   granules before the conflict resolved, abort releases those independent
+   granules as well
+
+Until then, deterministic model tests remain the required coverage for
+conflict rules, abort release, and `GranuleId` ownership transitions.
+
 ## Object Table Direction
 
 The current executable core uses a volatile object table/index. This is now the

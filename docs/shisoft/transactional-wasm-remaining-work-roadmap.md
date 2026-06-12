@@ -856,6 +856,29 @@ git add crates/wast/src/spectest.rs crates/wasmtime/src/runtime/transaction.rs c
 git commit -m "Run transaction conflict tests on LockBased state"
 ```
 
+## Future Loom Workstream
+
+This is documentation-only for now. The active strategy for `LockBased`
+correctness remains the current bounded deterministic state-space/model tests
+and focused conflict WAST coverage. Do not add `loom` coverage until the future
+shared-concurrency implementation satisfies every entry criterion below:
+
+- lock ownership is stored in thread-safe shared runtime structures
+- tests can run lock table behavior directly without invoking Wasmtime
+  compilation
+- transaction ids are deterministic per simulated thread
+- tests do not depend on sleeps, wall-clock timing, or OS scheduler behavior
+
+The first future `loom` scenario should be:
+
+1. simulated thread 1 acquires write ownership on granule A
+2. simulated thread 2 attempts write ownership on granule A
+3. exactly one owner remains for that `GranuleId`
+4. an aborted transaction releases any partially acquired independent granules
+
+Until those criteria are met, extend the deterministic model tests instead of
+adding scheduler-dependent concurrency tests.
+
 ## Wave 8: Parser And Harness Mock Removal
 
 **Purpose:** remove the normalization adapter and remaining parser scaffolds
