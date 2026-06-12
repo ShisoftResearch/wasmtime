@@ -21,6 +21,41 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 9: ObjectTable Rebuild Model Tests
+
+Date: 2026-06-12
+
+Wave 9 of the model-checking roadmap now adds an object-table rebuild slice in
+`crates/wasmtime/src/runtime/transaction.rs`.
+
+Changes in this slice:
+
+- Added a nested `model_object_rebuild` unit-test module so the Wave 9 slice is
+  runnable with
+  `cargo test -p wasmtime --lib model_object_rebuild -- --format terse`.
+- Added a test-only `ModelObjectRecord` reference shape that tracks object id,
+  record version, object kind, one small payload field, and commit visibility
+  independently of live transaction execution.
+- Added deterministic rebuild coverage proving that the highest committed
+  version wins per object id, loose-end object publications stay invisible,
+  rebuilt persistent objects preserve their recovered `ObjectId` as runtime
+  identity, and corrupt payload/header mismatches are rejected during rebuild.
+- Added fixed-seed generated rebuild histories over small struct/array object
+  records and compared rebuilt `ObjectTable` state against the reference model's
+  highest committed version per `ObjectId`, including payload bytes, kind,
+  logical id, publication version, persistence bit, and live-slot count.
+- Kept the implementation localized to test-only helpers in
+  `transaction.rs`; no production object semantics changed for this slice.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_object_rebuild -- --format terse
+cargo test -p wasmtime --lib transaction -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 8: Durable Backend Conformance Harness
 
 Date: 2026-06-12
