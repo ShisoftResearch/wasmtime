@@ -2934,6 +2934,10 @@ mod tests {
         let mut created = TMemory::new(create_config, 1, Some(1)).unwrap();
         created.commit_range(64, &[1, 2, 3, 4]).unwrap();
         drop(created);
+        assert_eq!(
+            std::fs::metadata(&tmemory_path).unwrap().len(),
+            crate::vm::block_region::BLOCK_SIZE as u64
+        );
 
         store
             .transaction_open_file_backed_storage_for_test(tmemory_path.clone(), tx_log_path)

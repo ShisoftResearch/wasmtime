@@ -937,7 +937,7 @@ impl TMemoryBackendStorage for NVMemory {
 /// Filesystem-backed transactional storage backed by a file-mapped block region.
 #[derive(Debug)]
 pub(crate) struct FileBackedMemory {
-    mapping: block_region::FileBackedMapping,
+    region: TMemoryRegion,
     file_backing: TMemoryFileBacking,
     granules: Vec<TMemoryGranuleInfo>,
     byte_len: usize,
@@ -960,28 +960,11 @@ impl FileBackedMemory {
             None => byte_len,
         };
         let granule_capacity = granules_for_bytes(byte_capacity);
-        if let TMemoryFileBacking::ExistingPath(path) = &file_backing {
-            let existing_len = usize::try_from(
-                std::fs::metadata(path)
-                    .with_context(|| {
-                        format!(
-                            "failed to stat existing file-backed tmemory {}",
-                            path.display()
-                        )
-                    })?
-                    .len(),
-            )
-            .context("existing file-backed tmemory length overflow")?;
-            ensure!(
-                existing_len == byte_capacity,
-                "existing file-backed tmemory length/capacity mismatch: expected {byte_capacity} bytes, found {existing_len}"
-            );
-        }
 
         Ok(Self {
-            mapping: block_region::FileBackedMapping::new(
-                file_backed_region_mode(&file_backing),
+            region: TMemoryRegion::new_file_backed(
                 byte_capacity,
+                file_backed_region_mode(&file_backing),
             )?,
             file_backing,
             granules: vec![TMemoryGranuleInfo::default(); granule_capacity],
@@ -1002,7 +985,7 @@ impl FileBackedMemory {
     pub(crate) fn read(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
         ensure!(range.start <= range.end, "tmemory read invalid range");
         ensure!(range.end <= self.byte_len, "tmemory read out of bounds");
-        self.mapping.read(range.start, range.end - range.start)
+        self.region.read(range.start, range.end - range.start)
     }
 
     pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
@@ -1045,7 +1028,8 @@ impl FileBackedMemory {
             return Ok(());
         }
 
-        self.mapping.remap_len(new_byte_capacity)?;
+        self.region
+            .reserve_file_backed_capacity(new_byte_capacity)?;
 
         let new_granule_capacity = granules_for_bytes(new_byte_capacity);
         self.granules
@@ -1074,17 +1058,17 @@ impl FileBackedMemory {
 
     #[cfg(test)]
     pub(crate) fn block_region_block_size_for_test(&self) -> usize {
-        block_region::BLOCK_SIZE
+        self.region.block_size_for_test()
     }
 
     #[cfg(test)]
     pub(crate) fn immix_line_size_for_test(&self) -> usize {
-        block_region::IMMIX_LINE_SIZE
+        self.region.immix_line_size_for_test()
     }
 
     #[cfg(test)]
     pub(crate) fn line_mark_count_for_test(&self) -> usize {
-        self.mapping.len().div_ceil(block_region::IMMIX_LINE_SIZE)
+        self.region.line_mark_count_for_test()
     }
 }
 
@@ -1129,9 +1113,9 @@ impl TMemoryBackendStorage for FileBackedMemory {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.mapping.write(addr, bytes)?;
-        self.mapping.flush(addr, bytes.len())?;
-        self.mapping.fence_all()
+        self.region.write(addr, bytes)?;
+        self.region.flush(addr, bytes.len())?;
+        self.region.fence()
     }
 
     fn can_grow_to_pages(&self, new_pages: u64) -> bool {
@@ -1739,7 +1723,10 @@ mod tests {
     fn file_backed_existing_tmemory_path_rejects_length_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("existing-mismatch.tmemory");
-        std::fs::File::create(&path).unwrap().set_len(1024).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(WASM_PAGE_SIZE as u64)
+            .unwrap();
 
         let config = TransactionConfig::with_file_backed_tmemory_existing_path(path).unwrap();
         let error = TMemory::new(config, 1, Some(1)).unwrap_err().to_string();

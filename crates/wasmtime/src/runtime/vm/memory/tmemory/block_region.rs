@@ -62,7 +62,9 @@ impl FileBackedMapping {
         match mode {
             FileBackedRegionMode::Temp => Self::new_temp(len),
             FileBackedRegionMode::Path(path) => Self::new_path(path, len),
-            FileBackedRegionMode::OpenExistingPath(path) => Self::open_existing_path(path),
+            FileBackedRegionMode::OpenExistingPath(path) => {
+                Self::open_existing_path_with_len(path, len)
+            }
         }
     }
 
@@ -76,6 +78,16 @@ impl FileBackedMapping {
 
     pub(crate) fn open_existing_path(path: PathBuf) -> Result<Self> {
         open_existing_file_backed_mapping(path)
+    }
+
+    fn open_existing_path_with_len(path: PathBuf, len: usize) -> Result<Self> {
+        let mapping = Self::open_existing_path(path)?;
+        ensure!(
+            mapping.len() == len,
+            "existing file-backed tmemory length/capacity mismatch: expected {len} bytes, found {}",
+            mapping.len()
+        );
+        Ok(mapping)
     }
 
     fn new_path_with_unlink(path: PathBuf, len: usize, unlink_on_drop: bool) -> Result<Self> {
