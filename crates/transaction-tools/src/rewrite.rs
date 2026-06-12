@@ -20,8 +20,7 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
 }
 
 pub fn main() -> anyhow::Result<()> {
-    println!("twasm-rust rewrite support is not initialized until the CLI task");
-    Ok(())
+    crate::cli::main()
 }
 
 #[cfg(test)]
