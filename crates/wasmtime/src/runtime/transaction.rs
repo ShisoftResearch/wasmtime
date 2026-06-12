@@ -6746,6 +6746,13 @@ mod tests {
             observed.lock().unwrap().clone()
         }
 
+        fn assert_active_transaction_id(id: Option<u64>) {
+            let Some(id) = id else {
+                panic!("expected an active transaction id to be observed");
+            };
+            assert!(id > 0, "expected a nonzero active transaction id, got {id}");
+        }
+
         fn observing_import(
             store: &mut crate::Store<()>,
             observed: Arc<Mutex<Vec<Option<u64>>>>,
@@ -6863,9 +6870,8 @@ mod tests {
 
             let observed = observed_transaction_ids(&observed);
             assert_eq!(observed.len(), 2);
-            assert!(observed[0].is_some());
-            assert!(observed[1].is_some());
-            assert_ne!(observed[0], observed[1]);
+            assert_active_transaction_id(observed[0]);
+            assert_active_transaction_id(observed[1]);
         }
 
         #[test]
@@ -6913,9 +6919,8 @@ mod tests {
 
             let observed = observed_transaction_ids(&observed);
             assert_eq!(observed.len(), 2);
-            assert!(observed[0].is_some());
-            assert!(observed[1].is_some());
-            assert_ne!(observed[0], observed[1]);
+            assert_active_transaction_id(observed[0]);
+            assert_active_transaction_id(observed[1]);
         }
 
         #[test]
