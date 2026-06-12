@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
-use wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test;
+use wasmtime::_internal::transaction_persistence::{
+    fail_next_commit_before_lp_for_test, recover_file_backed_tmemory_for_test,
+};
 use wasmtime::{Config, Engine, Result};
 use wasmtime_wast::{Async, WastContext};
 
@@ -86,6 +88,9 @@ fn transaction_wast_loose_end_tmemory_write_is_recovered() -> Result<()> {
         true,
     )?;
 
+    let tmemory_bytes = std::fs::read(&tmemory_path)?;
+    assert_eq!(&tmemory_bytes[64..68], &[0x88, 0x77, 0x66, 0x55]);
+
     recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
 
     run_wast_phase(
@@ -117,7 +122,7 @@ fn run_wast_phase(
     tmemory_path: &Path,
     tx_log_path: &Path,
     create: bool,
-    fail_next_commit_before_lp_for_test: bool,
+    arm_fail_next_commit_before_lp_for_test: bool,
 ) -> Result<()> {
     let tmemory_path = tmemory_path.to_path_buf();
     let tx_log_path = tx_log_path.to_path_buf();
@@ -137,8 +142,8 @@ fn run_wast_phase(
         result.unwrap_or_else(|error| {
             panic!("failed to configure file-backed transaction storage: {error:#}");
         });
-        if fail_next_commit_before_lp_for_test {
-            store.transaction_fail_next_commit_before_lp_for_test();
+        if arm_fail_next_commit_before_lp_for_test {
+            fail_next_commit_before_lp_for_test(store);
         }
     });
     context.run_file(wast_path)

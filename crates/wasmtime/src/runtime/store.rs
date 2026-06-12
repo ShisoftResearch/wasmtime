@@ -924,13 +924,6 @@ impl<T> Store<T> {
             .transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
     }
 
-    #[doc(hidden)]
-    #[cfg(feature = "transaction")]
-    pub fn transaction_fail_next_commit_before_lp_for_test(&mut self) {
-        self.inner
-            .transaction_fail_next_commit_before_lp_for_test();
-    }
-
     /// Access the underlying `T` data owned by this `Store`.
     #[inline]
     pub fn data(&self) -> &T {
@@ -1698,12 +1691,6 @@ impl StoreOpaque {
             .open_file_backed_durable_log(&tx_log_path)?;
         self.transaction_config = config;
         Ok(())
-    }
-
-    #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_fail_next_commit_before_lp_for_test(&mut self) {
-        self.transaction_state
-            .fail_next_commit_before_lp_for_test();
     }
 
     #[allow(dead_code)]

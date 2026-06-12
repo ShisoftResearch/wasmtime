@@ -562,6 +562,12 @@ pub mod _internal {
             reopen_and_recover_file_backed_region,
         };
 
+        pub fn fail_next_commit_before_lp_for_test<T>(store: &mut crate::Store<T>) {
+            store
+                .transaction_state_mut()
+                .fail_next_commit_before_lp_for_test();
+        }
+
         pub fn recover_file_backed_tmemory_for_test(
             tx_log_path: &std::path::Path,
             tmemory_path: &std::path::Path,
