@@ -1,5 +1,8 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+#[allow(unused_extern_crates)]
+extern crate self as wasmtime_transaction_sdk;
+
 #[cfg(feature = "macros")]
 pub use wasmtime_transaction_sdk_macros::{Persist, transaction as transaction_attr};
 
