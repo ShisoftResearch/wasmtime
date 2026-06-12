@@ -1,3 +1,5 @@
+#![cfg(all(feature = "transaction", unix))]
+
 use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
@@ -5,7 +7,6 @@ use wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_fo
 use wasmtime::{Config, Engine, Result};
 use wasmtime_wast::{Async, WastContext};
 
-#[cfg(all(feature = "transaction", unix))]
 #[test]
 fn transaction_wast_commit_survives_file_backed_recovery() -> Result<()> {
     let dir = tempdir()?;
@@ -35,7 +36,35 @@ fn transaction_wast_commit_survives_file_backed_recovery() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "transaction", unix))]
+#[test]
+fn transaction_wast_trap_does_not_recover_staged_tmemory_write() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+
+    let engine = transaction_wast_engine()?;
+
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-abort-before.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        true,
+    )?;
+
+    recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
+
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-abort-after.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        false,
+    )?;
+
+    Ok(())
+}
+
 fn transaction_wast_engine() -> Result<Engine> {
     let mut config = Config::new();
     config
@@ -47,7 +76,6 @@ fn transaction_wast_engine() -> Result<Engine> {
     Engine::new(&config)
 }
 
-#[cfg(all(feature = "transaction", unix))]
 fn run_wast_phase(
     engine: &Engine,
     wast_path: &Path,
@@ -70,12 +98,13 @@ fn run_wast_phase(
                 tx_log_path.clone(),
             )
         };
-        result.expect("failed to configure file-backed transaction storage");
+        result.unwrap_or_else(|error| {
+            panic!("failed to configure file-backed transaction storage: {error:#}");
+        });
     });
     context.run_file(wast_path)
 }
 
-#[cfg(all(feature = "transaction", unix))]
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/transaction-persistence")
