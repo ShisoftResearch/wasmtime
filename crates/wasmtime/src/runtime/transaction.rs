@@ -1271,6 +1271,36 @@ pub(crate) struct LockBased {
     read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LockBasedConflictKind {
+    ReadOwnedByOther,
+    ReadVersionMismatch,
+    WriteOwnedByOther,
+    WriteVersionMismatch,
+}
+
+impl LockBasedConflictKind {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ReadOwnedByOther => {
+                "transaction read conflict: granule is owned by another transaction"
+            }
+            Self::ReadVersionMismatch => {
+                "transaction read conflict: optimistic read version changed"
+            }
+            Self::WriteOwnedByOther => {
+                "transaction write conflict: granule is owned by another transaction"
+            }
+            Self::WriteVersionMismatch => {
+                "transaction write conflict: optimistic read version changed"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+use self::LockBasedConflictKind as LockBasedConflictKindForTest;
+
 impl LockBased {
     pub(crate) fn record_read(
         &mut self,
@@ -1278,21 +1308,7 @@ impl LockBased {
         granule: GranuleId,
         version: u64,
     ) -> Result<Option<TransactionId>> {
-        let aborted = self.resolve_writer_conflict(transaction, granule, "read")?;
-
-        match self.read_versions.entry((transaction, granule)) {
-            alloc::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(version);
-            }
-            alloc::collections::btree_map::Entry::Occupied(entry) => {
-                ensure!(
-                    *entry.get() == version,
-                    "transaction read conflict: optimistic read version changed"
-                );
-            }
-        }
-
-        Ok(aborted)
+        Self::map_conflict_result(self.record_read_typed(transaction, granule, version))
     }
 
     pub(crate) fn acquire_write(
@@ -1301,17 +1317,7 @@ impl LockBased {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
-        let aborted = self.resolve_writer_conflict(transaction, granule, "write")?;
-        if self
-            .read_versions
-            .get(&(transaction, granule))
-            .is_some_and(|version| *version != current_version)
-        {
-            bail!("transaction write conflict: optimistic read version changed");
-        }
-
-        self.owners.insert(granule, transaction);
-        Ok(aborted)
+        Self::map_conflict_result(self.acquire_write_typed(transaction, granule, current_version))
     }
 
     pub(crate) fn validate_read(
@@ -1320,22 +1326,7 @@ impl LockBased {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        if self
-            .owners
-            .get(&granule)
-            .is_some_and(|owner| *owner != transaction)
-        {
-            bail!("transaction read conflict: granule is owned by another transaction");
-        }
-        if self
-            .read_versions
-            .get(&(transaction, granule))
-            .is_some_and(|version| *version != current_version)
-        {
-            bail!("transaction read conflict: optimistic read version changed");
-        }
-
-        Ok(())
+        Self::map_conflict_result(self.validate_read_typed(transaction, granule, current_version))
     }
 
     pub(crate) fn validate_transaction_reads<F>(
@@ -1374,12 +1365,84 @@ impl LockBased {
             .retain(|(reader, _), _| *reader != transaction);
     }
 
-    fn resolve_writer_conflict(
+    fn map_conflict_result<T>(result: core::result::Result<T, LockBasedConflictKind>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(kind) => bail!(kind.message()),
+        }
+    }
+
+    fn record_read_typed(
         &mut self,
         transaction: TransactionId,
         granule: GranuleId,
-        access: &str,
-    ) -> Result<Option<TransactionId>> {
+        version: u64,
+    ) -> core::result::Result<Option<TransactionId>, LockBasedConflictKind> {
+        let aborted = self.resolve_writer_conflict_typed(transaction, granule, false)?;
+
+        match self.read_versions.entry((transaction, granule)) {
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(version);
+            }
+            alloc::collections::btree_map::Entry::Occupied(entry) => {
+                if *entry.get() != version {
+                    return Err(LockBasedConflictKind::ReadVersionMismatch);
+                }
+            }
+        }
+
+        Ok(aborted)
+    }
+
+    fn acquire_write_typed(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> core::result::Result<Option<TransactionId>, LockBasedConflictKind> {
+        let aborted = self.resolve_writer_conflict_typed(transaction, granule, true)?;
+        if self
+            .read_versions
+            .get(&(transaction, granule))
+            .is_some_and(|version| *version != current_version)
+        {
+            return Err(LockBasedConflictKind::WriteVersionMismatch);
+        }
+
+        self.owners.insert(granule, transaction);
+        Ok(aborted)
+    }
+
+    fn validate_read_typed(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> core::result::Result<(), LockBasedConflictKind> {
+        if self
+            .owners
+            .get(&granule)
+            .is_some_and(|owner| *owner != transaction)
+        {
+            return Err(LockBasedConflictKind::ReadOwnedByOther);
+        }
+        if self
+            .read_versions
+            .get(&(transaction, granule))
+            .is_some_and(|version| *version != current_version)
+        {
+            return Err(LockBasedConflictKind::ReadVersionMismatch);
+        }
+
+        Ok(())
+    }
+
+    fn resolve_writer_conflict_typed(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        is_write: bool,
+    ) -> core::result::Result<Option<TransactionId>, LockBasedConflictKind> {
         let Some(owner) = self.owners.get(&granule).copied() else {
             return Ok(None);
         };
@@ -1390,7 +1453,11 @@ impl LockBased {
             self.release_transaction(owner);
             return Ok(Some(owner));
         }
-        bail!("transaction {access} conflict: granule is owned by another transaction");
+        Err(if is_write {
+            LockBasedConflictKind::WriteOwnedByOther
+        } else {
+            LockBasedConflictKind::ReadOwnedByOther
+        })
     }
 }
 
@@ -1472,6 +1539,35 @@ impl LockBased {
         current_version: u64,
     ) -> Result<()> {
         self.validate_read(transaction, granule, current_version)
+    }
+
+    fn record_read_result_for_test(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        version: u64,
+    ) -> core::result::Result<(), LockBasedConflictKindForTest> {
+        self.record_read_typed(transaction, granule, version)
+            .map(|_| ())
+    }
+
+    fn acquire_write_result_for_test(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> core::result::Result<(), LockBasedConflictKindForTest> {
+        self.acquire_write_typed(transaction, granule, current_version)
+            .map(|_| ())
+    }
+
+    fn validate_read_result_for_test(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> core::result::Result<(), LockBasedConflictKindForTest> {
+        self.validate_read_typed(transaction, granule, current_version)
     }
 
     fn abort_for_test(&mut self, transaction: TransactionId) {
@@ -3676,30 +3772,6 @@ pub(crate) fn execute_research_transaction_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ActualLockErrorKind {
-        ReadOwnedByOther,
-        ReadVersionMismatch,
-        WriteOwnedByOther,
-        WriteVersionMismatch,
-    }
-
-    fn classify_actual_lock_error(error: &str) -> Option<ActualLockErrorKind> {
-        if error.contains("transaction read conflict: granule is owned by another transaction") {
-            Some(ActualLockErrorKind::ReadOwnedByOther)
-        } else if error.contains("transaction read conflict: optimistic read version changed") {
-            Some(ActualLockErrorKind::ReadVersionMismatch)
-        } else if error
-            .contains("transaction write conflict: granule is owned by another transaction")
-        {
-            Some(ActualLockErrorKind::WriteOwnedByOther)
-        } else if error.contains("transaction write conflict: optimistic read version changed") {
-            Some(ActualLockErrorKind::WriteVersionMismatch)
-        } else {
-            None
-        }
-    }
 
     fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
         with_transaction_object_metadata(wasm, &[1, 1, 0, 0])
@@ -6696,12 +6768,14 @@ mod tests {
         }
 
         impl LockModelErrorKind {
-            fn as_actual(self) -> ActualLockErrorKind {
+            fn as_actual(self) -> LockBasedConflictKindForTest {
                 match self {
-                    Self::ReadOwnedByOther => ActualLockErrorKind::ReadOwnedByOther,
-                    Self::ReadVersionMismatch => ActualLockErrorKind::ReadVersionMismatch,
-                    Self::WriteOwnedByOther => ActualLockErrorKind::WriteOwnedByOther,
-                    Self::WriteVersionMismatch => ActualLockErrorKind::WriteVersionMismatch,
+                    Self::ReadOwnedByOther => LockBasedConflictKindForTest::ReadOwnedByOther,
+                    Self::ReadVersionMismatch => LockBasedConflictKindForTest::ReadVersionMismatch,
+                    Self::WriteOwnedByOther => LockBasedConflictKindForTest::WriteOwnedByOther,
+                    Self::WriteVersionMismatch => {
+                        LockBasedConflictKindForTest::WriteVersionMismatch
+                    }
                 }
             }
         }
@@ -6898,24 +6972,27 @@ mod tests {
             Ok(state)
         }
 
-        fn apply_lock_model_op(locks: &mut LockBased, op: LockModelOp) -> Option<String> {
+        fn apply_lock_model_op(
+            locks: &mut LockBased,
+            op: LockModelOp,
+        ) -> Option<LockBasedConflictKindForTest> {
             match op {
                 LockModelOp::Read {
                     tx,
                     granule,
                     version,
                 } => locks
-                    .record_read(model_tx(tx), model_granule(granule), version)
+                    .record_read_result_for_test(model_tx(tx), model_granule(granule), version)
                     .err()
-                    .map(|error| error.to_string()),
+                    .map(|error| error),
                 LockModelOp::Write {
                     tx,
                     granule,
                     version,
                 } => locks
-                    .acquire_write(model_tx(tx), model_granule(granule), version)
+                    .acquire_write_result_for_test(model_tx(tx), model_granule(granule), version)
                     .err()
-                    .map(|error| error.to_string()),
+                    .map(|error| error),
                 LockModelOp::Abort { tx } => {
                     locks.abort_for_test(model_tx(tx));
                     None
@@ -6933,30 +7010,21 @@ mod tests {
             before: &LockModelState,
             after: &LockModelState,
             step: LockModelStep,
-            actual_error: Option<&str>,
+            actual_error: Option<LockBasedConflictKindForTest>,
         ) -> Result<()> {
             if let Some(error_kind) = step.error_kind {
                 let actual_error = actual_error
                     .context("real LockBased op succeeded when model expected error")?;
-                let actual_error_kind =
-                    classify_actual_lock_error(actual_error).with_context(|| {
-                        format!(
-                            "schedule prefix {prefix:?} produced unclassified lock error {:?}",
-                            actual_error
-                        )
-                    })?;
                 ensure!(
-                    actual_error_kind == error_kind.as_actual(),
-                    "schedule prefix {prefix:?} expected error {:?}, got {:?} from {:?}",
+                    actual_error == error_kind.as_actual(),
+                    "schedule prefix {prefix:?} expected error {:?}, got {:?}",
                     error_kind.as_actual(),
-                    actual_error_kind,
                     actual_error
                 );
             } else {
                 ensure!(
                     actual_error.is_none(),
-                    "schedule prefix {prefix:?} unexpectedly failed with {:?}",
-                    actual_error
+                    "schedule prefix {prefix:?} unexpectedly failed with {actual_error:?}"
                 );
             }
 
@@ -7043,7 +7111,7 @@ mod tests {
                     actual == model,
                     "schedule prefix {prefix:?} diverged\nexpected: {model:?}\nactual:   {actual:?}"
                 );
-                assert_lock_step(&prefix, op, &before, &model, step, actual_error.as_deref())?;
+                assert_lock_step(&prefix, op, &before, &model, step, actual_error)?;
             }
 
             Ok(model)
@@ -7098,14 +7166,7 @@ mod tests {
                         "schedule prefix {prefix:?} diverged\nexpected: {next_model:?}\nactual:   {actual:?}"
                     );
                     let before = model.clone();
-                    assert_lock_step(
-                        prefix,
-                        op,
-                        &before,
-                        &next_model,
-                        step,
-                        actual_error.as_deref(),
-                    )?;
+                    assert_lock_step(prefix, op, &before, &next_model, step, actual_error)?;
                     schedule_count +=
                         visit(prefix, &next_real, &next_model, alphabet, remaining - 1)?;
                     prefix.pop();
@@ -8038,19 +8099,15 @@ mod tests {
 
         locks.acquire_write_for_test(first, granule, 3).unwrap();
 
-        let read_error = locks.record_read_for_test(second, granule, 3).unwrap_err();
-        assert_eq!(
-            classify_actual_lock_error(&read_error.to_string()),
-            Some(ActualLockErrorKind::ReadOwnedByOther)
-        );
+        let read_error = locks
+            .record_read_result_for_test(second, granule, 3)
+            .unwrap_err();
+        assert_eq!(read_error, LockBasedConflictKindForTest::ReadOwnedByOther);
 
         let write_error = locks
-            .acquire_write_for_test(second, granule, 3)
+            .acquire_write_result_for_test(second, granule, 3)
             .unwrap_err();
-        assert_eq!(
-            classify_actual_lock_error(&write_error.to_string()),
-            Some(ActualLockErrorKind::WriteOwnedByOther)
-        );
+        assert_eq!(write_error, LockBasedConflictKindForTest::WriteOwnedByOther);
     }
 
     #[test]
@@ -8102,12 +8159,9 @@ mod tests {
             .unwrap();
 
         let error = locks
-            .acquire_write_for_test(second, conflicted, 9)
+            .acquire_write_result_for_test(second, conflicted, 9)
             .unwrap_err();
-        assert_eq!(
-            classify_actual_lock_error(&error.to_string()),
-            Some(ActualLockErrorKind::WriteOwnedByOther)
-        );
+        assert_eq!(error, LockBasedConflictKindForTest::WriteOwnedByOther);
         assert_eq!(locks.owner_for_test(independent), Some(second));
 
         locks.abort_for_test(second);
@@ -8132,12 +8186,9 @@ mod tests {
         locks.abort_for_test(writer);
 
         let error = locks
-            .validate_read_for_test(reader, granule, 8)
+            .validate_read_result_for_test(reader, granule, 8)
             .unwrap_err();
-        assert_eq!(
-            classify_actual_lock_error(&error.to_string()),
-            Some(ActualLockErrorKind::ReadVersionMismatch)
-        );
+        assert_eq!(error, LockBasedConflictKindForTest::ReadVersionMismatch);
     }
 
     #[test]

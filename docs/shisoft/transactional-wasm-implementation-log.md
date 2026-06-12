@@ -49,9 +49,10 @@ Changes in this slice:
   available behind
   `WASMTIME_TRANSACTION_LOCK_MODEL_EXHAUSTIVE=1 cargo test -p wasmtime --lib model_lock_based -- --format terse`
   for manual coverage sweeps when longer runtimes are acceptable.
-- Replaced raw substring assertions with a local structured lock-error
-  classifier so the model tests compare exact conflict kinds while still
-  tolerating the current stringly runtime errors underneath.
+- Replaced raw substring assertions with typed test-only `LockBased` conflict
+  helpers so the model tests and lock regressions compare exact conflict kinds
+  through the real lock-operation path while keeping the production diagnostics
+  unchanged.
 - Added test-only `LockBased` snapshot/clone helpers so the reference model no
   longer reaches into private lock-manager fields or relies on a production
   `Clone` derive that only existed for tests.
