@@ -21,6 +21,48 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 7: Transaction Boundary And Active-State Tests
+
+Date: 2026-06-12
+
+Wave 7 of the model-checking roadmap now adds a focused active-transaction
+boundary slice in `crates/wasmtime/src/runtime/transaction.rs`.
+
+Changes in this slice:
+
+- Added a nested `transaction_active` unit-test module so the Wave 7 slice is
+  runnable with
+  `cargo test -p wasmtime --lib transaction_active -- --format terse`.
+- Added a direct `TransactionState` regression that covers the active-state
+  gate across transactional memory, memory-size, global, table-granule,
+  table-size, and persistent-object acquisition helpers. Persistent object
+  field/element helpers are also checked to ensure they do not succeed without
+  an active transaction or previously acquired permission.
+- Added small imported-host WAT smoke tests proving that an exported top-level
+  `tfunc` starts a fresh transaction, clears thread-local active state on
+  return, still commits its side effect, and allows a second exported `tfunc`
+  call to start a new transaction afterward.
+- Added a trap-path smoke test proving that a trapping `tfunc` aborts staged
+  work, clears thread-local active state, and does not block a later exported
+  `tfunc` from starting a fresh transaction.
+- Added a nested `tcall` smoke test that observes the same transaction id in
+  the outer `tfunc`, the inner callee, and the post-`tcall` continuation,
+  proving that nested transactional calls reuse the active transaction until
+  the outermost return.
+- Kept the Wave 7 changes localized to `transaction.rs`; no WAST harness or
+  proposal WAST edits were needed because the existing transaction-proposal
+  parser/runtime test path already covers the broader syntax/runtime lane and
+  this slice only needed a focused active-state unit-test filter.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib transaction_active -- --format terse
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 9: ObjectTable Rebuild Model Tests
 
 Date: 2026-06-12

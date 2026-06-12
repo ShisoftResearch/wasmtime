@@ -6727,6 +6727,243 @@ mod tests {
         }
     }
 
+    mod transaction_active {
+        use super::*;
+        use std::fmt::Debug;
+        use std::sync::{Arc, Mutex};
+
+        fn assert_requires_active<T: Debug>(result: Result<T>) {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("transaction operation requires an active transaction"),
+                "{error:?}"
+            );
+        }
+
+        fn observed_transaction_ids(observed: &Arc<Mutex<Vec<Option<u64>>>>) -> Vec<Option<u64>> {
+            observed.lock().unwrap().clone()
+        }
+
+        fn observing_import(
+            store: &mut crate::Store<()>,
+            observed: Arc<Mutex<Vec<Option<u64>>>>,
+        ) -> crate::Func {
+            crate::Func::wrap(store, move || {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(current_thread_transaction_for_test().map(TransactionId::as_raw));
+            })
+        }
+
+        #[test]
+        fn direct_transactional_operations_do_not_succeed_without_active_transaction() {
+            clear_current_thread_transaction_for_test();
+            let mut state = TransactionState::default();
+            let backing = vec![0; TMEMORY_GRANULE_SIZE];
+            let mut objects = ObjectTable::default();
+            let struct_object = objects
+                .allocate_persistent_struct_for_gc_ref(0x701, vec![ObjectValue::I32(7)])
+                .unwrap();
+            let array_object = objects
+                .allocate_persistent_array_for_gc_ref(0x702, vec![ObjectValue::I32(9)])
+                .unwrap();
+
+            assert_requires_active(state.acquire_memory_granule_read(0, 0));
+            assert_requires_active(state.acquire_memory_granule_write(
+                0,
+                0,
+                vec![0xaa; TMEMORY_GRANULE_SIZE],
+            ));
+            assert_requires_active(state.acquire_memory_size_read_owned(None, 0));
+            assert_requires_active(state.acquire_memory_size_write_owned(None, 0));
+            assert_requires_active(state.read_memory_overlay(0, 0, 1, &backing));
+            assert_requires_active(state.stage_memory_write(0, 0, &[0xaa], &backing));
+
+            assert_requires_active(state.acquire_global_read_owned(None, 0));
+            assert_requires_active(state.acquire_global_write_owned(None, 0));
+            assert_requires_active(state.stage_global(0, GlobalSnapshot::I32(11)));
+
+            assert_requires_active(state.acquire_table_granule_read_owned(None, 0, 0, 0));
+            assert_requires_active(state.acquire_table_granule_write_owned(None, 0, 0, 0));
+            assert_requires_active(state.acquire_table_granule_read_range_owned(None, 0, 0, 1, 0));
+            assert_requires_active(state.acquire_table_granule_write_range_owned(None, 0, 0, 1, 0));
+            assert_requires_active(state.acquire_table_size_read_owned(None, 0, 0));
+            assert_requires_active(state.acquire_table_size_write_owned(None, 0, 0));
+
+            assert_requires_active(state.acquire_object_read(&objects, struct_object));
+            assert_requires_active(state.acquire_object_write(&objects, struct_object));
+            assert!(
+                state.read_struct_field(&objects, struct_object, 0).is_err(),
+                "persistent object read without an active transaction should not succeed"
+            );
+            assert!(
+                state
+                    .stage_struct_field(&objects, struct_object, 0, ObjectValue::I32(12))
+                    .is_err(),
+                "persistent object write without an active transaction should not succeed"
+            );
+            assert!(
+                state.read_array_element(&objects, array_object, 0).is_err(),
+                "persistent array read without an active transaction should not succeed"
+            );
+            assert!(
+                state
+                    .stage_array_element(&objects, array_object, 0, ObjectValue::I32(12))
+                    .is_err(),
+                "persistent array write without an active transaction should not succeed"
+            );
+            assert_eq!(current_thread_transaction_for_test(), None);
+        }
+
+        #[test]
+        fn exported_tfunc_starts_and_clears_transaction_state() {
+            clear_current_thread_transaction_for_test();
+            let engine = crate::Engine::default();
+            let module = transaction_test_module(
+                &engine,
+                r#"
+                (module
+                  (import "env" "observe" (func $observe))
+                  (tmemory 1)
+                  (tfunc (export "first")
+                    (call $observe)
+                    (i32.tstore (i32.const 0) (i32.const 1)))
+                  (tfunc (export "second")
+                    (call $observe)
+                    (i32.tstore (i32.const 0) (i32.const 2)))
+                  (tfunc (export "read") (result i32)
+                    (i32.tload (i32.const 0))))
+                "#,
+            );
+            let mut store = crate::Store::new(&engine, ());
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let observe = observing_import(&mut store, Arc::clone(&observed));
+            let instance = crate::Instance::new(&mut store, &module, &[observe.into()]).unwrap();
+            let first = instance
+                .get_typed_func::<(), ()>(&mut store, "first")
+                .unwrap();
+            let second = instance
+                .get_typed_func::<(), ()>(&mut store, "second")
+                .unwrap();
+            let read = instance
+                .get_typed_func::<(), i32>(&mut store, "read")
+                .unwrap();
+
+            assert_eq!(current_thread_transaction_for_test(), None);
+            first.call(&mut store, ()).unwrap();
+            assert_eq!(read.call(&mut store, ()).unwrap(), 1);
+            assert_eq!(current_thread_transaction_for_test(), None);
+
+            second.call(&mut store, ()).unwrap();
+            assert_eq!(read.call(&mut store, ()).unwrap(), 2);
+            assert_eq!(current_thread_transaction_for_test(), None);
+
+            let observed = observed_transaction_ids(&observed);
+            assert_eq!(observed.len(), 2);
+            assert!(observed[0].is_some());
+            assert!(observed[1].is_some());
+            assert_ne!(observed[0], observed[1]);
+        }
+
+        #[test]
+        fn trap_path_aborts_and_clears_transaction_state() {
+            clear_current_thread_transaction_for_test();
+            let engine = crate::Engine::default();
+            let module = transaction_test_module(
+                &engine,
+                r#"
+                (module
+                  (import "env" "observe" (func $observe))
+                  (tmemory 1)
+                  (tfunc (export "trap")
+                    (call $observe)
+                    (i32.tstore (i32.const 0) (i32.const 42))
+                    (unreachable))
+                  (tfunc (export "write")
+                    (call $observe)
+                    (i32.tstore (i32.const 0) (i32.const 7)))
+                  (tfunc (export "read") (result i32)
+                    (i32.tload (i32.const 0))))
+                "#,
+            );
+            let mut store = crate::Store::new(&engine, ());
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let observe = observing_import(&mut store, Arc::clone(&observed));
+            let instance = crate::Instance::new(&mut store, &module, &[observe.into()]).unwrap();
+            let trap = instance
+                .get_typed_func::<(), ()>(&mut store, "trap")
+                .unwrap();
+            let write = instance
+                .get_typed_func::<(), ()>(&mut store, "write")
+                .unwrap();
+            let read = instance
+                .get_typed_func::<(), i32>(&mut store, "read")
+                .unwrap();
+
+            assert!(trap.call(&mut store, ()).is_err());
+            assert_eq!(current_thread_transaction_for_test(), None);
+            assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+
+            write.call(&mut store, ()).unwrap();
+            assert_eq!(current_thread_transaction_for_test(), None);
+            assert_eq!(read.call(&mut store, ()).unwrap(), 7);
+
+            let observed = observed_transaction_ids(&observed);
+            assert_eq!(observed.len(), 2);
+            assert!(observed[0].is_some());
+            assert!(observed[1].is_some());
+            assert_ne!(observed[0], observed[1]);
+        }
+
+        #[test]
+        fn nested_tcall_reuses_active_transaction_until_outer_return() {
+            clear_current_thread_transaction_for_test();
+            let engine = crate::Engine::default();
+            let module = transaction_test_module(
+                &engine,
+                r#"
+                (module
+                  (import "env" "observe" (func $observe))
+                  (tmemory 1)
+                  (tfunc $inner
+                    (call $observe)
+                    (i32.tstore (i32.const 0) (i32.const 1)))
+                  (tfunc (export "outer")
+                    (call $observe)
+                    (tcall $inner)
+                    (call $observe)
+                    (i32.tstore (i32.const 0) (i32.const 2)))
+                  (tfunc (export "read") (result i32)
+                    (i32.tload (i32.const 0))))
+                "#,
+            );
+            let mut store = crate::Store::new(&engine, ());
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let observe = observing_import(&mut store, Arc::clone(&observed));
+            let instance = crate::Instance::new(&mut store, &module, &[observe.into()]).unwrap();
+            let outer = instance
+                .get_typed_func::<(), ()>(&mut store, "outer")
+                .unwrap();
+            let read = instance
+                .get_typed_func::<(), i32>(&mut store, "read")
+                .unwrap();
+
+            outer.call(&mut store, ()).unwrap();
+
+            assert_eq!(read.call(&mut store, ()).unwrap(), 2);
+            assert_eq!(current_thread_transaction_for_test(), None);
+
+            let observed = observed_transaction_ids(&observed);
+            assert_eq!(observed.len(), 3);
+            assert!(observed.iter().all(Option::is_some));
+            assert_eq!(observed[0], observed[1]);
+            assert_eq!(observed[1], observed[2]);
+        }
+    }
+
     mod model_lock_based {
         use super::*;
         use proptest::prelude::*;
