@@ -4,9 +4,12 @@ use proc_macro2::Span;
 use quote::{ToTokens, format_ident, quote};
 use std::collections::HashSet;
 use syn::{
-    Data, DeriveInput, Error, FnArg, ItemFn, Path, Type, WherePredicate, parse_macro_input,
+    Data, DeriveInput, Error, Fields, FnArg, ItemFn, Path, Type, WherePredicate, parse_macro_input,
     parse_quote,
 };
+
+const PERSIST_METADATA_MAGIC: &[u8; 4] = b"TPRS";
+const PERSIST_METADATA_VERSION: u8 = 1;
 
 #[proc_macro_derive(Persist)]
 pub fn derive_persist(input: TokenStream) -> TokenStream {
@@ -62,21 +65,43 @@ fn derive_persist_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
         ));
     }
 
-    if !matches!(input.data, Data::Struct(_)) {
-        return Err(Error::new_spanned(
-            &input.ident,
-            "Persist can only be derived for structs; enums and unions are unsupported",
-        ));
-    }
+    let data = match &input.data {
+        Data::Struct(data) => data,
+        _ => {
+            return Err(Error::new_spanned(
+                &input.ident,
+                "Persist can only be derived for structs; enums and unions are unsupported",
+            ));
+        }
+    };
+
+    require_stable_repr(&input)?;
+
+    let field_types = persist_field_types(&data.fields)?;
 
     let ident = input.ident;
     let sdk_path = sdk_path();
     let type_name = ident.to_string();
-    let type_name_len = type_name.len();
-    let type_name_bytes = proc_macro2::Literal::byte_string(type_name.as_bytes());
+    let metadata_bytes = persist_metadata_bytes(&ident, &type_name)?;
+    let metadata_len = metadata_bytes.len();
+    let metadata_bytes = proc_macro2::Literal::byte_string(&metadata_bytes);
     let metadata_ident = format_ident!("__TWASM_PERSIST_METADATA_{}", ident);
+    let field_assert_ident = format_ident!("__TWASM_PERSIST_FIELDS_{}", ident);
+    let field_assert = if field_types.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            #[allow(non_camel_case_types)]
+            struct #field_assert_ident
+            where
+                #(#field_types: #sdk_path::Persist,)*
+            ;
+        }
+    };
 
     Ok(quote! {
+        #field_assert
+
         unsafe impl #sdk_path::Persist for #ident {
             const TYPE_NAME: &'static str = #type_name;
         }
@@ -84,8 +109,59 @@ fn derive_persist_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
         #[used]
         #[allow(non_upper_case_globals)]
         #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "twasm.persist"))]
-        static #metadata_ident: [u8; #type_name_len] = *#type_name_bytes;
+        static #metadata_ident: [u8; #metadata_len] = *#metadata_bytes;
     })
+}
+
+fn require_stable_repr(input: &DeriveInput) -> syn::Result<()> {
+    for attr in &input.attrs {
+        if !attr.path().is_ident("repr") {
+            continue;
+        }
+
+        let mut has_stable_repr = false;
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("C") || meta.path.is_ident("transparent") {
+                has_stable_repr = true;
+            }
+            Ok(())
+        })?;
+
+        if has_stable_repr {
+            return Ok(());
+        }
+    }
+
+    Err(Error::new_spanned(
+        &input.ident,
+        "Persist derive requires #[repr(C)] or #[repr(transparent)]",
+    ))
+}
+
+fn persist_field_types(fields: &Fields) -> syn::Result<Vec<&Type>> {
+    match fields {
+        Fields::Named(fields) => Ok(fields.named.iter().map(|field| &field.ty).collect()),
+        Fields::Unnamed(fields) => Ok(fields.unnamed.iter().map(|field| &field.ty).collect()),
+        Fields::Unit => Err(Error::new_spanned(
+            fields,
+            "Persist can only be derived for named or tuple structs; unit structs are unsupported",
+        )),
+    }
+}
+
+fn persist_metadata_bytes(ident: &syn::Ident, type_name: &str) -> syn::Result<Vec<u8>> {
+    let type_name_len = u16::try_from(type_name.len()).map_err(|_| {
+        Error::new_spanned(
+            ident,
+            "Persist derive type names must be 65535 bytes or shorter",
+        )
+    })?;
+    let mut metadata = Vec::with_capacity(PERSIST_METADATA_MAGIC.len() + 3 + type_name.len());
+    metadata.extend_from_slice(PERSIST_METADATA_MAGIC);
+    metadata.push(PERSIST_METADATA_VERSION);
+    metadata.extend_from_slice(&type_name_len.to_le_bytes());
+    metadata.extend_from_slice(type_name.as_bytes());
+    Ok(metadata)
 }
 
 fn sdk_path() -> Path {
@@ -151,12 +227,14 @@ mod tests {
     #[test]
     fn derive_persist_preserves_metadata_symbol_spelling() {
         let mixed_case = derive_persist_impl(parse_quote! {
-            struct Foo;
+            #[repr(C)]
+            struct Foo(u8);
         })
         .expect("derive should succeed")
         .to_string();
         let upper_case = derive_persist_impl(parse_quote! {
-            struct FOO;
+            #[repr(C)]
+            struct FOO(u8);
         })
         .expect("derive should succeed")
         .to_string();
@@ -193,6 +271,29 @@ mod tests {
             err.to_string(),
             "Persist can only be derived for structs; enums and unions are unsupported"
         );
+    }
+
+    #[test]
+    fn derive_persist_rejects_structs_without_stable_repr() {
+        let err = derive_persist_impl(parse_quote! {
+            struct Wrapper {
+                field: u32,
+            }
+        })
+        .expect_err("structs without repr(C) should be rejected");
+
+        assert!(err.to_string().contains("Persist derive requires"));
+    }
+
+    #[test]
+    fn derive_persist_rejects_unit_structs() {
+        let err = derive_persist_impl(parse_quote! {
+            #[repr(C)]
+            struct Marker;
+        })
+        .expect_err("unit structs should be rejected");
+
+        assert!(err.to_string().contains("named or tuple structs"));
     }
 
     #[test]
