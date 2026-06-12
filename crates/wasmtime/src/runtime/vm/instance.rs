@@ -6,7 +6,7 @@ use crate::code::ModuleWithCode;
 use crate::module::ModuleRegistry;
 use crate::prelude::*;
 #[cfg(has_virtual_memory)]
-use crate::runtime::transaction::TransactionConfig;
+use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
 use crate::runtime::vm::export::{Export, ExportMemory};
 #[cfg(has_virtual_memory)]
 use crate::runtime::vm::memory::tmemory::{
@@ -175,7 +175,7 @@ impl Instance {
         req: InstanceAllocationRequest,
         memories: TryPrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)>,
         tables: TryPrimaryMap<DefinedTableIndex, (TableAllocationIndex, Table)>,
-    ) -> Result<InstanceHandle, OutOfMemory> {
+    ) -> Result<InstanceHandle> {
         let module = req.runtime_info.env_module();
         let memory_tys = &module.memories;
         #[cfg(has_virtual_memory)]
@@ -233,8 +233,22 @@ impl Instance {
     fn build_tmemory_sidecar(
         module: &wasmtime_environ::Module,
         transaction_config: &TransactionConfig,
-    ) -> Result<TMemorySidecar, OutOfMemory> {
+    ) -> Result<TMemorySidecar> {
         let mut sidecar = TMemorySidecar::default();
+        let defined_tmemories = module
+            .transaction_objects
+            .memories
+            .iter()
+            .copied()
+            .filter(|memory_index| module.defined_memory_index(*memory_index).is_some())
+            .count();
+        if transaction_config.tmemory_backend() == TMemoryBackend::FileBackedMemory
+            && defined_tmemories > 1
+        {
+            bail!(
+                "file-backed tmemory supports one transactional memory for now; found {defined_tmemories}"
+            );
+        }
 
         for memory_index in module.transaction_objects.memories.iter().copied() {
             if module.defined_memory_index(memory_index).is_none() {
@@ -254,16 +268,7 @@ impl Instance {
                 )),
                 None => None,
             };
-            let tmemory =
-                TMemory::new(transaction_config.clone(), min_pages, max_pages).map_err(|_| {
-                    let oom_size = memory
-                        .maximum_byte_size()
-                        .ok()
-                        .or(Some(min_bytes))
-                        .and_then(|bytes| usize::try_from(bytes).ok())
-                        .unwrap_or(usize::MAX);
-                    OutOfMemory::new(oom_size)
-                })?;
+            let tmemory = TMemory::new(transaction_config.clone(), min_pages, max_pages)?;
             sidecar.insert(memory_index, tmemory)?;
         }
 

@@ -2944,6 +2944,38 @@ mod tests {
         assert_eq!(reopened.read_committed(64..68).unwrap(), vec![1, 2, 3, 4]);
     }
 
+    #[cfg(all(feature = "transaction", unix, has_virtual_memory))]
+    #[test]
+    fn file_backed_transaction_storage_rejects_multiple_tmemories() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let engine = Engine::default();
+        let module = Module::new(
+            &engine,
+            wat::parse_str(
+                r#"
+                (module
+                  (tmemory 1)
+                  (tmemory 1))
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = Store::new(&engine, ());
+        store
+            .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 32)
+            .unwrap();
+
+        let error = Instance::new(&mut store, &module, &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("file-backed tmemory"));
+        assert!(error.contains("one transactional memory"));
+    }
+
     #[test]
     fn does_not_lose_precision() {
         let mut tank = FuelTank::new();
