@@ -21,6 +21,56 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 6: Permission-State Model Tests
+
+Date: 2026-06-12
+
+Wave 6 of the model-checking roadmap now adds permission-state model tests in
+`crates/wasmtime/src/runtime/transaction.rs`.
+
+Changes in this slice:
+
+- Added a nested `model_permissions` unit-test module so the Wave 6 slice is
+  runnable with `cargo test -p wasmtime --lib model_permissions -- --format terse`.
+- Added an object-focused reference permission machine that tracks active
+  transaction state, committed value, staged value, and transaction-owned
+  read/write access on the persistent object granule, then compares every
+  schedule prefix against real `TransactionState` behavior.
+- Added deterministic regressions covering read-only access, write-owned staged
+  mutation, write-implies-read of the staged value, permission cleanup on
+  abort, and permission cleanup on commit/release.
+- Added a fixed-seed generated short-sequence test over the Wave 6 operation
+  alphabet: `grant read`, `grant write`, `read`, `write`, `downgrade`,
+  `abort`, and `commit/release`, with prefix-by-prefix comparison against the
+  reference machine.
+- Added one small non-object granule check using a `TGlobal` granule so the
+  tests show the transaction/granule permission state is generic and not tied
+  to object payload helpers alone.
+
+Semantic note for this slice:
+
+- There is no production permission-downgrade API yet. The Wave 6 tests model
+  downgrade with a test-only transition that clears active write ownership for
+  one granule while preserving the transaction's read permission and any staged
+  object payload. This matches the meeting design intent closely enough to
+  verify that subsequent writes are rejected until write ownership is acquired
+  again.
+- The object helper path currently reads the payload before checking write
+  ownership, so a bare object `write` without prior permission fails as a read
+  denial first. The reference machine matches that exact runtime behavior.
+- The `commit/release` transition uses the real object commit path
+  (`commit_object_payloads` plus `complete_commit`) for the object model and
+  `complete_commit` for the small generic granule release check.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_permissions -- --format terse
+cargo test -p wasmtime --lib transaction -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 5: LockBased Reference-World State-Space Tests
 
 Date: 2026-06-12

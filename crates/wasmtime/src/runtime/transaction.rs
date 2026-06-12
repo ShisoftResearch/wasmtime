@@ -7289,6 +7289,562 @@ mod tests {
         }
     }
 
+    mod model_permissions {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum PermissionModelOp {
+            GrantRead,
+            GrantWrite,
+            Read,
+            Write(i32),
+            Downgrade,
+            Abort,
+            CommitRelease,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum PermissionErrorKind {
+            Inactive,
+            ReadDenied,
+            WriteDenied,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum PermissionStepOutcome {
+            Bool(bool),
+            ReadValue(i32),
+            Unit,
+            Error(PermissionErrorKind),
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct PermissionRuntimeSnapshot {
+            active: bool,
+            committed_value: i32,
+            staged_value: Option<i32>,
+            read: bool,
+            write: bool,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct PermissionTraceStep {
+            outcome: PermissionStepOutcome,
+            snapshot: PermissionRuntimeSnapshot,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct PermissionModelState {
+            snapshot: PermissionRuntimeSnapshot,
+        }
+
+        impl Default for PermissionModelState {
+            fn default() -> Self {
+                Self {
+                    snapshot: PermissionRuntimeSnapshot {
+                        active: true,
+                        committed_value: 7,
+                        staged_value: None,
+                        read: false,
+                        write: false,
+                    },
+                }
+            }
+        }
+
+        impl PermissionModelState {
+            fn apply(&mut self, op: PermissionModelOp) -> PermissionStepOutcome {
+                match op {
+                    PermissionModelOp::GrantRead => {
+                        if !self.snapshot.active {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                        }
+                        let granted = !self.snapshot.read;
+                        self.snapshot.read = true;
+                        PermissionStepOutcome::Bool(granted)
+                    }
+                    PermissionModelOp::GrantWrite => {
+                        if !self.snapshot.active {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                        }
+                        let granted = !self.snapshot.write;
+                        self.snapshot.read = true;
+                        self.snapshot.write = true;
+                        PermissionStepOutcome::Bool(granted)
+                    }
+                    PermissionModelOp::Read => {
+                        if !self.snapshot.read {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied);
+                        }
+                        PermissionStepOutcome::ReadValue(
+                            self.snapshot
+                                .staged_value
+                                .unwrap_or(self.snapshot.committed_value),
+                        )
+                    }
+                    PermissionModelOp::Write(value) => {
+                        if !self.snapshot.read {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied);
+                        }
+                        if !self.snapshot.write {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::WriteDenied);
+                        }
+                        self.snapshot.staged_value = Some(value);
+                        PermissionStepOutcome::Unit
+                    }
+                    PermissionModelOp::Downgrade => {
+                        if !self.snapshot.active {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                        }
+                        let removed = self.snapshot.write;
+                        self.snapshot.write = false;
+                        PermissionStepOutcome::Bool(removed)
+                    }
+                    PermissionModelOp::Abort => {
+                        if !self.snapshot.active {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                        }
+                        self.snapshot.active = false;
+                        self.snapshot.staged_value = None;
+                        self.snapshot.read = false;
+                        self.snapshot.write = false;
+                        PermissionStepOutcome::Unit
+                    }
+                    PermissionModelOp::CommitRelease => {
+                        if !self.snapshot.active {
+                            return PermissionStepOutcome::Error(PermissionErrorKind::Inactive);
+                        }
+                        if let Some(value) = self.snapshot.staged_value {
+                            self.snapshot.committed_value = value;
+                        }
+                        self.snapshot.active = false;
+                        self.snapshot.staged_value = None;
+                        self.snapshot.read = false;
+                        self.snapshot.write = false;
+                        PermissionStepOutcome::Unit
+                    }
+                }
+            }
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct GranulePermissionModelState {
+            active: bool,
+            read: bool,
+            write: bool,
+        }
+
+        impl Default for GranulePermissionModelState {
+            fn default() -> Self {
+                Self {
+                    active: true,
+                    read: false,
+                    write: false,
+                }
+            }
+        }
+
+        fn permission_model_object() -> Result<(ObjectTable, ObjectId)> {
+            let mut objects = ObjectTable::default();
+            let object =
+                objects.allocate_persistent_struct_for_gc_ref(0x611, vec![ObjectValue::I32(7)])?;
+            Ok((objects, object))
+        }
+
+        fn payload_i32(payload: &ObjectPayload) -> Result<i32> {
+            let ObjectPayload::Struct(fields) = payload else {
+                bail!("permission model expected struct payload");
+            };
+            let field = fields
+                .first()
+                .context("permission model expected one struct field")?;
+            let ObjectValue::I32(value) = field else {
+                bail!("permission model expected i32 field");
+            };
+            Ok(*value)
+        }
+
+        fn classify_permission_error(error: Error) -> Result<PermissionStepOutcome> {
+            let message = error.to_string();
+            if message.contains("transaction operation requires an active transaction") {
+                return Ok(PermissionStepOutcome::Error(PermissionErrorKind::Inactive));
+            }
+            if message.contains("transactional object read permission was not acquired") {
+                return Ok(PermissionStepOutcome::Error(
+                    PermissionErrorKind::ReadDenied,
+                ));
+            }
+            if message.contains("transactional object write permission was not acquired") {
+                return Ok(PermissionStepOutcome::Error(
+                    PermissionErrorKind::WriteDenied,
+                ));
+            }
+            Err(error)
+        }
+
+        fn downgrade_granule_write_for_test(
+            state: &mut TransactionState,
+            granule: GranuleId,
+        ) -> Result<bool> {
+            let Some(transaction) = state.active else {
+                bail!("transaction operation requires an active transaction");
+            };
+            let removed = state.write_granules.remove(&granule);
+            if removed {
+                ensure!(
+                    state.read_granules.contains(&granule),
+                    "permission downgrade should preserve read permission for {granule:?}"
+                );
+                ensure!(
+                    state.locks.owners.remove(&granule) == Some(transaction),
+                    "permission downgrade expected tx {transaction:?} to own {granule:?}"
+                );
+            }
+            Ok(removed)
+        }
+
+        fn apply_permission_runtime_op(
+            state: &mut TransactionState,
+            objects: &mut ObjectTable,
+            object: ObjectId,
+            op: PermissionModelOp,
+        ) -> Result<PermissionStepOutcome> {
+            match op {
+                PermissionModelOp::GrantRead => match state.acquire_object_read(objects, object) {
+                    Ok(granted) => Ok(PermissionStepOutcome::Bool(granted)),
+                    Err(error) => classify_permission_error(error),
+                },
+                PermissionModelOp::GrantWrite => {
+                    match state.acquire_object_write(objects, object) {
+                        Ok(granted) => Ok(PermissionStepOutcome::Bool(granted)),
+                        Err(error) => classify_permission_error(error),
+                    }
+                }
+                PermissionModelOp::Read => match state.read_struct_field(objects, object, 0) {
+                    Ok(ObjectValue::I32(value)) => Ok(PermissionStepOutcome::ReadValue(value)),
+                    Ok(other) => bail!("permission model expected i32 field, got {other:?}"),
+                    Err(error) => classify_permission_error(error),
+                },
+                PermissionModelOp::Write(value) => {
+                    match state.stage_struct_field(objects, object, 0, ObjectValue::I32(value)) {
+                        Ok(()) => Ok(PermissionStepOutcome::Unit),
+                        Err(error) => classify_permission_error(error),
+                    }
+                }
+                PermissionModelOp::Downgrade => {
+                    let granule = objects.granule_id(object)?;
+                    match downgrade_granule_write_for_test(state, granule) {
+                        Ok(removed) => Ok(PermissionStepOutcome::Bool(removed)),
+                        Err(error) => classify_permission_error(error),
+                    }
+                }
+                PermissionModelOp::Abort => match state.abort() {
+                    Ok(()) => Ok(PermissionStepOutcome::Unit),
+                    Err(error) => classify_permission_error(error),
+                },
+                PermissionModelOp::CommitRelease => {
+                    match state
+                        .commit_object_payloads(objects)
+                        .and_then(|_| state.complete_commit())
+                    {
+                        Ok(()) => Ok(PermissionStepOutcome::Unit),
+                        Err(error) => classify_permission_error(error),
+                    }
+                }
+            }
+        }
+
+        fn permission_runtime_snapshot(
+            state: &TransactionState,
+            objects: &ObjectTable,
+            object: ObjectId,
+        ) -> Result<PermissionRuntimeSnapshot> {
+            let granule = objects.granule_id(object)?;
+            let committed_value = payload_i32(&objects.payload(object)?)?;
+            let staged_value = state
+                .staged_objects
+                .get(&object)
+                .map(payload_i32)
+                .transpose()?;
+            Ok(PermissionRuntimeSnapshot {
+                active: state.active.is_some(),
+                committed_value,
+                staged_value,
+                read: state.read_granules.contains(&granule),
+                write: state.write_granules.contains(&granule),
+            })
+        }
+
+        fn run_permission_model_schedule(
+            schedule: &[PermissionModelOp],
+        ) -> Result<Vec<PermissionTraceStep>> {
+            let outcome = (|| -> Result<Vec<PermissionTraceStep>> {
+                let (mut objects, object) = permission_model_object()?;
+                let mut state = TransactionState::new_for_test(TransactionId::from_raw(91));
+                let mut model = PermissionModelState::default();
+                let mut prefix = Vec::with_capacity(schedule.len());
+                let mut trace = Vec::with_capacity(schedule.len());
+
+                let initial = permission_runtime_snapshot(&state, &objects, object)?;
+                ensure!(
+                    initial == model.snapshot,
+                    "initial permission snapshot diverged\nexpected: {:?}\nactual:   {:?}",
+                    model.snapshot,
+                    initial
+                );
+
+                for &op in schedule {
+                    prefix.push(op);
+                    let expected_outcome = model.apply(op);
+                    let actual_outcome =
+                        apply_permission_runtime_op(&mut state, &mut objects, object, op)?;
+                    ensure!(
+                        actual_outcome == expected_outcome,
+                        "permission prefix {prefix:?} produced the wrong outcome\nexpected: {:?}\nactual:   {:?}",
+                        expected_outcome,
+                        actual_outcome
+                    );
+                    let actual_snapshot = permission_runtime_snapshot(&state, &objects, object)?;
+                    ensure!(
+                        actual_snapshot == model.snapshot,
+                        "permission prefix {prefix:?} diverged\nexpected: {:?}\nactual:   {:?}",
+                        model.snapshot,
+                        actual_snapshot
+                    );
+                    trace.push(PermissionTraceStep {
+                        outcome: actual_outcome,
+                        snapshot: actual_snapshot,
+                    });
+                }
+
+                Ok(trace)
+            })();
+            clear_current_thread_transaction_for_test();
+            outcome
+        }
+
+        fn granule_permission_snapshot(
+            state: &TransactionState,
+            granule: GranuleId,
+        ) -> GranulePermissionModelState {
+            GranulePermissionModelState {
+                active: state.active.is_some(),
+                read: state.read_granules.contains(&granule),
+                write: state.write_granules.contains(&granule),
+            }
+        }
+
+        #[test]
+        fn model_permissions_read_permission_allows_read_without_write() {
+            let trace = run_permission_model_schedule(&[
+                PermissionModelOp::GrantRead,
+                PermissionModelOp::Read,
+                PermissionModelOp::Write(9),
+            ])
+            .unwrap();
+
+            assert_eq!(trace[0].outcome, PermissionStepOutcome::Bool(true));
+            assert_eq!(trace[1].outcome, PermissionStepOutcome::ReadValue(7));
+            assert_eq!(
+                trace[2].outcome,
+                PermissionStepOutcome::Error(PermissionErrorKind::WriteDenied)
+            );
+            assert_eq!(
+                trace[2].snapshot,
+                PermissionRuntimeSnapshot {
+                    active: true,
+                    committed_value: 7,
+                    staged_value: None,
+                    read: true,
+                    write: false,
+                }
+            );
+        }
+
+        #[test]
+        fn model_permissions_write_permission_grants_staged_mutation_and_reads_staged_value() {
+            let trace = run_permission_model_schedule(&[
+                PermissionModelOp::GrantWrite,
+                PermissionModelOp::Write(9),
+                PermissionModelOp::Read,
+            ])
+            .unwrap();
+
+            assert_eq!(trace[0].outcome, PermissionStepOutcome::Bool(true));
+            assert_eq!(trace[1].outcome, PermissionStepOutcome::Unit);
+            assert_eq!(trace[2].outcome, PermissionStepOutcome::ReadValue(9));
+            assert_eq!(
+                trace[2].snapshot,
+                PermissionRuntimeSnapshot {
+                    active: true,
+                    committed_value: 7,
+                    staged_value: Some(9),
+                    read: true,
+                    write: true,
+                }
+            );
+        }
+
+        #[test]
+        fn model_permissions_downgrade_rejects_future_writes_until_reacquired() {
+            let trace = run_permission_model_schedule(&[
+                PermissionModelOp::GrantWrite,
+                PermissionModelOp::Write(9),
+                PermissionModelOp::Downgrade,
+                PermissionModelOp::Read,
+                PermissionModelOp::Write(10),
+                PermissionModelOp::GrantWrite,
+                PermissionModelOp::Write(10),
+                PermissionModelOp::Read,
+            ])
+            .unwrap();
+
+            assert_eq!(trace[2].outcome, PermissionStepOutcome::Bool(true));
+            assert_eq!(trace[3].outcome, PermissionStepOutcome::ReadValue(9));
+            assert_eq!(
+                trace[4].outcome,
+                PermissionStepOutcome::Error(PermissionErrorKind::WriteDenied)
+            );
+            assert_eq!(trace[5].outcome, PermissionStepOutcome::Bool(true));
+            assert_eq!(trace[7].outcome, PermissionStepOutcome::ReadValue(10));
+        }
+
+        #[test]
+        fn model_permissions_abort_discards_state() {
+            let trace = run_permission_model_schedule(&[
+                PermissionModelOp::GrantWrite,
+                PermissionModelOp::Write(9),
+                PermissionModelOp::Abort,
+                PermissionModelOp::Read,
+            ])
+            .unwrap();
+
+            assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit);
+            assert_eq!(
+                trace[3].outcome,
+                PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied)
+            );
+            assert_eq!(
+                trace[3].snapshot,
+                PermissionRuntimeSnapshot {
+                    active: false,
+                    committed_value: 7,
+                    staged_value: None,
+                    read: false,
+                    write: false,
+                }
+            );
+        }
+
+        #[test]
+        fn model_permissions_commit_release_clears_permissions_and_commits_value() {
+            let trace = run_permission_model_schedule(&[
+                PermissionModelOp::GrantWrite,
+                PermissionModelOp::Write(9),
+                PermissionModelOp::CommitRelease,
+                PermissionModelOp::Read,
+            ])
+            .unwrap();
+
+            assert_eq!(trace[2].outcome, PermissionStepOutcome::Unit);
+            assert_eq!(
+                trace[3].outcome,
+                PermissionStepOutcome::Error(PermissionErrorKind::ReadDenied)
+            );
+            assert_eq!(
+                trace[3].snapshot,
+                PermissionRuntimeSnapshot {
+                    active: false,
+                    committed_value: 9,
+                    staged_value: None,
+                    read: false,
+                    write: false,
+                }
+            );
+        }
+
+        #[test]
+        fn model_permissions_generic_granule_state_is_not_object_specific() {
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(92));
+            let granule = GranuleId::TGlobal {
+                instance: Some(4),
+                global_index: 1,
+            };
+
+            assert_eq!(
+                granule_permission_snapshot(&state, granule),
+                GranulePermissionModelState::default()
+            );
+
+            assert!(state.acquire_granule_read(granule, 0).unwrap());
+            assert_eq!(
+                granule_permission_snapshot(&state, granule),
+                GranulePermissionModelState {
+                    active: true,
+                    read: true,
+                    write: false,
+                }
+            );
+
+            assert!(state.acquire_granule_write(granule, 0).unwrap());
+            assert_eq!(
+                granule_permission_snapshot(&state, granule),
+                GranulePermissionModelState {
+                    active: true,
+                    read: true,
+                    write: true,
+                }
+            );
+
+            state.complete_commit().unwrap();
+            assert_eq!(
+                granule_permission_snapshot(&state, granule),
+                GranulePermissionModelState {
+                    active: false,
+                    read: false,
+                    write: false,
+                }
+            );
+            clear_current_thread_transaction_for_test();
+        }
+
+        fn permission_model_op_strategy() -> impl Strategy<Value = PermissionModelOp> {
+            prop_oneof![
+                Just(PermissionModelOp::GrantRead),
+                Just(PermissionModelOp::GrantWrite),
+                Just(PermissionModelOp::Read),
+                (0i32..=15).prop_map(PermissionModelOp::Write),
+                Just(PermissionModelOp::Downgrade),
+                Just(PermissionModelOp::Abort),
+                Just(PermissionModelOp::CommitRelease),
+            ]
+        }
+
+        #[test]
+        fn model_permissions_generated_short_sequences_match_reference_world() {
+            let mut runner = TestRunner::new(Config {
+                cases: 64,
+                failure_persistence: None,
+                max_shrink_iters: 256,
+                rng_seed: RngSeed::Fixed(0x5eed_0006),
+                ..Config::default()
+            });
+
+            runner
+                .run(
+                    &prop::collection::vec(permission_model_op_strategy(), 1..=10usize),
+                    |schedule| {
+                        run_permission_model_schedule(&schedule)
+                            .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+    }
+
     #[test]
     fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed_record() {
         let mut objects = ObjectTable::default();
