@@ -82,7 +82,9 @@ use crate::error::OutOfMemory;
 use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
-use crate::runtime::transaction::{ObjectTable, TransactionConfig, TransactionState};
+use crate::runtime::transaction::{
+    ObjectTable, TMemoryBackend, TransactionConfig, TransactionState,
+};
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
 #[cfg(feature = "stack-switching")]
@@ -481,6 +483,7 @@ pub struct StoreOpaque {
     #[allow(dead_code)]
     transaction_state: TransactionState,
     transaction_config: TransactionConfig,
+    file_backed_tmemory_count: usize,
     #[allow(dead_code)]
     transaction_object_table: ObjectTable,
     // GC-related fields.
@@ -624,6 +627,16 @@ pub(crate) enum ExecutorRef<'a> {
     Interpreter(InterpreterRef<'a>),
     #[cfg(has_host_compiler_backend)]
     Native,
+}
+
+fn count_defined_tmemories(module: &wasmtime_environ::Module) -> usize {
+    module
+        .transaction_objects
+        .memories
+        .iter()
+        .copied()
+        .filter(|memory_index| module.defined_memory_index(*memory_index).is_some())
+        .count()
 }
 
 /// An RAII type to automatically mark a region of code as unsafe for GC.
@@ -773,6 +786,7 @@ impl<T> Store<T> {
             host_globals: TryPrimaryMap::new(),
             transaction_state: TransactionState::default(),
             transaction_config: TransactionConfig::default(),
+            file_backed_tmemory_count: 0,
             transaction_object_table: ObjectTable::default(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
@@ -2419,6 +2433,8 @@ at https://bytecodealliance.org/security.
         runtime_info: &ModuleRuntimeInfo,
         imports: Imports<'_>,
     ) -> Result<InstanceId> {
+        let defined_tmemories = count_defined_tmemories(runtime_info.env_module());
+        self.ensure_file_backed_tmemory_capacity(defined_tmemories)?;
         self.instances.reserve(1)?;
 
         let id = self.instances.next_key();
@@ -2471,8 +2487,39 @@ at https://bytecodealliance.org/security.
         // double-check we didn't accidentally allocate two instances and our
         // prediction of what the id would be is indeed the id it should be.
         assert_eq!(id, actual);
+        self.record_file_backed_tmemories(defined_tmemories)?;
 
         Ok(id)
+    }
+
+    fn ensure_file_backed_tmemory_capacity(&self, defined_tmemories: usize) -> Result<()> {
+        if self.transaction_config.tmemory_backend() != TMemoryBackend::FileBackedMemory
+            || defined_tmemories == 0
+        {
+            return Ok(());
+        }
+        let total = self
+            .file_backed_tmemory_count
+            .checked_add(defined_tmemories)
+            .context("file-backed tmemory count overflow")?;
+        ensure!(
+            total <= 1,
+            "file-backed tmemory supports one transactional memory for now; found {total} across this store"
+        );
+        Ok(())
+    }
+
+    fn record_file_backed_tmemories(&mut self, defined_tmemories: usize) -> Result<()> {
+        if self.transaction_config.tmemory_backend() != TMemoryBackend::FileBackedMemory
+            || defined_tmemories == 0
+        {
+            return Ok(());
+        }
+        self.file_backed_tmemory_count = self
+            .file_backed_tmemory_count
+            .checked_add(defined_tmemories)
+            .context("file-backed tmemory count overflow")?;
+        Ok(())
     }
 
     /// Tests whether there is a pending exception.
@@ -2973,6 +3020,49 @@ mod tests {
             .unwrap();
 
         let error = Instance::new(&mut store, &module, &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("file-backed tmemory"));
+        assert!(error.contains("one transactional memory"));
+    }
+
+    #[cfg(all(feature = "transaction", unix, has_virtual_memory))]
+    #[test]
+    fn file_backed_transaction_storage_rejects_multiple_tmemory_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let engine = Engine::default();
+        let module_a = Module::new(
+            &engine,
+            wat::parse_str(
+                r#"
+                (module
+                  (tmemory 1))
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let module_b = Module::new(
+            &engine,
+            wat::parse_str(
+                r#"
+                (module
+                  (tmemory 1))
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = Store::new(&engine, ());
+        store
+            .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 32)
+            .unwrap();
+
+        Instance::new(&mut store, &module_a, &[]).unwrap();
+        let error = Instance::new(&mut store, &module_b, &[])
             .unwrap_err()
             .to_string();
 
