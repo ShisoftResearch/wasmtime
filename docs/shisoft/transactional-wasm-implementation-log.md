@@ -41,12 +41,24 @@ Changes in this slice:
   the reference model.
 - Added exhaustive small-schedule coverage over the full 20-operation alphabet
   induced by txs `1/2`, granules `0/1`, versions `0/1`, plus `Abort` and
-  `Release`. The test enumerates every schedule prefix through length `5`
-  (3,368,421 total schedules) and compares the real `LockBased` state against
-  the reference state after each prefix.
-- Added fixed-seed generated `proptest` coverage for operation sequences of
-  length `0..20`, again comparing the real state and the reference state after
-  each applied prefix.
+  `Release`. The default unit-test path now exhaustively enumerates every
+  schedule prefix through length `3` (8,421 total schedules) so
+  `cargo test -p wasmtime --lib model_lock_based -- --format terse` stays
+  quick in ordinary runs.
+- Kept the original full depth-`5` traversal (3,368,421 total schedules)
+  available behind
+  `WASMTIME_TRANSACTION_LOCK_MODEL_EXHAUSTIVE=1 cargo test -p wasmtime --lib model_lock_based -- --format terse`
+  for manual coverage sweeps when longer runtimes are acceptable.
+- Replaced raw substring assertions with a local structured lock-error
+  classifier so the model tests compare exact conflict kinds while still
+  tolerating the current stringly runtime errors underneath.
+- Added test-only `LockBased` snapshot/clone helpers so the reference model no
+  longer reaches into private lock-manager fields or relies on a production
+  `Clone` derive that only existed for tests.
+- Retuned the fixed-seed generated `proptest` coverage to complement the
+  bounded exhaustive sweep: one profile exercises medium-length histories and a
+  second profile stresses longer churn sequences (`24..=48` ops) that the
+  quick exhaustive pass does not reach, while keeping runtime practical.
 - Added explicit post-prefix checks for the Wave 5 invariants: one owner per
   granule, owner-map and owner-set agreement, abort/release cleanup, failed
   conflicting writes preserving the existing owner, failed reads against an

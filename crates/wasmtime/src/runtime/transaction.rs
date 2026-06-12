@@ -1263,7 +1263,7 @@ pub(crate) trait TransactionConcurrencyControl {
     fn release_transaction(&mut self, transaction: TransactionId);
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct LockBased {
     // SHISOFT-TWASM-MOCK: versioned persistent backends are still incomplete,
     // so some non-object granules feed version `0` through the lock manager.
@@ -1395,7 +1395,28 @@ impl LockBased {
 }
 
 #[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LockBasedSnapshotForTest {
+    owners: BTreeMap<GranuleId, TransactionId>,
+    read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
+}
+
+#[cfg(test)]
 impl LockBased {
+    fn clone_for_test(&self) -> Self {
+        Self {
+            owners: self.owners.clone(),
+            read_versions: self.read_versions.clone(),
+        }
+    }
+
+    fn snapshot_for_test(&self) -> LockBasedSnapshotForTest {
+        LockBasedSnapshotForTest {
+            owners: self.owners.clone(),
+            read_versions: self.read_versions.clone(),
+        }
+    }
+
     fn record_read_for_test(
         &mut self,
         transaction: TransactionId,
@@ -3655,6 +3676,30 @@ pub(crate) fn execute_research_transaction_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ActualLockErrorKind {
+        ReadOwnedByOther,
+        ReadVersionMismatch,
+        WriteOwnedByOther,
+        WriteVersionMismatch,
+    }
+
+    fn classify_actual_lock_error(error: &str) -> Option<ActualLockErrorKind> {
+        if error.contains("transaction read conflict: granule is owned by another transaction") {
+            Some(ActualLockErrorKind::ReadOwnedByOther)
+        } else if error.contains("transaction read conflict: optimistic read version changed") {
+            Some(ActualLockErrorKind::ReadVersionMismatch)
+        } else if error
+            .contains("transaction write conflict: granule is owned by another transaction")
+        {
+            Some(ActualLockErrorKind::WriteOwnedByOther)
+        } else if error.contains("transaction write conflict: optimistic read version changed") {
+            Some(ActualLockErrorKind::WriteVersionMismatch)
+        } else {
+            None
+        }
+    }
 
     fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
         with_transaction_object_metadata(wasm, &[1, 1, 0, 0])
@@ -6615,8 +6660,11 @@ mod tests {
         use proptest::prelude::*;
         use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
 
-        const MODEL_LOCK_BASED_MAX_EXHAUSTIVE_LEN: usize = 5;
-        const MODEL_LOCK_BASED_EXHAUSTIVE_SCHEDULES: usize = 3_368_421;
+        const MODEL_LOCK_BASED_EXHAUSTIVE_ENV: &str = "WASMTIME_TRANSACTION_LOCK_MODEL_EXHAUSTIVE";
+        const MODEL_LOCK_BASED_DEFAULT_MAX_EXHAUSTIVE_LEN: usize = 3;
+        const MODEL_LOCK_BASED_DEFAULT_EXHAUSTIVE_SCHEDULES: usize = 8_421;
+        const MODEL_LOCK_BASED_FULL_MAX_EXHAUSTIVE_LEN: usize = 5;
+        const MODEL_LOCK_BASED_FULL_EXHAUSTIVE_SCHEDULES: usize = 3_368_421;
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum LockModelOp {
@@ -6648,20 +6696,12 @@ mod tests {
         }
 
         impl LockModelErrorKind {
-            fn message_fragment(self) -> &'static str {
+            fn as_actual(self) -> ActualLockErrorKind {
                 match self {
-                    Self::ReadOwnedByOther => {
-                        "transaction read conflict: granule is owned by another transaction"
-                    }
-                    Self::ReadVersionMismatch => {
-                        "transaction read conflict: optimistic read version changed"
-                    }
-                    Self::WriteOwnedByOther => {
-                        "transaction write conflict: granule is owned by another transaction"
-                    }
-                    Self::WriteVersionMismatch => {
-                        "transaction write conflict: optimistic read version changed"
-                    }
+                    Self::ReadOwnedByOther => ActualLockErrorKind::ReadOwnedByOther,
+                    Self::ReadVersionMismatch => ActualLockErrorKind::ReadVersionMismatch,
+                    Self::WriteOwnedByOther => ActualLockErrorKind::WriteOwnedByOther,
+                    Self::WriteVersionMismatch => ActualLockErrorKind::WriteVersionMismatch,
                 }
             }
         }
@@ -6841,15 +6881,15 @@ mod tests {
             Ok(granule)
         }
 
-        fn snapshot_lock_state(locks: &LockBased) -> Result<LockModelState> {
+        fn snapshot_lock_state(snapshot: &LockBasedSnapshotForTest) -> Result<LockModelState> {
             let mut state = LockModelState::default();
-            for (&granule, &owner) in &locks.owners {
+            for (&granule, &owner) in &snapshot.owners {
                 let granule = decode_model_granule(granule)?;
                 let owner = owner.as_raw();
                 state.owners.insert(granule, owner);
                 state.owner_sets.entry(owner).or_default().insert(granule);
             }
-            for (&(reader, granule), &version) in &locks.read_versions {
+            for (&(reader, granule), &version) in &snapshot.read_versions {
                 let reader = reader.as_raw();
                 let granule = decode_model_granule(granule)?;
                 state.read_versions.insert((reader, granule), version);
@@ -6898,11 +6938,18 @@ mod tests {
             if let Some(error_kind) = step.error_kind {
                 let actual_error = actual_error
                     .context("real LockBased op succeeded when model expected error")?;
+                let actual_error_kind =
+                    classify_actual_lock_error(actual_error).with_context(|| {
+                        format!(
+                            "schedule prefix {prefix:?} produced unclassified lock error {:?}",
+                            actual_error
+                        )
+                    })?;
                 ensure!(
-                    actual_error.contains(error_kind.message_fragment()),
-                    "schedule prefix {prefix:?} expected error {:?} containing {:?}, got {:?}",
-                    error_kind,
-                    error_kind.message_fragment(),
+                    actual_error_kind == error_kind.as_actual(),
+                    "schedule prefix {prefix:?} expected error {:?}, got {:?} from {:?}",
+                    error_kind.as_actual(),
+                    actual_error_kind,
                     actual_error
                 );
             } else {
@@ -6979,7 +7026,7 @@ mod tests {
             let mut model = LockModelState::default();
             let mut prefix = Vec::with_capacity(schedule.len());
 
-            let actual_initial = snapshot_lock_state(&locks)?;
+            let actual_initial = snapshot_lock_state(&locks.snapshot_for_test())?;
             ensure!(
                 actual_initial == model,
                 "initial lock state diverged before running any schedule"
@@ -6990,7 +7037,7 @@ mod tests {
                 let before = model.clone();
                 let step = model.apply(op);
                 let actual_error = apply_lock_model_op(&mut locks, op);
-                let actual = snapshot_lock_state(&locks)?;
+                let actual = snapshot_lock_state(&locks.snapshot_for_test())?;
                 model.assert_internal_invariants()?;
                 ensure!(
                     actual == model,
@@ -7040,11 +7087,11 @@ mod tests {
 
                 for &op in alphabet {
                     prefix.push(op);
-                    let mut next_real = real.clone();
+                    let mut next_real = real.clone_for_test();
                     let mut next_model = model.clone();
                     let step = next_model.apply(op);
                     let actual_error = apply_lock_model_op(&mut next_real, op);
-                    let actual = snapshot_lock_state(&next_real)?;
+                    let actual = snapshot_lock_state(&next_real.snapshot_for_test())?;
                     next_model.assert_internal_invariants()?;
                     ensure!(
                         actual == next_model,
@@ -7130,35 +7177,54 @@ mod tests {
 
         #[test]
         fn model_lock_based_exhaustive_small_schedules_match_reference_world() {
-            // Wave 5 keeps the full 20-op alphabet for txs 1/2, granules 0/1, and
-            // versions 0/1. Exhaustive enumeration through length 5 covers
-            // 3,368,421 schedules, which is still tractable without OS threads.
-            let schedule_count =
-                run_exhaustive_lock_model_schedules(MODEL_LOCK_BASED_MAX_EXHAUSTIVE_LEN).unwrap();
+            // Default runs stay quick by covering the full alphabet through length 3.
+            // Opt in to the full depth-5 enumeration when explicitly requested.
+            let full_exhaustive =
+                std::env::var(MODEL_LOCK_BASED_EXHAUSTIVE_ENV).is_ok_and(|value| value == "1");
+            let (max_len, expected_schedule_count) = if full_exhaustive {
+                (
+                    MODEL_LOCK_BASED_FULL_MAX_EXHAUSTIVE_LEN,
+                    MODEL_LOCK_BASED_FULL_EXHAUSTIVE_SCHEDULES,
+                )
+            } else {
+                (
+                    MODEL_LOCK_BASED_DEFAULT_MAX_EXHAUSTIVE_LEN,
+                    MODEL_LOCK_BASED_DEFAULT_EXHAUSTIVE_SCHEDULES,
+                )
+            };
 
-            assert_eq!(schedule_count, MODEL_LOCK_BASED_EXHAUSTIVE_SCHEDULES);
+            let schedule_count = run_exhaustive_lock_model_schedules(max_len).unwrap();
+
+            assert_eq!(schedule_count, expected_schedule_count);
         }
 
         #[test]
         fn model_lock_based_generated_schedules_match_reference_world() {
-            let mut runner = TestRunner::new(Config {
-                cases: 128,
-                failure_persistence: None,
-                max_shrink_iters: 256,
-                rng_seed: RngSeed::Fixed(0x5eed_0005),
-                ..Config::default()
-            });
+            // Exhaustive coverage already owns the tiny prefix space. These fixed-seed
+            // profiles spend the same budget on longer churn histories instead.
+            for (cases, seed, len_range) in [
+                (64, 0x5eed_0005, 4..=12usize),
+                (32, 0x5eed_0505, 24..=48usize),
+            ] {
+                let mut runner = TestRunner::new(Config {
+                    cases,
+                    failure_persistence: None,
+                    max_shrink_iters: 256,
+                    rng_seed: RngSeed::Fixed(seed),
+                    ..Config::default()
+                });
 
-            runner
-                .run(
-                    &prop::collection::vec(lock_model_op_strategy(), 0..=20),
-                    |schedule| {
-                        run_lock_model_schedule(&schedule)
-                            .map_err(|error| TestCaseError::fail(error.to_string()))?;
-                        Ok(())
-                    },
-                )
-                .unwrap();
+                runner
+                    .run(
+                        &prop::collection::vec(lock_model_op_strategy(), len_range),
+                        |schedule| {
+                            run_lock_model_schedule(&schedule)
+                                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+            }
         }
     }
 
@@ -7973,15 +8039,17 @@ mod tests {
         locks.acquire_write_for_test(first, granule, 3).unwrap();
 
         let read_error = locks.record_read_for_test(second, granule, 3).unwrap_err();
-        assert!(read_error.to_string().contains("transaction read conflict"));
+        assert_eq!(
+            classify_actual_lock_error(&read_error.to_string()),
+            Some(ActualLockErrorKind::ReadOwnedByOther)
+        );
 
         let write_error = locks
             .acquire_write_for_test(second, granule, 3)
             .unwrap_err();
-        assert!(
-            write_error
-                .to_string()
-                .contains("transaction write conflict")
+        assert_eq!(
+            classify_actual_lock_error(&write_error.to_string()),
+            Some(ActualLockErrorKind::WriteOwnedByOther)
         );
     }
 
@@ -8036,7 +8104,10 @@ mod tests {
         let error = locks
             .acquire_write_for_test(second, conflicted, 9)
             .unwrap_err();
-        assert!(error.to_string().contains("transaction write conflict"));
+        assert_eq!(
+            classify_actual_lock_error(&error.to_string()),
+            Some(ActualLockErrorKind::WriteOwnedByOther)
+        );
         assert_eq!(locks.owner_for_test(independent), Some(second));
 
         locks.abort_for_test(second);
@@ -8063,7 +8134,10 @@ mod tests {
         let error = locks
             .validate_read_for_test(reader, granule, 8)
             .unwrap_err();
-        assert!(error.to_string().contains("transaction read conflict"));
+        assert_eq!(
+            classify_actual_lock_error(&error.to_string()),
+            Some(ActualLockErrorKind::ReadVersionMismatch)
+        );
     }
 
     #[test]
