@@ -226,7 +226,7 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
         }
     }
 
-    if layout.has_memory_zero {
+    if layout.has_memory_zero && needs_transaction_metadata(&report, &transaction_functions) {
         let metadata = encode_transaction_objects(&transaction_functions);
         module.section(&CustomSection {
             name: Cow::Borrowed(TRANSACTION_OBJECTS_CUSTOM_SECTION),
@@ -235,6 +235,21 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
     }
 
     Ok((module.finish(), report))
+}
+
+fn needs_transaction_metadata(
+    report: &RewriteReport,
+    transaction_functions: &BTreeSet<u32>,
+) -> bool {
+    !transaction_functions.is_empty()
+        || report.i32_tloads != 0
+        || report.i64_tloads != 0
+        || report.f32_tloads != 0
+        || report.f64_tloads != 0
+        || report.i32_tstores != 0
+        || report.i64_tstores != 0
+        || report.f32_tstores != 0
+        || report.f64_tstores != 0
 }
 
 fn analyze_module(input: &[u8]) -> Result<ModuleLayout> {

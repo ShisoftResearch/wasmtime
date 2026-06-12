@@ -250,8 +250,8 @@ fn rewrite_preserves_non_tainted_scalar_memory_ops() {
     assert!(!printed.contains("i32.tstore"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
-    assert_eq!(metadata.memories, vec![0]);
+    assert_eq!(section_count, 0);
+    assert!(metadata.memories.is_empty());
     assert!(metadata.functions.is_empty());
 }
 
