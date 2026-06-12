@@ -770,6 +770,22 @@ mod tests {
     }
 
     #[test]
+    fn recovery_selects_latest_committed_tglobal_root_version() {
+        let region = sample_region_with_rewritten_global_root();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.root_object_ids, vec![42]);
+    }
+
+    #[test]
+    fn recovery_ignores_loose_end_ttable_root_update() {
+        let region = sample_region_with_loose_end_table_root_update();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.root_object_ids, vec![41]);
+    }
+
+    #[test]
     fn recovery_replays_tmemory_undo_for_loose_end_transaction() {
         let region = sample_region_with_loose_end_tmemory_undo();
         let recovered = recover_region_for_test(&region).unwrap();
@@ -1002,6 +1018,41 @@ mod tests {
         region
     }
 
+    fn sample_region_with_rewritten_global_root() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let logical_id = pack_test_granule_id(PackedGranuleDomain::TGlobal, 1);
+        append_committed_root_update(&mut region, 1, stream, 0, logical_id, 1, &[Some(41)]);
+        append_committed_root_update(&mut region, 1, stream, 1, logical_id, 2, &[Some(42)]);
+        region
+    }
+
+    fn sample_region_with_loose_end_table_root_update() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let committed_stream = region.alloc_stream(1).unwrap();
+        let loose_stream = region.alloc_stream(2).unwrap();
+        let logical_id = pack_test_granule_id(PackedGranuleDomain::TTable, 1);
+        append_committed_root_update(
+            &mut region,
+            1,
+            committed_stream,
+            0,
+            logical_id,
+            1,
+            &[Some(41)],
+        );
+        append_loose_end_root_update(
+            &mut region,
+            2,
+            loose_stream,
+            0,
+            logical_id,
+            2,
+            &[Some(42)],
+        );
+        region
+    }
+
     fn sample_region_with_loose_end_tmemory_undo() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream = region.alloc_stream(1).unwrap();
@@ -1180,6 +1231,39 @@ mod tests {
             location.data_offset,
             true,
         );
+        write_log_entries(region, log_block, &[entry]);
+    }
+
+    fn append_loose_end_root_update(
+        region: &mut VMemoryBlockRegion,
+        stream_id: u32,
+        stream: StreamCursor,
+        block_seq: u32,
+        logical_id: u64,
+        version: u32,
+        object_ids: &[Option<u64>],
+    ) {
+        let domain = packed_granule_domain(logical_id).unwrap();
+        let payload = encode_root_object_refs(object_ids);
+        let record = TMemory::encode_publication_data_record(
+            logical_id,
+            version,
+            domain as u16,
+            0,
+            &payload,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
+        let mut entry = TMemory::publication_log_entry(
+            logical_id,
+            version,
+            stream_id << 1,
+            location.data_block,
+            location.data_offset,
+            false,
+        );
+        entry.seal_crc32();
         write_log_entries(region, log_block, &[entry]);
     }
 
