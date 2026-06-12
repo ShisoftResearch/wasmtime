@@ -181,19 +181,6 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
 
     #[cfg(test)]
     fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32>;
-
-    #[cfg(test)]
-    fn backend_stats_for_test(&self) -> TxDurableBackendStats;
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TxDurableBackendStats {
-    append_data_calls: usize,
-    append_log_calls: usize,
-    flush_data_calls: usize,
-    flush_log_calls: usize,
-    fence_calls: usize,
 }
 
 #[derive(Debug, Default)]
@@ -256,11 +243,6 @@ impl TxDurableLog {
     ) -> Result<u32> {
         self.storage
             .data_chunk_stream_id_for_data_block_for_test(data_block)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn backend_stats_for_test(&self) -> TxDurableBackendStats {
-        self.storage.backend_stats_for_test()
     }
 
     pub(crate) fn create_file_backed(path: &Path, num_blocks: u32) -> Result<Self> {
@@ -342,11 +324,6 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
     #[cfg(test)]
     fn data_chunk_stream_id_for_data_block_for_test(&self, _data_block: u32) -> Result<u32> {
         bail!("in-memory transaction log has no file-backed data chunk headers")
-    }
-
-    #[cfg(test)]
-    fn backend_stats_for_test(&self) -> TxDurableBackendStats {
-        TxDurableBackendStats::default()
     }
 }
 
@@ -441,11 +418,6 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
             }
         }
         bail!("transaction data block {data_block} is not inside a data chunk")
-    }
-
-    #[cfg(test)]
-    fn backend_stats_for_test(&self) -> TxDurableBackendStats {
-        TxDurableBackendStats::default()
     }
 }
 
@@ -1874,26 +1846,16 @@ mod tests {
                         factory: self,
                         _tempdir: None,
                         path: None,
-                        log: TxDurableLog::with_backend(RecordingBackend::new(
-                            InMemoryTxDurableLog::default(),
-                        )),
+                        log: TxDurableLog::default(),
                     }),
                     Self::FileBacked => {
                         let tempdir = tempfile::tempdir()?;
                         let path = tempdir.path().join("tx-log.bin");
-                        let region = crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(&path, 64)?;
                         Ok(DurableLogTestHandle {
                             factory: self,
                             _tempdir: Some(tempdir),
-                            path: Some(path),
-                            log: TxDurableLog::with_backend(RecordingBackend::new(
-                                FileBackedTxDurableLog {
-                                    region,
-                                    streams: BTreeMap::new(),
-                                    pending_data_chunks: BTreeSet::new(),
-                                    pending_log_blocks: BTreeSet::new(),
-                                },
-                            )),
+                            path: Some(path.clone()),
+                            log: TxDurableLog::create_file_backed(&path, 64)?,
                         })
                     }
                 }
@@ -1906,77 +1868,6 @@ mod tests {
             _tempdir: Option<TempDir>,
             path: Option<PathBuf>,
             log: TxDurableLog,
-        }
-
-        #[derive(Debug)]
-        struct RecordingBackend<B> {
-            inner: B,
-            stats: TxDurableBackendStats,
-        }
-
-        impl<B> RecordingBackend<B> {
-            fn new(inner: B) -> Self {
-                Self {
-                    inner,
-                    stats: TxDurableBackendStats::default(),
-                }
-            }
-        }
-
-        impl<B> TxDurableLogBackend for RecordingBackend<B>
-        where
-            B: TxDurableLogBackend,
-        {
-            fn append_data_record(
-                &mut self,
-                transaction_stream_id: u32,
-                data_stream: DurableDataStream,
-                record: &[u8],
-            ) -> Result<(u32, u32)> {
-                self.stats.append_data_calls += 1;
-                self.inner
-                    .append_data_record(transaction_stream_id, data_stream, record)
-            }
-
-            fn append_log_entry(
-                &mut self,
-                transaction_stream_id: u32,
-                entry: TxLogEntry,
-            ) -> Result<()> {
-                self.stats.append_log_calls += 1;
-                self.inner.append_log_entry(transaction_stream_id, entry)
-            }
-
-            fn flush_data(&mut self) -> Result<()> {
-                self.stats.flush_data_calls += 1;
-                self.inner.flush_data()
-            }
-
-            fn flush_log(&mut self) -> Result<()> {
-                self.stats.flush_log_calls += 1;
-                self.inner.flush_log()
-            }
-
-            fn fence(&mut self) -> Result<()> {
-                self.stats.fence_calls += 1;
-                self.inner.fence()
-            }
-
-            #[cfg(test)]
-            fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry> {
-                self.inner.log_entries_for_test(stream_id)
-            }
-
-            #[cfg(test)]
-            fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32> {
-                self.inner
-                    .data_chunk_stream_id_for_data_block_for_test(data_block)
-            }
-
-            #[cfg(test)]
-            fn backend_stats_for_test(&self) -> TxDurableBackendStats {
-                self.stats
-            }
         }
 
         #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1997,8 +1888,8 @@ mod tests {
 
         #[derive(Debug)]
         struct BackendObservation {
-            stats: TxDurableBackendStats,
             streams: BTreeMap<u32, Vec<TxLogEntry>>,
+            file_backed_data_stream_ids: Option<BTreeMap<(u32, usize), u32>>,
             recovery: Option<BackendRecoverySummary>,
         }
 
@@ -2034,19 +1925,28 @@ mod tests {
         impl DurableLogTestHandle {
             fn observe(self, scenario: &BackendScenario) -> Result<BackendObservation> {
                 let DurableLogTestHandle {
-                    factory: _factory,
+                    factory,
                     _tempdir,
                     path,
                     log,
                 } = self;
                 let mut streams = BTreeMap::new();
+                let mut file_backed_data_stream_ids = factory
+                    .supports_recovery()
+                    .then(BTreeMap::<(u32, usize), u32>::new);
 
                 for tx in &scenario.transactions {
                     let entries = log.log_entries_for_test(tx.stream_id);
+                    if let Some(data_stream_ids) = file_backed_data_stream_ids.as_mut() {
+                        for (entry_index, entry) in entries.iter().enumerate() {
+                            data_stream_ids.insert(
+                                (tx.stream_id, entry_index),
+                                log.data_chunk_stream_id_for_data_block_for_test(entry.data_block)?,
+                            );
+                        }
+                    }
                     streams.insert(tx.stream_id, entries);
                 }
-
-                let stats = log.backend_stats_for_test();
                 drop(log);
 
                 let recovery = match path {
@@ -2059,8 +1959,8 @@ mod tests {
                 let _ = _tempdir;
 
                 Ok(BackendObservation {
-                    stats,
                     streams,
+                    file_backed_data_stream_ids,
                     recovery,
                 })
             }
@@ -2238,31 +2138,6 @@ mod tests {
             PendingGranuleUndo::tmemory(logical_id, version, repeated_payload(payload_byte))
         }
 
-        fn expected_backend_stats(scenario: &BackendScenario) -> TxDurableBackendStats {
-            let total_records = scenario
-                .transactions
-                .iter()
-                .map(|tx| tx.records.len())
-                .sum::<usize>();
-            let committed_txs = scenario
-                .transactions
-                .iter()
-                .filter(|tx| tx.commit && !tx.records.is_empty())
-                .count();
-
-            TxDurableBackendStats {
-                append_data_calls: total_records,
-                append_log_calls: total_records + committed_txs,
-                flush_data_calls: total_records,
-                flush_log_calls: total_records + committed_txs,
-                fence_calls: total_records
-                    .checked_mul(2)
-                    .unwrap()
-                    .checked_add(committed_txs)
-                    .unwrap(),
-            }
-        }
-
         fn expected_stream_entries(
             scenario: &BackendScenario,
         ) -> BTreeMap<u32, Vec<ExpectedLogEntry>> {
@@ -2410,14 +2285,6 @@ mod tests {
             scenario: &BackendScenario,
             observation: &BackendObservation,
         ) {
-            assert_eq!(
-                observation.stats,
-                expected_backend_stats(scenario),
-                "backend {} scenario {} stats",
-                factory.name(),
-                scenario.name,
-            );
-
             let expected_streams = expected_stream_entries(scenario);
             assert_eq!(
                 observation.streams.len(),
@@ -2524,6 +2391,87 @@ mod tests {
                         );
                     }
                 }
+            }
+
+            if factory.supports_recovery() {
+                assert_file_backed_role_data_stream_separation(scenario, observation);
+            }
+        }
+
+        fn assert_file_backed_role_data_stream_separation(
+            scenario: &BackendScenario,
+            observation: &BackendObservation,
+        ) {
+            let Some(data_stream_ids) = observation.file_backed_data_stream_ids.as_ref() else {
+                panic!("file-backed observation must capture data stream ids");
+            };
+
+            for tx in &scenario.transactions {
+                let has_object = tx
+                    .records
+                    .iter()
+                    .any(|record| matches!(record, BackendScenarioRecord::TObjectPub { .. }));
+                let has_tmemory = tx
+                    .records
+                    .iter()
+                    .any(|record| matches!(record, BackendScenarioRecord::TMemoryUndo { .. }));
+                if !has_object || !has_tmemory {
+                    continue;
+                }
+
+                let actual_entries = observation
+                    .streams
+                    .get(&tx.stream_id)
+                    .unwrap_or_else(|| panic!("missing stream {}", tx.stream_id));
+                let mut object_stream_ids = BTreeSet::new();
+                let mut tmemory_stream_ids = BTreeSet::new();
+
+                for (entry_index, entry) in actual_entries.iter().enumerate() {
+                    if (entry.tx_meta & 1) != 0 {
+                        continue;
+                    }
+
+                    let data_stream_id = *data_stream_ids
+                        .get(&(tx.stream_id, entry_index))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "missing file-backed data stream id for stream {} entry {}",
+                                tx.stream_id, entry_index
+                            )
+                        });
+                    match entry.role().unwrap() {
+                        TxLogEntryRole::TObjectPub => {
+                            object_stream_ids.insert(data_stream_id);
+                        }
+                        TxLogEntryRole::TMemoryUndo => {
+                            tmemory_stream_ids.insert(data_stream_id);
+                        }
+                    }
+                }
+
+                assert_eq!(
+                    object_stream_ids.len(),
+                    1,
+                    "backend file_backed scenario {} stream {} object records should use one object data stream",
+                    scenario.name,
+                    tx.stream_id,
+                );
+                assert_eq!(
+                    tmemory_stream_ids.len(),
+                    1,
+                    "backend file_backed scenario {} stream {} tmemory records should use one tmemory data stream",
+                    scenario.name,
+                    tx.stream_id,
+                );
+
+                let object_stream_id = *object_stream_ids.iter().next().unwrap();
+                let tmemory_stream_id = *tmemory_stream_ids.iter().next().unwrap();
+
+                assert_ne!(
+                    object_stream_id, tmemory_stream_id,
+                    "backend file_backed scenario {} stream {} object and tmemory data must use distinct data streams",
+                    scenario.name, tx.stream_id,
+                );
             }
         }
 

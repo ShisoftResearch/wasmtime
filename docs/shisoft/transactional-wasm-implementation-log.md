@@ -39,15 +39,17 @@ Changes in this slice:
 - Added a file-backed factory that creates temp path-backed logs and compares
   recovered durable summaries via
   `TxDurableLog::recover_file_backed_for_test`.
-- Added an in-memory factory that runs the same append, flush, fence, LP, and
-  log-entry ordering scenarios through a recording wrapper over the in-memory
-  durable-log backend, without claiming reopen recovery coverage.
+- Added an in-memory factory that runs the same LP visibility, log-entry role,
+  tx-id, CRC, and data-pointer ordering scenarios through the default
+  in-memory durable log, without claiming reopen recovery coverage.
 - Added deterministic conformance scenarios for object-only commit,
   `tmemory`-undo-only commit, mixed commit, mixed loose end, and multi-stream
   transaction ids.
-- Added shared assertions for backend call counts, log-entry roles, tx ids,
-  final-LP counts, CRC sealing, and LP data-pointer reuse, with recovery
-  summary comparison enabled only for the file-backed backend.
+- Added shared assertions for log-entry roles, tx ids, final-LP placement, CRC
+  sealing, and LP data-pointer reuse across both backends, with recovery
+  summary comparison enabled only for the file-backed backend and
+  role-specific object-vs-`tmemory` data-stream separation checked in the
+  file-backed mixed conformance scenarios.
 
 Semantic note for this slice:
 
