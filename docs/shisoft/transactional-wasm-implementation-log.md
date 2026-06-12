@@ -1608,6 +1608,49 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## File-Backed TMemory WAST Recovery
+
+Date: 2026-06-12
+
+Added end-to-end WAST restart/recovery coverage for file-backed transactional
+linear `tmemory`. The WAST fixtures use real transaction syntax (`tmemory`,
+`tfunc`, `i32.tload`, `i32.tstore`, and `tinvoke`) with assertions kept in the
+`.wast` files; restart and recovery orchestration lives in Rust because WAST has
+no restart directive.
+
+Runtime/harness work in this tranche:
+
+- Store-local transaction configuration can create or reopen a file-backed
+  `tmemory` image and a file-backed durable transaction log.
+- File-backed `tmemory` can reopen an existing image without truncating it, while
+  preserving the block-region storage layout.
+- A hidden `_internal::transaction_persistence` helper recovers the durable log
+  and applies loose-end `tmemory` undo records to an existing file-backed
+  `tmemory` image.
+- `tests/transaction_persistence_wast.rs` runs phase-A WAST, drops that store,
+  runs recovery against the same files, and then runs phase-B WAST against the
+  recovered storage.
+- Coverage now includes committed reopen persistence, ordinary trap/abort
+  semantics, and a controlled loose-end failure after durable undo plus in-place
+  file-backed write but before LP. The loose-end test checks the dirty file bytes
+  before recovery, then verifies from WAST that recovery restored the old value.
+
+Deferred:
+
+- Persistent object WAST recovery remains future work until object publication,
+  object-table rebuild, and GC-backed persistent object identity are fully wired
+  into the embedder/runtime path.
+
+Verification:
+
+```text
+cargo test --test transaction_persistence_wast -- --format terse
+test result: ok. 3 passed; 0 failed
+
+cargo check -p wasmtime
+Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
 ## Zen-Style Object Log Recovery Smoke Path
 
 Date: 2026-06-10
