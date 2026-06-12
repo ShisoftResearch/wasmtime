@@ -7306,9 +7306,16 @@ mod tests {
         #[derive(Clone, Copy, Debug)]
         struct ModelObjectSeed {
             object_id: u64,
-            kind: u16,
             field: i32,
             committed: bool,
+        }
+
+        #[derive(Debug)]
+        struct RecoveredObjectHistory {
+            rebuilt: ObjectTable,
+            recovered_region:
+                crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion,
+            object_winners: Vec<crate::runtime::vm::RecoveredObjectWinner>,
         }
 
         fn model_kind_strategy() -> impl Strategy<Value = u16> {
@@ -7319,41 +7326,37 @@ mod tests {
         }
 
         fn model_object_history_strategy() -> impl Strategy<Value = Vec<ModelObjectRecord>> {
-            prop::collection::vec(
-                (
-                    0u64..=3u64,
-                    model_kind_strategy(),
-                    -20i32..=20i32,
-                    any::<bool>(),
-                )
-                    .prop_map(|(object_id, kind, field, committed)| {
-                        ModelObjectSeed {
+            prop::collection::vec(model_kind_strategy(), 4).prop_flat_map(|kinds| {
+                prop::collection::vec(
+                    (0u64..=3u64, -20i32..=20i32, any::<bool>()).prop_map(
+                        |(object_id, field, committed)| ModelObjectSeed {
                             object_id,
-                            kind,
                             field,
                             committed,
-                        }
-                    }),
-                1..=8usize,
-            )
-            .prop_map(|seeds| {
-                let mut versions = BTreeMap::<u64, u32>::new();
-                seeds
-                    .into_iter()
-                    .map(|seed| {
-                        let next_version = versions
-                            .entry(seed.object_id)
-                            .and_modify(|version| *version += 1)
-                            .or_insert(1);
-                        ModelObjectRecord {
-                            object_id: seed.object_id,
-                            version: *next_version,
-                            kind: seed.kind,
-                            field: seed.field,
-                            committed: seed.committed,
-                        }
-                    })
-                    .collect()
+                        },
+                    ),
+                    1..=8usize,
+                )
+                .prop_map(move |seeds| {
+                    let mut versions = BTreeMap::<u64, u32>::new();
+                    seeds
+                        .into_iter()
+                        .map(|seed| {
+                            let next_version = versions
+                                .entry(seed.object_id)
+                                .and_modify(|version| *version += 1)
+                                .or_insert(1);
+                            let kind_index = usize::try_from(seed.object_id).unwrap();
+                            ModelObjectRecord {
+                                object_id: seed.object_id,
+                                version: *next_version,
+                                kind: kinds[kind_index],
+                                field: seed.field,
+                                committed: seed.committed,
+                            }
+                        })
+                        .collect()
+                })
             })
         }
 
@@ -7365,52 +7368,57 @@ mod tests {
             })
         }
 
+        fn model_domain(
+            record: &ModelObjectRecord,
+        ) -> Result<crate::runtime::vm::PackedGranuleDomain> {
+            Ok(match object_kind_from_u16(record.kind)? {
+                ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
+                ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
+                kind => bail!("unsupported model object kind for durable publication: {kind:?}"),
+            })
+        }
+
         fn model_type_index(record: &ModelObjectRecord) -> Result<u32> {
             u32::try_from(record.object_id)
                 .context("model object id does not fit u32 for type index")
                 .map(|id| 100 + id)
         }
 
-        fn winner_for_model_record(
-            record: &ModelObjectRecord,
-        ) -> Result<crate::runtime::vm::RecoveredObjectWinner> {
-            let payload = model_payload(record)?;
-            Ok(crate::runtime::vm::RecoveredObjectWinner {
-                object_id: record.object_id,
-                version: record.version,
-                kind: record.kind,
-                type_index: model_type_index(record)?,
-                record_bytes: encode_object_record_for_test(
-                    record.object_id,
-                    record.version,
-                    model_type_index(record)?,
-                    &payload,
-                )?,
-            })
+        fn model_record_bytes(record: &ModelObjectRecord) -> Result<Vec<u8>> {
+            encode_object_record_for_test(
+                record.object_id,
+                record.version,
+                model_type_index(record)?,
+                &model_payload(record)?,
+            )
+        }
+
+        fn model_publication(record: &ModelObjectRecord) -> Result<persist::PendingPublication> {
+            persist::PendingPublication::persistent_object(
+                model_domain(record)?,
+                record.object_id,
+                record.version,
+                model_type_index(record)?,
+                model_record_bytes(record)?,
+            )
         }
 
         fn expected_latest_committed_by_object(
             history: &[ModelObjectRecord],
         ) -> BTreeMap<u64, ModelObjectRecord> {
             let mut latest = BTreeMap::<u64, ModelObjectRecord>::new();
+            let mut committed_versions = BTreeSet::<(u64, u32)>::new();
             for &record in history {
                 if !record.committed {
                     continue;
                 }
+                assert!(
+                    committed_versions.insert((record.object_id, record.version)),
+                    "generated model history should not contain duplicate committed object/version pairs"
+                );
                 match latest.get(&record.object_id).copied() {
                     Some(current) if current.version > record.version => {}
-                    Some(current) if current.version == record.version => {
-                        assert_eq!(
-                            current.kind, record.kind,
-                            "duplicate committed model version changed kind for object {}",
-                            record.object_id
-                        );
-                        assert_eq!(
-                            current.field, record.field,
-                            "duplicate committed model version changed field for object {}",
-                            record.object_id
-                        );
-                    }
+                    Some(current) if current.version == record.version => unreachable!(),
                     _ => {
                         latest.insert(record.object_id, record);
                     }
@@ -7427,28 +7435,69 @@ mod tests {
             Ok(objects)
         }
 
-        fn rebuild_object_table_from_history(history: &[ModelObjectRecord]) -> Result<ObjectTable> {
-            let winners = expected_latest_committed_by_object(history)
-                .into_values()
-                .map(|record| winner_for_model_record(&record))
-                .collect::<Result<Vec<_>>>()?;
-            rebuild_object_table_from_winners(&winners)
+        fn recover_object_history(history: &[ModelObjectRecord]) -> Result<RecoveredObjectHistory> {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("tx-log.bin");
+            let mut log = TxDurableLog::create_file_backed(&path, 64)?;
+
+            for (index, record) in history.iter().enumerate() {
+                let stream_id =
+                    u32::try_from(index.checked_add(1).context(
+                        "model object history index overflow while assigning stream id",
+                    )?)
+                    .context("model object history stream id does not fit u32")?;
+                let txid = stream_id
+                    .checked_add(400)
+                    .context("model object history txid overflow")?;
+                let publication = model_publication(record)?;
+                let marker = {
+                    let mut sink = log.stream_sink(stream_id);
+                    let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+                    publisher.publish_object_publication_before_commit(&publication)?
+                };
+                if record.committed {
+                    let mut sink = log.stream_sink(stream_id);
+                    let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+                    publisher.publish_commit_lp(marker)?;
+                }
+            }
+            drop(log);
+
+            let recovered_region = TxDurableLog::recover_file_backed_for_test(&path)?;
+            let object_winners =
+                crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+                    &path,
+                )?;
+            let mut rebuilt = ObjectTable::default();
+            rebuilt.rebuild_from_recovery_for_test(&object_winners)?;
+
+            Ok(RecoveredObjectHistory {
+                rebuilt,
+                recovered_region,
+                object_winners,
+            })
+        }
+
+        fn recover_rebuilt_object_history(history: &[ModelObjectRecord]) -> Result<ObjectTable> {
+            Ok(recover_object_history(history)?.rebuilt)
         }
 
         fn expected_logical_id(record: &ModelObjectRecord) -> Result<u64> {
-            let domain = match object_kind_from_u16(record.kind)? {
-                ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
-                ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
-                kind => bail!("unsupported model object kind for logical id: {kind:?}"),
-            };
-            crate::runtime::vm::pack_object_granule_id(domain, record.object_id)
+            crate::runtime::vm::pack_object_granule_id(model_domain(record)?, record.object_id)
         }
 
-        fn assert_model_object_rebuild_matches_history(
+        fn assert_model_object_rebuild_matches_real_recovery(
             history: &[ModelObjectRecord],
         ) -> Result<()> {
             let expected = expected_latest_committed_by_object(history);
-            let rebuilt = rebuild_object_table_from_history(history)?;
+            let recovered = recover_object_history(history)?;
+            let rebuilt = &recovered.rebuilt;
+            let recovered_versions = recovered
+                .recovered_region
+                .object_winners
+                .iter()
+                .map(|winner| (winner.object_id, winner.version))
+                .collect::<BTreeMap<_, _>>();
 
             ensure!(
                 rebuilt.live_count() == expected.len(),
@@ -7483,8 +7532,17 @@ mod tests {
                     "rebuilt publication version mismatch for object {object_id}"
                 );
                 ensure!(
+                    rebuilt.pending_publication_for_test(object)?.type_info
+                        == model_type_index(record)?,
+                    "rebuilt publication type info mismatch for object {object_id}"
+                );
+                ensure!(
                     rebuilt.trace_object_ids(object)?.is_empty(),
                     "model payloads should not carry object references"
+                );
+                ensure!(
+                    recovered_versions.get(&object_id) == Some(&record.version),
+                    "recovered summary version mismatch for object {object_id}"
                 );
             }
 
@@ -7502,6 +7560,13 @@ mod tests {
                     record.object_id
                 );
             }
+
+            ensure!(
+                recovered.object_winners.len() == expected.len(),
+                "recovered object winner count mismatch\nexpected: {}\nactual:   {}",
+                expected.len(),
+                recovered.object_winners.len()
+            );
 
             Ok(())
         }
@@ -7522,7 +7587,7 @@ mod tests {
 
         #[test]
         fn model_object_rebuild_latest_committed_version_wins() {
-            let rebuilt = rebuild_object_table_from_history(&[
+            let rebuilt = recover_rebuilt_object_history(&[
                 ModelObjectRecord {
                     object_id: 41,
                     version: 2,
@@ -7564,11 +7629,18 @@ mod tests {
                     .version,
                 9
             );
+            assert_eq!(
+                rebuilt
+                    .pending_publication_for_test(ObjectId { object_index: 41 })
+                    .unwrap()
+                    .type_info,
+                141
+            );
         }
 
         #[test]
         fn model_object_rebuild_ignores_loose_end_publication() {
-            let rebuilt = rebuild_object_table_from_history(&[
+            let rebuilt = recover_rebuilt_object_history(&[
                 ModelObjectRecord {
                     object_id: 52,
                     version: 1,
@@ -7595,7 +7667,7 @@ mod tests {
 
         #[test]
         fn model_object_rebuild_preserves_recovered_object_identity() {
-            let rebuilt = rebuild_object_table_from_history(&[
+            let rebuilt = recover_rebuilt_object_history(&[
                 ModelObjectRecord {
                     object_id: 77,
                     version: 4,
@@ -7630,6 +7702,13 @@ mod tests {
                 )
                 .unwrap()
             );
+            assert_eq!(
+                rebuilt
+                    .pending_publication_for_test(object)
+                    .unwrap()
+                    .type_info,
+                203
+            );
         }
 
         #[test]
@@ -7645,7 +7724,33 @@ mod tests {
         }
 
         #[test]
-        fn model_object_rebuild_generated_histories_match_highest_committed_versions() {
+        fn model_object_rebuild_rejects_duplicate_committed_same_version() {
+            let err = recover_object_history(&[
+                ModelObjectRecord {
+                    object_id: 9,
+                    version: 4,
+                    kind: ObjectKind::Struct as u16,
+                    field: 11,
+                    committed: true,
+                },
+                ModelObjectRecord {
+                    object_id: 9,
+                    version: 4,
+                    kind: ObjectKind::Struct as u16,
+                    field: 22,
+                    committed: true,
+                },
+            ])
+            .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("duplicate committed object version 4 for object id 9")
+            );
+        }
+
+        #[test]
+        fn model_object_rebuild_generated_histories_match_real_recovery_and_reference_model() {
             let mut runner = TestRunner::new(Config {
                 cases: 64,
                 failure_persistence: None,
@@ -7656,7 +7761,7 @@ mod tests {
 
             runner
                 .run(&model_object_history_strategy(), |history| {
-                    assert_model_object_rebuild_matches_history(&history)
+                    assert_model_object_rebuild_matches_real_recovery(&history)
                         .map_err(|error| TestCaseError::fail(error.to_string()))
                 })
                 .unwrap();

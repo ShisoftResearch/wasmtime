@@ -39,13 +39,30 @@ Changes in this slice:
 - Added deterministic rebuild coverage proving that the highest committed
   version wins per object id, loose-end object publications stay invisible,
   rebuilt persistent objects preserve their recovered `ObjectId` as runtime
-  identity, and corrupt payload/header mismatches are rejected during rebuild.
+  identity, duplicate committed same-version object publications are rejected
+  by real recovery, and corrupt payload/header mismatches are rejected during
+  rebuild.
+- Replaced the earlier tautological helper path with a real file-backed durable
+  log harness: the tests now publish the full model history through
+  `TxDurableLog`, omit LPs for loose-end records, reopen the durable region,
+  recover real object winners, and only then call
+  `ObjectTable::rebuild_from_recovery_for_test`.
 - Added fixed-seed generated rebuild histories over small struct/array object
-  records and compared rebuilt `ObjectTable` state against the reference model's
-  highest committed version per `ObjectId`, including payload bytes, kind,
-  logical id, publication version, persistence bit, and live-slot count.
+  records and compared rebuilt `ObjectTable` state against the independent
+  reference model's highest committed version per `ObjectId`, including payload
+  bytes, kind, logical id, publication version, publication `type_info`,
+  persistence bit, live-slot count, and the file-backed recovery summary's
+  selected winner versions.
 - Kept the implementation localized to test-only helpers in
   `transaction.rs`; no production object semantics changed for this slice.
+
+Semantic note for this slice:
+
+- Generated histories intentionally assign monotonically increasing versions per
+  object id, so they exercise the ordinary winner-selection path without
+  duplicate committed object/version pairs. A separate deterministic regression
+  now proves that real recovery rejects duplicate committed same-version object
+  publications instead of silently accepting them.
 
 Verification commands for this slice:
 
