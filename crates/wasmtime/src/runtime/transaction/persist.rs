@@ -1797,6 +1797,11 @@ mod tests {
                 version: u32,
                 payload_byte: u8,
             },
+            TRootPub {
+                logical_id: u64,
+                version: u32,
+                object_ids: &'static [Option<u64>],
+            },
             TMemoryUndo {
                 logical_id: u64,
                 version: u32,
@@ -1873,6 +1878,7 @@ mod tests {
         #[derive(Clone, Debug, Default, Eq, PartialEq)]
         struct BackendRecoverySummary {
             object_winners: BTreeSet<(u64, u32)>,
+            root_object_ids: BTreeSet<u64>,
             tmemory_undo_rollbacks: BTreeSet<(u64, u32, Vec<u8>)>,
             tmemory_undo_rollback_count: usize,
         }
@@ -1897,19 +1903,24 @@ mod tests {
             fn logical_id(self) -> u64 {
                 match self {
                     Self::TObjectPub { object_id, .. } => object_logical_id(object_id),
+                    Self::TRootPub { logical_id, .. } => logical_id,
                     Self::TMemoryUndo { logical_id, .. } => logical_id,
                 }
             }
 
             fn version(self) -> u32 {
                 match self {
-                    Self::TObjectPub { version, .. } | Self::TMemoryUndo { version, .. } => version,
+                    Self::TObjectPub { version, .. }
+                    | Self::TRootPub { version, .. }
+                    | Self::TMemoryUndo { version, .. } => version,
                 }
             }
 
             fn role(self) -> TxLogEntryRole {
                 match self {
-                    Self::TObjectPub { .. } => TxLogEntryRole::TObjectPub,
+                    Self::TObjectPub { .. } | Self::TRootPub { .. } => {
+                        TxLogEntryRole::TObjectPub
+                    }
                     Self::TMemoryUndo { .. } => TxLogEntryRole::TMemoryUndo,
                 }
             }
@@ -1918,6 +1929,20 @@ mod tests {
                 match self {
                     Self::TObjectPub { payload_byte, .. }
                     | Self::TMemoryUndo { payload_byte, .. } => payload_byte,
+                    Self::TRootPub { .. } => {
+                        panic!("root publications do not use repeated payload bytes")
+                    }
+                }
+            }
+
+            fn is_object_publication(self) -> bool {
+                matches!(self, Self::TObjectPub { .. })
+            }
+
+            fn root_object_ids(self) -> &'static [Option<u64>] {
+                match self {
+                    Self::TRootPub { object_ids, .. } => object_ids,
+                    _ => &[],
                 }
             }
         }
@@ -2089,12 +2114,93 @@ mod tests {
             }
         }
 
+        fn mixed_commit_with_root_publication_scenario() -> BackendScenario {
+            BackendScenario {
+                name: "mixed_commit_with_root_publication",
+                transactions: vec![BackendScenarioTx {
+                    stream_id: 123,
+                    txid: 89,
+                    records: vec![
+                        BackendScenarioRecord::TMemoryUndo {
+                            logical_id: tmemory_logical_id(9),
+                            version: 1,
+                            payload_byte: 0xb1,
+                        },
+                        BackendScenarioRecord::TObjectPub {
+                            object_id: 62,
+                            version: 2,
+                            payload_byte: 0xb2,
+                        },
+                        BackendScenarioRecord::TRootPub {
+                            logical_id: root_global_logical_id(0),
+                            version: 3,
+                            object_ids: &[Some(62)],
+                        },
+                    ],
+                    commit: true,
+                }],
+            }
+        }
+
+        fn mixed_loose_end_with_root_publication_scenario() -> BackendScenario {
+            BackendScenario {
+                name: "mixed_loose_end_with_root_publication",
+                transactions: vec![BackendScenarioTx {
+                    stream_id: 124,
+                    txid: 90,
+                    records: vec![
+                        BackendScenarioRecord::TMemoryUndo {
+                            logical_id: tmemory_logical_id(10),
+                            version: 1,
+                            payload_byte: 0xc1,
+                        },
+                        BackendScenarioRecord::TObjectPub {
+                            object_id: 63,
+                            version: 2,
+                            payload_byte: 0xc2,
+                        },
+                        BackendScenarioRecord::TRootPub {
+                            logical_id: root_global_logical_id(0),
+                            version: 3,
+                            object_ids: &[Some(63)],
+                        },
+                    ],
+                    commit: false,
+                }],
+            }
+        }
+
         fn object_logical_id(object_id: u64) -> u64 {
             pack_object_granule_id(PackedGranuleDomain::TStruct, object_id).unwrap()
         }
 
+        fn root_global_logical_id(global_index: u64) -> u64 {
+            ((PackedGranuleDomain::TGlobal as u64) << 60) | global_index
+        }
+
         fn tmemory_logical_id(granule_id: u64) -> u64 {
             0x1000_0000_0000_0000 | (granule_id << 12) | 0x2a
+        }
+
+        fn root_publication_kind(logical_id: u64) -> u16 {
+            match logical_id >> 60 {
+                value if value == PackedGranuleDomain::TGlobal as u64 => {
+                    PackedGranuleDomain::TGlobal as u16
+                }
+                value if value == PackedGranuleDomain::TTable as u64 => {
+                    PackedGranuleDomain::TTable as u16
+                }
+                other => panic!("unsupported root publication domain {other:#x}"),
+            }
+        }
+
+        fn encode_root_object_ids(object_ids: &[Option<u64>]) -> Vec<u8> {
+            let mut payload = Vec::with_capacity(object_ids.len() * size_of::<u64>());
+            for object_id in object_ids {
+                let raw = object_id.map(|id| id + 1).unwrap_or(0);
+                payload.extend_from_slice(&raw.to_le_bytes());
+            }
+            payload
         }
 
         fn repeated_payload(byte: u8) -> Vec<u8> {
@@ -2102,28 +2208,40 @@ mod tests {
         }
 
         fn pending_publication(record: BackendScenarioRecord) -> PendingPublication {
-            let BackendScenarioRecord::TObjectPub {
-                object_id,
-                version,
-                payload_byte,
-            } = record
-            else {
-                unreachable!();
-            };
-            let payload = encode_object_record_for_test(
-                object_id,
-                version,
-                12,
-                &ObjectPayload::Struct(vec![ObjectValue::I32(i32::from(payload_byte))]),
-            )
-            .unwrap();
-            PendingPublication::persistent_object_for_test(
-                PackedGranuleDomain::TStruct,
-                object_id,
-                version,
-                12,
-                &payload,
-            )
+            match record {
+                BackendScenarioRecord::TObjectPub {
+                    object_id,
+                    version,
+                    payload_byte,
+                } => {
+                    let payload = encode_object_record_for_test(
+                        object_id,
+                        version,
+                        12,
+                        &ObjectPayload::Struct(vec![ObjectValue::I32(i32::from(payload_byte))]),
+                    )
+                    .unwrap();
+                    PendingPublication::persistent_object_for_test(
+                        PackedGranuleDomain::TStruct,
+                        object_id,
+                        version,
+                        12,
+                        &payload,
+                    )
+                }
+                BackendScenarioRecord::TRootPub {
+                    logical_id,
+                    version,
+                    object_ids,
+                } => {
+                    let payload = encode_root_object_ids(object_ids);
+                    let mut publication =
+                        PendingPublication::tmemory_for_test(logical_id, version, &payload);
+                    publication.kind = root_publication_kind(logical_id);
+                    publication
+                }
+                BackendScenarioRecord::TMemoryUndo { .. } => unreachable!(),
+            }
         }
 
         fn pending_undo(record: BackendScenarioRecord) -> PendingGranuleUndo {
@@ -2176,19 +2294,28 @@ mod tests {
 
         fn expected_recovery(scenario: &BackendScenario) -> BackendRecoverySummary {
             let mut object_versions = BTreeMap::<u64, u32>::new();
+            let mut root_versions = BTreeMap::<u64, (u32, &'static [Option<u64>])>::new();
             let mut tmemory_undo_rollbacks = BTreeSet::new();
             let mut tmemory_undo_rollback_count = 0usize;
 
             for tx in &scenario.transactions {
                 if tx.commit {
                     for record in &tx.records {
-                        if record.role() != TxLogEntryRole::TObjectPub {
-                            continue;
+                        if record.is_object_publication() {
+                            object_versions
+                                .entry(record.logical_id())
+                                .and_modify(|current| *current = (*current).max(record.version()))
+                                .or_insert(record.version());
+                        } else if matches!(record, BackendScenarioRecord::TRootPub { .. }) {
+                            root_versions
+                                .entry(record.logical_id())
+                                .and_modify(|current| {
+                                    if current.0 < record.version() {
+                                        *current = (record.version(), record.root_object_ids());
+                                    }
+                                })
+                                .or_insert((record.version(), record.root_object_ids()));
                         }
-                        object_versions
-                            .entry(record.logical_id())
-                            .and_modify(|current| *current = (*current).max(record.version()))
-                            .or_insert(record.version());
                     }
                     continue;
                 }
@@ -2208,6 +2335,10 @@ mod tests {
 
             BackendRecoverySummary {
                 object_winners: object_versions.into_iter().collect(),
+                root_object_ids: root_versions
+                    .into_values()
+                    .flat_map(|(_, object_ids)| object_ids.iter().filter_map(|id| *id))
+                    .collect(),
                 tmemory_undo_rollbacks,
                 tmemory_undo_rollback_count,
             }
@@ -2222,6 +2353,7 @@ mod tests {
                     .iter()
                     .map(|winner| (object_logical_id(winner.object_id), winner.version))
                     .collect(),
+                root_object_ids: recovered.root_object_ids.iter().copied().collect(),
                 tmemory_undo_rollbacks: recovered
                     .tmemory_undo_rollbacks
                     .iter()
@@ -2256,7 +2388,8 @@ mod tests {
                         StreamPublisher::new_for_test(&mut sink, tx.stream_id, tx.txid);
                     for record in &tx.records {
                         let marker = match record {
-                            BackendScenarioRecord::TObjectPub { .. } => publisher
+                            BackendScenarioRecord::TObjectPub { .. }
+                            | BackendScenarioRecord::TRootPub { .. } => publisher
                                 .publish_object_publication_before_commit(&pending_publication(
                                     *record,
                                 ))?,
@@ -2493,6 +2626,16 @@ mod tests {
         #[test]
         fn model_backend_conformance_mixed_loose_end() {
             assert_scenario_across_backends(mixed_loose_end_scenario());
+        }
+
+        #[test]
+        fn model_backend_conformance_mixed_commit_with_root_publication() {
+            assert_scenario_across_backends(mixed_commit_with_root_publication_scenario());
+        }
+
+        #[test]
+        fn model_backend_conformance_mixed_loose_end_with_root_publication() {
+            assert_scenario_across_backends(mixed_loose_end_with_root_publication_scenario());
         }
 
         #[test]
