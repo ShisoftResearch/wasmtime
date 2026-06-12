@@ -43,11 +43,18 @@ Changes in this slice:
 - Added malformed-image coverage for corrupt log-entry CRC, committed
   log/data-role mismatch, object-publication data-role mismatch, and data
   pointers outside any data chunk.
+- Added explicit multi-block data-chunk regressions for a valid publication
+  pointer landing in a later block, rejection when a publication payload
+  crosses the chunk tail, and rejection when a publication pointer lands in
+  the data-chunk header region.
 - Tightened recovery validation so committed entries now validate their data
   record logical id/version and reject mismatched publication versus
   `TMemoryUndo` roles instead of silently dropping malformed committed records.
 - Tightened raw data-record loading so recovery rejects pointers that do not
   land inside a discovered data chunk or that extend past the chunk tail.
+- Replaced the per-load whole-region data-chunk scan with one discovery pass
+  that indexes each chunk's block range, start offset, header boundary, and
+  tail offset for reused publication-pointer validation.
 
 Deferred in this slice:
 

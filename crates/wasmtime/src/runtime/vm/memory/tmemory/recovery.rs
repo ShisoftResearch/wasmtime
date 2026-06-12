@@ -69,6 +69,27 @@ struct DiscoveredStreamParts {
     data_chunks: Vec<(u32, u32)>,
 }
 
+#[derive(Debug)]
+struct IndexedDataChunk {
+    start_block: u32,
+    end_block_exclusive: u32,
+    chunk_start_byte_offset: usize,
+    chunk_tail_offset: usize,
+    header_boundary_offset: usize,
+}
+
+#[derive(Debug)]
+struct DataChunkIndex {
+    chunks: Vec<IndexedDataChunk>,
+    block_to_chunk: Vec<Option<usize>>,
+}
+
+#[derive(Debug)]
+struct DiscoveredRegion {
+    streams: Vec<RecoveredStream>,
+    data_chunk_index: DataChunkIndex,
+}
+
 #[derive(Debug, Default)]
 struct PendingTransaction {
     txid: u32,
@@ -76,12 +97,12 @@ struct PendingTransaction {
 }
 
 pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<RecoveredRegion> {
-    let streams = discover_streams(region)?;
+    let discovered = discover_region(region)?;
     let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
     let mut tmemory_undo_rollbacks = Vec::new();
 
-    for stream in streams.iter() {
-        let replay = replay_stream(region, stream)?;
+    for stream in discovered.streams.iter() {
+        let replay = replay_stream(region, stream, &discovered.data_chunk_index)?;
         tmemory_undo_rollbacks.extend(replay.tmemory_undo_rollbacks);
         for update in replay.winners {
             match winners.get(&update.logical_id) {
@@ -112,17 +133,18 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
     }
 
     let winners = winners.into_values().collect::<Vec<_>>();
-    let object_winners = replay_object_winners(region, &winners)?;
-    let root_object_ids = replay_root_object_ids(region, &winners)?;
+    let object_winners = replay_object_winners(region, &discovered.data_chunk_index, &winners)?;
+    let root_object_ids = replay_root_object_ids(region, &discovered.data_chunk_index, &winners)?;
 
     Ok(RecoveredRegion {
-        next_stream_id: streams
+        next_stream_id: discovered
+            .streams
             .iter()
             .map(|stream| stream.stream_id)
             .max()
             .unwrap_or(0)
             + 1,
-        streams,
+        streams: discovered.streams,
         winners,
         object_winners,
         root_object_ids,
@@ -138,6 +160,7 @@ impl RecoveredRegion {
 
 fn replay_root_object_ids(
     region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
     winners: &[RecoveryWinner],
 ) -> Result<Vec<u64>> {
     let mut roots = Vec::new();
@@ -148,11 +171,13 @@ fn replay_root_object_ids(
         };
         match domain {
             PackedGranuleDomain::TGlobal => {
-                let payload = load_root_publication_payload(region, winner, domain)?;
+                let payload =
+                    load_root_publication_payload(region, data_chunk_index, winner, domain)?;
                 roots.extend(decode_root_object_refs(&payload)?.into_iter().take(1));
             }
             PackedGranuleDomain::TTable => {
-                let payload = load_root_publication_payload(region, winner, domain)?;
+                let payload =
+                    load_root_publication_payload(region, data_chunk_index, winner, domain)?;
                 roots.extend(decode_root_object_refs(&payload)?);
             }
             _ => {}
@@ -166,11 +191,16 @@ fn replay_root_object_ids(
 
 fn load_root_publication_payload(
     region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
     winner: &RecoveryWinner,
     expected_domain: PackedGranuleDomain,
 ) -> Result<Vec<u8>> {
-    let (data_header, payload) =
-        load_publication_payload(region, winner.data_block, winner.data_offset)?;
+    let (data_header, payload) = load_publication_payload(
+        region,
+        data_chunk_index,
+        winner.data_block,
+        winner.data_offset,
+    )?;
     ensure!(
         data_header.logical_id == winner.logical_id,
         "recovered root publication logical id does not match log winner"
@@ -206,6 +236,7 @@ fn decode_root_object_refs(payload: &[u8]) -> Result<Vec<u64>> {
 
 fn replay_object_winners(
     region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
     winners: &[RecoveryWinner],
 ) -> Result<Vec<RecoveredObjectWinner>> {
     let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
@@ -214,8 +245,12 @@ fn replay_object_winners(
         let Ok((domain, object_id)) = unpack_object_granule_id(winner.logical_id) else {
             continue;
         };
-        let (data_header, record_bytes) =
-            load_publication_payload(region, winner.data_block, winner.data_offset)?;
+        let (data_header, record_bytes) = load_publication_payload(
+            region,
+            data_chunk_index,
+            winner.data_block,
+            winner.data_offset,
+        )?;
         ensure!(
             data_header.logical_id == winner.logical_id,
             "recovered object publication logical id does not match log winner"
@@ -268,11 +303,12 @@ fn replay_object_winners(
 
 fn load_publication_payload(
     region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
     data_block: u32,
     data_offset: u32,
 ) -> Result<(TxDataRecordHeader, Vec<u8>)> {
     let (record_offset, chunk_tail_offset) =
-        locate_data_record_offset(region, data_block, data_offset)?;
+        data_chunk_index.locate_data_record_offset(region, data_block, data_offset)?;
     let header = TxDataRecordHeader::from_bytes(
         region.read(record_offset, size_of::<TxDataRecordHeader>())?,
     )?;
@@ -290,71 +326,6 @@ fn load_publication_payload(
     );
     let payload = region.read(payload_offset, payload_len)?;
     Ok((header, payload))
-}
-
-fn locate_data_record_offset(
-    region: &BlockRegionBackendView<'_>,
-    data_block: u32,
-    data_offset: u32,
-) -> Result<(usize, usize)> {
-    let block = usize::try_from(data_block).context("publication data block overflow")?;
-    let in_block = usize::try_from(data_offset).context("publication data offset overflow")?;
-    ensure!(
-        in_block < region.block_size(),
-        "publication data offset exceeds block size"
-    );
-
-    let mut cursor = 0usize;
-    while cursor < region.num_blocks() {
-        let start_block = u32::try_from(cursor).context("transactional recovery block overflow")?;
-        match region.block_magic(start_block)? {
-            DATA_CHUNK_MAGIC => {
-                let header = region.data_chunk_header(start_block)?;
-                let chunk_blocks = validated_chunk_blocks(region, cursor, start_block, header)?;
-                let chunk_end = cursor
-                    .checked_add(chunk_blocks)
-                    .context("transactional data chunk range overflow")?;
-                if block >= cursor && block < chunk_end {
-                    let in_chunk = block
-                        .checked_sub(cursor)
-                        .and_then(|delta| delta.checked_mul(region.block_size()))
-                        .and_then(|offset| offset.checked_add(in_block))
-                        .context("publication data record offset overflow")?;
-                    let chunk_tail = chunk_tail_offset(region, header)?;
-                    ensure!(
-                        in_chunk >= size_of::<DataChunkHeader>(),
-                        "publication data record points into data chunk header"
-                    );
-                    let record_end = in_chunk
-                        .checked_add(size_of::<TxDataRecordHeader>())
-                        .context("publication data record offset overflow")?;
-                    ensure!(
-                        record_end <= chunk_tail,
-                        "publication data record is not fully inside a data chunk"
-                    );
-                    let chunk_start_offset = cursor
-                        .checked_mul(region.block_size())
-                        .context("publication data record offset overflow")?;
-                    let record_offset = chunk_start_offset
-                        .checked_add(in_chunk)
-                        .context("publication data record offset overflow")?;
-                    let chunk_tail_offset = chunk_start_offset
-                        .checked_add(chunk_tail)
-                        .context("publication data record offset overflow")?;
-                    return Ok((record_offset, chunk_tail_offset));
-                }
-                cursor = chunk_end;
-            }
-            LOG_BLOCK_MAGIC => {
-                cursor += 1;
-            }
-            _ => {
-                cursor += 1;
-            }
-        }
-    }
-
-    bail!("publication data record is not inside a data chunk")
 }
 
 fn validated_chunk_blocks(
@@ -399,8 +370,114 @@ fn chunk_tail_offset(
     Ok(tail)
 }
 
-fn discover_streams(region: &BlockRegionBackendView<'_>) -> Result<Vec<RecoveredStream>> {
+impl DataChunkIndex {
+    fn new(num_blocks: usize) -> Self {
+        Self {
+            chunks: Vec::new(),
+            block_to_chunk: vec![None; num_blocks],
+        }
+    }
+
+    fn push_chunk(
+        &mut self,
+        region: &BlockRegionBackendView<'_>,
+        cursor: usize,
+        start_block: u32,
+        chunk_blocks: usize,
+        header: DataChunkHeader,
+    ) -> Result<()> {
+        let chunk_end = cursor
+            .checked_add(chunk_blocks)
+            .context("transactional data chunk range overflow")?;
+        let start_block_index =
+            usize::try_from(start_block).context("transactional data chunk start overflow")?;
+        let end_block_exclusive = start_block
+            .checked_add(
+                u32::try_from(chunk_blocks)
+                    .context("transactional data chunk end block conversion overflow")?,
+            )
+            .context("transactional data chunk end block overflow")?;
+        let chunk_start_byte_offset = cursor
+            .checked_mul(region.block_size())
+            .context("transactional data chunk byte offset overflow")?;
+        let chunk_tail_offset = chunk_tail_offset(region, header)?;
+        let chunk_index = self.chunks.len();
+
+        for block in start_block_index..chunk_end {
+            self.block_to_chunk[block] = Some(chunk_index);
+        }
+
+        self.chunks.push(IndexedDataChunk {
+            start_block,
+            end_block_exclusive,
+            chunk_start_byte_offset,
+            chunk_tail_offset,
+            header_boundary_offset: size_of::<DataChunkHeader>(),
+        });
+        Ok(())
+    }
+
+    fn locate_data_record_offset(
+        &self,
+        region: &BlockRegionBackendView<'_>,
+        data_block: u32,
+        data_offset: u32,
+    ) -> Result<(usize, usize)> {
+        let block = usize::try_from(data_block).context("publication data block overflow")?;
+        let in_block = usize::try_from(data_offset).context("publication data offset overflow")?;
+        ensure!(
+            in_block < region.block_size(),
+            "publication data offset exceeds block size"
+        );
+
+        let chunk_index = self
+            .block_to_chunk
+            .get(block)
+            .copied()
+            .flatten()
+            .context("publication data record is not inside a data chunk")?;
+        let chunk = &self.chunks[chunk_index];
+        let chunk_start_block =
+            usize::try_from(chunk.start_block).context("publication chunk start overflow")?;
+        let chunk_end_block_exclusive =
+            usize::try_from(chunk.end_block_exclusive).context("publication chunk end overflow")?;
+        ensure!(
+            block >= chunk_start_block && block < chunk_end_block_exclusive,
+            "publication data record is not inside a data chunk"
+        );
+
+        let in_chunk = block
+            .checked_sub(chunk_start_block)
+            .and_then(|delta| delta.checked_mul(region.block_size()))
+            .and_then(|offset| offset.checked_add(in_block))
+            .context("publication data record offset overflow")?;
+        ensure!(
+            in_chunk >= chunk.header_boundary_offset,
+            "publication data record points into data chunk header"
+        );
+        let record_end = in_chunk
+            .checked_add(size_of::<TxDataRecordHeader>())
+            .context("publication data record offset overflow")?;
+        ensure!(
+            record_end <= chunk.chunk_tail_offset,
+            "publication data record is not fully inside a data chunk"
+        );
+
+        let record_offset = chunk
+            .chunk_start_byte_offset
+            .checked_add(in_chunk)
+            .context("publication data record offset overflow")?;
+        let chunk_tail_offset = chunk
+            .chunk_start_byte_offset
+            .checked_add(chunk.chunk_tail_offset)
+            .context("publication data record offset overflow")?;
+        Ok((record_offset, chunk_tail_offset))
+    }
+}
+
+fn discover_region(region: &BlockRegionBackendView<'_>) -> Result<DiscoveredRegion> {
     let mut streams = BTreeMap::<u32, DiscoveredStreamParts>::new();
+    let mut data_chunk_index = DataChunkIndex::new(region.num_blocks());
     let mut block = 0usize;
 
     while block < region.num_blocks() {
@@ -417,21 +494,13 @@ fn discover_streams(region: &BlockRegionBackendView<'_>) -> Result<Vec<Recovered
             }
             DATA_CHUNK_MAGIC => {
                 let header = region.data_chunk_header(start_block)?;
-                let chunk_blocks = usize::try_from(header.chunk_blocks)
-                    .context("transactional data chunk block count overflow")?;
-                ensure!(
-                    chunk_blocks > 0,
-                    "transactional data chunk at block {start_block} has zero blocks"
-                );
-                ensure!(
-                    block + chunk_blocks <= region.num_blocks(),
-                    "transactional data chunk at block {start_block} exceeds region"
-                );
+                let chunk_blocks = validated_chunk_blocks(region, block, start_block, header)?;
                 streams
                     .entry(header.stream_id)
                     .or_default()
                     .data_chunks
                     .push((header.chunk_seq, start_block));
+                data_chunk_index.push_chunk(region, block, start_block, chunk_blocks, header)?;
                 block += chunk_blocks;
             }
             _ => {
@@ -440,31 +509,35 @@ fn discover_streams(region: &BlockRegionBackendView<'_>) -> Result<Vec<Recovered
         }
     }
 
-    Ok(streams
-        .into_iter()
-        .map(|(stream_id, mut parts)| {
-            parts.log_blocks.sort_unstable();
-            parts.data_chunks.sort_unstable();
-            RecoveredStream {
-                stream_id,
-                log_blocks: parts
-                    .log_blocks
-                    .into_iter()
-                    .map(|(_, start_block)| start_block)
-                    .collect(),
-                data_chunks: parts
-                    .data_chunks
-                    .into_iter()
-                    .map(|(_, start_block)| start_block)
-                    .collect(),
-            }
-        })
-        .collect())
+    Ok(DiscoveredRegion {
+        streams: streams
+            .into_iter()
+            .map(|(stream_id, mut parts)| {
+                parts.log_blocks.sort_unstable();
+                parts.data_chunks.sort_unstable();
+                RecoveredStream {
+                    stream_id,
+                    log_blocks: parts
+                        .log_blocks
+                        .into_iter()
+                        .map(|(_, start_block)| start_block)
+                        .collect(),
+                    data_chunks: parts
+                        .data_chunks
+                        .into_iter()
+                        .map(|(_, start_block)| start_block)
+                        .collect(),
+                }
+            })
+            .collect(),
+        data_chunk_index,
+    })
 }
 
 fn replay_stream(
     region: &BlockRegionBackendView<'_>,
     stream: &RecoveredStream,
+    data_chunk_index: &DataChunkIndex,
 ) -> Result<StreamReplay> {
     let mut replay = StreamReplay::default();
     let mut pending: Option<PendingTransaction> = None;
@@ -484,7 +557,11 @@ fn replay_stream(
                 if let Some(txn) = pending.take() {
                     replay
                         .tmemory_undo_rollbacks
-                        .extend(loose_end_tmemory_undo_rollbacks(region, txn.entries)?);
+                        .extend(loose_end_tmemory_undo_rollbacks(
+                            region,
+                            data_chunk_index,
+                            txn.entries,
+                        )?);
                 }
             }
             let txn = pending.get_or_insert_with(|| PendingTransaction {
@@ -495,7 +572,7 @@ fn replay_stream(
             if is_final_lp(entry) {
                 txn.entries.push(entry);
                 for committed in &txn.entries {
-                    validate_committed_entry(region, *committed)?;
+                    validate_committed_entry(region, data_chunk_index, *committed)?;
                     if committed.role()? == TxLogEntryRole::TObjectPub {
                         replay.winners.push(RecoveryWinner {
                             logical_id: committed.logical_id,
@@ -515,14 +592,27 @@ fn replay_stream(
     if let Some(txn) = pending.take() {
         replay
             .tmemory_undo_rollbacks
-            .extend(loose_end_tmemory_undo_rollbacks(region, txn.entries)?);
+            .extend(loose_end_tmemory_undo_rollbacks(
+                region,
+                data_chunk_index,
+                txn.entries,
+            )?);
     }
 
     Ok(replay)
 }
 
-fn validate_committed_entry(region: &BlockRegionBackendView<'_>, entry: TxLogEntry) -> Result<()> {
-    let (data_header, _) = load_publication_payload(region, entry.data_block, entry.data_offset)?;
+fn validate_committed_entry(
+    region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
+    entry: TxLogEntry,
+) -> Result<()> {
+    let (data_header, _) = load_publication_payload(
+        region,
+        data_chunk_index,
+        entry.data_block,
+        entry.data_offset,
+    )?;
     ensure!(
         data_header.logical_id == entry.logical_id,
         "committed data record logical id does not match log entry"
@@ -548,6 +638,7 @@ fn validate_committed_entry(region: &BlockRegionBackendView<'_>, entry: TxLogEnt
 
 fn loose_end_tmemory_undo_rollbacks(
     region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
     entries: Vec<TxLogEntry>,
 ) -> Result<Vec<RecoveredTMemoryUndoRollback>> {
     let mut rollbacks = Vec::new();
@@ -555,8 +646,12 @@ fn loose_end_tmemory_undo_rollbacks(
         if entry.role()? != TxLogEntryRole::TMemoryUndo {
             continue;
         }
-        let (data_header, old_granule_bytes) =
-            load_publication_payload(region, entry.data_block, entry.data_offset)?;
+        let (data_header, old_granule_bytes) = load_publication_payload(
+            region,
+            data_chunk_index,
+            entry.data_block,
+            entry.data_offset,
+        )?;
         ensure!(
             data_header.role()? == TxDataRecordRole::TMemoryUndo,
             "tmemory undo data record has non-undo role"
@@ -742,6 +837,32 @@ mod tests {
         let err = recover_region_for_test(&region).unwrap_err();
 
         assert!(err.to_string().contains("data chunk"));
+    }
+
+    #[test]
+    fn model_recovery_accepts_publication_pointer_in_later_block_of_multi_block_chunk() {
+        let region = sample_region_with_multiblock_publication_pointer_in_later_block();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.winners.len(), 1);
+        assert_eq!(recovered.winners[0].logical_id, 0x3000);
+        assert_eq!(recovered.winners[0].version, 5);
+    }
+
+    #[test]
+    fn model_recovery_rejects_publication_payload_crossing_multi_block_chunk_tail() {
+        let region = sample_region_with_multiblock_publication_payload_crossing_tail();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("extends beyond data chunk tail"));
+    }
+
+    #[test]
+    fn model_recovery_rejects_publication_pointer_into_multi_block_chunk_header() {
+        let region = sample_region_with_multiblock_publication_pointer_into_header();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("points into data chunk header"));
     }
 
     fn sample_region_with_two_streams() -> VMemoryBlockRegion {
@@ -1000,6 +1121,36 @@ mod tests {
         region
     }
 
+    fn sample_region_with_multiblock_publication_pointer_in_later_block() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        append_committed_multiblock_update(&mut region, 1, stream, 0, 0x3000, 5, 0x5a);
+        region
+    }
+
+    fn sample_region_with_multiblock_publication_payload_crossing_tail() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let (_, location) =
+            append_committed_multiblock_update(&mut region, 1, stream, 0, 0x3000, 5, 0x5a);
+        rewrite_data_record_header(&mut region, location, |header| {
+            header.payload_len += 1;
+        });
+        region
+    }
+
+    fn sample_region_with_multiblock_publication_pointer_into_header() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let (log_block, location) =
+            append_committed_multiblock_update(&mut region, 1, stream, 0, 0x3000, 5, 0x5a);
+        rewrite_log_entry(&mut region, log_block, 0, |entry| {
+            entry.data_block = location.chunk_start_block;
+            entry.data_offset = 0;
+        });
+        region
+    }
+
     fn append_committed_root_update(
         region: &mut VMemoryBlockRegion,
         stream_id: u32,
@@ -1153,6 +1304,39 @@ mod tests {
             true,
         );
         write_log_entries(region, log_block, &[entry]);
+    }
+
+    fn append_committed_multiblock_update(
+        region: &mut VMemoryBlockRegion,
+        stream_id: u32,
+        stream: StreamCursor,
+        block_seq: u32,
+        logical_id: u64,
+        version: u32,
+        fill: u8,
+    ) -> (u32, DataRecordLocation) {
+        let filler = vec![0xa5; BLOCK_SIZE - size_of::<DataChunkHeader>() + 1];
+        let filler_location = region.append_data_record(stream, &filler).unwrap();
+        let (log_block, location) = append_publication_record(
+            region, stream_id, stream, block_seq, logical_id, version, fill,
+        );
+        let entry = TMemory::publication_log_entry(
+            logical_id,
+            version,
+            stream_id << 1,
+            location.data_block,
+            location.data_offset,
+            true,
+        );
+        write_log_entries(region, log_block, &[entry]);
+
+        assert_eq!(
+            location.chunk_start_block,
+            filler_location.chunk_start_block
+        );
+        assert!(location.data_block > location.chunk_start_block);
+
+        (log_block, location)
     }
 
     fn append_loose_end_update(
