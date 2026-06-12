@@ -18,7 +18,30 @@ pub use tx::Tx;
 macro_rules! transaction {
     ($tx:ident, $body:block) => {{
         $crate::marker::mark_transaction_func();
-        let $tx = unsafe { $crate::Tx::from_marker() };
+        let mut $tx = unsafe { $crate::Tx::from_marker() };
         $body
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Persist, Root};
+
+    #[repr(C)]
+    struct Counter {
+        value: u32,
+    }
+
+    unsafe impl Persist for Counter {
+        const TYPE_NAME: &'static str = "Counter";
+    }
+
+    #[test]
+    fn transaction_macro_allows_root_mut() {
+        let root = Root::<Counter>::tmemory_offset(0);
+
+        crate::transaction!(tx, {
+            let _ = tx.root_mut(&root);
+        });
+    }
 }
