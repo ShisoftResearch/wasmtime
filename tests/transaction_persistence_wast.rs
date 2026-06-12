@@ -21,6 +21,7 @@ fn transaction_wast_commit_survives_file_backed_recovery() -> Result<()> {
         &tmemory_path,
         &tx_log_path,
         true,
+        false,
     )?;
 
     recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
@@ -30,6 +31,7 @@ fn transaction_wast_commit_survives_file_backed_recovery() -> Result<()> {
         &fixture_path("tmemory-commit-after.wast"),
         &tmemory_path,
         &tx_log_path,
+        false,
         false,
     )?;
 
@@ -50,6 +52,7 @@ fn transaction_wast_trap_does_not_recover_staged_tmemory_write() -> Result<()> {
         &tmemory_path,
         &tx_log_path,
         true,
+        false,
     )?;
 
     recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
@@ -59,6 +62,38 @@ fn transaction_wast_trap_does_not_recover_staged_tmemory_write() -> Result<()> {
         &fixture_path("tmemory-abort-after.wast"),
         &tmemory_path,
         &tx_log_path,
+        false,
+        false,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn transaction_wast_loose_end_tmemory_write_is_recovered() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+
+    let engine = transaction_wast_engine()?;
+
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-loose-end-before.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        true,
+        true,
+    )?;
+
+    recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
+
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-loose-end-after.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        false,
         false,
     )?;
 
@@ -82,6 +117,7 @@ fn run_wast_phase(
     tmemory_path: &Path,
     tx_log_path: &Path,
     create: bool,
+    fail_next_commit_before_lp_for_test: bool,
 ) -> Result<()> {
     let tmemory_path = tmemory_path.to_path_buf();
     let tx_log_path = tx_log_path.to_path_buf();
@@ -101,6 +137,9 @@ fn run_wast_phase(
         result.unwrap_or_else(|error| {
             panic!("failed to configure file-backed transaction storage: {error:#}");
         });
+        if fail_next_commit_before_lp_for_test {
+            store.transaction_fail_next_commit_before_lp_for_test();
+        }
     });
     context.run_file(wast_path)
 }

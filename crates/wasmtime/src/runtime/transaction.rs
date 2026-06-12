@@ -283,6 +283,7 @@ pub(crate) struct TransactionState {
     active: Option<TransactionId>,
     failed: bool,
     failure_code: u32,
+    fail_next_commit_before_lp_for_test: bool,
     next_id: u64,
     locks: LockBased,
     suspended: BTreeMap<TransactionId, TransactionWorkspace>,
@@ -324,6 +325,7 @@ impl Default for TransactionState {
             active: None,
             failed: false,
             failure_code: 0,
+            fail_next_commit_before_lp_for_test: false,
             next_id: 10_001,
             locks: LockBased::default(),
             suspended: BTreeMap::new(),
@@ -1713,6 +1715,14 @@ impl TransactionState {
 
     pub(crate) fn active_transaction(&self) -> Option<TransactionId> {
         self.active
+    }
+
+    pub(crate) fn fail_next_commit_before_lp_for_test(&mut self) {
+        self.fail_next_commit_before_lp_for_test = true;
+    }
+
+    pub(crate) fn take_fail_next_commit_before_lp_for_test(&mut self) -> bool {
+        mem::take(&mut self.fail_next_commit_before_lp_for_test)
     }
 
     pub(crate) fn active_transaction_required_raw(&self) -> Result<u64> {

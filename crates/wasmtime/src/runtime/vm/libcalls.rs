@@ -393,6 +393,13 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         final_marker = object_marker.or(final_marker);
     }
     if let Some(marker) = final_marker {
+        if store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .take_fail_next_commit_before_lp_for_test()
+        {
+            bail!("transaction test failure before commit LP");
+        }
         store
             .store_opaque_mut()
             .transaction_state_mut()
