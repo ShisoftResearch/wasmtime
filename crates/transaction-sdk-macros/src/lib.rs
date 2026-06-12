@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
-use quote::{ToTokens, format_ident, quote};
+use quote::{ToTokens, quote};
 use std::collections::HashSet;
 use syn::{
     Data, DeriveInput, Error, Fields, FnArg, ItemFn, Path, Type, WherePredicate, parse_macro_input,
@@ -20,8 +20,25 @@ pub fn derive_persist(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn transaction(_args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_transaction_impl(parse_macro_input!(input as ItemFn)).into()
+pub fn transaction(args: TokenStream, input: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(input as ItemFn);
+    match expand_transaction_attr(args.into(), func) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn expand_transaction_attr(
+    args: proc_macro2::TokenStream,
+    func: ItemFn,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if !args.is_empty() {
+        return Err(Error::new(
+            Span::call_site(),
+            "transaction attribute does not accept arguments",
+        ));
+    }
+    Ok(expand_transaction_impl(func))
 }
 
 fn expand_transaction_impl(mut func: ItemFn) -> proc_macro2::TokenStream {
@@ -85,17 +102,17 @@ fn derive_persist_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
     let metadata_bytes = persist_metadata_bytes(&ident, &type_name)?;
     let metadata_len = metadata_bytes.len();
     let metadata_bytes = proc_macro2::Literal::byte_string(&metadata_bytes);
-    let metadata_ident = format_ident!("__TWASM_PERSIST_METADATA_{}", ident);
-    let field_assert_ident = format_ident!("__TWASM_PERSIST_FIELDS_{}", ident);
     let field_assert = if field_types.is_empty() {
         quote!()
     } else {
         quote! {
-            #[allow(non_camel_case_types)]
-            struct #field_assert_ident
-            where
-                #(#field_types: #sdk_path::Persist,)*
-            ;
+            const _: fn() = || {
+                fn assert_fields()
+                where
+                    #(#field_types: #sdk_path::Persist,)*
+                {}
+                let _ = assert_fields;
+            };
         }
     };
 
@@ -106,10 +123,11 @@ fn derive_persist_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
             const TYPE_NAME: &'static str = #type_name;
         }
 
-        #[used]
-        #[allow(non_upper_case_globals)]
-        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "twasm.persist"))]
-        static #metadata_ident: [u8; #metadata_len] = *#metadata_bytes;
+        const _: () = {
+            #[used]
+            #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "twasm.persist"))]
+            static METADATA: [u8; #metadata_len] = *#metadata_bytes;
+        };
     })
 }
 
@@ -218,27 +236,23 @@ fn is_mutable_persistent_arg(arg: &FnArg) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_persist_impl, expand_transaction_impl};
+    use super::{derive_persist_impl, expand_transaction_attr, expand_transaction_impl};
+    use quote::quote;
     use syn::parse_quote;
 
     #[test]
-    fn derive_persist_preserves_metadata_symbol_spelling() {
-        let mixed_case = derive_persist_impl(parse_quote! {
+    fn derive_persist_scopes_metadata_helpers() {
+        let tokens = derive_persist_impl(parse_quote! {
             #[repr(C)]
             struct Foo(u8);
         })
         .expect("derive should succeed")
         .to_string();
-        let upper_case = derive_persist_impl(parse_quote! {
-            #[repr(C)]
-            struct FOO(u8);
-        })
-        .expect("derive should succeed")
-        .to_string();
 
-        assert!(mixed_case.contains("__TWASM_PERSIST_METADATA_Foo"));
-        assert!(upper_case.contains("__TWASM_PERSIST_METADATA_FOO"));
-        assert_ne!(mixed_case, upper_case);
+        assert!(tokens.contains("const _ : ()"));
+        assert!(tokens.contains("static METADATA"));
+        assert!(!tokens.contains("__TWASM_PERSIST_METADATA_Foo"));
+        assert!(!tokens.contains("__TWASM_PERSIST_FIELDS_Foo"));
     }
 
     #[test]
@@ -314,5 +328,19 @@ mod tests {
 
         assert!(tokens.contains("where Self : :: wasmtime_transaction_sdk :: Persist"));
         assert!(tokens.contains("T : :: wasmtime_transaction_sdk :: Persist"));
+    }
+
+    #[test]
+    fn transaction_attr_rejects_arguments() {
+        let err = expand_transaction_attr(
+            quote!(foo),
+            parse_quote! {
+                fn update() {}
+            },
+        )
+        .expect_err("transaction args should be rejected")
+        .to_string();
+
+        assert!(err.contains("transaction attribute does not accept arguments"));
     }
 }
