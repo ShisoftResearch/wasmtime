@@ -1613,5 +1613,108 @@ mod tests {
                 })
                 .unwrap();
         }
+
+        mod model_crash {
+            use super::*;
+
+            #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+            enum CrashCutpoint {
+                BeforeAnyRecord,
+                AfterUndoRecordBeforeLp,
+                AfterObjectRecordBeforeLp,
+                AfterAllRecordsBeforeLp,
+                AfterLp,
+            }
+
+            impl CrashCutpoint {
+                fn all() -> [Self; 5] {
+                    [
+                        Self::BeforeAnyRecord,
+                        Self::AfterUndoRecordBeforeLp,
+                        Self::AfterObjectRecordBeforeLp,
+                        Self::AfterAllRecordsBeforeLp,
+                        Self::AfterLp,
+                    ]
+                }
+            }
+
+            fn cutpoint_records(cutpoint: CrashCutpoint) -> Vec<ModelRecord> {
+                let undo = ModelRecord {
+                    tx: 1,
+                    logical_id: tmemory_logical_id(7),
+                    version: 1,
+                    role: ModelRole::TMemoryUndo,
+                    payload_byte: 0x3c,
+                    has_lp: false,
+                };
+                let object_a = ModelRecord {
+                    tx: 1,
+                    logical_id: object_logical_id(41),
+                    version: 2,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x4d,
+                    has_lp: false,
+                };
+                let object_b = ModelRecord {
+                    tx: 1,
+                    logical_id: object_logical_id(42),
+                    version: 5,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x5e,
+                    has_lp: false,
+                };
+
+                match cutpoint {
+                    CrashCutpoint::BeforeAnyRecord => Vec::new(),
+                    CrashCutpoint::AfterUndoRecordBeforeLp => vec![undo],
+                    CrashCutpoint::AfterObjectRecordBeforeLp => vec![undo, object_a],
+                    CrashCutpoint::AfterAllRecordsBeforeLp => vec![undo, object_a, object_b],
+                    CrashCutpoint::AfterLp => {
+                        let mut object_b = object_b;
+                        object_b.has_lp = true;
+                        vec![undo, object_a, object_b]
+                    }
+                }
+            }
+
+            fn actual_recovery_at_cutpoint(cutpoint: CrashCutpoint) -> ExpectedRecovery {
+                let recovered = recover_model_history(&cutpoint_records(cutpoint)).unwrap();
+                summarize_actual_recovery(&recovered)
+            }
+
+            #[test]
+            fn model_crash_before_lp_rolls_back_tmemory_and_drops_objects() {
+                let actual = actual_recovery_at_cutpoint(CrashCutpoint::AfterAllRecordsBeforeLp);
+
+                assert!(actual.object_winners.is_empty());
+                assert_eq!(actual.tmemory_undo_rollback_count, 1);
+                assert_eq!(
+                    actual.tmemory_undo_rollbacks,
+                    BTreeSet::from([(tmemory_logical_id(7), 1, repeated_payload(0x3c),)])
+                );
+            }
+
+            #[test]
+            fn model_crash_after_lp_commits_objects_and_ignores_undo() {
+                let actual = actual_recovery_at_cutpoint(CrashCutpoint::AfterLp);
+
+                assert_eq!(
+                    actual.object_winners,
+                    BTreeSet::from([(object_logical_id(41), 2), (object_logical_id(42), 5),])
+                );
+                assert!(actual.tmemory_undo_rollbacks.is_empty());
+                assert_eq!(actual.tmemory_undo_rollback_count, 0);
+            }
+
+            #[test]
+            fn model_crash_generated_cutpoints_match_lp_visibility_expectations() {
+                for cutpoint in CrashCutpoint::all() {
+                    let expected = expected_recovery(&cutpoint_records(cutpoint));
+                    let actual = actual_recovery_at_cutpoint(cutpoint);
+
+                    assert_eq!(actual, expected, "cutpoint: {cutpoint:?}");
+                }
+            }
+        }
     }
 }

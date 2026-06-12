@@ -21,6 +21,39 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 2: Crash Cutpoint LP-Visibility Tests
+
+Date: 2026-06-12
+
+Wave 2 of the model-checking roadmap now adds executable crash-cutpoint tests
+for the Zen-style durable ordering in
+`crates/wasmtime/src/runtime/transaction/persist.rs`.
+
+Changes in this slice:
+
+- Added a nested `model_crash` test module under the existing `model_recovery`
+  scaffolding so the Wave 2 cutpoint slice is runnable with a focused cargo
+  test filter.
+- Added `CrashCutpoint` coverage for `BeforeAnyRecord`,
+  `AfterUndoRecordBeforeLp`, `AfterObjectRecordBeforeLp`,
+  `AfterAllRecordsBeforeLp`, and `AfterLp`.
+- Added deterministic regressions proving that a crash before LP drops object
+  winners and preserves `tmemory` undo rollback bytes, while a crash after LP
+  commits object winners and ignores `tmemory` undo rollback actions.
+- Added generated cutpoint coverage that publishes one logical transaction
+  through the real file-backed `TxDurableLog`, truncates publication at each
+  cutpoint by selecting which publish calls occur, and compares recovered
+  object winners plus rollback-byte summaries against the reference evaluator.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_crash -- --format terse
+cargo test -p wasmtime --lib transaction::persist -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 1: Durable-Log Recovery Reference Tests
 
 Date: 2026-06-12
