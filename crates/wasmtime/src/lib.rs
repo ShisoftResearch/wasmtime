@@ -561,5 +561,25 @@ pub mod _internal {
             publish_committed_struct_object, publish_committed_tmemory_update,
             reopen_and_recover_file_backed_region,
         };
+
+        pub fn recover_file_backed_tmemory_for_test(
+            tx_log_path: &std::path::Path,
+            tmemory_path: &std::path::Path,
+            min_pages: u64,
+            max_pages: Option<u64>,
+        ) -> crate::Result<TransactionPersistenceRecoveredRegion> {
+            let recovered = reopen_and_recover_file_backed_region(tx_log_path)?;
+            let mut tmemory = crate::runtime::vm::TMemory::new(
+                crate::runtime::transaction::TransactionConfig::with_file_backed_tmemory_existing_path(
+                    tmemory_path.to_path_buf(),
+                )?,
+                min_pages,
+                max_pages,
+            )?;
+            tmemory.apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
+                recovered.tmemory_undo_rollbacks.clone(),
+            )?;
+            Ok(recovered)
+        }
     }
 }

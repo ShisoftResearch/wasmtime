@@ -361,7 +361,6 @@ impl TMemory {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn apply_file_backed_recovered_tmemory_undo_rollbacks_for_test<I>(
         &mut self,
         rollbacks: I,
@@ -1733,6 +1732,64 @@ mod tests {
 
         assert!(error.contains("length"));
         assert!(error.contains("capacity"));
+    }
+
+    #[cfg(all(feature = "transaction", unix))]
+    #[test]
+    fn file_backed_recovery_helper_replays_loose_end_undo_to_existing_tmemory_file() {
+        use crate::runtime::transaction::{StreamPublisher, TxDurableLog};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("recover.tmemory");
+        let tx_log_path = dir.path().join("recover-log.bin");
+        let old_granule = vec![0xaa; TMEMORY_GRANULE_SIZE];
+        let new_granule = vec![0x11; TMEMORY_GRANULE_SIZE];
+        let mut memory = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+            1,
+            Some(1),
+        )
+        .unwrap();
+        memory
+            .commit_staged_tmemory_granule(1, &old_granule)
+            .unwrap();
+        let undo = memory
+            .prepare_tmemory_undo_record(Some(0), 0, 1, &new_granule)
+            .unwrap();
+        memory
+            .commit_staged_tmemory_granule(1, &new_granule)
+            .unwrap();
+        drop(memory);
+
+        let mut log = TxDurableLog::create_file_backed(&tx_log_path, 32).unwrap();
+        let mut sink = log.stream_sink(41);
+        let mut publisher = StreamPublisher::new(&mut sink, 41, 41);
+        publisher
+            .publish_tmemory_undo_before_in_place_write(&undo)
+            .unwrap();
+        drop(sink);
+        drop(log);
+
+        crate::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+            &tx_log_path,
+            &tmemory_path,
+            1,
+            Some(1),
+        )
+        .unwrap();
+
+        let reopened = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path).unwrap(),
+            1,
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .read_committed(TMEMORY_GRANULE_SIZE..TMEMORY_GRANULE_SIZE + 4)
+                .unwrap(),
+            vec![0xaa, 0xaa, 0xaa, 0xaa]
+        );
     }
 
     #[test]
