@@ -137,6 +137,14 @@ mod tests {
     }
 
     #[test]
+    fn inspect_reports_truncated_header() {
+        let bytes = module_with_persist_section(b"TP".to_vec());
+        let err = inspect_module(&bytes).unwrap_err().to_string();
+
+        assert!(err.contains("truncated twasm.persist header"));
+    }
+
+    #[test]
     fn inspect_reports_invalid_utf8() {
         let bytes = module_with_persist_section(persist_record_bytes(*b"TPRS", 1, &[0xff]));
         let err = inspect_module(&bytes).unwrap_err().to_string();

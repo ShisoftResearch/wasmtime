@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -7,7 +8,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "twasm-rust")]
 #[command(about = "Inspect and rewrite Rust transactional Wasm metadata")]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     command: Command,
 }
@@ -27,14 +28,17 @@ enum Command {
 }
 
 pub fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut stdout = std::io::stdout();
+    run(Cli::parse(), &mut stdout)
+}
 
+pub fn run(cli: Cli, stdout: &mut impl Write) -> Result<()> {
     match cli.command {
         Command::Inspect { input } => {
             let bytes =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
             let report = crate::metadata::inspect_module(&bytes)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            writeln!(stdout, "{}", serde_json::to_string_pretty(&report)?)?;
         }
         Command::Rewrite {
             input,
