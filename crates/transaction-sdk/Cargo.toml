@@ -15,3 +15,7 @@ macros = ["dep:wasmtime-transaction-sdk-macros"]
 
 [dependencies]
 wasmtime-transaction-sdk-macros = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wasmparser = { workspace = true }
