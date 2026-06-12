@@ -21,6 +21,44 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 10: WAST And Model Cross-Checks
+
+Date: 2026-06-12
+
+Wave 10 of the model-checking roadmap now adds documentation-only WAST/model
+cross-checks in `docs/shisoft/transactional-wasm-wast-ledger.md` and refreshes
+the current transaction-proposal WAST baseline.
+
+Changes in this slice:
+
+- Added a feature-level coverage table near the WAST ledger baseline so the
+  current transaction WAST corpus can be cross-checked against Rust example or
+  unit coverage, model/property-test coverage, and still-missing areas without
+  churning the full 173-row per-file ledger.
+- Cross-linked the current feature rows to the recent model-test filters where
+  they actually apply: `model_recovery`, `model_crash`,
+  `model_mixed_participants`, `model_lock_based`, `model_permissions`,
+  `model_backend_conformance`, `model_object_rebuild`, and
+  `transaction_active`.
+- Recorded the places where the current WAST suite is broader than the model
+  suite or vice versa, especially for `tmemory.size/grow`, table bulk
+  operations, permission-state assertions, and durable persistent-object
+  recovery.
+- Called out the still-open deeper gaps around persistent GC, promotion,
+  object-root closure, delete-version precedence, and future shared-thread
+  concurrency testing so later waves do not overstate current correctness
+  evidence.
+- Re-ran the gated transaction WAST suite on 2026-06-12 and recorded the
+  actual result, which still matches the expected 173-pass baseline.
+
+Verification command for this slice:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+running 173 tests
+test result: ok. 173 passed; 0 failed; 0 ignored; 0 measured; 3438 filtered out; finished in 9.08s
+```
+
 ## Model-Checking Wave 7: Transaction Boundary And Active-State Tests
 
 Date: 2026-06-12
