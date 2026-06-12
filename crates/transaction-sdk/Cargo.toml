@@ -1,0 +1,17 @@
+[package]
+name = "wasmtime-transaction-sdk"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 WITH LLVM-exception"
+
+[lints]
+workspace = true
+
+[features]
+default = ["macros"]
+macros = ["dep:wasmtime-transaction-sdk-macros"]
+
+[dependencies]
+wasmtime-transaction-sdk-macros = { workspace = true, optional = true }

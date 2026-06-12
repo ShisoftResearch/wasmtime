@@ -173,6 +173,9 @@ members = [
   "crates/c-api/artifact",
   "crates/environ/fuzz",
   "crates/misc/component-async-tests",
+  "crates/transaction-sdk",
+  "crates/transaction-sdk-macros",
+  "crates/transaction-tools",
   "crates/test-programs",
   "crates/wasi-preview1-component-adapter",
   "crates/wasi-preview1-component-adapter/verify",
@@ -271,6 +274,9 @@ wasmtime-wasi-keyvalue = { path = "crates/wasi-keyvalue", version = "46.0.0" }
 wasmtime-wasi-threads = { path = "crates/wasi-threads", version = "46.0.0" }
 wasmtime-wasi-tls = { path = "crates/wasi-tls", version = "46.0.0" }
 wasmtime-wast = { path = "crates/wast", version = "=46.0.0" }
+wasmtime-transaction-sdk = { path = "crates/transaction-sdk", version = "=46.0.0" }
+wasmtime-transaction-sdk-macros = { path = "crates/transaction-sdk-macros", version = "=46.0.0" }
+wasmtime-transaction-tools = { path = "crates/transaction-tools", version = "=46.0.0" }
 
 # Internal Wasmtime-specific crates.
 #

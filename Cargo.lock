@@ -5275,6 +5275,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-transaction-sdk"
+version = "46.0.0"
+dependencies = [
+ "wasmtime-transaction-sdk-macros",
+]
+
+[[package]]
+name = "wasmtime-transaction-sdk-macros"
+version = "46.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
+
+[[package]]
+name = "wasmtime-transaction-tools"
+version = "46.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "wasm-encoder 0.251.0",
+ "wasmparser 0.251.0",
+ "wasmprinter",
+ "wat",
+]
+
+[[package]]
 name = "wasmtime-wasi"
 version = "46.0.0"
 dependencies = [

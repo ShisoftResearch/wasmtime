@@ -1,0 +1,27 @@
+[package]
+name = "wasmtime-transaction-tools"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 WITH LLVM-exception"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "twasm-rust"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+wasm-encoder = { workspace = true, features = ["wasmparser"] }
+wasmparser = { workspace = true, features = ["validate", "features"] }
+wasmprinter = { workspace = true }
+wat = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
