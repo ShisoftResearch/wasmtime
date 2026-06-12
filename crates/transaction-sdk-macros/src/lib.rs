@@ -124,8 +124,9 @@ fn derive_persist_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
         }
 
         const _: () = {
+            #[cfg(target_arch = "wasm32")]
             #[used]
-            #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "twasm.persist"))]
+            #[unsafe(link_section = "twasm.persist")]
             static METADATA: [u8; #metadata_len] = *#metadata_bytes;
         };
     })
