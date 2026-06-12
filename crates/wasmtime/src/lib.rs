@@ -554,6 +554,8 @@ pub mod _internal {
     pub use crate::runtime::vm::MmapVec;
     #[cfg(feature = "transaction")]
     pub mod transaction_persistence {
+        use crate::error::Context as _;
+
         pub use crate::vm::block_region::{
             TransactionPersistenceRecoveredObjectWinner, TransactionPersistenceRecoveredRegion,
             TransactionPersistenceRecoveredWinner, corrupt_first_log_crc,
@@ -561,6 +563,27 @@ pub mod _internal {
             publish_committed_struct_object, publish_committed_tmemory_update,
             reopen_and_recover_file_backed_region,
         };
+
+        pub fn create_file_backed_storage_for_test<T>(
+            store: &mut crate::Store<T>,
+            tmemory_path: std::path::PathBuf,
+            tx_log_path: std::path::PathBuf,
+            tx_log_blocks: u32,
+        ) -> crate::Result<()> {
+            store.transaction_create_file_backed_storage_for_test(
+                tmemory_path,
+                tx_log_path,
+                tx_log_blocks,
+            )
+        }
+
+        pub fn open_file_backed_storage_for_test<T>(
+            store: &mut crate::Store<T>,
+            tmemory_path: std::path::PathBuf,
+            tx_log_path: std::path::PathBuf,
+        ) -> crate::Result<()> {
+            store.transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
+        }
 
         pub fn fail_next_commit_before_lp_for_test<T>(store: &mut crate::Store<T>) {
             store
@@ -585,7 +608,41 @@ pub mod _internal {
             tmemory.apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
                 recovered.tmemory_undo_rollbacks.clone(),
             )?;
+            reset_file_backed_log_after_recovery_for_test(tx_log_path)?;
             Ok(recovered)
+        }
+
+        fn reset_file_backed_log_after_recovery_for_test(
+            tx_log_path: &std::path::Path,
+        ) -> crate::Result<()> {
+            let blocks = file_backed_log_block_count_for_test(tx_log_path)?;
+            let _reset_log =
+                crate::runtime::transaction::TxDurableLog::create_file_backed(tx_log_path, blocks)?;
+            Ok(())
+        }
+
+        fn file_backed_log_block_count_for_test(
+            tx_log_path: &std::path::Path,
+        ) -> crate::Result<u32> {
+            let len = std::fs::metadata(tx_log_path)
+                .with_context(|| {
+                    format!(
+                        "failed to stat file-backed transaction log {}",
+                        tx_log_path.display()
+                    )
+                })?
+                .len();
+            let block_size = crate::vm::block_region::BLOCK_SIZE as u64;
+            crate::ensure!(
+                len >= block_size,
+                "file-backed transaction log is smaller than one block"
+            );
+            crate::ensure!(
+                len % block_size == 0,
+                "file-backed transaction log length is not block-aligned"
+            );
+            u32::try_from(len / block_size)
+                .context("file-backed transaction log block count overflow")
         }
     }
 }

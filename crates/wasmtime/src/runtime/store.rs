@@ -898,9 +898,8 @@ impl<T> Store<T> {
         self.inner.transaction_state_and_object_table_mut()
     }
 
-    #[doc(hidden)]
     #[cfg(feature = "transaction")]
-    pub fn transaction_create_file_backed_storage_for_test(
+    pub(crate) fn transaction_create_file_backed_storage_for_test(
         &mut self,
         tmemory_path: PathBuf,
         tx_log_path: PathBuf,
@@ -913,9 +912,8 @@ impl<T> Store<T> {
         )
     }
 
-    #[doc(hidden)]
     #[cfg(feature = "transaction")]
-    pub fn transaction_open_file_backed_storage_for_test(
+    pub(crate) fn transaction_open_file_backed_storage_for_test(
         &mut self,
         tmemory_path: PathBuf,
         tx_log_path: PathBuf,

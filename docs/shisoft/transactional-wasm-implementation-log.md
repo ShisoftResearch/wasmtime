@@ -1631,9 +1631,10 @@ Runtime/harness work in this tranche:
   runs recovery against the same files, and then runs phase-B WAST against the
   recovered storage.
 - Coverage now includes committed reopen persistence, ordinary trap/abort
-  semantics, and a controlled loose-end failure after durable undo plus in-place
-  file-backed write but before LP. The loose-end test checks the dirty file bytes
-  before recovery, then verifies from WAST that recovery restored the old value.
+  semantics, a controlled loose-end failure after durable undo plus in-place
+  file-backed write but before LP, and a repeated recovery cycle on the same
+  granule. The loose-end tests check dirty file bytes before recovery, then
+  verify from WAST that recovery restored the old value.
 
 Deferred:
 
@@ -1645,7 +1646,7 @@ Verification:
 
 ```text
 cargo test --test transaction_persistence_wast -- --format terse
-test result: ok. 3 passed; 0 failed
+test result: ok. 4 passed; 0 failed
 
 cargo check -p wasmtime
 Finished `dev` profile [unoptimized + debuginfo] target(s)

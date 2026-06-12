@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 use wasmtime::_internal::transaction_persistence::{
-    fail_next_commit_before_lp_for_test, recover_file_backed_tmemory_for_test,
+    create_file_backed_storage_for_test, fail_next_commit_before_lp_for_test,
+    open_file_backed_storage_for_test, recover_file_backed_tmemory_for_test,
 };
 use wasmtime::{Config, Engine, Result};
 use wasmtime_wast::{Async, WastContext};
@@ -88,14 +89,79 @@ fn transaction_wast_loose_end_tmemory_write_is_recovered() -> Result<()> {
         true,
     )?;
 
-    let tmemory_bytes = std::fs::read(&tmemory_path)?;
-    assert_eq!(&tmemory_bytes[64..68], &[0x88, 0x77, 0x66, 0x55]);
-
+    assert_tmemory_file_bytes(&tmemory_path, 64, &[0x88, 0x77, 0x66, 0x55])?;
     recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
 
     run_wast_phase(
         &engine,
         &fixture_path("tmemory-loose-end-after.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        false,
+        false,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn transaction_wast_recovery_resets_stale_loose_end_log() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+
+    let engine = transaction_wast_engine()?;
+
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-loose-end-before.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        true,
+        true,
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 64, &[0x88, 0x77, 0x66, 0x55])?;
+    recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-loose-end-after.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        false,
+        false,
+    )?;
+
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-commit-before.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        false,
+        false,
+    )?;
+    recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-commit-after.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        false,
+        false,
+    )?;
+
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-loose-end-existing-before.wast"),
+        &tmemory_path,
+        &tx_log_path,
+        false,
+        true,
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 64, &[0xcc, 0xbb, 0xaa, 0x99])?;
+    recover_file_backed_tmemory_for_test(&tx_log_path, &tmemory_path, 1, Some(1))?;
+    run_wast_phase(
+        &engine,
+        &fixture_path("tmemory-commit-after.wast"),
         &tmemory_path,
         &tx_log_path,
         false,
@@ -128,16 +194,14 @@ fn run_wast_phase(
     let tx_log_path = tx_log_path.to_path_buf();
     let mut context = WastContext::new(engine, Async::No, move |store| {
         let result = if create {
-            store.transaction_create_file_backed_storage_for_test(
+            create_file_backed_storage_for_test(
+                store,
                 tmemory_path.clone(),
                 tx_log_path.clone(),
                 64,
             )
         } else {
-            store.transaction_open_file_backed_storage_for_test(
-                tmemory_path.clone(),
-                tx_log_path.clone(),
-            )
+            open_file_backed_storage_for_test(store, tmemory_path.clone(), tx_log_path.clone())
         };
         result.unwrap_or_else(|error| {
             panic!("failed to configure file-backed transaction storage: {error:#}");
@@ -153,4 +217,10 @@ fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/transaction-persistence")
         .join(name)
+}
+
+fn assert_tmemory_file_bytes(tmemory_path: &Path, offset: usize, expected: &[u8]) -> Result<()> {
+    let tmemory_bytes = std::fs::read(tmemory_path)?;
+    assert_eq!(&tmemory_bytes[offset..offset + expected.len()], expected);
+    Ok(())
 }
