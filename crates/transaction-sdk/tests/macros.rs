@@ -9,13 +9,12 @@ struct Account {
 #[derive(Persist)]
 #[repr(C)]
 struct Bank {
-    primary: Account,
-    savings: Account,
+    accounts: [Account; 2],
 }
 
 #[transaction_attr]
 fn apply_credit(bank: &mut Bank, amount: i64) {
-    bank.primary.balance += amount;
+    bank.accounts[0].balance += amount;
 }
 
 #[test]
@@ -34,14 +33,13 @@ fn root_type_checks_derived_persist_types() {
 #[test]
 fn transaction_attr_expands_for_mut_helpers() {
     let mut bank = Bank {
-        primary: Account { balance: 5 },
-        savings: Account { balance: 7 },
+        accounts: [Account { balance: 5 }, Account { balance: 7 }],
     };
 
     apply_credit(&mut bank, 4);
 
-    assert_eq!(bank.primary.balance, 9);
-    assert_eq!(bank.savings.balance, 7);
+    assert_eq!(bank.accounts[0].balance, 9);
+    assert_eq!(bank.accounts[1].balance, 7);
 }
 
 #[test]

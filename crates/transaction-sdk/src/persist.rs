@@ -35,3 +35,7 @@ unsafe impl Persist for f32 {
 unsafe impl Persist for f64 {
     const TYPE_NAME: &'static str = "f64";
 }
+
+unsafe impl<T: Persist, const N: usize> Persist for [T; N] {
+    const TYPE_NAME: &'static str = "[T; N]";
+}
