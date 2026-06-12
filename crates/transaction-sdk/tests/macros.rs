@@ -54,6 +54,7 @@ fn transaction_attr_emits_wasm_markers_for_mut_self_methods() {
     let manifest_dir = tempdir.path();
     let sdk_manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
+    let sdk_path = manifest_path_string(sdk_manifest_dir);
     fs::write(
         manifest_dir.join("Cargo.toml"),
         format!(
@@ -66,9 +67,9 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasmtime-transaction-sdk = {{ path = "{}" }}
+sdk = {{ package = "wasmtime-transaction-sdk", path = {} }}
 "#,
-            sdk_manifest_dir.display()
+            sdk_path
         ),
     )
     .expect("write probe manifest");
@@ -78,7 +79,7 @@ wasmtime-transaction-sdk = {{ path = "{}" }}
         r#"#![no_std]
 
 use core::panic::PanicInfo;
-use wasmtime_transaction_sdk::{Persist, transaction_attr};
+use sdk::{Persist, transaction_attr};
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
@@ -215,4 +216,75 @@ pub extern "C" fn call_credit(account: &mut Account, amount: i64) {
         saw_transaction_and_receiver_marker,
         "expected a function body to call both transaction marking and mark_persistent_arg(0)"
     );
+}
+
+#[test]
+fn transaction_attr_rejects_non_persist_mut_args() {
+    use std::fs;
+    use std::process::Command;
+
+    use tempfile::tempdir;
+
+    let tempdir = tempdir().expect("create temp dir");
+    let manifest_dir = tempdir.path();
+    let sdk_manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    write_host_probe_manifest(manifest_dir, sdk_manifest_dir);
+    fs::create_dir(manifest_dir.join("src")).expect("create src dir");
+    fs::write(
+        manifest_dir.join("src/lib.rs"),
+        r#"use wasmtime_transaction_sdk::transaction_attr;
+
+struct Transient;
+
+#[transaction_attr]
+fn touch(value: &mut Transient) {
+    let _ = value;
+}
+"#,
+    )
+    .expect("write probe source");
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(cargo)
+        .arg("check")
+        .arg("--quiet")
+        .arg("--manifest-path")
+        .arg(manifest_dir.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", manifest_dir.join("target"))
+        .output()
+        .expect("check probe crate");
+    assert!(
+        !output.status.success(),
+        "probe crate unexpectedly compiled:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Transient"));
+    assert!(stderr.contains("Persist"));
+}
+
+fn write_host_probe_manifest(manifest_dir: &std::path::Path, sdk_manifest_dir: &std::path::Path) {
+    let sdk_path = manifest_path_string(sdk_manifest_dir);
+    std::fs::write(
+        manifest_dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "tx-macro-host-probe"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+wasmtime-transaction-sdk = {{ path = {} }}
+"#,
+            sdk_path
+        ),
+    )
+    .expect("write probe manifest");
+}
+
+fn manifest_path_string(path: &std::path::Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
 }

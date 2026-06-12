@@ -18,4 +18,5 @@ wasmtime-transaction-sdk-macros = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+toml = { workspace = true }
 wasmparser = { workspace = true }
