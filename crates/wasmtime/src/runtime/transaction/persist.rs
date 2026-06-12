@@ -1593,6 +1593,73 @@ mod tests {
         }
 
         #[test]
+        fn model_recovery_selects_highest_committed_object_version() {
+            let records = [
+                ModelRecord {
+                    tx: 1,
+                    logical_id: object_logical_id(41),
+                    version: 2,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x21,
+                    has_lp: true,
+                },
+                ModelRecord {
+                    tx: 2,
+                    logical_id: object_logical_id(41),
+                    version: 9,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x22,
+                    has_lp: true,
+                },
+                ModelRecord {
+                    tx: 3,
+                    logical_id: object_logical_id(41),
+                    version: 7,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x23,
+                    has_lp: true,
+                },
+            ];
+
+            let recovered = recover_model_history(&records).unwrap();
+            let actual = summarize_actual_recovery(&recovered);
+
+            assert_eq!(
+                actual.object_winners,
+                BTreeSet::from([(object_logical_id(41), 9)])
+            );
+            assert_eq!(actual.tmemory_undo_rollback_count, 0);
+        }
+
+        #[test]
+        fn model_recovery_rejects_distinct_duplicate_committed_object_version() {
+            let records = [
+                ModelRecord {
+                    tx: 1,
+                    logical_id: object_logical_id(41),
+                    version: 9,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x11,
+                    has_lp: true,
+                },
+                ModelRecord {
+                    tx: 2,
+                    logical_id: object_logical_id(41),
+                    version: 9,
+                    role: ModelRole::TObjectPub,
+                    payload_byte: 0x22,
+                    has_lp: true,
+                },
+            ];
+
+            let err = recover_model_history(&records).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("duplicate committed object version")
+            );
+        }
+
+        #[test]
         fn model_recovery_matches_file_backed_recovery_for_small_histories() {
             let mut runner = TestRunner::new(Config {
                 cases: 48,

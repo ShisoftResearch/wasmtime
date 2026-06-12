@@ -1,7 +1,7 @@
 use super::block_region::BlockRegionBackendView;
 use super::{
-    DATA_CHUNK_MAGIC, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader, TxDataRecordRole,
-    TxLogEntry, TxLogEntryRole, packed_granule_domain, unpack_object_granule_id,
+    DATA_CHUNK_MAGIC, DataChunkHeader, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader,
+    TxDataRecordRole, TxLogEntry, TxLogEntryRole, packed_granule_domain, unpack_object_granule_id,
 };
 use crate::prelude::*;
 use crate::runtime::transaction::TxObjectHeader;
@@ -180,6 +180,10 @@ fn load_root_publication_payload(
         "recovered root publication version does not match log winner"
     );
     ensure!(
+        data_header.role()? == TxDataRecordRole::TObjectPub,
+        "recovered root publication data record has non-publication role"
+    );
+    ensure!(
         data_header.kind == expected_domain as u16,
         "recovered root publication kind does not match granule domain"
     );
@@ -219,6 +223,10 @@ fn replay_object_winners(
         ensure!(
             data_header.version == winner.version,
             "recovered object publication version does not match log winner"
+        );
+        ensure!(
+            data_header.role()? == TxDataRecordRole::TObjectPub,
+            "recovered object publication data record has non-publication role"
         );
         ensure!(
             data_header.kind == domain as u16,
@@ -263,19 +271,132 @@ fn load_publication_payload(
     data_block: u32,
     data_offset: u32,
 ) -> Result<(TxDataRecordHeader, Vec<u8>)> {
-    let block = usize::try_from(data_block).context("publication data block overflow")?;
-    let in_block = usize::try_from(data_offset).context("publication data offset overflow")?;
-    let record_offset = block
-        .checked_mul(region.block_size())
-        .and_then(|offset| offset.checked_add(in_block))
-        .context("publication data record offset overflow")?;
+    let (record_offset, chunk_tail_offset) =
+        locate_data_record_offset(region, data_block, data_offset)?;
     let header = TxDataRecordHeader::from_bytes(
         region.read(record_offset, size_of::<TxDataRecordHeader>())?,
     )?;
     let payload_len =
         usize::try_from(header.payload_len).context("publication payload length overflow")?;
-    let payload = region.read(record_offset + size_of::<TxDataRecordHeader>(), payload_len)?;
+    let payload_offset = record_offset
+        .checked_add(size_of::<TxDataRecordHeader>())
+        .context("publication payload offset overflow")?;
+    let payload_end = payload_offset
+        .checked_add(payload_len)
+        .context("publication payload end overflow")?;
+    ensure!(
+        payload_end <= chunk_tail_offset,
+        "publication data record extends beyond data chunk tail"
+    );
+    let payload = region.read(payload_offset, payload_len)?;
     Ok((header, payload))
+}
+
+fn locate_data_record_offset(
+    region: &BlockRegionBackendView<'_>,
+    data_block: u32,
+    data_offset: u32,
+) -> Result<(usize, usize)> {
+    let block = usize::try_from(data_block).context("publication data block overflow")?;
+    let in_block = usize::try_from(data_offset).context("publication data offset overflow")?;
+    ensure!(
+        in_block < region.block_size(),
+        "publication data offset exceeds block size"
+    );
+
+    let mut cursor = 0usize;
+    while cursor < region.num_blocks() {
+        let start_block = u32::try_from(cursor).context("transactional recovery block overflow")?;
+        match region.block_magic(start_block)? {
+            DATA_CHUNK_MAGIC => {
+                let header = region.data_chunk_header(start_block)?;
+                let chunk_blocks = validated_chunk_blocks(region, cursor, start_block, header)?;
+                let chunk_end = cursor
+                    .checked_add(chunk_blocks)
+                    .context("transactional data chunk range overflow")?;
+                if block >= cursor && block < chunk_end {
+                    let in_chunk = block
+                        .checked_sub(cursor)
+                        .and_then(|delta| delta.checked_mul(region.block_size()))
+                        .and_then(|offset| offset.checked_add(in_block))
+                        .context("publication data record offset overflow")?;
+                    let chunk_tail = chunk_tail_offset(region, header)?;
+                    ensure!(
+                        in_chunk >= size_of::<DataChunkHeader>(),
+                        "publication data record points into data chunk header"
+                    );
+                    let record_end = in_chunk
+                        .checked_add(size_of::<TxDataRecordHeader>())
+                        .context("publication data record offset overflow")?;
+                    ensure!(
+                        record_end <= chunk_tail,
+                        "publication data record is not fully inside a data chunk"
+                    );
+                    let chunk_start_offset = cursor
+                        .checked_mul(region.block_size())
+                        .context("publication data record offset overflow")?;
+                    let record_offset = chunk_start_offset
+                        .checked_add(in_chunk)
+                        .context("publication data record offset overflow")?;
+                    let chunk_tail_offset = chunk_start_offset
+                        .checked_add(chunk_tail)
+                        .context("publication data record offset overflow")?;
+                    return Ok((record_offset, chunk_tail_offset));
+                }
+                cursor = chunk_end;
+            }
+            LOG_BLOCK_MAGIC => {
+                cursor += 1;
+            }
+            _ => {
+                cursor += 1;
+            }
+        }
+    }
+
+    bail!("publication data record is not inside a data chunk")
+}
+
+fn validated_chunk_blocks(
+    region: &BlockRegionBackendView<'_>,
+    cursor: usize,
+    start_block: u32,
+    header: DataChunkHeader,
+) -> Result<usize> {
+    let chunk_blocks = usize::try_from(header.chunk_blocks)
+        .context("transactional data chunk block count overflow")?;
+    ensure!(
+        chunk_blocks > 0,
+        "transactional data chunk at block {start_block} has zero blocks"
+    );
+    ensure!(
+        cursor + chunk_blocks <= region.num_blocks(),
+        "transactional data chunk at block {start_block} exceeds region"
+    );
+    Ok(chunk_blocks)
+}
+
+fn chunk_tail_offset(
+    region: &BlockRegionBackendView<'_>,
+    header: DataChunkHeader,
+) -> Result<usize> {
+    let tail_block_delta = usize::try_from(header.tail_block_delta)
+        .context("transactional data chunk tail block delta conversion overflow")?;
+    let tail_in_block = usize::try_from(header.tail_in_block)
+        .context("transactional data chunk tail offset conversion overflow")?;
+    let tail = tail_block_delta
+        .checked_mul(region.block_size())
+        .and_then(|offset| offset.checked_add(tail_in_block))
+        .context("transactional data chunk tail overflow")?;
+    let capacity = usize::try_from(header.chunk_blocks)
+        .context("transactional data chunk block count conversion overflow")?
+        .checked_mul(region.block_size())
+        .context("transactional data chunk capacity overflow")?;
+    ensure!(
+        tail <= capacity,
+        "transactional data chunk tail exceeds chunk capacity"
+    );
+    Ok(tail)
 }
 
 fn discover_streams(region: &BlockRegionBackendView<'_>) -> Result<Vec<RecoveredStream>> {
@@ -374,15 +495,15 @@ fn replay_stream(
             if is_final_lp(entry) {
                 txn.entries.push(entry);
                 for committed in &txn.entries {
-                    if committed.role()? != TxLogEntryRole::TObjectPub {
-                        continue;
+                    validate_committed_entry(region, *committed)?;
+                    if committed.role()? == TxLogEntryRole::TObjectPub {
+                        replay.winners.push(RecoveryWinner {
+                            logical_id: committed.logical_id,
+                            version: committed.version,
+                            data_block: committed.data_block,
+                            data_offset: committed.data_offset,
+                        });
                     }
-                    replay.winners.push(RecoveryWinner {
-                        logical_id: committed.logical_id,
-                        version: committed.version,
-                        data_block: committed.data_block,
-                        data_offset: committed.data_offset,
-                    });
                 }
                 pending = None;
             } else {
@@ -398,6 +519,31 @@ fn replay_stream(
     }
 
     Ok(replay)
+}
+
+fn validate_committed_entry(region: &BlockRegionBackendView<'_>, entry: TxLogEntry) -> Result<()> {
+    let (data_header, _) = load_publication_payload(region, entry.data_block, entry.data_offset)?;
+    ensure!(
+        data_header.logical_id == entry.logical_id,
+        "committed data record logical id does not match log entry"
+    );
+    ensure!(
+        data_header.version == entry.version,
+        "committed data record version does not match log entry"
+    );
+
+    match entry.role()? {
+        TxLogEntryRole::TObjectPub => ensure!(
+            data_header.role()? == TxDataRecordRole::TObjectPub,
+            "recovered object publication data record has non-publication role"
+        ),
+        TxLogEntryRole::TMemoryUndo => ensure!(
+            data_header.role()? == TxDataRecordRole::TMemoryUndo,
+            "tmemory undo data record has non-undo role"
+        ),
+    }
+
+    Ok(())
 }
 
 fn loose_end_tmemory_undo_rollbacks(
@@ -552,6 +698,50 @@ mod tests {
 
         assert_eq!(recovered.winners.len(), 0);
         assert_eq!(recovered.tmemory_undo_rollbacks.len(), 0);
+    }
+
+    #[test]
+    fn model_recovery_accepts_idempotent_lp_duplicate_pointer() {
+        let region = sample_region_with_duplicate_lp_pointer();
+        let recovered = recover_region_for_test(&region).unwrap();
+        let objects = recovered.committed_object_winners().unwrap();
+
+        assert_eq!(recovered.winners.len(), 1);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].object_id, 41);
+        assert_eq!(objects[0].version, 9);
+    }
+
+    #[test]
+    fn model_recovery_rejects_corrupt_log_entry_crc() {
+        let region = sample_region_with_corrupt_non_final_log_entry();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("corrupt log entry"));
+    }
+
+    #[test]
+    fn model_recovery_rejects_committed_entry_role_mismatch() {
+        let region = sample_region_with_committed_entry_role_mismatch();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("non-undo role"));
+    }
+
+    #[test]
+    fn model_recovery_rejects_object_publication_data_role_mismatch() {
+        let region = sample_region_with_object_publication_data_role_mismatch();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("non-publication role"));
+    }
+
+    #[test]
+    fn model_recovery_rejects_publication_pointer_outside_data_chunk() {
+        let region = sample_region_with_publication_pointer_outside_data_chunk();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("data chunk"));
     }
 
     fn sample_region_with_two_streams() -> VMemoryBlockRegion {
@@ -723,6 +913,93 @@ mod tests {
         region
     }
 
+    fn sample_region_with_duplicate_lp_pointer() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let (log_block, location) = append_committed_object_update_raw(
+            &mut region,
+            1,
+            stream,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        let entry = TMemory::publication_log_entry(
+            logical_id,
+            9,
+            1 << 1,
+            location.data_block,
+            location.data_offset,
+            true,
+        );
+        write_log_entries(&mut region, log_block, &[entry, entry]);
+        region
+    }
+
+    fn sample_region_with_committed_entry_role_mismatch() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let (log_block, _) = append_committed_object_update_raw(
+            &mut region,
+            1,
+            stream,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        rewrite_log_entry(&mut region, log_block, 0, |entry| {
+            entry.set_role(TxLogEntryRole::TMemoryUndo);
+        });
+        region
+    }
+
+    fn sample_region_with_object_publication_data_role_mismatch() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let (_, location) = append_committed_object_update_raw(
+            &mut region,
+            1,
+            stream,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        rewrite_data_record_header(&mut region, location, |header| {
+            header.set_role(TxDataRecordRole::TMemoryUndo);
+        });
+        region
+    }
+
+    fn sample_region_with_publication_pointer_outside_data_chunk() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let (log_block, _) = append_committed_object_update_raw(
+            &mut region,
+            1,
+            stream,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        rewrite_log_entry(&mut region, log_block, 0, |entry| {
+            entry.data_block = log_block;
+            entry.data_offset = 0;
+        });
+        region
+    }
+
     fn append_committed_root_update(
         region: &mut VMemoryBlockRegion,
         stream_id: u32,
@@ -815,6 +1092,21 @@ mod tests {
         type_index: u32,
         payload: ObjectPayload,
     ) {
+        let _ = append_committed_object_update_raw(
+            region, stream_id, stream, block_seq, logical_id, version, type_index, payload,
+        );
+    }
+
+    fn append_committed_object_update_raw(
+        region: &mut VMemoryBlockRegion,
+        stream_id: u32,
+        stream: StreamCursor,
+        block_seq: u32,
+        logical_id: u64,
+        version: u32,
+        type_index: u32,
+        payload: ObjectPayload,
+    ) -> (u32, DataRecordLocation) {
         let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
         let object_record =
             encode_object_record_for_test(object_id, version, type_index, &payload).unwrap();
@@ -837,6 +1129,7 @@ mod tests {
             true,
         );
         write_log_entries(region, log_block, &[entry]);
+        (log_block, location)
     }
 
     fn append_committed_update(
@@ -947,5 +1240,46 @@ mod tests {
         let mut bytes = region.read(field_offset, 4).unwrap();
         bytes[0] ^= 0x01;
         region.write(field_offset, &bytes).unwrap();
+    }
+
+    fn rewrite_log_entry(
+        region: &mut VMemoryBlockRegion,
+        start_block: u32,
+        entry_index: usize,
+        update: impl FnOnce(&mut TxLogEntry),
+    ) {
+        let entry_offset = usize::try_from(start_block).unwrap() * BLOCK_SIZE
+            + size_of::<LogBlockHeader>()
+            + entry_index * size_of::<TxLogEntry>();
+        let bytes = region.read(entry_offset, size_of::<TxLogEntry>()).unwrap();
+        let mut entry = TxLogEntry {
+            logical_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            version: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            tx_meta: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            data_block: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            data_offset: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            crc32: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            reserved: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+        };
+        update(&mut entry);
+        entry.seal_crc32();
+        region
+            .write(entry_offset, &encode_tx_log_entry(entry))
+            .unwrap();
+    }
+
+    fn rewrite_data_record_header(
+        region: &mut VMemoryBlockRegion,
+        location: DataRecordLocation,
+        update: impl FnOnce(&mut TxDataRecordHeader),
+    ) {
+        let record_offset = usize::try_from(location.data_block).unwrap() * BLOCK_SIZE
+            + usize::try_from(location.data_offset).unwrap();
+        let bytes = region
+            .read(record_offset, size_of::<TxDataRecordHeader>())
+            .unwrap();
+        let mut header = TxDataRecordHeader::from_bytes(bytes).unwrap();
+        update(&mut header);
+        region.write(record_offset, &header.as_bytes()).unwrap();
     }
 }

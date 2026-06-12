@@ -21,6 +21,53 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 4: Version Selection And Corruption Recovery Tests
+
+Date: 2026-06-12
+
+Wave 4 of the model-checking roadmap now extends the durable recovery slice in
+`crates/wasmtime/src/runtime/transaction/persist.rs` plus the raw region-image
+recovery tests in `crates/wasmtime/src/runtime/vm/memory/tmemory/recovery.rs`.
+
+Changes in this slice:
+
+- Added deterministic `model_recovery_selects_highest_committed_object_version`
+  coverage so committed versions `2`, `9`, and `7` for the same object id
+  deterministically recover version `9`.
+- Added deterministic duplicate-version corruption coverage:
+  `model_recovery_rejects_distinct_duplicate_committed_object_version`
+  exercises two committed object publications with the same logical
+  id/version but different payload bytes, while
+  `model_recovery_accepts_idempotent_lp_duplicate_pointer` preserves the
+  existing exact same logical/version/data-pointer duplicate LP acceptance.
+- Added malformed-image coverage for corrupt log-entry CRC, committed
+  log/data-role mismatch, object-publication data-role mismatch, and data
+  pointers outside any data chunk.
+- Tightened recovery validation so committed entries now validate their data
+  record logical id/version and reject mismatched publication versus
+  `TMemoryUndo` roles instead of silently dropping malformed committed records.
+- Tightened raw data-record loading so recovery rejects pointers that do not
+  land inside a discovered data chunk or that extend past the chunk tail.
+
+Deferred in this slice:
+
+- Delete-version precedence remains omitted because delete semantics are not
+  wired into the durable object model yet.
+- Data-chunk stream mismatch remains deferred. Current recovery discovers data
+  chunks globally and validates chunk membership plus chunk-tail bounds, but it
+  does not yet enforce a stronger stream-identity rule for object publication
+  pointers, and this slice does not force that broader design change.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_recovery -- --format terse
+cargo test -p wasmtime --lib block_region -- --format terse
+cargo test -p wasmtime --lib transaction::persist -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 3: Mixed Participant Reference-World Tests
 
 Date: 2026-06-12
