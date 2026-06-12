@@ -142,10 +142,7 @@ fn persist_field_types(fields: &Fields) -> syn::Result<Vec<&Type>> {
     match fields {
         Fields::Named(fields) => Ok(fields.named.iter().map(|field| &field.ty).collect()),
         Fields::Unnamed(fields) => Ok(fields.unnamed.iter().map(|field| &field.ty).collect()),
-        Fields::Unit => Err(Error::new_spanned(
-            fields,
-            "Persist can only be derived for named or tuple structs; unit structs are unsupported",
-        )),
+        Fields::Unit => Ok(Vec::new()),
     }
 }
 
@@ -286,14 +283,15 @@ mod tests {
     }
 
     #[test]
-    fn derive_persist_rejects_unit_structs() {
-        let err = derive_persist_impl(parse_quote! {
+    fn derive_persist_accepts_stable_repr_unit_structs() {
+        let tokens = derive_persist_impl(parse_quote! {
             #[repr(C)]
             struct Marker;
         })
-        .expect_err("unit structs should be rejected");
+        .expect("unit structs should be accepted")
+        .to_string();
 
-        assert!(err.to_string().contains("named or tuple structs"));
+        assert!(tokens.contains("unsafe impl :: wasmtime_transaction_sdk :: Persist for Marker"));
     }
 
     #[test]
