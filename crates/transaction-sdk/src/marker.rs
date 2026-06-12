@@ -1,5 +1,9 @@
 use crate::PersistentId;
 
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_PERSISTENT_REF_PANIC: &str =
+    "persistent references are only materialized for wasm32 transaction guests";
+
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "twasm_intrinsics")]
 unsafe extern "C" {
@@ -21,7 +25,8 @@ pub unsafe fn persistent_addr_mut(id: PersistentId) -> *mut u8 {
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        id.payload() as usize as *mut u8
+        let _ = id;
+        panic!("{HOST_PERSISTENT_REF_PANIC}")
     }
 }
 

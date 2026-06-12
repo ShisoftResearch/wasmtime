@@ -44,4 +44,25 @@ mod tests {
             let _ = tx.root_mut(&root);
         });
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[should_panic(
+        expected = "persistent references are only materialized for wasm32 transaction guests"
+    )]
+    fn host_persistent_addr_materialization_panics() {
+        let _ =
+            unsafe { crate::marker::persistent_addr_mut(crate::PersistentId::tmemory_offset(0)) };
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[should_panic(
+        expected = "persistent references are only materialized for wasm32 transaction guests"
+    )]
+    fn host_persistent_ref_deref_panics() {
+        let root = Root::<Counter>::tmemory_offset(0);
+        let tx = unsafe { crate::Tx::from_marker() };
+        let _ = tx.root_ref(&root).as_ref();
+    }
 }
