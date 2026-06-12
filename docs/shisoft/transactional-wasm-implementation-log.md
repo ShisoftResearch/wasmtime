@@ -21,6 +21,49 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Model-Checking Wave 8: Durable Backend Conformance Harness
+
+Date: 2026-06-12
+
+Wave 8 of the model-checking roadmap now adds a backend-conformance slice in
+`crates/wasmtime/src/runtime/transaction/persist.rs`.
+
+Changes in this slice:
+
+- Added a nested `model_backend_conformance` unit-test module so the Wave 8
+  slice is runnable with
+  `cargo test -p wasmtime --lib model_backend_conformance -- --format terse`.
+- Added a test backend-factory abstraction that drives the same transaction
+  scenarios through backend-compatible `TxDurableLog` instances instead of
+  hard-coding file-backed recovery-only tests.
+- Added a file-backed factory that creates temp path-backed logs and compares
+  recovered durable summaries via
+  `TxDurableLog::recover_file_backed_for_test`.
+- Added an in-memory factory that runs the same append, flush, fence, LP, and
+  log-entry ordering scenarios through a recording wrapper over the in-memory
+  durable-log backend, without claiming reopen recovery coverage.
+- Added deterministic conformance scenarios for object-only commit,
+  `tmemory`-undo-only commit, mixed commit, mixed loose end, and multi-stream
+  transaction ids.
+- Added shared assertions for backend call counts, log-entry roles, tx ids,
+  final-LP counts, CRC sealing, and LP data-pointer reuse, with recovery
+  summary comparison enabled only for the file-backed backend.
+
+Semantic note for this slice:
+
+- The in-memory factory is intentionally limited to non-restart properties. It
+  verifies publish ordering and log shape through test hooks, but only the
+  file-backed factory proves reopen-and-recover behavior.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib model_backend_conformance -- --format terse
+cargo test -p wasmtime --lib transaction::persist -- --format terse
+cargo fmt --check
+git diff --check
+```
+
 ## Model-Checking Wave 6: Permission-State Model Tests
 
 Date: 2026-06-12

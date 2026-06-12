@@ -181,6 +181,19 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
 
     #[cfg(test)]
     fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32>;
+
+    #[cfg(test)]
+    fn backend_stats_for_test(&self) -> TxDurableBackendStats;
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TxDurableBackendStats {
+    append_data_calls: usize,
+    append_log_calls: usize,
+    flush_data_calls: usize,
+    flush_log_calls: usize,
+    fence_calls: usize,
 }
 
 #[derive(Debug, Default)]
@@ -243,6 +256,11 @@ impl TxDurableLog {
     ) -> Result<u32> {
         self.storage
             .data_chunk_stream_id_for_data_block_for_test(data_block)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_stats_for_test(&self) -> TxDurableBackendStats {
+        self.storage.backend_stats_for_test()
     }
 
     pub(crate) fn create_file_backed(path: &Path, num_blocks: u32) -> Result<Self> {
@@ -324,6 +342,11 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
     #[cfg(test)]
     fn data_chunk_stream_id_for_data_block_for_test(&self, _data_block: u32) -> Result<u32> {
         bail!("in-memory transaction log has no file-backed data chunk headers")
+    }
+
+    #[cfg(test)]
+    fn backend_stats_for_test(&self) -> TxDurableBackendStats {
+        TxDurableBackendStats::default()
     }
 }
 
@@ -418,6 +441,11 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
             }
         }
         bail!("transaction data block {data_block} is not inside a data chunk")
+    }
+
+    #[cfg(test)]
+    fn backend_stats_for_test(&self) -> TxDurableBackendStats {
+        TxDurableBackendStats::default()
     }
 }
 
@@ -1782,6 +1810,770 @@ mod tests {
                     assert_eq!(actual, expected, "cutpoint: {cutpoint:?}");
                 }
             }
+        }
+    }
+
+    mod model_backend_conformance {
+        use super::*;
+        use std::path::PathBuf;
+        use tempfile::TempDir;
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum BackendScenarioRecord {
+            TObjectPub {
+                object_id: u64,
+                version: u32,
+                payload_byte: u8,
+            },
+            TMemoryUndo {
+                logical_id: u64,
+                version: u32,
+                payload_byte: u8,
+            },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct BackendScenarioTx {
+            stream_id: u32,
+            txid: u32,
+            records: Vec<BackendScenarioRecord>,
+            commit: bool,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct BackendScenario {
+            name: &'static str,
+            transactions: Vec<BackendScenarioTx>,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum DurableLogTestFactory {
+            InMemory,
+            FileBacked,
+        }
+
+        impl DurableLogTestFactory {
+            fn all() -> [Self; 2] {
+                [Self::InMemory, Self::FileBacked]
+            }
+
+            fn name(self) -> &'static str {
+                match self {
+                    Self::InMemory => "in_memory",
+                    Self::FileBacked => "file_backed",
+                }
+            }
+
+            fn supports_recovery(self) -> bool {
+                matches!(self, Self::FileBacked)
+            }
+
+            fn create(self) -> Result<DurableLogTestHandle> {
+                match self {
+                    Self::InMemory => Ok(DurableLogTestHandle {
+                        factory: self,
+                        _tempdir: None,
+                        path: None,
+                        log: TxDurableLog::with_backend(RecordingBackend::new(
+                            InMemoryTxDurableLog::default(),
+                        )),
+                    }),
+                    Self::FileBacked => {
+                        let tempdir = tempfile::tempdir()?;
+                        let path = tempdir.path().join("tx-log.bin");
+                        let region = crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(&path, 64)?;
+                        Ok(DurableLogTestHandle {
+                            factory: self,
+                            _tempdir: Some(tempdir),
+                            path: Some(path),
+                            log: TxDurableLog::with_backend(RecordingBackend::new(
+                                FileBackedTxDurableLog {
+                                    region,
+                                    streams: BTreeMap::new(),
+                                    pending_data_chunks: BTreeSet::new(),
+                                    pending_log_blocks: BTreeSet::new(),
+                                },
+                            )),
+                        })
+                    }
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        struct DurableLogTestHandle {
+            factory: DurableLogTestFactory,
+            _tempdir: Option<TempDir>,
+            path: Option<PathBuf>,
+            log: TxDurableLog,
+        }
+
+        #[derive(Debug)]
+        struct RecordingBackend<B> {
+            inner: B,
+            stats: TxDurableBackendStats,
+        }
+
+        impl<B> RecordingBackend<B> {
+            fn new(inner: B) -> Self {
+                Self {
+                    inner,
+                    stats: TxDurableBackendStats::default(),
+                }
+            }
+        }
+
+        impl<B> TxDurableLogBackend for RecordingBackend<B>
+        where
+            B: TxDurableLogBackend,
+        {
+            fn append_data_record(
+                &mut self,
+                transaction_stream_id: u32,
+                data_stream: DurableDataStream,
+                record: &[u8],
+            ) -> Result<(u32, u32)> {
+                self.stats.append_data_calls += 1;
+                self.inner
+                    .append_data_record(transaction_stream_id, data_stream, record)
+            }
+
+            fn append_log_entry(
+                &mut self,
+                transaction_stream_id: u32,
+                entry: TxLogEntry,
+            ) -> Result<()> {
+                self.stats.append_log_calls += 1;
+                self.inner.append_log_entry(transaction_stream_id, entry)
+            }
+
+            fn flush_data(&mut self) -> Result<()> {
+                self.stats.flush_data_calls += 1;
+                self.inner.flush_data()
+            }
+
+            fn flush_log(&mut self) -> Result<()> {
+                self.stats.flush_log_calls += 1;
+                self.inner.flush_log()
+            }
+
+            fn fence(&mut self) -> Result<()> {
+                self.stats.fence_calls += 1;
+                self.inner.fence()
+            }
+
+            #[cfg(test)]
+            fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry> {
+                self.inner.log_entries_for_test(stream_id)
+            }
+
+            #[cfg(test)]
+            fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32> {
+                self.inner
+                    .data_chunk_stream_id_for_data_block_for_test(data_block)
+            }
+
+            #[cfg(test)]
+            fn backend_stats_for_test(&self) -> TxDurableBackendStats {
+                self.stats
+            }
+        }
+
+        #[derive(Clone, Debug, Default, Eq, PartialEq)]
+        struct BackendRecoverySummary {
+            object_winners: BTreeSet<(u64, u32)>,
+            tmemory_undo_rollbacks: BTreeSet<(u64, u32, Vec<u8>)>,
+            tmemory_undo_rollback_count: usize,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct ExpectedLogEntry {
+            logical_id: u64,
+            version: u32,
+            txid: u32,
+            role: TxLogEntryRole,
+            is_final: bool,
+        }
+
+        #[derive(Debug)]
+        struct BackendObservation {
+            stats: TxDurableBackendStats,
+            streams: BTreeMap<u32, Vec<TxLogEntry>>,
+            recovery: Option<BackendRecoverySummary>,
+        }
+
+        impl BackendScenarioRecord {
+            fn logical_id(self) -> u64 {
+                match self {
+                    Self::TObjectPub { object_id, .. } => object_logical_id(object_id),
+                    Self::TMemoryUndo { logical_id, .. } => logical_id,
+                }
+            }
+
+            fn version(self) -> u32 {
+                match self {
+                    Self::TObjectPub { version, .. } | Self::TMemoryUndo { version, .. } => version,
+                }
+            }
+
+            fn role(self) -> TxLogEntryRole {
+                match self {
+                    Self::TObjectPub { .. } => TxLogEntryRole::TObjectPub,
+                    Self::TMemoryUndo { .. } => TxLogEntryRole::TMemoryUndo,
+                }
+            }
+
+            fn payload_byte(self) -> u8 {
+                match self {
+                    Self::TObjectPub { payload_byte, .. }
+                    | Self::TMemoryUndo { payload_byte, .. } => payload_byte,
+                }
+            }
+        }
+
+        impl DurableLogTestHandle {
+            fn observe(self, scenario: &BackendScenario) -> Result<BackendObservation> {
+                let DurableLogTestHandle {
+                    factory: _factory,
+                    _tempdir,
+                    path,
+                    log,
+                } = self;
+                let mut streams = BTreeMap::new();
+
+                for tx in &scenario.transactions {
+                    let entries = log.log_entries_for_test(tx.stream_id);
+                    streams.insert(tx.stream_id, entries);
+                }
+
+                let stats = log.backend_stats_for_test();
+                drop(log);
+
+                let recovery = match path {
+                    Some(path) => Some(summarize_recovery(
+                        &TxDurableLog::recover_file_backed_for_test(&path)?,
+                    )),
+                    None => None,
+                };
+
+                let _ = _tempdir;
+
+                Ok(BackendObservation {
+                    stats,
+                    streams,
+                    recovery,
+                })
+            }
+        }
+
+        fn object_only_commit_scenario() -> BackendScenario {
+            BackendScenario {
+                name: "object_only_commit",
+                transactions: vec![BackendScenarioTx {
+                    stream_id: 110,
+                    txid: 7,
+                    records: vec![BackendScenarioRecord::TObjectPub {
+                        object_id: 41,
+                        version: 2,
+                        payload_byte: 0x11,
+                    }],
+                    commit: true,
+                }],
+            }
+        }
+
+        fn tmemory_undo_only_commit_scenario() -> BackendScenario {
+            BackendScenario {
+                name: "tmemory_undo_only_commit",
+                transactions: vec![BackendScenarioTx {
+                    stream_id: 111,
+                    txid: 8,
+                    records: vec![BackendScenarioRecord::TMemoryUndo {
+                        logical_id: tmemory_logical_id(1),
+                        version: 5,
+                        payload_byte: 0x22,
+                    }],
+                    commit: true,
+                }],
+            }
+        }
+
+        fn mixed_commit_scenario() -> BackendScenario {
+            BackendScenario {
+                name: "mixed_commit",
+                transactions: vec![BackendScenarioTx {
+                    stream_id: 112,
+                    txid: 9,
+                    records: vec![
+                        BackendScenarioRecord::TMemoryUndo {
+                            logical_id: tmemory_logical_id(2),
+                            version: 3,
+                            payload_byte: 0x33,
+                        },
+                        BackendScenarioRecord::TObjectPub {
+                            object_id: 42,
+                            version: 7,
+                            payload_byte: 0x44,
+                        },
+                    ],
+                    commit: true,
+                }],
+            }
+        }
+
+        fn mixed_loose_end_scenario() -> BackendScenario {
+            BackendScenario {
+                name: "mixed_loose_end",
+                transactions: vec![BackendScenarioTx {
+                    stream_id: 113,
+                    txid: 10,
+                    records: vec![
+                        BackendScenarioRecord::TMemoryUndo {
+                            logical_id: tmemory_logical_id(3),
+                            version: 4,
+                            payload_byte: 0x55,
+                        },
+                        BackendScenarioRecord::TObjectPub {
+                            object_id: 43,
+                            version: 8,
+                            payload_byte: 0x66,
+                        },
+                    ],
+                    commit: false,
+                }],
+            }
+        }
+
+        fn multi_stream_transaction_ids_scenario() -> BackendScenario {
+            BackendScenario {
+                name: "multi_stream_transaction_ids",
+                transactions: vec![
+                    BackendScenarioTx {
+                        stream_id: 120,
+                        txid: 41,
+                        records: vec![BackendScenarioRecord::TObjectPub {
+                            object_id: 60,
+                            version: 1,
+                            payload_byte: 0xa1,
+                        }],
+                        commit: true,
+                    },
+                    BackendScenarioTx {
+                        stream_id: 121,
+                        txid: 77,
+                        records: vec![BackendScenarioRecord::TMemoryUndo {
+                            logical_id: tmemory_logical_id(7),
+                            version: 2,
+                            payload_byte: 0xa2,
+                        }],
+                        commit: true,
+                    },
+                    BackendScenarioTx {
+                        stream_id: 122,
+                        txid: 88,
+                        records: vec![
+                            BackendScenarioRecord::TMemoryUndo {
+                                logical_id: tmemory_logical_id(8),
+                                version: 5,
+                                payload_byte: 0xa3,
+                            },
+                            BackendScenarioRecord::TObjectPub {
+                                object_id: 61,
+                                version: 9,
+                                payload_byte: 0xa4,
+                            },
+                        ],
+                        commit: false,
+                    },
+                ],
+            }
+        }
+
+        fn object_logical_id(object_id: u64) -> u64 {
+            pack_object_granule_id(PackedGranuleDomain::TStruct, object_id).unwrap()
+        }
+
+        fn tmemory_logical_id(granule_id: u64) -> u64 {
+            0x1000_0000_0000_0000 | (granule_id << 12) | 0x2a
+        }
+
+        fn repeated_payload(byte: u8) -> Vec<u8> {
+            vec![byte; 4]
+        }
+
+        fn pending_publication(record: BackendScenarioRecord) -> PendingPublication {
+            let BackendScenarioRecord::TObjectPub {
+                object_id,
+                version,
+                payload_byte,
+            } = record
+            else {
+                unreachable!();
+            };
+            let payload = encode_object_record_for_test(
+                object_id,
+                version,
+                12,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(i32::from(payload_byte))]),
+            )
+            .unwrap();
+            PendingPublication::persistent_object_for_test(
+                PackedGranuleDomain::TStruct,
+                object_id,
+                version,
+                12,
+                &payload,
+            )
+        }
+
+        fn pending_undo(record: BackendScenarioRecord) -> PendingGranuleUndo {
+            let BackendScenarioRecord::TMemoryUndo {
+                logical_id,
+                version,
+                payload_byte,
+            } = record
+            else {
+                unreachable!();
+            };
+            PendingGranuleUndo::tmemory(logical_id, version, repeated_payload(payload_byte))
+        }
+
+        fn expected_backend_stats(scenario: &BackendScenario) -> TxDurableBackendStats {
+            let total_records = scenario
+                .transactions
+                .iter()
+                .map(|tx| tx.records.len())
+                .sum::<usize>();
+            let committed_txs = scenario
+                .transactions
+                .iter()
+                .filter(|tx| tx.commit && !tx.records.is_empty())
+                .count();
+
+            TxDurableBackendStats {
+                append_data_calls: total_records,
+                append_log_calls: total_records + committed_txs,
+                flush_data_calls: total_records,
+                flush_log_calls: total_records + committed_txs,
+                fence_calls: total_records
+                    .checked_mul(2)
+                    .unwrap()
+                    .checked_add(committed_txs)
+                    .unwrap(),
+            }
+        }
+
+        fn expected_stream_entries(
+            scenario: &BackendScenario,
+        ) -> BTreeMap<u32, Vec<ExpectedLogEntry>> {
+            let mut streams = BTreeMap::new();
+
+            for tx in &scenario.transactions {
+                let mut entries = Vec::new();
+                for record in &tx.records {
+                    entries.push(ExpectedLogEntry {
+                        logical_id: record.logical_id(),
+                        version: record.version(),
+                        txid: tx.txid,
+                        role: record.role(),
+                        is_final: false,
+                    });
+                }
+                if tx.commit {
+                    let last = tx
+                        .records
+                        .last()
+                        .copied()
+                        .expect("scenario tx must have records");
+                    entries.push(ExpectedLogEntry {
+                        logical_id: last.logical_id(),
+                        version: last.version(),
+                        txid: tx.txid,
+                        role: last.role(),
+                        is_final: true,
+                    });
+                }
+                streams.insert(tx.stream_id, entries);
+            }
+
+            streams
+        }
+
+        fn expected_recovery(scenario: &BackendScenario) -> BackendRecoverySummary {
+            let mut object_versions = BTreeMap::<u64, u32>::new();
+            let mut tmemory_undo_rollbacks = BTreeSet::new();
+            let mut tmemory_undo_rollback_count = 0usize;
+
+            for tx in &scenario.transactions {
+                if tx.commit {
+                    for record in &tx.records {
+                        if record.role() != TxLogEntryRole::TObjectPub {
+                            continue;
+                        }
+                        object_versions
+                            .entry(record.logical_id())
+                            .and_modify(|current| *current = (*current).max(record.version()))
+                            .or_insert(record.version());
+                    }
+                    continue;
+                }
+
+                for record in &tx.records {
+                    if record.role() != TxLogEntryRole::TMemoryUndo {
+                        continue;
+                    }
+                    tmemory_undo_rollbacks.insert((
+                        record.logical_id(),
+                        record.version(),
+                        repeated_payload(record.payload_byte()),
+                    ));
+                    tmemory_undo_rollback_count += 1;
+                }
+            }
+
+            BackendRecoverySummary {
+                object_winners: object_versions.into_iter().collect(),
+                tmemory_undo_rollbacks,
+                tmemory_undo_rollback_count,
+            }
+        }
+
+        fn summarize_recovery(
+            recovered: &crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion,
+        ) -> BackendRecoverySummary {
+            BackendRecoverySummary {
+                object_winners: recovered
+                    .object_winners
+                    .iter()
+                    .map(|winner| (object_logical_id(winner.object_id), winner.version))
+                    .collect(),
+                tmemory_undo_rollbacks: recovered
+                    .tmemory_undo_rollbacks
+                    .iter()
+                    .map(|rollback| {
+                        (
+                            rollback.logical_id,
+                            rollback.version,
+                            rollback.old_granule_bytes.clone(),
+                        )
+                    })
+                    .collect(),
+                tmemory_undo_rollback_count: recovered.tmemory_undo_rollbacks.len(),
+            }
+        }
+
+        fn execute_scenario(
+            factory: DurableLogTestFactory,
+            scenario: &BackendScenario,
+        ) -> Result<BackendObservation> {
+            let mut handle = factory.create()?;
+
+            for tx in &scenario.transactions {
+                assert!(
+                    !tx.records.is_empty(),
+                    "scenario transactions must publish at least one record"
+                );
+
+                let mut final_marker = None;
+                {
+                    let mut sink = handle.log.stream_sink(tx.stream_id);
+                    let mut publisher =
+                        StreamPublisher::new_for_test(&mut sink, tx.stream_id, tx.txid);
+                    for record in &tx.records {
+                        let marker = match record {
+                            BackendScenarioRecord::TObjectPub { .. } => publisher
+                                .publish_object_publication_before_commit(&pending_publication(
+                                    *record,
+                                ))?,
+                            BackendScenarioRecord::TMemoryUndo { .. } => publisher
+                                .publish_tmemory_undo_before_in_place_write(&pending_undo(
+                                    *record,
+                                ))?,
+                        };
+                        final_marker = Some(marker);
+                    }
+                }
+
+                if tx.commit {
+                    let mut sink = handle.log.stream_sink(tx.stream_id);
+                    let mut publisher =
+                        StreamPublisher::new_for_test(&mut sink, tx.stream_id, tx.txid);
+                    publisher.publish_commit_lp(final_marker.unwrap())?;
+                }
+            }
+
+            handle.observe(scenario)
+        }
+
+        fn assert_log_properties(
+            factory: DurableLogTestFactory,
+            scenario: &BackendScenario,
+            observation: &BackendObservation,
+        ) {
+            assert_eq!(
+                observation.stats,
+                expected_backend_stats(scenario),
+                "backend {} scenario {} stats",
+                factory.name(),
+                scenario.name,
+            );
+
+            let expected_streams = expected_stream_entries(scenario);
+            assert_eq!(
+                observation.streams.len(),
+                expected_streams.len(),
+                "backend {} scenario {} stream count",
+                factory.name(),
+                scenario.name,
+            );
+
+            for (stream_id, expected_entries) in expected_streams {
+                let actual_entries = observation
+                    .streams
+                    .get(&stream_id)
+                    .unwrap_or_else(|| panic!("missing stream {stream_id}"));
+                assert_eq!(
+                    actual_entries.len(),
+                    expected_entries.len(),
+                    "backend {} scenario {} stream {} entry count",
+                    factory.name(),
+                    scenario.name,
+                    stream_id,
+                );
+                assert!(
+                    actual_entries.iter().all(TxLogEntry::validate_crc32),
+                    "backend {} scenario {} stream {} must seal crc32",
+                    factory.name(),
+                    scenario.name,
+                    stream_id,
+                );
+
+                for (entry_index, (actual, expected)) in actual_entries
+                    .iter()
+                    .zip(expected_entries.iter())
+                    .enumerate()
+                {
+                    assert_eq!(
+                        actual.logical_id,
+                        expected.logical_id,
+                        "backend {} scenario {} stream {} entry {} logical id",
+                        factory.name(),
+                        scenario.name,
+                        stream_id,
+                        entry_index,
+                    );
+                    assert_eq!(
+                        actual.version,
+                        expected.version,
+                        "backend {} scenario {} stream {} entry {} version",
+                        factory.name(),
+                        scenario.name,
+                        stream_id,
+                        entry_index,
+                    );
+                    assert_eq!(
+                        actual.role().unwrap(),
+                        expected.role,
+                        "backend {} scenario {} stream {} entry {} role",
+                        factory.name(),
+                        scenario.name,
+                        stream_id,
+                        entry_index,
+                    );
+                    assert_eq!(
+                        actual.tx_meta >> 1,
+                        expected.txid,
+                        "backend {} scenario {} stream {} entry {} txid",
+                        factory.name(),
+                        scenario.name,
+                        stream_id,
+                        entry_index,
+                    );
+                    assert_eq!(
+                        (actual.tx_meta & 1) != 0,
+                        expected.is_final,
+                        "backend {} scenario {} stream {} entry {} lp bit",
+                        factory.name(),
+                        scenario.name,
+                        stream_id,
+                        entry_index,
+                    );
+                }
+
+                for window in actual_entries.windows(2) {
+                    let current = &window[0];
+                    let next = &window[1];
+                    let next_is_final = (next.tx_meta & 1) != 0;
+                    if next_is_final {
+                        assert_eq!(
+                            (next.data_block, next.data_offset),
+                            (current.data_block, current.data_offset),
+                            "backend {} scenario {} stream {} final lp must reuse previous data pointer",
+                            factory.name(),
+                            scenario.name,
+                            stream_id,
+                        );
+                    } else {
+                        assert_ne!(
+                            (next.data_block, next.data_offset),
+                            (current.data_block, current.data_offset),
+                            "backend {} scenario {} stream {} new records must advance to a new data pointer",
+                            factory.name(),
+                            scenario.name,
+                            stream_id,
+                        );
+                    }
+                }
+            }
+        }
+
+        fn assert_scenario_across_backends(scenario: BackendScenario) {
+            let expected_recovery = expected_recovery(&scenario);
+
+            for factory in DurableLogTestFactory::all() {
+                let observation = execute_scenario(factory, &scenario).unwrap();
+                assert_log_properties(factory, &scenario, &observation);
+
+                match observation.recovery {
+                    Some(actual) => assert_eq!(
+                        actual,
+                        expected_recovery,
+                        "backend {} scenario {} recovery",
+                        factory.name(),
+                        scenario.name,
+                    ),
+                    None => assert!(
+                        !factory.supports_recovery(),
+                        "backend {} unexpectedly lacked recovery support",
+                        factory.name(),
+                    ),
+                }
+            }
+        }
+
+        #[test]
+        fn model_backend_conformance_object_only_commit() {
+            assert_scenario_across_backends(object_only_commit_scenario());
+        }
+
+        #[test]
+        fn model_backend_conformance_tmemory_undo_only_commit() {
+            assert_scenario_across_backends(tmemory_undo_only_commit_scenario());
+        }
+
+        #[test]
+        fn model_backend_conformance_mixed_commit() {
+            assert_scenario_across_backends(mixed_commit_scenario());
+        }
+
+        #[test]
+        fn model_backend_conformance_mixed_loose_end() {
+            assert_scenario_across_backends(mixed_loose_end_scenario());
+        }
+
+        #[test]
+        fn model_backend_conformance_multi_stream_transaction_ids() {
+            assert_scenario_across_backends(multi_stream_transaction_ids_scenario());
         }
     }
 }
