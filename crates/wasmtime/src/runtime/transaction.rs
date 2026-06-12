@@ -8392,6 +8392,52 @@ mod tests {
             }
         }
 
+        fn assert_generic_granule_reacquires_after_abort(granule: GranuleId) {
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(101));
+            assert!(state.acquire_granule_write(granule, 0).unwrap());
+            assert_eq!(
+                granule_permission_snapshot(&state, granule),
+                GranulePermissionModelState {
+                    active: true,
+                    read: true,
+                    write: true,
+                }
+            );
+            state.abort().unwrap();
+            assert_eq!(
+                granule_permission_snapshot(&state, granule),
+                GranulePermissionModelState {
+                    active: false,
+                    read: false,
+                    write: false,
+                }
+            );
+            state.begin().unwrap();
+            assert!(state.acquire_granule_write(granule, 1).unwrap());
+            state.abort().unwrap();
+            clear_current_thread_transaction_for_test();
+        }
+
+        fn assert_generic_granule_reacquires_after_commit(granule: GranuleId) {
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(102));
+            assert!(state.acquire_granule_read(granule, 0).unwrap());
+            assert!(state.acquire_granule_write(granule, 0).unwrap());
+            state.complete_commit().unwrap();
+            assert_eq!(
+                granule_permission_snapshot(&state, granule),
+                GranulePermissionModelState {
+                    active: false,
+                    read: false,
+                    write: false,
+                }
+            );
+            state.begin().unwrap();
+            assert!(state.acquire_granule_read(granule, 1).unwrap());
+            assert!(state.acquire_granule_write(granule, 1).unwrap());
+            state.abort().unwrap();
+            clear_current_thread_transaction_for_test();
+        }
+
         #[test]
         fn model_permissions_write_without_permission_fails_without_mutating_state() {
             let trace = run_permission_semantic_schedule(&[PermissionModelOp::Write(9)]).unwrap();
@@ -8691,6 +8737,31 @@ mod tests {
                 }
             );
             clear_current_thread_transaction_for_test();
+        }
+
+        #[test]
+        fn model_permissions_ttable_granule_reacquires_after_abort() {
+            assert_generic_granule_reacquires_after_abort(GranuleId::TTable {
+                instance: Some(3),
+                table_index: 2,
+                granule_index: 1,
+            });
+        }
+
+        #[test]
+        fn model_permissions_ttable_size_reacquires_after_commit() {
+            assert_generic_granule_reacquires_after_commit(GranuleId::TTableSize {
+                instance: Some(3),
+                table_index: 2,
+            });
+        }
+
+        #[test]
+        fn model_permissions_tglobal_reacquires_after_commit() {
+            assert_generic_granule_reacquires_after_commit(GranuleId::TGlobal {
+                instance: Some(3),
+                global_index: 4,
+            });
         }
 
         fn permission_model_op_strategy() -> impl Strategy<Value = PermissionModelOp> {
