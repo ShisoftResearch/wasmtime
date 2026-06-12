@@ -76,8 +76,7 @@ fn parse_persist_section(bytes: &[u8], payloads: &mut Vec<String>) -> Result<()>
 
         let name = core::str::from_utf8(&bytes[name_start..name_end]).with_context(|| {
             format!(
-                "invalid utf-8 in twasm.persist name at bytes {}..{}",
-                name_start, name_end
+                "invalid utf-8 in twasm.persist name at bytes {name_start}..{name_end}",
             )
         })?;
         payloads.push(name.to_owned());
