@@ -41,8 +41,8 @@ Changes in this slice:
   transactions, and selects the highest object version per logical id.
 - Added a fixed-seed small-history `proptest` that publishes generated model
   records through the real file-backed `TxDurableLog` and compares recovered
-  object winners plus `tmemory` rollback summaries against the reference
-  evaluator.
+  object winners plus `tmemory` rollback summaries, including recovered old
+  granule bytes, against the reference evaluator.
 
 Verification commands for this slice:
 

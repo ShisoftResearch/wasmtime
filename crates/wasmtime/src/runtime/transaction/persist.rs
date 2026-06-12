@@ -1238,7 +1238,7 @@ mod tests {
         #[derive(Clone, Debug, Default, Eq, PartialEq)]
         struct ExpectedRecovery {
             object_winners: BTreeSet<(u64, u32)>,
-            tmemory_undo_rollback_set: BTreeSet<(u64, u32)>,
+            tmemory_undo_rollbacks: BTreeSet<(u64, u32, Vec<u8>)>,
             tmemory_undo_rollback_count: usize,
         }
 
@@ -1249,7 +1249,7 @@ mod tests {
             }
 
             let mut object_versions = BTreeMap::<u64, u32>::new();
-            let mut tmemory_undo_rollback_set = BTreeSet::new();
+            let mut tmemory_undo_rollbacks = BTreeSet::new();
             let mut tmemory_undo_rollback_count = 0usize;
 
             for tx_records in records_by_tx.values() {
@@ -1271,14 +1271,18 @@ mod tests {
                     if record.role != ModelRole::TMemoryUndo {
                         continue;
                     }
-                    tmemory_undo_rollback_set.insert((record.logical_id, record.version));
+                    tmemory_undo_rollbacks.insert((
+                        record.logical_id,
+                        record.version,
+                        repeated_payload(record.payload_byte),
+                    ));
                     tmemory_undo_rollback_count += 1;
                 }
             }
 
             ExpectedRecovery {
                 object_winners: object_versions.into_iter().collect(),
-                tmemory_undo_rollback_set,
+                tmemory_undo_rollbacks,
                 tmemory_undo_rollback_count,
             }
         }
@@ -1505,13 +1509,58 @@ mod tests {
                     .iter()
                     .map(|winner| (object_logical_id(winner.object_id), winner.version))
                     .collect(),
-                tmemory_undo_rollback_set: recovered
+                tmemory_undo_rollbacks: recovered
                     .tmemory_undo_rollbacks
                     .iter()
-                    .map(|rollback| (rollback.logical_id, rollback.version))
+                    .map(|rollback| {
+                        (
+                            rollback.logical_id,
+                            rollback.version,
+                            rollback.old_granule_bytes.clone(),
+                        )
+                    })
                     .collect(),
                 tmemory_undo_rollback_count: recovered.tmemory_undo_rollbacks.len(),
             }
+        }
+
+        #[test]
+        fn summarize_actual_recovery_distinguishes_rollback_payload_bytes() {
+            let rollback_a =
+                crate::runtime::vm::block_region::TransactionPersistenceRecoveredTMemoryUndoRollback {
+                    logical_id: tmemory_logical_id(1),
+                    version: 7,
+                    old_granule_bytes: repeated_payload(0x11),
+                };
+            let rollback_b =
+                crate::runtime::vm::block_region::TransactionPersistenceRecoveredTMemoryUndoRollback {
+                    logical_id: rollback_a.logical_id,
+                    version: rollback_a.version,
+                    old_granule_bytes: repeated_payload(0x22),
+                };
+            let recovered_a =
+                crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion {
+                    winners: Vec::new(),
+                    object_winners: Vec::new(),
+                    root_object_ids: Vec::new(),
+                    tmemory_undo_rollbacks: vec![rollback_a],
+                };
+            let recovered_b =
+                crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion {
+                    winners: Vec::new(),
+                    object_winners: Vec::new(),
+                    root_object_ids: Vec::new(),
+                    tmemory_undo_rollbacks: vec![rollback_b],
+                };
+
+            assert_ne!(
+                recovered_a.tmemory_undo_rollbacks,
+                recovered_b.tmemory_undo_rollbacks
+            );
+            assert_ne!(
+                summarize_actual_recovery(&recovered_a),
+                summarize_actual_recovery(&recovered_b)
+            );
         }
 
         #[test]
