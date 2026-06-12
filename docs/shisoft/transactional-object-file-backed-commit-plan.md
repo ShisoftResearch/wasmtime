@@ -4,7 +4,7 @@
 
 **Goal:** Wire transactional object publications into the existing file-backed transaction log commit path.
 
-**Architecture:** Object payload commit already produces `PendingPublication` records. The runtime commit coordinator should publish those records to `TxDurableLog` before the final LP, then publish exactly one LP shared with any tmemory undo records in the same transaction. The durable log stream is unified for ordering, but file-backed object data records and linear-memory undo data records are allocated from separate data streams.
+**Architecture:** Object payload commit already produces `PendingPublication` records. The runtime commit coordinator should publish those records to `TxDurableLog` before the final LP, then publish exactly one LP shared with any tmemory undo records in the same transaction. The durable log stream is unified for ordering, but file-backed object data records and linear-memory undo data records are allocated from separate data streams. Durable storage is selected through the `TxDurableLogBackend` trait; file-backed storage is one backend implementation rather than a special transaction path.
 
 **Tech Stack:** Rust, Wasmtime runtime, transactional `TxDurableLog`, file-backed block-region recovery tests.
 
@@ -48,3 +48,14 @@
 
 - [x] Note that persistent object commit now writes `TObjectPub` records through the same durable log stream as tmemory.
 - [x] Note the remaining GC-dependent object work remains separate from the durable commit path.
+
+### Task 5: Keep Durable Storage Backend-Abstracted
+
+**Files:**
+- Modify: `crates/wasmtime/src/runtime/transaction/persist.rs`
+- Modify: `docs/shisoft/transactional-wasm-runtime-core-design.md`
+- Modify: `docs/shisoft/transactional-wasm-implementation-log.md`
+
+- [x] Replace the enum-dispatched transaction-log storage path with a `TxDurableLogBackend` trait.
+- [x] Keep in-memory and file-backed durable storage behind the same append, flush, and fence interface.
+- [x] Add restart-style file-backed tests that use real file-backed `TMemory` plus file-backed `TxDurableLog` for committed and loose-end mixed tmemory/object transactions.

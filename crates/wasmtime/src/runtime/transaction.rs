@@ -6076,6 +6076,173 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_mixed_commit_recovers_tmemory_and_persistent_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("tmemory.bin");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let mut tmemory = crate::runtime::vm::TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+            1,
+            Some(1),
+        )
+        .unwrap();
+        let old_granule = vec![0x11; TMEMORY_GRANULE_SIZE];
+        let new_granule = vec![0x22; TMEMORY_GRANULE_SIZE];
+        tmemory
+            .commit_staged_tmemory_granule(0, &old_granule)
+            .unwrap();
+
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(31),
+            durable_log,
+        );
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x101, vec![ObjectValue::I32(1)])
+            .unwrap();
+
+        let undo = tmemory
+            .prepare_tmemory_undo_record(Some(7), 0, 0, &new_granule)
+            .unwrap();
+        let tmemory_marker = state
+            .publish_tmemory_undo_before_in_place_write(31, 31, &undo)
+            .unwrap();
+        tmemory
+            .commit_staged_tmemory_granule(0, &new_granule)
+            .unwrap();
+
+        state.acquire_object_write(&objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+            .unwrap();
+        let mut publications = Vec::new();
+        assert!(
+            state
+                .commit_object_payloads_into(&mut objects, &mut publications)
+                .unwrap()
+        );
+        let object_marker = state
+            .publish_object_publications_before_commit(31, 31, &publications)
+            .unwrap();
+        state
+            .publish_commit_lp(31, 31, object_marker.unwrap_or(tmemory_marker))
+            .unwrap();
+        drop(state);
+        clear_current_thread_transaction_for_test();
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&tx_log_path).unwrap();
+        assert!(recovered.tmemory_undo_rollbacks.is_empty());
+        tmemory
+            .apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
+                recovered.tmemory_undo_rollbacks,
+            )
+            .unwrap();
+        assert_eq!(
+            tmemory.read_committed(0..TMEMORY_GRANULE_SIZE).unwrap(),
+            new_granule
+        );
+        let tmemory_file = std::fs::read(&tmemory_path).unwrap();
+        assert_eq!(
+            &tmemory_file[..TMEMORY_GRANULE_SIZE],
+            new_granule.as_slice()
+        );
+
+        let object_winners =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+                &tx_log_path,
+            )
+            .unwrap();
+        let mut recovered_objects = ObjectTable::default();
+        recovered_objects
+            .rebuild_from_recovery_for_test(&object_winners)
+            .unwrap();
+        assert_eq!(
+            recovered_objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)])
+        );
+    }
+
+    #[test]
+    fn file_backed_mixed_loose_end_rolls_back_tmemory_and_drops_object_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("tmemory.bin");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let mut tmemory = crate::runtime::vm::TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+            1,
+            Some(1),
+        )
+        .unwrap();
+        let old_granule = vec![0x33; TMEMORY_GRANULE_SIZE];
+        let new_granule = vec![0x44; TMEMORY_GRANULE_SIZE];
+        tmemory
+            .commit_staged_tmemory_granule(0, &old_granule)
+            .unwrap();
+
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(32),
+            durable_log,
+        );
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x102, vec![ObjectValue::I32(1)])
+            .unwrap();
+
+        let undo = tmemory
+            .prepare_tmemory_undo_record(Some(7), 0, 0, &new_granule)
+            .unwrap();
+        state
+            .publish_tmemory_undo_before_in_place_write(32, 32, &undo)
+            .unwrap();
+        tmemory
+            .commit_staged_tmemory_granule(0, &new_granule)
+            .unwrap();
+
+        state.acquire_object_write(&objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+            .unwrap();
+        let mut publications = Vec::new();
+        assert!(
+            state
+                .commit_object_payloads_into(&mut objects, &mut publications)
+                .unwrap()
+        );
+        state
+            .publish_object_publications_before_commit(32, 32, &publications)
+            .unwrap();
+        drop(state);
+        clear_current_thread_transaction_for_test();
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&tx_log_path).unwrap();
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+        assert!(recovered.object_winners.is_empty());
+        tmemory
+            .apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
+                recovered.tmemory_undo_rollbacks,
+            )
+            .unwrap();
+        assert_eq!(
+            tmemory.read_committed(0..TMEMORY_GRANULE_SIZE).unwrap(),
+            old_granule
+        );
+        let tmemory_file = std::fs::read(&tmemory_path).unwrap();
+        assert_eq!(
+            &tmemory_file[..TMEMORY_GRANULE_SIZE],
+            old_granule.as_slice()
+        );
+
+        let object_winners =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+                &tx_log_path,
+            )
+            .unwrap();
+        assert!(object_winners.is_empty());
+    }
+
+    #[test]
     fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed_record() {
         let mut objects = ObjectTable::default();
         let object = objects

@@ -469,16 +469,17 @@ persistent in-place memory write, applies every touched `tmemory` participant,
 and then publishes one LP marker for the whole transaction.
 
 This removes the earlier conservative rejection for transactions that touch
-more than one persistent `tmemory` participant. The durable-log owner now has
-two storage variants: the original in-memory research scaffold and a
-file-backed block-region sink that writes data chunks and fixed-size log
-entries through the existing region layout, flushes them with
-`msync`/`sync_data`, and can be scanned by restart recovery. The remaining
-runtime limitation is selection and integration: ordinary store construction
-still defaults to the in-memory variant until transaction-log backing is wired
-through configuration. Future hardware-PMEM validation should replace the
-file-backed flush analogue with CLWB/SFENCE-backed storage at the same
-transaction/store boundary, without moving log ownership back into `TMemory`.
+more than one persistent `tmemory` participant. The durable-log owner dispatches
+through a storage-backend trait. The current implementations are the original
+in-memory research scaffold and a file-backed block-region sink that writes data
+chunks and fixed-size log entries through the existing region layout, flushes
+them with `msync`/`sync_data`, and can be scanned by restart recovery. File
+backing is therefore one persistent-backend implementation, not a special
+transaction path. Future hardware-PMEM validation should add a CLWB/SFENCE
+backend at the same append/flush/fence boundary, without moving log ownership
+back into `TMemory`. The remaining runtime limitation is selection and
+integration: ordinary store construction still defaults to the in-memory
+variant until transaction-log backing is wired through configuration.
 
 ## Copy-On-Write Workspace
 

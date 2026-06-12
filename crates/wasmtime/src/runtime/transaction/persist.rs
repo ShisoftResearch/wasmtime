@@ -155,13 +155,32 @@ pub(crate) trait DurableSink {
 
 #[derive(Debug)]
 pub(crate) struct TxDurableLog {
-    storage: TxDurableLogStorage,
+    storage: Box<dyn TxDurableLogBackend>,
 }
 
-#[derive(Debug)]
-enum TxDurableLogStorage {
-    InMemory(InMemoryTxDurableLog),
-    FileBacked(FileBackedTxDurableLog),
+/// Storage backend for the transaction-owned durable log.
+///
+/// `TxDurableLog` owns transaction ordering and commit protocol decisions; a
+/// backend only provides append, flush, and fence primitives for log entries
+/// and role-specific data records. File-backed storage is one implementation
+/// of this trait, not a separate commit path.
+pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
+    fn append_data_record(
+        &mut self,
+        transaction_stream_id: u32,
+        data_stream: DurableDataStream,
+        record: &[u8],
+    ) -> Result<(u32, u32)>;
+    fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()>;
+    fn flush_data(&mut self) -> Result<()>;
+    fn flush_log(&mut self) -> Result<()>;
+    fn fence(&mut self) -> Result<()>;
+
+    #[cfg(test)]
+    fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry>;
+
+    #[cfg(test)]
+    fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32>;
 }
 
 #[derive(Debug, Default)]
@@ -191,13 +210,20 @@ pub(crate) struct TxDurableLogSink<'a> {
 
 impl Default for TxDurableLog {
     fn default() -> Self {
-        Self {
-            storage: TxDurableLogStorage::InMemory(InMemoryTxDurableLog::default()),
-        }
+        Self::with_backend(InMemoryTxDurableLog::default())
     }
 }
 
 impl TxDurableLog {
+    pub(crate) fn with_backend<B>(backend: B) -> Self
+    where
+        B: TxDurableLogBackend + 'static,
+    {
+        Self {
+            storage: Box::new(backend),
+        }
+    }
+
     pub(crate) fn stream_sink(&mut self, stream_id: u32) -> TxDurableLogSink<'_> {
         TxDurableLogSink {
             log: self,
@@ -205,54 +231,9 @@ impl TxDurableLog {
         }
     }
 
-    fn stream_state_mut(&mut self, stream_id: u32) -> &mut TxDurableStreamState {
-        match &mut self.storage {
-            TxDurableLogStorage::InMemory(log) => log.streams.entry(stream_id).or_default(),
-            TxDurableLogStorage::FileBacked(_) => {
-                unreachable!("file-backed transaction log does not use in-memory stream state")
-            }
-        }
-    }
-
-    fn file_backed_stream_cursor(
-        log: &mut FileBackedTxDurableLog,
-        stream_id: u32,
-    ) -> Result<crate::runtime::vm::block_region::StreamCursor> {
-        if let Some(stream) = log.streams.get(&stream_id).copied() {
-            return Ok(stream);
-        }
-        let stream = log.region.alloc_stream(stream_id)?;
-        log.streams.insert(stream_id, stream);
-        Ok(stream)
-    }
-
     #[cfg(test)]
     pub(crate) fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry> {
-        match &self.storage {
-            TxDurableLogStorage::InMemory(log) => log
-                .streams
-                .get(&stream_id)
-                .map(|stream| stream.log_entries.clone())
-                .unwrap_or_default(),
-            TxDurableLogStorage::FileBacked(log) => {
-                let mut entries = Vec::new();
-                let view = log.region.view();
-                for block in 1..view.num_blocks() {
-                    let Ok(block) = u32::try_from(block) else {
-                        break;
-                    };
-                    let Ok(header) = view.log_block_header(block) else {
-                        continue;
-                    };
-                    if header.stream_id == stream_id {
-                        if let Ok(block_entries) = view.log_block_entries(block) {
-                            entries.extend(block_entries);
-                        }
-                    }
-                }
-                entries
-            }
-        }
+        self.storage.log_entries_for_test(stream_id)
     }
 
     #[cfg(test)]
@@ -260,29 +241,8 @@ impl TxDurableLog {
         &self,
         data_block: u32,
     ) -> Result<u32> {
-        match &self.storage {
-            TxDurableLogStorage::InMemory(_) => {
-                bail!("in-memory transaction log has no file-backed data chunk headers")
-            }
-            TxDurableLogStorage::FileBacked(log) => {
-                let view = log.region.view();
-                for block in 1..view.num_blocks() {
-                    let chunk_start =
-                        u32::try_from(block).context("transaction data block index overflow")?;
-                    let Ok(header) = view.data_chunk_header(chunk_start) else {
-                        continue;
-                    };
-                    let chunk_blocks = header.chunk_blocks;
-                    let chunk_end = chunk_start
-                        .checked_add(chunk_blocks)
-                        .context("transaction data chunk range overflow")?;
-                    if chunk_start <= data_block && data_block < chunk_end {
-                        return Ok(header.stream_id);
-                    }
-                }
-                bail!("transaction data block {data_block} is not inside a data chunk")
-            }
-        }
+        self.storage
+            .data_chunk_stream_id_for_data_block_for_test(data_block)
     }
 
     pub(crate) fn create_file_backed(path: &Path, num_blocks: u32) -> Result<Self> {
@@ -302,14 +262,12 @@ impl TxDurableLog {
     fn from_file_backed_region(
         region: crate::runtime::vm::block_region::FileBackedMemoryBlockRegion,
     ) -> Self {
-        Self {
-            storage: TxDurableLogStorage::FileBacked(FileBackedTxDurableLog {
-                region,
-                streams: BTreeMap::new(),
-                pending_data_chunks: BTreeSet::new(),
-                pending_log_blocks: BTreeSet::new(),
-            }),
-        }
+        Self::with_backend(FileBackedTxDurableLog {
+            region,
+            streams: BTreeMap::new(),
+            pending_data_chunks: BTreeSet::new(),
+            pending_log_blocks: BTreeSet::new(),
+        })
     }
 
     #[cfg(test)]
@@ -320,31 +278,158 @@ impl TxDurableLog {
     }
 }
 
+impl TxDurableLogBackend for InMemoryTxDurableLog {
+    fn append_data_record(
+        &mut self,
+        transaction_stream_id: u32,
+        _data_stream: DurableDataStream,
+        record: &[u8],
+    ) -> Result<(u32, u32)> {
+        let state = self.streams.entry(transaction_stream_id).or_default();
+        state.data_records.push(record.to_vec());
+        let data_block = state.next_data_block;
+        state.next_data_block = state
+            .next_data_block
+            .checked_add(1)
+            .context("transaction durable data block overflow")?;
+        Ok((data_block, 0))
+    }
+
+    fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
+        let state = self.streams.entry(transaction_stream_id).or_default();
+        state.log_entries.push(entry);
+        Ok(())
+    }
+
+    fn flush_data(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn flush_log(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn fence(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry> {
+        self.streams
+            .get(&stream_id)
+            .map(|stream| stream.log_entries.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn data_chunk_stream_id_for_data_block_for_test(&self, _data_block: u32) -> Result<u32> {
+        bail!("in-memory transaction log has no file-backed data chunk headers")
+    }
+}
+
+impl FileBackedTxDurableLog {
+    fn stream_cursor(
+        &mut self,
+        stream_id: u32,
+    ) -> Result<crate::runtime::vm::block_region::StreamCursor> {
+        if let Some(stream) = self.streams.get(&stream_id).copied() {
+            return Ok(stream);
+        }
+        let stream = self.region.alloc_stream(stream_id)?;
+        self.streams.insert(stream_id, stream);
+        Ok(stream)
+    }
+}
+
+impl TxDurableLogBackend for FileBackedTxDurableLog {
+    fn append_data_record(
+        &mut self,
+        transaction_stream_id: u32,
+        data_stream: DurableDataStream,
+        record: &[u8],
+    ) -> Result<(u32, u32)> {
+        let data_stream_id = data_stream.file_backed_stream_id(transaction_stream_id)?;
+        let stream = self.stream_cursor(data_stream_id)?;
+        let location = self.region.append_data_record(stream, record)?;
+        self.pending_data_chunks.insert(location.chunk_start_block);
+        Ok((location.data_block, location.data_offset))
+    }
+
+    fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
+        let stream = self.stream_cursor(transaction_stream_id)?;
+        let log_block = self.region.append_log_entry(stream, entry)?;
+        self.pending_log_blocks.insert(log_block);
+        Ok(())
+    }
+
+    fn flush_data(&mut self) -> Result<()> {
+        for chunk in core::mem::take(&mut self.pending_data_chunks) {
+            self.region.flush_data_chunk(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn flush_log(&mut self) -> Result<()> {
+        for block in core::mem::take(&mut self.pending_log_blocks) {
+            self.region.flush_log_block(block)?;
+        }
+        Ok(())
+    }
+
+    fn fence(&mut self) -> Result<()> {
+        self.region.fence()
+    }
+
+    #[cfg(test)]
+    fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry> {
+        let mut entries = Vec::new();
+        let view = self.region.view();
+        for block in 1..view.num_blocks() {
+            let Ok(block) = u32::try_from(block) else {
+                break;
+            };
+            let Ok(header) = view.log_block_header(block) else {
+                continue;
+            };
+            if header.stream_id == stream_id
+                && let Ok(block_entries) = view.log_block_entries(block)
+            {
+                entries.extend(block_entries);
+            }
+        }
+        entries
+    }
+
+    #[cfg(test)]
+    fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32> {
+        let view = self.region.view();
+        for block in 1..view.num_blocks() {
+            let chunk_start =
+                u32::try_from(block).context("transaction data block index overflow")?;
+            let Ok(header) = view.data_chunk_header(chunk_start) else {
+                continue;
+            };
+            let chunk_blocks = header.chunk_blocks;
+            let chunk_end = chunk_start
+                .checked_add(chunk_blocks)
+                .context("transaction data chunk range overflow")?;
+            if chunk_start <= data_block && data_block < chunk_end {
+                return Ok(header.stream_id);
+            }
+        }
+        bail!("transaction data block {data_block} is not inside a data chunk")
+    }
+}
+
 impl DurableSink for TxDurableLogSink<'_> {
     fn append_data_record(
         &mut self,
         record: &[u8],
         data_stream: DurableDataStream,
     ) -> Result<(u32, u32)> {
-        match &mut self.log.storage {
-            TxDurableLogStorage::InMemory(log) => {
-                let state = log.streams.entry(self.stream_id).or_default();
-                state.data_records.push(record.to_vec());
-                let data_block = state.next_data_block;
-                state.next_data_block = state
-                    .next_data_block
-                    .checked_add(1)
-                    .context("transaction durable data block overflow")?;
-                Ok((data_block, 0))
-            }
-            TxDurableLogStorage::FileBacked(log) => {
-                let data_stream_id = data_stream.file_backed_stream_id(self.stream_id)?;
-                let stream = TxDurableLog::file_backed_stream_cursor(log, data_stream_id)?;
-                let location = log.region.append_data_record(stream, record)?;
-                log.pending_data_chunks.insert(location.chunk_start_block);
-                Ok((location.data_block, location.data_offset))
-            }
-        }
+        self.log
+            .storage
+            .append_data_record(self.stream_id, data_stream, record)
     }
 
     fn append_log_entry(
@@ -367,50 +452,19 @@ impl DurableSink for TxDurableLogSink<'_> {
         );
         entry.set_role(role);
         entry.seal_crc32();
-        match &mut self.log.storage {
-            TxDurableLogStorage::InMemory(log) => {
-                let state = log.streams.entry(self.stream_id).or_default();
-                state.log_entries.push(entry);
-                Ok(())
-            }
-            TxDurableLogStorage::FileBacked(log) => {
-                let stream = TxDurableLog::file_backed_stream_cursor(log, self.stream_id)?;
-                let log_block = log.region.append_log_entry(stream, entry)?;
-                log.pending_log_blocks.insert(log_block);
-                Ok(())
-            }
-        }
+        self.log.storage.append_log_entry(self.stream_id, entry)
     }
 
     fn flush_data(&mut self) -> Result<()> {
-        match &mut self.log.storage {
-            TxDurableLogStorage::InMemory(_) => Ok(()),
-            TxDurableLogStorage::FileBacked(log) => {
-                for chunk in core::mem::take(&mut log.pending_data_chunks) {
-                    log.region.flush_data_chunk(chunk)?;
-                }
-                Ok(())
-            }
-        }
+        self.log.storage.flush_data()
     }
 
     fn flush_log(&mut self) -> Result<()> {
-        match &mut self.log.storage {
-            TxDurableLogStorage::InMemory(_) => Ok(()),
-            TxDurableLogStorage::FileBacked(log) => {
-                for block in core::mem::take(&mut log.pending_log_blocks) {
-                    log.region.flush_log_block(block)?;
-                }
-                Ok(())
-            }
-        }
+        self.log.storage.flush_log()
     }
 
     fn fence(&mut self) -> Result<()> {
-        match &mut self.log.storage {
-            TxDurableLogStorage::InMemory(_) => Ok(()),
-            TxDurableLogStorage::FileBacked(log) => log.region.fence(),
-        }
+        self.log.storage.fence()
     }
 }
 

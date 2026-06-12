@@ -38,6 +38,10 @@ Changes in this slice:
 - The file-backed durable log keeps one transaction log-entry stream for
   ordering, but allocates object publication data records and linear-memory
   undo data records from separate data streams.
+- `TxDurableLog` now dispatches through a `TxDurableLogBackend` trait.
+  File-backed storage is one backend implementation alongside the in-memory
+  scaffold, so future PMEM or alternate filesystem backends plug into the same
+  append/flush/fence boundary instead of creating a separate commit path.
 - Changed the real libcall commit path so `commit_staged_tmemory_records`
   returns a durable marker instead of publishing LP internally.
 - Recovery now treats an exact duplicate logical/version/data pointer as an
@@ -45,7 +49,10 @@ Changes in this slice:
   object versions as corruption.
 - Added file-backed tests for uncommitted object publications, committed object
   publications, and mixed object publication plus `TMemoryUndo` transactions
-  with a single LP.
+  with a single LP. The mixed restart-style tests use file-backed `TMemory` and
+  file-backed `TxDurableLog`: committed transactions keep the new linear-memory
+  bytes and rebuild the persistent object winner, while loose-end transactions
+  roll linear memory back from undo records and drop the object publication.
 
 Still deferred:
 

@@ -361,6 +361,25 @@ impl TMemory {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn apply_file_backed_recovered_tmemory_undo_rollbacks_for_test<I>(
+        &mut self,
+        rollbacks: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = block_region::TransactionPersistenceRecoveredTMemoryUndoRollback>,
+    {
+        self.apply_recovered_tmemory_undo_rollbacks(rollbacks.into_iter().map(|rollback| {
+            recovery::RecoveredTMemoryUndoRollback {
+                logical_id: rollback.logical_id,
+                version: rollback.version,
+                data_block: 0,
+                data_offset: 0,
+                old_granule_bytes: rollback.old_granule_bytes,
+            }
+        }))
+    }
+
     pub(crate) fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
         self.storage.grow_to_pages(new_pages)
     }

@@ -2380,6 +2380,15 @@ pub fn reopen_and_recover_file_backed_region(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn reopen_and_recover_file_backed_object_winners_for_test(
+    path: &Path,
+) -> Result<Vec<super::recovery::RecoveredObjectWinner>> {
+    let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let recovered = super::recovery::recover_region(&region.view())?;
+    recovered.committed_object_winners()
+}
+
 fn flush_chunk_for_recovery(
     region: &FileBackedMemoryBlockRegion,
     chunk_start_block: u32,
