@@ -18,6 +18,7 @@ use wasmtime_environ::MemoryIndex;
 pub(crate) mod block_region;
 mod durable_log;
 mod linear_region;
+pub(crate) mod metadata;
 pub(crate) mod recovery;
 
 use self::linear_region::TMemoryRegion;

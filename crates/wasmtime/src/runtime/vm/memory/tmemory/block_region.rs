@@ -5,12 +5,20 @@
 use super::{
     DATA_CHUNK_MAGIC, DataChunkClass, DataChunkHeader, DataRecordLocation, LOG_BLOCK_MAGIC,
     LogBlockHeader, NO_NEXT_BLOCK, PackedGranuleDomain, REGION_MAGIC, RegionHeader,
-    SMALL_DATA_LIMIT, TMemory, TxLogEntry, pack_object_granule_id,
+    SMALL_DATA_LIMIT, TMemory, TxLogEntry,
+    metadata::{
+        METADATA_DESC_BLOCK_COUNT, METADATA_DESC_START_BLOCK, RESERVED_METADATA_BLOCKS,
+        TYPE_LAYOUT_META_KIND, TYPE_LAYOUT_METADATA_BLOCK_COUNT,
+        TYPE_LAYOUT_METADATA_START_BLOCK, append_type_layout_to_block,
+        empty_type_layout_metadata_block, load_type_layout_registry_from_block,
+    },
+    pack_object_granule_id,
 };
 use crate::prelude::*;
 use crate::runtime::transaction::{
     ObjectKind, ObjectPayload, ObjectValue, encode_object_record_for_recovery,
 };
+use crate::runtime::transaction::type_layout::{PersistentTypeLayout, TypeLayoutRegistry};
 use crate::runtime::vm::SendSyncPtr;
 use core::{
     mem::size_of,
@@ -569,6 +577,41 @@ pub(crate) struct MetaDataDesc {
     pub offset: u64,
 }
 
+impl MetaDataDesc {
+    const BYTE_LEN: usize = 32;
+
+    pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..8].copy_from_slice(&self.kind.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.fixed_bytes.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.unit_size.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.bytes_per_unit.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.padding.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.offset.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() == Self::BYTE_LEN,
+            "transactional metadata descriptor length mismatch"
+        );
+        let desc = Self {
+            kind: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            fixed_bytes: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            unit_size: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            bytes_per_unit: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            padding: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        };
+        ensure!(
+            desc.padding == 0,
+            "transactional metadata descriptor padding must be zero"
+        );
+        Ok(desc)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BlockEntry {
@@ -1074,6 +1117,39 @@ impl VMemoryBlockRegion {
         )
     }
 
+    pub(crate) fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry> {
+        if !self.metadata_blocks_initialized() {
+            return Ok(TypeLayoutRegistry::default());
+        }
+        let desc = self.type_layout_metadata_desc()?;
+        let offset =
+            usize::try_from(desc.offset).context("transactional metadata offset overflow")?;
+        let len = usize::try_from(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+            .context("transactional metadata block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata byte length overflow")?;
+        load_type_layout_registry_from_block(&self.read(offset, len)?)
+    }
+
+    pub(crate) fn append_type_layout_metadata(
+        &mut self,
+        layout: &PersistentTypeLayout,
+    ) -> Result<()> {
+        self.initialize_metadata_blocks()?;
+        let desc = self.type_layout_metadata_desc()?;
+        let offset =
+            usize::try_from(desc.offset).context("transactional metadata offset overflow")?;
+        let len = usize::try_from(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+            .context("transactional metadata block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata byte length overflow")?;
+        let mut bytes = self.read(offset, len)?;
+        if append_type_layout_to_block(&mut bytes, layout)? {
+            self.write(offset, &bytes)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
         ensure!(block_count > 0, "transactional chunk must contain a block");
         ensure!(
@@ -1252,6 +1328,74 @@ impl VMemoryBlockRegion {
 
     fn log_entry_capacity(&self) -> usize {
         (BLOCK_SIZE - size_of::<LogBlockHeader>()) / size_of::<TxLogEntry>()
+    }
+
+    fn initialize_metadata_blocks(&mut self) -> Result<()> {
+        if self.metadata_blocks_initialized() {
+            return Ok(());
+        }
+        ensure!(
+            self.num_blocks() >= RESERVED_METADATA_BLOCKS,
+            "transactional block region needs at least {RESERVED_METADATA_BLOCKS} blocks for metadata"
+        );
+        self.mark_blocks_used(0, RESERVED_METADATA_BLOCKS)?;
+        self.write_metadata_desc_table()?;
+        self.write_type_layout_metadata_block(&empty_type_layout_metadata_block())
+    }
+
+    fn mark_blocks_used(&mut self, start: usize, block_count: usize) -> Result<()> {
+        let end = start
+            .checked_add(block_count)
+            .context("transactional used-block range overflow")?;
+        ensure!(
+            end <= self.block_entries.len(),
+            "transactional used-block range out of bounds"
+        );
+        ensure!(
+            self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0),
+            "transactional used-block range overlaps existing chunk"
+        );
+        for entry in &mut self.block_entries[start..end] {
+            entry.used = 1;
+            entry.list_num = ListKind::Used as i16;
+        }
+        Ok(())
+    }
+
+    fn metadata_blocks_initialized(&self) -> bool {
+        self.block_entries
+            .iter()
+            .take(RESERVED_METADATA_BLOCKS)
+            .all(|entry| entry.used == 1)
+    }
+
+    fn type_layout_metadata_desc(&self) -> Result<MetaDataDesc> {
+        let block = usize::try_from(METADATA_DESC_START_BLOCK)
+            .context("transactional metadata descriptor start block overflow")?;
+        let offset = block
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata descriptor offset overflow")?;
+        MetaDataDesc::from_bytes(&self.read(offset, MetaDataDesc::BYTE_LEN)?)
+    }
+
+    fn write_metadata_desc_table(&mut self) -> Result<()> {
+        let block = usize::try_from(METADATA_DESC_START_BLOCK)
+            .context("transactional metadata descriptor start block overflow")?;
+        let offset = block
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata descriptor offset overflow")?;
+        self.write(offset, &type_layout_metadata_desc().as_bytes())
+    }
+
+    fn write_type_layout_metadata_block(&mut self, bytes: &[u8]) -> Result<()> {
+        let block = usize::try_from(TYPE_LAYOUT_METADATA_START_BLOCK)
+            .context("transactional metadata block start overflow")?;
+        let offset = block
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata block offset overflow")?;
+        self.write(offset, bytes)
     }
 
     fn block_offset(&self, block: u32) -> Result<usize> {
@@ -1536,8 +1680,8 @@ impl FileBackedMemoryBlockRegion {
         let num_blocks = usize::try_from(num_blocks)
             .context("transactional file-backed region size overflow")?;
         ensure!(
-            num_blocks > 0,
-            "transactional file-backed region must have at least one block"
+            num_blocks >= RESERVED_METADATA_BLOCKS,
+            "transactional file-backed region must have at least {RESERVED_METADATA_BLOCKS} blocks"
         );
         let mut region = Self::new(num_blocks, FileBackedRegionMode::Path(path.to_path_buf()))?;
         region.initialize_region_image()?;
@@ -1809,6 +1953,37 @@ impl FileBackedMemoryBlockRegion {
         )
     }
 
+    pub(crate) fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry> {
+        let desc = self.load_validated_type_layout_metadata_desc()?;
+        let offset =
+            usize::try_from(desc.offset).context("transactional metadata offset overflow")?;
+        let len = usize::try_from(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+            .context("transactional metadata block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata byte length overflow")?;
+        load_type_layout_registry_from_block(&self.read(offset, len)?)
+    }
+
+    pub(crate) fn append_type_layout_metadata(
+        &mut self,
+        layout: &PersistentTypeLayout,
+    ) -> Result<()> {
+        let desc = self.load_validated_type_layout_metadata_desc()?;
+        let offset =
+            usize::try_from(desc.offset).context("transactional metadata offset overflow")?;
+        let len = usize::try_from(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+            .context("transactional metadata block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata byte length overflow")?;
+        let mut bytes = self.read(offset, len)?;
+        if append_type_layout_to_block(&mut bytes, layout)? {
+            self.write(offset, &bytes)?;
+            self.flush(offset, len)?;
+            self.fence()?;
+        }
+        Ok(())
+    }
+
     fn log_entry_capacity(&self) -> usize {
         (BLOCK_SIZE - size_of::<LogBlockHeader>()) / size_of::<TxLogEntry>()
     }
@@ -1875,7 +2050,11 @@ impl FileBackedMemoryBlockRegion {
 
     fn initialize_region_image(&mut self) -> Result<()> {
         self.reset_recovered_state();
-        self.mark_blocks_used(0, 1)?;
+        ensure!(
+            self.num_blocks() >= RESERVED_METADATA_BLOCKS,
+            "transactional file-backed region needs at least {RESERVED_METADATA_BLOCKS} blocks for metadata"
+        );
+        self.mark_blocks_used(0, RESERVED_METADATA_BLOCKS)?;
         self.write_region_header(RegionHeader {
             magic: REGION_MAGIC,
             block_size: u32::try_from(BLOCK_SIZE).unwrap(),
@@ -1883,11 +2062,13 @@ impl FileBackedMemoryBlockRegion {
                 .context("transactional file-backed region block count overflow")?,
             block_table_start_block: 0,
             block_table_block_count: 0,
-            metadata_descs_start_block: 0,
-            metadata_descs_block_count: 0,
-            num_descs: 0,
+            metadata_descs_start_block: METADATA_DESC_START_BLOCK,
+            metadata_descs_block_count: METADATA_DESC_BLOCK_COUNT,
+            num_descs: 1,
         })?;
-        self.flush(0, size_of::<RegionHeader>())?;
+        self.write_metadata_desc_table()?;
+        self.write_type_layout_metadata_block(&empty_type_layout_metadata_block())?;
+        self.flush(0, RESERVED_METADATA_BLOCKS * BLOCK_SIZE)?;
         self.fence()
     }
 
@@ -1908,13 +2089,15 @@ impl FileBackedMemoryBlockRegion {
             usize::try_from(header.block_size).ok() == Some(BLOCK_SIZE),
             "transactional file-backed region image has unexpected block size"
         );
+        // Research file-backed region images intentionally require the current
+        // single type-layout descriptor shape; legacy zero-metadata images are rejected.
         ensure!(
             header.block_table_start_block == 0
                 && header.block_table_block_count == 0
-                && header.metadata_descs_start_block == 0
-                && header.metadata_descs_block_count == 0
-                && header.num_descs == 0,
-            "transactional file-backed region image contains unsupported durable metadata tables"
+                && header.metadata_descs_start_block == METADATA_DESC_START_BLOCK
+                && header.metadata_descs_block_count == METADATA_DESC_BLOCK_COUNT
+                && header.num_descs == 1,
+            "transactional file-backed region image has malformed metadata descriptor table header"
         );
         let expected_blocks = usize::try_from(header.num_blocks)
             .context("transactional file-backed region block count overflow")?;
@@ -1922,16 +2105,22 @@ impl FileBackedMemoryBlockRegion {
             expected_blocks == self.num_blocks(),
             "transactional file-backed region image length does not match header"
         );
+        let descs = self.read_metadata_descs(header)?;
+        ensure!(
+            descs.len() == 1,
+            "transactional file-backed region image must contain exactly one metadata descriptor"
+        );
+        validate_type_layout_metadata_desc(descs[0], self.num_blocks())?;
         Ok(())
     }
 
     fn rebuild_state_from_image(&mut self) -> Result<()> {
         self.reset_recovered_state();
-        self.mark_blocks_used(0, 1)?;
+        self.mark_blocks_used(0, RESERVED_METADATA_BLOCKS)?;
 
         let mut chunk_tails = BTreeMap::<u32, (u32, u32)>::new();
         let mut log_tails = BTreeMap::<u32, (u32, u32)>::new();
-        let mut block = 1usize;
+        let mut block = RESERVED_METADATA_BLOCKS;
         while block < self.num_blocks() {
             let start_block = u32::try_from(block).context("transactional block index overflow")?;
             match self.block_magic(start_block)? {
@@ -2106,6 +2295,53 @@ impl FileBackedMemoryBlockRegion {
         Ok(capacity - tail)
     }
 
+    fn load_validated_type_layout_metadata_desc(&self) -> Result<MetaDataDesc> {
+        let header = self.region_header()?;
+        self.validate_region_header(header)?;
+        let mut descs = self.read_metadata_descs(header)?;
+        Ok(descs.remove(0))
+    }
+
+    fn read_metadata_descs(&self, header: RegionHeader) -> Result<Vec<MetaDataDesc>> {
+        let start_block = usize::try_from(header.metadata_descs_start_block)
+            .context("transactional metadata descriptor start block overflow")?;
+        let offset = start_block
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata descriptor offset overflow")?;
+        let desc_count = usize::try_from(header.num_descs)
+            .context("transactional metadata descriptor count overflow")?;
+        let byte_len = desc_count
+            .checked_mul(MetaDataDesc::BYTE_LEN)
+            .context("transactional metadata descriptor table length overflow")?;
+        let table_capacity = usize::try_from(header.metadata_descs_block_count)
+            .context("transactional metadata descriptor block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata descriptor table capacity overflow")?;
+        ensure!(
+            byte_len <= table_capacity,
+            "transactional metadata descriptor table exceeds reserved blocks"
+        );
+
+        let bytes = self.read(offset, byte_len)?;
+        let mut descs = Vec::with_capacity(desc_count);
+        for chunk in bytes.chunks_exact(MetaDataDesc::BYTE_LEN) {
+            descs.push(MetaDataDesc::from_bytes(chunk)?);
+        }
+        Ok(descs)
+    }
+
+    fn write_metadata_desc_table(&mut self) -> Result<()> {
+        let offset = self.block_offset(METADATA_DESC_START_BLOCK)?;
+        let mut bytes = vec![0; BLOCK_SIZE];
+        bytes[..MetaDataDesc::BYTE_LEN].copy_from_slice(&type_layout_metadata_desc().as_bytes());
+        self.write(offset, &bytes)
+    }
+
+    fn write_type_layout_metadata_block(&mut self, bytes: &[u8]) -> Result<()> {
+        let offset = self.block_offset(TYPE_LAYOUT_METADATA_START_BLOCK)?;
+        self.write(offset, bytes)
+    }
+
     fn block_offset(&self, block: u32) -> Result<usize> {
         let block = usize::try_from(block).context("transactional block index overflow")?;
         ensure!(
@@ -2170,6 +2406,58 @@ impl BlockRegionBackend for FileBackedMemoryBlockRegion {
     fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
         self.grow_to_blocks(new_block_count)
     }
+}
+
+fn type_layout_metadata_desc() -> MetaDataDesc {
+    MetaDataDesc {
+        kind: TYPE_LAYOUT_META_KIND,
+        fixed_bytes: 4,
+        unit_size: 1,
+        bytes_per_unit: 1,
+        padding: 0,
+        offset: u64::try_from(TYPE_LAYOUT_METADATA_START_BLOCK as usize * BLOCK_SIZE).unwrap(),
+    }
+}
+
+fn validate_type_layout_metadata_desc(desc: MetaDataDesc, num_blocks: usize) -> Result<()> {
+    match desc.kind {
+        TYPE_LAYOUT_META_KIND => {}
+        kind => {
+            bail!(
+                "transactional file-backed region image has unknown metadata descriptor kind {kind:#x}"
+            )
+        }
+    }
+    ensure!(
+        desc.fixed_bytes == 4 && desc.unit_size == 1 && desc.bytes_per_unit == 1,
+        "transactional file-backed region image has malformed type-layout metadata descriptor"
+    );
+
+    let start = usize::try_from(desc.offset).context("transactional metadata offset overflow")?;
+    ensure!(
+        start % BLOCK_SIZE == 0,
+        "transactional metadata descriptor offset must be block-aligned"
+    );
+    let start_block = start / BLOCK_SIZE;
+    let block_count = usize::try_from(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+        .context("transactional metadata block count overflow")?;
+    let end_block = start_block
+        .checked_add(block_count)
+        .context("transactional metadata descriptor block range overflow")?;
+    ensure!(
+        end_block <= num_blocks,
+        "transactional metadata descriptor exceeds region bounds"
+    );
+    ensure!(
+        start_block >= 1,
+        "transactional metadata descriptor overlaps region header block"
+    );
+    ensure!(
+        start_block == TYPE_LAYOUT_METADATA_START_BLOCK as usize
+            && end_block <= RESERVED_METADATA_BLOCKS,
+        "transactional metadata descriptor overlaps log or data blocks"
+    );
+    Ok(())
 }
 
 /// Narrow recovered-winner summary exported for file-backed persistence tests.
@@ -2461,6 +2749,13 @@ fn encode_tx_log_entry(entry: TxLogEntry) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::transaction::type_layout::{
+        PersistentTypeKind, PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId,
+    };
+    use crate::runtime::vm::memory::tmemory::metadata::{
+        METADATA_DESC_START_BLOCK, RESERVED_METADATA_BLOCKS, TYPE_LAYOUT_META_KIND,
+        TYPE_LAYOUT_METADATA_HEADER_LEN, TYPE_LAYOUT_METADATA_START_BLOCK,
+    };
     use crate::runtime::vm::memory::tmemory::DataChunkHeader;
     use core::mem::size_of;
     use std::sync::{Mutex, OnceLock};
@@ -2472,6 +2767,36 @@ mod tests {
     fn file_backed_temp_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn sample_struct_layout(id: u32, fingerprint: u64) -> PersistentTypeLayout {
+        PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(id).unwrap(),
+            fingerprint,
+            body_size: 24,
+            fields: vec![
+                StructTraceField {
+                    field_index: 0,
+                    field_offset: 0,
+                    value_size: 8,
+                    kind: TraceSlotKind::ObjectRef,
+                },
+                StructTraceField {
+                    field_index: 1,
+                    field_offset: 8,
+                    value_size: 4,
+                    kind: TraceSlotKind::Scalar,
+                },
+            ],
+        }
+    }
+
+    fn sample_scalar_layout(id: u32, fingerprint: u64) -> PersistentTypeLayout {
+        PersistentTypeLayout::Scalar {
+            id: TypeLayoutId::new(id).unwrap(),
+            fingerprint,
+            kind: PersistentTypeKind::Extern,
+        }
     }
 
     #[test]
@@ -2757,6 +3082,231 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(bytes.len(), 4097);
         assert_eq!(bytes[4096], 0x5a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_image_initializes_type_layout_metadata_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-init.tmemory");
+        let region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+
+        let header = region.region_header().unwrap();
+        assert_eq!(header.metadata_descs_start_block, METADATA_DESC_START_BLOCK);
+        assert_eq!(header.metadata_descs_block_count, 1);
+        assert_eq!(header.num_descs, 1);
+
+        let desc_offset = usize::try_from(METADATA_DESC_START_BLOCK).unwrap() * BLOCK_SIZE;
+        let desc = MetaDataDesc::from_bytes(
+            &region.read(desc_offset, META_DATA_DESC_SIZE).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(desc.kind, TYPE_LAYOUT_META_KIND);
+        assert_eq!(
+            desc.offset,
+            u64::try_from(TYPE_LAYOUT_METADATA_START_BLOCK as usize * BLOCK_SIZE).unwrap()
+        );
+
+        let metadata_offset =
+            usize::try_from(TYPE_LAYOUT_METADATA_START_BLOCK).unwrap() * BLOCK_SIZE;
+        let metadata = region.read(metadata_offset, TYPE_LAYOUT_METADATA_HEADER_LEN).unwrap();
+        assert_eq!(metadata, 0u32.to_le_bytes());
+
+        let reserved = region
+            .block_entries
+            .iter()
+            .take(RESERVED_METADATA_BLOCKS)
+            .filter(|entry| entry.used == 1)
+            .count();
+        assert_eq!(reserved, RESERVED_METADATA_BLOCKS);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reopen_loads_empty_type_layout_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-empty.tmemory");
+        FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+
+        let region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        let registry = region.load_type_layout_metadata().unwrap();
+
+        assert_eq!(registry.iter().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_rejects_malformed_metadata_descriptor_header_values() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for (suffix, offset, bytes, expected) in [
+            (
+                "bad-start",
+                20usize,
+                0u32.to_le_bytes().to_vec(),
+                "malformed metadata descriptor table header",
+            ),
+            (
+                "bad-count",
+                24usize,
+                0u32.to_le_bytes().to_vec(),
+                "malformed metadata descriptor table header",
+            ),
+            (
+                "bad-num-descs",
+                28usize,
+                2u32.to_le_bytes().to_vec(),
+                "malformed metadata descriptor table header",
+            ),
+        ] {
+            let path = dir.path().join(format!("{suffix}.tmemory"));
+            let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+            region.write(offset, &bytes).unwrap();
+            region.flush(0, size_of::<RegionHeader>()).unwrap();
+            region.fence().unwrap();
+            drop(region);
+
+            let err = FileBackedMemoryBlockRegion::open_for_test(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{suffix}: {err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_rejects_invalid_metadata_descriptor_kind_or_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let desc_offset = usize::try_from(METADATA_DESC_START_BLOCK).unwrap() * BLOCK_SIZE;
+
+        for (suffix, field_offset, bytes, expected) in [
+            (
+                "bad-kind",
+                0usize,
+                0xffff_ffff_ffff_ffffu64.to_le_bytes().to_vec(),
+                "unknown metadata descriptor kind",
+            ),
+            (
+                "bad-offset",
+                24usize,
+                0u64.to_le_bytes().to_vec(),
+                "overlaps region header block",
+            ),
+        ] {
+            let path = dir.path().join(format!("{suffix}.tmemory"));
+            let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+            region.write(desc_offset + field_offset, &bytes).unwrap();
+            region.flush(desc_offset, META_DATA_DESC_SIZE).unwrap();
+            region.fence().unwrap();
+            drop(region);
+
+            let err = FileBackedMemoryBlockRegion::open_for_test(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{suffix}: {err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_type_layout_metadata_round_trips_one_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-one.tmemory");
+        let layout = sample_struct_layout(11, 0x1111_2222_3333_4444);
+
+        let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+        region.append_type_layout_metadata(&layout).unwrap();
+        drop(region);
+
+        let region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        let registry = region.load_type_layout_metadata().unwrap();
+        let layouts = registry.iter().cloned().collect::<Vec<_>>();
+
+        assert_eq!(layouts, vec![layout]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_type_layout_metadata_round_trips_two_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-two.tmemory");
+        let first = sample_struct_layout(21, 0xaaaa_bbbb_cccc_dddd);
+        let second = sample_scalar_layout(22, 0xeeee_ffff_0000_1111);
+
+        let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+        region.append_type_layout_metadata(&first).unwrap();
+        region.append_type_layout_metadata(&second).unwrap();
+        drop(region);
+
+        let region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        let registry = region.load_type_layout_metadata().unwrap();
+        let layouts = registry.iter().cloned().collect::<Vec<_>>();
+
+        assert_eq!(layouts, vec![first, second]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_rejects_corrupt_type_layout_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-corrupt.tmemory");
+        let layout = sample_struct_layout(31, 0x0123_4567_89ab_cdef);
+
+        let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+        region.append_type_layout_metadata(&layout).unwrap();
+
+        let corrupt_offset = usize::try_from(TYPE_LAYOUT_METADATA_START_BLOCK).unwrap() * BLOCK_SIZE
+            + TYPE_LAYOUT_METADATA_HEADER_LEN
+            + 12;
+        region.write(corrupt_offset, &0xffff_u16.to_le_bytes()).unwrap();
+        region.flush(corrupt_offset, 2).unwrap();
+        region.fence().unwrap();
+        drop(region);
+
+        let region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        let err = region.load_type_layout_metadata().unwrap_err().to_string();
+
+        assert!(err.contains("unknown persistent type kind"));
+    }
+
+    #[test]
+    fn vmemory_type_layout_metadata_round_trips_one_layout() {
+        let layout = sample_struct_layout(41, 0x5566_7788_99aa_bbcc);
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+
+        region.append_type_layout_metadata(&layout).unwrap();
+
+        let registry = region.load_type_layout_metadata().unwrap();
+        let layouts = registry.iter().cloned().collect::<Vec<_>>();
+
+        assert_eq!(layouts, vec![layout]);
+    }
+
+    #[test]
+    fn vmemory_type_layout_metadata_requires_reserved_blocks_before_other_allocations() {
+        let layout = sample_struct_layout(42, 0x6677_8899_aabb_ccdd);
+        let mut region = VMemoryBlockRegion::new_for_test(4).unwrap();
+
+        let _chunk = region.alloc_chunk(1).unwrap();
+
+        let err = region.append_type_layout_metadata(&layout).unwrap_err().to_string();
+        assert!(
+            err.contains("used-block range overlaps existing chunk")
+                || err.contains("blocks for metadata"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_initialized_region_requires_reserved_metadata_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("too-small-metadata.tmemory");
+
+        let err = FileBackedMemoryBlockRegion::create_for_test(&path, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least 3 blocks") || err.contains("metadata"), "{err}");
     }
 
     #[cfg(unix)]
