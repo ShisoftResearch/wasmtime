@@ -138,3 +138,38 @@ fn rust_bank_guest_survives_file_backed_recovery() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn rust_pressure_guest_survives_file_backed_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let wasm_path: PathBuf = temp.path().join("pressure.twasm.wasm");
+    let tmemory_path = temp.path().join("pressure.tmemory");
+    let tx_log_path = temp.path().join("pressure.txlog");
+
+    build_guest("examples/transaction-rust/pressure/Cargo.toml", &wasm_path)?;
+
+    {
+        let (mut store, instance) = instantiate(&wasm_path, &tmemory_path, &tx_log_path, true)?;
+        let pressure_round =
+            get_func(&mut store, &instance, "pressure_round")?.typed::<(u32, u32), i64>(&store)?;
+        assert_eq!(pressure_round.call(&mut store, (4, 3))?, 26);
+    }
+
+    let tmemory_pages = file_backed_tmemory_pages(&tmemory_path)?;
+    recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        tmemory_pages,
+        Some(tmemory_pages),
+    )?;
+
+    {
+        let (mut store, instance) = instantiate(&wasm_path, &tmemory_path, &tx_log_path, false)?;
+        let pressure_round =
+            get_func(&mut store, &instance, "pressure_round")?.typed::<(u32, u32), i64>(&store)?;
+        assert_eq!(pressure_round.call(&mut store, (0, 3))?, 20);
+        assert_eq!(pressure_round.call(&mut store, (4, 3))?, 64);
+    }
+
+    Ok(())
+}
