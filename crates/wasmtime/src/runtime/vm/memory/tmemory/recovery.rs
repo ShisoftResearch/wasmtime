@@ -44,7 +44,7 @@ pub(crate) struct RecoveredObjectWinner {
     pub(crate) object_id: u64,
     pub(crate) version: u32,
     pub(crate) kind: u16,
-    pub(crate) type_index: u32,
+    pub(crate) type_layout_id: u32,
     pub(crate) record_bytes: Vec<u8>,
 }
 
@@ -280,7 +280,7 @@ fn replay_object_winners(
             object_id,
             version: winner.version,
             kind: object_header.kind,
-            type_index: object_header.type_index,
+            type_layout_id: object_header.type_layout_id,
             record_bytes,
         };
         match object_winners.get(&object_id) {
@@ -1316,11 +1316,18 @@ mod tests {
         block_seq: u32,
         logical_id: u64,
         version: u32,
-        type_index: u32,
+        type_layout_id: u32,
         payload: ObjectPayload,
     ) {
         let _ = append_committed_object_update_raw(
-            region, stream_id, stream, block_seq, logical_id, version, type_index, payload,
+            region,
+            stream_id,
+            stream,
+            block_seq,
+            logical_id,
+            version,
+            type_layout_id,
+            payload,
         );
     }
 
@@ -1331,17 +1338,17 @@ mod tests {
         block_seq: u32,
         logical_id: u64,
         version: u32,
-        type_index: u32,
+        type_layout_id: u32,
         payload: ObjectPayload,
     ) -> (u32, DataRecordLocation) {
         let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
         let object_record =
-            encode_object_record_for_test(object_id, version, type_index, &payload).unwrap();
+            encode_object_record_for_test(object_id, version, type_layout_id, &payload).unwrap();
         let publication = TMemory::encode_publication_data_record(
             logical_id,
             version,
             domain as u16,
-            type_index,
+            type_layout_id,
             &object_record,
         )
         .unwrap();

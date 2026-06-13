@@ -1195,7 +1195,7 @@ mod tests {
         let header = TxObjectHeader::read_from_prefix(&bytes).unwrap();
         assert_eq!(header.object_id, 41);
         assert_eq!(header.version, 7);
-        assert_eq!(header.type_index, 12);
+        assert_eq!(header.type_layout_id, 12);
     }
 
     #[test]

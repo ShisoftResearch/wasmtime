@@ -21,7 +21,7 @@ pub(crate) struct TxObjectHeader {
     pub(crate) version: u32,
     pub(crate) kind: u16,
     pub(crate) flags: u16,
-    pub(crate) type_index: u32,
+    pub(crate) type_layout_id: u32,
 }
 
 impl TxObjectHeader {
@@ -34,7 +34,7 @@ impl TxObjectHeader {
         bytes[16..20].copy_from_slice(&self.version.to_le_bytes());
         bytes[20..22].copy_from_slice(&self.kind.to_le_bytes());
         bytes[22..24].copy_from_slice(&self.flags.to_le_bytes());
-        bytes[24..28].copy_from_slice(&self.type_index.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.type_layout_id.to_le_bytes());
         bytes
     }
 
@@ -49,7 +49,7 @@ impl TxObjectHeader {
             version: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
             kind: u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
             flags: u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
-            type_index: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            type_layout_id: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
         })
     }
 }
@@ -108,7 +108,7 @@ impl ObjectHeap {
         version: u32,
         kind: ObjectKind,
         flags: u16,
-        type_index: u32,
+        type_layout_id: u32,
         payload: &ObjectPayload,
     ) -> Result<TxRecordHandle> {
         ensure!(
@@ -129,7 +129,7 @@ impl ObjectHeap {
             version,
             kind: kind as u16,
             flags,
-            type_index,
+            type_layout_id,
         };
         let bytes = serialize_record(&header, array_length, payload)?;
         let offset = self.region_mut()?.allocate(&bytes)?;
@@ -324,7 +324,7 @@ pub(crate) fn encode_object_record(
     object_id: u64,
     version: u32,
     kind: u16,
-    type_index: u32,
+    type_layout_id: u32,
     payload: &ObjectPayload,
 ) -> Result<Vec<u8>> {
     let array_length = match payload {
@@ -340,7 +340,7 @@ pub(crate) fn encode_object_record(
         version,
         kind,
         flags: 0,
-        type_index,
+        type_layout_id,
     };
 
     serialize_record(&header, array_length, payload)
@@ -350,14 +350,14 @@ pub(crate) fn encode_object_record(
 pub(crate) fn encode_object_record_for_test(
     object_id: u64,
     version: u32,
-    type_index: u32,
+    type_layout_id: u32,
     payload: &ObjectPayload,
 ) -> Result<Vec<u8>> {
     encode_object_record(
         object_id,
         version,
         payload.kind() as u16,
-        type_index,
+        type_layout_id,
         payload,
     )
 }
@@ -621,4 +621,24 @@ fn object_value_offset(values: &[ObjectValue], field_index: usize) -> Result<u32
 
 fn logical_object_value_len(_value: &ObjectValue) -> Result<u64> {
     u64::try_from(OBJECT_VALUE_RECORD_LEN).context("object value record length overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectKind, ObjectPayload, TxObjectHeader, encode_object_record};
+
+    #[test]
+    fn object_record_header_uses_type_layout_id() {
+        let record = encode_object_record(
+            7,
+            11,
+            ObjectKind::Struct as u16,
+            23,
+            &ObjectPayload::Struct(vec![]),
+        )
+        .unwrap();
+        let header = TxObjectHeader::read_from_prefix(record.as_slice()).unwrap();
+
+        assert_eq!(header.type_layout_id, 23);
+    }
 }

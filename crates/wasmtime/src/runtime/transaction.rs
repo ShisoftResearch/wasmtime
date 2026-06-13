@@ -613,7 +613,7 @@ fn object_kind_from_u16(raw: u16) -> Result<ObjectKind> {
 struct ObjectTableSlot {
     kind: ObjectKind,
     version: u64,
-    type_index: u32,
+    type_layout_id: u32,
     persistent: bool,
     current_record: object_heap::TxRecordHandle,
 }
@@ -782,7 +782,7 @@ impl ObjectTable {
         self.slots[index] = Some(ObjectTableSlot {
             kind,
             version,
-            type_index: 0,
+            type_layout_id: 0,
             persistent,
             current_record: record,
         });
@@ -927,17 +927,22 @@ impl ObjectTable {
             kind == payload.kind(),
             "object payload kind does not match object table slot kind"
         );
-        let type_index = self.live_slot(object_id)?.type_index;
+        let type_layout_id = self.live_slot(object_id)?.type_layout_id;
         let persistent = self.live_slot(object_id)?.persistent;
         let record_version = self.bump_record_version()?;
-        let record =
-            self.heap
-                .allocate_record(object_id, record_version, kind, 0, type_index, &payload)?;
+        let record = self.heap.allocate_record(
+            object_id,
+            record_version,
+            kind,
+            0,
+            type_layout_id,
+            &payload,
+        )?;
         let version = self.bump_object_version()?;
         self.slots[index] = Some(ObjectTableSlot {
             kind,
             version,
-            type_index,
+            type_layout_id,
             persistent,
             current_record: record,
         });
@@ -969,7 +974,7 @@ impl ObjectTable {
             domain,
             header.object_id,
             header.version,
-            header.type_index,
+            header.type_layout_id,
             payload,
         )
     }
@@ -1081,7 +1086,7 @@ impl ObjectTable {
             self.slots[index] = Some(ObjectTableSlot {
                 kind,
                 version,
-                type_index: header.type_index,
+                type_layout_id: header.type_layout_id,
                 persistent: true,
                 current_record: handle,
             });
@@ -1143,8 +1148,8 @@ impl ObjectTable {
                 "recovered object record kind does not match winner"
             );
             ensure!(
-                header.type_index == winner.type_index,
-                "recovered object record type index does not match winner"
+                header.type_layout_id == winner.type_layout_id,
+                "recovered object record type layout id does not match winner"
             );
 
             self.next_record_version = self.next_record_version.max(header.version);
@@ -1152,7 +1157,7 @@ impl ObjectTable {
             self.slots[index] = Some(ObjectTableSlot {
                 kind,
                 version,
-                type_index: header.type_index,
+                type_layout_id: header.type_layout_id,
                 persistent: true,
                 current_record: handle,
             });
@@ -7685,9 +7690,9 @@ mod tests {
             })
         }
 
-        fn model_type_index(record: &ModelObjectRecord) -> Result<u32> {
+        fn model_type_layout_id(record: &ModelObjectRecord) -> Result<u32> {
             u32::try_from(record.object_id)
-                .context("model object id does not fit u32 for type index")
+                .context("model object id does not fit u32 for type layout id")
                 .map(|id| 100 + id)
         }
 
@@ -7695,7 +7700,7 @@ mod tests {
             encode_object_record_for_test(
                 record.object_id,
                 record.version,
-                model_type_index(record)?,
+                model_type_layout_id(record)?,
                 &model_payload(record)?,
             )
         }
@@ -7705,7 +7710,7 @@ mod tests {
                 model_domain(record)?,
                 record.object_id,
                 record.version,
-                model_type_index(record)?,
+                model_type_layout_id(record)?,
                 model_record_bytes(record)?,
             )
         }
@@ -7840,7 +7845,7 @@ mod tests {
                 );
                 ensure!(
                     rebuilt.pending_publication_for_test(object)?.type_info
-                        == model_type_index(record)?,
+                        == model_type_layout_id(record)?,
                     "rebuilt publication type info mismatch for object {object_id}"
                 );
                 ensure!(
@@ -7887,7 +7892,7 @@ mod tests {
                 object_id: 7,
                 version: 3,
                 kind: ObjectKind::Struct as u16,
-                type_index: 207,
+                type_layout_id: 207,
                 record_bytes,
             }
         }
@@ -9172,7 +9177,7 @@ mod tests {
         assert_eq!(header.version, 1);
         assert_eq!(header.kind, ObjectKind::Struct as u16);
         assert_eq!(header.flags, 0x23);
-        assert_eq!(header.type_index, 41);
+        assert_eq!(header.type_layout_id, 41);
         assert_eq!(header.record_len, heap.record_len(handle).unwrap());
     }
 
@@ -9194,7 +9199,7 @@ mod tests {
         assert_eq!(header.base.object_id, object_id.object_index);
         assert_eq!(header.base.version, 2);
         assert_eq!(header.base.kind, ObjectKind::Array as u16);
-        assert_eq!(header.base.type_index, 7);
+        assert_eq!(header.base.type_layout_id, 7);
         assert_eq!(header.length, 3);
         assert_eq!(header.base.record_len, heap.record_len(handle).unwrap());
     }
@@ -9516,7 +9521,7 @@ mod tests {
     fn encoded_object_publication_for_recovery_test(
         object_id: u64,
         version: u32,
-        type_index: u32,
+        type_layout_id: u32,
         payload: ObjectPayload,
     ) -> persist::PendingPublication {
         persist::PendingPublication::persistent_object(
@@ -9527,8 +9532,8 @@ mod tests {
             },
             object_id,
             version,
-            type_index,
-            encode_object_record_for_test(object_id, version, type_index, &payload).unwrap(),
+            type_layout_id,
+            encode_object_record_for_test(object_id, version, type_layout_id, &payload).unwrap(),
         )
         .unwrap()
     }
