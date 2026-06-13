@@ -396,9 +396,8 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-wasmtime-transaction-sdk = {{ path = {} }}
+wasmtime-transaction-sdk = {{ path = {sdk_path} }}
 "#,
-            sdk_path
         ),
     )
     .expect("write probe manifest");

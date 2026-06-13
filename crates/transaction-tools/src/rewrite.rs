@@ -65,6 +65,20 @@ struct FunctionMarkers {
     persistent_params: BTreeSet<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistentArgMarker {
+    ImmediateConst(u32),
+    SpilledConst(u32),
+}
+
+impl PersistentArgMarker {
+    fn param_index(self) -> u32 {
+        match self {
+            Self::ImmediateConst(param_index) | Self::SpilledConst(param_index) => param_index,
+        }
+    }
+}
+
 struct IndexRemapper {
     func_index_map: Vec<Option<u32>>,
 }
@@ -416,14 +430,21 @@ fn rewrite_function_body(
 
     let mut i = 0usize;
     while i < operators.len() {
-        if let Some(param_index) = mark_persistent_arg_index(&operators, i, layout) {
+        if let Some(marker) = mark_persistent_arg_marker(&operators, i, layout) {
+            let param_index = marker.param_index();
             if param_index as usize >= sig.params {
                 bail!(
                     "persistent arg marker refers to non-parameter {param_index} in function index {old_index}"
                 );
             }
             local_taints[param_index as usize] = true;
-            i += 2;
+            if marker == PersistentArgMarker::SpilledConst(param_index) {
+                pop_taint(&mut stack);
+                function.instruction(&Instruction::Drop);
+                i += 1;
+            } else {
+                i += 2;
+            }
             continue;
         }
 
@@ -800,14 +821,18 @@ fn function_markers_for_body(
 
     let mut i = 0usize;
     while i < operators.len() {
-        if let Some(param_index) = mark_persistent_arg_index(&operators, i, layout) {
+        if let Some(marker) = mark_persistent_arg_marker(&operators, i, layout) {
+            let param_index = marker.param_index();
             if param_index as usize >= sig.params {
                 bail!(
                     "persistent arg marker refers to non-parameter {param_index} in function index {old_index}"
                 );
             }
             markers.persistent_params.insert(param_index);
-            i += 2;
+            i += match marker {
+                PersistentArgMarker::ImmediateConst(_) => 2,
+                PersistentArgMarker::SpilledConst(_) => 1,
+            };
             continue;
         }
 
@@ -891,14 +916,23 @@ fn function_return_taints_for_body(
 
     let mut i = 0usize;
     while i < operators.len() {
-        if let Some(param_index) = mark_persistent_arg_index(&operators, i, layout) {
+        if let Some(marker) = mark_persistent_arg_marker(&operators, i, layout) {
+            let param_index = marker.param_index();
             if param_index as usize >= sig.params {
                 bail!(
                     "persistent arg marker refers to non-parameter {param_index} in function index {old_index}"
                 );
             }
             local_taints[param_index as usize] = true;
-            i += 2;
+            match marker {
+                PersistentArgMarker::ImmediateConst(_) => {
+                    i += 2;
+                }
+                PersistentArgMarker::SpilledConst(_) => {
+                    pop_taint(&mut stack);
+                    i += 1;
+                }
+            }
             continue;
         }
 
@@ -1078,21 +1112,61 @@ fn for_each_import(
     }
 }
 
-fn mark_persistent_arg_index(
+fn mark_persistent_arg_marker(
     operators: &[Operator<'_>],
     index: usize,
     layout: &ModuleLayout,
-) -> Option<u32> {
-    let Operator::I32Const { value } = operators.get(index)? else {
-        return None;
-    };
-    let Operator::Call { function_index } = operators.get(index + 1)? else {
+) -> Option<PersistentArgMarker> {
+    if let Operator::I32Const { value } = operators.get(index)? {
+        let Operator::Call { function_index } = operators.get(index + 1)? else {
+            return None;
+        };
+        if layout.intrinsic_imports.get(function_index) != Some(&IntrinsicKind::MarkPersistentArg) {
+            return None;
+        }
+        return u32::try_from(*value)
+            .ok()
+            .map(PersistentArgMarker::ImmediateConst);
+    }
+
+    let Operator::Call { function_index } = operators.get(index)? else {
         return None;
     };
     if layout.intrinsic_imports.get(function_index) != Some(&IntrinsicKind::MarkPersistentArg) {
         return None;
     }
-    u32::try_from(*value).ok()
+    let Some(Operator::LocalGet { local_index }) =
+        index.checked_sub(1).and_then(|i| operators.get(i))
+    else {
+        return None;
+    };
+    const_local_value_before(operators, index - 1, *local_index)
+        .map(PersistentArgMarker::SpilledConst)
+}
+
+fn const_local_value_before(
+    operators: &[Operator<'_>],
+    before_index: usize,
+    local_index: u32,
+) -> Option<u32> {
+    for i in (0..before_index).rev() {
+        match operators.get(i)? {
+            Operator::LocalSet {
+                local_index: assigned,
+            }
+            | Operator::LocalTee {
+                local_index: assigned,
+            } if *assigned == local_index => {
+                let Operator::I32Const { value } = operators.get(i.checked_sub(1)?)? else {
+                    return None;
+                };
+                return u32::try_from(*value).ok();
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn type_sig(layout: &ModuleLayout, type_index: u32) -> Result<FuncSig> {

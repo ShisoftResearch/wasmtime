@@ -1,6 +1,9 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
-#[allow(unused_extern_crates)]
+#[allow(
+    unused_extern_crates,
+    reason = "proc macro expansions refer to this crate through the wasmtime_transaction_sdk alias"
+)]
 extern crate self as wasmtime_transaction_sdk;
 
 #[cfg(feature = "macros")]

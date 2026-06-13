@@ -91,6 +91,8 @@ fn build_and_rewrite(
         .arg("build")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
+        .arg("--target-dir")
+        .arg("target")
         .arg("--manifest-path")
         .arg(&manifest_path);
     if release {
@@ -130,8 +132,7 @@ fn build_and_rewrite(
 fn package_name_from_manifest(manifest_path: &Path) -> Result<String> {
     let manifest = fs::read_to_string(manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let manifest: toml::Value = manifest
-        .parse()
+    let manifest: toml::Value = toml::from_str(&manifest)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
     manifest
         .get("package")
@@ -153,4 +154,35 @@ fn create_parent_dir(path: &Path) -> Result<()> {
         return Ok(());
     }
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{package_name_from_manifest, wasm_artifact_stem};
+
+    #[test]
+    fn package_name_reads_manifest_document() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest = tempdir.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            r#"
+                [package]
+                name = "transaction-rust-bank"
+                version = "0.0.0"
+
+                [workspace]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            package_name_from_manifest(&manifest).unwrap(),
+            "transaction-rust-bank"
+        );
+        assert_eq!(
+            wasm_artifact_stem("transaction-rust-bank"),
+            "transaction_rust_bank"
+        );
+    }
 }

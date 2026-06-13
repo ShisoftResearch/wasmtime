@@ -17,6 +17,7 @@ unsafe extern "C" {
     fn wasm_mark_persistent_arg(index: u32);
 }
 
+#[inline(always)]
 pub unsafe fn persistent_addr_mut(id: PersistentId) -> *mut u8 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -30,6 +31,7 @@ pub unsafe fn persistent_addr_mut(id: PersistentId) -> *mut u8 {
     }
 }
 
+#[inline(always)]
 pub fn mark_transaction_func() {
     #[cfg(target_arch = "wasm32")]
     unsafe {
@@ -37,6 +39,7 @@ pub fn mark_transaction_func() {
     }
 }
 
+#[inline(always)]
 pub fn mark_persistent_arg(index: u32) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
