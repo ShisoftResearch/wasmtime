@@ -1,4 +1,7 @@
 use crate::prelude::*;
+use crate::runtime::transaction::type_layout::{
+    PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
+};
 #[cfg(test)]
 use crate::runtime::vm::unpack_object_granule_id;
 use crate::runtime::vm::{
@@ -7,13 +10,15 @@ use crate::runtime::vm::{
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingPublication {
     pub(crate) logical_id: u64,
     pub(crate) version: u32,
     pub(crate) kind: u16,
-    pub(crate) type_info: u32,
+    pub(crate) type_layout_id: u32,
     pub(crate) payload: Vec<u8>,
 }
 
@@ -22,7 +27,7 @@ pub(crate) fn encode_data_record(pub_: &PendingPublication) -> Result<Vec<u8>> {
         pub_.logical_id,
         pub_.version,
         pub_.kind,
-        pub_.type_info,
+        pub_.type_layout_id,
         &pub_.payload,
     )
 }
@@ -84,16 +89,28 @@ impl PendingPublication {
         domain: PackedGranuleDomain,
         object_id: u64,
         version: u32,
-        type_info: u32,
+        type_layout_id: u32,
         payload: Vec<u8>,
     ) -> Result<Self> {
         Ok(Self {
             logical_id: pack_object_granule_id(domain, object_id)?,
             version,
             kind: domain as u16,
-            type_info,
+            type_layout_id,
             payload,
         })
+    }
+
+    pub(crate) fn persistent_object_type_layout_id(&self) -> Result<Option<TypeLayoutId>> {
+        if self.kind == PackedGranuleDomain::TStruct as u16
+            || self.kind == PackedGranuleDomain::TArray as u16
+        {
+            return Ok(Some(
+                TypeLayoutId::new(self.type_layout_id)
+                    .context("persistent object publication type layout id cannot be zero")?,
+            ));
+        }
+        Ok(None)
     }
 }
 
@@ -116,7 +133,7 @@ impl PendingPublication {
             logical_id,
             version,
             kind: 1,
-            type_info: 0,
+            type_layout_id: 0,
             payload: payload.to_vec(),
         }
     }
@@ -125,10 +142,11 @@ impl PendingPublication {
         domain: PackedGranuleDomain,
         object_id: u64,
         version: u32,
-        type_info: u32,
+        type_layout_id: u32,
         payload: &[u8],
     ) -> Self {
-        Self::persistent_object(domain, object_id, version, type_info, payload.to_vec()).unwrap()
+        Self::persistent_object(domain, object_id, version, type_layout_id, payload.to_vec())
+            .unwrap()
     }
 }
 
@@ -161,10 +179,12 @@ pub(crate) struct TxDurableLog {
 /// Storage backend for the transaction-owned durable log.
 ///
 /// `TxDurableLog` owns transaction ordering and commit protocol decisions; a
-/// backend only provides append, flush, and fence primitives for log entries
-/// and role-specific data records. File-backed storage is one implementation
-/// of this trait, not a separate commit path.
+/// backend provides type-layout metadata persistence plus append, flush, and
+/// fence primitives for log entries and role-specific data records. File-backed
+/// storage is one implementation of this trait, not a separate commit path.
 pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
+    fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()>;
+    fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool>;
     fn append_data_record(
         &mut self,
         transaction_stream_id: u32,
@@ -186,6 +206,7 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
 #[derive(Debug, Default)]
 struct InMemoryTxDurableLog {
     streams: BTreeMap<u32, TxDurableStreamState>,
+    type_layouts: TypeLayoutRegistry,
 }
 
 #[derive(Debug, Default)]
@@ -229,6 +250,14 @@ impl TxDurableLog {
             log: self,
             stream_id,
         }
+    }
+
+    pub(crate) fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
+        self.storage.ensure_type_layout(layout)
+    }
+
+    pub(crate) fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool> {
+        self.storage.has_type_layout(id)
     }
 
     #[cfg(test)]
@@ -276,9 +305,26 @@ impl TxDurableLog {
     ) -> Result<crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion> {
         crate::runtime::vm::block_region::reopen_and_recover_file_backed_region(path)
     }
+
+    #[cfg(test)]
+    pub(crate) fn recording_backend_for_test() -> (Self, Arc<Mutex<Vec<RecordingBackendEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self::with_backend(RecordingTxDurableLogBackend::new(events.clone())),
+            events,
+        )
+    }
 }
 
 impl TxDurableLogBackend for InMemoryTxDurableLog {
+    fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
+        self.type_layouts.insert(layout.clone())
+    }
+
+    fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool> {
+        Ok(self.type_layouts.contains(id))
+    }
+
     fn append_data_record(
         &mut self,
         transaction_stream_id: u32,
@@ -342,6 +388,14 @@ impl FileBackedTxDurableLog {
 }
 
 impl TxDurableLogBackend for FileBackedTxDurableLog {
+    fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
+        self.region.append_type_layout_metadata(layout)
+    }
+
+    fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool> {
+        Ok(self.region.load_type_layout_metadata()?.contains(id))
+    }
+
     fn append_data_record(
         &mut self,
         transaction_stream_id: u32,
@@ -632,6 +686,96 @@ where
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecordingBackendEvent {
+    EnsureTypeLayout(u32),
+    AppendDataRecord(DurableDataStream),
+    AppendLogEntry(TxLogEntryRole),
+    FlushData,
+    FlushLog,
+    Fence,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RecordingTxDurableLogBackend {
+    events: Arc<Mutex<Vec<RecordingBackendEvent>>>,
+    next_data_block: u32,
+    type_layouts: TypeLayoutRegistry,
+}
+
+#[cfg(test)]
+impl RecordingTxDurableLogBackend {
+    fn new(events: Arc<Mutex<Vec<RecordingBackendEvent>>>) -> Self {
+        Self {
+            events,
+            next_data_block: 0,
+            type_layouts: TypeLayoutRegistry::default(),
+        }
+    }
+
+    fn push_event(&self, event: RecordingBackendEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+#[cfg(test)]
+impl TxDurableLogBackend for RecordingTxDurableLogBackend {
+    fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
+        self.type_layouts.insert(layout.clone())?;
+        self.push_event(RecordingBackendEvent::EnsureTypeLayout(layout.id().get()));
+        Ok(())
+    }
+
+    fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool> {
+        Ok(self.type_layouts.contains(id))
+    }
+
+    fn append_data_record(
+        &mut self,
+        _transaction_stream_id: u32,
+        data_stream: DurableDataStream,
+        _record: &[u8],
+    ) -> Result<(u32, u32)> {
+        self.push_event(RecordingBackendEvent::AppendDataRecord(data_stream));
+        let data_block = self.next_data_block;
+        self.next_data_block = self
+            .next_data_block
+            .checked_add(1)
+            .context("recording backend data block overflow")?;
+        Ok((data_block, 0))
+    }
+
+    fn append_log_entry(&mut self, _transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
+        self.push_event(RecordingBackendEvent::AppendLogEntry(entry.role()?));
+        Ok(())
+    }
+
+    fn flush_data(&mut self) -> Result<()> {
+        self.push_event(RecordingBackendEvent::FlushData);
+        Ok(())
+    }
+
+    fn flush_log(&mut self) -> Result<()> {
+        self.push_event(RecordingBackendEvent::FlushLog);
+        Ok(())
+    }
+
+    fn fence(&mut self) -> Result<()> {
+        self.push_event(RecordingBackendEvent::Fence);
+        Ok(())
+    }
+
+    fn log_entries_for_test(&self, _stream_id: u32) -> Vec<TxLogEntry> {
+        Vec::new()
+    }
+
+    fn data_chunk_stream_id_for_data_block_for_test(&self, _data_block: u32) -> Result<u32> {
+        bail!("recording transaction log backend has no file-backed data chunks")
+    }
+}
+
+#[cfg(test)]
 impl<'a, S> StreamPublisher<'a, S>
 where
     S: DurableSink,
@@ -741,14 +885,14 @@ fn sample_publications() -> Vec<PendingPublication> {
             logical_id: 0x1000,
             version: 1,
             kind: 7,
-            type_info: 0x10,
+            type_layout_id: 0x10,
             payload: vec![1, 2, 3, 4],
         },
         PendingPublication {
             logical_id: 0x1001,
             version: 2,
             kind: 9,
-            type_info: 0x20,
+            type_layout_id: 0x20,
             payload: vec![5, 6, 7, 8, 9],
         },
     ]
@@ -760,7 +904,30 @@ mod tests {
     use crate::runtime::transaction::{
         ObjectPayload, ObjectValue, object_heap::TxObjectHeader,
         object_heap::encode_object_record_for_test,
+        type_layout::{PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId},
     };
+
+    fn sample_struct_type_layout(id: u32, fingerprint: u64) -> PersistentTypeLayout {
+        PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(id).unwrap(),
+            fingerprint,
+            body_size: 16,
+            fields: vec![
+                StructTraceField {
+                    field_index: 0,
+                    field_offset: 0,
+                    value_size: 8,
+                    kind: TraceSlotKind::ObjectRef,
+                },
+                StructTraceField {
+                    field_index: 1,
+                    field_offset: 8,
+                    value_size: 4,
+                    kind: TraceSlotKind::Scalar,
+                },
+            ],
+        }
+    }
 
     #[test]
     fn commit_publishes_only_the_last_entry_with_lp() {
@@ -914,6 +1081,44 @@ mod tests {
 
         let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
         assert!(recovered.object_winners.is_empty());
+    }
+
+    #[test]
+    fn file_backed_durable_log_persists_type_layout_metadata_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let layout = sample_struct_type_layout(101, 0x0101_0202_0303_0404);
+        let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+
+        assert!(!log.has_type_layout(layout.id()).unwrap());
+
+        log.ensure_type_layout(&layout).unwrap();
+        log.ensure_type_layout(&layout).unwrap();
+
+        assert!(log.has_type_layout(layout.id()).unwrap());
+        drop(log);
+
+        let region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(&path)
+                .unwrap();
+        let registry = region.load_type_layout_metadata().unwrap();
+        let layouts = registry.iter().cloned().collect::<Vec<_>>();
+
+        assert_eq!(layouts, vec![layout]);
+    }
+
+    #[test]
+    fn file_backed_durable_log_rejects_conflicting_type_layout_for_existing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let original = sample_struct_type_layout(102, 0x1111_2222_3333_4444);
+        let conflicting = sample_struct_type_layout(102, 0x5555_6666_7777_8888);
+        let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+
+        log.ensure_type_layout(&original).unwrap();
+        let err = log.ensure_type_layout(&conflicting).unwrap_err().to_string();
+
+        assert!(err.contains("conflicting persistent type layout for id 102"));
     }
 
     #[test]
@@ -1211,7 +1416,7 @@ mod tests {
         assert_eq!(domain, PackedGranuleDomain::TStruct);
         assert_eq!(object_id, 41);
         assert_eq!(pub_.version, 7);
-        assert_eq!(pub_.type_info, 12);
+        assert_eq!(pub_.type_layout_id, 12);
     }
 
     mod model_recovery {

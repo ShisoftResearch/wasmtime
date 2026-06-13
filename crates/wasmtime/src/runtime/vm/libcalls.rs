@@ -382,14 +382,16 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         state.commit_object_payloads_into(object_table, &mut object_publications)?;
     }
     if !object_publications.is_empty() {
-        let object_marker = store
-            .store_opaque_mut()
-            .transaction_state_mut()
-            .publish_object_publications_before_commit(
+        let object_marker = {
+            let store = store.store_opaque_mut();
+            let (state, object_table) = store.transaction_state_and_object_table_mut();
+            state.publish_object_publications_before_commit(
                 stream_id,
                 stream_id,
+                &*object_table,
                 &object_publications,
-            )?;
+            )?
+        };
         final_marker = object_marker.or(final_marker);
     }
     if let Some(marker) = final_marker {

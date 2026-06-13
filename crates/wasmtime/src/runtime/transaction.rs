@@ -1908,8 +1908,23 @@ impl TransactionState {
         &mut self,
         stream_id: u32,
         txid: u32,
+        object_table: &ObjectTable,
         publications: &[persist::PendingPublication],
     ) -> Result<Option<PendingCommitLogEntry>> {
+        let mut required_layout_ids = BTreeSet::new();
+        let mut required_layouts = Vec::new();
+        for publication in publications {
+            let Some(type_layout_id) = publication.persistent_object_type_layout_id()? else {
+                continue;
+            };
+            if required_layout_ids.insert(type_layout_id) {
+                required_layouts.push(object_table.require_type_layout(type_layout_id)?);
+            }
+        }
+        for layout in required_layouts {
+            self.durable_log.ensure_type_layout(layout)?;
+        }
+
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
         let mut final_marker = None;
@@ -6501,7 +6516,7 @@ mod tests {
                 .unwrap()
         );
         let marker = state
-            .publish_object_publications_before_commit(12, 12, &publications)
+            .publish_object_publications_before_commit(12, 12, &objects, &publications)
             .unwrap()
             .unwrap();
         state.publish_commit_lp(12, 12, marker).unwrap();
@@ -6511,6 +6526,136 @@ mod tests {
         assert_eq!(recovered.object_winners.len(), 1);
         assert_eq!(recovered.object_winners[0].object_id, object.object_index);
         assert_eq!(recovered.object_winners[0].version, 2);
+    }
+
+    #[test]
+    fn transaction_state_rejects_unknown_object_publication_layout_before_log_write() {
+        let (durable_log, events) = TxDurableLog::recording_backend_for_test();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(18),
+            durable_log,
+        );
+        let objects = ObjectTable::default();
+        let publication = persist::PendingPublication::persistent_object(
+            crate::runtime::vm::PackedGranuleDomain::TStruct,
+            41,
+            7,
+            999,
+            encode_object_record_for_test(
+                41,
+                7,
+                999,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = state
+            .publish_object_publications_before_commit(18, 18, &objects, &[publication])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown persistent type layout id: 999"));
+        assert!(state.durable_log_entries_for_test(18).is_empty());
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                persist::RecordingBackendEvent::AppendDataRecord(
+                    persist::DurableDataStream::ObjectPublication
+                )
+            )
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                persist::RecordingBackendEvent::AppendLogEntry(
+                    crate::runtime::vm::TxLogEntryRole::TObjectPub
+                )
+            )
+        }));
+    }
+
+    #[test]
+    fn transaction_state_persists_type_layout_before_object_publication_writes() {
+        let (durable_log, events) = TxDurableLog::recording_backend_for_test();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(19),
+            durable_log,
+        );
+        let mut objects = ObjectTable::default();
+        let layout = type_layout::PersistentTypeLayout::Struct {
+            id: type_layout::TypeLayoutId::new(101).unwrap(),
+            fingerprint: 0x0101_0000_0000_0001,
+            body_size: 16,
+            fields: vec![type_layout::StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 8,
+                kind: type_layout::TraceSlotKind::Scalar,
+            }],
+        };
+        objects.register_type_layout(layout.clone()).unwrap();
+        let publication = persist::PendingPublication::persistent_object(
+            crate::runtime::vm::PackedGranuleDomain::TStruct,
+            41,
+            7,
+            layout.id().get(),
+            encode_object_record_for_test(
+                41,
+                7,
+                layout.id().get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let marker = state
+            .publish_object_publications_before_commit(19, 19, &objects, &[publication])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            marker.role,
+            crate::runtime::vm::TxLogEntryRole::TObjectPub
+        );
+
+        let events = events.lock().unwrap().clone();
+        let ensure_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    persist::RecordingBackendEvent::EnsureTypeLayout(id) if *id == layout.id().get()
+                )
+            })
+            .unwrap();
+        let data_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    persist::RecordingBackendEvent::AppendDataRecord(
+                        persist::DurableDataStream::ObjectPublication
+                    )
+                )
+            })
+            .unwrap();
+        let log_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    persist::RecordingBackendEvent::AppendLogEntry(
+                        crate::runtime::vm::TxLogEntryRole::TObjectPub
+                    )
+                )
+            })
+            .unwrap();
+
+        assert!(ensure_index < data_index);
+        assert!(ensure_index < log_index);
     }
 
     #[test]
@@ -6582,7 +6727,7 @@ mod tests {
                 .unwrap()
         );
         let object_marker = state
-            .publish_object_publications_before_commit(31, 31, &publications)
+            .publish_object_publications_before_commit(31, 31, &objects, &publications)
             .unwrap();
         state
             .publish_commit_lp(31, 31, object_marker.unwrap_or(tmemory_marker))
@@ -6670,7 +6815,7 @@ mod tests {
                 .unwrap()
         );
         state
-            .publish_object_publications_before_commit(32, 32, &publications)
+            .publish_object_publications_before_commit(32, 32, &objects, &publications)
             .unwrap();
         drop(state);
         clear_current_thread_transaction_for_test();
@@ -6699,6 +6844,60 @@ mod tests {
             )
             .unwrap();
         assert!(object_winners.is_empty());
+    }
+
+    #[test]
+    fn transaction_state_does_not_duplicate_persisted_layout_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let durable_log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(20),
+            durable_log,
+        );
+        let mut objects = ObjectTable::default();
+        let layout = type_layout::PersistentTypeLayout::Struct {
+            id: type_layout::TypeLayoutId::new(102).unwrap(),
+            fingerprint: 0x0102_0000_0000_0002,
+            body_size: 16,
+            fields: vec![type_layout::StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 8,
+                kind: type_layout::TraceSlotKind::Scalar,
+            }],
+        };
+        objects.register_type_layout(layout.clone()).unwrap();
+
+        for (object_id, version, value) in [(41, 7, 9), (42, 8, 10)] {
+            let publication = persist::PendingPublication::persistent_object(
+                crate::runtime::vm::PackedGranuleDomain::TStruct,
+                object_id,
+                version,
+                layout.id().get(),
+                encode_object_record_for_test(
+                    object_id,
+                    version,
+                    layout.id().get(),
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(value)]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            state
+                .publish_object_publications_before_commit(20, 20, &objects, &[publication])
+                .unwrap();
+        }
+        drop(state);
+
+        let region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(&path)
+                .unwrap();
+        let registry = region.load_type_layout_metadata().unwrap();
+        let layouts = registry.iter().cloned().collect::<Vec<_>>();
+
+        assert_eq!(layouts, vec![layout]);
     }
 
     mod model_mixed_participants {
@@ -6935,7 +7134,7 @@ mod tests {
                 let mut publications = Vec::new();
                 state.commit_object_payloads_into(&mut objects, &mut publications)?;
                 if let Some(marker) =
-                    state.publish_object_publications_before_commit(71, 71, &publications)?
+                    state.publish_object_publications_before_commit(71, 71, &objects, &publications)?
                 {
                     final_marker = Some(marker);
                 }
@@ -8118,9 +8317,9 @@ mod tests {
                     "rebuilt publication version mismatch for object {object_id}"
                 );
                 ensure!(
-                    rebuilt.pending_publication_for_test(object)?.type_info
+                    rebuilt.pending_publication_for_test(object)?.type_layout_id
                         == model_type_layout_id(record)?,
-                    "rebuilt publication type info mismatch for object {object_id}"
+                    "rebuilt publication type layout mismatch for object {object_id}"
                 );
                 ensure!(
                     rebuilt.trace_object_ids(object)?.is_empty(),
@@ -8219,7 +8418,7 @@ mod tests {
                 rebuilt
                     .pending_publication_for_test(ObjectId { object_index: 41 })
                     .unwrap()
-                    .type_info,
+                    .type_layout_id,
                 141
             );
         }
@@ -8292,7 +8491,7 @@ mod tests {
                 rebuilt
                     .pending_publication_for_test(object)
                     .unwrap()
-                    .type_info,
+                    .type_layout_id,
                 203
             );
         }
@@ -9823,7 +10022,7 @@ mod tests {
             publication.logical_id,
             publication.version,
             publication.kind,
-            publication.type_info,
+            publication.type_layout_id,
             &publication.payload,
         )
         .unwrap();
