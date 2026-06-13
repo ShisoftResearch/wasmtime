@@ -250,6 +250,46 @@ fn rewrite_taints_persistent_parameter_marker_spilled_through_local() {
 }
 
 #[test]
+fn rewrite_taints_dynamic_indexed_persistent_addresses() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (import "twasm_intrinsics" "__twasm_mark_persistent_arg" (func $mark_persistent_arg (param i32)))
+          (memory 1)
+          (func (export "transfer") (param $ptr i32) (param $index i32) (param $delta i64) (result i64)
+            (local $slot i32)
+            (local $next i64)
+            call $mark_transaction
+            i32.const 0
+            call $mark_persistent_arg
+            local.get $ptr
+            local.get $index
+            i32.const 1
+            i32.and
+            i32.const 3
+            i32.shl
+            i32.add
+            local.tee $slot
+            i64.load
+            local.get $delta
+            i64.add
+            local.tee $next
+            local.get $slot
+            local.get $next
+            i64.store
+            local.get $next))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.transaction_functions, 1);
+    assert_eq!(report.i64_tloads, 1);
+    assert_eq!(report.i64_tstores, 1);
+    assert!(printed.contains("i64.tload"));
+    assert!(printed.contains("i64.tstore"));
+}
+
+#[test]
 fn rewrite_allows_persistent_pointer_to_marked_transaction_callee() {
     let wat = r#"
         (module

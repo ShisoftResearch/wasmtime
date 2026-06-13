@@ -45,8 +45,8 @@ pub extern "C" fn transfer(from: u32, to: u32, amount: i64) {
 
 #[transaction_attr]
 fn transfer_impl(bank: &mut Bank, req: &Request) {
-    let from = (req.from & 1) as usize;
-    let to = (req.to & 1) as usize;
+    let from = req.from as usize;
+    let to = req.to as usize;
     bank.accounts[from].balance -= req.amount;
     bank.accounts[to].balance += req.amount;
 }

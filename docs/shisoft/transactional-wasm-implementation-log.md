@@ -1608,6 +1608,41 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Rust Transaction Toolset
+
+Date: 2026-06-13
+
+- Added a Rust SDK frontend for typed persistent roots and transaction-scoped
+  references.
+- Added `twasm-rust`, a Rust/Wasm postpass wrapper that lowers SDK marker
+  intrinsics into transactional Wasm.
+- The postpass now tracks persistent-address taint through Rust-generated
+  integer address arithmetic, so ordinary dynamic array indexing lowers to
+  transactional loads/stores.
+- The first supported backend is typed roots over file-backed `tmemory`; the
+  persistent ID encoding reserves object IDs for the persistent-GC/object-storage
+  path.
+- The bank fixture is only the first example. Pressure tests should add new Rust
+  guest crates under `examples/transaction-rust/` and compile them through
+  `twasm-rust`.
+
+## Rust Frontend Simple-Transactions Oracle
+
+Date: 2026-06-13
+
+- The Rust SDK marker ABI is frontend-only. It must not appear in rewritten
+  modules.
+- `twasm-rust` output is checked for real simple-transactions scalar operators:
+  `i32.tload`, `i64.tload`, `f32.tload`, `f64.tload`, and matching stores.
+- The rewritten Rust bank guest is instantiated and executed by this Wasmtime
+  transaction branch with the default volatile transaction backend, proving the
+  postpass output is accepted by the active runtime variant.
+- The simple-transactions WAST fixtures remain the semantic oracle for the
+  postpass output boundary; external prototypes should see rewritten
+  transactional Wasm, not SDK markers.
+- File-backed recovery stays covered by the separate Rust toolset recovery test;
+  the oracle test is intentionally focused on the Wasm instruction boundary.
+
 ## File-Backed TMemory WAST Recovery
 
 Date: 2026-06-12

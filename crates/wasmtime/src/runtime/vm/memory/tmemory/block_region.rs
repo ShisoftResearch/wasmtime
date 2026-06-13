@@ -83,8 +83,8 @@ impl FileBackedMapping {
     fn open_existing_path_with_len(path: PathBuf, len: usize) -> Result<Self> {
         let mapping = Self::open_existing_path(path)?;
         ensure!(
-            mapping.len() == len,
-            "existing file-backed tmemory length/capacity mismatch: expected {len} bytes, found {}",
+            mapping.len() >= len,
+            "existing file-backed tmemory is smaller than requested capacity: expected at least {len} bytes, found {}",
             mapping.len()
         );
         Ok(mapping)

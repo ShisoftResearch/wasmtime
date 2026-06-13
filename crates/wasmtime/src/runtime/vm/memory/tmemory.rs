@@ -954,10 +954,15 @@ impl FileBackedMemory {
         let max_pages = max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES);
         ensure!(min_pages <= max_pages, "tmemory minimum exceeds maximum");
         let byte_len = pages_to_bytes(min_pages)?;
-        let byte_capacity = match requested_max_pages {
+        let requested_byte_capacity = match requested_max_pages {
             Some(max_pages) => pages_to_bytes(max_pages)?,
             None => byte_len,
         };
+        let byte_capacity =
+            existing_file_backed_capacity(&file_backing)?.unwrap_or(requested_byte_capacity);
+        let byte_capacity = byte_capacity.max(requested_byte_capacity);
+        let existing_pages = byte_capacity.div_ceil(WASM_PAGE_SIZE) as u64;
+        let max_pages = max_pages.max(existing_pages);
         let granule_capacity = granules_for_bytes(byte_capacity);
 
         Ok(Self {
@@ -1069,6 +1074,23 @@ impl FileBackedMemory {
     pub(crate) fn line_mark_count_for_test(&self) -> usize {
         self.region.line_mark_count_for_test()
     }
+}
+
+fn existing_file_backed_capacity(file_backing: &TMemoryFileBacking) -> Result<Option<usize>> {
+    let TMemoryFileBacking::ExistingPath(path) = file_backing else {
+        return Ok(None);
+    };
+    let len = std::fs::metadata(path)
+        .with_context(|| {
+            format!(
+                "failed to stat existing file-backed tmemory {}",
+                path.display()
+            )
+        })?
+        .len();
+    usize::try_from(len)
+        .map(Some)
+        .context("existing file-backed tmemory is too large for this host")
 }
 
 fn file_backed_region_mode(
@@ -1719,9 +1741,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn file_backed_existing_tmemory_path_rejects_length_mismatch() {
+    fn file_backed_existing_tmemory_path_rejects_undersized_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("existing-mismatch.tmemory");
+        let path = dir.path().join("existing-undersized.tmemory");
         std::fs::File::create(&path)
             .unwrap()
             .set_len(WASM_PAGE_SIZE as u64)
@@ -1730,8 +1752,35 @@ mod tests {
         let config = TransactionConfig::with_file_backed_tmemory_existing_path(path).unwrap();
         let error = TMemory::new(config, 1, Some(1)).unwrap_err().to_string();
 
-        assert!(error.contains("length"));
+        assert!(error.contains("smaller"));
         assert!(error.contains("capacity"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_existing_tmemory_path_accepts_grown_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing-grown.tmemory");
+        let config = TransactionConfig::with_file_backed_tmemory_path(path.clone()).unwrap();
+        let mut memory = TMemory::new(config, 1, None).unwrap();
+
+        memory.grow_to_pages(9).unwrap();
+        memory
+            .commit_range(block_region::BLOCK_SIZE + 8, &[9, 8, 7, 6])
+            .unwrap();
+        drop(memory);
+
+        let config = TransactionConfig::with_file_backed_tmemory_existing_path(path).unwrap();
+        let mut reopened = TMemory::new(config, 1, Some(1)).unwrap();
+        assert!(reopened.byte_capacity() >= block_region::BLOCK_SIZE * 2);
+
+        reopened.grow_to_pages(9).unwrap();
+        assert_eq!(
+            reopened
+                .read_committed(block_region::BLOCK_SIZE + 8..block_region::BLOCK_SIZE + 12)
+                .unwrap(),
+            vec![9, 8, 7, 6]
+        );
     }
 
     #[cfg(all(feature = "transaction", unix))]
