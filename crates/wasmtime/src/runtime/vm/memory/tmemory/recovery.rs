@@ -4,7 +4,10 @@ use super::{
     TxDataRecordRole, TxLogEntry, TxLogEntryRole, packed_granule_domain, unpack_object_granule_id,
 };
 use crate::prelude::*;
-use crate::runtime::transaction::TxObjectHeader;
+use crate::runtime::transaction::{
+    ObjectKind, TxObjectHeader,
+    type_layout::{PersistentTypeKind, TypeLayoutId, TypeLayoutRegistry},
+};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -34,6 +37,7 @@ pub(crate) struct RecoveredRegion {
     pub(crate) streams: Vec<RecoveredStream>,
     pub(crate) winners: Vec<RecoveryWinner>,
     pub(crate) object_winners: Vec<RecoveredObjectWinner>,
+    pub(crate) type_layouts: TypeLayoutRegistry,
     pub(crate) root_object_ids: Vec<u64>,
     pub(crate) tmemory_undo_rollbacks: Vec<RecoveredTMemoryUndoRollback>,
     pub(crate) next_stream_id: u32,
@@ -96,7 +100,10 @@ struct PendingTransaction {
     entries: Vec<TxLogEntry>,
 }
 
-pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<RecoveredRegion> {
+pub(crate) fn recover_region(
+    region: &BlockRegionBackendView<'_>,
+    type_layouts: TypeLayoutRegistry,
+) -> Result<RecoveredRegion> {
     let discovered = discover_region(region)?;
     let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
     let mut tmemory_undo_rollbacks = Vec::new();
@@ -133,7 +140,12 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
     }
 
     let winners = winners.into_values().collect::<Vec<_>>();
-    let object_winners = replay_object_winners(region, &discovered.data_chunk_index, &winners)?;
+    let object_winners = replay_object_winners(
+        region,
+        &discovered.data_chunk_index,
+        &winners,
+        &type_layouts,
+    )?;
     let root_object_ids = replay_root_object_ids(region, &discovered.data_chunk_index, &winners)?;
 
     Ok(RecoveredRegion {
@@ -147,6 +159,7 @@ pub(crate) fn recover_region(region: &BlockRegionBackendView<'_>) -> Result<Reco
         streams: discovered.streams,
         winners,
         object_winners,
+        type_layouts,
         root_object_ids,
         tmemory_undo_rollbacks,
     })
@@ -238,6 +251,7 @@ fn replay_object_winners(
     region: &BlockRegionBackendView<'_>,
     data_chunk_index: &DataChunkIndex,
     winners: &[RecoveryWinner],
+    type_layouts: &TypeLayoutRegistry,
 ) -> Result<Vec<RecoveredObjectWinner>> {
     let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
 
@@ -276,6 +290,28 @@ fn replay_object_winners(
             object_header.version == winner.version,
             "recovered object record version does not match log winner"
         );
+        ensure!(
+            data_header.type_info == object_header.type_layout_id,
+            "recovered object publication outer type layout id does not match object record"
+        );
+        ensure!(
+            object_domain_matches_object_kind(domain, object_header.kind),
+            "recovered object publication outer kind does not match object record kind"
+        );
+        let type_layout_id = TypeLayoutId::new(object_header.type_layout_id)
+            .context("recovered object record type layout id cannot be zero")?;
+        let layout = type_layouts.get(type_layout_id).with_context(|| {
+            format!(
+                "recovered object record references missing persistent type layout id {}",
+                type_layout_id.get()
+            )
+        })?;
+        ensure!(
+            persistent_layout_kind_matches_object_kind(layout.kind(), object_header.kind),
+            "recovered persistent type layout kind {:?} does not match object kind {}",
+            layout.kind(),
+            object_header.kind
+        );
         let candidate = RecoveredObjectWinner {
             object_id,
             version: winner.version,
@@ -299,6 +335,27 @@ fn replay_object_winners(
     }
 
     Ok(object_winners.into_values().collect())
+}
+
+fn persistent_layout_kind_matches_object_kind(
+    type_kind: PersistentTypeKind,
+    object_kind: u16,
+) -> bool {
+    match type_kind {
+        PersistentTypeKind::Struct => object_kind == ObjectKind::Struct as u16,
+        PersistentTypeKind::Array => object_kind == ObjectKind::Array as u16,
+        PersistentTypeKind::I31 => object_kind == ObjectKind::I31 as u16,
+        PersistentTypeKind::Extern => object_kind == ObjectKind::Extern as u16,
+        PersistentTypeKind::Func => object_kind == ObjectKind::Func as u16,
+    }
+}
+
+fn object_domain_matches_object_kind(domain: PackedGranuleDomain, object_kind: u16) -> bool {
+    match domain {
+        PackedGranuleDomain::TStruct => object_kind == ObjectKind::Struct as u16,
+        PackedGranuleDomain::TArray => object_kind == ObjectKind::Array as u16,
+        _ => false,
+    }
 }
 
 fn load_publication_payload(
@@ -689,13 +746,20 @@ fn is_final_lp(entry: TxLogEntry) -> bool {
 
 #[cfg(test)]
 pub(crate) fn recover_region_for_test(region: &VMemoryBlockRegion) -> Result<RecoveredRegion> {
-    recover_region(&region.view())
+    let type_layouts = region.load_type_layout_metadata()?;
+    recover_region(&region.view(), type_layouts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::transaction::{ObjectPayload, ObjectValue, encode_object_record_for_test};
+    use crate::runtime::transaction::{
+        ObjectPayload, ObjectValue, encode_object_record_for_test,
+        type_layout::{PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId},
+    };
+    use crate::runtime::vm::memory::tmemory::metadata::{
+        TYPE_LAYOUT_METADATA_HEADER_LEN, TYPE_LAYOUT_METADATA_START_BLOCK,
+    };
     use crate::runtime::vm::{PackedGranuleDomain, pack_object_granule_id};
 
     #[test]
@@ -751,6 +815,56 @@ mod tests {
             err.to_string()
                 .contains("duplicate committed object version")
         );
+    }
+
+    #[test]
+    fn recovery_rejects_object_record_with_missing_type_layout_metadata() {
+        let region = sample_region_with_missing_object_type_layout_metadata();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("persistent type layout"));
+    }
+
+    #[test]
+    fn recovery_rejects_object_record_kind_layout_mismatch() {
+        let region = sample_region_with_object_kind_layout_mismatch();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("does not match object kind"));
+    }
+
+    #[test]
+    fn recovery_rejects_corrupt_in_memory_type_layout_metadata() {
+        let region = sample_region_with_corrupt_type_layout_metadata();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(err.to_string().contains("unknown persistent type kind"));
+    }
+
+    #[test]
+    fn recovery_accepts_struct_object_with_matching_struct_layout() {
+        let layout = struct_layout(101);
+        let region = sample_region_with_matching_struct_layout(layout.clone());
+        let recovered = recover_region_for_test(&region).unwrap();
+        let objects = recovered.committed_object_winners().unwrap();
+
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].object_id, 41);
+        assert_eq!(objects[0].type_layout_id, layout.id().get());
+        assert!(recovered.type_layouts.contains(layout.id()));
+    }
+
+    #[test]
+    fn recovery_accepts_array_object_with_matching_array_layout() {
+        let layout = array_layout(102);
+        let region = sample_region_with_matching_array_layout(layout.clone());
+        let recovered = recover_region_for_test(&region).unwrap();
+        let objects = recovered.committed_object_winners().unwrap();
+
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].object_id, 42);
+        assert_eq!(objects[0].type_layout_id, layout.id().get());
+        assert!(recovered.type_layouts.contains(layout.id()));
     }
 
     #[test]
@@ -848,6 +962,28 @@ mod tests {
     }
 
     #[test]
+    fn model_recovery_rejects_object_publication_outer_type_layout_id_mismatch() {
+        let region = sample_region_with_object_publication_outer_type_layout_id_mismatch();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("outer type layout id does not match object record")
+        );
+    }
+
+    #[test]
+    fn model_recovery_rejects_object_publication_outer_domain_kind_mismatch() {
+        let region = sample_region_with_object_publication_outer_domain_kind_mismatch();
+        let err = recover_region_for_test(&region).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("outer kind does not match object record kind")
+        );
+    }
+
+    #[test]
     fn model_recovery_rejects_publication_pointer_outside_data_chunk() {
         let region = sample_region_with_publication_pointer_outside_data_chunk();
         let err = recover_region_for_test(&region).unwrap_err();
@@ -936,6 +1072,12 @@ mod tests {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream1 = region.alloc_stream(1).unwrap();
         let stream2 = region.alloc_stream(2).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(11))
+            .unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
         let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
         append_committed_object_update(
             &mut region,
@@ -964,6 +1106,12 @@ mod tests {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream1 = region.alloc_stream(1).unwrap();
         let stream2 = region.alloc_stream(2).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(11))
+            .unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
         let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
         append_committed_object_update(
             &mut region,
@@ -985,6 +1133,95 @@ mod tests {
             22,
             ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
         );
+        region
+    }
+
+    fn sample_region_with_missing_object_type_layout_metadata() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+            1,
+            101,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        region
+    }
+
+    fn sample_region_with_object_kind_layout_mismatch() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(101))
+            .unwrap();
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_object_granule_id(PackedGranuleDomain::TArray, 41).unwrap(),
+            1,
+            101,
+            ObjectPayload::Array(vec![ObjectValue::I32(9)]),
+        );
+        region
+    }
+
+    fn sample_region_with_matching_struct_layout(
+        layout: PersistentTypeLayout,
+    ) -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let type_layout_id = layout.id().get();
+        region.append_type_layout_metadata(&layout).unwrap();
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+            1,
+            type_layout_id,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        region
+    }
+
+    fn sample_region_with_matching_array_layout(
+        layout: PersistentTypeLayout,
+    ) -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let type_layout_id = layout.id().get();
+        region.append_type_layout_metadata(&layout).unwrap();
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_object_granule_id(PackedGranuleDomain::TArray, 42).unwrap(),
+            1,
+            type_layout_id,
+            ObjectPayload::Array(vec![ObjectValue::I32(11)]),
+        );
+        region
+    }
+
+    fn sample_region_with_corrupt_type_layout_metadata() -> VMemoryBlockRegion {
+        let layout = struct_layout(101);
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        region.append_type_layout_metadata(&layout).unwrap();
+        let corrupt_offset = usize::try_from(TYPE_LAYOUT_METADATA_START_BLOCK).unwrap()
+            * BLOCK_SIZE
+            + TYPE_LAYOUT_METADATA_HEADER_LEN
+            + 12;
+        region
+            .write(corrupt_offset, &0xffff_u16.to_le_bytes())
+            .unwrap();
         region
     }
 
@@ -1080,6 +1317,9 @@ mod tests {
     fn sample_region_with_duplicate_lp_pointer() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
         let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
         let (log_block, location) = append_committed_object_update_raw(
             &mut region,
@@ -1106,6 +1346,9 @@ mod tests {
     fn sample_region_with_committed_entry_role_mismatch() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
         let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
         let (log_block, _) = append_committed_object_update_raw(
             &mut region,
@@ -1126,6 +1369,9 @@ mod tests {
     fn sample_region_with_object_publication_data_role_mismatch() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
         let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
         let (_, location) = append_committed_object_update_raw(
             &mut region,
@@ -1146,6 +1392,9 @@ mod tests {
     fn sample_region_with_publication_pointer_outside_data_chunk() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
         let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
         let (log_block, _) = append_committed_object_update_raw(
             &mut region,
@@ -1161,6 +1410,52 @@ mod tests {
             entry.data_block = log_block;
             entry.data_offset = 0;
         });
+        region
+    }
+
+    fn sample_region_with_object_publication_outer_type_layout_id_mismatch() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(23))
+            .unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let (_, location) = append_committed_object_update_raw(
+            &mut region,
+            1,
+            stream,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        rewrite_data_record_header(&mut region, location, |header| {
+            header.type_info = 23;
+        });
+        region
+    }
+
+    fn sample_region_with_object_publication_outer_domain_kind_mismatch() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TArray, 41).unwrap();
+        let _ = append_committed_object_update_raw(
+            &mut region,
+            1,
+            stream,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
         region
     }
 
@@ -1307,6 +1602,29 @@ mod tests {
 
     fn pack_test_granule_id(domain: PackedGranuleDomain, payload: u64) -> u64 {
         ((domain as u64) << 60) | payload
+    }
+
+    fn struct_layout(raw_id: u32) -> PersistentTypeLayout {
+        PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(raw_id).unwrap(),
+            fingerprint: 0x5354_5255_4354_0000 | u64::from(raw_id),
+            body_size: 8,
+            fields: vec![StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 4,
+                kind: TraceSlotKind::Scalar,
+            }],
+        }
+    }
+
+    fn array_layout(raw_id: u32) -> PersistentTypeLayout {
+        PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(raw_id).unwrap(),
+            fingerprint: 0x4152_5241_5900_0000 | u64::from(raw_id),
+            element_size: 4,
+            element_kind: TraceSlotKind::Scalar,
+        }
     }
 
     fn append_committed_object_update(

@@ -118,6 +118,8 @@ pub(crate) use crate::runtime::vm::memory::tmemory::block_region;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredObjectWinner;
 #[cfg(all(has_virtual_memory, test))]
+pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredRegion;
+#[cfg(all(has_virtual_memory, test))]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::recover_region_for_test;
 #[cfg(all(has_virtual_memory, test))]
 pub(crate) use crate::runtime::vm::memory::tmemory::unpack_object_granule_id;

@@ -669,6 +669,20 @@ impl Default for ObjectTable {
 }
 
 impl ObjectTable {
+    fn install_recovered_type_layouts(
+        &mut self,
+        recovered_type_layouts: &TypeLayoutRegistry,
+    ) -> Result<()> {
+        self.type_layouts = TypeLayoutRegistry::default();
+        for layout in builtin_type_layouts() {
+            self.type_layouts.insert(layout)?;
+        }
+        for layout in recovered_type_layouts.iter().cloned() {
+            self.type_layouts.insert(layout)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn allocate(&mut self, kind: ObjectKind) -> Result<ObjectId> {
         self.allocate_payload(ObjectPayload::default_for_kind(kind))
     }
@@ -690,10 +704,8 @@ impl ObjectTable {
             !self.gc_ref_to_object.contains_key(&gc_ref),
             "transactional object GC ref is already associated"
         );
-        let object_id = self.allocate_payload_with_persistence(
-            ObjectPayload::Struct(fields),
-            true,
-        )?;
+        let object_id =
+            self.allocate_payload_with_persistence(ObjectPayload::Struct(fields), true)?;
         self.associate_gc_ref(gc_ref, object_id)?;
         Ok(object_id)
     }
@@ -1165,10 +1177,12 @@ impl ObjectTable {
 
     fn rebuild_from_recovered_object_winners(
         &mut self,
+        recovered_type_layouts: &TypeLayoutRegistry,
         winners: &[crate::runtime::vm::RecoveredObjectWinner],
     ) -> Result<()> {
         self.clear_volatile_index();
         self.heap = object_heap::ObjectHeap::default();
+        self.install_recovered_type_layouts(recovered_type_layouts)?;
 
         if let Some(max_object_id) = winners.iter().map(|winner| winner.object_id).max() {
             let slot_len = usize::try_from(
@@ -1180,8 +1194,6 @@ impl ObjectTable {
             self.slots.resize(slot_len, None);
         }
 
-        // Wave 3 intentionally defers recovered layout-id registry validation
-        // until Wave 6 installs recovered region metadata first.
         for winner in winners {
             let object_id = ObjectId {
                 object_index: winner.object_id,
@@ -1199,6 +1211,8 @@ impl ObjectTable {
             let handle = self.heap.install_record_bytes(&winner.record_bytes)?;
             let header = self.heap.header(handle)?;
             let kind = object_kind_from_u16(header.kind)?;
+            let type_layout_id = TypeLayoutId::new(header.type_layout_id)
+                .context("recovered object record type layout id cannot be zero")?;
 
             ensure!(
                 header.object_id == winner.object_id,
@@ -1216,6 +1230,7 @@ impl ObjectTable {
                 header.type_layout_id == winner.type_layout_id,
                 "recovered object record type layout id does not match winner"
             );
+            self.validate_type_layout_for_object_kind(kind, type_layout_id)?;
 
             self.next_record_version = self.next_record_version.max(header.version);
             let version = self.bump_object_version()?;
@@ -1255,9 +1270,10 @@ impl ObjectTable {
     #[cfg(test)]
     fn rebuild_from_recovery_for_test(
         &mut self,
+        recovered_type_layouts: &TypeLayoutRegistry,
         winners: &[crate::runtime::vm::RecoveredObjectWinner],
     ) -> Result<()> {
-        self.rebuild_from_recovered_object_winners(winners)
+        self.rebuild_from_recovered_object_winners(recovered_type_layouts, winners)
     }
 
     #[cfg(test)]
@@ -6230,7 +6246,10 @@ mod tests {
         let handle = objects.current_record_handle_for_test(object).unwrap();
         let header = objects.heap.header(handle).unwrap();
 
-        assert_eq!(objects.live_slot(object).unwrap().type_layout_id, layout.id().get());
+        assert_eq!(
+            objects.live_slot(object).unwrap().type_layout_id,
+            layout.id().get()
+        );
         assert_eq!(header.type_layout_id, layout.id().get());
     }
 
@@ -6262,7 +6281,9 @@ mod tests {
         let func_object = objects.allocate(ObjectKind::Func).unwrap();
 
         let i31_handle = objects.current_record_handle_for_test(i31_object).unwrap();
-        let extern_handle = objects.current_record_handle_for_test(extern_object).unwrap();
+        let extern_handle = objects
+            .current_record_handle_for_test(extern_object)
+            .unwrap();
         let func_handle = objects.current_record_handle_for_test(func_object).unwrap();
 
         assert_eq!(
@@ -6616,10 +6637,7 @@ mod tests {
             .publish_object_publications_before_commit(19, 19, &objects, &[publication])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            marker.role,
-            crate::runtime::vm::TxLogEntryRole::TObjectPub
-        );
+        assert_eq!(marker.role, crate::runtime::vm::TxLogEntryRole::TObjectPub);
 
         let events = events.lock().unwrap().clone();
         let ensure_index = events
@@ -6752,14 +6770,15 @@ mod tests {
             new_granule.as_slice()
         );
 
-        let object_winners =
-            crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+        let recovered_region =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_test(
                 &tx_log_path,
             )
             .unwrap();
+        let object_winners = recovered_region.committed_object_winners().unwrap();
         let mut recovered_objects = ObjectTable::default();
         recovered_objects
-            .rebuild_from_recovery_for_test(&object_winners)
+            .rebuild_from_recovery_for_test(&recovered_region.type_layouts, &object_winners)
             .unwrap();
         assert_eq!(
             recovered_objects.payload(object).unwrap(),
@@ -7133,9 +7152,12 @@ mod tests {
 
                 let mut publications = Vec::new();
                 state.commit_object_payloads_into(&mut objects, &mut publications)?;
-                if let Some(marker) =
-                    state.publish_object_publications_before_commit(71, 71, &objects, &publications)?
-                {
+                if let Some(marker) = state.publish_object_publications_before_commit(
+                    71,
+                    71,
+                    &objects,
+                    &publications,
+                )? {
                     final_marker = Some(marker);
                 }
                 if case.committed {
@@ -7162,13 +7184,17 @@ mod tests {
                     );
                 }
 
-                let object_winners =
-                    crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+                let recovered_region =
+                    crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_test(
                         &tx_log_path,
                     )?;
+                let object_winners = recovered_region.committed_object_winners()?;
                 let object_winner_count = object_winners.len();
                 let mut recovered_objects = ObjectTable::default();
-                recovered_objects.rebuild_from_recovery_for_test(&object_winners)?;
+                recovered_objects.rebuild_from_recovery_for_test(
+                    &recovered_region.type_layouts,
+                    &object_winners,
+                )?;
                 for winner in &object_winners {
                     let payload = recovered_objects.payload(ObjectId {
                         object_index: winner.object_id,
@@ -8098,8 +8124,7 @@ mod tests {
         #[derive(Debug)]
         struct RecoveredObjectHistory {
             rebuilt: ObjectTable,
-            recovered_region:
-                crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion,
+            recovered_region: crate::runtime::vm::RecoveredRegion,
             object_winners: Vec<crate::runtime::vm::RecoveredObjectWinner>,
         }
 
@@ -8169,6 +8194,31 @@ mod tests {
                 .map(|id| 100 + id)
         }
 
+        fn model_type_layout(record: &ModelObjectRecord) -> Result<PersistentTypeLayout> {
+            let id = type_layout::TypeLayoutId::new(model_type_layout_id(record)?)
+                .context("model type layout id cannot be zero")?;
+            Ok(match object_kind_from_u16(record.kind)? {
+                ObjectKind::Struct => PersistentTypeLayout::Struct {
+                    id,
+                    fingerprint: 0x5354_5255_4354_1000 | u64::from(id.get()),
+                    body_size: 4,
+                    fields: vec![type_layout::StructTraceField {
+                        field_index: 0,
+                        field_offset: 0,
+                        value_size: 4,
+                        kind: type_layout::TraceSlotKind::Scalar,
+                    }],
+                },
+                ObjectKind::Array => PersistentTypeLayout::Array {
+                    id,
+                    fingerprint: 0x4152_5241_5900_1000 | u64::from(id.get()),
+                    element_size: 4,
+                    element_kind: type_layout::TraceSlotKind::Scalar,
+                },
+                kind => bail!("unsupported model object kind for type layout: {kind:?}"),
+            })
+        }
+
         fn model_record_bytes(record: &ModelObjectRecord) -> Result<Vec<u8>> {
             encode_object_record_for_test(
                 record.object_id,
@@ -8213,10 +8263,11 @@ mod tests {
         }
 
         fn rebuild_object_table_from_winners(
+            recovered_type_layouts: &TypeLayoutRegistry,
             winners: &[crate::runtime::vm::RecoveredObjectWinner],
         ) -> Result<ObjectTable> {
             let mut objects = ObjectTable::default();
-            objects.rebuild_from_recovery_for_test(winners)?;
+            objects.rebuild_from_recovery_for_test(recovered_type_layouts, winners)?;
             Ok(objects)
         }
 
@@ -8224,6 +8275,10 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let path = dir.path().join("tx-log.bin");
             let mut log = TxDurableLog::create_file_backed(&path, 64)?;
+
+            for record in history {
+                log.ensure_type_layout(&model_type_layout(record)?)?;
+            }
 
             for (index, record) in history.iter().enumerate() {
                 let stream_id =
@@ -8248,13 +8303,14 @@ mod tests {
             }
             drop(log);
 
-            let recovered_region = TxDurableLog::recover_file_backed_for_test(&path)?;
-            let object_winners =
-                crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+            let recovered_region =
+                crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_test(
                     &path,
                 )?;
+            let object_winners = recovered_region.committed_object_winners()?;
             let mut rebuilt = ObjectTable::default();
-            rebuilt.rebuild_from_recovery_for_test(&object_winners)?;
+            rebuilt
+                .rebuild_from_recovery_for_test(&recovered_region.type_layouts, &object_winners)?;
 
             Ok(RecoveredObjectHistory {
                 rebuilt,
@@ -8498,8 +8554,25 @@ mod tests {
 
         #[test]
         fn model_object_rebuild_rejects_corrupt_payload_header_mismatch() {
-            let err =
-                rebuild_object_table_from_winners(&[corrupt_payload_header_winner()]).unwrap_err();
+            let mut recovered_type_layouts = TypeLayoutRegistry::default();
+            recovered_type_layouts
+                .insert(PersistentTypeLayout::Struct {
+                    id: type_layout::TypeLayoutId::new(207).unwrap(),
+                    fingerprint: 0x5354_5255_4354_0207,
+                    body_size: 4,
+                    fields: vec![type_layout::StructTraceField {
+                        field_index: 0,
+                        field_offset: 0,
+                        value_size: 4,
+                        kind: type_layout::TraceSlotKind::Scalar,
+                    }],
+                })
+                .unwrap();
+            let err = rebuild_object_table_from_winners(
+                &recovered_type_layouts,
+                &[corrupt_payload_header_winner()],
+            )
+            .unwrap_err();
 
             assert!(
                 err.to_string().contains(
@@ -9890,12 +9963,35 @@ mod tests {
         let winners = recovered.committed_object_winners().unwrap();
         let mut objects = ObjectTable::default();
 
-        objects.rebuild_from_recovery_for_test(&winners).unwrap();
+        objects
+            .rebuild_from_recovery_for_test(&recovered.type_layouts, &winners)
+            .unwrap();
 
         assert_eq!(objects.live_count(), 2);
+        assert!(
+            objects
+                .type_layouts()
+                .contains(type_layout::TypeLayoutId::new(7).unwrap())
+        );
+        assert!(
+            objects
+                .type_layouts()
+                .contains(type_layout::TypeLayoutId::new(9).unwrap())
+        );
+        assert!(objects.gc_ref_to_object.is_empty());
+        assert!(objects.object_to_gc_ref.is_empty());
+        assert!(objects.func_ref_to_object.is_empty());
+        assert!(objects.object_to_func_ref.is_empty());
         assert_eq!(
             objects.kind(ObjectId { object_index: 41 }).unwrap(),
             ObjectKind::Struct
+        );
+        assert_eq!(
+            objects
+                .live_slot(ObjectId { object_index: 41 })
+                .unwrap()
+                .type_layout_id,
+            7
         );
         assert_eq!(
             objects.payload(ObjectId { object_index: 41 }).unwrap(),
@@ -9904,6 +10000,13 @@ mod tests {
         assert_eq!(
             objects.kind(ObjectId { object_index: 42 }).unwrap(),
             ObjectKind::Array
+        );
+        assert_eq!(
+            objects
+                .live_slot(ObjectId { object_index: 42 })
+                .unwrap()
+                .type_layout_id,
+            9
         );
         assert_eq!(
             objects.payload(ObjectId { object_index: 42 }).unwrap(),
@@ -9968,6 +10071,12 @@ mod tests {
             crate::runtime::vm::block_region::VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream1 = region.alloc_stream(1).unwrap();
         let stream2 = region.alloc_stream(2).unwrap();
+        region
+            .append_type_layout_metadata(&recovery_test_struct_layout(7))
+            .unwrap();
+        region
+            .append_type_layout_metadata(&recovery_test_array_layout(9))
+            .unwrap();
 
         let first = encoded_object_publication_for_recovery_test(
             41,
@@ -9989,6 +10098,37 @@ mod tests {
         append_committed_object_winner(&mut region, 2, stream2, 0, &second);
 
         region
+    }
+
+    fn recovery_test_struct_layout(layout_id: u32) -> type_layout::PersistentTypeLayout {
+        type_layout::PersistentTypeLayout::Struct {
+            id: type_layout::TypeLayoutId::new(layout_id).unwrap(),
+            fingerprint: 0x5354_5255_4354_2000 | u64::from(layout_id),
+            body_size: 16,
+            fields: vec![
+                type_layout::StructTraceField {
+                    field_index: 0,
+                    field_offset: 0,
+                    value_size: 4,
+                    kind: type_layout::TraceSlotKind::Scalar,
+                },
+                type_layout::StructTraceField {
+                    field_index: 1,
+                    field_offset: 8,
+                    value_size: 8,
+                    kind: type_layout::TraceSlotKind::ObjectRef,
+                },
+            ],
+        }
+    }
+
+    fn recovery_test_array_layout(layout_id: u32) -> type_layout::PersistentTypeLayout {
+        type_layout::PersistentTypeLayout::Array {
+            id: type_layout::TypeLayoutId::new(layout_id).unwrap(),
+            fingerprint: 0x4152_5241_5900_2000 | u64::from(layout_id),
+            element_size: 8,
+            element_kind: type_layout::TraceSlotKind::ObjectRef,
+        }
     }
 
     fn encoded_object_publication_for_recovery_test(
