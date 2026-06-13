@@ -5333,6 +5333,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "wasm-encoder 0.251.0",
  "wasmparser 0.251.0",
  "wasmprinter",
