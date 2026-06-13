@@ -21,6 +21,9 @@ pub(crate) use object_heap::encode_object_record_for_test;
 pub(crate) use persist::{
     PendingCommitLogEntry, PendingGranuleUndo, StreamPublisher, TxDurableLog,
 };
+use type_layout::{
+    PersistentTypeKind, PersistentTypeLayout, TraceSlotKind, TypeLayoutId, TypeLayoutRegistry,
+};
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
 // store-local transaction state, `VMemory` and configurable `NVMemory`
@@ -620,7 +623,7 @@ struct ObjectTableSlot {
     current_record: object_heap::TxRecordHandle,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ObjectTable {
     slots: Vec<Option<ObjectTableSlot>>,
     free_list: Vec<ObjectId>,
@@ -634,10 +637,35 @@ pub(crate) struct ObjectTable {
     object_to_gc_ref: BTreeMap<ObjectId, u32>,
     func_ref_to_object: BTreeMap<u64, ObjectId>,
     object_to_func_ref: BTreeMap<ObjectId, u64>,
+    type_layouts: TypeLayoutRegistry,
     next_version: u64,
     next_record_version: u32,
     live_count: usize,
     heap: object_heap::ObjectHeap,
+}
+
+impl Default for ObjectTable {
+    fn default() -> Self {
+        let mut table = Self {
+            slots: Vec::new(),
+            free_list: Vec::new(),
+            gc_ref_to_object: BTreeMap::new(),
+            object_to_gc_ref: BTreeMap::new(),
+            func_ref_to_object: BTreeMap::new(),
+            object_to_func_ref: BTreeMap::new(),
+            type_layouts: TypeLayoutRegistry::default(),
+            next_version: 0,
+            next_record_version: 0,
+            live_count: 0,
+            heap: object_heap::ObjectHeap::default(),
+        };
+        for layout in builtin_type_layouts() {
+            table
+                .register_type_layout(layout)
+                .expect("built-in type layouts must register");
+        }
+        table
+    }
 }
 
 impl ObjectTable {
@@ -662,8 +690,10 @@ impl ObjectTable {
             !self.gc_ref_to_object.contains_key(&gc_ref),
             "transactional object GC ref is already associated"
         );
-        let object_id =
-            self.allocate_payload_with_persistence(ObjectPayload::Struct(fields), true)?;
+        let object_id = self.allocate_payload_with_persistence(
+            ObjectPayload::Struct(fields),
+            true,
+        )?;
         self.associate_gc_ref(gc_ref, object_id)?;
         Ok(object_id)
     }
@@ -752,6 +782,18 @@ impl ObjectTable {
         payload: ObjectPayload,
         persistent: bool,
     ) -> Result<ObjectId> {
+        let type_layout_id = default_type_layout_id_for_kind(payload.kind());
+        self.allocate_payload_with_type_layout_id(payload, type_layout_id, persistent)
+    }
+
+    fn allocate_payload_with_type_layout_id(
+        &mut self,
+        payload: ObjectPayload,
+        type_layout_id: TypeLayoutId,
+        persistent: bool,
+    ) -> Result<ObjectId> {
+        self.validate_type_layout_for_object_kind(payload.kind(), type_layout_id)?;
+
         let reused_slot = self.free_list.last().copied();
         let object_id = match reused_slot {
             Some(object_id) => object_id,
@@ -774,9 +816,14 @@ impl ObjectTable {
         );
         let kind = payload.kind();
         let record_version = self.bump_record_version()?;
-        let record = self
-            .heap
-            .allocate_record(object_id, record_version, kind, 0, 0, &payload)?;
+        let record = self.heap.allocate_record(
+            object_id,
+            record_version,
+            kind,
+            0,
+            type_layout_id.get(),
+            &payload,
+        )?;
         let version = self.bump_object_version()?;
         if reused_slot.is_some() {
             let _ = self.free_list.pop();
@@ -784,7 +831,7 @@ impl ObjectTable {
         self.slots[index] = Some(ObjectTableSlot {
             kind,
             version,
-            type_layout_id: 0,
+            type_layout_id: type_layout_id.get(),
             persistent,
             current_record: record,
         });
@@ -793,6 +840,20 @@ impl ObjectTable {
             .checked_add(1)
             .context("object table live count overflow")?;
         Ok(object_id)
+    }
+
+    pub(crate) fn register_type_layout(&mut self, layout: PersistentTypeLayout) -> Result<()> {
+        self.type_layouts.insert(layout)
+    }
+
+    pub(crate) fn type_layouts(&self) -> &TypeLayoutRegistry {
+        &self.type_layouts
+    }
+
+    pub(crate) fn require_type_layout(&self, id: TypeLayoutId) -> Result<&PersistentTypeLayout> {
+        self.type_layouts
+            .get(id)
+            .with_context(|| format!("unknown persistent type layout id: {}", id.get()))
     }
 
     pub(crate) fn live_count(&self) -> usize {
@@ -1119,6 +1180,8 @@ impl ObjectTable {
             self.slots.resize(slot_len, None);
         }
 
+        // Wave 3 intentionally defers recovered layout-id registry validation
+        // until Wave 6 installs recovered region metadata first.
         for winner in winners {
             let object_id = ObjectId {
                 object_index: winner.object_id,
@@ -1196,6 +1259,86 @@ impl ObjectTable {
     ) -> Result<()> {
         self.rebuild_from_recovered_object_winners(winners)
     }
+
+    #[cfg(test)]
+    fn allocate_payload_with_type_layout_id_for_test(
+        &mut self,
+        payload: ObjectPayload,
+        type_layout_id: TypeLayoutId,
+    ) -> Result<ObjectId> {
+        self.allocate_payload_with_type_layout_id(payload, type_layout_id, false)
+    }
+
+    fn validate_type_layout_for_object_kind(
+        &self,
+        kind: ObjectKind,
+        type_layout_id: TypeLayoutId,
+    ) -> Result<()> {
+        let layout = self.require_type_layout(type_layout_id)?;
+        ensure!(
+            persistent_type_kind_matches_object_kind(layout.kind(), kind),
+            "persistent type layout kind {:?} does not match object kind {:?}",
+            layout.kind(),
+            kind
+        );
+        Ok(())
+    }
+}
+
+fn default_type_layout_id_for_kind(kind: ObjectKind) -> TypeLayoutId {
+    match kind {
+        ObjectKind::Struct => TypeLayoutId::DEFAULT_STRUCT,
+        ObjectKind::Array => TypeLayoutId::DEFAULT_ARRAY,
+        ObjectKind::I31 => TypeLayoutId::BUILTIN_I31,
+        ObjectKind::Extern => TypeLayoutId::BUILTIN_EXTERN,
+        ObjectKind::Func => TypeLayoutId::BUILTIN_FUNC,
+    }
+}
+
+fn persistent_type_kind_matches_object_kind(
+    type_kind: PersistentTypeKind,
+    object_kind: ObjectKind,
+) -> bool {
+    matches!(
+        (type_kind, object_kind),
+        (PersistentTypeKind::Struct, ObjectKind::Struct)
+            | (PersistentTypeKind::Array, ObjectKind::Array)
+            | (PersistentTypeKind::I31, ObjectKind::I31)
+            | (PersistentTypeKind::Extern, ObjectKind::Extern)
+            | (PersistentTypeKind::Func, ObjectKind::Func)
+    )
+}
+
+fn builtin_type_layouts() -> [PersistentTypeLayout; 5] {
+    [
+        PersistentTypeLayout::Struct {
+            id: TypeLayoutId::DEFAULT_STRUCT,
+            fingerprint: 0x5354_5255_4354_0001,
+            body_size: 0,
+            fields: Vec::new(),
+        },
+        PersistentTypeLayout::Array {
+            id: TypeLayoutId::DEFAULT_ARRAY,
+            fingerprint: 0x4152_5241_5900_0001,
+            element_size: 0,
+            element_kind: TraceSlotKind::Scalar,
+        },
+        PersistentTypeLayout::Scalar {
+            id: TypeLayoutId::BUILTIN_I31,
+            fingerprint: 0x4933_3100_0000_0001,
+            kind: PersistentTypeKind::I31,
+        },
+        PersistentTypeLayout::Scalar {
+            id: TypeLayoutId::BUILTIN_EXTERN,
+            fingerprint: 0x4558_5445_524e_0001,
+            kind: PersistentTypeKind::Extern,
+        },
+        PersistentTypeLayout::Scalar {
+            id: TypeLayoutId::BUILTIN_FUNC,
+            fingerprint: 0x4655_4e43_0000_0001,
+            kind: PersistentTypeKind::Func,
+        },
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -6004,6 +6147,135 @@ mod tests {
         assert_eq!(objects.slot_count(), 2);
         assert!(objects.version(reused).unwrap() > second_version);
         assert_eq!(objects.kind(reused).unwrap(), ObjectKind::Struct);
+    }
+
+    #[test]
+    fn object_table_default_registers_builtin_scalar_type_layouts() {
+        let objects = ObjectTable::default();
+
+        assert_eq!(
+            objects
+                .require_type_layout(type_layout::TypeLayoutId::BUILTIN_I31)
+                .unwrap()
+                .kind(),
+            type_layout::PersistentTypeKind::I31
+        );
+        assert_eq!(
+            objects
+                .require_type_layout(type_layout::TypeLayoutId::BUILTIN_EXTERN)
+                .unwrap()
+                .kind(),
+            type_layout::PersistentTypeKind::Extern
+        );
+        assert_eq!(
+            objects
+                .require_type_layout(type_layout::TypeLayoutId::BUILTIN_FUNC)
+                .unwrap()
+                .kind(),
+            type_layout::PersistentTypeKind::Func
+        );
+    }
+
+    #[test]
+    fn object_table_rejects_allocation_with_missing_struct_layout_id() {
+        let mut objects = ObjectTable::default();
+
+        let err = objects
+            .allocate_payload_with_type_layout_id_for_test(
+                ObjectPayload::Struct(vec![ObjectValue::I32(1)]),
+                type_layout::TypeLayoutId::new(99).unwrap(),
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unknown persistent type layout"));
+    }
+
+    #[test]
+    fn object_table_allows_allocation_with_registered_struct_layout_id() {
+        let mut objects = ObjectTable::default();
+        let layout = type_layout::PersistentTypeLayout::Struct {
+            id: type_layout::TypeLayoutId::new(101).unwrap(),
+            fingerprint: 0x0101_0000_0000_0001,
+            body_size: 16,
+            fields: vec![type_layout::StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 8,
+                kind: type_layout::TraceSlotKind::Scalar,
+            }],
+        };
+        objects.register_type_layout(layout.clone()).unwrap();
+
+        let object = objects
+            .allocate_payload_with_type_layout_id_for_test(
+                ObjectPayload::Struct(vec![ObjectValue::I32(1)]),
+                layout.id(),
+            )
+            .unwrap();
+        let handle = objects.current_record_handle_for_test(object).unwrap();
+        let header = objects.heap.header(handle).unwrap();
+
+        assert_eq!(objects.live_slot(object).unwrap().type_layout_id, layout.id().get());
+        assert_eq!(header.type_layout_id, layout.id().get());
+    }
+
+    #[test]
+    fn object_table_public_struct_and_array_allocations_use_nonzero_layout_ids() {
+        let mut objects = ObjectTable::default();
+
+        let struct_object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        let array_object = objects.allocate_array(vec![ObjectValue::I32(2)]).unwrap();
+
+        assert_ne!(
+            objects.live_slot(struct_object).unwrap().type_layout_id,
+            0,
+            "struct allocation must not use layout id zero"
+        );
+        assert_ne!(
+            objects.live_slot(array_object).unwrap().type_layout_id,
+            0,
+            "array allocation must not use layout id zero"
+        );
+    }
+
+    #[test]
+    fn object_table_scalar_allocations_use_builtin_layout_ids() {
+        let mut objects = ObjectTable::default();
+
+        let i31_object = objects.allocate(ObjectKind::I31).unwrap();
+        let extern_object = objects.allocate(ObjectKind::Extern).unwrap();
+        let func_object = objects.allocate(ObjectKind::Func).unwrap();
+
+        let i31_handle = objects.current_record_handle_for_test(i31_object).unwrap();
+        let extern_handle = objects.current_record_handle_for_test(extern_object).unwrap();
+        let func_handle = objects.current_record_handle_for_test(func_object).unwrap();
+
+        assert_eq!(
+            objects.live_slot(i31_object).unwrap().type_layout_id,
+            type_layout::TypeLayoutId::BUILTIN_I31.get()
+        );
+        assert_eq!(
+            objects.heap.header(i31_handle).unwrap().type_layout_id,
+            type_layout::TypeLayoutId::BUILTIN_I31.get()
+        );
+
+        assert_eq!(
+            objects.live_slot(extern_object).unwrap().type_layout_id,
+            type_layout::TypeLayoutId::BUILTIN_EXTERN.get()
+        );
+        assert_eq!(
+            objects.heap.header(extern_handle).unwrap().type_layout_id,
+            type_layout::TypeLayoutId::BUILTIN_EXTERN.get()
+        );
+
+        assert_eq!(
+            objects.live_slot(func_object).unwrap().type_layout_id,
+            type_layout::TypeLayoutId::BUILTIN_FUNC.get()
+        );
+        assert_eq!(
+            objects.heap.header(func_handle).unwrap().type_layout_id,
+            type_layout::TypeLayoutId::BUILTIN_FUNC.get()
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 const TYPE_LAYOUT_RECORD_MAGIC: u32 = 0x544c_4159; // "TLAY"
@@ -19,6 +20,12 @@ const TYPE_LAYOUT_FIELD_RESERVED_OFFSET: usize = TypeLayoutRecordHeader::BYTE_LE
 pub(crate) struct TypeLayoutId(u32);
 
 impl TypeLayoutId {
+    pub(crate) const DEFAULT_STRUCT: Self = Self(1);
+    pub(crate) const DEFAULT_ARRAY: Self = Self(2);
+    pub(crate) const BUILTIN_I31: Self = Self(3);
+    pub(crate) const BUILTIN_EXTERN: Self = Self(4);
+    pub(crate) const BUILTIN_FUNC: Self = Self(5);
+
     pub(crate) const fn new(raw: u32) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
     }
@@ -72,6 +79,12 @@ pub(crate) enum PersistentTypeLayout {
         fingerprint: u64,
         kind: PersistentTypeKind,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TypeLayoutRegistry {
+    layouts: BTreeMap<TypeLayoutId, PersistentTypeLayout>,
+    fingerprints: BTreeMap<u64, TypeLayoutId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,6 +390,77 @@ impl PersistentTypeLayout {
             Self::Scalar { kind, .. } => *kind,
         }
     }
+
+    pub(crate) fn fingerprint(&self) -> u64 {
+        match self {
+            Self::Struct { fingerprint, .. }
+            | Self::Array { fingerprint, .. }
+            | Self::Scalar { fingerprint, .. } => *fingerprint,
+        }
+    }
+}
+
+impl TypeLayoutRegistry {
+    pub(crate) fn insert(&mut self, layout: PersistentTypeLayout) -> Result<()> {
+        let id = layout.id();
+        ensure!(id.get() != 0, "persistent type layout id cannot be zero");
+
+        if let Some(existing) = self.layouts.get(&id) {
+            ensure!(
+                existing == &layout,
+                "conflicting persistent type layout for id {}",
+                id.get()
+            );
+            return Ok(());
+        }
+
+        let fingerprint = layout.fingerprint();
+        if let Some(existing_id) = self.fingerprints.get(&fingerprint).copied() {
+            ensure!(
+                existing_id == id,
+                "persistent type layout fingerprint {fingerprint:#x} is already registered to layout id {}",
+                existing_id.get()
+            );
+        }
+
+        self.fingerprints.insert(fingerprint, id);
+        self.layouts.insert(id, layout);
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, id: TypeLayoutId) -> Option<&PersistentTypeLayout> {
+        self.layouts.get(&id)
+    }
+
+    pub(crate) fn contains(&self, id: TypeLayoutId) -> bool {
+        self.layouts.contains_key(&id)
+    }
+
+    pub(crate) fn id_for_fingerprint(&self, fingerprint: u64) -> Option<TypeLayoutId> {
+        self.fingerprints.get(&fingerprint).copied()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &PersistentTypeLayout> {
+        self.layouts.values()
+    }
+
+    pub(crate) fn encode_all(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for layout in self.iter() {
+            bytes.extend_from_slice(&layout.encode()?);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode_all(mut bytes: &[u8]) -> Result<Self> {
+        let mut registry = Self::default();
+        while !bytes.is_empty() {
+            let (layout, consumed) = PersistentTypeLayout::decode_prefix(bytes)?;
+            registry.insert(layout)?;
+            bytes = &bytes[consumed..];
+        }
+        Ok(registry)
+    }
 }
 
 fn decode_header_element_kind(raw: u8) -> Result<TraceSlotKind> {
@@ -431,10 +515,11 @@ mod tests {
         TYPE_LAYOUT_RECORD_ELEMENT_KIND_OFFSET, TYPE_LAYOUT_RECORD_KIND_OFFSET,
         TYPE_LAYOUT_RECORD_LEN_OFFSET, TYPE_LAYOUT_RECORD_MAGIC,
         TYPE_LAYOUT_RECORD_RESERVED_OFFSET, TYPE_LAYOUT_RECORD_RESERVED2_OFFSET, TraceSlotKind,
-        TypeLayoutFieldEntry, TypeLayoutId, TypeLayoutRecordHeader,
+        TypeLayoutFieldEntry, TypeLayoutId, TypeLayoutRecordHeader, TypeLayoutRegistry,
         encoded_record_len_for_field_count,
     };
     use alloc::string::ToString;
+    use alloc::vec::Vec;
 
     const TEST_MAX_TYPE_LAYOUT_RECORD_LEN: usize = 64 * 1024;
     const TEST_MAX_STRUCT_TRACE_FIELDS: usize = 4096;
@@ -731,5 +816,137 @@ mod tests {
         let err = encoded_record_len_for_field_count(MAX_STRUCT_TRACE_FIELDS + 1).unwrap_err();
 
         assert!(err.to_string().contains("field count"));
+    }
+
+    #[test]
+    fn registry_accepts_idempotent_duplicate() {
+        let layout = PersistentTypeLayout::Scalar {
+            id: TypeLayoutId::new(21).unwrap(),
+            fingerprint: 0x2100_0000_0000_0001,
+            kind: PersistentTypeKind::I31,
+        };
+        let mut registry = TypeLayoutRegistry::default();
+
+        registry.insert(layout.clone()).unwrap();
+        registry.insert(layout.clone()).unwrap();
+
+        assert_eq!(registry.get(layout.id()), Some(&layout));
+        assert_eq!(
+            registry.id_for_fingerprint(layout.fingerprint()),
+            Some(layout.id())
+        );
+    }
+
+    #[test]
+    fn registry_rejects_conflicting_duplicate_id() {
+        let id = TypeLayoutId::new(22).unwrap();
+        let mut registry = TypeLayoutRegistry::default();
+        registry
+            .insert(PersistentTypeLayout::Scalar {
+                id,
+                fingerprint: 0x2200_0000_0000_0001,
+                kind: PersistentTypeKind::Extern,
+            })
+            .unwrap();
+
+        let err = registry
+            .insert(PersistentTypeLayout::Scalar {
+                id,
+                fingerprint: 0x2200_0000_0000_0002,
+                kind: PersistentTypeKind::Func,
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("conflicting"));
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_fingerprint_for_different_id() {
+        let fingerprint = 0x2300_0000_0000_0001;
+        let mut registry = TypeLayoutRegistry::default();
+        registry
+            .insert(PersistentTypeLayout::Scalar {
+                id: TypeLayoutId::new(23).unwrap(),
+                fingerprint,
+                kind: PersistentTypeKind::I31,
+            })
+            .unwrap();
+
+        let err = registry
+            .insert(PersistentTypeLayout::Scalar {
+                id: TypeLayoutId::new(24).unwrap(),
+                fingerprint,
+                kind: PersistentTypeKind::Extern,
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("fingerprint"));
+    }
+
+    #[test]
+    fn registry_encode_all_decode_all_round_trips_multiple_layouts() {
+        let layouts = vec![
+            PersistentTypeLayout::Struct {
+                id: TypeLayoutId::new(31).unwrap(),
+                fingerprint: 0x3100_0000_0000_0001,
+                body_size: 24,
+                fields: vec![
+                    StructTraceField {
+                        field_index: 0,
+                        field_offset: 0,
+                        value_size: 8,
+                        kind: TraceSlotKind::ObjectRef,
+                    },
+                    StructTraceField {
+                        field_index: 1,
+                        field_offset: 8,
+                        value_size: 8,
+                        kind: TraceSlotKind::Scalar,
+                    },
+                ],
+            },
+            PersistentTypeLayout::Array {
+                id: TypeLayoutId::new(32).unwrap(),
+                fingerprint: 0x3200_0000_0000_0001,
+                element_size: 8,
+                element_kind: TraceSlotKind::ObjectRef,
+            },
+            PersistentTypeLayout::Scalar {
+                id: TypeLayoutId::new(33).unwrap(),
+                fingerprint: 0x3300_0000_0000_0001,
+                kind: PersistentTypeKind::Func,
+            },
+        ];
+        let mut registry = TypeLayoutRegistry::default();
+        for layout in &layouts {
+            registry.insert(layout.clone()).unwrap();
+        }
+
+        let encoded = registry.encode_all().unwrap();
+        let decoded = TypeLayoutRegistry::decode_all(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().cloned().collect::<Vec<_>>(), layouts);
+    }
+
+    #[test]
+    fn registry_decode_all_rejects_invalid_concatenated_record_data() {
+        let first = PersistentTypeLayout::Scalar {
+            id: TypeLayoutId::new(41).unwrap(),
+            fingerprint: 0x4100_0000_0000_0001,
+            kind: PersistentTypeKind::I31,
+        };
+        let second = PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(42).unwrap(),
+            fingerprint: 0x4200_0000_0000_0001,
+            element_size: 8,
+            element_kind: TraceSlotKind::ObjectRef,
+        };
+        let mut bytes = first.encode().unwrap();
+        let second = second.encode().unwrap();
+        bytes.extend_from_slice(&second[..second.len() - 1]);
+
+        let err = TypeLayoutRegistry::decode_all(&bytes).unwrap_err();
+
+        assert!(err.to_string().contains("shorter"));
     }
 }
