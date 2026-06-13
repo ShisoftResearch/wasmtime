@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 mod object_heap;
 #[path = "transaction/persist.rs"]
 mod persist;
+#[path = "transaction/type_layout.rs"]
+pub(crate) mod type_layout;
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
