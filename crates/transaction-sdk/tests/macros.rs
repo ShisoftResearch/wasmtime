@@ -1,4 +1,4 @@
-use wasmtime_transaction_sdk::{Persist, Root, transaction_attr};
+use wasmtime_transaction_sdk::{Persist, Root, txn_func};
 
 #[derive(Persist)]
 #[repr(C)]
@@ -12,7 +12,7 @@ struct Bank {
     accounts: [Account; 2],
 }
 
-#[transaction_attr]
+#[txn_func]
 fn apply_credit(bank: &mut Bank, amount: i64) {
     bank.accounts[0].balance += amount;
 }
@@ -31,7 +31,7 @@ fn root_type_checks_derived_persist_types() {
 }
 
 #[test]
-fn transaction_attr_expands_for_mut_helpers() {
+fn txn_func_expands_for_mut_helpers() {
     let mut bank = Bank {
         accounts: [Account { balance: 5 }, Account { balance: 7 }],
     };
@@ -116,13 +116,13 @@ pub struct Ledger {
 }
 
 #[test]
-fn transaction_attr_emits_wasm_markers_for_mut_self_methods() {
+fn txn_func_emits_wasm_markers_for_mut_self_methods() {
     use std::fs;
     use std::process::Command;
 
     use tempfile::tempdir;
 
-    if !ensure_wasm32_target_or_skip("transaction_attr_emits_wasm_markers_for_mut_self_methods") {
+    if !ensure_wasm32_target_or_skip("txn_func_emits_wasm_markers_for_mut_self_methods") {
         return;
     }
 
@@ -137,7 +137,7 @@ fn transaction_attr_emits_wasm_markers_for_mut_self_methods() {
         r#"#![no_std]
 
 use core::panic::PanicInfo;
-use sdk::{Persist, transaction_attr};
+use sdk::{Persist, txn_func};
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
@@ -151,7 +151,7 @@ pub struct Account {
 }
 
 impl Account {
-    #[transaction_attr]
+    #[txn_func]
     pub fn credit(&mut self, amount: i64) {
         self.balance += amount;
     }
@@ -193,7 +193,7 @@ pub extern "C" fn call_credit(account: &mut Account, amount: i64) {
 }
 
 #[test]
-fn transaction_attr_rejects_non_persist_mut_args() {
+fn txn_func_rejects_non_persist_mut_args() {
     use std::fs;
     use std::process::Command;
 
@@ -207,11 +207,11 @@ fn transaction_attr_rejects_non_persist_mut_args() {
     fs::create_dir(manifest_dir.join("src")).expect("create src dir");
     fs::write(
         manifest_dir.join("src/lib.rs"),
-        r#"use wasmtime_transaction_sdk::transaction_attr;
+        r#"use wasmtime_transaction_sdk::txn_func;
 
 struct Transient;
 
-#[transaction_attr]
+#[txn_func]
 fn touch(value: &mut Transient) {
     let _ = value;
 }

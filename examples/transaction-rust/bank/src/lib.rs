@@ -1,6 +1,6 @@
 #![no_std]
 
-use wasmtime_transaction_sdk::{Persist, Root, transaction_attr};
+use wasmtime_transaction_sdk::{Persist, Root, txn_func};
 
 #[derive(Clone, Copy, Persist)]
 #[repr(C)]
@@ -43,7 +43,7 @@ pub extern "C" fn transfer(from: u32, to: u32, amount: i64) {
     })
 }
 
-#[transaction_attr]
+#[txn_func]
 fn transfer_impl(bank: &mut Bank, req: &Request) {
     let from = req.from as usize;
     let to = req.to as usize;

@@ -1,6 +1,6 @@
 #![no_std]
 
-use wasmtime_transaction_sdk::{Persist, Root, transaction_attr};
+use wasmtime_transaction_sdk::{Persist, Root, txn_func};
 
 #[derive(Clone, Copy, Persist)]
 #[repr(C)]
@@ -20,7 +20,7 @@ pub struct Region {
 
 const REGION_ROOT: Root<Region> = Root::tmemory_offset(4096);
 
-#[transaction_attr]
+#[txn_func]
 #[unsafe(no_mangle)]
 pub extern "C" fn pressure_round(iterations: u32, stride: u32) -> i64 {
     wasmtime_transaction_sdk::transaction!(tx, {

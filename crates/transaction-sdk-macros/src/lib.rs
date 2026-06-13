@@ -20,28 +20,28 @@ pub fn derive_persist(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn transaction(args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn txn_func(args: TokenStream, input: TokenStream) -> TokenStream {
     let func = parse_macro_input!(input as ItemFn);
-    match expand_transaction_attr(args.into(), func) {
+    match expand_txn_func_attr(args.into(), func) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
 }
 
-fn expand_transaction_attr(
+fn expand_txn_func_attr(
     args: proc_macro2::TokenStream,
     func: ItemFn,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if !args.is_empty() {
         return Err(Error::new(
             Span::call_site(),
-            "transaction attribute does not accept arguments",
+            "txn_func attribute does not accept arguments",
         ));
     }
-    Ok(expand_transaction_impl(func))
+    Ok(expand_txn_func_impl(func))
 }
 
-fn expand_transaction_impl(mut func: ItemFn) -> proc_macro2::TokenStream {
+fn expand_txn_func_impl(mut func: ItemFn) -> proc_macro2::TokenStream {
     let sdk_path = sdk_path();
     let persistent_arg_markers = func
         .sig
@@ -237,7 +237,7 @@ fn is_mutable_persistent_arg(arg: &FnArg) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_persist_impl, expand_transaction_attr, expand_transaction_impl};
+    use super::{derive_persist_impl, expand_txn_func_attr, expand_txn_func_impl};
     use quote::quote;
     use syn::parse_quote;
 
@@ -310,8 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn transaction_attr_adds_persist_bounds_for_mut_refs_only() {
-        let tokens = expand_transaction_impl(parse_quote! {
+    fn txn_func_adds_persist_bounds_for_mut_refs_only() {
+        let tokens = expand_txn_func_impl(parse_quote! {
             fn update<T, U>(value: &mut T, readonly: &U) {}
         })
         .to_string();
@@ -321,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn transaction_attr_adds_persist_bounds_for_mut_self_methods() {
-        let tokens = expand_transaction_impl(parse_quote! {
+    fn txn_func_adds_persist_bounds_for_mut_self_methods() {
+        let tokens = expand_txn_func_impl(parse_quote! {
             fn update<T>(&mut self, value: &mut T) {}
         })
         .to_string();
@@ -332,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn transaction_attr_rejects_arguments() {
-        let err = expand_transaction_attr(
+    fn txn_func_rejects_arguments() {
+        let err = expand_txn_func_attr(
             quote!(foo),
             parse_quote! {
                 fn update() {}
@@ -342,6 +342,6 @@ mod tests {
         .expect_err("transaction args should be rejected")
         .to_string();
 
-        assert!(err.contains("transaction attribute does not accept arguments"));
+        assert!(err.contains("txn_func attribute does not accept arguments"));
     }
 }
