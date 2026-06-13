@@ -1,0 +1,13 @@
+[package]
+name = "transaction-rust-heap"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmtime-transaction-sdk = { path = "../../../crates/transaction-sdk" }
+
+[workspace]

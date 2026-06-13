@@ -1,0 +1,3114 @@
+[Hao Shi] 15:34:47
+All right.
+
+[Eliot Moss] 15:34:47
+Hello?
+
+[Hao Shi] 15:34:50
+So, I thought about being late, I was, um…
+
+[Hao Shi] 15:34:54
+I was messing around with the new…
+
+[Hao Shi] 15:34:57
+cloud model, and I forgot.
+
+[Eliot Moss] 15:35:01
+Uh, it's easy to happen. Um, I was a couple minutes late myself, so…
+
+[Eliot Moss] 15:35:06
+I wouldn't worry about it.
+
+[Eliot Moss] 15:35:09
+Uh, anyway, yeah, I was working on, um…
+
+[Eliot Moss] 15:35:14
+some modest…
+
+[Eliot Moss] 15:35:16
+revisions to the…
+
+[Eliot Moss] 15:35:19
+transactions, spec, things that, uh, Angela had found that needed fixing up.
+
+[Eliot Moss] 15:35:23
+Still trying to debug the reference interpreter. But anyway, um…
+
+[Eliot Moss] 15:35:28
+Yes, how is it going? What, uh…
+
+[Eliot Moss] 15:35:32
+What would be helpful to…
+
+[Eliot Moss] 15:35:35
+uh… go over together.
+
+[Hao Shi] 15:35:36
+Now, yeah, I thought I was reviewing, um…
+
+[Hao Shi] 15:35:40
+I was reviewing the weather engine where I totally did.
+
+[Eliot Moss] 15:35:45
+I'm sorry that… that what?
+
+[Hao Shi] 15:35:47
+Oh, I was reviewing the Watham engine, we were doing, um…
+
+[Hao Shi] 15:35:54
+And, uh, yeah, that was the email I sent you asking questions.
+
+[Hao Shi] 15:36:00
+So, uh, so another question I do have is, um…
+
+[Hao Shi] 15:36:06
+So, there are com- there are permission, uh…
+
+[Hao Shi] 15:36:11
+you know, something like lack of permission for, like,
+
+[Hao Shi] 15:36:17
+conventional objects.
+
+[Eliot Moss] 15:36:20
+transact… they're associated with transactional reference types, but yes.
+
+[Hao Shi] 15:36:24
+Yeah, yeah, they're not just objects, it can also be…
+
+[Hao Shi] 15:36:28
+key memory, just any granules, right?
+
+[Eliot Moss] 15:36:32
+No.
+
+[Hao Shi] 15:36:32
+No.
+
+[Eliot Moss] 15:36:34
+Um…
+
+[Eliot Moss] 15:36:36
+Well, the permissions…
+
+[Eliot Moss] 15:36:39
+are associated with reference types, not with reference values or with objects.
+
+[Hao Shi] 15:36:46
+Okay, so it's just types.
+
+[Eliot Moss] 15:36:50
+reference types.
+
+[Hao Shi] 15:36:51
+reference types.
+
+[Eliot Moss] 15:36:53
+Yeah.
+
+[Hao Shi] 15:36:54
+Um, so…
+
+[Eliot Moss] 15:36:55
+So, uh, the point being, if I have hold of a T-Ref,
+
+[Hao Shi] 15:36:59
+Yeah.
+
+[Eliot Moss] 15:36:59
+Without permissions, and I try to use that TREF to… let's say it's a TREF to an array.
+
+[Eliot Moss] 15:37:06
+And I try to use that TREF to do a T array GET.
+
+[Eliot Moss] 15:37:09
+is gonna fail, because I don't have the permissions.
+
+[Hao Shi] 15:37:15
+Okay.
+
+[Eliot Moss] 15:37:16
+Right? Uh, in fact, it's going to fail at validation time.
+
+[Eliot Moss] 15:37:20
+Because the type's wrong. It's a type check.
+
+[Hao Shi] 15:37:23
+I have type chat. Uh…
+
+[Eliot Moss] 15:37:25
+Right. So I have to do, for example, if I want to be able to do T array get,
+
+[Eliot Moss] 15:37:30
+that I need, uh, a reference
+
+[Eliot Moss] 15:37:33
+that has a permission type that allows reading.
+
+[Eliot Moss] 15:37:37
+So, one way I can do that, if I have permission
+
+[Eliot Moss] 15:37:41
+If I have a reference with permissions none,
+
+[Eliot Moss] 15:37:44
+Uh, that is a reference whose type
+
+[Eliot Moss] 15:37:47
+It says, permissions none. I can try to upgrade it by doing a TCAST read.
+
+[Hao Shi] 15:37:52
+Okay, so, uh…
+
+[Hao Shi] 15:37:54
+to explain what was the, uh, what was the purpose of this permission?
+
+[Hao Shi] 15:38:00
+Um…
+
+[Eliot Moss] 15:38:00
+To avoid having to do a check on every access at runtime.
+
+[Eliot Moss] 15:38:06
+Dynamically.
+
+[Hao Shi] 15:38:07
+Uh…
+
+[Hao Shi] 15:38:10
+our access.
+
+[Eliot Moss] 15:38:11
+Yep.
+
+[Hao Shi] 15:38:13
+Underworld scenario?
+
+[Eliot Moss] 15:38:15
+Well, like, every T-array get? Do I have to go check…
+
+[Eliot Moss] 15:38:18
+And see, do I have permissions to do this?
+
+[Eliot Moss] 15:38:21
+The point is, I can do… I can do the permissions check on the TCAST read,
+
+[Eliot Moss] 15:38:26
+And then I have hold of a pointer that… whose type…
+
+[Eliot Moss] 15:38:29
+says, I'm allowed to use it for reading.
+
+[Hao Shi] 15:38:35
+Okay, maybe I should add to another question. So…
+
+[Hao Shi] 15:38:39
+Uh, why… why do we even have permission to begin with? I mean…
+
+[Hao Shi] 15:38:45
+uh… what was trying to… trying to guard.
+
+[Eliot Moss] 15:38:46
+Well,
+
+[Eliot Moss] 15:38:50
+trying to guard the checks that let me access something in a transaction.
+
+[Hao Shi] 15:38:56
+Um… let me see…
+
+[Eliot Moss] 15:38:59
+If I want to use… if I want to do a T-array GET,
+
+[Hao Shi] 15:39:02
+Yeah.
+
+[Eliot Moss] 15:39:02
+then the array needs to get…
+
+[Eliot Moss] 15:39:05
+somehow get into my transaction reset, and the conflict check
+
+[Eliot Moss] 15:39:10
+has to happen.
+
+[Eliot Moss] 15:39:12
+And the idea of TCAST read is I do that check once, and then I have hold of a pointer that's validated for reading,
+
+[Eliot Moss] 15:39:20
+that I can use over and over without having to do the check over and over.
+
+[Hao Shi] 15:39:27
+Oh.
+
+[Hao Shi] 15:39:30
+Okay, does this permission…
+
+[Hao Shi] 15:39:35
+I mean, there's permissioning, they're kind of like…
+
+[Hao Shi] 15:39:40
+Uh… there are kind of different…
+
+[Hao Shi] 15:39:42
+for, uh,
+
+[Hao Shi] 15:39:44
+concurrency control, or it's kind of universal?
+
+[Eliot Moss] 15:39:51
+You mean… are you asking a question?
+
+[Eliot Moss] 15:39:52
+With the permissions be different according to the concurrency control mechanism?
+
+[Hao Shi] 15:39:56
+Yeah.
+
+[Eliot Moss] 15:39:57
+The answer is no.
+
+[Eliot Moss] 15:40:02
+what the CassRead or castrite do…
+
+[Eliot Moss] 15:40:07
+might vary according to the…
+
+[Eliot Moss] 15:40:11
+concurrency control mechanism.
+
+[Hao Shi] 15:40:14
+Okay.
+
+[Hao Shi] 15:40:16
+Okay, I see.
+
+[Eliot Moss] 15:40:19
+So if… if you have a setup which is somehow optimistic for both reads and writes,
+
+[Hao Shi] 15:40:25
+Yeah.
+
+[Eliot Moss] 15:40:27
+then you do the caster, you cast right,
+
+[Eliot Moss] 15:40:31
+gains access… gets the object into your transaction table, but it's… but it's… in those… in that scenario, it's never going to fail.
+
+[Eliot Moss] 15:40:38
+Right. Whereas in a pessimistic case, it might fail.
+
+[Hao Shi] 15:40:39
+Yeah.
+
+[Hao Shi] 15:40:42
+Okay, so it's mainly for…
+
+[Hao Shi] 15:40:48
+permission control…
+
+[Hao Shi] 15:40:50
+for the, uh, I mean, for the transaction table.
+
+[Hao Shi] 15:40:56
+of each.
+
+[Eliot Moss] 15:40:56
+Um, yeah, I guess you could…
+
+[Eliot Moss] 15:40:58
+I guess you could say that.
+
+[Hao Shi] 15:40:59
+Okay. Um…
+
+[Eliot Moss] 15:41:01
+That is, um…
+
+[Eliot Moss] 15:41:06
+If…
+
+[Eliot Moss] 15:41:09
+If I had gotten hold of, uh, some reference, and… and it's one where… and the type…
+
+[Eliot Moss] 15:41:17
+Remember, type is a static thing, it's not actually associated with a value.
+
+[Hao Shi] 15:41:20
+Right.
+
+[Eliot Moss] 15:41:21
+Um, and the type says read, or whatever.
+
+[Eliot Moss] 15:41:25
+Uh, when we flow outside of a transaction scope, that is, when the transaction commits or aborts,
+
+[Eliot Moss] 15:41:33
+We no longer have that access.
+
+[Eliot Moss] 15:41:36
+The type reverts to none.
+
+[Eliot Moss] 15:41:38
+So that if you start another transaction, you gotta check it again.
+
+[Hao Shi] 15:41:41
+Okay.
+
+[Hao Shi] 15:41:47
+I… okay, I think I understand, um…
+
+[Hao Shi] 15:41:51
+First off, promotion.
+
+[Eliot Moss] 15:41:53
+Well, it's to hoist a dynamic check out so it can be more of a static check.
+
+[Hao Shi] 15:42:02
+Yeah, I was just curious, so is this really…
+
+[Hao Shi] 15:42:07
+Another third mechanism, or it's just, like, best to have mechanism?
+
+[Eliot Moss] 15:42:14
+Um…
+
+[Eliot Moss] 15:42:16
+You could design a system that didn't do it, and then you'd have to do the check on every single access.
+
+[Hao Shi] 15:42:21
+Okay, so it… so you'd have to check.
+
+[Hao Shi] 15:42:25
+At some point.
+
+[Eliot Moss] 15:42:27
+Well, if you're going to access some transactional object,
+
+[Eliot Moss] 15:42:31
+And you want to have transactional semantics, the accesses have to be checked.
+
+[Eliot Moss] 15:42:35
+Somehow.
+
+[Hao Shi] 15:42:37
+Okay.
+
+[Eliot Moss] 15:42:39
+And this is putting…
+
+[Eliot Moss] 15:42:42
+uh… the burden of most of the checks onto the type system
+
+[Eliot Moss] 15:42:46
+So that they're static.
+
+[Hao Shi] 15:42:49
+I see.
+
+[Eliot Moss] 15:42:52
+Or put another way,
+
+[Eliot Moss] 15:42:55
+You can prove that I already have access, so I don't need to do another check.
+
+[Hao Shi] 15:43:03
+Yeah, okay. Um…
+
+[Hao Shi] 15:43:06
+Okay.
+
+[Eliot Moss] 15:43:06
+Now, the same is not true for access to memories.
+
+[Eliot Moss] 15:43:13
+every access to…
+
+[Eliot Moss] 15:43:16
+the linear memory has to be checked.
+
+[Hao Shi] 15:43:19
+Oh.
+
+[Eliot Moss] 15:43:26
+Now, I did con… I did conceive of a mechanism
+
+[Eliot Moss] 15:43:30
+That would let us…
+
+[Eliot Moss] 15:43:33
+Uh…
+
+[Eliot Moss] 15:43:35
+do some kind of, uh, hoisting of that.
+
+[Eliot Moss] 15:43:38
+onto types. But, uh…
+
+[Eliot Moss] 15:43:40
+But it's not in the spec, and it's not implemented.
+
+[Eliot Moss] 15:43:45
+So the idea there… so this is something that I called a handle.
+
+[Eliot Moss] 15:43:51
+And, you know, without getting into all the little
+
+[Eliot Moss] 15:43:57
+knobs and bells and whistles.
+
+[Eliot Moss] 15:43:58
+The idea is that a, uh…
+
+[Eliot Moss] 15:44:02
+handle…
+
+[Eliot Moss] 15:44:04
+Uh, would say…
+
+[Eliot Moss] 15:44:06
+I have already checked access to…
+
+[Eliot Moss] 15:44:11
+Uh, something that starts where the handle refers.
+
+[Eliot Moss] 15:44:14
+And runs for some…
+
+[Eliot Moss] 15:44:16
+statically known number of bytes, so this would help particularly
+
+[Eliot Moss] 15:44:20
+with checks on, you know, something that would be analogous to a struct.
+
+[Eliot Moss] 15:44:25
+some thick-sized data structure in your…
+
+[Eliot Moss] 15:44:28
+memory. So…
+
+[Eliot Moss] 15:44:31
+you would do… we'd have an operation that says, okay, here's…
+
+[Eliot Moss] 15:44:37
+An address in the memory, which of course is just an integer, but anyway, here's an address in the memory.
+
+[Eliot Moss] 15:44:42
+And I want to get a handle, starting there, for…
+
+[Eliot Moss] 15:44:46
+let's say 32 bytes, or whatever.
+
+[Eliot Moss] 15:44:49
+Okay? Then I'd have a handle…
+
+[Eliot Moss] 15:44:53
+a static size 32.
+
+[Eliot Moss] 15:44:56
+then any access I do
+
+[Eliot Moss] 15:44:58
+with that handle that's within the 32 bytes,
+
+[Eliot Moss] 15:45:02
+That's already checked, and I don't have to run another check.
+
+[Eliot Moss] 15:45:09
+So, you know, could apply the concept to other things.
+
+[Eliot Moss] 15:45:13
+Um, but…
+
+[Eliot Moss] 15:45:15
+to be able to get the, uh…
+
+[Eliot Moss] 15:45:18
+Most of the value of it.
+
+[Eliot Moss] 15:45:21
+Um…
+
+[Eliot Moss] 15:45:22
+It has to have static properties. That's why the size has… would have to be statically known.
+
+[Hao Shi] 15:45:27
+Yeah.
+
+[Eliot Moss] 15:45:29
+Now, you could probably still, you know, re…
+
+[Eliot Moss] 15:45:33
+you could reduce…
+
+[Eliot Moss] 15:45:35
+You could have it have sort of a dynamic flavor of one of those, which might be helpful for arrays.
+
+[Eliot Moss] 15:45:40
+Where you'd say, okay, let's do…
+
+[Eliot Moss] 15:45:44
+a check that, you know, happens to be, let's say, the size of a hole,
+
+[Eliot Moss] 15:45:51
+array.
+
+[Eliot Moss] 15:45:53
+And then, um…
+
+[Eliot Moss] 15:45:55
+it would do the appropriate…
+
+[Eliot Moss] 15:45:57
+gain the appropriate read or write permissions to that range of bytes, and then the handle would have…
+
+[Eliot Moss] 15:46:03
+a starting point, and a…
+
+[Eliot Moss] 15:46:05
+And it would carry with it a dynamic…
+
+[Eliot Moss] 15:46:08
+dynamically computed size.
+
+[Eliot Moss] 15:46:11
+the size that you asked for. So,
+
+[Eliot Moss] 15:46:14
+Uh, on one occasion could be, you know, 53. On another occasion, it could be 75, however many bytes.
+
+[Eliot Moss] 15:46:20
+you want, but you'd have to carry that number with it, and accesses
+
+[Eliot Moss] 15:46:25
+would have to be statically checked to lie in that range.
+
+[Eliot Moss] 15:46:29
+But all you'd have to do is the range check. You wouldn't have to go probe…
+
+[Eliot Moss] 15:46:34
+a granule table.
+
+[Hao Shi] 15:46:37
+Yeah.
+
+[Hao Shi] 15:46:39
+I see.
+
+[Eliot Moss] 15:46:40
+Right. So, you know, you… one could come up with mechanisms.
+
+[Eliot Moss] 15:46:45
+Um, but…
+
+[Eliot Moss] 15:46:49
+we're sort of biasing toward the, uh…
+
+[Eliot Moss] 15:46:53
+WASM heap objects, as opposed to the linear memory.
+
+[Hao Shi] 15:46:56
+Yeah…
+
+[Hao Shi] 15:46:58
+And I think, well, uh, I think we're already have…
+
+[Hao Shi] 15:47:03
+most of what we need for, um…
+
+[Hao Shi] 15:47:06
+linear memory, but most…
+
+[Hao Shi] 15:47:09
+interesting part is the objects.
+
+[Hao Shi] 15:47:11
+month-to-month.
+
+[Hao Shi] 15:47:13
+Right.
+
+[Eliot Moss] 15:47:13
+Well, I'm not sure… I'm not sure I understand what you mean by have most of what we need for the linear memory. I mean…
+
+[Eliot Moss] 15:47:18
+We can make it go if, uh…
+
+[Eliot Moss] 15:47:21
+If it was something that people…
+
+[Eliot Moss] 15:47:24
+used a lot and cared about a lot, then we might want to
+
+[Eliot Moss] 15:47:27
+you know, add in that handle mechanism I was talking about to improve the performance.
+
+[Hao Shi] 15:47:32
+I don't know.
+
+[Eliot Moss] 15:47:34
+But… anyway.
+
+[Hao Shi] 15:47:35
+I see.
+
+[Hao Shi] 15:47:38
+Oh, okay, so, um…
+
+[Eliot Moss] 15:47:44
+So, so did you ever…
+
+[Eliot Moss] 15:47:47
+see or listen to my talk about…
+
+[Eliot Moss] 15:47:49
+Transactional WebAssembly?
+
+[Eliot Moss] 15:47:55
+Because it talks about this type…
+
+[Eliot Moss] 15:47:57
+stuff, and why it might be of value. I mean, I've explained it now, but I'm…
+
+[Eliot Moss] 15:48:03
+Anyway, I sort of thought all my students were familiar with it. Maybe I should have…
+
+[Eliot Moss] 15:48:07
+explicitly presented it to you all.
+
+[Hao Shi] 15:48:11
+I'm just trying to, uh…
+
+[Hao Shi] 15:48:17
+Okay, maybe I still have, but…
+
+[Hao Shi] 15:48:20
+But maybe I forgot.
+
+[Eliot Moss] 15:48:25
+It's okay. I mean, um…
+
+[Eliot Moss] 15:48:30
+You seem to me to be more of a runtime implementer
+
+[Eliot Moss] 15:48:35
+sort of guy than a programming languages and type systems kind of guy, so the…
+
+[Eliot Moss] 15:48:41
+type system stuff might have…
+
+[Eliot Moss] 15:48:43
+Um, sort of passed by without, um, the implications.
+
+[Eliot Moss] 15:48:48
+becoming really apparent. But…
+
+[Eliot Moss] 15:48:50
+Uh, it's about improving performance.
+
+[Eliot Moss] 15:48:53
+And then Angela's thesis is about…
+
+[Eliot Moss] 15:48:57
+moving around those cast read and cast-write operators,
+
+[Eliot Moss] 15:49:01
+So that, uh…
+
+[Eliot Moss] 15:49:03
+you know, perhaps they cover a bigger scope, and you get rid of more…
+
+[Eliot Moss] 15:49:07
+Uh, checks.
+
+[Eliot Moss] 15:49:12
+for the, you know, trying to get rid of…
+
+[Eliot Moss] 15:49:18
+of more of those cash checks, because that… that's going to be the expensive part, right? Is having to go probe the transaction table like that.
+
+[Hao Shi] 15:49:28
+Yeah.
+
+[Eliot Moss] 15:49:32
+Um, plus, and I haven't…
+
+[Eliot Moss] 15:49:34
+totally figured out every detail of exactly how this would work in Wizard.
+
+[Eliot Moss] 15:49:38
+The cast read and cast right operators…
+
+[Eliot Moss] 15:49:42
+Uh, will…
+
+[Eliot Moss] 15:49:45
+in your setup, um, they will take in a, um…
+
+[Eliot Moss] 15:49:52
+Generally speaking, uh, an object ID, an object number.
+
+[Eliot Moss] 15:49:57
+But what you get back…
+
+[Hao Shi] 15:49:57
+Yeah.
+
+[Eliot Moss] 15:50:00
+will be a pointer to the object.
+
+[Eliot Moss] 15:50:04
+to the actual contents, so that you don't have to be looking up in the object table every time, either.
+
+[Hao Shi] 15:50:04
+So…
+
+[Hao Shi] 15:50:11
+Oh.
+
+[Eliot Moss] 15:50:14
+Not that that's tremendously expensive. I mean, if it turns out to be…
+
+[Eliot Moss] 15:50:19
+too hard to have those sort of two different things floating around.
+
+[Eliot Moss] 15:50:22
+in the system, um, doing a load through the object table, it's not…
+
+[Eliot Moss] 15:50:28
+Uh, necessarily horrible.
+
+[Eliot Moss] 15:50:31
+Um, but it could be nice to just pass around the pointer to the object contents, right?
+
+[Eliot Moss] 15:50:37
+And avoid the indirection.
+
+[Eliot Moss] 15:50:42
+But there has to be some place at which you do that indirection and check.
+
+[Eliot Moss] 15:50:55
+Is it… I don't know if this is making sense.
+
+[Hao Shi] 15:51:00
+Um…
+
+[Eliot Moss] 15:51:12
+Well, let me put it this way. So, imagine we're running along. We have a local variable of WebAssembly local variable.
+
+[Hao Shi] 15:51:13
+Yeah, yeah.
+
+[Hao Shi] 15:51:18
+Yeah.
+
+[Eliot Moss] 15:51:19
+in some WebAssembly function.
+
+[Hao Shi] 15:51:20
+Yeah.
+
+[Eliot Moss] 15:51:20
+And it's of reference type.
+
+[Eliot Moss] 15:51:23
+Is it an ID, or is it a pointer to the actual object guts?
+
+[Hao Shi] 15:51:30
+Okay, um…
+
+[Eliot Moss] 15:51:35
+I would say if it has permissions, none.
+
+[Eliot Moss] 15:51:37
+It's got to be an ID, because, you know, we haven't…
+
+[Eliot Moss] 15:51:42
+Check the object at all.
+
+[Hao Shi] 15:51:45
+Yeah, okay, so every time we dereference this ID, it will turn into some…
+
+[Hao Shi] 15:51:53
+like a pointer with permission text with it.
+
+[Eliot Moss] 15:51:58
+Well, okay, the permissions don't exist on values that runtime. The permissions are a static type-checking thing.
+
+[Hao Shi] 15:52:06
+Oh, right, right, right, right. Um…
+
+[Eliot Moss] 15:52:09
+But doing the cast to… to…
+
+[Eliot Moss] 15:52:13
+Change subject from one type to another, that is one that has the permissions, doing the cast operator,
+
+[Eliot Moss] 15:52:19
+actually does something.
+
+[Hao Shi] 15:52:23
+Okay.
+
+[Eliot Moss] 15:52:25
+Uh, and in this case,
+
+[Eliot Moss] 15:52:27
+You may actually get a reference instead of an ID.
+
+[Eliot Moss] 15:52:33
+the pointer, I should say, instead of an ID.
+
+[Hao Shi] 15:52:38
+Yeah.
+
+[Eliot Moss] 15:52:48
+Although I have to admit, um, you know, what should happen in the case
+
+[Eliot Moss] 15:52:52
+You know, suppose I have something that has read permissions, and say, well, that's going to be a direct pointer to the object.
+
+[Eliot Moss] 15:52:59
+Um, and then if I want to upgrade that to get write permissions…
+
+[Eliot Moss] 15:53:07
+at work, because I no longer have the ID.
+
+[Eliot Moss] 15:53:10
+I just have this pointer to the object.
+
+[Eliot Moss] 15:53:13
+Um, but I think we mentioned we might want the objects
+
+[Eliot Moss] 15:53:18
+Object contents to indicate what their ID is. They basically have a…
+
+[Eliot Moss] 15:53:22
+back pointer to the object table, if you will.
+
+[Eliot Moss] 15:53:25
+If that's true, then we can get hold of the ID,
+
+[Eliot Moss] 15:53:28
+to do the cast-write operation.
+
+[Eliot Moss] 15:53:37
+But if we are able to
+
+[Eliot Moss] 15:53:39
+pass around…
+
+[Eliot Moss] 15:53:41
+actual pointers to object contents, then we can avoid
+
+[Eliot Moss] 15:53:47
+Uh…
+
+[Eliot Moss] 15:53:49
+doing the indirection through the object table all the time.
+
+[Hao Shi] 15:54:04
+Okay, um, another question is, um…
+
+[Hao Shi] 15:54:09
+So I… I think everything is…
+
+[Hao Shi] 15:54:12
+I mean, everything we care about for this, and they are behind this granule.
+
+[Hao Shi] 15:54:22
+granular IDEF.
+
+[Hao Shi] 15:54:24
+Right.
+
+[Eliot Moss] 15:54:24
+I… I guess…
+
+[Eliot Moss] 15:54:31
+I mean, the granules are the unit of concurrency control and the unit of rollback, if that's what you mean.
+
+[Hao Shi] 15:54:39
+Yeah, so, um…
+
+[Hao Shi] 15:54:47
+Okay, so we are going to, so for our…
+
+[Hao Shi] 15:54:51
+Uh, for, you know, transaction, we…
+
+[Hao Shi] 15:54:55
+we will mix.
+
+[Hao Shi] 15:54:57
+different kind of granule in one transaction.
+
+[Hao Shi] 15:55:02
+Um, which also implies…
+
+[Eliot Moss] 15:55:02
+Yeah. Yeah.
+
+[Hao Shi] 15:55:05
+for each of the transaction, we also produce…
+
+[Hao Shi] 15:55:08
+log for different types of…
+
+[Hao Shi] 15:55:12
+Grails.
+
+[Eliot Moss] 15:55:14
+Yes.
+
+[Hao Shi] 15:55:16
+And, um…
+
+[Eliot Moss] 15:55:16
+Technically, the logs are for operations on the granules, but yes.
+
+[Hao Shi] 15:55:22
+And, uh…
+
+[Hao Shi] 15:55:24
+Um, and we have…
+
+[Hao Shi] 15:55:27
+through separate logs, uh…
+
+[Hao Shi] 15:55:30
+Well, for the object table, we are working on, one for the transaction log,
+
+[Hao Shi] 15:55:36
+Uh, one for the transaction. Actually, uh, the objects…
+
+[Eliot Moss] 15:55:42
+When you say transaction, you mean the transaction commit log?
+
+[Hao Shi] 15:55:49
+Um, yeah.
+
+[Eliot Moss] 15:55:51
+Okay, let's, uh, that says transaction number 73 is committed.
+
+[Hao Shi] 15:55:51
+conversion com…
+
+[Hao Shi] 15:55:56
+Yeah, yeah, something like that. Uh, transaction commit log, uh, object table log…
+
+[Eliot Moss] 15:55:57
+Okay.
+
+[Eliot Moss] 15:56:00
+Right.
+
+[Hao Shi] 15:56:02
+Uh, they are… they are all in a same lock.
+
+[Hao Shi] 15:56:06
+And…
+
+[Hao Shi] 15:56:08
+And we also have, like, a set of…
+
+[Hao Shi] 15:56:11
+blog for small, medium, and large.
+
+[Hao Shi] 15:56:15
+objects.
+
+[Hao Shi] 15:56:18
+Um…
+
+[Hao Shi] 15:56:19
+not… sorry, not objects. It's, like, auto-granule. They are… they're also kind of mixed together, uh, in the same…
+
+[Hao Shi] 15:56:29
+blocks, right?
+
+[Eliot Moss] 15:56:32
+Um…
+
+[Eliot Moss] 15:56:35
+Not sure I understand quite what you mean by mixed together in the same blocks.
+
+[Hao Shi] 15:56:39
+or one minute, uh…
+
+[Hao Shi] 15:56:42
+all the granules, regardless their types.
+
+[Hao Shi] 15:56:47
+they are not, like, categorized in different blocks. They are all in their, um,
+
+[Eliot Moss] 15:56:53
+Uh… they might be.
+
+[Hao Shi] 15:56:58
+Okay, um…
+
+[Eliot Moss] 15:56:59
+They might be in distinct blocks. For example, the heap objects get allocated using bump pointer allocation.
+
+[Eliot Moss] 15:57:07
+Right?
+
+[Hao Shi] 15:57:08
+Yeah, yeah.
+
+[Eliot Moss] 15:57:10
+Um, and then, you know, they interact in a…
+
+[Eliot Moss] 15:57:15
+particular way with the object table.
+
+[Eliot Moss] 15:57:17
+Um, but if we imagine WebAssembly, uh,
+
+[Eliot Moss] 15:57:21
+tables, for example.
+
+[Eliot Moss] 15:57:25
+Um, then…
+
+[Eliot Moss] 15:57:30
+does… I mean, they can grow and stuff, but…
+
+[Eliot Moss] 15:57:34
+Mostly, they, uh…
+
+[Eliot Moss] 15:57:37
+happen when you load a module.
+
+[Eliot Moss] 15:57:40
+Um…
+
+[Eliot Moss] 15:57:41
+And they kind of…
+
+[Eliot Moss] 15:57:43
+stick around. Um…
+
+[Eliot Moss] 15:57:47
+I don't know. I… I might tend to…
+
+[Eliot Moss] 15:57:50
+allocate them in distinct
+
+[Eliot Moss] 15:57:53
+blocks.
+
+[Eliot Moss] 15:57:56
+Uh, I'm not totally sure how we should deal with…
+
+[Eliot Moss] 15:58:01
+Uh, you know, what happens when, say, a persistent table grows.
+
+[Eliot Moss] 15:58:07
+Um…
+
+[Eliot Moss] 15:58:08
+if…
+
+[Eliot Moss] 15:58:12
+I guess to some extent, it depends on how people use tables and… and…
+
+[Eliot Moss] 15:58:16
+How often they grow them and stuff like that.
+
+[Eliot Moss] 15:58:19
+you know, I… personally, I'd start by keeping it really simple.
+
+[Eliot Moss] 15:58:23
+And say, okay, we'll allocate enough space
+
+[Eliot Moss] 15:58:28
+you know, rounding up to some…
+
+[Eliot Moss] 15:58:32
+uh… pleasant.
+
+[Eliot Moss] 15:58:34
+chunk size or something, or in fact,
+
+[Eliot Moss] 15:58:37
+with the tables, and we say how many table entries there are per granule, you can just round up to…
+
+[Eliot Moss] 15:58:42
+some number of whole granules. And then if the table grows beyond that,
+
+[Eliot Moss] 15:58:46
+Maybe you end up copying it over into…
+
+[Eliot Moss] 15:58:48
+Totally separate space.
+
+[Eliot Moss] 15:58:53
+Um…
+
+[Eliot Moss] 15:58:57
+just, you know, so it stays contiguous, and you don't…
+
+[Eliot Moss] 15:59:02
+I don't know, they probably don't tend to grow that much, and they probably tend not to be that large.
+
+[Eliot Moss] 15:59:07
+Uh, they…
+
+[Eliot Moss] 15:59:09
+tables get used for function dispatch and to initialize
+
+[Eliot Moss] 15:59:14
+arrays.
+
+[Eliot Moss] 15:59:20
+Um, and for that initialization, they're…
+
+[Eliot Moss] 15:59:24
+sized at module build time.
+
+[Eliot Moss] 15:59:26
+Typically. So, people could do other strange and wondrous things, and if they ever did, and…
+
+[Eliot Moss] 15:59:33
+you know, performance needed to be improved, one could change around the implementation of the…
+
+[Eliot Moss] 15:59:40
+tables, I guess. Um, so there are tables, and then…
+
+[Eliot Moss] 15:59:44
+data and elements.
+
+[Eliot Moss] 15:59:46
+Um, which…
+
+[Eliot Moss] 15:59:48
+really are typically used mostly for initialization.
+
+[Eliot Moss] 15:59:53
+Um…
+
+[Eliot Moss] 15:59:54
+So, anyway…
+
+[Eliot Moss] 15:59:57
+Um…
+
+[Eliot Moss] 16:00:00
+I don't know whether, uh…
+
+[Eliot Moss] 16:00:02
+each of those would go into their own kind of thing, or whether we just keep
+
+[Eliot Moss] 16:00:06
+the module things that are distinct from the heap and the linear memories in separate
+
+[Eliot Moss] 16:00:12
+blocks.
+
+[Hao Shi] 16:00:13
+So, it was… so there are…
+
+[Hao Shi] 16:00:16
+It got separate just because they are in different, uh…
+
+[Hao Shi] 16:00:21
+modules.
+
+[Hao Shi] 16:00:23
+Um…
+
+[Eliot Moss] 16:00:24
+modules.
+
+[Eliot Moss] 16:00:26
+There are different sections of…
+
+[Eliot Moss] 16:00:28
+a module. But also, uh, you know, they aren't pro… they aren't processed by a garbage collector, they're not done by reachability,
+
+[Eliot Moss] 16:00:37
+So, in terms of…
+
+[Eliot Moss] 16:00:39
+When they get reclaimed and things like that, they follow different rules.
+
+[Eliot Moss] 16:00:49
+So I would say a table becomes unreachable.
+
+[Eliot Moss] 16:00:52
+When, uh, its module gets unloaded.
+
+[Eliot Moss] 16:00:58
+Whereas a heap object becomes unreachable.
+
+[Eliot Moss] 16:01:02
+when, yes, it's no longer reachable through the graph structure, which is a rather different rule.
+
+[Hao Shi] 16:01:09
+I see.
+
+[Eliot Moss] 16:01:11
+So…
+
+[Eliot Moss] 16:01:15
+the storage behavior of…
+
+[Eliot Moss] 16:01:18
+say something like tables is much more like…
+
+[Eliot Moss] 16:01:23
+malloc-free and realloc for when it grows or shrinks.
+
+[Eliot Moss] 16:01:29
+This is very, very explicit memory management on tables,
+
+[Eliot Moss] 16:01:33
+data elements.
+
+[Eliot Moss] 16:01:45
+I guess in the same way that, say, you know,
+
+[Eliot Moss] 16:01:49
+files are in a file system.
+
+[Eliot Moss] 16:01:54
+When you remove the last link, not symbolic link, but hard link.
+
+[Eliot Moss] 16:01:58
+Removes the last hard link to a Linux file, then…
+
+[Eliot Moss] 16:02:01
+It's gone, and its spaces are claimed.
+
+[Eliot Moss] 16:02:08
+And all these other sections of modules would…
+
+[Eliot Moss] 16:02:11
+tend to have that sort of behavior.
+
+[Eliot Moss] 16:02:22
+I don't know, is this helpful? Do you…
+
+[Eliot Moss] 16:02:25
+seem puzzled or confused.
+
+[Hao Shi] 16:02:31
+Yeah, I think… I think I understand, but if… I don't know if…
+
+[Hao Shi] 16:02:36
+kinda, like…
+
+[Hao Shi] 16:02:39
+corner case.
+
+[Hao Shi] 16:02:41
+Um…
+
+[Eliot Moss] 16:02:47
+Well, I would agree that… that…
+
+[Eliot Moss] 16:02:49
+you know, persistent
+
+[Eliot Moss] 16:02:52
+tables, or things like persistent web…
+
+[Eliot Moss] 16:02:54
+WebAssembly tables are not the primary thing we're trying to implement, but…
+
+[Eliot Moss] 16:02:59
+you know, they may need to be supported.
+
+[Hao Shi] 16:03:03
+Right, right.
+
+[Eliot Moss] 16:03:15
+Um, now, linear memories…
+
+[Eliot Moss] 16:03:18
+Uh, because…
+
+[Eliot Moss] 16:03:20
+They get allocated in bigger chunks, for one thing. They have this notion of a
+
+[Eliot Moss] 16:03:26
+page, I'll put that in quotes, because as I recall, a page is 64K bytes.
+
+[Eliot Moss] 16:03:32
+So the linear memories come in units of 64K bytes.
+
+[Eliot Moss] 16:03:37
+So they're somewhat larger than…
+
+[Eliot Moss] 16:03:40
+Typical tables and such.
+
+[Eliot Moss] 16:03:43
+Um, and…
+
+[Eliot Moss] 16:03:46
+they indeed might be something where people might do large ones,
+
+[Eliot Moss] 16:03:50
+Uh, they might grow them.
+
+[Eliot Moss] 16:03:53
+Um, so…
+
+[Eliot Moss] 16:03:55
+We may tend to implement them more
+
+[Eliot Moss] 16:03:57
+with a multi-level tree structure similar to the object table.
+
+[Hao Shi] 16:04:04
+I mean, uh…
+
+[Hao Shi] 16:04:07
+Oh, you mean a linear memory?
+
+[Eliot Moss] 16:04:09
+Yes.
+
+[Hao Shi] 16:04:10
+You also need to turn into a tree structure.
+
+[Eliot Moss] 16:04:13
+Well, I… I'm recommending we do it that way. I don't know about need.
+
+[Eliot Moss] 16:04:19
+Uh, but if the memory… if you were trying to keep it as one contiguous chunk, and it had to grow,
+
+[Hao Shi] 16:04:25
+Yeah.
+
+[Eliot Moss] 16:04:26
+That's painful, right? If it's big.
+
+[Hao Shi] 16:04:29
+Right, but just, uh…
+
+[Hao Shi] 16:04:31
+I'm not sure if we want to go that complicated at…
+
+[Hao Shi] 16:04:36
+this point.
+
+[Hao Shi] 16:04:38
+Um…
+
+[Hao Shi] 16:04:41
+I don't know, I'm just… I'm just saying…
+
+[Eliot Moss] 16:04:41
+Well, we don't have to, but if you've already built up the mechanism to do…
+
+[Eliot Moss] 16:04:47
+a multi-level thing.
+
+[Eliot Moss] 16:04:50
+then…
+
+[Eliot Moss] 16:04:53
+It's not hard. Um…
+
+[Eliot Moss] 16:04:56
+I mean, you could just make it, you know,
+
+[Hao Shi] 16:04:57
+Yeah.
+
+[Eliot Moss] 16:04:59
+I guess, you know, simple two-level thing.
+
+[Eliot Moss] 16:05:02
+They would be…
+
+[Eliot Moss] 16:05:05
+a collection of…
+
+[Eliot Moss] 16:05:08
+what we're calling chunks, right, where each chunk is contiguous.
+
+[Eliot Moss] 16:05:13
+to the blocks. Uh, it would be actually a sequence of chunks. The chunks could be
+
+[Eliot Moss] 16:05:19
+anywhere in the memory,
+
+[Eliot Moss] 16:05:21
+But we have…
+
+[Eliot Moss] 16:05:24
+Uh, you know, with a second-level thing that…
+
+[Eliot Moss] 16:05:28
+refers to the chunks.
+
+[Eliot Moss] 16:05:30
+you know, it says where they are, and so forth.
+
+[Eliot Moss] 16:05:33
+Or, in fact, maybe you don't even need that, you just say, all right, we've got a separate list.
+
+[Eliot Moss] 16:05:39
+Remember, we have the ability for the chunks to be on lists.
+
+[Eliot Moss] 16:05:44
+in our low-level allocator.
+
+[Hao Shi] 16:05:47
+Alright, uh, so, so, sorry. Uh, first, just wanted to clarify, a chunk is, uh,
+
+[Hao Shi] 16:05:55
+Instead of contiguous blocks, right?
+
+[Eliot Moss] 16:05:57
+Yeah. So…
+
+[Hao Shi] 16:05:58
+Okay.
+
+[Eliot Moss] 16:05:59
+what Sean has been working on is the chunk allocator.
+
+[Hao Shi] 16:06:05
+Okay.
+
+[Eliot Moss] 16:06:09
+Right? That…
+
+[Eliot Moss] 16:06:12
+deals with, uh,
+
+[Eliot Moss] 16:06:13
+you know, allocating those contiguous
+
+[Eliot Moss] 16:06:17
+sets of blocks.
+
+[Eliot Moss] 16:06:20
+So you can ask for a small one, you know, one block long, you can ask for one that's 7 blocks long, or whatever, but that's a chunk.
+
+[Hao Shi] 16:06:26
+Yeah, yeah.
+
+[Eliot Moss] 16:06:27
+Um, so…
+
+[Eliot Moss] 16:06:29
+I'm suggesting a linear memory, and that lower-level mechanism.
+
+[Eliot Moss] 16:06:34
+It supports having, um…
+
+[Eliot Moss] 16:06:38
+blocks, chunks on two lists. One of the lists
+
+[Eliot Moss] 16:06:42
+is sorted in…
+
+[Eliot Moss] 16:06:44
+memory order, that is, order within the region.
+
+[Eliot Moss] 16:06:50
+So that you can, um…
+
+[Eliot Moss] 16:06:57
+deal with, uh, combining
+
+[Eliot Moss] 16:07:01
+adjacent free chunks when a chunk is freed.
+
+[Eliot Moss] 16:07:06
+Right, so you free a chunk, you can say, oh, what's my previous chunk in memory? You can check and see, is it free, and you can…
+
+[Eliot Moss] 16:07:13
+merge them, and likewise, you can ask what's the one after me, and you can merge that.
+
+[Eliot Moss] 16:07:17
+And so forth. Um…
+
+[Eliot Moss] 16:07:20
+But in addition to having
+
+[Eliot Moss] 16:07:22
+a doubly linked list that's in memory order.
+
+[Eliot Moss] 16:07:28
+Uh, each chunk can be on another doubly linked list.
+
+[Eliot Moss] 16:07:31
+of our choice.
+
+[Eliot Moss] 16:07:33
+So, a linear memory can just be one of those lists.
+
+[Eliot Moss] 16:07:41
+So then, if it needs to grow, you can just say, okay,
+
+[Eliot Moss] 16:07:45
+get me a chunk, and I put it on the end of the list.
+
+[Eliot Moss] 16:07:49
+Um, and that's how it'd be stored in the region.
+
+[Eliot Moss] 16:07:53
+be a list of chunks.
+
+[Hao Shi] 16:07:54
+Yeah.
+
+[Eliot Moss] 16:07:59
+you map those chunks so that in virtual memory, they're contiguous.
+
+[Eliot Moss] 16:08:06
+in a place separate from the region.
+
+[Eliot Moss] 16:08:11
+to the kind of, uh…
+
+[Eliot Moss] 16:08:14
+doubly mapped, I guess.
+
+[Eliot Moss] 16:08:15
+Potentially.
+
+[Eliot Moss] 16:08:22
+Does that make sense?
+
+[Hao Shi] 16:08:24
+Yeah.
+
+[Eliot Moss] 16:08:25
+So, so imagine, you know, I had first one chunk that had, I don't know, three
+
+[Eliot Moss] 16:08:31
+pages, or blocks, say 3 blocks, then it grew, and I have another 2 blocks, so I got 5.
+
+[Eliot Moss] 16:08:36
+So they're in these two separate places within my region, that's fine.
+
+[Eliot Moss] 16:08:41
+But then the linear memory itself is mapped in another place,
+
+[Eliot Moss] 16:08:45
+And those are put adjacent to each other.
+
+[Eliot Moss] 16:08:47
+And if you recall, a linear memory
+
+[Eliot Moss] 16:08:50
+is mapped as an 8GB
+
+[Eliot Moss] 16:08:53
+piece of address space.
+
+[Eliot Moss] 16:08:55
+Most of which won't have anything in it.
+
+[Eliot Moss] 16:08:58
+Most of which will have, uh…
+
+[Eliot Moss] 16:09:04
+memory permissions, none, so if you touch it, it'll fault.
+
+[Eliot Moss] 16:09:08
+And that way, they avoid having to do a bounce check.
+
+[Eliot Moss] 16:09:12
+and explicit… so you don't have to do an explicit bounce check on every access to linear memory.
+
+[Eliot Moss] 16:09:18
+little fault if you go past the end.
+
+[Hao Shi] 16:09:23
+No way.
+
+[Eliot Moss] 16:09:25
+And that mechanism is already there in…
+
+[Eliot Moss] 16:09:28
+wizard. It's just when we…
+
+[Eliot Moss] 16:09:31
+set up the…
+
+[Eliot Moss] 16:09:34
+uh, linear memory for a persistent linear memory.
+
+[Eliot Moss] 16:09:38
+We'll set it up a little differently.
+
+[Eliot Moss] 16:09:40
+to… map.
+
+[Eliot Moss] 16:09:43
+the chunks that are on that memories list in the region.
+
+[Hao Shi] 16:09:49
+Okay.
+
+[Hao Shi] 16:09:56
+Okay, I think I got it. Um…
+
+[Eliot Moss] 16:10:00
+And conceivably, you know, for rollback purposes, we might have to, um…
+
+[Eliot Moss] 16:10:05
+you know, map two separate regions so that you can have a place to copy
+
+[Eliot Moss] 16:10:11
+Um…
+
+[Eliot Moss] 16:10:15
+data too, or something like that. I mean, it depends how you want to do the rollback.
+
+[Eliot Moss] 16:10:20
+with the objects, we allocate a new version of the object.
+
+[Eliot Moss] 16:10:25
+So we always have fresh bites. With the linear memory,
+
+[Eliot Moss] 16:10:28
+It's not clear what we're doing.
+
+[Hao Shi] 16:10:34
+Right.
+
+[Hao Shi] 16:10:44
+Uh… wait…
+
+[Hao Shi] 16:10:49
+Oh yeah, so… okay.
+
+[Hao Shi] 16:10:52
+Yeah, I think I missed one point is, um…
+
+[Hao Shi] 16:10:58
+So, the object is like copyright,
+
+[Hao Shi] 16:11:04
+linear memory can't really do that.
+
+[Eliot Moss] 16:11:07
+Well, it doesn't do it automatically, anyway.
+
+[Eliot Moss] 16:11:10
+And we can't just…
+
+[Eliot Moss] 16:11:12
+say, oh, we're gonna have this…
+
+[Eliot Moss] 16:11:14
+group of bytes at some other address. There's no…
+
+[Eliot Moss] 16:11:17
+Easy way to do that.
+
+[Hao Shi] 16:11:20
+Yeah.
+
+[Eliot Moss] 16:11:27
+You could use…
+
+[Eliot Moss] 16:11:30
+Page protections and page mapping.
+
+[Eliot Moss] 16:11:34
+uh, technology
+
+[Hao Shi] 16:11:35
+But… but that can't go…
+
+[Eliot Moss] 16:11:36
+to do it at the level of pages.
+
+[Hao Shi] 16:11:39
+Yeah, but…
+
+[Eliot Moss] 16:11:40
+Uh, but it could get to be pretty expensive.
+
+[Hao Shi] 16:11:43
+Yeah.
+
+[Eliot Moss] 16:11:52
+Now, I suppose… let me think about this a little bit…
+
+[Eliot Moss] 16:11:56
+Uh, so, I was thinking we would map that stuff, but suppose…
+
+[Eliot Moss] 16:11:59
+The linear memory is done
+
+[Eliot Moss] 16:12:01
+by, uh, I guess, a little bit like the object table.
+
+[Eliot Moss] 16:12:06
+copying the persistent version out.
+
+[Eliot Moss] 16:12:10
+Okay, so we've got a copy of it, and that's what we look at
+
+[Hao Shi] 16:12:11
+Yeah.
+
+[Eliot Moss] 16:12:15
+and change.
+
+[Eliot Moss] 16:12:18
+So then, um…
+
+[Eliot Moss] 16:12:22
+We would not be changing the actual persistent data until…
+
+[Eliot Moss] 16:12:27
+changes were in the log, and the log was committed, and then, you know,
+
+[Eliot Moss] 16:12:31
+as you do log cleanup,
+
+[Eliot Moss] 16:12:35
+you might then commit changes.
+
+[Eliot Moss] 16:12:38
+to the actual persistent linear memory.
+
+[Eliot Moss] 16:12:42
+And doing it that way would mean, oh, we probably could do update in place
+
+[Eliot Moss] 16:12:48
+in the DRAM copy,
+
+[Eliot Moss] 16:12:49
+Because we would have around, also in DRAM,
+
+[Eliot Moss] 16:12:53
+the undo bites who could put back if the transaction fails.
+
+[Eliot Moss] 16:12:57
+If there's system failure, nothing's been written to persistent store, so we're good.
+
+[Hao Shi] 16:13:06
+Alright, uh, alright, let me, let me catch up.
+
+[Eliot Moss] 16:13:09
+Sure.
+
+[Hao Shi] 16:13:15
+Okay, so I was saying we put the changes in the log for linear memory,
+
+[Hao Shi] 16:13:21
+And… when a system crashed, it didn't do anything, so it's fine, and…
+
+[Hao Shi] 16:13:31
+Um…
+
+[Hao Shi] 16:13:42
+So what about Darren Commit? Um…
+
+[Hao Shi] 16:13:48
+We might have partial rights in place.
+
+[Eliot Moss] 16:13:54
+What do you mean?
+
+[Eliot Moss] 16:13:58
+So, okay, so…
+
+[Eliot Moss] 16:14:03
+We're running with this separate copy in DRAM.
+
+[Hao Shi] 16:14:06
+Yeah.
+
+[Eliot Moss] 16:14:06
+Uh, so…
+
+[Eliot Moss] 16:14:08
+if there's system failure,
+
+[Eliot Moss] 16:14:12
+or persistent data set.
+
+[Eliot Moss] 16:14:13
+Uh, now, to make the transactional stuff work in
+
+[Eliot Moss] 16:14:16
+DRAM, when we want to update a granule of the linear memory,
+
+[Eliot Moss] 16:14:21
+We first save in our transaction table,
+
+[Eliot Moss] 16:14:24
+The old contents, the current contents of that granule.
+
+[Eliot Moss] 16:14:28
+So that we can roll it back.
+
+[Hao Shi] 16:14:30
+Yeah.
+
+[Eliot Moss] 16:14:31
+Um, but then, after that, we go ahead and let the transaction mutate the data.
+
+[Eliot Moss] 16:14:38
+in place.
+
+[Hao Shi] 16:14:41
+Okay.
+
+[Eliot Moss] 16:14:41
+Now, we've got recorded in our transaction table that, oh,
+
+[Eliot Moss] 16:14:45
+We…
+
+[Eliot Moss] 16:14:47
+you know, gained permission to modify this granule, which means it's probably changed.
+
+[Eliot Moss] 16:14:53
+Uh, so at commit time,
+
+[Eliot Moss] 16:14:55
+we can, um…
+
+[Eliot Moss] 16:14:57
+Right. Uh…
+
+[Eliot Moss] 16:15:00
+record, you know, we can go look at the actual new data, and we'll…
+
+[Eliot Moss] 16:15:04
+current data in the…
+
+[Eliot Moss] 16:15:06
+DRAM linear memory.
+
+[Eliot Moss] 16:15:08
+take the contents of that granule and log it as saying, here's the new value.
+
+[Eliot Moss] 16:15:14
+We can also log the old value, if that's helpful.
+
+[Eliot Moss] 16:15:17
+So it can be rolled forward or back.
+
+[Eliot Moss] 16:15:19
+But the old value should be sitting in the…
+
+[Eliot Moss] 16:15:25
+And the persistent copy.
+
+[Eliot Moss] 16:15:30
+Does that make sense? Yeah.
+
+[Hao Shi] 16:15:30
+Yeah. Yeah, yeah, yeah.
+
+[Hao Shi] 16:15:34
+Well, yeah, I missed that part for linear memory.
+
+[Eliot Moss] 16:15:39
+Right. But if… but if our transaction aborts, we have the old bytes, we can just put them back in.
+
+[Hao Shi] 16:15:46
+I mean, okay, so… I mean, for linear referee to… in place, right, we're always…
+
+[Hao Shi] 16:15:54
+at some point will be corrupted.
+
+[Hao Shi] 16:15:57
+half right to, uh…
+
+[Hao Shi] 16:16:01
+to some linear memory, so…
+
+[Eliot Moss] 16:16:03
+I'm not sure I grasp what you mean.
+
+[Hao Shi] 16:16:06
+Uh, I'm a thing, if we do in place right for linear memory, there will always
+
+[Eliot Moss] 16:16:12
+I don't understand the always.
+
+[Hao Shi] 16:16:14
+at some point.
+
+[Hao Shi] 16:16:17
+I mean, they'll have to…
+
+[Hao Shi] 16:16:20
+Well, there will be definitely to have… at some point, there will be
+
+[Hao Shi] 16:16:26
+They don't have the risk of corrupted
+
+[Hao Shi] 16:16:28
+memory. Um…
+
+[Eliot Moss] 16:16:31
+If there's a failure, yes, but we're talking about corrupting the DRAM copy of
+
+[Eliot Moss] 16:16:36
+the data, which is not the same as the…
+
+[Eliot Moss] 16:16:40
+Persistent regions copy.
+
+[Hao Shi] 16:16:42
+I'm a fan of Crescent region copy, um…
+
+[Hao Shi] 16:16:46
+Not a copy in place, so it's basically just…
+
+[Eliot Moss] 16:16:49
+Uh, well, it would be dangerous to…
+
+[Eliot Moss] 16:16:56
+do in-place updates of the persistent region. You could.
+
+[Eliot Moss] 16:16:59
+But what you'd have to do is…
+
+[Eliot Moss] 16:17:03
+Log the old bytes and force that log before you update.
+
+[Eliot Moss] 16:17:07
+the data.
+
+[Hao Shi] 16:17:11
+Yeah. That would be super slow.
+
+[Eliot Moss] 16:17:15
+It could be.
+
+[Eliot Moss] 16:17:17
+Depending on the logging mechanism.
+
+[Eliot Moss] 16:17:25
+But this other approach…
+
+[Eliot Moss] 16:17:28
+Um, it relies on
+
+[Eliot Moss] 16:17:30
+Having enough DRAM to be able to hold the copy.
+
+[Eliot Moss] 16:17:35
+of the data.
+
+[Hao Shi] 16:17:41
+Okay, so how is that going to help?
+
+[Eliot Moss] 16:17:47
+Now, does it help?
+
+[Hao Shi] 16:17:48
+Yeah, I mean, if you hold it in a deal, if it's going to go away.
+
+[Hao Shi] 16:17:54
+during the crash…
+
+[Eliot Moss] 16:17:55
+Yes, but you log all the changes of the committed transactions.
+
+[Eliot Moss] 16:18:01
+And the log is persistent.
+
+[Eliot Moss] 16:18:03
+So it can get applied to the persistent copy.
+
+[Eliot Moss] 16:18:09
+Right, you've got a persistent copy of the linear memory, you've got the DRAM copy.
+
+[Eliot Moss] 16:18:14
+You update this, and you log the changes into a persistent log.
+
+[Eliot Moss] 16:18:18
+Then eventually they get propagated into the…
+
+[Eliot Moss] 16:18:21
+persistent version of the linear memory.
+
+[Hao Shi] 16:18:23
+Okay.
+
+[Eliot Moss] 16:18:25
+You know, when you truncate the log, you've got to push those changes.
+
+[Hao Shi] 16:18:26
+Okay, so…
+
+[Hao Shi] 16:18:28
+Okay, so… so here I think, right? Uh…
+
+[Hao Shi] 16:18:31
+We have this…
+
+[Hao Shi] 16:18:34
+compact bite fixed log.
+
+[Eliot Moss] 16:18:38
+Mm-hmm.
+
+[Hao Shi] 16:18:38
+I mean…
+
+[Hao Shi] 16:18:40
+And we want… if we wanted to, um, to…
+
+[Hao Shi] 16:18:45
+to log, like, uh…
+
+[Hao Shi] 16:18:48
+to lock the changes of the linear memory, we probably also need to…
+
+[Hao Shi] 16:18:56
+have some… copy some of the linear memory to the, uh…
+
+[Hao Shi] 16:19:02
+to the other…
+
+[Hao Shi] 16:19:04
+object, memory, faith, because they are, um…
+
+[Eliot Moss] 16:19:09
+I wouldn't call it object memory space, but…
+
+[Hao Shi] 16:19:16
+So how are we going to log
+
+[Eliot Moss] 16:19:17
+Is your objection that the granule is bigger than the log record or something? What are you envisioning as the size of a log record?
+
+[Hao Shi] 16:19:25
+log record in a fixed size, like…
+
+[Hao Shi] 16:19:28
+15 bytes.
+
+[Eliot Moss] 16:19:31
+Really? That only allows you two 8-byte quantities? I think that's a little small.
+
+[Hao Shi] 16:19:45
+more about, like, 64, like…
+
+[Hao Shi] 16:19:48
+cash life for one lock.
+
+[Eliot Moss] 16:19:51
+Right. Okay. Then, um, what are you foreseeing as the granule
+
+[Eliot Moss] 16:19:57
+size for the linear memory.
+
+[Hao Shi] 16:20:05
+Granule 5…
+
+[Hao Shi] 16:20:09
+Actually, I'm not sure. I assume it can be any size.
+
+[Hao Shi] 16:20:15
+If… if it's, like, smarter than the page size.
+
+[Eliot Moss] 16:20:20
+Well, any size smaller than 64K, yes.
+
+[Hao Shi] 16:20:20
+memory page flow.
+
+[Eliot Moss] 16:20:24
+Um,
+
+[Eliot Moss] 16:20:26
+I guess I was envisioning it as probably being on the order of cash line size. So, anyway, it might turn out that to
+
+[Eliot Moss] 16:20:35
+log, uh…
+
+[Eliot Moss] 16:20:36
+a linear memory granule will take two log records or something.
+
+[Eliot Moss] 16:20:41
+Um, so it's not necessarily very compact in the log.
+
+[Eliot Moss] 16:20:44
+But, um…
+
+[Hao Shi] 16:20:45
+Oh, I'm just saying, I…
+
+[Eliot Moss] 16:20:46
+I think… I think you can make it fit into the fixed log.
+
+[Eliot Moss] 16:20:50
+record scheme, uh, without having to go to having some separate log area that has things of different sizes.
+
+[Hao Shi] 16:20:51
+Oh, what I…
+
+[Hao Shi] 16:20:57
+Okay, so my worry is, uh, linear memory…
+
+[Hao Shi] 16:21:02
+I mean, their linear memory…
+
+[Hao Shi] 16:21:06
+they are… they are kind of like…
+
+[Hao Shi] 16:21:09
+Albert Re-sized.
+
+[Eliot Moss] 16:21:10
+Yes.
+
+[Hao Shi] 16:21:11
+So, they can't really fit in a log. I mean, the log…
+
+[Hao Shi] 16:21:16
+entry. Uh, we…
+
+[Eliot Moss] 16:21:17
+Wait, wait, wait, wait. The memory itself can be arbitrarily large. The granules are fixed size.
+
+[Eliot Moss] 16:21:24
+And we choose the size.
+
+[Hao Shi] 16:21:31
+Okay. So…
+
+[Eliot Moss] 16:21:36
+And if… if that granule size is somewhat bigger than a log record,
+
+[Eliot Moss] 16:21:41
+We can, you know, break the granule into
+
+[Eliot Moss] 16:21:44
+subparts and have multiple log records.
+
+[Eliot Moss] 16:21:48
+If need be. It's not tremendously space-efficient,
+
+[Eliot Moss] 16:21:53
+But…
+
+[Eliot Moss] 16:21:55
+It's probably better than… I mean…
+
+[Eliot Moss] 16:21:59
+Where else would you plan to put it?
+
+[Hao Shi] 16:22:04
+Um, Asher, I don't…
+
+[Hao Shi] 16:22:06
+No. So…
+
+[Eliot Moss] 16:22:12
+I mean, you'd have to have some other…
+
+[Hao Shi] 16:22:14
+I mean, okay, so…
+
+[Eliot Moss] 16:22:15
+Presumably linear kind of area, but separate from the log that you're writing into, and has to get…
+
+[Eliot Moss] 16:22:23
+forest, it has to have, uh,
+
+[Eliot Moss] 16:22:25
+memory management on it, in the sense it has to get allocated and reclaimed and so forth. Anyway, go ahead.
+
+[Hao Shi] 16:22:31
+Uh, okay, okay, yeah, this is actually a new problem to me. I never even think about it before.
+
+[Hao Shi] 16:22:39
+I mean, in some way, it actually kinda…
+
+[Hao Shi] 16:22:46
+kind of upset me, uh, because I thought, I thought everything out. Uh, anyway, so…
+
+[Eliot Moss] 16:22:52
+Every kind of great deal has potential rollback.
+
+[Eliot Moss] 16:22:57
+Uh, rollback, roll forward, whatever. Um…
+
+[Eliot Moss] 16:23:01
+Now, you… you were saying, you know, why not put it in the, uh…
+
+[Eliot Moss] 16:23:06
+the bump pointer allocated object area.
+
+[Eliot Moss] 16:23:10
+You kind of could, but then…
+
+[Eliot Moss] 16:23:12
+the reclamation of different stuff gets all tangled together, of when can I reuse that block?
+
+[Eliot Moss] 16:23:18
+And… is this portion of Bytes in here an object, or is it part of the linear memory log?
+
+[Eliot Moss] 16:23:25
+And stuff like that. Um…
+
+[Eliot Moss] 16:23:28
+Start mixing stuff together in ways that may…
+
+[Eliot Moss] 16:23:32
+complicate the software and, uh, make it more likely to have
+
+[Eliot Moss] 16:23:37
+implementation errors in it.
+
+[Eliot Moss] 16:23:40
+Um, so…
+
+[Hao Shi] 16:23:42
+So you are… you're…
+
+[Eliot Moss] 16:23:42
+Personally, I would say it needs to be separate. Now, simplest would be
+
+[Eliot Moss] 16:23:47
+If it can just… if there's a way to just do it
+
+[Eliot Moss] 16:23:51
+in your fixed-size log entries.
+
+[Eliot Moss] 16:23:53
+If that's deemed to have
+
+[Eliot Moss] 16:23:55
+you know, to be too space inefficient or whatever.
+
+[Eliot Moss] 16:23:58
+then you could have a log entry that refers over to…
+
+[Eliot Moss] 16:24:02
+Another…
+
+[Eliot Moss] 16:24:04
+area that's also kind of a log, but is one
+
+[Eliot Moss] 16:24:09
+Uh, that gets allocated, you know, that's strictly for…
+
+[Eliot Moss] 16:24:13
+these groups of bytes from the linear memory.
+
+[Eliot Moss] 16:24:18
+Um…
+
+[Hao Shi] 16:24:20
+So…
+
+[Eliot Moss] 16:24:20
+And has its, uh, has its own, you know, log head and log tail pointers and so forth.
+
+[Hao Shi] 16:24:30
+Uh, well, okay, so my thought was, like, um, cause we do have the need to scan the log.
+
+[Hao Shi] 16:24:37
+So…
+
+[Eliot Moss] 16:24:39
+Yes.
+
+[Hao Shi] 16:24:40
+crimping data…
+
+[Hao Shi] 16:24:42
+to the log doesn't seem like, uh,
+
+[Hao Shi] 16:24:47
+good approach to me.
+
+[Eliot Moss] 16:24:50
+Some of what data to the… what were you saying?
+
+[Eliot Moss] 16:24:52
+I didn't…
+
+[Hao Shi] 16:24:52
+to put a… I mean…
+
+[Hao Shi] 16:24:55
+put the, um, his… sorry, not history. I'll put the…
+
+[Hao Shi] 16:25:00
+original copy of the data.
+
+[Hao Shi] 16:25:02
+into the log.
+
+[Eliot Moss] 16:25:03
+Well, it's more the new copy than the original.
+
+[Eliot Moss] 16:25:07
+In the log.
+
+[Eliot Moss] 16:25:09
+The transaction table would have the old bytes.
+
+[Eliot Moss] 16:25:12
+You don't really need to log the old bytes.
+
+[Hao Shi] 16:25:14
+Yeah, but the transaction table doesn't survive.
+
+[Hao Shi] 16:25:19
+does not survive, like, a power outage.
+
+[Eliot Moss] 16:25:20
+That's… yeah, that's fine. If the transaction fails, you lose the old DRAM copy, boo-hoo.
+
+[Hao Shi] 16:25:28
+Uh, yeah, but…
+
+[Hao Shi] 16:25:30
+I mean, but what if, like…
+
+[Hao Shi] 16:25:33
+Okay, so… so your model is more like, okay, so I put…
+
+[Hao Shi] 16:25:38
+the, um, the old data in the transaction table.
+
+[Eliot Moss] 16:25:42
+Yep.
+
+[Hao Shi] 16:25:43
+So, and then we, uh, so at commit time, we write the, uh, new data in place.
+
+[Eliot Moss] 16:25:51
+No, we write the new data into the log.
+
+[Hao Shi] 16:25:55
+Okay, so there'll be two copies in the log.
+
+[Eliot Moss] 16:25:58
+What do you mean, too? No.
+
+[Hao Shi] 16:25:59
+to copy of the same object. I thought two versions of the same object in a log.
+
+[Eliot Moss] 16:26:04
+Well, not object, we're talking linear memory.
+
+[Hao Shi] 16:26:06
+I'm sorry, two versions of the memory
+
+[Eliot Moss] 16:26:09
+No. No, the transaction table, it's a completely volatile
+
+[Hao Shi] 16:26:11
+No?
+
+[Eliot Moss] 16:26:14
+Virgil heap-allocated thing that has…
+
+[Eliot Moss] 16:26:17
+The old bites.
+
+[Eliot Moss] 16:26:19
+And then at transaction commit time, we go and look and say, what are the new bytes now? And we put them in the log.
+
+[Eliot Moss] 16:26:27
+So the log would only have the new data.
+
+[Eliot Moss] 16:26:30
+the new version.
+
+[Hao Shi] 16:26:30
+Uh, okay, let me…
+
+[Hao Shi] 16:26:32
+Let me go over again. So…
+
+[Eliot Moss] 16:26:33
+Sure.
+
+[Hao Shi] 16:26:34
+We have the old data in the production.
+
+[Hao Shi] 16:26:37
+Uh, table. And then during commit time, we put the new data.
+
+[Eliot Moss] 16:26:38
+Correct.
+
+[Hao Shi] 16:26:42
+to the log.
+
+[Eliot Moss] 16:26:43
+Correct.
+
+[Hao Shi] 16:26:44
+And then we write the new… write a copy of the…
+
+[Hao Shi] 16:26:51
+new data.
+
+[Hao Shi] 16:26:54
+to, uh, insight to the linear memory.
+
+[Hao Shi] 16:26:57
+Right.
+
+[Eliot Moss] 16:26:57
+Only when doing log truncation.
+
+[Eliot Moss] 16:27:02
+We have to commit the transaction first. The data has to be safe.
+
+[Hao Shi] 16:27:02
+only…
+
+[Eliot Moss] 16:27:06
+Before we can dare touch.
+
+[Hao Shi] 16:27:08
+Okay.
+
+[Eliot Moss] 16:27:08
+the, uh, the, the, uh…
+
+[Eliot Moss] 16:27:11
+Linear memory copy of the data.
+
+[Hao Shi] 16:27:14
+for a linear memory copy will be updated after the transaction is committed.
+
+[Hao Shi] 16:27:19
+committed.
+
+[Eliot Moss] 16:27:23
+Yeah, it's the general principle. At some point, there's got to be two copies of the data.
+
+[Hao Shi] 16:27:23
+Okay.
+
+[Eliot Moss] 16:27:32
+old and new, somehow, somewhere.
+
+[Hao Shi] 16:27:34
+Okay, so that's when…
+
+[Hao Shi] 16:27:41
+Death won a law going to get truncated, or…
+
+[Hao Shi] 16:27:45
+Yeah, truncated. We will put the…
+
+[Hao Shi] 16:27:49
+log data to the…
+
+[Hao Shi] 16:27:51
+linear memory.
+
+[Eliot Moss] 16:27:52
+Correct. It's very similar to updating the…
+
+[Eliot Moss] 16:27:57
+Um, persistent version of the object table.
+
+[Hao Shi] 16:27:59
+Which also implies if the following transaction wants to read that data, you need to refund the log instead from the linear memory.
+
+[Eliot Moss] 16:28:09
+Well, no, it'll… it'll be…
+
+[Hao Shi] 16:28:10
+If we have not truncated.
+
+[Eliot Moss] 16:28:12
+It'll be in the DRAM,
+
+[Eliot Moss] 16:28:14
+You're saying there's a failure in between?
+
+[Hao Shi] 16:28:17
+Oh, no, no, I'm just saying, like…
+
+[Eliot Moss] 16:28:19
+If there's no failure in between, if there's no failure in between, they just…
+
+[Hao Shi] 16:28:20
+No failure.
+
+[Eliot Moss] 16:28:23
+look at it in DRAM.
+
+[Hao Shi] 16:28:27
+When we look at the linear memory data from DRAM,
+
+[Eliot Moss] 16:28:31
+Yes!
+
+[Eliot Moss] 16:28:33
+The DRAM copy is up to date, is kept up to date.
+
+[Eliot Moss] 16:28:36
+As I change it, it's up to date. I'm not going to roll it back when I commit.
+
+[Eliot Moss] 16:28:40
+That would be silly, I think.
+
+[Hao Shi] 16:28:41
+Okay, so the theorem data will be fit inside…
+
+[Hao Shi] 16:28:47
+transaction table?
+
+[Eliot Moss] 16:28:49
+No. No. No.
+
+[Hao Shi] 16:28:50
+No. It's somewhere else.
+
+[Eliot Moss] 16:28:53
+Uh, just like the object table is somewhere else.
+
+[Hao Shi] 16:28:58
+Uh, but it's not pointing to the processing memory, it's pointing to some area in the DRAM.
+
+[Eliot Moss] 16:29:05
+I don't know about pointing, but…
+
+[Hao Shi] 16:29:07
+I mean, the table will be pointing
+
+[Hao Shi] 16:29:10
+to somewhere in the DRA, not in the…
+
+[Eliot Moss] 16:29:12
+table, which table?
+
+[Eliot Moss] 16:29:16
+Uh, object table can point to persistent space.
+
+[Hao Shi] 16:29:18
+Sorry, sorry.
+
+[Eliot Moss] 16:29:21
+Linear memory is linear memory. It's a chunk of bytes. We've got the DRAM, we got a DRAM version of it, we have a persistent version of it,
+
+[Hao Shi] 16:29:23
+Yeah.
+
+[Eliot Moss] 16:29:28
+And we have a log of changes
+
+[Eliot Moss] 16:29:31
+to be applied to the persistent version.
+
+[Eliot Moss] 16:29:35
+individual transactions…
+
+[Eliot Moss] 16:29:38
+Uh, do their concurrency control, gain access. They remember the old copy of the bytes,
+
+[Eliot Moss] 16:29:44
+for the granules they want to write.
+
+[Eliot Moss] 16:29:46
+If they fail, they write the bytes back to fix the DRAM copy up.
+
+[Eliot Moss] 16:29:53
+If they commit, then they don't have to do anything.
+
+[Eliot Moss] 16:29:59
+Do they don't have to do anything to the DRAM copy. It's already up to date.
+
+[Eliot Moss] 16:30:03
+Sort of by definition, because, you know, they changed it, and their changes are there.
+
+[Eliot Moss] 16:30:09
+I'm not sure…
+
+[Eliot Moss] 16:30:12
+Not quite sure what's confusing you.
+
+[Eliot Moss] 16:30:21
+It's pretty analogous to how you're running the object table.
+
+[Hao Shi] 16:30:25
+Yeah, but off the table, we just…
+
+[Hao Shi] 16:30:29
+Okay, so object table is met by a tape… object…
+
+[Hao Shi] 16:30:32
+table. Sorry, objects are my better object table.
+
+[Eliot Moss] 16:30:37
+Yes.
+
+[Hao Shi] 16:30:38
+And I assume we can just append new object version to the… to the end of the
+
+[Eliot Moss] 16:30:45
+Uh, I think you're confusing object data with object table.
+
+[Eliot Moss] 16:30:49
+I was saying the linear memory works very much like the object table.
+
+[Hao Shi] 16:30:52
+Okay, the table itself.
+
+[Eliot Moss] 16:30:53
+The object data works in a different way.
+
+[Eliot Moss] 16:30:56
+Object contents.
+
+[Hao Shi] 16:30:57
+Yeah, but we… I think we took snapshot of the object table.
+
+[Hao Shi] 16:31:03
+Well, for the leading memory, it will be, like…
+
+[Eliot Moss] 16:31:04
+Yes.
+
+[Hao Shi] 16:31:06
+the object table, but without the…
+
+[Hao Shi] 16:31:08
+Snapshot part.
+
+[Eliot Moss] 16:31:09
+No, you can run it, you can run a snapshot, which means updating the…
+
+[Eliot Moss] 16:31:13
+persistent version.
+
+[Hao Shi] 16:31:24
+Sorry, uh, I think a snapshot…
+
+[Eliot Moss] 16:31:26
+Oh, I… well, okay, well, I think, yeah, there's…
+
+[Eliot Moss] 16:31:30
+Um…
+
+[Eliot Moss] 16:31:32
+There is a difference there, in that…
+
+[Eliot Moss] 16:31:34
+doing the snapshot, you're organizing it according to
+
+[Eliot Moss] 16:31:39
+pages, or blocks, or whatever of the object table. You can just sort of sweep it.
+
+[Eliot Moss] 16:31:45
+If you'd like. But with the linear memory,
+
+[Eliot Moss] 16:31:49
+Well, I mean, you might do it that way.
+
+[Eliot Moss] 16:31:51
+You could still do it that way.
+
+[Eliot Moss] 16:31:54
+Uh, the update sitting in the log…
+
+[Eliot Moss] 16:31:57
+could be scattered all around and be in complicated order.
+
+[Eliot Moss] 16:32:01
+Right?
+
+[Hao Shi] 16:32:03
+Here.
+
+[Eliot Moss] 16:32:04
+But you could do the, uh…
+
+[Eliot Moss] 16:32:08
+sort of incremental, fuzzy,
+
+[Eliot Moss] 16:32:11
+snapshot kind of thing.
+
+[Eliot Moss] 16:32:14
+Um…
+
+[Eliot Moss] 16:32:18
+That is, you could, um…
+
+[Eliot Moss] 16:32:28
+Well, I'm just trying to think what would happen, you know, with respect to…
+
+[Eliot Moss] 16:32:36
+what running transactions are doing, but if we ignore running transactions for a moment…
+
+[Eliot Moss] 16:32:41
+Um, you could…
+
+[Eliot Moss] 16:32:43
+you know, work, uh, sort of block by block of the, uh, DRAM copy.
+
+[Eliot Moss] 16:32:49
+of the data and write it out into a new…
+
+[Eliot Moss] 16:32:56
+copy in, um…
+
+[Eliot Moss] 16:32:58
+The persistent memory, similar to…
+
+[Eliot Moss] 16:33:00
+the object table scheme.
+
+[Eliot Moss] 16:33:02
+Um, the…
+
+[Eliot Moss] 16:33:05
+difficulty would be, and I… well, I guess we're probably somehow
+
+[Eliot Moss] 16:33:09
+doing it for the object table as well.
+
+[Eliot Moss] 16:33:13
+is dealing with running transactions that may have made changes to a given
+
+[Eliot Moss] 16:33:18
+piece of the linear memory.
+
+[Eliot Moss] 16:33:20
+But, uh, not committed them yet.
+
+[Hao Shi] 16:33:25
+Yeah.
+
+[Eliot Moss] 16:33:28
+Um, so I'm trying to remember…
+
+[Eliot Moss] 16:33:30
+how we deal with that in doing the, uh…
+
+[Eliot Moss] 16:33:37
+Object Table Snapshot.
+
+[Eliot Moss] 16:33:42
+How do we ensure that we get only committed data?
+
+[Eliot Moss] 16:33:45
+only committed object table.
+
+[Eliot Moss] 16:33:48
+entries out there. Oh, I guess…
+
+[Eliot Moss] 16:33:51
+we don't update the object table until commit time.
+
+[Eliot Moss] 16:33:58
+Is that it?
+
+[Hao Shi] 16:33:58
+Yeah, so… so my thought is something like, uh…
+
+[Hao Shi] 16:34:03
+we… uh, so during commit time, we copy the… after
+
+[Hao Shi] 16:34:10
+wake up the new data to the…
+
+[Hao Shi] 16:34:13
+to a new place of the, uh…
+
+[Hao Shi] 16:34:16
+And then to a new place somewhere new.
+
+[Hao Shi] 16:34:20
+I mean, and then we update the object table.
+
+[Hao Shi] 16:34:24
+to point it to the new place.
+
+[Hao Shi] 16:34:26
+Um, during commit.
+
+[Eliot Moss] 16:34:26
+Well, you're talking about the object… well, yeah, it's the object table, but the…
+
+[Eliot Moss] 16:34:31
+object table itself doesn't get updated
+
+[Eliot Moss] 16:34:33
+Until we've committed.
+
+[Hao Shi] 16:34:35
+Yeah.
+
+[Eliot Moss] 16:34:37
+Um, right. So, that's…
+
+[Eliot Moss] 16:34:40
+what enables the, um…
+
+[Eliot Moss] 16:34:43
+snapshot of the object table to work.
+
+[Eliot Moss] 16:34:47
+is that only committed
+
+[Eliot Moss] 16:34:48
+data gets written out. Uh, if we wanted to…
+
+[Hao Shi] 16:34:50
+Yeah.
+
+[Eliot Moss] 16:34:54
+Uh…
+
+[Eliot Moss] 16:34:56
+do the same sort of thing.
+
+[Eliot Moss] 16:35:00
+Um…
+
+[Eliot Moss] 16:35:04
+for the linear memory, not quite sure how we do it, because it's being updated in place as the transactions run.
+
+[Eliot Moss] 16:35:13
+Um, so it may tend to have…
+
+[Eliot Moss] 16:35:16
+uncommitted data in it.
+
+[Eliot Moss] 16:35:19
+Um, and you might say, well, we could go around and look at everybody's transaction table and figure out what the original data…
+
+[Eliot Moss] 16:35:26
+would be, yeah, you could.
+
+[Eliot Moss] 16:35:30
+Um…
+
+[Eliot Moss] 16:35:32
+I don't know, taking the snapshot,
+
+[Eliot Moss] 16:35:35
+Uh, you know, in order to avoid doing a lot of deep…
+
+[Eliot Moss] 16:35:37
+The purpose of Snapshot is to avoid
+
+[Eliot Moss] 16:35:39
+having to do a lot of detailed log truncation work, you know, of having to process the log.
+
+[Eliot Moss] 16:35:45
+Doing all the tiny bits that are there in the log.
+
+[Hao Shi] 16:35:48
+Yeah,
+
+[Eliot Moss] 16:35:48
+Um, so another way…
+
+[Eliot Moss] 16:35:51
+to do it is to, um…
+
+[Eliot Moss] 16:36:01
+Uh, again, how would we catch it between transactions? I'm not exactly sure, but…
+
+[Eliot Moss] 16:36:05
+Um, to…
+
+[Eliot Moss] 16:36:08
+You could right protect the DRAM copy.
+
+[Eliot Moss] 16:36:11
+So that when transactions start to write it, there's a fault, and then you save
+
+[Eliot Moss] 16:36:17
+the, uh…
+
+[Eliot Moss] 16:36:20
+old copy and a snapshot or something.
+
+[Eliot Moss] 16:36:22
+Something of that order. Um…
+
+[Eliot Moss] 16:36:25
+But you'd have to, you know, set
+
+[Eliot Moss] 16:36:29
+set that faulting up at a time when the
+
+[Eliot Moss] 16:36:32
+pages between transactions.
+
+[Eliot Moss] 16:36:34
+So it doesn't have uncommitted data in it.
+
+[Eliot Moss] 16:36:38
+Not quite. Anyway, bears more thought.
+
+[Eliot Moss] 16:36:41
+Uh, but one might be able to use a page fault mechanism.
+
+[Eliot Moss] 16:36:46
+to periodically…
+
+[Eliot Moss] 16:36:49
+Um…
+
+[Eliot Moss] 16:36:52
+snapshot a linear memory.
+
+[Hao Shi] 16:36:59
+Well, uh, okay, I'll… I wanna think about that, um…
+
+[Eliot Moss] 16:37:03
+Well, I'm not sure it's worth loads of your time now. It's more important to get…
+
+[Eliot Moss] 16:37:10
+your, um, object table functional, I think.
+
+[Hao Shi] 16:37:14
+Yeah, but I think if…
+
+[Hao Shi] 16:37:16
+pumping
+
+[Hao Shi] 16:37:18
+Okay. Um…
+
+[Eliot Moss] 16:37:19
+I mean, at some point, maybe, but…
+
+[Eliot Moss] 16:37:22
+Um…
+
+[Hao Shi] 16:37:24
+You mean the linear memory?
+
+[Eliot Moss] 16:37:25
+at some point, maybe, you know, get the linear memory
+
+[Eliot Moss] 16:37:29
+stuff, you know, going in a, uh…
+
+[Hao Shi] 16:37:35
+Well, well, what?
+
+[Eliot Moss] 16:37:35
+good way, as opposed to just a barely functional way.
+
+[Eliot Moss] 16:37:38
+Uh, but…
+
+[Hao Shi] 16:37:38
+Okay, so…
+
+[Hao Shi] 16:37:40
+Um, okay, so…
+
+[Hao Shi] 16:37:43
+So, the other thing, like, for now, the linear memory doesn't really functional, um, as a persistent
+
+[Eliot Moss] 16:37:50
+Well, I think we… I think we want it to, but I don't think we necessarily, you know, it might be…
+
+[Hao Shi] 16:37:51
+But for this instance.
+
+[Eliot Moss] 16:37:58
+for the case of the linear memory, if you want to use it after a crash,
+
+[Eliot Moss] 16:38:02
+you're gonna have to process the log.
+
+[Hao Shi] 16:38:06
+Okay.
+
+[Eliot Moss] 16:38:06
+you know, that, you know, we won't have a snapshot. Too bad.
+
+[Hao Shi] 16:38:09
+Okay, okay.
+
+[Eliot Moss] 16:38:11
+Um, I… I don't know.
+
+[Hao Shi] 16:38:15
+Anyway, uh, well, well, thanks for identifying the problem.
+
+[Eliot Moss] 16:38:19
+Right.
+
+[Hao Shi] 16:38:25
+Okay, um, maybe we should…
+
+[Eliot Moss] 16:38:28
+So I think for the linear memory, what I'd go for at this point would be, uh, simple to possibly
+
+[Eliot Moss] 16:38:35
+Uh, in some ways, inefficient approach.
+
+[Hao Shi] 16:38:38
+Okay.
+
+[Eliot Moss] 16:38:39
+Um, and focus more on the object heap.
+
+[Eliot Moss] 16:38:42
+Uh, as being, you know, sort of the more interesting
+
+[Hao Shi] 16:38:45
+Yeah, I think… I think of that model, if… if our focus…
+
+[Eliot Moss] 16:38:46
+Sort of thing.
+
+[Hao Shi] 16:38:50
+Um…
+
+[Eliot Moss] 16:38:51
+Right. Okay, so, um…
+
+[Eliot Moss] 16:38:56
+I normally allocate about an hour and a half to these meetings. We've got about another 20 minutes or so. What would…
+
+[Eliot Moss] 16:39:03
+be most helpful to you.
+
+[Hao Shi] 16:39:05
+Well, certainly seems…
+
+[Hao Shi] 16:39:07
+You know, for code review.
+
+[Hao Shi] 16:39:11
+Uh, let me think…
+
+[Eliot Moss] 16:39:13
+So, um…
+
+[Eliot Moss] 16:39:17
+Did you kind of, uh…
+
+[Eliot Moss] 16:39:19
+You know, we only looked for, like, 2 minutes at, uh…
+
+[Eliot Moss] 16:39:24
+the object table code that you had started to write. Um…
+
+[Hao Shi] 16:39:28
+Yeah.
+
+[Eliot Moss] 16:39:31
+do… do you unders…
+
+[Eliot Moss] 16:39:32
+what I was saying about how you do not want to be allocating a virtual
+

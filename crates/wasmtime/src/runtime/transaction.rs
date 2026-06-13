@@ -3860,6 +3860,34 @@ mod tests {
     }
 
     #[test]
+    fn mock_transaction_store8_commits_to_tmemory() {
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore8 (i32.const 8) (i32.const 0xab)))
+              (tfunc (export "read") (result i32)
+                (i32.tload8_u (i32.const 8))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let write = instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        write.call(&mut store, ()).unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 0xab);
+    }
+
+    #[test]
     fn mock_transaction_simd_store_commits_to_tmemory() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(

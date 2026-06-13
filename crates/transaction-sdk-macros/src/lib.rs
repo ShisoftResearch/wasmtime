@@ -4,8 +4,8 @@ use proc_macro2::Span;
 use quote::{ToTokens, quote};
 use std::collections::HashSet;
 use syn::{
-    Data, DeriveInput, Error, Fields, FnArg, ItemFn, Path, Type, WherePredicate, parse_macro_input,
-    parse_quote,
+    Data, DeriveInput, Error, Fields, FnArg, Index, ItemFn, Member, Path, Type, WherePredicate,
+    parse_macro_input, parse_quote,
 };
 
 const PERSIST_METADATA_MAGIC: &[u8; 4] = b"TPRS";
@@ -94,7 +94,8 @@ fn derive_persist_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
 
     require_stable_repr(&input)?;
 
-    let field_types = persist_field_types(&data.fields)?;
+    let fields = persist_fields(&data.fields);
+    let field_types = fields.iter().map(|field| field.ty).collect::<Vec<_>>();
 
     let ident = input.ident;
     let sdk_path = sdk_path();
@@ -115,12 +116,29 @@ fn derive_persist_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
             };
         }
     };
+    let field_entries = fields.iter().map(|field| {
+        let name = &field.name;
+        let ty = field.ty;
+        let member = &field.member;
+        quote! {
+            #sdk_path::PersistField {
+                name: #name,
+                type_name: <#ty as #sdk_path::Persist>::TYPE_NAME,
+                offset: core::mem::offset_of!(#ident, #member),
+                size: <#ty as #sdk_path::Persist>::SIZE,
+                align: <#ty as #sdk_path::Persist>::ALIGN,
+            }
+        }
+    });
 
     Ok(quote! {
         #field_assert
 
         unsafe impl #sdk_path::Persist for #ident {
             const TYPE_NAME: &'static str = #type_name;
+            const FIELDS: &'static [#sdk_path::PersistField] = &[
+                #(#field_entries),*
+            ];
         }
 
         const _: () = {
@@ -157,11 +175,37 @@ fn require_stable_repr(input: &DeriveInput) -> syn::Result<()> {
     ))
 }
 
-fn persist_field_types(fields: &Fields) -> syn::Result<Vec<&Type>> {
+struct PersistFieldSpec<'a> {
+    name: String,
+    ty: &'a Type,
+    member: Member,
+}
+
+fn persist_fields(fields: &Fields) -> Vec<PersistFieldSpec<'_>> {
     match fields {
-        Fields::Named(fields) => Ok(fields.named.iter().map(|field| &field.ty).collect()),
-        Fields::Unnamed(fields) => Ok(fields.unnamed.iter().map(|field| &field.ty).collect()),
-        Fields::Unit => Ok(Vec::new()),
+        Fields::Named(fields) => fields
+            .named
+            .iter()
+            .map(|field| {
+                let ident = field.ident.as_ref().expect("named field has ident");
+                PersistFieldSpec {
+                    name: ident.to_string(),
+                    ty: &field.ty,
+                    member: Member::Named(ident.clone()),
+                }
+            })
+            .collect(),
+        Fields::Unnamed(fields) => fields
+            .unnamed
+            .iter()
+            .enumerate()
+            .map(|(index, field)| PersistFieldSpec {
+                name: index.to_string(),
+                ty: &field.ty,
+                member: Member::Unnamed(Index::from(index)),
+            })
+            .collect(),
+        Fields::Unit => Vec::new(),
     }
 }
 

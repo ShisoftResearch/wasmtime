@@ -1,5 +1,7 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+extern crate alloc as rust_alloc;
+
 #[allow(
     unused_extern_crates,
     reason = "proc macro expansions refer to this crate through the wasmtime_transaction_sdk alias"
@@ -9,20 +11,26 @@ extern crate self as wasmtime_transaction_sdk;
 #[cfg(feature = "macros")]
 pub use wasmtime_transaction_sdk_macros::{Persist, txn_func};
 
+pub mod alloc;
 pub mod id;
 pub mod marker;
 pub mod persist;
 pub mod root;
 pub mod tx;
 
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static TX_GLOBAL_ALLOCATOR: crate::alloc::TxAllocator = crate::alloc::TxAllocator::new();
+
 pub use id::{PersistentId, PersistentIdKind};
-pub use persist::Persist;
+pub use persist::{Persist, PersistField};
 pub use root::{PMut, PRef, Root};
 pub use tx::Tx;
 
 #[macro_export]
 macro_rules! transaction {
     ($tx:ident, $body:block) => {{
+        let _tx_alloc_guard = $crate::alloc::enter_transaction();
         $crate::marker::mark_transaction_func();
         let mut $tx = unsafe { $crate::Tx::from_marker() };
         $body

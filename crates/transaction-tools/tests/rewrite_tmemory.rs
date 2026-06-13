@@ -185,6 +185,309 @@ fn rewrite_lowers_scalar_tmemory_roots_and_emits_transaction_metadata() {
 }
 
 #[test]
+fn rewrite_lowers_narrow_i32_tmemory_ops() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (memory 1)
+          (func (export "roundtrip") (param $root i64) (param $value i32) (result i32)
+            local.get $root
+            call $persistent_addr
+            local.get $value
+            i32.store8
+            local.get $root
+            call $persistent_addr
+            i32.load8_u))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 2);
+    assert_eq!(report.i32_tloads, 1);
+    assert_eq!(report.i32_tstores, 1);
+    assert!(printed.contains("i32.tstore8"));
+    assert!(printed.contains("i32.tload8_u"));
+}
+
+#[test]
+fn rewrite_lowers_mixed_memory_copy_to_tmemory_store_loop() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (memory 1)
+          (data (i32.const 32) "hello")
+          (func (export "copy")
+            i64.const 256
+            call $persistent_addr
+            i32.const 32
+            i32.const 5
+            memory.copy))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tstores, 1);
+    assert!(printed.contains("i32.load8_u"));
+    assert!(printed.contains("i32.tstore8"));
+    assert!(!printed.contains("memory.copy"));
+}
+
+#[test]
+fn rewrite_lowers_memory_copy_when_destination_is_persistent_helper_result() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (import "twasm_intrinsics" "__twasm_mark_persistent_arg" (func $mark_persistent_arg (param i32)))
+          (memory 1)
+          (func $alloc (result i32)
+            i64.const 256
+            call $persistent_addr)
+          (func (export "copy") (param $src i32)
+            call $mark_transaction
+            i32.const 0
+            call $mark_persistent_arg
+            call $alloc
+            local.get $src
+            i32.const 5
+            memory.copy))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tloads, 0);
+    assert_eq!(report.i32_tstores, 0);
+    assert!(printed.contains("tmemory.copy"));
+    assert!(
+        !printed
+            .lines()
+            .any(|line| line.trim_start().starts_with("memory.copy"))
+    );
+}
+
+#[test]
+fn rewrite_propagates_persistent_helper_result_spilled_through_linear_memory() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (import "twasm_intrinsics" "__twasm_mark_persistent_arg" (func $mark_persistent_arg (param i32)))
+          (memory 1)
+          (func $alloc (result i32)
+            (local $sp i32)
+            (local $ptr i32)
+            i32.const 1024
+            local.set $sp
+            i64.const 256
+            call $persistent_addr
+            local.set $ptr
+            local.get $sp
+            local.get $ptr
+            i32.store offset=36
+            local.get $sp
+            i32.load offset=36)
+          (func (export "copy") (param $src i32)
+            call $mark_transaction
+            i32.const 0
+            call $mark_persistent_arg
+            call $alloc
+            local.get $src
+            i32.const 5
+            memory.copy))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tloads, 0);
+    assert_eq!(report.i32_tstores, 0);
+    assert!(printed.contains("tmemory.copy"));
+}
+
+#[test]
+fn rewrite_clears_spilled_persistent_helper_result_after_definite_overwrite() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (memory 1)
+          (func $alloc (result i32)
+            (local $sp i32)
+            i32.const 1024
+            local.set $sp
+            block
+              local.get $sp
+              i64.const 256
+              call $persistent_addr
+              i32.store offset=36
+              br 0
+            end
+            local.get $sp
+            i32.const 0
+            i32.store offset=36
+            local.get $sp
+            i32.load offset=36)
+          (func (export "copy") (param $src i32)
+            call $mark_transaction
+            call $alloc
+            local.get $src
+            i32.const 5
+            memory.copy))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tloads, 0);
+    assert_eq!(report.i32_tstores, 0);
+    assert!(
+        printed
+            .lines()
+            .any(|line| line.trim_start().starts_with("memory.copy"))
+    );
+}
+
+#[test]
+fn rewrite_infers_persistent_params_through_branchy_precheck_helper() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (memory 1)
+          (func $runtime (param $dst i32) (param $src i32) (param $len i32) (param $count i32) (result i32)
+            local.get $src
+            i32.load
+            drop
+            i32.const 1)
+          (func $precheck (param $dst i32) (param $src i32) (param $len i32) (param $align i32) (param $count i32)
+            block
+              block
+                local.get $count
+                br_if 0
+                br 1
+              end
+              block
+                local.get $src
+                i32.const 0
+                i32.eq
+                br_if 0
+              end
+              local.get $dst
+              local.get $src
+              local.get $len
+              local.get $count
+              call $runtime
+              drop
+            end)
+          (func (export "go") (param $root i64)
+            call $mark_transaction
+            i32.const 0
+            local.get $root
+            call $persistent_addr
+            i32.const 4
+            i32.const 1
+            i32.const 1
+            call $precheck))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tloads, 1);
+    assert!(printed.contains("i32.tload"));
+}
+
+#[test]
+fn rewrite_propagates_persistent_pointer_written_through_out_param() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (memory 1)
+          (func $as_slice (param $out i32) (param $object i32)
+            local.get $out
+            local.get $object
+            i32.load offset=4
+            i32.store
+            local.get $out
+            local.get $object
+            i32.load offset=8
+            i32.store offset=4)
+          (func (export "read_byte") (param $root i64) (result i32)
+            (local $sp i32)
+            (local $ptr i32)
+            call $mark_transaction
+            i32.const 1024
+            local.set $sp
+            local.get $sp
+            local.get $root
+            call $persistent_addr
+            call $as_slice
+            local.get $sp
+            i32.load
+            local.set $ptr
+            local.get $ptr
+            i32.load8_u))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tloads, 3);
+    assert!(printed.contains("i32.tload offset=4"));
+    assert!(printed.contains("i32.tload8_u"));
+}
+
+#[test]
+fn rewrite_propagates_full_i32_load_results_as_persistent_pointers() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (memory 1)
+          (func $field_ptr (param $root i64) (result i32)
+            local.get $root
+            call $persistent_addr
+            i32.load)
+          (func (export "read") (param $root i64) (result i32)
+            local.get $root
+            call $field_ptr
+            i32.load))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tloads, 2);
+    assert_eq!(printed.matches("i32.tload").count(), 2);
+}
+
+#[test]
+fn rewrite_does_not_propagate_narrow_i32_load_results_as_persistent_pointers() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (memory 1)
+          (func $byte_value (param $root i64) (result i32)
+            local.get $root
+            call $persistent_addr
+            i32.load8_u)
+          (func (export "read") (param $root i64) (result i32)
+            local.get $root
+            call $byte_value
+            i32.load))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i32_tloads, 1);
+    assert!(printed.contains("i32.tload8_u"));
+    assert!(printed.contains("i32.load"));
+}
+
+#[test]
 fn rewrite_taints_marked_persistent_parameters() {
     let wat = r#"
         (module
@@ -406,6 +709,89 @@ fn rewrite_propagates_forward_persistent_pointer_return_from_marked_callee() {
 }
 
 #[test]
+fn rewrite_propagates_persistent_allocator_wrapper_result_to_i64_store() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (memory 1)
+          (func $persistent_alloc (param $size i32) (result i32)
+            call $mark_transaction
+            local.get $size
+            i32.eqz
+            if
+              i32.const 0
+              return
+            end
+            i64.const 131072
+            call $persistent_addr)
+          (func $rust_alloc (param $size i32) (result i32)
+            local.get $size
+            call $persistent_alloc)
+          (func (export "init_box")
+            call $mark_transaction
+            i32.const 8
+            call $rust_alloc
+            i64.const 7
+            i64.store))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.transaction_functions, 2);
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i64_tstores, 1);
+    assert!(printed.contains("i64.tstore"));
+}
+
+#[test]
+fn rewrite_propagates_branchy_out_param_allocator_result_to_i64_store() {
+    let wat = r#"
+        (module
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (import "twasm_intrinsics" "__twasm_mark_transaction_func" (func $mark_transaction))
+          (memory 1)
+          (func $inner_alloc (param $out i32)
+            block
+              i32.const 0
+              br_if 0
+            end
+            local.get $out
+            i64.const 131072
+            call $persistent_addr
+            i32.store)
+          (func $box_new_out (param $out i32)
+            (local $sp i32)
+            i32.const 1024
+            local.set $sp
+            local.get $sp
+            call $inner_alloc
+            local.get $out
+            local.get $sp
+            i32.load
+            i32.store)
+          (func (export "init_box")
+            (local $sp i32)
+            call $mark_transaction
+            i32.const 2048
+            local.set $sp
+            local.get $sp
+            call $box_new_out
+            local.get $sp
+            i32.load
+            i64.const 7
+            i64.store))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.transaction_functions, 1);
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert_eq!(report.i64_tstores, 1);
+    assert!(printed.contains("i64.tstore"));
+}
+
+#[test]
 fn rewrite_propagates_nested_forward_persistent_pointer_return() {
     let wat = r#"
         (module
@@ -553,6 +939,27 @@ fn rewrite_rejects_persistent_pointer_escape_to_unrecognized_call() {
     let err = rewrite_module(&input).unwrap_err().to_string();
 
     assert!(err.contains("persistent pointer escapes to unrecognized call in function index 2"));
+}
+
+#[test]
+fn rewrite_allows_persistent_pointer_escape_to_immediate_trap_call() {
+    let wat = r#"
+        (module
+          (import "env" "panic" (func $panic (param i32)))
+          (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
+          (memory 1)
+          (func (export "trap") (param $root i64)
+            local.get $root
+            call $persistent_addr
+            call $panic
+            unreachable))
+    "#;
+
+    let (_output, report, printed) = rewrite_and_print(wat);
+
+    assert_eq!(report.persistent_addr_markers, 1);
+    assert!(printed.contains("call 0"));
+    assert!(printed.contains("unreachable"));
 }
 
 #[test]

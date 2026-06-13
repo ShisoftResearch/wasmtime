@@ -25,6 +25,28 @@ fn derive_persist_uses_rust_layout_values() {
 }
 
 #[test]
+fn derive_persist_generates_field_metadata() {
+    let account_fields = Account::FIELDS;
+    assert_eq!(account_fields.len(), 1);
+    assert_eq!(account_fields[0].name, "balance");
+    assert_eq!(account_fields[0].type_name, i64::TYPE_NAME);
+    assert_eq!(
+        account_fields[0].offset,
+        core::mem::offset_of!(Account, balance)
+    );
+    assert_eq!(account_fields[0].size, core::mem::size_of::<i64>());
+    assert_eq!(account_fields[0].align, core::mem::align_of::<i64>());
+
+    let bank_fields = Bank::FIELDS;
+    assert_eq!(bank_fields.len(), 1);
+    assert_eq!(bank_fields[0].name, "accounts");
+    assert_eq!(bank_fields[0].type_name, <[Account; 2]>::TYPE_NAME);
+    assert_eq!(bank_fields[0].offset, core::mem::offset_of!(Bank, accounts));
+    assert_eq!(bank_fields[0].size, core::mem::size_of::<[Account; 2]>());
+    assert_eq!(bank_fields[0].align, core::mem::align_of::<[Account; 2]>());
+}
+
+#[test]
 fn root_type_checks_derived_persist_types() {
     let root = Root::<Bank>::tmemory_offset(0);
     assert_eq!(root.id().payload(), 0);

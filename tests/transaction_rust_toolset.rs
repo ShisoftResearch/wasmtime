@@ -173,3 +173,70 @@ fn rust_pressure_guest_survives_file_backed_recovery() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn rust_heap_guest_survives_file_backed_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let wasm_path: PathBuf = temp.path().join("heap.twasm.wasm");
+    let tmemory_path = temp.path().join("heap.tmemory");
+    let tx_log_path = temp.path().join("heap.txlog");
+
+    build_guest("examples/transaction-rust/heap/Cargo.toml", &wasm_path)?;
+
+    {
+        let (mut store, instance) = instantiate(&wasm_path, &tmemory_path, &tx_log_path, true)?;
+        get_func(&mut store, &instance, "init_profile")?
+            .typed::<(), ()>(&store)?
+            .call(&mut store, ())?;
+        let name_len = get_func(&mut store, &instance, "name_len")?.typed::<(), u32>(&store)?;
+        let score_len = get_func(&mut store, &instance, "score_len")?.typed::<(), u32>(&store)?;
+        let bonus = get_func(&mut store, &instance, "bonus")?.typed::<(), i64>(&store)?;
+        let set_bonus = get_func(&mut store, &instance, "set_bonus")?.typed::<i64, ()>(&store)?;
+        assert_eq!(name_len.call(&mut store, ())?, 10);
+        assert_eq!(score_len.call(&mut store, ())?, 2);
+        assert_eq!(bonus.call(&mut store, ())?, 7);
+
+        get_func(&mut store, &instance, "append_profile")?
+            .typed::<i64, ()>(&store)?
+            .call(&mut store, 30)?;
+        set_bonus.call(&mut store, 99)?;
+
+        let score = get_func(&mut store, &instance, "score")?.typed::<u32, i64>(&store)?;
+        assert_eq!(name_len.call(&mut store, ())?, 13);
+        assert_eq!(score_len.call(&mut store, ())?, 3);
+        assert_eq!(score.call(&mut store, 2)?, 30);
+        assert_eq!(bonus.call(&mut store, ())?, 99);
+    }
+
+    let tmemory_pages = file_backed_tmemory_pages(&tmemory_path)?;
+    recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        tmemory_pages,
+        Some(tmemory_pages),
+    )?;
+
+    {
+        let (mut store, instance) = instantiate(&wasm_path, &tmemory_path, &tx_log_path, false)?;
+        let name_len = get_func(&mut store, &instance, "name_len")?.typed::<(), u32>(&store)?;
+        let name_byte = get_func(&mut store, &instance, "name_byte")?.typed::<u32, u32>(&store)?;
+        let score_len = get_func(&mut store, &instance, "score_len")?.typed::<(), u32>(&store)?;
+        let score = get_func(&mut store, &instance, "score")?.typed::<u32, i64>(&store)?;
+        let bonus = get_func(&mut store, &instance, "bonus")?.typed::<(), i64>(&store)?;
+
+        let len = name_len.call(&mut store, ())?;
+        let mut name = Vec::new();
+        for index in 0..len {
+            name.push(u8::try_from(name_byte.call(&mut store, index)?).unwrap());
+        }
+
+        assert_eq!(name, b"alice-init-tx");
+        assert_eq!(score_len.call(&mut store, ())?, 3);
+        assert_eq!(score.call(&mut store, 0)?, 10);
+        assert_eq!(score.call(&mut store, 1)?, 20);
+        assert_eq!(score.call(&mut store, 2)?, 30);
+        assert_eq!(bonus.call(&mut store, ())?, 99);
+    }
+
+    Ok(())
+}

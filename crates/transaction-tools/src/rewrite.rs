@@ -7,6 +7,7 @@ use std::fmt;
 use wasm_encoder::reencode::{Error as ReencodeError, Reencode, RoundtripReencoder};
 use wasm_encoder::{
     CodeSection, CustomSection, Encode, Function, ImportSection, Instruction, Module, RawSection,
+    ValType,
 };
 use wasmparser::{BinaryReader, CodeSectionReader, Operator, Parser, Payload, TypeRef};
 
@@ -55,6 +56,7 @@ struct ModuleLayout {
     transaction_func_markers: BTreeSet<u32>,
     persistent_param_markers: BTreeMap<u32, BTreeSet<u32>>,
     function_return_taints: BTreeMap<u32, Vec<bool>>,
+    function_param_store_taints: BTreeMap<u32, BTreeMap<ParamStoreSlot, bool>>,
     imported_function_count: u32,
     has_memory_zero: bool,
 }
@@ -411,21 +413,51 @@ fn rewrite_function_body(
         .get(old_index as usize)
         .context("missing function signature for rewritten body")?;
     let locals = collect_locals(body)?;
-    let mut function = Function::new(locals.iter().copied());
-    let mut local_taints = vec![
-        false;
-        sig.params
-            + locals
-                .iter()
-                .map(|(count, _)| *count as usize)
-                .sum::<usize>()
-    ];
-    let mut stack = Vec::new();
-    let mut marked_transactional = false;
     let operators = body
         .get_operators_reader()?
         .into_iter()
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let original_local_count = locals
+        .iter()
+        .map(|(count, _)| *count as usize)
+        .sum::<usize>();
+    let memory_copy_scratch = operators
+        .iter()
+        .any(|op| matches!(op, Operator::MemoryCopy { .. }))
+        .then(|| {
+            let first = sig
+                .params
+                .checked_add(original_local_count)
+                .context("function local count overflow")?;
+            let first =
+                u32::try_from(first).context("function local count does not fit wasm index")?;
+            Ok::<_, anyhow::Error>(MemoryCopyScratch {
+                dst: first,
+                src: first + 1,
+                len: first + 2,
+            })
+        })
+        .transpose()?;
+    let mut function_locals = locals.clone();
+    if memory_copy_scratch.is_some() {
+        function_locals.push((3, ValType::I32));
+    }
+    let mut function = Function::new(function_locals);
+    let mut local_taints =
+        vec![
+            false;
+            sig.params + original_local_count + usize::from(memory_copy_scratch.is_some()) * 3
+        ];
+    if let Some(params) = layout.persistent_param_markers.get(&old_index) {
+        for param in params {
+            if (*param as usize) < sig.params {
+                local_taints[*param as usize] = true;
+            }
+        }
+    }
+    let mut stack = Vec::<AnalysisValue>::new();
+    let mut spilled_taints = BTreeMap::<AnalysisStackSlot, bool>::new();
+    let mut marked_transactional = false;
     let current_new_index = remapper.remap_function_index(old_index)?;
 
     let mut i = 0usize;
@@ -439,7 +471,7 @@ fn rewrite_function_body(
             }
             local_taints[param_index as usize] = true;
             if marker == PersistentArgMarker::SpilledConst(param_index) {
-                pop_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
                 function.instruction(&Instruction::Drop);
                 i += 1;
             } else {
@@ -460,11 +492,11 @@ fn rewrite_function_body(
                         }
                     }
                     Some(IntrinsicKind::PersistentAddrMut) => {
-                        pop_taint(&mut stack);
+                        pop_analysis_taint(&mut stack);
                         function.instruction(&Instruction::I64Const(PERSISTENT_ADDR_MASK));
                         function.instruction(&Instruction::I64And);
                         function.instruction(&Instruction::I32WrapI64);
-                        stack.push(true);
+                        stack.push(AnalysisValue::tainted());
                         report.persistent_addr_markers += 1;
                     }
                     Some(IntrinsicKind::MarkPersistentArg) => {
@@ -474,21 +506,29 @@ fn rewrite_function_body(
                     }
                     None => {
                         let callee_sig = function_sig(layout, function_index)?;
-                        let arg_taints = pop_call_arg_taints(&mut stack, callee_sig.params);
-                        reject_unallowed_direct_tainted_args(
-                            layout,
-                            old_index,
-                            function_index,
-                            &arg_taints,
-                        )?;
+                        let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                        let arg_taints = analysis_arg_taints(&args);
+                        if !call_is_immediately_unreachable(&operators, i) {
+                            reject_unallowed_direct_tainted_args(
+                                layout,
+                                old_index,
+                                function_index,
+                                &arg_taints,
+                            )?;
+                        }
                         function.instruction(&Instruction::Call(
                             remapper.remap_function_index(function_index)?,
                         ));
-                        stack.extend(function_return_taints(
+                        apply_callee_param_store_taints(
                             layout,
                             function_index,
-                            callee_sig.results,
-                        ));
+                            &args,
+                            &mut spilled_taints,
+                        );
+                        push_analysis_taints(
+                            &mut stack,
+                            function_return_taints(layout, function_index, callee_sig.results),
+                        );
                     }
                 }
             }
@@ -499,7 +539,8 @@ fn rewrite_function_body(
                     );
                 }
                 let callee_sig = function_sig(layout, function_index)?;
-                let arg_taints = pop_call_arg_taints(&mut stack, callee_sig.params);
+                let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                let arg_taints = analysis_arg_taints(&args);
                 reject_unallowed_direct_tainted_args(
                     layout,
                     old_index,
@@ -516,15 +557,16 @@ fn rewrite_function_body(
                 table_index,
             } => {
                 let callee_sig = type_sig(layout, type_index)?;
-                let table_index_tainted = pop_taint(&mut stack);
-                let arg_taints = pop_call_arg_taints(&mut stack, callee_sig.params);
+                let table_index_tainted = pop_analysis_taint(&mut stack);
+                let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                let arg_taints = analysis_arg_taints(&args);
                 reject_any_tainted_call_operand(old_index, table_index_tainted, &arg_taints)?;
                 function.instruction(&Instruction::CallIndirect {
                     type_index: remapper.type_index(type_index)?,
                     table_index: remapper.table_index(table_index)?,
                 });
                 for _ in 0..callee_sig.results {
-                    stack.push(false);
+                    stack.push(AnalysisValue::untainted());
                 }
             }
             Operator::ReturnCallIndirect {
@@ -532,8 +574,9 @@ fn rewrite_function_body(
                 table_index,
             } => {
                 let callee_sig = type_sig(layout, type_index)?;
-                let table_index_tainted = pop_taint(&mut stack);
-                let arg_taints = pop_call_arg_taints(&mut stack, callee_sig.params);
+                let table_index_tainted = pop_analysis_taint(&mut stack);
+                let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                let arg_taints = analysis_arg_taints(&args);
                 reject_any_tainted_call_operand(old_index, table_index_tainted, &arg_taints)?;
                 function.instruction(&Instruction::ReturnCallIndirect {
                     type_index: remapper.type_index(type_index)?,
@@ -543,145 +586,399 @@ fn rewrite_function_body(
             }
             Operator::CallRef { type_index } => {
                 let callee_sig = type_sig(layout, type_index)?;
-                let callee_ref_tainted = pop_taint(&mut stack);
-                let arg_taints = pop_call_arg_taints(&mut stack, callee_sig.params);
+                let callee_ref_tainted = pop_analysis_taint(&mut stack);
+                let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                let arg_taints = analysis_arg_taints(&args);
                 reject_any_tainted_call_operand(old_index, callee_ref_tainted, &arg_taints)?;
                 function.instruction(&remapper.instruction(op)?);
                 for _ in 0..callee_sig.results {
-                    stack.push(false);
+                    stack.push(AnalysisValue::untainted());
                 }
             }
             Operator::ReturnCallRef { type_index } => {
                 let callee_sig = type_sig(layout, type_index)?;
-                let callee_ref_tainted = pop_taint(&mut stack);
-                let arg_taints = pop_call_arg_taints(&mut stack, callee_sig.params);
+                let callee_ref_tainted = pop_analysis_taint(&mut stack);
+                let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                let arg_taints = analysis_arg_taints(&args);
                 reject_any_tainted_call_operand(old_index, callee_ref_tainted, &arg_taints)?;
                 function.instruction(&remapper.instruction(op)?);
                 stack.clear();
             }
             Operator::LocalGet { local_index } => {
                 function.instruction(&remapper.instruction(op)?);
-                stack.push(
+                stack.push(AnalysisValue::local(
+                    local_index,
                     local_taints
                         .get(local_index as usize)
                         .copied()
                         .unwrap_or(false),
-                );
+                ));
             }
             Operator::LocalSet { local_index } => {
-                let value = pop_taint(&mut stack);
+                let value = pop_analysis_value(&mut stack);
                 if let Some(slot) = local_taints.get_mut(local_index as usize) {
-                    *slot = value;
+                    *slot = value.tainted;
                 }
                 function.instruction(&remapper.instruction(op)?);
             }
             Operator::LocalTee { local_index } => {
-                let value = stack.last().copied().unwrap_or(false);
+                let value = stack.last().copied().unwrap_or_default();
                 if let Some(slot) = local_taints.get_mut(local_index as usize) {
-                    *slot = value;
+                    *slot = value.tainted;
                 }
                 function.instruction(&remapper.instruction(op)?);
             }
-            Operator::I32Const { .. }
-            | Operator::I64Const { .. }
-            | Operator::F32Const { .. }
-            | Operator::F64Const { .. } => {
+            Operator::I32Const { value } => {
                 function.instruction(&remapper.instruction(op)?);
-                stack.push(false);
+                stack.push(AnalysisValue::i32_const(value));
+            }
+            Operator::I64Const { .. } | Operator::F32Const { .. } | Operator::F64Const { .. } => {
+                function.instruction(&remapper.instruction(op)?);
+                stack.push(AnalysisValue::untainted());
             }
             Operator::Drop => {
-                pop_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
                 function.instruction(&remapper.instruction(op)?);
             }
             Operator::I32Load { memarg } => {
+                let address = pop_analysis_value(&mut stack);
+                let spilled_taint = if address.tainted {
+                    false
+                } else {
+                    address
+                        .offset_slot(memarg.offset)
+                        .and_then(|slot| spilled_taints.get(&slot).copied())
+                        .unwrap_or(false)
+                };
                 rewrite_load(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    address.tainted,
                     memarg,
                     report,
                     ScalarLoad::I32,
                 )?;
-                stack.push(false);
+                stack.push(AnalysisValue::with_taint(
+                    load_result_taint(ScalarLoad::I32, address.tainted) || spilled_taint,
+                ));
             }
-            Operator::I64Load { memarg } => {
+            Operator::I32Load8S { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
                 rewrite_load(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I32Load8S,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load8S,
+                    tainted_address,
+                )));
+            }
+            Operator::I32Load8U { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I32Load8U,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load8U,
+                    tainted_address,
+                )));
+            }
+            Operator::I32Load16S { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I32Load16S,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load16S,
+                    tainted_address,
+                )));
+            }
+            Operator::I32Load16U { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I32Load16U,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load16U,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
                     memarg,
                     report,
                     ScalarLoad::I64,
                 )?;
-                stack.push(false);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64,
+                    tainted_address,
+                )));
             }
-            Operator::F32Load { memarg } => {
+            Operator::I64Load8S { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
                 rewrite_load(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I64Load8S,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load8S,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load8U { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I64Load8U,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load8U,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load16S { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I64Load16S,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load16S,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load16U { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I64Load16U,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load16U,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load32S { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I64Load32S,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load32S,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load32U { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
+                    memarg,
+                    report,
+                    ScalarLoad::I64Load32U,
+                )?;
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load32U,
+                    tainted_address,
+                )));
+            }
+            Operator::F32Load { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                rewrite_load(
+                    &mut function,
+                    remapper,
+                    tainted_address,
                     memarg,
                     report,
                     ScalarLoad::F32,
                 )?;
-                stack.push(false);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::F32,
+                    tainted_address,
+                )));
             }
             Operator::F64Load { memarg } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
                 rewrite_load(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    tainted_address,
                     memarg,
                     report,
                     ScalarLoad::F64,
                 )?;
-                stack.push(false);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::F64,
+                    tainted_address,
+                )));
             }
             Operator::I32Store { memarg } => {
-                pop_taint(&mut stack);
+                let value = pop_analysis_value(&mut stack);
+                let address = pop_analysis_value(&mut stack);
                 rewrite_store(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    address.tainted,
                     memarg,
                     report,
                     ScalarStore::I32,
                 )?;
+                if !address.tainted {
+                    if let Some(slot) = address.offset_slot(memarg.offset) {
+                        spilled_taints.insert(slot, value.tainted);
+                    }
+                }
             }
-            Operator::I64Store { memarg } => {
-                pop_taint(&mut stack);
+            Operator::I32Store8 { memarg } => {
+                pop_analysis_taint(&mut stack);
                 rewrite_store(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    pop_analysis_taint(&mut stack),
+                    memarg,
+                    report,
+                    ScalarStore::I32Store8,
+                )?;
+            }
+            Operator::I32Store16 { memarg } => {
+                pop_analysis_taint(&mut stack);
+                rewrite_store(
+                    &mut function,
+                    remapper,
+                    pop_analysis_taint(&mut stack),
+                    memarg,
+                    report,
+                    ScalarStore::I32Store16,
+                )?;
+            }
+            Operator::I64Store { memarg } => {
+                pop_analysis_taint(&mut stack);
+                rewrite_store(
+                    &mut function,
+                    remapper,
+                    pop_analysis_taint(&mut stack),
                     memarg,
                     report,
                     ScalarStore::I64,
                 )?;
             }
-            Operator::F32Store { memarg } => {
-                pop_taint(&mut stack);
+            Operator::I64Store8 { memarg } => {
+                pop_analysis_taint(&mut stack);
                 rewrite_store(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    pop_analysis_taint(&mut stack),
+                    memarg,
+                    report,
+                    ScalarStore::I64Store8,
+                )?;
+            }
+            Operator::I64Store16 { memarg } => {
+                pop_analysis_taint(&mut stack);
+                rewrite_store(
+                    &mut function,
+                    remapper,
+                    pop_analysis_taint(&mut stack),
+                    memarg,
+                    report,
+                    ScalarStore::I64Store16,
+                )?;
+            }
+            Operator::I64Store32 { memarg } => {
+                pop_analysis_taint(&mut stack);
+                rewrite_store(
+                    &mut function,
+                    remapper,
+                    pop_analysis_taint(&mut stack),
+                    memarg,
+                    report,
+                    ScalarStore::I64Store32,
+                )?;
+            }
+            Operator::F32Store { memarg } => {
+                pop_analysis_taint(&mut stack);
+                rewrite_store(
+                    &mut function,
+                    remapper,
+                    pop_analysis_taint(&mut stack),
                     memarg,
                     report,
                     ScalarStore::F32,
                 )?;
             }
             Operator::F64Store { memarg } => {
-                pop_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
                 rewrite_store(
                     &mut function,
                     remapper,
-                    pop_taint(&mut stack),
+                    pop_analysis_taint(&mut stack),
                     memarg,
                     report,
                     ScalarStore::F64,
                 )?;
             }
-            op if apply_value_taint_stack_effect(&op, &mut stack) => {
+            Operator::MemoryCopy { dst_mem, src_mem } => {
+                let len_tainted = pop_analysis_taint(&mut stack);
+                let src_tainted = pop_analysis_taint(&mut stack);
+                let dst_tainted = pop_analysis_taint(&mut stack);
+                rewrite_memory_copy(
+                    &mut function,
+                    remapper,
+                    memory_copy_scratch.context("missing memory.copy scratch locals")?,
+                    report,
+                    dst_mem,
+                    src_mem,
+                    dst_tainted,
+                    src_tainted,
+                )?;
+                let _ = len_tainted;
+            }
+            op if apply_analysis_value_taint_stack_effect(&op, &mut stack) => {
                 function.instruction(&remapper.instruction(op)?);
             }
             Operator::End => {
@@ -703,7 +1000,17 @@ fn rewrite_function_body(
 #[derive(Clone, Copy)]
 enum ScalarLoad {
     I32,
+    I32Load8S,
+    I32Load8U,
+    I32Load16S,
+    I32Load16U,
     I64,
+    I64Load8S,
+    I64Load8U,
+    I64Load16S,
+    I64Load16U,
+    I64Load32S,
+    I64Load32U,
     F32,
     F64,
 }
@@ -711,9 +1018,25 @@ enum ScalarLoad {
 #[derive(Clone, Copy)]
 enum ScalarStore {
     I32,
+    I32Store8,
+    I32Store16,
     I64,
+    I64Store8,
+    I64Store16,
+    I64Store32,
     F32,
     F64,
+}
+
+#[derive(Clone, Copy)]
+struct MemoryCopyScratch {
+    dst: u32,
+    src: u32,
+    len: u32,
+}
+
+fn load_result_taint(kind: ScalarLoad, tainted_address: bool) -> bool {
+    tainted_address && matches!(kind, ScalarLoad::I32)
 }
 
 fn rewrite_load(
@@ -731,8 +1054,48 @@ fn rewrite_load(
                 function.instruction(&Instruction::I32TLoad { memarg });
                 report.i32_tloads += 1;
             }
+            ScalarLoad::I32Load8S => {
+                function.instruction(&Instruction::I32TLoad8S { memarg });
+                report.i32_tloads += 1;
+            }
+            ScalarLoad::I32Load8U => {
+                function.instruction(&Instruction::I32TLoad8U { memarg });
+                report.i32_tloads += 1;
+            }
+            ScalarLoad::I32Load16S => {
+                function.instruction(&Instruction::I32TLoad16S { memarg });
+                report.i32_tloads += 1;
+            }
+            ScalarLoad::I32Load16U => {
+                function.instruction(&Instruction::I32TLoad16U { memarg });
+                report.i32_tloads += 1;
+            }
             ScalarLoad::I64 => {
                 function.instruction(&Instruction::I64TLoad { memarg });
+                report.i64_tloads += 1;
+            }
+            ScalarLoad::I64Load8S => {
+                function.instruction(&Instruction::I64TLoad8S { memarg });
+                report.i64_tloads += 1;
+            }
+            ScalarLoad::I64Load8U => {
+                function.instruction(&Instruction::I64TLoad8U { memarg });
+                report.i64_tloads += 1;
+            }
+            ScalarLoad::I64Load16S => {
+                function.instruction(&Instruction::I64TLoad16S { memarg });
+                report.i64_tloads += 1;
+            }
+            ScalarLoad::I64Load16U => {
+                function.instruction(&Instruction::I64TLoad16U { memarg });
+                report.i64_tloads += 1;
+            }
+            ScalarLoad::I64Load32S => {
+                function.instruction(&Instruction::I64TLoad32S { memarg });
+                report.i64_tloads += 1;
+            }
+            ScalarLoad::I64Load32U => {
+                function.instruction(&Instruction::I64TLoad32U { memarg });
                 report.i64_tloads += 1;
             }
             ScalarLoad::F32 => {
@@ -747,7 +1110,17 @@ fn rewrite_load(
     } else {
         match kind {
             ScalarLoad::I32 => function.instruction(&Instruction::I32Load(memarg)),
+            ScalarLoad::I32Load8S => function.instruction(&Instruction::I32Load8S(memarg)),
+            ScalarLoad::I32Load8U => function.instruction(&Instruction::I32Load8U(memarg)),
+            ScalarLoad::I32Load16S => function.instruction(&Instruction::I32Load16S(memarg)),
+            ScalarLoad::I32Load16U => function.instruction(&Instruction::I32Load16U(memarg)),
             ScalarLoad::I64 => function.instruction(&Instruction::I64Load(memarg)),
+            ScalarLoad::I64Load8S => function.instruction(&Instruction::I64Load8S(memarg)),
+            ScalarLoad::I64Load8U => function.instruction(&Instruction::I64Load8U(memarg)),
+            ScalarLoad::I64Load16S => function.instruction(&Instruction::I64Load16S(memarg)),
+            ScalarLoad::I64Load16U => function.instruction(&Instruction::I64Load16U(memarg)),
+            ScalarLoad::I64Load32S => function.instruction(&Instruction::I64Load32S(memarg)),
+            ScalarLoad::I64Load32U => function.instruction(&Instruction::I64Load32U(memarg)),
             ScalarLoad::F32 => function.instruction(&Instruction::F32Load(memarg)),
             ScalarLoad::F64 => function.instruction(&Instruction::F64Load(memarg)),
         };
@@ -770,8 +1143,28 @@ fn rewrite_store(
                 function.instruction(&Instruction::I32TStore { memarg });
                 report.i32_tstores += 1;
             }
+            ScalarStore::I32Store8 => {
+                function.instruction(&Instruction::I32TStore8 { memarg });
+                report.i32_tstores += 1;
+            }
+            ScalarStore::I32Store16 => {
+                function.instruction(&Instruction::I32TStore16 { memarg });
+                report.i32_tstores += 1;
+            }
             ScalarStore::I64 => {
                 function.instruction(&Instruction::I64TStore { memarg });
+                report.i64_tstores += 1;
+            }
+            ScalarStore::I64Store8 => {
+                function.instruction(&Instruction::I64TStore8 { memarg });
+                report.i64_tstores += 1;
+            }
+            ScalarStore::I64Store16 => {
+                function.instruction(&Instruction::I64TStore16 { memarg });
+                report.i64_tstores += 1;
+            }
+            ScalarStore::I64Store32 => {
+                function.instruction(&Instruction::I64TStore32 { memarg });
                 report.i64_tstores += 1;
             }
             ScalarStore::F32 => {
@@ -786,12 +1179,141 @@ fn rewrite_store(
     } else {
         match kind {
             ScalarStore::I32 => function.instruction(&Instruction::I32Store(memarg)),
+            ScalarStore::I32Store8 => function.instruction(&Instruction::I32Store8(memarg)),
+            ScalarStore::I32Store16 => function.instruction(&Instruction::I32Store16(memarg)),
             ScalarStore::I64 => function.instruction(&Instruction::I64Store(memarg)),
+            ScalarStore::I64Store8 => function.instruction(&Instruction::I64Store8(memarg)),
+            ScalarStore::I64Store16 => function.instruction(&Instruction::I64Store16(memarg)),
+            ScalarStore::I64Store32 => function.instruction(&Instruction::I64Store32(memarg)),
             ScalarStore::F32 => function.instruction(&Instruction::F32Store(memarg)),
             ScalarStore::F64 => function.instruction(&Instruction::F64Store(memarg)),
         };
     }
     Ok(())
+}
+
+fn rewrite_memory_copy(
+    function: &mut Function,
+    remapper: &mut IndexRemapper,
+    scratch: MemoryCopyScratch,
+    report: &mut RewriteReport,
+    dst_mem: u32,
+    src_mem: u32,
+    dst_tainted: bool,
+    src_tainted: bool,
+) -> Result<()> {
+    let dst_mem = remapper.memory_index(dst_mem)?;
+    let src_mem = remapper.memory_index(src_mem)?;
+    match (dst_tainted, src_tainted) {
+        (false, false) => {
+            function.instruction(&Instruction::MemoryCopy { src_mem, dst_mem });
+        }
+        (true, true) => {
+            function.instruction(&Instruction::TMemoryCopy { src_mem, dst_mem });
+        }
+        (true, false) => {
+            rewrite_mixed_memory_copy_loop(function, scratch, true, dst_mem, src_mem);
+            report.i32_tstores += 1;
+        }
+        (false, true) => {
+            rewrite_mixed_memory_copy_loop(function, scratch, false, dst_mem, src_mem);
+            report.i32_tloads += 1;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_mixed_memory_copy_loop(
+    function: &mut Function,
+    scratch: MemoryCopyScratch,
+    dst_is_tmemory: bool,
+    dst_mem: u32,
+    src_mem: u32,
+) {
+    function.instruction(&Instruction::LocalSet(scratch.len));
+    function.instruction(&Instruction::LocalSet(scratch.src));
+    function.instruction(&Instruction::LocalSet(scratch.dst));
+
+    emit_memory_copy_bounds_check(function, scratch.dst, scratch.len, dst_mem, dst_is_tmemory);
+    emit_memory_copy_bounds_check(function, scratch.src, scratch.len, src_mem, !dst_is_tmemory);
+
+    function.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    function.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(scratch.len));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::BrIf(1));
+
+    function.instruction(&Instruction::LocalGet(scratch.dst));
+    function.instruction(&Instruction::LocalGet(scratch.src));
+    if dst_is_tmemory {
+        function.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: src_mem,
+        }));
+        function.instruction(&Instruction::I32TStore8 {
+            memarg: wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: dst_mem,
+            },
+        });
+    } else {
+        function.instruction(&Instruction::I32TLoad8U {
+            memarg: wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: src_mem,
+            },
+        });
+        function.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: dst_mem,
+        }));
+    }
+
+    function.instruction(&Instruction::LocalGet(scratch.dst));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(scratch.dst));
+    function.instruction(&Instruction::LocalGet(scratch.src));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(scratch.src));
+    function.instruction(&Instruction::LocalGet(scratch.len));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::LocalSet(scratch.len));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+}
+
+fn emit_memory_copy_bounds_check(
+    function: &mut Function,
+    ptr_local: u32,
+    len_local: u32,
+    memory_index: u32,
+    is_tmemory: bool,
+) {
+    function.instruction(&Instruction::LocalGet(ptr_local));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::LocalGet(len_local));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Add);
+    if is_tmemory {
+        function.instruction(&Instruction::TMemorySize { mem: memory_index });
+    } else {
+        function.instruction(&Instruction::MemorySize(memory_index));
+    }
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(65_536));
+    function.instruction(&Instruction::I64Mul);
+    function.instruction(&Instruction::I64GtU);
+    function.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
 }
 
 fn collect_locals(
@@ -866,21 +1388,44 @@ fn recompute_function_return_taints(
             .or_insert_with(|| vec![false; results]);
     }
 
-    for _ in 0..=function_count {
+    for _ in 0..=function_count.saturating_mul(2) {
         let reader = BinaryReader::new(body_bytes, body_offset);
         let section = CodeSectionReader::new(reader)?;
         let mut changed = false;
 
         for (defined_index, body) in section.into_iter().enumerate() {
             let old_index = layout.imported_function_count + defined_index as u32;
-            let taints = function_return_taints_for_body(layout, old_index, &body?)?;
+            let analysis = analyze_function_taints_for_body(layout, old_index, &body?)?;
             let entry = layout
                 .function_return_taints
                 .get_mut(&old_index)
                 .context("missing initialized return-taint entry")?;
-            if *entry != taints {
-                *entry = taints;
+            if *entry != analysis.return_taints {
+                *entry = analysis.return_taints;
                 changed = true;
+            }
+            let param_store_entry = layout
+                .function_param_store_taints
+                .entry(old_index)
+                .or_default();
+            if *param_store_entry != analysis.param_store_taints {
+                *param_store_entry = analysis.param_store_taints;
+                changed = true;
+            }
+            for (callee_index, params) in analysis.inferred_persistent_params {
+                if callee_index < layout.imported_function_count {
+                    continue;
+                }
+                let entry = layout
+                    .persistent_param_markers
+                    .entry(callee_index)
+                    .or_default();
+                for param in params {
+                    if entry.insert(param) {
+                        layout.transaction_func_markers.insert(callee_index);
+                        changed = true;
+                    }
+                }
             }
         }
 
@@ -892,11 +1437,81 @@ fn recompute_function_return_taints(
     bail!("function return taint analysis did not converge")
 }
 
-fn function_return_taints_for_body(
+#[derive(Default)]
+struct BodyTaintAnalysis {
+    return_taints: Vec<bool>,
+    param_store_taints: BTreeMap<ParamStoreSlot, bool>,
+    inferred_persistent_params: BTreeMap<u32, BTreeSet<u32>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct AnalysisStackSlot {
+    base_local: u32,
+    offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ParamStoreSlot {
+    param_index: u32,
+    offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AnalysisValue {
+    tainted: bool,
+    stack_slot: Option<AnalysisStackSlot>,
+    const_i32: Option<i32>,
+}
+
+impl AnalysisValue {
+    fn untainted() -> Self {
+        Self::default()
+    }
+
+    fn tainted() -> Self {
+        Self {
+            tainted: true,
+            ..Self::default()
+        }
+    }
+
+    fn local(local_index: u32, tainted: bool) -> Self {
+        Self {
+            tainted,
+            stack_slot: Some(AnalysisStackSlot {
+                base_local: local_index,
+                offset: 0,
+            }),
+            const_i32: None,
+        }
+    }
+
+    fn i32_const(value: i32) -> Self {
+        Self {
+            const_i32: Some(value),
+            ..Self::default()
+        }
+    }
+
+    fn with_taint(tainted: bool) -> Self {
+        Self {
+            tainted,
+            ..Self::default()
+        }
+    }
+
+    fn offset_slot(self, offset: u64) -> Option<AnalysisStackSlot> {
+        let mut slot = self.stack_slot?;
+        slot.offset = slot.offset.checked_add(offset)?;
+        Some(slot)
+    }
+}
+
+fn analyze_function_taints_for_body(
     layout: &ModuleLayout,
     old_index: u32,
     body: &wasmparser::FunctionBody<'_>,
-) -> Result<Vec<bool>> {
+) -> Result<BodyTaintAnalysis> {
     let sig = function_sig(layout, old_index)?;
     let operators = body
         .get_operators_reader()?
@@ -911,8 +1526,19 @@ fn function_return_taints_for_body(
                 .map(|(count, _)| *count as usize)
                 .sum::<usize>()
     ];
-    let mut stack = Vec::new();
+    if let Some(params) = layout.persistent_param_markers.get(&old_index) {
+        for param in params {
+            if (*param as usize) < sig.params {
+                local_taints[*param as usize] = true;
+            }
+        }
+    }
+    let mut stack = Vec::<AnalysisValue>::new();
+    let mut spilled_taints = BTreeMap::<AnalysisStackSlot, bool>::new();
+    let mut branch_exit_taints = BTreeMap::<usize, BTreeMap<AnalysisStackSlot, bool>>::new();
     let mut return_taints = vec![false; sig.results];
+    let mut param_store_taints = BTreeMap::<ParamStoreSlot, bool>::new();
+    let mut inferred_persistent_params = BTreeMap::<u32, BTreeSet<u32>>::new();
     let mut block_depth = 0usize;
 
     let mut i = 0usize;
@@ -930,7 +1556,7 @@ fn function_return_taints_for_body(
                     i += 2;
                 }
                 PersistentArgMarker::SpilledConst(_) => {
-                    pop_taint(&mut stack);
+                    pop_analysis_taint(&mut stack);
                     i += 1;
                 }
             }
@@ -942,8 +1568,8 @@ fn function_return_taints_for_body(
                 match layout.intrinsic_imports.get(&function_index) {
                     Some(IntrinsicKind::MarkTransactionFunc) => {}
                     Some(IntrinsicKind::PersistentAddrMut) => {
-                        pop_taint(&mut stack);
-                        stack.push(true);
+                        pop_analysis_taint(&mut stack);
+                        stack.push(AnalysisValue::tainted());
                     }
                     Some(IntrinsicKind::MarkPersistentArg) => {
                         bail!(
@@ -952,22 +1578,37 @@ fn function_return_taints_for_body(
                     }
                     None => {
                         let callee_sig = function_sig(layout, function_index)?;
-                        for _ in 0..callee_sig.params {
-                            pop_taint(&mut stack);
-                        }
-                        stack.extend(function_return_taints(
+                        let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                        let arg_taints = analysis_arg_taints(&args);
+                        infer_direct_persistent_params(
+                            layout,
+                            &mut inferred_persistent_params,
+                            function_index,
+                            &arg_taints,
+                        );
+                        apply_callee_param_store_taints(
                             layout,
                             function_index,
-                            callee_sig.results,
-                        ));
+                            &args,
+                            &mut spilled_taints,
+                        );
+                        push_analysis_taints(
+                            &mut stack,
+                            function_return_taints(layout, function_index, callee_sig.results),
+                        );
                     }
                 }
             }
             Operator::ReturnCall { function_index } => {
                 let callee_sig = function_sig(layout, function_index)?;
-                for _ in 0..callee_sig.params {
-                    pop_taint(&mut stack);
-                }
+                let args = pop_analysis_call_args(&mut stack, callee_sig.params);
+                let arg_taints = analysis_arg_taints(&args);
+                infer_direct_persistent_params(
+                    layout,
+                    &mut inferred_persistent_params,
+                    function_index,
+                    &arg_taints,
+                );
                 merge_return_taints(
                     &mut return_taints,
                     &function_return_taints(layout, function_index, callee_sig.results),
@@ -976,80 +1617,238 @@ fn function_return_taints_for_body(
             }
             Operator::CallIndirect { type_index, .. } | Operator::CallRef { type_index } => {
                 let callee_sig = type_sig(layout, type_index)?;
-                pop_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
                 for _ in 0..callee_sig.params {
-                    pop_taint(&mut stack);
+                    pop_analysis_taint(&mut stack);
                 }
-                stack.extend(std::iter::repeat_n(false, callee_sig.results));
+                push_analysis_taints(&mut stack, vec![false; callee_sig.results]);
             }
             Operator::ReturnCallIndirect { type_index, .. }
             | Operator::ReturnCallRef { type_index } => {
                 let callee_sig = type_sig(layout, type_index)?;
-                pop_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
                 for _ in 0..callee_sig.params {
-                    pop_taint(&mut stack);
+                    pop_analysis_taint(&mut stack);
                 }
                 merge_return_taints(&mut return_taints, &vec![false; callee_sig.results]);
                 stack.clear();
             }
             Operator::Block { .. } | Operator::Loop { .. } | Operator::If { .. } => {
+                if matches!(operators[i], Operator::If { .. }) {
+                    pop_analysis_taint(&mut stack);
+                }
                 block_depth += 1;
             }
             Operator::Else => {
                 stack.clear();
             }
+            Operator::Br { relative_depth } => {
+                let target_depth = branch_target_depth_after_end(block_depth, relative_depth);
+                merge_spilled_taints_into_branch_exit(
+                    &mut branch_exit_taints,
+                    target_depth,
+                    &spilled_taints,
+                );
+                stack.clear();
+            }
+            Operator::BrIf { relative_depth } => {
+                pop_analysis_taint(&mut stack);
+                let target_depth = branch_target_depth_after_end(block_depth, relative_depth);
+                merge_spilled_taints_into_branch_exit(
+                    &mut branch_exit_taints,
+                    target_depth,
+                    &spilled_taints,
+                );
+            }
             Operator::LocalGet { local_index } => {
-                stack.push(
+                stack.push(AnalysisValue::local(
+                    local_index,
                     local_taints
                         .get(local_index as usize)
                         .copied()
                         .unwrap_or(false),
-                );
+                ));
             }
             Operator::LocalSet { local_index } => {
-                let value = pop_taint(&mut stack);
+                let value = pop_analysis_value(&mut stack);
                 if let Some(slot) = local_taints.get_mut(local_index as usize) {
-                    *slot = value;
+                    *slot = value.tainted;
                 }
             }
             Operator::LocalTee { local_index } => {
-                let value = stack.last().copied().unwrap_or(false);
+                let value = stack.last().copied().unwrap_or_default();
                 if let Some(slot) = local_taints.get_mut(local_index as usize) {
-                    *slot = value;
+                    *slot = value.tainted;
                 }
             }
-            Operator::I32Const { .. }
-            | Operator::I64Const { .. }
-            | Operator::F32Const { .. }
-            | Operator::F64Const { .. } => stack.push(false),
-            Operator::I32Load { .. }
-            | Operator::I64Load { .. }
-            | Operator::F32Load { .. }
-            | Operator::F64Load { .. } => {
-                pop_taint(&mut stack);
-                stack.push(false);
+            Operator::I32Const { value } => stack.push(AnalysisValue::i32_const(value)),
+            Operator::I64Const { .. } | Operator::F32Const { .. } | Operator::F64Const { .. } => {
+                stack.push(AnalysisValue::untainted())
             }
-            Operator::I32Store { .. }
+            Operator::I32Load { memarg } => {
+                let address = pop_analysis_value(&mut stack);
+                let spilled_taint = if address.tainted {
+                    false
+                } else {
+                    address
+                        .offset_slot(memarg.offset)
+                        .and_then(|slot| spilled_taints.get(&slot).copied())
+                        .unwrap_or(false)
+                };
+                stack.push(AnalysisValue::with_taint(
+                    load_result_taint(ScalarLoad::I32, address.tainted) || spilled_taint,
+                ));
+            }
+            Operator::I32Load8S { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load8S,
+                    tainted_address,
+                )));
+            }
+            Operator::I32Load8U { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load8U,
+                    tainted_address,
+                )));
+            }
+            Operator::I32Load16S { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load16S,
+                    tainted_address,
+                )));
+            }
+            Operator::I32Load16U { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I32Load16U,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load8S { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load8S,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load8U { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load8U,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load16S { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load16S,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load16U { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load16U,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load32S { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load32S,
+                    tainted_address,
+                )));
+            }
+            Operator::I64Load32U { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::I64Load32U,
+                    tainted_address,
+                )));
+            }
+            Operator::F32Load { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::F32,
+                    tainted_address,
+                )));
+            }
+            Operator::F64Load { .. } => {
+                let tainted_address = pop_analysis_taint(&mut stack);
+                stack.push(AnalysisValue::with_taint(load_result_taint(
+                    ScalarLoad::F64,
+                    tainted_address,
+                )));
+            }
+            Operator::I32Store { memarg } => {
+                let value = pop_analysis_value(&mut stack);
+                let address = pop_analysis_value(&mut stack);
+                if !address.tainted {
+                    if let Some(slot) = address.offset_slot(memarg.offset) {
+                        spilled_taints.insert(slot, value.tainted);
+                        if slot.base_local < sig.params as u32 {
+                            param_store_taints.insert(
+                                ParamStoreSlot {
+                                    param_index: slot.base_local,
+                                    offset: slot.offset,
+                                },
+                                value.tainted,
+                            );
+                        }
+                    }
+                }
+            }
+            Operator::I32Store8 { .. }
+            | Operator::I32Store16 { .. }
             | Operator::I64Store { .. }
+            | Operator::I64Store8 { .. }
+            | Operator::I64Store16 { .. }
+            | Operator::I64Store32 { .. }
             | Operator::F32Store { .. }
             | Operator::F64Store { .. } => {
-                pop_taint(&mut stack);
-                pop_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
+            }
+            Operator::MemoryCopy { .. } => {
+                pop_analysis_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
             }
             Operator::Drop => {
-                pop_taint(&mut stack);
+                pop_analysis_taint(&mut stack);
             }
-            op if apply_value_taint_stack_effect(&op, &mut stack) => {}
+            op if apply_analysis_value_taint_stack_effect(&op, &mut stack) => {}
             Operator::Return => {
-                merge_return_taints(&mut return_taints, &stack_results(&stack, sig.results));
+                merge_return_taints(
+                    &mut return_taints,
+                    &analysis_stack_results(&stack, sig.results),
+                );
                 stack.clear();
             }
             Operator::End => {
                 if block_depth == 0 {
-                    merge_return_taints(&mut return_taints, &stack_results(&stack, sig.results));
+                    merge_return_taints(
+                        &mut return_taints,
+                        &analysis_stack_results(&stack, sig.results),
+                    );
                     stack.clear();
                 } else {
                     block_depth -= 1;
+                    merge_branch_exit_taints(
+                        &mut spilled_taints,
+                        &mut branch_exit_taints,
+                        block_depth,
+                    );
                     stack.clear();
                 }
             }
@@ -1061,7 +1860,63 @@ fn function_return_taints_for_body(
         i += 1;
     }
 
-    Ok(return_taints)
+    Ok(BodyTaintAnalysis {
+        return_taints,
+        param_store_taints,
+        inferred_persistent_params,
+    })
+}
+
+fn infer_direct_persistent_params(
+    layout: &ModuleLayout,
+    inferred: &mut BTreeMap<u32, BTreeSet<u32>>,
+    callee_index: u32,
+    arg_taints: &[bool],
+) {
+    if callee_index < layout.imported_function_count
+        || layout.intrinsic_imports.contains_key(&callee_index)
+    {
+        return;
+    }
+
+    for (param_index, tainted) in arg_taints.iter().enumerate() {
+        if *tainted {
+            inferred
+                .entry(callee_index)
+                .or_default()
+                .insert(param_index as u32);
+        }
+    }
+}
+
+fn branch_target_depth_after_end(block_depth: usize, relative_depth: u32) -> usize {
+    block_depth.saturating_sub(relative_depth as usize + 1)
+}
+
+fn merge_spilled_taints_into_branch_exit(
+    branch_exit_taints: &mut BTreeMap<usize, BTreeMap<AnalysisStackSlot, bool>>,
+    target_depth: usize,
+    spilled_taints: &BTreeMap<AnalysisStackSlot, bool>,
+) {
+    let exits = branch_exit_taints.entry(target_depth).or_default();
+    for (slot, tainted) in spilled_taints {
+        let entry = exits.entry(*slot).or_insert(false);
+        *entry |= *tainted;
+    }
+}
+
+fn merge_branch_exit_taints(
+    spilled_taints: &mut BTreeMap<AnalysisStackSlot, bool>,
+    branch_exit_taints: &mut BTreeMap<usize, BTreeMap<AnalysisStackSlot, bool>>,
+    target_depth: usize,
+) {
+    let Some(exits) = branch_exit_taints.remove(&target_depth) else {
+        return;
+    };
+    for (slot, tainted) in exits {
+        let entry = spilled_taints.entry(slot).or_insert(false);
+        *entry |= tainted;
+    }
 }
 
 fn intrinsic_kind(module: &str, name: &str) -> Option<IntrinsicKind> {
@@ -1182,12 +2037,49 @@ fn function_sig(layout: &ModuleLayout, function_index: u32) -> Result<FuncSig> {
         .context("missing callee signature")
 }
 
-fn pop_call_arg_taints(stack: &mut Vec<bool>, params: usize) -> Vec<bool> {
-    let mut arg_taints = vec![false; params];
+fn pop_analysis_value(stack: &mut Vec<AnalysisValue>) -> AnalysisValue {
+    stack.pop().unwrap_or_default()
+}
+
+fn pop_analysis_taint(stack: &mut Vec<AnalysisValue>) -> bool {
+    pop_analysis_value(stack).tainted
+}
+
+fn pop_analysis_call_args(stack: &mut Vec<AnalysisValue>, params: usize) -> Vec<AnalysisValue> {
+    let mut args = vec![AnalysisValue::default(); params];
     for param_index in (0..params).rev() {
-        arg_taints[param_index] = pop_taint(stack);
+        args[param_index] = pop_analysis_value(stack);
     }
-    arg_taints
+    args
+}
+
+fn analysis_arg_taints(args: &[AnalysisValue]) -> Vec<bool> {
+    args.iter().map(|arg| arg.tainted).collect()
+}
+
+fn push_analysis_taints(stack: &mut Vec<AnalysisValue>, taints: Vec<bool>) {
+    stack.extend(taints.into_iter().map(AnalysisValue::with_taint));
+}
+
+fn apply_callee_param_store_taints(
+    layout: &ModuleLayout,
+    callee_index: u32,
+    args: &[AnalysisValue],
+    spilled_taints: &mut BTreeMap<AnalysisStackSlot, bool>,
+) {
+    let Some(param_store_taints) = layout.function_param_store_taints.get(&callee_index) else {
+        return;
+    };
+
+    for (param_slot, tainted) in param_store_taints {
+        let Some(arg) = args.get(param_slot.param_index as usize) else {
+            continue;
+        };
+        let Some(caller_slot) = arg.offset_slot(param_slot.offset) else {
+            continue;
+        };
+        spilled_taints.insert(caller_slot, *tainted);
+    }
 }
 
 fn function_return_taints(
@@ -1205,12 +2097,15 @@ fn function_return_taints(
     }
 }
 
-fn stack_results(stack: &[bool], results: usize) -> Vec<bool> {
+fn analysis_stack_results(stack: &[AnalysisValue], results: usize) -> Vec<bool> {
     if results == 0 {
         return Vec::new();
     }
     let start = stack.len().saturating_sub(results);
-    let mut taints = stack[start..].to_vec();
+    let mut taints = stack[start..]
+        .iter()
+        .map(|value| value.tainted)
+        .collect::<Vec<_>>();
     if taints.len() < results {
         taints.resize(results, false);
     }
@@ -1226,57 +2121,100 @@ fn merge_return_taints(target: &mut Vec<bool>, source: &[bool]) {
     }
 }
 
-fn apply_value_taint_stack_effect(op: &Operator<'_>, stack: &mut Vec<bool>) -> bool {
+fn apply_analysis_value_taint_stack_effect(
+    op: &Operator<'_>,
+    stack: &mut Vec<AnalysisValue>,
+) -> bool {
     match op {
+        Operator::I32Add => {
+            let rhs = pop_analysis_value(stack);
+            let lhs = pop_analysis_value(stack);
+            stack.push(analysis_i32_add(lhs, rhs));
+            true
+        }
         op if is_taint_preserving_unary_op(op) => {
-            let value = pop_taint(stack);
-            stack.push(value);
+            let value = pop_analysis_value(stack);
+            stack.push(AnalysisValue::with_taint(value.tainted));
             true
         }
         op if is_taint_dropping_unary_result_op(op) => {
-            pop_taint(stack);
-            stack.push(false);
+            pop_analysis_taint(stack);
+            stack.push(AnalysisValue::untainted());
             true
         }
         op if is_taint_merging_binary_op(op) => {
-            let rhs = pop_taint(stack);
-            let lhs = pop_taint(stack);
-            stack.push(lhs || rhs);
+            let rhs = pop_analysis_taint(stack);
+            let lhs = pop_analysis_taint(stack);
+            stack.push(AnalysisValue::with_taint(lhs || rhs));
             true
         }
         op if is_taint_dropping_binary_result_op(op) => {
-            pop_taint(stack);
-            pop_taint(stack);
-            stack.push(false);
+            pop_analysis_taint(stack);
+            pop_analysis_taint(stack);
+            stack.push(AnalysisValue::untainted());
             true
         }
         Operator::Select | Operator::TypedSelect { .. } => {
-            pop_taint(stack);
-            let rhs = pop_taint(stack);
-            let lhs = pop_taint(stack);
-            stack.push(lhs || rhs);
+            pop_analysis_taint(stack);
+            let rhs = pop_analysis_taint(stack);
+            let lhs = pop_analysis_taint(stack);
+            stack.push(AnalysisValue::with_taint(lhs || rhs));
             true
         }
         Operator::MemorySize { .. } | Operator::TableSize { .. } | Operator::TTableSize { .. } => {
-            stack.push(false);
+            stack.push(AnalysisValue::untainted());
             true
         }
         Operator::MemoryGrow { .. }
         | Operator::TableGet { .. }
         | Operator::TTableGet { .. }
         | Operator::TMemoryGrow { .. } => {
-            pop_taint(stack);
-            stack.push(false);
+            pop_analysis_taint(stack);
+            stack.push(AnalysisValue::untainted());
             true
         }
         Operator::TableGrow { .. } | Operator::TTableGrow { .. } => {
-            pop_taint(stack);
-            pop_taint(stack);
-            stack.push(false);
+            pop_analysis_taint(stack);
+            pop_analysis_taint(stack);
+            stack.push(AnalysisValue::untainted());
             true
         }
         _ => false,
     }
+}
+
+fn analysis_i32_add(lhs: AnalysisValue, rhs: AnalysisValue) -> AnalysisValue {
+    let tainted = lhs.tainted || rhs.tainted;
+    let const_i32 = lhs
+        .const_i32
+        .and_then(|lhs| rhs.const_i32.and_then(|rhs| lhs.checked_add(rhs)));
+    let stack_slot = if tainted {
+        None
+    } else {
+        match (lhs.stack_slot, lhs.const_i32, rhs.stack_slot, rhs.const_i32) {
+            (Some(slot), _, _, Some(offset)) => offset_analysis_stack_slot(slot, offset),
+            (_, Some(offset), Some(slot), _) => offset_analysis_stack_slot(slot, offset),
+            _ => None,
+        }
+    };
+
+    AnalysisValue {
+        tainted,
+        stack_slot,
+        const_i32,
+    }
+}
+
+fn offset_analysis_stack_slot(
+    mut slot: AnalysisStackSlot,
+    offset: i32,
+) -> Option<AnalysisStackSlot> {
+    if offset >= 0 {
+        slot.offset = slot.offset.checked_add(offset as u64)?;
+    } else {
+        slot.offset = slot.offset.checked_sub(offset.unsigned_abs() as u64)?;
+    }
+    Some(slot)
 }
 
 fn is_taint_preserving_unary_op(op: &Operator<'_>) -> bool {
@@ -1456,7 +2394,10 @@ fn reject_unallowed_direct_tainted_args(
     });
 
     if has_unmarked_tainted_arg {
-        bail!("persistent pointer escapes to unrecognized call in function index {caller_index}");
+        bail!(
+            "persistent pointer escapes to unrecognized call in function index {caller_index} \
+             calling {callee_index} with tainted args {arg_taints:?}"
+        );
     }
 
     Ok(())
@@ -1474,8 +2415,8 @@ fn reject_any_tainted_call_operand(
     Ok(())
 }
 
-fn pop_taint(stack: &mut Vec<bool>) -> bool {
-    stack.pop().unwrap_or(false)
+fn call_is_immediately_unreachable(operators: &[Operator<'_>], call_index: usize) -> bool {
+    matches!(operators.get(call_index + 1), Some(Operator::Unreachable))
 }
 
 fn encode_transaction_objects(transaction_functions: &BTreeSet<u32>) -> Vec<u8> {
