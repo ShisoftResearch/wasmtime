@@ -11,7 +11,8 @@ pub struct Account {
 #[derive(Clone, Copy, Persist)]
 #[repr(C)]
 pub struct Bank {
-    pub accounts: [Account; 2],
+    pub alice: Account,
+    pub bob: Account,
 }
 
 #[derive(Clone, Copy)]
@@ -29,8 +30,8 @@ pub extern "C" fn init_bank(a: i64, b: i64) {
     wasmtime_transaction_sdk::transaction!(tx, {
         let bank = tx.root_mut(&BANK_ROOT);
         let bank = bank.as_mut();
-        bank.accounts[0].balance = a;
-        bank.accounts[1].balance = b;
+        bank.alice.balance = a;
+        bank.bob.balance = b;
     })
 }
 
@@ -45,10 +46,17 @@ pub extern "C" fn transfer(from: u32, to: u32, amount: i64) {
 
 #[txn_func]
 fn transfer_impl(bank: &mut Bank, req: &Request) {
-    let from = req.from as usize;
-    let to = req.to as usize;
-    bank.accounts[from].balance -= req.amount;
-    bank.accounts[to].balance += req.amount;
+    if req.from & 1 == 0 {
+        bank.alice.balance -= req.amount;
+    } else {
+        bank.bob.balance -= req.amount;
+    }
+
+    if req.to & 1 == 0 {
+        bank.alice.balance += req.amount;
+    } else {
+        bank.bob.balance += req.amount;
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -57,9 +65,9 @@ pub extern "C" fn balance(index: u32) -> i64 {
         let bank = tx.root_ref(&BANK_ROOT);
         let bank = bank.as_ref();
         if index & 1 == 0 {
-            bank.accounts[0].balance
+            bank.alice.balance
         } else {
-            bank.accounts[1].balance
+            bank.bob.balance
         }
     })
 }
