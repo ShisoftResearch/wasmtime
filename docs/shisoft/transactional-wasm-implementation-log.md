@@ -21,6 +21,27 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Persistent Object GC 9C Planning Update: GC Tombstone Blocks
+
+Date: 2026-06-14
+
+The Wave 9C tombstone design has changed. GC tombstones are global GC metadata,
+not user transaction publications. They should be stored in dedicated GC
+tombstone blocks as fixed-size entries containing `ObjectId`, target object-data
+version, GC epoch, and CRC32.
+
+Recovery should scan user transaction logs to choose the highest live
+object-data winner per `ObjectId`, then scan GC tombstone blocks and omit an
+object from the rebuilt volatile object table when
+`tombstone.target_version >= live.version`. Object data remains directly
+readable from persistent object-data blocks; old bytes are reclaimed only by a
+later block cleaner.
+
+The earlier plan
+`docs/shisoft/2026-06-14-persistent-object-gc-9b-9c-implementation-plan.md`
+is retained for Wave 9A/9B context but is superseded for tombstones by
+`docs/shisoft/2026-06-14-persistent-object-gc-9b-9c-gc-blocks-plan.md`.
+
 ## Persistent Object GC Wave 1: Logical ObjectId Marking
 
 Date: 2026-06-14
@@ -73,9 +94,10 @@ test result: ok. 591 passed; 0 failed; 2 ignored
 cargo fmt --check
 ```
 
-Remaining boundaries:
+Remaining implementation boundaries:
 
-- No durable deletion/tombstone design yet.
+- No durable deletion/tombstone implementation yet; the current design uses
+  GC-owned tombstone blocks.
 - No volatile sweep mode yet.
 - No block, chunk, or Immix line reclamation yet.
 - No root integration with Wasmtime stack/host roots; roots are explicit

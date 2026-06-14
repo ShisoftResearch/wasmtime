@@ -807,8 +807,54 @@ This incremental design is conservative. Removing a root or deleting an edge
 during a mark cycle may leave the old target marked until a later cycle. That
 only delays reclamation and is acceptable before durable tombstones and block
 reuse exist. Actual sweep, tombstone publication, block reclamation, and
-Immix-style line reuse remain later phases after commit-coupled marking is
-tested.
+Immix-style line reuse remain phases after commit-coupled marking is tested.
+
+Durable GC tombstones are GC-owned metadata, not user transaction
+publications. User transaction streams are per-thread and publish live object
+versions through `TxLogEntry` and object data records. GC tombstones describe
+global persistent reachability state, so they live in dedicated GC metadata
+blocks allocated from the same region block allocator, but scanned as a
+separate stream.
+
+The first tombstone format should be a fixed-size entry that fits cleanly in a
+metadata block and can be validated independently:
+
+```text
+GcTombstoneEntry {
+  object_id: ObjectId,
+  target_version: u32,
+  gc_epoch: u32,
+  crc32: u32,
+}
+```
+
+`target_version` is the highest object-data version that the collector proved
+unreachable. The entry has no transaction id and no LP bit. Each tombstone is
+individually durable: the collector writes the entry, flushes it, and seals the
+entry checksum. If a crash interrupts a sweep, recovery observes a prefix or
+subset of valid tombstones; missing tombstones mean incomplete collection, not
+corruption.
+
+Recovery applies tombstones after selecting the highest committed live object
+data record for each `ObjectId`:
+
+```text
+live = highest committed object data version for ObjectId
+dead = highest valid GC tombstone for ObjectId
+
+if dead.target_version >= live.version:
+  do not rebuild the volatile object-table entry
+else:
+  object table points directly at the live persistent object data record
+```
+
+This keeps object data immutable and directly readable from persistent object
+data blocks. The rebuilt volatile object table may ignore tombstoned objects,
+while the old object data bytes remain available for a later block cleaner to
+copy live records out and retire garbage-heavy object-data and GC metadata
+blocks together. Until `ObjectId` reuse is explicitly designed, `ObjectId`s
+remain non-reused so a tombstone cannot accidentally kill a later unrelated
+object.
 
 Read-heavy workloads with few commits may not advance commit-coupled marking.
 A later explicit maintenance API can expose the same minibatch scanner, for

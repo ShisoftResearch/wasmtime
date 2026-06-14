@@ -72,12 +72,13 @@ tombstone and recovery semantics.
 
 ### Approach C: Durable mark/sweep with tombstones
 
-The collector appends delete versions for unreachable objects and allows later
-recovery to ignore older live versions.
+The collector appends GC-owned tombstone metadata for unreachable object-data
+versions and allows recovery to omit covered objects from the rebuilt volatile
+object table.
 
 This is the right durable direction, but it requires a deletion design:
-tombstone version ordering, root consistency, transaction interaction, and
-chunk/block reclamation rules. It is too much for the first proof point.
+tombstone version ordering, root consistency, GC block scanning, and chunk/block
+reclamation rules. It is too much for the first proof point.
 
 ## Wave 1 Scope
 
@@ -166,7 +167,7 @@ scope for Wave 1.
 Wave 1 does not:
 
 - reclaim durable storage
-- publish tombstones or delete versions
+- publish GC tombstone metadata
 - free object-table slots
 - rewrite roots
 - move object records
@@ -247,9 +248,13 @@ incremental marking proves reliable. It may remove unreachable objects from
 volatile runtime indices or report reclaim candidates to a test-only harness,
 but it should still avoid durable deletion.
 
-Wave 4 should design durable tombstones and recovery behavior. A higher-version
-delete record should beat older live records, but that needs explicit rules for
-transaction ordering, root consistency, and duplicate-version corruption.
+Wave 4 should design durable GC tombstones and recovery behavior. Tombstones
+belong in GC-owned metadata blocks, not in per-thread user transaction logs.
+Each fixed-size tombstone entry records an `ObjectId`, the object-data version
+that was proven unreachable, a GC epoch, and a checksum. Recovery should first
+select the highest committed live object-data version from transaction logs,
+then apply the highest valid GC tombstone for that `ObjectId`; a tombstone only
+suppresses a live record when `tombstone.target_version >= live.version`.
 
 Wave 5 should integrate Immix-style block/line reclamation using the existing
 Wizard-shaped block region. Immix should be a storage reuse policy under stable

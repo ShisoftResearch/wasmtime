@@ -1049,13 +1049,29 @@ This wave still must not reclaim durable storage.
 **Purpose:** design and implement actual persistent-object reclamation after the
 logical marker and commit-coupled incremental marker have enough coverage.
 
+Current design direction:
+
+- tombstones are GC-owned fixed-size metadata entries stored in dedicated GC
+  tombstone blocks, not user transaction log entries
+- each tombstone records `ObjectId`, target object-data `version`, GC epoch,
+  and CRC32
+- tombstones have no transaction id and no LP bit; each entry is independently
+  durable, so a crash during sweep leaves a partial collection rather than a
+  corrupt transaction
+- recovery first selects the highest committed live object-data version per
+  `ObjectId`, then applies the highest valid GC tombstone for that `ObjectId`
+- if `tombstone.target_version >= live.version`, recovery omits the object from
+  the rebuilt volatile object table
+- object data bytes remain in object-data blocks until a block cleaner copies
+  live records out and retires garbage-heavy blocks
+- `ObjectId` reuse stays disabled until generation/reuse rules are designed
+
 Deferred scope:
 
-- non-durable sweep/report-only mode, if useful for runtime cleanup tests
-- durable tombstone records and recovery precedence
-- root consistency rules across deletion
-- object-table slot/free-list handling
-- block/chunk reclamation and future Immix line reuse
+- block/chunk reclamation and Immix line reuse
+- explicit `ObjectId` reuse
+- concurrent sweep without a GC safe point
+- persistent full object-table storage
 
 ## Wave 10: Durable Backends
 
