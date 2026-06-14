@@ -58,16 +58,20 @@ Current remaining mock categories:
 - The runtime object path still uses volatile bridges for some Wasmtime GC and
   function-reference integration. Persistent transactional refs must end at
   `ObjectId`, not `VMGcRef` or `VMFuncRef`.
-- Object records need durable publication metadata and recovery scanning so the
-  volatile object index can be rebuilt after restart.
-- Persistent roots and commit-time promotion need to publish only `ObjectId`
-  edges into committed state.
-- Table/global object snapshots still need the final `ObjectId`-based durable
-  representation.
+- Durable object publication and Zen-style restart recovery are now implemented
+  for committed object records, roots, type/layout metadata, and scan-critical
+  region metadata.
+- Persistent roots now recover as `ObjectId`s from committed `TGlobal`/`TTable`
+  winners, but full runtime reintegration and GC-facing root closure remain
+  future work.
+- Commit-time promotion from volatile `VMGcRef` graphs into persistent
+  `ObjectId` graphs remains future work.
 - `ttry`/`tfail` remains a later structured-failure workstream.
-- Persistent-object GC has a runtime-only logical marker. Commit-coupled
-  incremental marking, tombstone-less recovery-time GC, volatile sweep, and
-  block/chunk reclamation remain future work. Per-object tombstones are not the
+- Persistent-object GC now has a runtime marker, commit-coupled incremental
+  marking, tombstone-less recovery filtering, recovered record location
+  reporting, volatile sweep/reporting, and file-backed end-to-end coverage.
+  Durable block/chunk retirement, durable block reuse, and explicit
+  `ObjectId` reuse remain future work. Per-object tombstones are not the
   baseline design.
 - `FileBackedMemory` and `NVMemory` still need real recovery semantics; tests
   that require restart durability stay gated until hardware or restart harness
@@ -89,10 +93,10 @@ Current remaining mock categories:
   index is rebuilt in DRAM during recovery.
 - Persistent object-index maintenance is future work behind a separate policy.
   Do not add persistent-index writes to the first Zen-style path.
-- Full durable persistent-object GC is a future workstream. The current runtime
-  marker proves `ObjectId` reachability over traceable records, but transaction
-  object work still does not need to reclaim persistent objects to pass proposal
-  WAST.
+- Wave 9B/9C is implemented in volatile/recovery form: the current branch has
+  the runtime marker, commit-coupled `PersistentGcState` delta observation,
+  tombstone-less recovery filtering, recovered record location reporting, and
+  volatile sweep/reporting. Durable block/chunk reuse remains future work.
 - Reuse Wasmtime GC type/layout/cast/validation code where useful. Do not reuse
   `GcHeap`, `VMGcRef`, Wasmtime GC roots, or Wasmtime GC barriers as persistent
   object identity or storage.
@@ -1030,20 +1034,26 @@ git commit -m "Add persistent object marker"
 **Purpose:** make persistent reachability advance incrementally at transaction
 commit, where persistent graph mutation actually becomes visible.
 
-Design direction:
+**Status:** implemented on the `transaction` branch and done enough for the
+current baseline.
 
-- do not add ordinary per-field write barriers to staged transaction writes
-- collect a commit barrier delta from committed object/root publications
-- enqueue new root `ObjectId`s directly
-- when a committed edge `A -> B` is published and `A` is already marked,
-  enqueue `B` directly
-- keep `PersistentGcState` volatile: mark epoch, reachable set, grey queue, and
-  current phase
-- run a bounded marking minibatch after each successful commit
-- initially budget by scanned object count; consider edge or byte budgets later
-- keep an explicit maintenance step as a later option for read-heavy workloads
+Implemented status:
 
-This wave still must not reclaim durable storage.
+- `PersistentGcCommitDelta` captures committed root publications and committed
+  `ObjectId` edges from newly published object payloads.
+- `PersistentGcState::observe_commit_delta` performs bounded post-commit
+  marking minibatches.
+- New root publications enqueue their root `ObjectId`s directly.
+- When a committed edge `A -> B` is published and `A` is already reachable in
+  the current cycle, the commit delta enqueues `B`; otherwise `B` is observed
+  when `A` is later scanned.
+- Coverage exists for root enqueue, marked-owner child enqueue, and
+  unmarked-owner no-op cases.
+
+Still deferred around 9B:
+
+- an explicit maintenance-step API for read-heavy workloads
+- any reclamation path that depends on durable block/chunk retirement metadata
 
 ## Wave 9C: Tombstone-Less Recovery-Time Persistent GC
 
@@ -1051,30 +1061,31 @@ This wave still must not reclaim durable storage.
 allocator state from reachable persistent objects only, without writing durable
 per-object GC tombstones.
 
-Current design direction:
+**Status:** implemented on the `transaction` branch and done enough for the
+current baseline.
 
-- follow the Makalu/Ralloc-style tradeoff: minimize runtime persistent metadata
-  writes and pay recovery-time GC cost after restart
-- use Ralloc-style recoverability as the correctness rule: after recovery,
-  allocator/object metadata describes all and only persistent objects reachable
-  from persistent roots
-- use Makalu-style ownership-before-use for future persistent block/chunk
-  allocation so crashes can leak temporarily but cannot double-allocate storage
-- use persistent type/layout metadata as Ralloc-style filter functions; recovery
-  traces typed `ObjectId` fields/elements and treats missing layout metadata as
-  corruption
-- do not persist tombstones, mark bits, line marks, free lists, reclaim queues,
-  block live-byte summaries, or object-table entries
-- recovery scans committed object data, selects the highest live version per
-  `ObjectId`, and builds a temporary winner map
-- recovery loads persistent roots and type/layout metadata, then runs a full
-  `ObjectId` graph mark over the winner map
-- recovery rebuilds the volatile object table only for reachable winners
-- recovery reconstructs auxiliary allocator state from reachable records and
-  region metadata
-- runtime sweep may remove unreachable entries from volatile indices and update
-  volatile block summaries, but it does not persist dead-object state
-- `ObjectId` reuse stays disabled until generation/reuse rules are designed
+Wave 9C now uses tombstone-less Makalu/Ralloc-style recovery. Persistent
+storage contains committed object records, roots, type/layout metadata, and
+scan-critical region metadata. Recovery selects live object-data winners, marks
+from persistent roots, rebuilds the volatile object table only for reachable
+objects, and reconstructs auxiliary allocator state. Durable block reuse
+remains deferred until block-generation or checkpoint retirement metadata
+exists.
+
+Implemented status:
+
+- Recovery scans committed object data, selects the highest live version per
+  `ObjectId`, and builds a temporary winner map.
+- Recovery loads persistent roots and type/layout metadata, then runs a full
+  `ObjectId` graph mark over the winner map.
+- Recovery rebuilds the volatile object table only for reachable winners, so
+  unreachable garbage is not installed into the runtime object index.
+- Recovered winners carry `data_block`, `data_offset`, and `record_len`, and
+  recovery reports reachable and unreachable durable record locations.
+- Runtime volatile sweep/reporting updates volatile indices and block summaries
+  without persisting dead-object state.
+- File-backed end-to-end coverage exercises tombstone-less recovery and the
+  reachable-only rebuild path.
 
 Deferred scope:
 
@@ -1084,6 +1095,10 @@ Deferred scope:
   retired blocks
 - persistent allocator undo/redo repair for future block ownership transitions
 - explicit `ObjectId` reuse
+- commit-time promotion from volatile `VMGcRef` graphs into persistent object
+  graphs
+- full runtime reintegration of recovered `TGlobal`/`TTable` roots into
+  Wasmtime GC-facing root closure
 - persistent full object-table storage
 
 ## Wave 10: Durable Backends

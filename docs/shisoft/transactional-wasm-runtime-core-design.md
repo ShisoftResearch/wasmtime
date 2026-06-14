@@ -731,10 +731,12 @@ promotion map.
 
 ## Persistent Object GC Strategy
 
-Full durable persistent-object GC remains a future workstream, not a blocker for
-the first real object runtime or proposal WAST completion. The current branch
-has a runtime-only logical marker, and the object runtime must remain ready for
-incremental marking and later reclamation.
+Wave 9B/9C now provides the first implemented persistent-object GC baseline for
+this branch. The current runtime has a logical marker, commit-coupled
+`PersistentGcState` delta observation, tombstone-less recovery-time winner
+filtering, recovered record location reporting, and volatile sweep/reporting.
+Durable block/chunk reclamation and reuse remain later workstreams, not
+blockers for the first real object runtime or proposal WAST completion.
 
 The current implementation direction is:
 
@@ -743,8 +745,8 @@ The current implementation direction is:
 - keep payloads traceable by `kind` and recovered `type_layout_id` metadata
 - store persistent references as `ObjectId`
 - reject or promote volatile `VMGcRef` values before commit
-- allow the first volatile backend to leak or explicitly free test objects
-  rather than implementing a full collector immediately
+- defer durable block/chunk reuse until recovery can safely ignore retired
+  object-data ranges
 
 Wasmtime GC code should be reused for type knowledge, not persistent storage.
 Useful reusable pieces include shared type indices, struct and array layout
@@ -753,13 +755,7 @@ transaction-local objects. The persistent object space must not reuse
 `GcHeap`, `VMGcRef`, Wasmtime GC roots, or Wasmtime GC barriers as durable
 object identity or durability mechanisms.
 
-The implemented first persistent collector is a runtime-only `ObjectId` graph
-marker. It takes explicit persistent roots, walks committed object records
-through the volatile object table and recovered layout metadata, and returns a
-reachability report. It does not write persistent storage, mutate the object
-table, publish tombstones, or reclaim blocks.
-
-The future persistent collector remains an `ObjectId` graph collector:
+The implemented collector pipeline remains an `ObjectId` graph collector:
 
 ```text
 persistent roots
@@ -769,8 +765,8 @@ persistent roots
 ```
 
 Because persistent graph mutation becomes visible only at transaction commit,
-future incremental marking should use commit barriers rather than ordinary
-per-field write barriers on staged writes. Staged `tstruct`, `tarray`,
+incremental marking uses commit barriers rather than ordinary per-field write
+barriers on staged writes. Staged `tstruct`, `tarray`,
 `tglobal`, and `ttable` reference writes remain private transaction workspace
 state until commit. The commit path is the first point where those changes can
 become durable and visible to persistent reachability.
@@ -790,11 +786,11 @@ work is needed because scanning `A` later in the same cycle will observe the
 current committed record. New root publications enqueue their root `ObjectId`s
 directly.
 
-GC progress should initially be commit-coupled rather than periodic. The store
-keeps a volatile `PersistentGcState` with a mark epoch, reachable set, and grey
-queue. Each successful transaction commit observes the commit barrier delta and
-then performs a bounded marking minibatch. The first budget unit can be scanned
-object count; later versions may switch to edge count or payload bytes.
+GC progress is commit-coupled rather than periodic in the current branch. The
+store keeps a volatile `PersistentGcState` with a reachable set and grey queue.
+Each successful transaction commit observes the commit barrier delta and then
+performs a bounded marking minibatch. The first budget unit is scanned object
+count; later versions may switch to edge count or payload bytes.
 
 The minibatch must not scan mutable staged workspaces as if they were committed
 state. It should run only after the commit graph is frozen and visible, either
@@ -812,6 +808,14 @@ tradeoff: avoid persistent writes for collector metadata during normal
 execution, then rebuild the auxiliary allocator and object-table state with
 recovery-time GC. Persistent storage keeps only program state and scan-critical
 layout facts:
+
+Wave 9C now uses tombstone-less Makalu/Ralloc-style recovery. Persistent
+storage contains committed object records, roots, type/layout metadata, and
+scan-critical region metadata. Recovery selects live object-data winners, marks
+from persistent roots, rebuilds the volatile object table only for reachable
+objects, and reconstructs auxiliary allocator state. Durable block reuse
+remains deferred until block-generation or checkpoint retirement metadata
+exists.
 
 Research basis: Makalu uses lazily persisted non-essential metadata plus
 post-failure recovery-time GC to reduce allocation persistence overhead. Ralloc
@@ -864,10 +868,12 @@ Recovery uses full reachability instead of tombstones:
 3. Build a temporary ObjectId -> object-record winner map.
 4. Load persistent roots and type/layout metadata.
 5. Run full ObjectId graph marking over the winner map.
-6. Rebuild the volatile ObjectTable only for reachable winners.
-7. Reconstruct line marks, block live-byte summaries, free lists, and reclaim
+6. Record reachable and unreachable durable record locations from recovered
+   `data_block`, `data_offset`, and `record_len` metadata.
+7. Rebuild the volatile ObjectTable only for reachable winners.
+8. Reconstruct line marks, block live-byte summaries, free lists, and reclaim
    queues from reachable records and region metadata.
-8. Expose the VM.
+9. Expose the VM.
 ```
 
 If the future block allocator uses persistent undo/redo metadata to move blocks
@@ -875,11 +881,12 @@ between free, owned, retired, and active generations, recovery must repair those
 metadata operations before the reachability pass. After repair, reachability
 remains authoritative for object liveness and volatile free/reclaim structures.
 
-Runtime persistent GC may use the same marker to remove unreachable entries from
-the volatile object table and update volatile block summaries. It still does
-not persist dead-object state. If the process crashes before runtime cleanup
-finishes, recovery repeats the full reachability computation and reaches the
-same logical object table.
+Runtime persistent GC now uses the same reachability machinery to remove
+unreachable entries from volatile indices and update volatile block summaries
+without persisting dead-object state. Recovery and runtime sweep both report
+durable record locations for reachable versus unreachable winners. If the
+process crashes before runtime cleanup finishes, recovery repeats the full
+reachability computation and reaches the same logical object table.
 
 Durable storage reuse is a block/chunk-cleaning problem, not a per-object
 tombstone problem. Old unreachable object data remains in object-data blocks
@@ -1025,11 +1032,14 @@ Recovery rebuilds the object table as follows:
 5. Select the highest `version` for each object logical id; duplicate committed
    versions are corruption.
 6. Validate every winner against the recovered `type_layout_id` metadata.
-7. Reinstall winning object record bytes into the runtime object heap.
-8. Reconstruct volatile object table slots from `TxObjectHeader.object_id`,
-   `kind`, `version`, and `type_layout_id`.
-9. Reconstruct phase-1 durable roots from committed `TGlobal`/`TTable`
+7. Reconstruct phase-1 durable roots from committed `TGlobal`/`TTable`
    root-bearing winners.
+8. Run full `ObjectId` graph marking over the recovered winner map.
+9. Record reachable and unreachable durable record locations from recovered
+   `data_block`, `data_offset`, and `record_len` metadata.
+10. Reinstall only reachable object record bytes into the runtime object heap.
+11. Reconstruct volatile object table slots only for reachable winners from
+    `TxObjectHeader.object_id`, `kind`, `version`, and `type_layout_id`.
 
 Object-table-facing constraints:
 
@@ -1115,8 +1125,9 @@ Final success requires:
 
 Implementation progress is tracked in
 `docs/shisoft/transactional-wasm-implementation-log.md` and the WAST roadmap.
-From this design point, the remaining architecture work should proceed in this
-order:
+The runtime-only marker, commit-coupled incremental marking, and tombstone-less
+recovery-time persistent GC are now implemented on this branch. From this
+design point, the remaining architecture work should proceed in this order:
 
 1. Keep the executable `tfunc`, `tmemory`, `tglobal`, `ttable`, SIMD, `ttry`,
    `tfail`, object, and conflict paths stable while removing remaining parser
@@ -1129,24 +1140,19 @@ order:
 4. Complete runtime reintegration for recovered `tglobal` and `ttable`
    reference-bearing roots. Recovery already reconstructs root `ObjectId`s from
    committed `TGlobal`/`TTable` winners, but the recovered roots still need to
-   be wired into the persistent object runtime and future GC root closure.
-   Persistent `TStruct` and `TArray` records already use durable object
-   publication data and recovered `type_layout_id` metadata in the current
-   file-backed path, but still need the final GC-backed object identity and
-   promotion integration.
+   be wired into the persistent object runtime and GC-facing root closure.
 5. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
    persistent `ObjectId` graphs.
 6. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
-   metadata so persistent GC can be added without changing committed formats.
-7. Add the runtime-only persistent `ObjectId` logical marker.
-8. Add commit-coupled incremental marking with commit barriers and bounded
-   marking minibatches.
-9. Implement tombstone-less recovery-time persistent GC first; do not add
-   ad hoc deletion/tombstone semantics before explicit durable delete or
-   block-retirement reclamation is designed.
-10. Add optional persistent-index/object-table persistence only behind an
-    explicit future feature/configuration switch if Zen-style recovery time is
-    unacceptable.
+   metadata while extending coverage for promotion and root reintegration paths.
+7. Add durable block/chunk retirement metadata, safe persistent block reuse,
+   and any required allocator repair for future ownership-generation
+   transitions.
+8. Design explicit `ObjectId` reuse rules only after durable block retirement
+   and reuse semantics exist.
+9. Add optional persistent-index/object-table persistence only behind an
+   explicit future feature/configuration switch if Zen-style recovery time is
+   unacceptable.
 
 This order keeps ordinary Wasmtime GC isolated while the persistent object heap
 is brought online, then adds persistent reachability collection after the

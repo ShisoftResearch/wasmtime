@@ -21,7 +21,70 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
-## Persistent Object GC 9C Planning Update: Tombstone-Less Recovery
+## Current Status: Wave 9B/9C Persistent Object GC
+
+Date: 2026-06-14
+
+Wave 9B/9C persistent object GC is implemented far enough for the current
+`transaction` branch baseline.
+
+Wave 9C now uses tombstone-less Makalu/Ralloc-style recovery. Persistent
+storage contains committed object records, roots, type/layout metadata, and
+scan-critical region metadata. Recovery selects live object-data winners, marks
+from persistent roots, rebuilds the volatile object table only for reachable
+objects, and reconstructs auxiliary allocator state. Durable block reuse
+remains deferred until block-generation or checkpoint retirement metadata
+exists.
+
+Implemented status:
+
+- `PersistentGcState` now observes commit-coupled deltas from committed roots
+  and committed object-edge publications.
+- Recovery filters the recovered winner map by reachability before rebuilding
+  the volatile `ObjectTable`, so unreachable garbage is not installed and then
+  swept later.
+- Recovered object winners now carry `data_block`, `data_offset`, and
+  `record_len`, and the recovery report exposes reachable and unreachable
+  durable record locations.
+- Runtime volatile sweep/reporting for persistent objects is implemented.
+- File-backed end-to-end coverage exercises the tombstone-less recovery path.
+
+Still deferred:
+
+- durable block/chunk retirement, durable block reuse, and Immix line reuse
+- explicit `ObjectId` reuse
+- commit-time promotion from volatile `VMGcRef` graphs into persistent object
+  graphs
+- full runtime reintegration of recovered persistent roots into Wasmtime
+  GC-facing root closure
+
+Verification commands for this slice:
+
+```text
+cargo fmt --check
+failed with an existing formatting diff in
+`crates/wasmtime/src/runtime/transaction.rs:12873`
+
+cargo test -p wasmtime --lib persistent_gc -- --format terse
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 598 filtered out
+
+cargo test -p wasmtime --lib persistent_object_marker -- --format terse
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 602 filtered out
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 304 passed; 0 failed; 0 ignored; 0 measured; 310 filtered out
+
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+cargo test -p wasmtime --lib -- --format terse
+test result: ok. 612 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+
+git diff --check
+no output
+```
+
+## Persistent Object GC 9C Design Basis: Tombstone-Less Recovery
 
 Date: 2026-06-14
 
@@ -42,12 +105,12 @@ The design adopts three specific ideas from Makalu and Ralloc:
   persistent type/layout metadata. Recovery traces only fields/elements that
   the recovered layout marks as `ObjectId` references.
 
-Recovery should scan user transaction logs to choose the highest live
-object-data winner per `ObjectId`, load persistent roots and type/layout
-metadata, run full `ObjectId` graph marking over the winner map, and rebuild
-the volatile object table only for reachable winners. It should also
-reconstruct volatile line marks, block live-byte summaries, free lists, and
-reclaim queues from reachable records and region metadata.
+Recovery now scans user transaction logs to choose the highest live object-data
+winner per `ObjectId`, loads persistent roots and type/layout metadata, runs
+full `ObjectId` graph marking over the winner map, and rebuilds the volatile
+object table only for reachable winners. It also reconstructs volatile line
+marks, block live-byte summaries, free lists, and reclaim queues from
+reachable records and region metadata.
 
 Durable space reuse moves to a later block/chunk-retirement workstream. Until
 the runtime can publish block-generation or checkpoint metadata that lets
@@ -115,9 +178,10 @@ cargo fmt --check
 
 Remaining implementation boundaries:
 
-- No recovery-time object-table filtering implementation yet.
+- Commit-coupled marking, recovery-time winner filtering, recovered record
+  location reporting, and volatile sweep are now implemented; see the current
+  status section above.
 - No durable block/chunk retirement or persistent block reuse yet.
-- No volatile sweep mode yet.
 - No block, chunk, or Immix line reclamation yet.
 - No root integration with Wasmtime stack/host roots; roots are explicit
   persistent `ObjectId` inputs.
@@ -185,10 +249,11 @@ Remaining boundaries:
 - Recovery can reconstruct root `ObjectId`s from committed `TGlobal`/`TTable`
   winners, but those recovered roots still need runtime reintegration and
   GC-facing root-closure handling.
-- Persistent-object recovery-time GC, volatile sweep, and block/chunk
-  reclamation are still future work. The current format is designed so those
-  can trace by `ObjectId` without adding a persisted object table. Per-object
-  tombstones are not the baseline GC design.
+- Commit-coupled marking, tombstone-less recovery filtering, recovered record
+  location reporting, and volatile sweep/reporting are now implemented. Durable
+  block/chunk reclamation and reuse are still future work. The current format
+  is designed so those can trace by `ObjectId` without adding a persisted
+  object table. Per-object tombstones are not the baseline GC design.
 
 ## Model-Checking Wave 10: WAST And Model Cross-Checks
 
