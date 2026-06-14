@@ -8712,12 +8712,27 @@ mod tests {
                 ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
             );
 
-            let err = recover_file_backed_object_without_layout_metadata_for_test(&publication)
+            let recovered =
+                recover_file_backed_object_without_layout_metadata_for_test(&publication).unwrap();
+            assert_eq!(recovered.root_object_ids, Vec::<u64>::new());
+            assert_eq!(recovered.type_layouts.iter().count(), 0);
+            let object_winners = recovered.committed_object_winners().unwrap();
+            assert_eq!(object_winners.len(), 1);
+            assert_eq!(object_winners[0].object_id, 41);
+            assert_eq!(object_winners[0].type_layout_id, 701);
+
+            let mut rebuilt = ObjectTable::default();
+            let err = rebuilt
+                .rebuild_reachable_from_recovery_for_test(
+                    &recovered.type_layouts,
+                    &object_winners,
+                    &[41],
+                )
                 .unwrap_err();
 
             assert!(
                 err.to_string()
-                    .contains("missing persistent type layout id 701"),
+                    .contains("unknown persistent type layout id: 701"),
                 "{err:?}"
             );
         }
