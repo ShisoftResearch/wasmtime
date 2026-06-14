@@ -17,14 +17,12 @@ mod persist;
 #[path = "transaction/type_layout.rs"]
 pub(crate) mod type_layout;
 pub(crate) use object_gc::{
-    DanglingObjectRef, DanglingObjectRefKind, PersistentRecoveryGcReport, PersistentRootError,
+    DanglingObjectRef, DanglingObjectRefKind, PersistentGcBudget, PersistentGcCommitDelta,
+    PersistentGcState, PersistentGcStepReport, PersistentRecoveryGcReport, PersistentRootError,
     PersistentRootErrorKind,
 };
 #[cfg(test)]
-use object_gc::{
-    PersistentGcBudget, PersistentGcCommitDelta, PersistentGcState, PersistentGcStepReport,
-    PersistentObjectEdge, PersistentObjectMarker,
-};
+use object_gc::{PersistentObjectEdge, PersistentObjectMarker};
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
 pub(crate) use object_heap::TxObjectHeader;
@@ -4085,6 +4083,9 @@ impl TransactionState {
     ) -> Result<object_gc::PersistentGcCommitDelta> {
         self.ensure_active()?;
         let mut delta = object_gc::PersistentGcCommitDelta::default();
+        delta.invalidates_reachable_cache = !self.staged_globals.is_empty()
+            || !self.staged_table_elements.is_empty()
+            || !publications.is_empty();
         for &value in self.staged_globals.values() {
             if let Some(root) = persistent_root_object_id_for_global_snapshot(object_table, value)?
             {
@@ -4124,6 +4125,9 @@ impl TransactionState {
             self.active.is_none() && current_thread_transaction().is_none(),
             "persistent object marker cannot run while a transaction is active"
         );
+        if delta.invalidates_reachable_cache {
+            self.persistent_gc_state = None;
+        }
         if self.persistent_gc_state.is_none()
             && delta.new_roots.is_empty()
             && delta.edges.is_empty()
@@ -4137,6 +4141,20 @@ impl TransactionState {
                 .insert(PersistentGcState::new(object_table, [])?),
         };
         state.observe_commit_delta(object_table, delta, PersistentGcBudget::objects(1))
+    }
+
+    pub(crate) fn observe_persistent_gc_commit_delta_after_commit_best_effort(
+        &mut self,
+        object_table: &ObjectTable,
+        delta: &PersistentGcCommitDelta,
+    ) -> PersistentGcStepReport {
+        match self.observe_persistent_gc_commit_delta_after_commit(object_table, delta) {
+            Ok(report) => report,
+            Err(_) => {
+                self.persistent_gc_state = None;
+                PersistentGcStepReport::default()
+            }
+        }
     }
 
     fn commit_object_payloads_with<F>(
@@ -12779,6 +12797,7 @@ mod tests {
             PersistentGcCommitDelta {
                 new_roots: object_set([root]),
                 edges: BTreeSet::new(),
+                invalidates_reachable_cache: true,
             }
         );
 
@@ -12914,10 +12933,7 @@ mod tests {
             state
                 .observe_persistent_gc_commit_delta_after_commit(&objects, &edge_delta)
                 .unwrap(),
-            PersistentGcStepReport {
-                scanned_objects: 1,
-                enqueued_objects: 0,
-            }
+            PersistentGcStepReport::default()
         );
     }
 
@@ -12941,6 +12957,100 @@ mod tests {
             err.to_string()
                 .contains("persistent object marker cannot run while a transaction is active"),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_gc_best_effort_observer_does_not_report_post_commit_failure() {
+        let mut objects = ObjectTable::default();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(0x581, vec![ObjectValue::I32(8)])
+            .unwrap();
+        let _root = objects
+            .allocate_persistent_struct_for_gc_ref(0x582, vec![ObjectValue::Ref(Some(child))])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(581));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x582)).unwrap();
+        let delta = state.persistent_gc_commit_delta(&objects, &[]).unwrap();
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            state
+                .observe_persistent_gc_commit_delta_after_commit(&objects, &delta)
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 1,
+            }
+        );
+
+        objects.free(child).unwrap();
+        let report = state.observe_persistent_gc_commit_delta_after_commit_best_effort(
+            &objects,
+            &PersistentGcCommitDelta::default(),
+        );
+        assert_eq!(report, PersistentGcStepReport::default());
+        assert!(state.persistent_gc_state.is_none());
+    }
+
+    #[test]
+    fn persistent_gc_commit_delta_invalidates_cached_reachability_on_root_removal() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x583, vec![ObjectValue::Ref(None)])
+            .unwrap();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(0x584, vec![ObjectValue::I32(8)])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(583));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x583)).unwrap();
+        let initial_delta = state.persistent_gc_commit_delta(&objects, &[]).unwrap();
+        state.complete_commit().unwrap();
+        assert_eq!(
+            state
+                .observe_persistent_gc_commit_delta_after_commit(&objects, &initial_delta)
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 0,
+            }
+        );
+
+        state.begin().unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(0)).unwrap();
+        let removal_delta = state.persistent_gc_commit_delta(&objects, &[]).unwrap();
+        assert!(removal_delta.invalidates_reachable_cache);
+        assert!(removal_delta.new_roots.is_empty());
+        state.complete_commit().unwrap();
+        assert_eq!(
+            state
+                .observe_persistent_gc_commit_delta_after_commit(&objects, &removal_delta)
+                .unwrap(),
+            PersistentGcStepReport::default()
+        );
+
+        state.begin().unwrap();
+        state.acquire_object_write(&objects, root).unwrap();
+        state
+            .stage_struct_field(&objects, root, 0, ObjectValue::Ref(Some(child)))
+            .unwrap();
+        let mut publications = Vec::new();
+        state
+            .commit_object_payloads_into(&mut objects, &mut publications)
+            .unwrap();
+        let edge_delta = state
+            .persistent_gc_commit_delta(&objects, &publications)
+            .unwrap();
+        assert!(edge_delta.invalidates_reachable_cache);
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            state
+                .observe_persistent_gc_commit_delta_after_commit(&objects, &edge_delta)
+                .unwrap(),
+            PersistentGcStepReport::default()
         );
     }
 
@@ -12987,6 +13097,7 @@ mod tests {
                     from: owner,
                     to: child,
                 }]),
+                invalidates_reachable_cache: true,
             }
         );
 

@@ -787,10 +787,13 @@ current committed record. New root publications enqueue their root `ObjectId`s
 directly.
 
 GC progress is commit-coupled rather than periodic in the current branch. The
-store keeps a volatile `PersistentGcState` with a reachable set and grey queue.
-Each successful transaction commit observes the commit barrier delta and then
-performs a bounded marking minibatch. The first budget unit is scanned object
-count; later versions may switch to edge count or payload bytes.
+store keeps an opportunistic volatile `PersistentGcState` with a reachable set
+and grey queue. Each successful transaction commit observes the commit barrier
+delta and then performs a bounded marking minibatch. The first budget unit is
+scanned object count; later versions may switch to edge count or payload bytes.
+Because this state is auxiliary GC progress, not transaction correctness state,
+post-commit observer failures clear the cached marker and must not report the
+already-completed transaction commit as failed.
 
 The minibatch must not scan mutable staged workspaces as if they were committed
 state. It should run only after the commit graph is frozen and visible, either
@@ -800,8 +803,12 @@ current full marker keeps the stricter rule and rejects arbitrary active
 transactions.
 
 This incremental design is conservative. Removing a root or deleting an edge
-during a mark cycle may leave the old target marked until a later cycle. That
-only delays reclamation and is acceptable before durable block reuse exists.
+during a mark cycle invalidates the cached reachable set in the current
+implementation. Until the runtime has a complete committed-root enumerator, any
+commit that changes root-bearing globals/tables or publishes an object record
+resets the opportunistic marker and then seeds only roots introduced by that
+commit. This may lose incremental progress and delay reclamation, but it avoids
+using stale reachability as evidence that later edge additions are live.
 
 The persistent GC baseline is tombstone-less, following the Makalu/Ralloc-style
 tradeoff: avoid persistent writes for collector metadata during normal
@@ -841,7 +848,10 @@ Ralloc's filter-function idea maps to our persistent type/layout metadata.
 Because persistent Wasm objects are typed, recovery does not need conservative
 pointer guessing for `tstruct`/`tarray` payloads. The recovered `kind` and
 `type_layout_id` identify exactly which fields/elements contain `ObjectId`
-references. Unknown or missing layout metadata is a recovery error, not a
+references. Raw log replay keeps scan-valid object winners even when their
+layout metadata is missing, so stale unreachable records cannot abort recovery.
+When a winner is reachable and must be traced or rebuilt into the volatile
+object table, unknown or missing layout metadata is a recovery error, not a
 reason to scan arbitrary words as object references.
 
 - committed object data records and their `ObjectId`, `version`, `kind`, and
@@ -1031,14 +1041,20 @@ Recovery rebuilds the object table as follows:
 4. Decode committed `TStruct` and `TArray` data records.
 5. Select the highest `version` for each object logical id; duplicate committed
    versions are corruption.
-6. Validate every winner against the recovered `type_layout_id` metadata.
+6. Validate scan-critical object-record facts: logical id, version, data role,
+   object kind, object header identity, and outer/header layout agreement.
+   Do not reject an otherwise scan-valid winner only because its layout record
+   is absent; unreachable stale records must not abort raw recovery.
 7. Reconstruct phase-1 durable roots from committed `TGlobal`/`TTable`
    root-bearing winners.
 8. Run full `ObjectId` graph marking over the recovered winner map.
-9. Record reachable and unreachable durable record locations from recovered
+9. Validate reachable winners against recovered `type_layout_id` metadata while
+   tracing and rebuilding them. Missing or kind-mismatched layout metadata is a
+   recovery error only for reachable winners.
+10. Record reachable and unreachable durable record locations from recovered
    `data_block`, `data_offset`, and `record_len` metadata.
-10. Reinstall only reachable object record bytes into the runtime object heap.
-11. Reconstruct volatile object table slots only for reachable winners from
+11. Reinstall only reachable object record bytes into the runtime object heap.
+12. Reconstruct volatile object table slots only for reachable winners from
     `TxObjectHeader.object_id`, `kind`, `version`, and `type_layout_id`.
 
 Object-table-facing constraints:

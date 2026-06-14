@@ -1,6 +1,6 @@
 # Persistent Object GC 9B/9C Tombstone-Less Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking; checked items reflect implemented status.
 
 **Goal:** Keep Wave 9B commit-coupled marking, then implement Wave 9C recovery-time persistent object GC without durable tombstones.
 
@@ -68,7 +68,7 @@ object-data blocks can be safely reused.
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
 - Test: `cargo test -p wasmtime --lib persistent_object_marker -- --format terse`
 
-- [ ] **Step 1: Move marker-only code into `object_gc.rs`**
+- [x] **Step 1: Move marker-only code into `object_gc.rs`**
 
 Move these existing types from `transaction.rs` into `object_gc.rs`:
 
@@ -84,7 +84,7 @@ PersistentObjectMarker
 Keep `PersistentObjectMarker::mark` as the compatibility entry used by current
 tests.
 
-- [ ] **Step 2: Add budgeted mark state**
+- [x] **Step 2: Add budgeted mark state**
 
 Add these runtime-only types in `object_gc.rs`:
 
@@ -119,7 +119,7 @@ pub(crate) struct PersistentGcState {
 validated roots, run mark steps until the grey queue is empty, and return the
 same report shape as Wave 9A.
 
-- [ ] **Step 3: Verify marker compatibility**
+- [x] **Step 3: Verify marker compatibility**
 
 Run:
 
@@ -133,7 +133,7 @@ Expected:
 test result: ok. 7 passed; 0 failed; 0 ignored
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 
@@ -150,7 +150,7 @@ git commit -m "Refactor persistent object marker core"
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
 - Test: `cargo test -p wasmtime --lib persistent_gc_commit -- --format terse`
 
-- [ ] **Step 1: Add commit delta types**
+- [x] **Step 1: Add commit delta types**
 
 Add these types to `object_gc.rs`:
 
@@ -172,7 +172,7 @@ Object publication commits should produce edges from the committed object to
 each persistent `ObjectId` in its payload. Root commits from `tglobal` and
 `ttable` produce `new_roots`.
 
-- [ ] **Step 2: Add commit barrier observation**
+- [x] **Step 2: Add commit barrier observation**
 
 Add:
 
@@ -200,7 +200,7 @@ impl PersistentGcState {
 If `A -> B` is published and `A` is unmarked, do not enqueue `B` immediately;
 scanning `A` in the same cycle will see the committed edge.
 
-- [ ] **Step 3: Add focused tests**
+- [x] **Step 3: Add focused tests**
 
 Add tests named:
 
@@ -218,7 +218,7 @@ cargo test -p wasmtime --lib persistent_gc_commit -- --format terse
 
 Expected: all three tests pass.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 
@@ -235,7 +235,7 @@ git commit -m "Add commit-coupled persistent marking"
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
 - Test: `cargo test -p wasmtime --lib persistent_gc_recovery_filter -- --format terse`
 
-- [ ] **Step 1: Write recovery filtering tests**
+- [x] **Step 1: Write recovery filtering tests**
 
 Add tests in `transaction.rs` named:
 
@@ -267,7 +267,7 @@ It should prove typed tracing is mandatory by giving a recovered object winner
 whose `type_layout_id` is not present in the recovered layout registry and
 asserting recovery returns an error.
 
-- [ ] **Step 2: Add recovery filter report**
+- [x] **Step 2: Add recovery filter report**
 
 Add to `object_gc.rs`:
 
@@ -280,7 +280,7 @@ pub(crate) struct PersistentRecoveryGcReport {
 }
 ```
 
-- [ ] **Step 3: Add reachable rebuild helper**
+- [x] **Step 3: Add reachable rebuild helper**
 
 Add to `ObjectTable` in `transaction.rs`:
 
@@ -339,7 +339,7 @@ The first implementation may use this two-phase rebuild because it stays inside
 volatile runtime structures. A later implementation can mark directly over the
 temporary winner map without first installing unreachable winners.
 
-- [ ] **Step 4: Expose a test wrapper**
+- [x] **Step 4: Expose a test wrapper**
 
 Add in the existing `#[cfg(test)] impl ObjectTable` block:
 
@@ -358,7 +358,7 @@ fn rebuild_reachable_from_recovery_for_test(
 }
 ```
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
@@ -369,7 +369,7 @@ cargo test -p wasmtime --lib persistent_object_marker -- --format terse
 
 Expected: recovery-filter tests and existing marker tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -386,7 +386,7 @@ git commit -m "Filter recovered persistent objects by reachability"
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
 - Test: `cargo test -p wasmtime --lib persistent_gc_recovery_locations -- --format terse`
 
-- [ ] **Step 1: Write location tests**
+- [x] **Step 1: Write location tests**
 
 Add tests named:
 
@@ -403,7 +403,7 @@ assert!(winner.data_block > 0);
 assert!(winner.record_len > 0);
 ```
 
-- [ ] **Step 2: Extend `RecoveredObjectWinner`**
+- [x] **Step 2: Extend `RecoveredObjectWinner`**
 
 Modify `RecoveredObjectWinner` in `recovery.rs`:
 
@@ -431,7 +431,7 @@ record_len: object_header.record_len,
 
 Update existing test helper constructors to include these fields.
 
-- [ ] **Step 3: Add recovered liveness report types**
+- [x] **Step 3: Add recovered liveness report types**
 
 Add to `object_gc.rs`:
 
@@ -453,7 +453,7 @@ pub(crate) reachable_record_locations: Vec<PersistentRecoveredRecordLocation>,
 pub(crate) unreachable_record_locations: Vec<PersistentRecoveredRecordLocation>,
 ```
 
-- [ ] **Step 4: Populate liveness report locations**
+- [x] **Step 4: Populate liveness report locations**
 
 In `rebuild_reachable_from_recovered_object_winners`, classify each winner into
 reachable or unreachable location vectors using the mark report.
@@ -463,7 +463,7 @@ future block/line reconstruction code enough information to rebuild volatile
 line marks, block live-byte summaries, free lists, and reclaim queues without
 persisting those structures.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
@@ -474,7 +474,7 @@ cargo test -p wasmtime --test transaction_persistence -- --format terse
 
 Expected: recovery location tests and existing persistence tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -491,7 +491,7 @@ git commit -m "Report recovered persistent object liveness"
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
 - Test: `cargo test -p wasmtime --lib persistent_gc_volatile_sweep -- --format terse`
 
-- [ ] **Step 1: Write volatile sweep tests**
+- [x] **Step 1: Write volatile sweep tests**
 
 Add tests named:
 
@@ -504,7 +504,7 @@ persistent_gc_volatile_sweep_does_not_persist_dead_state
 The removal test should allocate root and garbage objects, mark from the root,
 apply volatile sweep, and assert that the garbage object has no live slot.
 
-- [ ] **Step 2: Add sweep report types**
+- [x] **Step 2: Add sweep report types**
 
 Add to `object_gc.rs`:
 
@@ -516,7 +516,7 @@ pub(crate) struct PersistentVolatileSweepReport {
 }
 ```
 
-- [ ] **Step 3: Add object-table volatile sweep helper**
+- [x] **Step 3: Add object-table volatile sweep helper**
 
 Add to `ObjectTable`:
 
@@ -543,7 +543,7 @@ fn apply_volatile_persistent_sweep(
 runtime heap handles. It must not write object data, transaction logs,
 tombstones, or block metadata.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -554,7 +554,7 @@ cargo test -p wasmtime --lib transaction -- --format terse
 
 Expected: volatile sweep tests pass and transaction tests remain green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -570,7 +570,7 @@ git commit -m "Add volatile persistent object sweep"
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
 - Test: `cargo test -p wasmtime --lib persistent_gc_recovery_file_backed -- --format terse`
 
-- [ ] **Step 1: Write file-backed test**
+- [x] **Step 1: Write file-backed test**
 
 Add a test named:
 
@@ -588,7 +588,7 @@ The test should:
 5. Call `ObjectTable::rebuild_reachable_from_recovery_for_test`.
 6. Assert `root` is installed and `garbage` is skipped.
 
-- [ ] **Step 2: Verify the test**
+- [x] **Step 2: Verify the test**
 
 Run:
 
@@ -598,7 +598,7 @@ cargo test -p wasmtime --lib persistent_gc_file_backed_recovery_rebuilds_only_re
 
 Expected: the test passes without any tombstone or GC metadata block.
 
-- [ ] **Step 3: Guard against tombstone regressions**
+- [x] **Step 3: Guard against tombstone regressions**
 
 Add this assertion to the test or a companion test:
 
@@ -619,7 +619,7 @@ rg -n "GcTombstone|persistent_object_tombstone|TX_OBJECT_FLAG_DELETED" crates/wa
 Expected: no matches unless a future optional tombstone feature is explicitly
 introduced behind a separate design.
 
-- [ ] **Step 4: Verify recoverability invariant**
+- [x] **Step 4: Verify recoverability invariant**
 
 In the file-backed test, assert the report shape:
 
@@ -644,7 +644,7 @@ This verifies the Ralloc-style recoverability rule at the object-table level:
 after recovery filtering, live metadata names reachable objects and omits
 unreachable winners.
 
-- [ ] **Step 5: Run persistence tests**
+- [x] **Step 5: Run persistence tests**
 
 Run:
 
@@ -655,7 +655,7 @@ cargo test -p wasmtime --test transaction_persistence -- --format terse
 
 Expected: file-backed recovery test and existing persistence tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -672,7 +672,7 @@ git commit -m "Test tombstone-less persistent object recovery"
 - Modify: `docs/shisoft/transactional-wasm-remaining-work-roadmap.md`
 - Modify: `docs/shisoft/transactional-wasm-implementation-log.md`
 
-- [ ] **Step 1: Record implemented status**
+- [x] **Step 1: Record implemented status**
 
 Add this status text to the docs:
 
@@ -685,7 +685,7 @@ objects, and reconstructs auxiliary allocator state. Durable block reuse remains
 deferred until block-generation or checkpoint retirement metadata exists.
 ```
 
-- [ ] **Step 2: Run final verification**
+- [x] **Step 2: Run final verification**
 
 Run:
 
@@ -710,7 +710,7 @@ wasmtime lib tests: all pass with the existing ignored count only
 git diff --check: no output
 ```
 
-- [ ] **Step 3: Commit docs**
+- [x] **Step 3: Commit docs**
 
 Run:
 

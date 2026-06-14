@@ -417,7 +417,13 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
 
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
-    state.observe_persistent_gc_commit_delta_after_commit(&*object_table, &persistent_gc_delta)?;
+    // The transaction is already committed at this point. Persistent GC
+    // observation is opportunistic runtime maintenance and must not turn a
+    // completed commit into an apparent failure.
+    let _ = state.observe_persistent_gc_commit_delta_after_commit_best_effort(
+        &*object_table,
+        &persistent_gc_delta,
+    );
     Ok(())
 }
 

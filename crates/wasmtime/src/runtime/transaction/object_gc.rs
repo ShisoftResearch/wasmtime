@@ -87,6 +87,7 @@ pub(crate) struct PersistentObjectEdge {
 pub(crate) struct PersistentGcCommitDelta {
     pub(crate) new_roots: BTreeSet<ObjectId>,
     pub(crate) edges: BTreeSet<PersistentObjectEdge>,
+    pub(crate) invalidates_reachable_cache: bool,
 }
 
 #[derive(Clone, Debug)]

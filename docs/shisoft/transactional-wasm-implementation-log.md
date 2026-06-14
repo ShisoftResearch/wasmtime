@@ -39,10 +39,20 @@ exists.
 Implemented status:
 
 - `PersistentGcState` now observes commit-coupled deltas from committed roots
-  and committed object-edge publications.
+  and committed object-edge publications, including the runtime
+  `transaction_commit_impl` commit epilogue. Post-commit observation is
+  best-effort maintenance: observer errors clear cached GC progress and do not
+  turn an already-completed commit into a reported transaction failure.
+- Commits that change root-bearing globals/tables or publish persistent object
+  records invalidate the cached reachable set before observing new commit
+  deltas, avoiding stale additive reachability.
 - Recovery filters the recovered winner map by reachability before rebuilding
   the volatile `ObjectTable`, so unreachable garbage is not installed and then
   swept later.
+- Raw log recovery keeps scan-valid object winners even when stale unreachable
+  records refer to missing type-layout metadata. Layout validation is applied
+  when a winner is reachable and must be traced or rebuilt into the volatile
+  object table.
 - Recovered object winners now carry `data_block`, `data_offset`, and
   `record_len`, and the recovery report exposes reachable and unreachable
   durable record locations.
@@ -62,23 +72,34 @@ Verification commands for this slice:
 
 ```text
 cargo fmt --check
-failed with an existing formatting diff in
-`crates/wasmtime/src/runtime/transaction.rs:12873`
+ok
 
 cargo test -p wasmtime --lib persistent_gc -- --format terse
-test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 598 filtered out
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 598 filtered out
 
 cargo test -p wasmtime --lib persistent_object_marker -- --format terse
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 602 filtered out
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 607 filtered out
+
+cargo test -p wasmtime --lib persistent_gc_recovery_filter -- --format terse
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out
+
+cargo test -p wasmtime --lib persistent_gc_commit -- --format terse
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 614 filtered out
+
+cargo test -p wasmtime --lib recovery_ -- --format terse
+test result: ok. 46 passed; 0 failed; 1 ignored; 0 measured; 572 filtered out
 
 cargo test -p wasmtime --lib transaction -- --format terse
-test result: ok. 304 passed; 0 failed; 0 ignored; 0 measured; 310 filtered out
+test result: ok. 309 passed; 0 failed; 0 ignored; 0 measured; 310 filtered out
 
 cargo test -p wasmtime --test transaction_persistence -- --format terse
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 cargo test -p wasmtime --lib -- --format terse
-test result: ok. 612 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+test result: ok. 617 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+
+rg -n "GcTombstone|persistent_object_tombstone|TX_OBJECT_FLAG_DELETED" crates/wasmtime/src/runtime
+no matches
 
 git diff --check
 no output
