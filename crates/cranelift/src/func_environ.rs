@@ -60,6 +60,12 @@ const TRANSACTION_OBJECT_VALUE_ABI_TAG_F32: u32 = 2;
 const TRANSACTION_OBJECT_VALUE_ABI_TAG_F64: u32 = 3;
 const TRANSACTION_OBJECT_VALUE_ABI_TAG_V128: u32 = 4;
 const TRANSACTION_OBJECT_VALUE_ABI_TAG_REF: u32 = 5;
+const TRANSACTION_PERSISTENT_OBJECT_VALUE_RECORD_SIZE: u32 = 20;
+const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_SIZE: u32 = 16;
+const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_INDEX_OFFSET: i32 = 0;
+const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_FIELD_OFFSET_OFFSET: i32 = 4;
+const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_VALUE_SIZE_OFFSET: i32 = 8;
+const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_IS_REF_OFFSET: i32 = 12;
 
 #[derive(Copy, Clone, Debug)]
 struct TransactionTryFrame {
@@ -3103,6 +3109,8 @@ impl FuncEnvironment<'_> {
         debug_assert_eq!(field_types.len(), fields.len());
         let fields_ptr =
             self.translate_transaction_object_values_to_stack(builder, &field_types, fields)?;
+        let layout_fields_ptr =
+            self.translate_transaction_persistent_struct_layout_to_stack(builder, &field_types)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tstruct_static_new(),
@@ -3115,7 +3123,14 @@ impl FuncEnvironment<'_> {
         let field_count = pos.ins().iconst(I32, i64::try_from(fields.len()).unwrap());
         pos.ins().call(
             callee,
-            &[vmctx, struct_ref, struct_type, field_count, fields_ptr],
+            &[
+                vmctx,
+                struct_ref,
+                struct_type,
+                field_count,
+                fields_ptr,
+                layout_fields_ptr,
+            ],
         );
         Ok(())
     }
@@ -3169,6 +3184,38 @@ impl FuncEnvironment<'_> {
     fn transaction_object_ref_type_supported(ref_ty: WasmRefType) -> bool {
         ref_ty.is_vmgcref_type_and_not_i31()
             || matches!(ref_ty.heap_type.top(), WasmHeapTopType::Func)
+    }
+
+    fn transaction_persistent_object_value_size(ty: WasmStorageType) -> WasmResult<u32> {
+        Ok(match ty {
+            WasmStorageType::I8 => 1,
+            WasmStorageType::I16 => 2,
+            WasmStorageType::Val(WasmValType::I32 | WasmValType::F32) => 4,
+            WasmStorageType::Val(WasmValType::I64 | WasmValType::F64) => 8,
+            WasmStorageType::Val(WasmValType::V128) => 16,
+            WasmStorageType::Val(WasmValType::Ref(ref_ty))
+                if Self::transaction_object_ref_type_supported(ref_ty) =>
+            {
+                TRANSACTION_PERSISTENT_OBJECT_VALUE_RECORD_SIZE
+            }
+            WasmStorageType::Val(WasmValType::Ref(_)) => {
+                return Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional i31 reference ObjectId values are not implemented yet".into(),
+                ));
+            }
+        })
+    }
+
+    fn transaction_persistent_array_element_size(
+        &mut self,
+        array_type_index: TypeIndex,
+    ) -> WasmResult<u32> {
+        let elem_ty = self.transaction_array_element_type(array_type_index)?;
+        if matches!(elem_ty, WasmStorageType::Val(WasmValType::Ref(_))) {
+            return Ok(TRANSACTION_PERSISTENT_OBJECT_VALUE_RECORD_SIZE);
+        }
+        let ty = self.module.types[array_type_index].unwrap_module_type_index();
+        Ok(self.array_layout(ty)?.elem_size)
     }
 
     fn transaction_default_field_value(
@@ -3252,6 +3299,89 @@ impl FuncEnvironment<'_> {
                     )
                 })?;
             self.store_transaction_object_value_abi(builder, ptr, offset, *ty, *value)?;
+        }
+        Ok(ptr)
+    }
+
+    fn translate_transaction_persistent_struct_layout_to_stack(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        field_types: &[WasmStorageType],
+    ) -> WasmResult<ir::Value> {
+        if field_types.is_empty() {
+            return Ok(builder.ins().iconst(self.pointer_type(), 1));
+        }
+        let field_count = u32::try_from(field_types.len()).map_err(|_| {
+            wasmtime_environ::WasmError::Unsupported(
+                "transactional struct layout field count does not fit u32".into(),
+            )
+        })?;
+        let size = field_count
+            .checked_mul(TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_SIZE)
+            .ok_or_else(|| {
+                wasmtime_environ::WasmError::Unsupported(
+                    "transactional struct layout ABI stack slot is too large".into(),
+                )
+            })?;
+        let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            size,
+            4,
+        ));
+        let ptr = builder.ins().stack_addr(self.pointer_type(), slot, 0);
+        let flags = MemFlagsData::trusted();
+        for (i, ty) in field_types.iter().enumerate() {
+            let index = u32::try_from(i).map_err(|_| {
+                wasmtime_environ::WasmError::Unsupported(
+                    "transactional struct layout field index does not fit u32".into(),
+                )
+            })?;
+            let entry_offset = index
+                .checked_mul(TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_SIZE)
+                .and_then(|offset| i32::try_from(offset).ok())
+                .ok_or_else(|| {
+                    wasmtime_environ::WasmError::Unsupported(
+                        "transactional struct layout ABI offset is too large".into(),
+                    )
+                })?;
+            let field_offset = index
+                .checked_mul(TRANSACTION_PERSISTENT_OBJECT_VALUE_RECORD_SIZE)
+                .ok_or_else(|| {
+                    wasmtime_environ::WasmError::Unsupported(
+                        "transactional persistent struct field offset is too large".into(),
+                    )
+                })?;
+            let value_size = Self::transaction_persistent_object_value_size(*ty)?;
+            let is_ref = u32::from(matches!(*ty, WasmStorageType::Val(WasmValType::Ref(_))));
+            let mut cursor = builder.cursor();
+            let index_value = cursor.ins().iconst(I32, i64::from(index));
+            let field_offset_value = cursor.ins().iconst(I32, i64::from(field_offset));
+            let value_size_value = cursor.ins().iconst(I32, i64::from(value_size));
+            let is_ref_value = cursor.ins().iconst(I32, i64::from(is_ref));
+            cursor.ins().store(
+                flags,
+                index_value,
+                ptr,
+                entry_offset + TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_INDEX_OFFSET,
+            );
+            cursor.ins().store(
+                flags,
+                field_offset_value,
+                ptr,
+                entry_offset + TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_FIELD_OFFSET_OFFSET,
+            );
+            cursor.ins().store(
+                flags,
+                value_size_value,
+                ptr,
+                entry_offset + TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_VALUE_SIZE_OFFSET,
+            );
+            cursor.ins().store(
+                flags,
+                is_ref_value,
+                ptr,
+                entry_offset + TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_IS_REF_OFFSET,
+            );
         }
         Ok(ptr)
     }
@@ -4237,12 +4367,15 @@ impl FuncEnvironment<'_> {
         let elem_types = vec![elem_ty; elems.len()];
         let elements_ptr =
             self.translate_transaction_object_values_to_stack(builder, &elem_types, elems)?;
+        let persistent_element_size =
+            self.transaction_persistent_array_element_size(array_type_index)?;
         let callee = self.builtin_functions.load_builtin(builder.func, builtin);
         let mut pos = builder.cursor();
         let vmctx = self.vmctx_val(&mut pos);
         let array_type = pos
             .ins()
             .iconst(I32, i64::try_from(array_type_index.index()).unwrap());
+        let persistent_element_size = pos.ins().iconst(I32, i64::from(persistent_element_size));
         let element_is_object_ref = pos.ins().iconst(
             I32,
             if matches!(elem_ty, WasmStorageType::Val(WasmValType::Ref(_))) {
@@ -4254,6 +4387,7 @@ impl FuncEnvironment<'_> {
         let element_count = pos.ins().iconst(I32, i64::try_from(elems.len()).unwrap());
         let mut args = vec![vmctx, array_ref, array_type];
         if builtin == BuiltinFunctionIndex::transaction_tarray_static_new_fixed() {
+            args.push(persistent_element_size);
             args.push(element_is_object_ref);
         }
         args.push(element_count);
@@ -4274,14 +4408,30 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<()> {
         let (tag, low, high) =
             self.translate_transaction_object_value_to_abi_values(builder, elem_ty, elem)?;
+        let persistent_element_size =
+            self.transaction_persistent_array_element_size(array_type_index)?;
         let callee = self.builtin_functions.load_builtin(builder.func, builtin);
         let mut pos = builder.cursor();
         let vmctx = self.vmctx_val(&mut pos);
         let array_type = pos
             .ins()
             .iconst(I32, i64::try_from(array_type_index.index()).unwrap());
-        pos.ins()
-            .call(callee, &[vmctx, array_ref, array_type, len, tag, low, high]);
+        let persistent_element_size = pos.ins().iconst(I32, i64::from(persistent_element_size));
+        let element_is_object_ref = pos.ins().iconst(
+            I32,
+            if matches!(elem_ty, WasmStorageType::Val(WasmValType::Ref(_))) {
+                1
+            } else {
+                0
+            },
+        );
+        let mut args = vec![vmctx, array_ref, array_type];
+        if builtin == BuiltinFunctionIndex::transaction_tarray_static_new() {
+            args.push(persistent_element_size);
+            args.push(element_is_object_ref);
+        }
+        args.extend([len, tag, low, high]);
+        pos.ins().call(callee, &args);
         Ok(())
     }
 

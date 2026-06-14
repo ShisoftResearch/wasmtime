@@ -38,6 +38,30 @@ pub(crate) struct WasmtimePersistentFieldLayout {
     pub(crate) is_object_ref: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WasmtimePersistentFieldLayoutAbi {
+    pub(crate) field_index: u32,
+    pub(crate) field_offset: u32,
+    pub(crate) value_size: u32,
+    pub(crate) is_object_ref: u32,
+}
+
+impl WasmtimePersistentFieldLayoutAbi {
+    pub(crate) fn to_field_layout(self) -> Result<WasmtimePersistentFieldLayout> {
+        ensure!(
+            self.is_object_ref <= 1,
+            "transactional persistent field layout ref flag must be 0 or 1"
+        );
+        Ok(WasmtimePersistentFieldLayout {
+            field_index: self.field_index,
+            field_offset: self.field_offset,
+            value_size: self.value_size,
+            is_object_ref: self.is_object_ref != 0,
+        })
+    }
+}
+
 pub(crate) fn persistent_layout_for_wasmtime_struct_type(
     type_layout_id: TypeLayoutId,
     body_size: u32,
@@ -141,6 +165,60 @@ fn stable_fingerprint_bytes(mut fingerprint: u64, bytes: &[u8]) -> u64 {
     fingerprint
 }
 
+fn wasmtime_struct_body_size_from_field_count(field_count: usize) -> Result<u32> {
+    u32::try_from(field_count)
+        .context("transactional struct field count exceeds u32")?
+        .checked_mul(PERSISTENT_OBJECT_ABI_SLOT_SIZE)
+        .context("transactional struct body size overflow")
+}
+
+fn validate_wasmtime_struct_field_layouts(fields: &[WasmtimePersistentFieldLayout]) -> Result<u32> {
+    for (index, field) in fields.iter().enumerate() {
+        let expected_index =
+            u32::try_from(index).context("transactional struct field index overflow")?;
+        let expected_offset = expected_index
+            .checked_mul(PERSISTENT_OBJECT_ABI_SLOT_SIZE)
+            .context("transactional struct field offset overflow")?;
+        ensure!(
+            field.field_index == expected_index,
+            "transactional persistent struct layout field index is not canonical"
+        );
+        ensure!(
+            field.field_offset == expected_offset,
+            "transactional persistent struct layout field offset is not canonical"
+        );
+        ensure!(
+            field.value_size > 0,
+            "transactional persistent struct layout field value size is zero"
+        );
+        if field.is_object_ref {
+            ensure!(
+                field.value_size == PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+                "transactional persistent struct object-ref layout field must use object value ABI size"
+            );
+        }
+    }
+    wasmtime_struct_body_size_from_field_count(fields.len())
+}
+
+fn validate_wasmtime_array_element_layout(
+    element_size: u32,
+    element_is_object_ref: bool,
+) -> Result<u32> {
+    ensure!(
+        element_size > 0,
+        "transactional persistent array element size is zero"
+    );
+    if element_is_object_ref {
+        ensure!(
+            element_size == PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+            "transactional persistent object-ref array element layout must use object value ABI size"
+        );
+    }
+    Ok(element_size)
+}
+
+#[cfg(test)]
 fn wasmtime_struct_field_layouts_from_values(
     fields: &[ObjectValue],
 ) -> Result<(u32, Vec<WasmtimePersistentFieldLayout>)> {
@@ -158,20 +236,15 @@ fn wasmtime_struct_field_layouts_from_values(
             is_object_ref: matches!(value, ObjectValue::Ref(_)),
         });
     }
-    let body_size = u32::try_from(fields.len())
-        .context("transactional struct field count exceeds u32")?
-        .checked_mul(PERSISTENT_OBJECT_ABI_SLOT_SIZE)
-        .context("transactional struct body size overflow")?;
+    let body_size = wasmtime_struct_body_size_from_field_count(fields.len())?;
     Ok((body_size, layouts))
 }
 
+#[cfg(test)]
 fn wasmtime_array_layout_from_values(
     type_layout_id: TypeLayoutId,
     elements: &[ObjectValue],
 ) -> PersistentTypeLayout {
-    // Wave 8 bridges Wasmtime type indices to persistent layouts using runtime
-    // values until authoritative Wasmtime field/element descriptors are
-    // threaded through these constructors.
     persistent_layout_for_wasmtime_array_type(
         type_layout_id,
         PERSISTENT_OBJECT_ABI_SLOT_SIZE,
@@ -181,15 +254,16 @@ fn wasmtime_array_layout_from_values(
     )
 }
 
-fn wasmtime_array_layout_from_element_kind(
+fn wasmtime_array_layout_from_element_layout(
     type_layout_id: TypeLayoutId,
+    element_size: u32,
     element_is_object_ref: bool,
-) -> PersistentTypeLayout {
-    persistent_layout_for_wasmtime_array_type(
+) -> Result<PersistentTypeLayout> {
+    Ok(persistent_layout_for_wasmtime_array_type(
         type_layout_id,
-        PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+        validate_wasmtime_array_element_layout(element_size, element_is_object_ref)?,
         element_is_object_ref,
-    )
+    ))
 }
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -932,19 +1006,51 @@ impl ObjectTable {
         self.allocate_payload(ObjectPayload::Struct(fields))
     }
 
-    pub(crate) fn allocate_persistent_struct_for_gc_ref_with_wasmtime_type(
+    pub(crate) fn allocate_persistent_struct_for_gc_ref_with_wasmtime_type_layout(
         &mut self,
         gc_ref: u32,
         owner_instance: Option<InstanceId>,
         type_index: u32,
+        field_layouts: Vec<WasmtimePersistentFieldLayout>,
         fields: Vec<ObjectValue>,
     ) -> Result<ObjectId> {
         let namespace = wasmtime_type_layout_namespace(owner_instance)?;
-        self.allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
-            gc_ref, namespace, type_index, fields,
+        self.allocate_persistent_struct_for_gc_ref_with_wasmtime_type_layout_namespace(
+            gc_ref,
+            namespace,
+            type_index,
+            field_layouts,
+            fields,
         )
     }
 
+    pub(crate) fn allocate_persistent_struct_for_gc_ref_with_wasmtime_type_layout_namespace(
+        &mut self,
+        gc_ref: u32,
+        type_namespace: u32,
+        type_index: u32,
+        field_layouts: Vec<WasmtimePersistentFieldLayout>,
+        fields: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        ensure!(
+            field_layouts.len() == fields.len(),
+            "transactional persistent struct layout field count does not match payload field count"
+        );
+        let body_size = validate_wasmtime_struct_field_layouts(&field_layouts)?;
+        let fingerprint = wasmtime_struct_layout_fingerprint(body_size, &field_layouts)?;
+        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+            type_namespace,
+            type_index,
+            PersistentTypeKind::Struct,
+            fingerprint,
+        )?;
+        let layout =
+            persistent_layout_for_wasmtime_struct_type(type_layout_id, body_size, &field_layouts)?;
+        self.register_type_layout(layout.clone())?;
+        self.allocate_persistent_struct_for_gc_ref_with_type_layout_id(gc_ref, fields, layout.id())
+    }
+
+    #[cfg(test)]
     pub(crate) fn allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
         &mut self,
         gc_ref: u32,
@@ -1024,6 +1130,7 @@ impl ObjectTable {
         self.allocate_payload(ObjectPayload::Array(elements))
     }
 
+    #[cfg(test)]
     pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_type(
         &mut self,
         gc_ref: u32,
@@ -1037,6 +1144,29 @@ impl ObjectTable {
         )
     }
 
+    pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer(
+        &mut self,
+        gc_ref: u32,
+        owner_instance: Option<InstanceId>,
+        type_index: u32,
+        element_size: u32,
+        element_is_object_ref: bool,
+        initializer: ObjectValue,
+        len: usize,
+    ) -> Result<ObjectId> {
+        let namespace = wasmtime_type_layout_namespace(owner_instance)?;
+        self.allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer_namespace(
+            gc_ref,
+            namespace,
+            type_index,
+            element_size,
+            element_is_object_ref,
+            initializer,
+            len,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_type_and_initializer(
         &mut self,
         gc_ref: u32,
@@ -1045,16 +1175,19 @@ impl ObjectTable {
         initializer: ObjectValue,
         len: usize,
     ) -> Result<ObjectId> {
-        let namespace = wasmtime_type_layout_namespace(owner_instance)?;
-        self.allocate_persistent_array_for_gc_ref_with_wasmtime_type_and_initializer_namespace(
+        let element_is_object_ref = matches!(initializer, ObjectValue::Ref(_));
+        self.allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer(
             gc_ref,
-            namespace,
+            owner_instance,
             type_index,
+            PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+            element_is_object_ref,
             initializer,
             len,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_type_namespace(
         &mut self,
         gc_ref: u32,
@@ -1069,6 +1202,7 @@ impl ObjectTable {
             gc_ref,
             type_namespace,
             type_index,
+            PERSISTENT_OBJECT_ABI_SLOT_SIZE,
             element_is_object_ref,
             elements,
         )
@@ -1079,28 +1213,61 @@ impl ObjectTable {
         gc_ref: u32,
         type_namespace: u32,
         type_index: u32,
+        element_size: u32,
         element_is_object_ref: bool,
         elements: Vec<ObjectValue>,
     ) -> Result<ObjectId> {
-        let fingerprint = wasmtime_array_layout_fingerprint(
-            PERSISTENT_OBJECT_ABI_SLOT_SIZE,
-            element_is_object_ref,
-        );
+        let element_size =
+            validate_wasmtime_array_element_layout(element_size, element_is_object_ref)?;
+        let fingerprint = wasmtime_array_layout_fingerprint(element_size, element_is_object_ref);
         let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
             type_namespace,
             type_index,
             PersistentTypeKind::Array,
             fingerprint,
         )?;
-        let layout = if elements.is_empty() {
-            wasmtime_array_layout_from_element_kind(type_layout_id, element_is_object_ref)
-        } else {
-            wasmtime_array_layout_from_values(type_layout_id, &elements)
-        };
+        let layout = wasmtime_array_layout_from_element_layout(
+            type_layout_id,
+            element_size,
+            element_is_object_ref,
+        )?;
         self.register_type_layout(layout.clone())?;
         self.allocate_persistent_array_for_gc_ref_with_type_layout_id(gc_ref, elements, layout.id())
     }
 
+    pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer_namespace(
+        &mut self,
+        gc_ref: u32,
+        type_namespace: u32,
+        type_index: u32,
+        element_size: u32,
+        element_is_object_ref: bool,
+        initializer: ObjectValue,
+        len: usize,
+    ) -> Result<ObjectId> {
+        let element_size =
+            validate_wasmtime_array_element_layout(element_size, element_is_object_ref)?;
+        let fingerprint = wasmtime_array_layout_fingerprint(element_size, element_is_object_ref);
+        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+            type_namespace,
+            type_index,
+            PersistentTypeKind::Array,
+            fingerprint,
+        )?;
+        let layout = wasmtime_array_layout_from_element_layout(
+            type_layout_id,
+            element_size,
+            element_is_object_ref,
+        )?;
+        self.register_type_layout(layout.clone())?;
+        self.allocate_persistent_array_for_gc_ref_with_type_layout_id(
+            gc_ref,
+            vec![initializer; len],
+            layout.id(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_type_and_initializer_namespace(
         &mut self,
         gc_ref: u32,
@@ -1110,22 +1277,14 @@ impl ObjectTable {
         len: usize,
     ) -> Result<ObjectId> {
         let element_is_object_ref = matches!(initializer, ObjectValue::Ref(_));
-        let fingerprint = wasmtime_array_layout_fingerprint(
-            PERSISTENT_OBJECT_ABI_SLOT_SIZE,
-            element_is_object_ref,
-        );
-        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+        self.allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer_namespace(
+            gc_ref,
             type_namespace,
             type_index,
-            PersistentTypeKind::Array,
-            fingerprint,
-        )?;
-        let layout = wasmtime_array_layout_from_element_kind(type_layout_id, element_is_object_ref);
-        self.register_type_layout(layout.clone())?;
-        self.allocate_persistent_array_for_gc_ref_with_type_layout_id(
-            gc_ref,
-            vec![initializer; len],
-            layout.id(),
+            PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+            element_is_object_ref,
+            initializer,
+            len,
         )
     }
 
@@ -6743,6 +6902,50 @@ mod tests {
     }
 
     #[test]
+    fn wasmtime_type_layout_mapping_struct_uses_descriptor_ref_map_not_payload_values() {
+        let mut objects = ObjectTable::default();
+        let namespace = 13;
+        let field_layouts = vec![
+            WasmtimePersistentFieldLayout {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 4,
+                is_object_ref: false,
+            },
+            WasmtimePersistentFieldLayout {
+                field_index: 1,
+                field_offset: 20,
+                value_size: 20,
+                is_object_ref: true,
+            },
+        ];
+
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_layout_namespace(
+                0x131,
+                namespace,
+                29,
+                field_layouts.clone(),
+                vec![ObjectValue::I32(1), ObjectValue::I64(2)],
+            )
+            .unwrap();
+        let layout_id = objects.live_slot(object).unwrap().type_layout_id;
+        let layout = objects
+            .require_type_layout(type_layout::TypeLayoutId::new(layout_id).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            layout,
+            &persistent_layout_for_wasmtime_struct_type(
+                type_layout::TypeLayoutId::new(layout_id).unwrap(),
+                40,
+                &field_layouts,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn wasmtime_type_layout_mapping_namespace_avoids_local_type_index_collisions() {
         let mut objects = ObjectTable::default();
         let first = persistent_layout_for_wasmtime_struct_type(
@@ -7199,6 +7402,7 @@ mod tests {
                 0x571,
                 namespace,
                 57,
+                20,
                 true,
                 Vec::new(),
             )
@@ -7237,6 +7441,7 @@ mod tests {
                 0x581,
                 namespace,
                 58,
+                20,
                 true,
                 Vec::new(),
             )
@@ -7246,6 +7451,7 @@ mod tests {
                 0x582,
                 namespace,
                 58,
+                20,
                 true,
                 vec![
                     ObjectValue::Ref(Some(first)),
@@ -7265,6 +7471,40 @@ mod tests {
         assert_eq!(
             objects.trace_object_ids(non_empty).unwrap(),
             vec![first, second]
+        );
+    }
+
+    #[test]
+    fn wasmtime_type_layout_mapping_scalar_array_uses_descriptor_element_size() {
+        let mut objects = ObjectTable::default();
+        let namespace = 46;
+        let layout_id = objects
+            .persistent_type_layout_id_for_wasmtime_key(
+                namespace,
+                59,
+                PersistentTypeKind::Array,
+                wasmtime_array_layout_fingerprint(1, false),
+            )
+            .unwrap();
+
+        let object = objects
+            .allocate_persistent_array_for_gc_ref_with_wasmtime_fixed_type_namespace(
+                0x591,
+                namespace,
+                59,
+                1,
+                false,
+                vec![ObjectValue::I32(1), ObjectValue::I32(2)],
+            )
+            .unwrap();
+
+        assert_eq!(
+            objects.live_slot(object).unwrap().type_layout_id,
+            layout_id.get()
+        );
+        assert_eq!(
+            objects.require_type_layout(layout_id).unwrap(),
+            &persistent_layout_for_wasmtime_array_type(layout_id, 1, false)
         );
     }
 

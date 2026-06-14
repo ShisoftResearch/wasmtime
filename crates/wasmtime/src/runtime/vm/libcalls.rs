@@ -60,7 +60,8 @@ use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue,
     ObjectValueAbi, PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend,
-    TableElementSnapshot, TransactionId, TransactionState, collect_tmemory_access_snapshot,
+    TableElementSnapshot, TransactionId, TransactionState, WasmtimePersistentFieldLayoutAbi,
+    collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -1489,6 +1490,7 @@ fn transaction_tstruct_static_new(
     struct_type: u32,
     field_count: u32,
     fields: *mut u8,
+    layout_fields: *mut u8,
 ) -> Result<()> {
     let result = transaction_tstruct_static_new_impl(
         store,
@@ -1497,6 +1499,7 @@ fn transaction_tstruct_static_new(
         struct_type,
         field_count,
         fields,
+        layout_fields,
     );
     abort_active_transaction_on_error(store, &result);
     result
@@ -1509,6 +1512,7 @@ fn transaction_tstruct_static_new_impl(
     struct_type: u32,
     field_count: u32,
     fields: *mut u8,
+    layout_fields: *mut u8,
 ) -> Result<()> {
     let field_count =
         usize::try_from(field_count).context("transactional struct field count overflow")?;
@@ -1516,10 +1520,24 @@ fn transaction_tstruct_static_new_impl(
         field_count == 0 || !fields.is_null(),
         "transactional struct fields pointer is null"
     );
+    ensure!(
+        field_count == 0 || !layout_fields.is_null(),
+        "transactional struct layout fields pointer is null"
+    );
     let fields = if field_count == 0 {
         &[][..]
     } else {
         unsafe { core::slice::from_raw_parts(fields.cast::<ObjectValueAbi>(), field_count) }
+    };
+    let layout_fields = if field_count == 0 {
+        &[][..]
+    } else {
+        unsafe {
+            core::slice::from_raw_parts(
+                layout_fields.cast::<WasmtimePersistentFieldLayoutAbi>(),
+                field_count,
+            )
+        }
     };
 
     let object_table = store.store_opaque_mut().transaction_object_table_mut();
@@ -1527,10 +1545,15 @@ fn transaction_tstruct_static_new_impl(
     for abi in fields {
         values.push(object_value_from_transaction_abi(object_table, *abi)?);
     }
-    object_table.allocate_persistent_struct_for_gc_ref_with_wasmtime_type(
+    let mut field_layouts = Vec::with_capacity(field_count);
+    for abi in layout_fields {
+        field_layouts.push(abi.to_field_layout()?);
+    }
+    object_table.allocate_persistent_struct_for_gc_ref_with_wasmtime_type_layout(
         gc_ref,
         Some(instance),
         struct_type,
+        field_layouts,
         values,
     )?;
     Ok(())
@@ -1650,13 +1673,24 @@ fn transaction_tarray_static_new(
     instance: InstanceId,
     gc_ref: u32,
     array_type: u32,
+    element_size: u32,
+    element_is_object_ref: u32,
     len: u32,
     tag: u32,
     low: u64,
     high: u64,
 ) -> Result<()> {
     let result = transaction_tarray_static_new_impl(
-        store, instance, gc_ref, array_type, len, tag, low, high,
+        store,
+        instance,
+        gc_ref,
+        array_type,
+        element_size,
+        element_is_object_ref,
+        len,
+        tag,
+        low,
+        high,
     );
     abort_active_transaction_on_error(store, &result);
     result
@@ -1667,22 +1701,31 @@ fn transaction_tarray_static_new_impl(
     instance: InstanceId,
     gc_ref: u32,
     array_type: u32,
+    element_size: u32,
+    element_is_object_ref: u32,
     len: u32,
     tag: u32,
     low: u64,
     high: u64,
 ) -> Result<()> {
+    ensure!(
+        element_is_object_ref <= 1,
+        "transactional array element kind flag must be 0 or 1"
+    );
     let len = usize::try_from(len).context("transactional array length overflow")?;
     let abi = ObjectValueAbi::from_parts(tag, low, high)?;
     let object_table = store.store_opaque_mut().transaction_object_table_mut();
     let value = object_value_from_transaction_abi(object_table, abi)?;
-    object_table.allocate_persistent_array_for_gc_ref_with_wasmtime_type_and_initializer(
-        gc_ref,
-        Some(instance),
-        array_type,
-        value,
-        len,
-    )?;
+    object_table
+        .allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer(
+            gc_ref,
+            Some(instance),
+            array_type,
+            element_size,
+            element_is_object_ref != 0,
+            value,
+            len,
+        )?;
     Ok(())
 }
 
@@ -1745,6 +1788,7 @@ fn transaction_tarray_static_new_fixed(
     instance: InstanceId,
     gc_ref: u32,
     array_type: u32,
+    element_size: u32,
     element_is_object_ref: u32,
     element_count: u32,
     elements: *mut u8,
@@ -1754,6 +1798,7 @@ fn transaction_tarray_static_new_fixed(
         instance,
         gc_ref,
         array_type,
+        element_size,
         element_is_object_ref,
         element_count,
         elements,
@@ -1767,6 +1812,7 @@ fn transaction_tarray_static_new_fixed_impl(
     instance: InstanceId,
     gc_ref: u32,
     array_type: u32,
+    element_size: u32,
     element_is_object_ref: u32,
     element_count: u32,
     elements: *mut u8,
@@ -1800,6 +1846,7 @@ fn transaction_tarray_static_new_fixed_impl(
         gc_ref,
         namespace,
         array_type,
+        element_size,
         element_is_object_ref != 0,
         values,
     )?;
