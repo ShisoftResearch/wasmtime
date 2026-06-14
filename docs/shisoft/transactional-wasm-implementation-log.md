@@ -21,26 +21,45 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
-## Persistent Object GC 9C Planning Update: GC Tombstone Blocks
+## Persistent Object GC 9C Planning Update: Tombstone-Less Recovery
 
 Date: 2026-06-14
 
-The Wave 9C tombstone design has changed. GC tombstones are global GC metadata,
-not user transaction publications. They should be stored in dedicated GC
-tombstone blocks as fixed-size entries containing `ObjectId`, target object-data
-version, GC epoch, and CRC32.
+The Wave 9C tombstone design has been replaced by a Makalu/Ralloc-style
+tombstone-less baseline. Persistent storage should not pay runtime write cost
+for per-object GC tombstones, mark bits, line marks, free lists, reclaim queues,
+or object-table entries. Those structures are auxiliary GC/allocator state and
+should be reconstructed during recovery.
+
+The design adopts three specific ideas from Makalu and Ralloc:
+
+- **Recoverability:** after recovery, allocator and object-table metadata must
+  describe all and only objects reachable from persistent roots.
+- **Ownership before use:** future persistent block/chunk allocation should
+  durably claim storage before handing it to the mutator. A crash may leak that
+  storage until recovery, but it must not permit double allocation.
+- **Typed tracing/filter functions:** Ralloc filter functions map to our
+  persistent type/layout metadata. Recovery traces only fields/elements that
+  the recovered layout marks as `ObjectId` references.
 
 Recovery should scan user transaction logs to choose the highest live
-object-data winner per `ObjectId`, then scan GC tombstone blocks and omit an
-object from the rebuilt volatile object table when
-`tombstone.target_version >= live.version`. Object data remains directly
-readable from persistent object-data blocks; old bytes are reclaimed only by a
-later block cleaner.
+object-data winner per `ObjectId`, load persistent roots and type/layout
+metadata, run full `ObjectId` graph marking over the winner map, and rebuild
+the volatile object table only for reachable winners. It should also
+reconstruct volatile line marks, block live-byte summaries, free lists, and
+reclaim queues from reachable records and region metadata.
+
+Durable space reuse moves to a later block/chunk-retirement workstream. Until
+the runtime can publish block-generation or checkpoint metadata that lets
+recovery ignore retired blocks, GC may report reclaim candidates but must not
+reuse persistent blocks whose old records would still be scanned after restart.
 
 The earlier plan
 `docs/shisoft/2026-06-14-persistent-object-gc-9b-9c-implementation-plan.md`
-is retained for Wave 9A/9B context but is superseded for tombstones by
-`docs/shisoft/2026-06-14-persistent-object-gc-9b-9c-gc-blocks-plan.md`.
+is retained only as a supersession stub. The GC tombstone-block plan
+`docs/shisoft/2026-06-14-persistent-object-gc-9b-9c-gc-blocks-plan.md`
+is also superseded by the tombstone-less plan
+`docs/shisoft/2026-06-14-persistent-object-gc-9b-9c-tombstone-less-plan.md`.
 
 ## Persistent Object GC Wave 1: Logical ObjectId Marking
 
@@ -96,8 +115,8 @@ cargo fmt --check
 
 Remaining implementation boundaries:
 
-- No durable deletion/tombstone implementation yet; the current design uses
-  GC-owned tombstone blocks.
+- No recovery-time object-table filtering implementation yet.
+- No durable block/chunk retirement or persistent block reuse yet.
 - No volatile sweep mode yet.
 - No block, chunk, or Immix line reclamation yet.
 - No root integration with Wasmtime stack/host roots; roots are explicit
@@ -166,9 +185,10 @@ Remaining boundaries:
 - Recovery can reconstruct root `ObjectId`s from committed `TGlobal`/`TTable`
   winners, but those recovered roots still need runtime reintegration and
   GC-facing root-closure handling.
-- Persistent-object GC, deletion/tombstones, and reclamation are still future
-  work. The current format is designed so those can trace by `ObjectId` without
-  adding a persisted object table.
+- Persistent-object recovery-time GC, volatile sweep, and block/chunk
+  reclamation are still future work. The current format is designed so those
+  can trace by `ObjectId` without adding a persisted object table. Per-object
+  tombstones are not the baseline GC design.
 
 ## Model-Checking Wave 10: WAST And Model Cross-Checks
 

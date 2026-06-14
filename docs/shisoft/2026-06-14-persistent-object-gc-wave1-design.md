@@ -61,24 +61,43 @@ objects, and dangling references.
 This is the recommended first step. It tests the hard infrastructure without
 risking persistent corruption from premature deletion or block reuse.
 
-### Approach B: Immediate mark/sweep with volatile index cleanup
+### Approach B: Tombstone-Less Recovery-Time GC
 
-The collector marks reachable objects and removes unreachable objects from the
-volatile object table, leaving durable records untouched.
+The collector marks reachable objects and uses that result to rebuild volatile
+runtime state. During recovery, it scans committed object data, selects the
+highest live version per `ObjectId`, marks from persistent roots, and installs
+only reachable winners into the volatile object table. Runtime GC can use the
+same marker to remove unreachable entries from volatile indices and refresh
+volatile block liveness summaries.
 
-This is useful later, but it is still a behavioral mutation. It can hide bugs in
-the marker by making objects disappear from the runtime before we have durable
-tombstone and recovery semantics.
+This is the recommended direction after Wave 1. It follows Makalu/Ralloc-style
+reconstruction: avoid persistent writes for GC metadata and rebuild mark bits,
+line marks, free lists, reclaim queues, and object-table entries from persistent
+program state.
 
-### Approach C: Durable mark/sweep with tombstones
+The key correctness invariant is recoverability. After recovery, the volatile
+allocator and object-table metadata should describe exactly the objects
+reachable from persistent roots. Crashes may leave allocated-but-unattached or
+detached-but-not-yet-reclaimed records in persistent storage, but those records
+are treated as leaks until recovery, not as live objects. Recovery-time marking
+then excludes them from the rebuilt object table and reconstructs free/reclaim
+state from the reachable set.
 
-The collector appends GC-owned tombstone metadata for unreachable object-data
-versions and allows recovery to omit covered objects from the rebuilt volatile
-object table.
+For typed Wasm objects, persistent type/layout metadata plays the role of
+Ralloc filter functions: it tells recovery where `ObjectId` references live
+inside each persistent record, avoiding conservative word scanning for
+`tstruct` and `tarray` payloads.
 
-This is the right durable direction, but it requires a deletion design:
-tombstone version ordering, root consistency, GC block scanning, and chunk/block
-reclamation rules. It is too much for the first proof point.
+### Approach C: Durable Tombstones
+
+The collector appends persistent tombstone metadata for unreachable object-data
+versions and allows recovery to omit covered objects without recomputing full
+reachability.
+
+This is rejected as the baseline. It adds persistent write traffic and durable
+metadata that Makalu/Ralloc-style recovery can avoid. Tombstones remain a
+possible future feature only for explicit durable deletes or bounded-recovery
+checkpoints, not for ordinary persistent object GC.
 
 ## Wave 1 Scope
 
@@ -243,21 +262,21 @@ not make progress. A later explicit maintenance API such as
 `persistent_gc_step(budget)` can reuse the same minibatch scanner without
 changing the commit-barrier design.
 
-Wave 3 should add a non-durable sweep/report mode only after commit-coupled
-incremental marking proves reliable. It may remove unreachable objects from
-volatile runtime indices or report reclaim candidates to a test-only harness,
-but it should still avoid durable deletion.
+Wave 3 should add tombstone-less recovery-time GC. Recovery should select live
+object-data winners from committed logs, run full reachability from persistent
+roots, rebuild the volatile object table only for reachable winners, and
+reconstruct line marks, free lists, reclaim queues, and block liveness
+summaries from reachable records.
 
-Wave 4 should design durable GC tombstones and recovery behavior. Tombstones
-belong in GC-owned metadata blocks, not in per-thread user transaction logs.
-Each fixed-size tombstone entry records an `ObjectId`, the object-data version
-that was proven unreachable, a GC epoch, and a checksum. Recovery should first
-select the highest committed live object-data version from transaction logs,
-then apply the highest valid GC tombstone for that `ObjectId`; a tombstone only
-suppresses a live record when `tombstone.target_version >= live.version`.
+Wave 4 should add runtime volatile sweep/report mode. It may remove
+unreachable objects from volatile runtime indices or report reclaim candidates
+to a test-only harness, but it still must not persist dead-object state or reuse
+persistent blocks whose old records would be scanned by recovery.
 
-Wave 5 should integrate Immix-style block/line reclamation using the existing
-Wizard-shaped block region. Immix should be a storage reuse policy under stable
+Wave 5 should integrate block/chunk retirement using the existing Wizard-shaped
+block region. The durable mechanism should be a block-generation or checkpoint
+scheme that lets recovery ignore retired blocks after live records have been
+copied elsewhere. Immix should be a storage reuse policy under stable
 `ObjectId` identity, not a reason to change persistent reference encoding.
 
 LXR should remain a later research branch after we have data showing whether its

@@ -66,8 +66,9 @@ Current remaining mock categories:
   representation.
 - `ttry`/`tfail` remains a later structured-failure workstream.
 - Persistent-object GC has a runtime-only logical marker. Commit-coupled
-  incremental marking, durable deletion/tombstones, and reclamation remain
-  future work.
+  incremental marking, tombstone-less recovery-time GC, volatile sweep, and
+  block/chunk reclamation remain future work. Per-object tombstones are not the
+  baseline design.
 - `FileBackedMemory` and `NVMemory` still need real recovery semantics; tests
   that require restart durability stay gated until hardware or restart harness
   support is ready.
@@ -1044,33 +1045,45 @@ Design direction:
 
 This wave still must not reclaim durable storage.
 
-## Wave 9C: Persistent Object Sweep And Tombstones
+## Wave 9C: Tombstone-Less Recovery-Time Persistent GC
 
-**Purpose:** design and implement actual persistent-object reclamation after the
-logical marker and commit-coupled incremental marker have enough coverage.
+**Purpose:** make recovery rebuild the volatile object table and auxiliary
+allocator state from reachable persistent objects only, without writing durable
+per-object GC tombstones.
 
 Current design direction:
 
-- tombstones are GC-owned fixed-size metadata entries stored in dedicated GC
-  tombstone blocks, not user transaction log entries
-- each tombstone records `ObjectId`, target object-data `version`, GC epoch,
-  and CRC32
-- tombstones have no transaction id and no LP bit; each entry is independently
-  durable, so a crash during sweep leaves a partial collection rather than a
-  corrupt transaction
-- recovery first selects the highest committed live object-data version per
-  `ObjectId`, then applies the highest valid GC tombstone for that `ObjectId`
-- if `tombstone.target_version >= live.version`, recovery omits the object from
-  the rebuilt volatile object table
-- object data bytes remain in object-data blocks until a block cleaner copies
-  live records out and retires garbage-heavy blocks
+- follow the Makalu/Ralloc-style tradeoff: minimize runtime persistent metadata
+  writes and pay recovery-time GC cost after restart
+- use Ralloc-style recoverability as the correctness rule: after recovery,
+  allocator/object metadata describes all and only persistent objects reachable
+  from persistent roots
+- use Makalu-style ownership-before-use for future persistent block/chunk
+  allocation so crashes can leak temporarily but cannot double-allocate storage
+- use persistent type/layout metadata as Ralloc-style filter functions; recovery
+  traces typed `ObjectId` fields/elements and treats missing layout metadata as
+  corruption
+- do not persist tombstones, mark bits, line marks, free lists, reclaim queues,
+  block live-byte summaries, or object-table entries
+- recovery scans committed object data, selects the highest live version per
+  `ObjectId`, and builds a temporary winner map
+- recovery loads persistent roots and type/layout metadata, then runs a full
+  `ObjectId` graph mark over the winner map
+- recovery rebuilds the volatile object table only for reachable winners
+- recovery reconstructs auxiliary allocator state from reachable records and
+  region metadata
+- runtime sweep may remove unreachable entries from volatile indices and update
+  volatile block summaries, but it does not persist dead-object state
 - `ObjectId` reuse stays disabled until generation/reuse rules are designed
 
 Deferred scope:
 
-- block/chunk reclamation and Immix line reuse
+- durable block/chunk retirement and Immix line reuse
+- compacting/copying live records into new persistent blocks
+- block-generation or checkpoint metadata that allows recovery to ignore
+  retired blocks
+- persistent allocator undo/redo repair for future block ownership transitions
 - explicit `ObjectId` reuse
-- concurrent sweep without a GC safe point
 - persistent full object-table storage
 
 ## Wave 10: Durable Backends

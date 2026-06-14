@@ -805,56 +805,90 @@ transactions.
 
 This incremental design is conservative. Removing a root or deleting an edge
 during a mark cycle may leave the old target marked until a later cycle. That
-only delays reclamation and is acceptable before durable tombstones and block
-reuse exist. Actual sweep, tombstone publication, block reclamation, and
-Immix-style line reuse remain phases after commit-coupled marking is tested.
+only delays reclamation and is acceptable before durable block reuse exists.
 
-Durable GC tombstones are GC-owned metadata, not user transaction
-publications. User transaction streams are per-thread and publish live object
-versions through `TxLogEntry` and object data records. GC tombstones describe
-global persistent reachability state, so they live in dedicated GC metadata
-blocks allocated from the same region block allocator, but scanned as a
-separate stream.
+The persistent GC baseline is tombstone-less, following the Makalu/Ralloc-style
+tradeoff: avoid persistent writes for collector metadata during normal
+execution, then rebuild the auxiliary allocator and object-table state with
+recovery-time GC. Persistent storage keeps only program state and scan-critical
+layout facts:
 
-The first tombstone format should be a fixed-size entry that fits cleanly in a
-metadata block and can be validated independently:
+Research basis: Makalu uses lazily persisted non-essential metadata plus
+post-failure recovery-time GC to reduce allocation persistence overhead. Ralloc
+adopts the same recovery-time GC direction, defines allocator recoverability,
+and adds filter functions to identify pointers inside persistent blocks.
+
+The recovery correctness target is Ralloc-style recoverability: after recovery,
+allocator and object-table metadata must describe all and only persistent
+objects reachable from persistent roots. A crash may temporarily leak allocated
+but unattached objects, detached-but-not-yet-reclaimed objects, thread-local
+cache contents, or stale free-list entries, but recovery must not allow the same
+persistent storage to be used for two live objects. Leaks are acceptable before
+recovery; double allocation is not.
+
+The Makalu-style ownership rule is that a block or chunk must be durably marked
+as owned before it can be handed to the mutator. If a crash happens after this
+ownership handoff but before the object becomes reachable, recovery-time GC will
+discover that the object is unreachable and rebuild volatile free/reclaim state
+accordingly. This shifts the steady-state cost away from per-allocation
+collector metadata and into recovery.
+
+Ralloc's filter-function idea maps to our persistent type/layout metadata.
+Because persistent Wasm objects are typed, recovery does not need conservative
+pointer guessing for `tstruct`/`tarray` payloads. The recovered `kind` and
+`type_layout_id` identify exactly which fields/elements contain `ObjectId`
+references. Unknown or missing layout metadata is a recovery error, not a
+reason to scan arbitrary words as object references.
+
+- committed object data records and their `ObjectId`, `version`, `kind`, and
+  `type_layout_id` headers
+- durable roots from `tglobal`, `ttable`, and explicit root metadata
+- persistent type/layout metadata needed to trace object payloads
+- minimal region, block, chunk, and log headers needed to scan committed data
+
+The following are volatile or reconstructable and must not be maintained as
+durable per-object GC metadata in the baseline design:
+
+- object table entries
+- mark bits and line marks
+- free lists and reclaim queues
+- block live-byte summaries
+- per-thread allocator caches
+- tombstones for unreachable objects
+
+Recovery uses full reachability instead of tombstones:
 
 ```text
-GcTombstoneEntry {
-  object_id: ObjectId,
-  target_version: u32,
-  gc_epoch: u32,
-  crc32: u32,
-}
+1. Scan committed transaction logs and object data records.
+2. Select the highest committed live object-data version per ObjectId.
+3. Build a temporary ObjectId -> object-record winner map.
+4. Load persistent roots and type/layout metadata.
+5. Run full ObjectId graph marking over the winner map.
+6. Rebuild the volatile ObjectTable only for reachable winners.
+7. Reconstruct line marks, block live-byte summaries, free lists, and reclaim
+   queues from reachable records and region metadata.
+8. Expose the VM.
 ```
 
-`target_version` is the highest object-data version that the collector proved
-unreachable. The entry has no transaction id and no LP bit. Each tombstone is
-individually durable: the collector writes the entry, flushes it, and seals the
-entry checksum. If a crash interrupts a sweep, recovery observes a prefix or
-subset of valid tombstones; missing tombstones mean incomplete collection, not
-corruption.
+If the future block allocator uses persistent undo/redo metadata to move blocks
+between free, owned, retired, and active generations, recovery must repair those
+metadata operations before the reachability pass. After repair, reachability
+remains authoritative for object liveness and volatile free/reclaim structures.
 
-Recovery applies tombstones after selecting the highest committed live object
-data record for each `ObjectId`:
+Runtime persistent GC may use the same marker to remove unreachable entries from
+the volatile object table and update volatile block summaries. It still does
+not persist dead-object state. If the process crashes before runtime cleanup
+finishes, recovery repeats the full reachability computation and reaches the
+same logical object table.
 
-```text
-live = highest committed object data version for ObjectId
-dead = highest valid GC tombstone for ObjectId
-
-if dead.target_version >= live.version:
-  do not rebuild the volatile object-table entry
-else:
-  object table points directly at the live persistent object data record
-```
-
-This keeps object data immutable and directly readable from persistent object
-data blocks. The rebuilt volatile object table may ignore tombstoned objects,
-while the old object data bytes remain available for a later block cleaner to
-copy live records out and retire garbage-heavy object-data and GC metadata
-blocks together. Until `ObjectId` reuse is explicitly designed, `ObjectId`s
-remain non-reused so a tombstone cannot accidentally kill a later unrelated
-object.
+Durable storage reuse is a block/chunk-cleaning problem, not a per-object
+tombstone problem. Old unreachable object data remains in object-data blocks
+until a cleaner copies live records into new blocks and publishes durable
+block-generation or checkpoint metadata that lets recovery ignore retired
+blocks. Until that block-retirement mechanism exists, 9C may report reclaim
+candidates and rebuild volatile free knowledge, but must not reuse persistent
+blocks whose old records would still be scanned by recovery. `ObjectId`s remain
+non-reused until generation/reuse rules are explicitly designed.
 
 Read-heavy workloads with few commits may not advance commit-coupled marking.
 A later explicit maintenance API can expose the same minibatch scanner, for
@@ -1107,8 +1141,9 @@ order:
 7. Add the runtime-only persistent `ObjectId` logical marker.
 8. Add commit-coupled incremental marking with commit barriers and bounded
    marking minibatches.
-9. Decide and implement deletion/tombstone rules together with GC; do not add
-   ad hoc deletion semantics before reclamation is designed.
+9. Implement tombstone-less recovery-time persistent GC first; do not add
+   ad hoc deletion/tombstone semantics before explicit durable delete or
+   block-retirement reclamation is designed.
 10. Add optional persistent-index/object-table persistence only behind an
     explicit future feature/configuration switch if Zen-style recovery time is
     unacceptable.
