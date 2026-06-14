@@ -1,6 +1,6 @@
 use super::{ObjectId, ObjectTable, current_thread_transaction};
 use crate::prelude::*;
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,22 +53,30 @@ pub(crate) struct PersistentGcStepReport {
     pub(crate) enqueued_objects: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct PersistentGcState {
     reachable: BTreeSet<ObjectId>,
-    grey: VecDeque<ObjectId>,
+    grey: Vec<ObjectId>,
     dangling_refs: Vec<DanglingObjectRef>,
     invalid_roots: Vec<PersistentRootError>,
 }
 
 impl PersistentGcState {
-    pub(crate) fn seed_roots<I>(&mut self, objects: &ObjectTable, roots: I)
+    pub(crate) fn new<I>(objects: &ObjectTable, roots: I) -> Result<Self>
     where
         I: IntoIterator<Item = ObjectId>,
     {
+        ensure_marker_inactive()?;
+        let mut state = Self {
+            reachable: BTreeSet::new(),
+            grey: Vec::new(),
+            dangling_refs: Vec::new(),
+            invalid_roots: Vec::new(),
+        };
         for root in roots {
-            self.seed_root(objects, root);
+            state.seed_root(objects, root);
         }
+        Ok(state)
     }
 
     pub(crate) fn mark_step(
@@ -76,9 +84,14 @@ impl PersistentGcState {
         objects: &ObjectTable,
         budget: PersistentGcBudget,
     ) -> Result<PersistentGcStepReport> {
+        ensure_marker_inactive()?;
+        ensure!(
+            budget.objects != 0 || self.grey.is_empty(),
+            "persistent object marker budget must scan at least one object"
+        );
         let mut report = PersistentGcStepReport::default();
         for _ in 0..budget.objects {
-            let Some(object) = self.grey.pop_front() else {
+            let Some(object) = self.grey.pop() else {
                 break;
             };
             report.scanned_objects += 1;
@@ -113,6 +126,11 @@ impl PersistentGcState {
     }
 
     pub(crate) fn into_report(self, objects: &ObjectTable) -> Result<PersistentObjectMarkReport> {
+        ensure_marker_inactive()?;
+        ensure!(
+            self.is_complete(),
+            "persistent object marker cannot report with pending work"
+        );
         let unreachable_persistent = objects
             .persistent_object_ids()?
             .difference(&self.reachable)
@@ -128,7 +146,7 @@ impl PersistentGcState {
 
     fn mark_reachable(&mut self, object: ObjectId) -> bool {
         if self.reachable.insert(object) {
-            self.grey.push_back(object);
+            self.grey.push(object);
             true
         } else {
             false
@@ -152,6 +170,14 @@ impl PersistentGcState {
     }
 }
 
+fn ensure_marker_inactive() -> Result<()> {
+    ensure!(
+        current_thread_transaction().is_none(),
+        "persistent object marker cannot run while a transaction is active"
+    );
+    Ok(())
+}
+
 pub(crate) struct PersistentObjectMarker;
 
 impl PersistentObjectMarker {
@@ -159,13 +185,7 @@ impl PersistentObjectMarker {
     where
         I: IntoIterator<Item = ObjectId>,
     {
-        ensure!(
-            current_thread_transaction().is_none(),
-            "persistent object marker cannot run while a transaction is active"
-        );
-
-        let mut state = PersistentGcState::default();
-        state.seed_roots(objects, roots);
+        let mut state = PersistentGcState::new(objects, roots)?;
         while !state.is_complete() {
             state.mark_step(objects, PersistentGcBudget::objects(state.grey.len()))?;
         }

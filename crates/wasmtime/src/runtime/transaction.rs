@@ -16,12 +16,13 @@ mod object_gc;
 mod persist;
 #[path = "transaction/type_layout.rs"]
 pub(crate) mod type_layout;
-#[allow(unused_imports)]
 pub(crate) use object_gc::{
-    DanglingObjectRef, DanglingObjectRefKind, PersistentGcBudget, PersistentGcState,
-    PersistentGcStepReport, PersistentObjectMarkReport, PersistentObjectMarker,
-    PersistentRootError, PersistentRootErrorKind,
+    DanglingObjectRef, DanglingObjectRefKind, PersistentObjectMarker, PersistentRootError,
+    PersistentRootErrorKind,
 };
+#[cfg(test)]
+use object_gc::{PersistentGcBudget, PersistentGcState, PersistentGcStepReport};
+pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
@@ -12263,8 +12264,7 @@ mod tests {
             .allocate_persistent_struct_for_gc_ref(0x508, vec![ObjectValue::I32(8)])
             .unwrap();
 
-        let mut state = PersistentGcState::default();
-        state.seed_roots(&objects, [root]);
+        let mut state = PersistentGcState::new(&objects, [root]).unwrap();
 
         assert_eq!(
             state
@@ -12305,6 +12305,111 @@ mod tests {
         assert_eq!(report.unreachable_persistent, object_set([unreachable]));
         assert!(report.invalid_roots.is_empty());
         assert!(report.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_object_marker_budgeted_state_rejects_zero_budget_with_pending_work() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x509, vec![ObjectValue::I32(9)])
+            .unwrap();
+
+        let mut state = PersistentGcState::new(&objects, [root]).unwrap();
+
+        let err = state
+            .mark_step(&objects, PersistentGcBudget::objects(0))
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object marker budget must scan at least one object"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_object_marker_budgeted_state_rejects_incomplete_report() {
+        let mut objects = ObjectTable::default();
+        let leaf = objects
+            .allocate_persistent_struct_for_gc_ref(0x50a, vec![ObjectValue::I32(10)])
+            .unwrap();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x50b, vec![ObjectValue::Ref(Some(leaf))])
+            .unwrap();
+
+        let state = PersistentGcState::new(&objects, [root]).unwrap();
+
+        let err = state.into_report(&objects).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object marker cannot report with pending work"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_object_marker_budgeted_state_rejects_active_transaction_use() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x50c, vec![ObjectValue::I32(12)])
+            .unwrap();
+        let mut state = PersistentGcState::new(&objects, [root]).unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let _state = TransactionState::new_for_test(TransactionId::from_raw(532));
+
+        let err = state
+            .mark_step(&objects, PersistentGcBudget::objects(1))
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object marker cannot run while a transaction is active"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_object_marker_preserves_lifo_dangling_ref_order() {
+        let mut objects = ObjectTable::default();
+        let left_missing = ObjectId { object_index: 201 };
+        let right_missing = ObjectId { object_index: 202 };
+        let left = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x50d,
+                vec![ObjectValue::Ref(Some(left_missing))],
+            )
+            .unwrap();
+        let right = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x50e,
+                vec![ObjectValue::Ref(Some(right_missing))],
+            )
+            .unwrap();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x50f,
+                vec![ObjectValue::Ref(Some(left)), ObjectValue::Ref(Some(right))],
+            )
+            .unwrap();
+
+        let report = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+
+        assert_eq!(
+            report.dangling_refs,
+            vec![
+                DanglingObjectRef {
+                    from: right,
+                    to: right_missing,
+                    kind: DanglingObjectRefKind::Missing,
+                },
+                DanglingObjectRef {
+                    from: left,
+                    to: left_missing,
+                    kind: DanglingObjectRefKind::Missing,
+                },
+            ]
+        );
     }
 
     #[test]
