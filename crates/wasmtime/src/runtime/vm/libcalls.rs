@@ -377,11 +377,12 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
     }
 
     let mut object_publications = Vec::new();
-    {
+    let persistent_gc_delta = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
         state.commit_object_payloads_into(object_table, &mut object_publications)?;
-    }
+        state.persistent_gc_commit_delta(&*object_table, &object_publications)?
+    };
     if !object_publications.is_empty() {
         let object_marker = {
             let store = store.store_opaque_mut();
@@ -412,7 +413,12 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
     store
         .store_opaque_mut()
         .transaction_state_mut()
-        .complete_commit()
+        .complete_commit()?;
+
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    state.observe_persistent_gc_commit_delta_after_commit(&*object_table, &persistent_gc_delta)?;
+    Ok(())
 }
 
 fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
