@@ -903,9 +903,10 @@ mod tests {
 
         let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
 
-        assert!(err.to_string().contains(
-            "persistent struct object-ref field must use object value ABI size"
-        ));
+        assert!(
+            err.to_string()
+                .contains("persistent struct object-ref field must use object value ABI size")
+        );
     }
 
     #[test]
@@ -921,9 +922,10 @@ mod tests {
 
         let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("persistent object-ref array elements must use object value ABI size"));
+        assert!(
+            err.to_string()
+                .contains("persistent object-ref array elements must use object value ABI size")
+        );
     }
 
     #[test]
@@ -939,9 +941,10 @@ mod tests {
 
         let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("persistent object reference slot is not encoded as a ref ABI value"));
+        assert!(
+            err.to_string()
+                .contains("persistent object reference slot is not encoded as a ref ABI value")
+        );
     }
 
     #[test]
@@ -958,8 +961,9 @@ mod tests {
 
         let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("non-canonical ref object value ABI payload"));
+        assert!(
+            err.to_string()
+                .contains("non-canonical ref object value ABI payload")
+        );
     }
 }

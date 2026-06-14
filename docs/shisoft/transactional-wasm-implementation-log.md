@@ -21,6 +21,71 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Persistent Type Layout Metadata And File-Backed Object Recovery
+
+Date: 2026-06-14
+
+The persistent object layout workstream now stores trace-oriented type metadata
+separately from object records and uses that metadata during recovery. The
+object table remains volatile in the Zen-style path: committed object records
+are durable, while the runtime index is rebuilt from file-backed log winners
+plus recovered layout metadata.
+
+Implemented status:
+
+- `TxObjectHeader` and runtime object-table slots now use `type_layout_id`
+  terminology. The durable `TxDataRecordHeader::type_info` wire field remains
+  unchanged, but object publication APIs map it to `type_layout_id`.
+- `transaction::type_layout` defines `TypeLayoutId`, trace slot kinds, struct,
+  array, and scalar persistent layouts, plus a compact little-endian codec and
+  `TypeLayoutRegistry`.
+- The block-region metadata path stores persistent type layout records in
+  region metadata space. File-backed recovery loads the registry before
+  replaying object winners.
+- Object publication calls `ensure_type_layout` before writing an object data
+  record. Publications that reference an unknown layout id fail before durable
+  object data is appended.
+- Recovery validates each object winner against the recovered layout registry:
+  missing layout ids, outer/header layout mismatch, and header-kind/layout-kind
+  mismatch are rejected.
+- Persistent object reference tracing is layout-guided for durable records.
+  Struct trace fields and array element trace kinds determine where `ObjectId`
+  references are found; scalar fields are ignored.
+- Wasmtime GC descriptors are now mapped into persistent trace layouts at the
+  transaction runtime boundary. Wasmtime still owns validation, casts, and
+  semantic type checks; persistent storage owns only trace metadata needed for
+  recovery and future persistent GC.
+- Added file-backed recovery coverage for scalar structs, structs with
+  persistent object references, scalar arrays, object-reference arrays, mixed
+  `tmemory` undo plus object-publication commit, mixed loose-end rollback, and
+  missing-layout rejection.
+
+Verification commands for the most recent file-backed recovery slice:
+
+```text
+cargo test -p wasmtime transaction::tests::file_backed_object_layout_recovery -- --nocapture
+test result: ok. 6 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime transaction::tests::file_backed_mixed_tmemory_object_recovery -- --nocapture
+test result: ok. 2 passed; 0 failed; 0 ignored
+
+git diff --check
+```
+
+Remaining boundaries:
+
+- The final `ObjectId`-carrying `tref` ABI is not complete; some execution paths
+  still use the volatile `VMGcRef -> ObjectId` bridge.
+- Commit-time promotion from volatile transaction objects into persistent
+  object records remains future work.
+- Persistent transactional function objects are still not complete.
+- Recovery can reconstruct root `ObjectId`s from committed `TGlobal`/`TTable`
+  winners, but those recovered roots still need runtime reintegration and
+  GC-facing root-closure handling.
+- Persistent-object GC, deletion/tombstones, and reclamation are still future
+  work. The current format is designed so those can trace by `ObjectId` without
+  adding a persisted object table.
+
 ## Model-Checking Wave 10: WAST And Model Cross-Checks
 
 Date: 2026-06-12

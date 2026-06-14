@@ -25,11 +25,8 @@ pub(crate) fn load_type_layout_registry_from_block(bytes: &[u8]) -> Result<TypeL
         bytes.len() >= TYPE_LAYOUT_METADATA_HEADER_LEN,
         "transactional type layout metadata block is shorter than the header"
     );
-    let payload_len = u32::from_le_bytes(
-        bytes[..TYPE_LAYOUT_METADATA_HEADER_LEN]
-            .try_into()
-            .unwrap(),
-    );
+    let payload_len =
+        u32::from_le_bytes(bytes[..TYPE_LAYOUT_METADATA_HEADER_LEN].try_into().unwrap());
     let payload_len = usize::try_from(payload_len)
         .context("transactional type layout metadata payload length overflow")?;
     ensure!(
@@ -49,11 +46,8 @@ pub(crate) fn append_type_layout_to_block(
         bytes.len() >= TYPE_LAYOUT_METADATA_HEADER_LEN,
         "transactional type layout metadata block is shorter than the header"
     );
-    let payload_len = u32::from_le_bytes(
-        bytes[..TYPE_LAYOUT_METADATA_HEADER_LEN]
-            .try_into()
-            .unwrap(),
-    );
+    let payload_len =
+        u32::from_le_bytes(bytes[..TYPE_LAYOUT_METADATA_HEADER_LEN].try_into().unwrap());
     let payload_len = usize::try_from(payload_len)
         .context("transactional type layout metadata payload length overflow")?;
     ensure!(
@@ -183,10 +177,12 @@ mod tests {
         assert!(append_type_layout_to_block(&mut bytes, &layout).unwrap());
         assert!(!append_type_layout_to_block(&mut bytes, &layout).unwrap());
 
-        let payload_len = u32::from_le_bytes(
-            bytes[..TYPE_LAYOUT_METADATA_HEADER_LEN].try_into().unwrap(),
+        let payload_len =
+            u32::from_le_bytes(bytes[..TYPE_LAYOUT_METADATA_HEADER_LEN].try_into().unwrap());
+        assert_eq!(
+            usize::try_from(payload_len).unwrap(),
+            layout.encode().unwrap().len()
         );
-        assert_eq!(usize::try_from(payload_len).unwrap(), layout.encode().unwrap().len());
     }
 
     #[test]

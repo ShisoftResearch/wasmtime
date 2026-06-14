@@ -15,7 +15,9 @@ use super::{
     pack_object_granule_id,
 };
 use crate::prelude::*;
-use crate::runtime::transaction::type_layout::{PersistentTypeLayout, TypeLayoutRegistry};
+use crate::runtime::transaction::type_layout::{
+    PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId, TypeLayoutRegistry,
+};
 use crate::runtime::transaction::{
     ObjectKind, ObjectPayload, ObjectValue, encode_object_record_for_recovery,
 };
@@ -2544,6 +2546,11 @@ pub fn publish_committed_struct_object(
         .iter()
         .map(|byte| ObjectValue::I32(i32::from(*byte)))
         .collect::<Vec<_>>();
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    region.append_type_layout_metadata(&scalar_struct_type_layout_for_test(
+        type_info,
+        fields.len(),
+    )?)?;
     let object_record = encode_object_record_for_recovery(
         object_id,
         version,
@@ -2551,8 +2558,8 @@ pub fn publish_committed_struct_object(
         type_info,
         &ObjectPayload::Struct(fields),
     )?;
-    publish_committed_data_record(
-        path,
+    publish_committed_data_record_into_region(
+        &mut region,
         stream_id,
         pack_object_granule_id(PackedGranuleDomain::TStruct, object_id)?,
         version,
@@ -2596,6 +2603,26 @@ fn publish_committed_data_record(
     payload: &[u8],
 ) -> Result<()> {
     let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    publish_committed_data_record_into_region(
+        &mut region,
+        stream_id,
+        logical_id,
+        version,
+        kind,
+        type_info,
+        payload,
+    )
+}
+
+fn publish_committed_data_record_into_region(
+    region: &mut FileBackedMemoryBlockRegion,
+    stream_id: u32,
+    logical_id: u64,
+    version: u32,
+    kind: u16,
+    type_info: u32,
+    payload: &[u8],
+) -> Result<()> {
     let stream = region.alloc_stream(stream_id)?;
     let record =
         TMemory::encode_publication_data_record(logical_id, version, kind, type_info, payload)?;
@@ -2609,11 +2636,41 @@ fn publish_committed_data_record(
         location.data_offset,
         true,
     );
-    write_log_entries_to_file_backed_region(&mut region, log_block, &[entry])?;
-    flush_chunk_for_recovery(&region, location.chunk_start_block)?;
+    write_log_entries_to_file_backed_region(&mut *region, log_block, &[entry])?;
+    flush_chunk_for_recovery(region, location.chunk_start_block)?;
     region.flush(region.block_offset(log_block)?, BLOCK_SIZE)?;
     region.fence()?;
     Ok(())
+}
+
+fn scalar_struct_type_layout_for_test(
+    type_layout_id: u32,
+    field_count: usize,
+) -> Result<PersistentTypeLayout> {
+    let mut fields = Vec::with_capacity(field_count);
+    for field_index in 0..field_count {
+        let field_index = u32::try_from(field_index).context("test struct field index overflow")?;
+        fields.push(StructTraceField {
+            field_index,
+            field_offset: field_index
+                .checked_mul(4)
+                .context("test struct field offset overflow")?,
+            value_size: 4,
+            kind: TraceSlotKind::Scalar,
+        });
+    }
+    Ok(PersistentTypeLayout::Struct {
+        id: TypeLayoutId::new(type_layout_id)
+            .context("test struct type layout id cannot be zero")?,
+        fingerprint: 0x7478_5f73_7472_0000
+            ^ u64::from(type_layout_id)
+            ^ (u64::try_from(field_count).context("test struct field count overflow")? << 32),
+        body_size: u32::try_from(field_count)
+            .context("test struct field count exceeds u32")?
+            .checked_mul(4)
+            .context("test struct body size overflow")?,
+        fields,
+    })
 }
 
 /// Corrupts the first durable log-entry CRC in a file-backed region image.

@@ -8,13 +8,26 @@
 
 **Tech Stack:** Rust, Wasmtime runtime, existing `transaction` feature, `TMemory` block-region metadata descriptors, file-backed durable transaction log, existing transaction object heap and recovery code.
 
+**Status as of 2026-06-14:** Waves 1-9 are implemented and committed through
+`2a0c82bfe`. Wave 10 documentation and broader verification are in progress.
+The current code already uses `type_layout_id`, persists type layouts in region
+metadata, validates object publications/recovery against recovered layouts, and
+has file-backed recovery tests for persistent structs, arrays, object
+references, and mixed `tmemory` undo plus object publication transactions.
+
 ---
 
 ## Current Boundary
 
-The implementation already has transactional objects, durable object publications, file-backed recovery, and a volatile object table. The remaining gap is that object records still use a generic `type_index` field and object tracing currently derives reference layout from decoded payload values. That is not enough for a persistent object model because recovery needs a durable, code-independent way to interpret object bodies and rebuild metadata.
+The implementation now has transactional objects, durable object publications,
+file-backed recovery, persistent type layout metadata, and a volatile object
+table rebuilt from committed object winners. The remaining object-model gaps are
+the final `ObjectId`-carrying transactional reference ABI, promotion from
+volatile transaction objects to persistent objects, persistent transactional
+function objects, runtime/GC integration of recovered `tglobal`/`ttable` roots,
+and persistent-object GC/reclamation.
 
-The desired boundary is:
+The implemented boundary is:
 
 - Region metadata stores per-type trace layouts.
 - Object records store a compact `type_layout_id`.
@@ -33,7 +46,9 @@ The desired boundary is:
 
 ## Wave 1: Rename The Durable Object Type Field
 
-- [ ] Add a focused failing unit test in [object_heap.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/object_heap.rs) proving object record headers expose `type_layout_id`, not `type_index`.
+Status: complete.
+
+- [x] Add a focused failing unit test in [object_heap.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/object_heap.rs) proving object record headers expose `type_layout_id`, not `type_index`.
 
   Test shape:
 
@@ -52,17 +67,17 @@ The desired boundary is:
   no field `type_layout_id` on type `TxObjectHeader`
   ```
 
-- [ ] Rename `TxObjectHeader::type_index` to `type_layout_id` in [object_heap.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/object_heap.rs).
+- [x] Rename `TxObjectHeader::type_index` to `type_layout_id` in [object_heap.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/object_heap.rs).
 
-- [ ] Rename runtime fields and parameters:
+- [x] Rename runtime fields and parameters:
 
   - `ObjectTableSlot::type_index` to `type_layout_id` in [transaction.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction.rs).
   - `RecoveredObjectWinner::type_index` to `type_layout_id` in [recovery.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/recovery.rs).
   - Function parameters named `type_index` in object heap helpers to `type_layout_id`.
 
-- [ ] Keep the on-disk `TxDataRecordHeader::type_info` field name unchanged for this wave, but map it at API boundaries as `type_layout_id`. This avoids a log-layout churn while making the runtime meaning explicit.
+- [x] Keep the on-disk `TxDataRecordHeader::type_info` field name unchanged for this wave, but map it at API boundaries as `type_layout_id`. This avoids a log-layout churn while making the runtime meaning explicit.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime transaction::tests::object_record_header_uses_type_layout_id
@@ -75,7 +90,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/transaction/object_heap.rs crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/vm/memory/tmemory/recovery.rs
@@ -84,9 +99,11 @@ The desired boundary is:
 
 ## Wave 2: Add Persistent Type Layout Records
 
-- [ ] Create [type_layout.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/type_layout.rs) and expose it from [transaction.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction.rs).
+Status: complete.
 
-- [ ] Add the durable type layout model:
+- [x] Create [type_layout.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/type_layout.rs) and expose it from [transaction.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction.rs).
+
+- [x] Add the durable type layout model:
 
   ```rust
   #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -149,7 +166,7 @@ The desired boundary is:
   }
   ```
 
-- [ ] Implement a compact little-endian codec in the same module:
+- [x] Implement a compact little-endian codec in the same module:
 
   - Fixed record header:
     - `magic: u32`
@@ -175,7 +192,7 @@ The desired boundary is:
   const TYPE_LAYOUT_RECORD_MAGIC: u32 = 0x544c_4159; // "TLAY"
   ```
 
-- [ ] Add codec tests in [type_layout.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/type_layout.rs):
+- [x] Add codec tests in [type_layout.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/type_layout.rs):
 
   - struct layout with two scalar fields and one object-ref field round-trips.
   - array layout with object-ref element round-trips.
@@ -184,7 +201,7 @@ The desired boundary is:
   - unknown layout kind is rejected.
   - invalid record length is rejected.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime transaction::type_layout
@@ -196,7 +213,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/transaction/type_layout.rs crates/wasmtime/src/runtime/transaction.rs
@@ -205,7 +222,9 @@ The desired boundary is:
 
 ## Wave 3: Add A Runtime Type Layout Registry
 
-- [ ] Add `TypeLayoutRegistry` to [type_layout.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/type_layout.rs):
+Status: complete.
+
+- [x] Add `TypeLayoutRegistry` to [type_layout.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/type_layout.rs):
 
   ```rust
   #[derive(Clone, Debug, Default)]
@@ -215,7 +234,7 @@ The desired boundary is:
   }
   ```
 
-- [ ] Implement registry operations:
+- [x] Implement registry operations:
 
   - `insert(layout) -> Result<()>`
   - `get(id) -> Option<&PersistentTypeLayout>`
@@ -225,20 +244,20 @@ The desired boundary is:
   - `encode_all() -> Vec<u8>`
   - `decode_all(bytes) -> Result<TypeLayoutRegistry>`
 
-- [ ] Enforce registry consistency:
+- [x] Enforce registry consistency:
 
   - Duplicate `TypeLayoutId` with identical record is accepted as idempotent.
   - Duplicate `TypeLayoutId` with different record is rejected.
   - Duplicate fingerprint mapped to a different layout id is rejected.
   - Layout id zero is rejected.
 
-- [ ] Add registry to `ObjectTable` in [transaction.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction.rs):
+- [x] Add registry to `ObjectTable` in [transaction.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction.rs):
 
   ```rust
   type_layouts: TypeLayoutRegistry,
   ```
 
-- [ ] Add `ObjectTable` helper methods:
+- [x] Add `ObjectTable` helper methods:
 
   ```rust
   pub(crate) fn register_type_layout(&mut self, layout: PersistentTypeLayout) -> Result<()>;
@@ -246,16 +265,16 @@ The desired boundary is:
   pub(crate) fn require_type_layout(&self, id: TypeLayoutId) -> Result<&PersistentTypeLayout>;
   ```
 
-- [ ] Keep existing object creation APIs working by registering built-in scalar layouts for `I31`, `Extern`, and `Func` during `ObjectTable::new`. Struct and array object creation paths that currently pass `0` must be changed to pass an explicit nonzero layout id.
+- [x] Keep existing object creation APIs working by registering built-in scalar layouts for `I31`, `Extern`, and `Func` during `ObjectTable::new`. Struct and array object creation paths that currently pass `0` must be changed to pass an explicit nonzero layout id.
 
-- [ ] Add tests:
+- [x] Add tests:
 
   - registry accepts idempotent duplicate.
   - registry rejects conflicting duplicate id.
   - object allocation with missing struct layout id returns an error.
   - object allocation with registered struct layout id succeeds.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime transaction::type_layout
@@ -268,7 +287,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/transaction/type_layout.rs crates/wasmtime/src/runtime/transaction.rs
@@ -277,28 +296,30 @@ The desired boundary is:
 
 ## Wave 4: Persist Type Layouts In Region Metadata Space
 
-- [ ] Add [metadata.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/metadata.rs) and expose it from [tmemory.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory.rs).
+Status: complete.
 
-- [ ] Use the existing metadata descriptor model in [block_region.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs). Add one descriptor kind for persistent type layouts:
+- [x] Add [metadata.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/metadata.rs) and expose it from [tmemory.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory.rs).
+
+- [x] Use the existing metadata descriptor model in [block_region.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs). Add one descriptor kind for persistent type layouts:
 
   ```rust
   pub(crate) const TYPE_LAYOUT_META_KIND: u64 = 0x5459_5045_4c41_594f; // "TYPELAYO"
   ```
 
-- [ ] Reserve metadata blocks during file-backed region initialization:
+- [x] Reserve metadata blocks during file-backed region initialization:
 
   - Block 0: `RegionHeader`.
   - Block 1: metadata descriptor table.
   - Block 2: append-only type layout metadata payload.
   - Log and data block allocation starts after reserved metadata blocks.
 
-- [ ] Change `validate_region_header` in [block_region.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs):
+- [x] Change `validate_region_header` in [block_region.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs):
 
   - Accept exactly one type-layout descriptor.
   - Reject descriptors whose offset/count overlap block 0, log blocks, or data blocks.
   - Reject descriptor records whose `kind` is unknown.
 
-- [ ] Add metadata APIs on `FileBackedMemoryBlockRegion`:
+- [x] Add metadata APIs on `FileBackedMemoryBlockRegion`:
 
   ```rust
   pub(crate) fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry>;
@@ -307,9 +328,9 @@ The desired boundary is:
 
   The append path writes the encoded layout record, flushes the touched file range, and leaves layout metadata independent from transaction log LP bits.
 
-- [ ] Add in-memory equivalents for tests on `VMemoryBlockRegion`, using the same codec and region metadata shape.
+- [x] Add in-memory equivalents for tests on `VMemoryBlockRegion`, using the same codec and region metadata shape.
 
-- [ ] Add tests in [block_region.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs) or [metadata.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/metadata.rs):
+- [x] Add tests in [block_region.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs) or [metadata.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/metadata.rs):
 
   - new file-backed region contains metadata descriptor table.
   - reopen loads an empty type-layout registry.
@@ -317,7 +338,7 @@ The desired boundary is:
   - append two layouts, reopen, recover both.
   - corrupt layout metadata record is rejected during metadata load.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime tmemory::metadata
@@ -330,7 +351,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/vm/memory/tmemory.rs crates/wasmtime/src/runtime/vm/memory/tmemory/metadata.rs crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs
@@ -339,7 +360,9 @@ The desired boundary is:
 
 ## Wave 5: Enforce Type Layout Publication Ordering
 
-- [ ] Extend the durable log backend boundary in [persist.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/persist.rs):
+Status: complete.
+
+- [x] Extend the durable log backend boundary in [persist.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/persist.rs):
 
   ```rust
   pub(crate) trait TxDurableLogBackend {
@@ -349,27 +372,27 @@ The desired boundary is:
   }
   ```
 
-- [ ] Implement `ensure_type_layout` for:
+- [x] Implement `ensure_type_layout` for:
 
   - in-memory durable log backend.
   - file-backed durable log backend, delegating to the region metadata APIs.
 
-- [ ] Rename `PendingPublication::type_info` to `type_layout_id` in [persist.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/persist.rs). Encode it into `TxDataRecordHeader::type_info` at the final wire boundary.
+- [x] Rename `PendingPublication::type_info` to `type_layout_id` in [persist.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/persist.rs). Encode it into `TxDataRecordHeader::type_info` at the final wire boundary.
 
-- [ ] Update `publish_object_publications_before_commit`:
+- [x] Update `publish_object_publications_before_commit`:
 
   - Collect required type layouts from the object table registry.
   - Call `ensure_type_layout` before writing the object publication data record.
   - Return an error if any publication references an unknown layout id.
   - Preserve current data-record-first, log-entry-second, LP-last commit ordering.
 
-- [ ] Add tests:
+- [x] Add tests:
 
   - publication referencing an unknown layout id fails before any object log entry is written.
   - known layout metadata is persisted before object publication data.
   - repeated publication for an already persisted layout does not append a duplicate layout record.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime transaction::persist
@@ -382,7 +405,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/transaction/persist.rs crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs
@@ -391,7 +414,9 @@ The desired boundary is:
 
 ## Wave 6: Recover Object Table From Layout Metadata Plus Logs
 
-- [ ] Extend [recovery.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/recovery.rs):
+Status: complete.
+
+- [x] Extend [recovery.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/vm/memory/tmemory/recovery.rs):
 
   ```rust
   pub(crate) struct RecoveredRegion {
@@ -402,7 +427,7 @@ The desired boundary is:
   }
   ```
 
-- [ ] Recovery sequence:
+- [x] Recovery sequence:
 
   1. Load type-layout metadata from region metadata space.
   2. Scan committed transaction log entries.
@@ -412,14 +437,14 @@ The desired boundary is:
   6. Verify header `kind` agrees with the recovered layout kind.
   7. Store winner with `type_layout_id`.
 
-- [ ] Update `ObjectTable::rebuild_from_recovered_object_winners`:
+- [x] Update `ObjectTable::rebuild_from_recovered_object_winners`:
 
   - Accept recovered `TypeLayoutRegistry`.
   - Install the registry before installing recovered slots.
   - Rebuild slots with `type_layout_id`.
   - Keep volatile GC handles and function handles empty unless explicitly reconstructed by runtime APIs.
 
-- [ ] Add recovery tests:
+- [x] Add recovery tests:
 
   - recovery rejects object records whose layout id is missing.
   - recovery rejects kind/layout mismatch.
@@ -427,7 +452,7 @@ The desired boundary is:
   - recovery accepts an array object with a matching array layout.
   - recovered object table contains slots keyed by persistent `ObjectId`.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime tmemory::recovery
@@ -440,7 +465,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/vm/memory/tmemory/recovery.rs crates/wasmtime/src/runtime/transaction.rs
@@ -449,9 +474,11 @@ The desired boundary is:
 
 ## Wave 7: Use Layout Metadata For Durable Reference Tracing
 
-- [ ] Replace payload-derived tracing in [object_heap.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/object_heap.rs) with layout-guided tracing for persistent objects.
+Status: complete.
 
-- [ ] Implement:
+- [x] Replace payload-derived tracing in [object_heap.rs](/home/shisoft/Code/Research/wasmtime/crates/wasmtime/src/runtime/transaction/object_heap.rs) with layout-guided tracing for persistent objects.
+
+- [x] Implement:
 
   ```rust
   pub(crate) fn trace_object_refs_with_layout(
@@ -461,21 +488,21 @@ The desired boundary is:
   ) -> Result<()>;
   ```
 
-- [ ] Struct tracing:
+- [x] Struct tracing:
 
   - For each `StructTraceField` with `ObjectRef`, read the object-ref ABI value at `field_offset`.
   - Ignore scalar fields.
   - Reject field offsets that exceed payload length.
 
-- [ ] Array tracing:
+- [x] Array tracing:
 
   - If `element_kind` is `Scalar`, no object refs are produced.
   - If `element_kind` is `ObjectRef`, iterate by `element_size`.
   - Reject payload lengths that are not divisible by `element_size`.
 
-- [ ] Keep the existing payload-derived tracing helpers only for tests that exercise object payload encoding without a persistent registry. Mark those helpers `#[cfg(test)]`.
+- [x] Keep the existing payload-derived tracing helpers only for tests that exercise object payload encoding without a persistent registry. Mark those helpers `#[cfg(test)]`.
 
-- [ ] Add tests:
+- [x] Add tests:
 
   - layout-guided struct tracing finds object refs.
   - layout-guided struct tracing ignores scalar slots.
@@ -483,7 +510,7 @@ The desired boundary is:
   - bad field offset is rejected.
   - bad array payload length is rejected.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime transaction::object_heap::trace
@@ -496,7 +523,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/transaction/object_heap.rs crates/wasmtime/src/runtime/transaction/type_layout.rs crates/wasmtime/src/runtime/transaction.rs
@@ -505,9 +532,11 @@ The desired boundary is:
 
 ## Wave 8: Connect Wasmtime Type Information To Layout Ids
 
-- [ ] Add a translation/runtime mapping layer that converts Wasmtime GC type information into `PersistentTypeLayout` records. Place the first implementation near the existing transaction runtime boundary, not in persistent storage code.
+Status: complete.
 
-- [ ] Required mapping behavior:
+- [x] Add a translation/runtime mapping layer that converts Wasmtime GC type information into `PersistentTypeLayout` records. Place the first implementation near the existing transaction runtime boundary, not in persistent storage code.
+
+- [x] Required mapping behavior:
 
   - Struct field value types become struct trace fields.
   - Reference-typed struct fields become `TraceSlotKind::ObjectRef`.
@@ -516,7 +545,7 @@ The desired boundary is:
   - Array element non-reference types become `TraceSlotKind::Scalar`.
   - Fingerprints are deterministic over Wasmtime type shape and transactional object kind.
 
-- [ ] Add an internal helper and a small adapter type:
+- [x] Add an internal helper and a small adapter type:
 
   ```rust
   pub(crate) struct WasmtimePersistentFieldLayout {
@@ -541,16 +570,16 @@ The desired boundary is:
 
   Use the concrete Wasmtime type descriptors available at the implementation site. The persistent module must not own Wasm validation or cast semantics.
 
-- [ ] Wire struct/array allocation paths so persistent object creation receives a nonzero `TypeLayoutId`.
+- [x] Wire struct/array allocation paths so persistent object creation receives a nonzero `TypeLayoutId`.
 
-- [ ] Tests:
+- [x] Tests:
 
   - two identical Wasmtime struct shapes produce the same fingerprint and layout id.
   - different field reference maps produce different fingerprints.
   - persistent struct allocation registers layout before publication.
   - persistent array allocation registers layout before publication.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime transaction::tests::wasmtime_type_layout_mapping
@@ -563,7 +592,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/transaction/type_layout.rs
@@ -572,9 +601,11 @@ The desired boundary is:
 
 ## Wave 9: File-Backed End-To-End Recovery Tests
 
-- [ ] Add file-backed tests that create a temporary persistent region, register layouts, commit object transactions, reopen the region, recover, and read back the object table.
+Status: complete.
 
-- [ ] Test cases:
+- [x] Add file-backed tests that create a temporary persistent region, register layouts, commit object transactions, reopen the region, recover, and read back the object table.
+
+- [x] Test cases:
 
   - persistent struct with only scalar fields.
   - persistent struct containing a persistent object reference.
@@ -584,7 +615,7 @@ The desired boundary is:
   - missing layout metadata causes recovery rejection.
   - object table volatile metadata is absent after recovery and rebuilt by `ObjectId`.
 
-- [ ] Tests should assert:
+- [x] Tests should assert:
 
   - committed object data is read from recovered object records.
   - `ObjectId` identity survives recovery.
@@ -592,7 +623,7 @@ The desired boundary is:
   - tmemory recovery still applies undo-log semantics.
   - object publications still apply redo-log semantics.
 
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cargo test -p wasmtime transaction::tests::file_backed_object_layout_recovery
@@ -605,7 +636,7 @@ The desired boundary is:
   test result: ok
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/vm/memory/tmemory/recovery.rs
@@ -614,7 +645,9 @@ The desired boundary is:
 
 ## Wave 10: Documentation And Progress Tracking
 
-- [ ] Update [transactional-wasm-runtime-core-design.md](/home/shisoft/Code/Research/wasmtime/docs/shisoft/transactional-wasm-runtime-core-design.md):
+Status: in progress.
+
+- [x] Update [transactional-wasm-runtime-core-design.md](/home/shisoft/Code/Research/wasmtime/docs/shisoft/transactional-wasm-runtime-core-design.md):
 
   - Add the region metadata/type layout section.
   - Clarify that type metadata is trace metadata, not Wasm semantic metadata.
@@ -622,24 +655,30 @@ The desired boundary is:
   - Clarify object table volatility and recovery rebuild.
   - Clarify type layout persistence-before-publication ordering.
 
-- [ ] Update [transactional-wasm-implementation-log.md](/home/shisoft/Code/Research/wasmtime/docs/shisoft/transactional-wasm-implementation-log.md):
+- [x] Update [transactional-wasm-implementation-log.md](/home/shisoft/Code/Research/wasmtime/docs/shisoft/transactional-wasm-implementation-log.md):
 
   - Record the implemented layout registry.
   - Record the file-backed metadata persistence status.
   - Record passing recovery tests.
   - Record any remaining GC integration boundaries.
 
-- [ ] Update [transactional-wasm-all-wast-completion-roadmap.md](/home/shisoft/Code/Research/wasmtime/docs/shisoft/transactional-wasm-all-wast-completion-roadmap.md) only if object metadata work changes WAST status.
+- [x] Update [transactional-wasm-all-wast-completion-roadmap.md](/home/shisoft/Code/Research/wasmtime/docs/shisoft/transactional-wasm-all-wast-completion-roadmap.md) only if object metadata work changes WAST status.
 
-- [ ] Run final verification:
+- [x] Run final verification:
 
   ```bash
   cargo test -p wasmtime transaction
   cargo test -p wasmtime tmemory
-  cargo test -p wasmtime --test all
+  cargo test -p wasmtime --tests
+  cargo fmt -p wasmtime --check
+  git diff --check
   ```
 
-  Expected final result:
+  Note: `cargo test -p wasmtime --test all` was attempted, but `wasmtime` has no
+  test target named `all`; `cargo test -p wasmtime --tests` is the valid
+  package-wide test command used for this verification.
+
+  Final result:
 
   ```text
   test result: ok

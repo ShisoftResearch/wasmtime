@@ -105,10 +105,9 @@ impl PendingPublication {
         if self.kind == PackedGranuleDomain::TStruct as u16
             || self.kind == PackedGranuleDomain::TArray as u16
         {
-            return Ok(Some(
-                TypeLayoutId::new(self.type_layout_id)
-                    .context("persistent object publication type layout id cannot be zero")?,
-            ));
+            return Ok(Some(TypeLayoutId::new(self.type_layout_id).context(
+                "persistent object publication type layout id cannot be zero",
+            )?));
         }
         Ok(None)
     }
@@ -902,10 +901,13 @@ fn sample_publications() -> Vec<PendingPublication> {
 mod tests {
     use super::*;
     use crate::runtime::transaction::{
-        ObjectPayload, ObjectValue, object_heap::TxObjectHeader,
+        ObjectPayload, ObjectValue,
+        object_heap::TxObjectHeader,
         object_heap::encode_object_record_for_test,
         type_layout::{PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId},
     };
+
+    const TEST_STRUCT_TYPE_LAYOUT_ID: u32 = 12;
 
     fn sample_struct_type_layout(id: u32, fingerprint: u64) -> PersistentTypeLayout {
         PersistentTypeLayout::Struct {
@@ -926,6 +928,20 @@ mod tests {
                     kind: TraceSlotKind::Scalar,
                 },
             ],
+        }
+    }
+
+    fn test_struct_type_layout() -> PersistentTypeLayout {
+        PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(TEST_STRUCT_TYPE_LAYOUT_ID).unwrap(),
+            fingerprint: 0x7478_5f74_6573_740c,
+            body_size: 4,
+            fields: vec![StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 4,
+                kind: TraceSlotKind::Scalar,
+            }],
         }
     }
 
@@ -1116,7 +1132,10 @@ mod tests {
         let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
 
         log.ensure_type_layout(&original).unwrap();
-        let err = log.ensure_type_layout(&conflicting).unwrap_err().to_string();
+        let err = log
+            .ensure_type_layout(&conflicting)
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("conflicting persistent type layout for id 102"));
     }
@@ -1219,16 +1238,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tx-log.bin");
         let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        log.ensure_type_layout(&test_struct_type_layout()).unwrap();
         let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
         let publication = PendingPublication::persistent_object_for_test(
             PackedGranuleDomain::TStruct,
             41,
             7,
-            12,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
             &encode_object_record_for_test(
                 41,
                 7,
-                12,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
                 &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
             )
             .unwrap(),
@@ -1269,16 +1289,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tx-log.bin");
         let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        log.ensure_type_layout(&test_struct_type_layout()).unwrap();
         let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
         let publication = PendingPublication::persistent_object_for_test(
             PackedGranuleDomain::TStruct,
             41,
             7,
-            12,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
             &encode_object_record_for_test(
                 41,
                 7,
-                12,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
                 &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
             )
             .unwrap(),
@@ -1639,7 +1660,7 @@ mod tests {
             let payload = encode_object_record_for_test(
                 object_id,
                 record.version,
-                12,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
                 &ObjectPayload::Struct(vec![ObjectValue::I32(i32::from(record.payload_byte))]),
             )
             .unwrap();
@@ -1647,7 +1668,7 @@ mod tests {
                 PackedGranuleDomain::TStruct,
                 object_id,
                 record.version,
-                12,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
                 &payload,
             )
         }
@@ -1667,6 +1688,7 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let path = dir.path().join("tx-log.bin");
             let mut log = TxDurableLog::create_file_backed(&path, 64)?;
+            log.ensure_type_layout(&test_struct_type_layout())?;
             let mut records_by_tx = BTreeMap::<u32, Vec<&ModelRecord>>::new();
             for record in records {
                 records_by_tx.entry(record.tx).or_default().push(record);
@@ -2420,7 +2442,7 @@ mod tests {
                     let payload = encode_object_record_for_test(
                         object_id,
                         version,
-                        12,
+                        TEST_STRUCT_TYPE_LAYOUT_ID,
                         &ObjectPayload::Struct(vec![ObjectValue::I32(i32::from(payload_byte))]),
                     )
                     .unwrap();
@@ -2428,7 +2450,7 @@ mod tests {
                         PackedGranuleDomain::TStruct,
                         object_id,
                         version,
-                        12,
+                        TEST_STRUCT_TYPE_LAYOUT_ID,
                         &payload,
                     )
                 }
@@ -2577,6 +2599,13 @@ mod tests {
             scenario: &BackendScenario,
         ) -> Result<BackendObservation> {
             let mut handle = factory.create()?;
+            if scenario.transactions.iter().any(|tx| {
+                tx.records
+                    .iter()
+                    .any(|record| (*record).is_object_publication())
+            }) {
+                handle.log.ensure_type_layout(&test_struct_type_layout())?;
+            }
 
             for tx in &scenario.transactions {
                 assert!(

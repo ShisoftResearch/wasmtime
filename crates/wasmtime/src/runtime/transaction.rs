@@ -8209,7 +8209,10 @@ mod tests {
                 recovered.rebuilt.payload(object).unwrap(),
                 ObjectPayload::Struct(vec![ObjectValue::I32(9), ObjectValue::I64(2)])
             );
-            assert_eq!(recovered.rebuilt.live_slot(object).unwrap().type_layout_id, layout_id);
+            assert_eq!(
+                recovered.rebuilt.live_slot(object).unwrap().type_layout_id,
+                layout_id
+            );
             assert!(
                 recovered
                     .recovered_region
@@ -8252,12 +8255,12 @@ mod tests {
             );
             assert_eq!(
                 recovered.rebuilt.payload(owner).unwrap(),
-                ObjectPayload::Struct(vec![
-                    ObjectValue::I32(9),
-                    ObjectValue::Ref(Some(target)),
-                ])
+                ObjectPayload::Struct(vec![ObjectValue::I32(9), ObjectValue::Ref(Some(target)),])
             );
-            assert_eq!(recovered.rebuilt.trace_object_ids(owner).unwrap(), vec![target]);
+            assert_eq!(
+                recovered.rebuilt.trace_object_ids(owner).unwrap(),
+                vec![target]
+            );
             assert_eq!(
                 recovered.rebuilt.live_slot(owner).unwrap().type_layout_id,
                 owner_layout_id
@@ -8299,7 +8302,10 @@ mod tests {
                     ObjectValue::I32(3),
                 ])
             );
-            assert_eq!(recovered.rebuilt.live_slot(object).unwrap().type_layout_id, layout_id);
+            assert_eq!(
+                recovered.rebuilt.live_slot(object).unwrap().type_layout_id,
+                layout_id
+            );
         }
 
         #[test]
@@ -8351,7 +8357,10 @@ mod tests {
                 recovered.rebuilt.trace_object_ids(array).unwrap(),
                 vec![second, first]
             );
-            assert_eq!(recovered.rebuilt.live_slot(array).unwrap().type_layout_id, layout_id);
+            assert_eq!(
+                recovered.rebuilt.live_slot(array).unwrap().type_layout_id,
+                layout_id
+            );
         }
 
         #[test]
@@ -8363,8 +8372,8 @@ mod tests {
                 ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
             );
 
-            let err =
-                recover_file_backed_object_without_layout_metadata_for_test(&publication).unwrap_err();
+            let err = recover_file_backed_object_without_layout_metadata_for_test(&publication)
+                .unwrap_err();
 
             assert!(
                 err.to_string()
@@ -8411,12 +8420,12 @@ mod tests {
             );
             assert_eq!(
                 recovered.rebuilt.payload(owner).unwrap(),
-                ObjectPayload::Struct(vec![
-                    ObjectValue::I32(16),
-                    ObjectValue::Ref(Some(target)),
-                ])
+                ObjectPayload::Struct(vec![ObjectValue::I32(16), ObjectValue::Ref(Some(target)),])
             );
-            assert_eq!(recovered.rebuilt.trace_object_ids(owner).unwrap(), vec![target]);
+            assert_eq!(
+                recovered.rebuilt.trace_object_ids(owner).unwrap(),
+                vec![target]
+            );
         }
     }
 
@@ -8510,9 +8519,16 @@ mod tests {
                 rebuilt.rebuilt.payload(object).unwrap(),
                 ObjectPayload::Struct(vec![ObjectValue::I32(9)])
             );
-            assert_eq!(rebuilt.rebuilt.live_slot(object).unwrap().type_layout_id, layout_id);
             assert_eq!(
-                rebuilt.rebuilt.pending_publication_for_test(object).unwrap().version,
+                rebuilt.rebuilt.live_slot(object).unwrap().type_layout_id,
+                layout_id
+            );
+            assert_eq!(
+                rebuilt
+                    .rebuilt
+                    .pending_publication_for_test(object)
+                    .unwrap()
+                    .version,
                 2
             );
         }

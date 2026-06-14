@@ -1,7 +1,7 @@
 # Transactional Wasm Runtime Core Design
 
 Date: 2026-06-04
-Last updated: 2026-06-11
+Last updated: 2026-06-14
 
 ## Feature Switch Policy
 
@@ -645,7 +645,8 @@ tref/ObjectId
 ```
 
 Every persistent object record has an explicit backend header. The exact layout
-can evolve with the backend, but the first shape should include at least:
+can evolve with the backend, but the current shape includes object-specific
+metadata only:
 
 ```rust
 #[repr(C)]
@@ -655,7 +656,7 @@ struct TxObjectHeader {
     version: u32,
     kind: u16,
     flags: u16,
-    type_index: u32,
+    type_layout_id: u32,
 }
 
 #[repr(C)]
@@ -668,11 +669,32 @@ struct TxArrayHeader {
 The `kind` field identifies the persistent object payload kind, such as struct,
 array, external object wrapper, or future persistent runtime object kinds.
 `version` is the durable object-record version used by log recovery.
-`type_index` records the Wasmtime shared type identity or a backend layout id.
+`type_layout_id` points at durable trace metadata in region metadata space. It
+is not the Wasmtime type identity used for validation or casts. Wasmtime module
+metadata remains the semantic authority for type checking; the persistent
+layout registry stores only the facts needed after recovery to size objects and
+trace `ObjectId` references.
 Write ownership remains attached to the stable `ObjectId` granule because COW
 writes publish a new object record at commit. The volatile table may keep
 additional live-slot versions for in-process optimistic-read validation, but it
 is not the durable source of object identity.
+
+Persistent type layout records are compact little-endian metadata records stored
+in region metadata space before any object publication that references them.
+The registry is keyed by nonzero `TypeLayoutId`s and contains:
+
+- `Struct` layouts: deterministic fingerprint, body size, and trace fields with
+  field index, payload offset, value size, and scalar/object-reference kind.
+- `Array` layouts: deterministic fingerprint, element size, and scalar or
+  object-reference element kind.
+- `Scalar` layouts for built-in persistent `i31`, extern, and function-object
+  cases.
+
+The durable transaction data header still has a generic `type_info` wire field,
+but object publication APIs map that field to `type_layout_id` at the runtime
+boundary. Recovery rejects an object publication if the referenced
+`type_layout_id` is missing, if the object header and outer data header disagree,
+or if the header kind disagrees with the recovered layout kind.
 
 Persistent-by-reachability is defined over durable roots and `ObjectId` edges:
 
@@ -717,7 +739,7 @@ The current implementation direction is:
 
 - allocate persistent object records in `ObjectHeapRegion`
 - publish records through stable `ObjectId` identities and volatile table slots
-- keep payloads traceable by `kind` and `type_index`
+- keep payloads traceable by `kind` and recovered `type_layout_id` metadata
 - store persistent references as `ObjectId`
 - reject or promote volatile `VMGcRef` values before commit
 - allow the first volatile backend to leak or explicitly free test objects
@@ -867,15 +889,17 @@ current winning object record is reconstructed during recovery.
 
 Recovery rebuilds the object table as follows:
 
-1. Scan durable log streams and validate `TxLogEntry` CRC32 values.
-2. Keep only transactions whose stream contains an LP-marked final entry.
-3. Decode committed `TStruct` and `TArray` data records.
-4. Select the highest `version` for each object logical id; duplicate committed
+1. Load the persistent type layout registry from region metadata space.
+2. Scan durable log streams and validate `TxLogEntry` CRC32 values.
+3. Keep only transactions whose stream contains an LP-marked final entry.
+4. Decode committed `TStruct` and `TArray` data records.
+5. Select the highest `version` for each object logical id; duplicate committed
    versions are corruption.
-5. Reinstall winning object record bytes into the runtime object heap.
-6. Reconstruct volatile object table slots from `TxObjectHeader.object_id`,
-   `kind`, `version`, and `type_index`.
-7. Reconstruct phase-1 durable roots from committed `TGlobal`/`TTable`
+6. Validate every winner against the recovered `type_layout_id` metadata.
+7. Reinstall winning object record bytes into the runtime object heap.
+8. Reconstruct volatile object table slots from `TxObjectHeader.object_id`,
+   `kind`, `version`, and `type_layout_id`.
+9. Reconstruct phase-1 durable roots from committed `TGlobal`/`TTable`
    root-bearing winners.
 
 Object-table-facing constraints:
@@ -973,18 +997,22 @@ order:
 3. Define transactional function objects so persistent `tfunc` and function
    references use `ObjectId` identity while Wasmtime function indices remain
    payload metadata.
-4. Complete durable publication for committed `tglobal`, `ttable`, `TStruct`,
-   and `TArray` updates through the publication log/data path, and complete
-   durable undo-before-in-place writes for persistent `tmemory`.
-5. Finish recovery root reconstruction for `tglobal` and `ttable` references.
-6. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
+4. Complete runtime reintegration for recovered `tglobal` and `ttable`
+   reference-bearing roots. Recovery already reconstructs root `ObjectId`s from
+   committed `TGlobal`/`TTable` winners, but the recovered roots still need to
+   be wired into the persistent object runtime and future GC root closure.
+   Persistent `TStruct` and `TArray` records already use durable object
+   publication data and recovered `type_layout_id` metadata in the current
+   file-backed path, but still need the final GC-backed object identity and
+   promotion integration.
+5. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
    persistent `ObjectId` graphs.
-7. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
+6. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
    metadata so persistent GC can be added without changing committed formats.
-8. Decide and implement deletion/tombstone rules together with GC; do not add
+7. Decide and implement deletion/tombstone rules together with GC; do not add
    ad hoc deletion semantics before reclamation is designed.
-9. Add the first non-moving persistent `ObjectId` mark/sweep collector.
-10. Add optional persistent-index/object-table persistence only behind an
+8. Add the first non-moving persistent `ObjectId` mark/sweep collector.
+9. Add optional persistent-index/object-table persistence only behind an
     explicit future feature/configuration switch if Zen-style recovery time is
     unacceptable.
 
