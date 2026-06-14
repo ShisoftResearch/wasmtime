@@ -6,7 +6,7 @@ use super::{
 use crate::prelude::*;
 use crate::runtime::transaction::{
     ObjectKind, TxObjectHeader,
-    type_layout::{PersistentTypeKind, TypeLayoutId, TypeLayoutRegistry},
+    type_layout::{TypeLayoutId, TypeLayoutRegistry},
 };
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -143,12 +143,7 @@ pub(crate) fn recover_region(
     }
 
     let winners = winners.into_values().collect::<Vec<_>>();
-    let object_winners = replay_object_winners(
-        region,
-        &discovered.data_chunk_index,
-        &winners,
-        &type_layouts,
-    )?;
+    let object_winners = replay_object_winners(region, &discovered.data_chunk_index, &winners)?;
     let root_object_ids = replay_root_object_ids(region, &discovered.data_chunk_index, &winners)?;
 
     Ok(RecoveredRegion {
@@ -254,7 +249,6 @@ fn replay_object_winners(
     region: &BlockRegionBackendView<'_>,
     data_chunk_index: &DataChunkIndex,
     winners: &[RecoveryWinner],
-    type_layouts: &TypeLayoutRegistry,
 ) -> Result<Vec<RecoveredObjectWinner>> {
     let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
 
@@ -301,20 +295,8 @@ fn replay_object_winners(
             object_domain_matches_object_kind(domain, object_header.kind),
             "recovered object publication outer kind does not match object record kind"
         );
-        let type_layout_id = TypeLayoutId::new(object_header.type_layout_id)
+        TypeLayoutId::new(object_header.type_layout_id)
             .context("recovered object record type layout id cannot be zero")?;
-        let layout = type_layouts.get(type_layout_id).with_context(|| {
-            format!(
-                "recovered object record references missing persistent type layout id {}",
-                type_layout_id.get()
-            )
-        })?;
-        ensure!(
-            persistent_layout_kind_matches_object_kind(layout.kind(), object_header.kind),
-            "recovered persistent type layout kind {:?} does not match object kind {}",
-            layout.kind(),
-            object_header.kind
-        );
         let candidate = RecoveredObjectWinner {
             object_id,
             version: winner.version,
@@ -341,19 +323,6 @@ fn replay_object_winners(
     }
 
     Ok(object_winners.into_values().collect())
-}
-
-fn persistent_layout_kind_matches_object_kind(
-    type_kind: PersistentTypeKind,
-    object_kind: u16,
-) -> bool {
-    match type_kind {
-        PersistentTypeKind::Struct => object_kind == ObjectKind::Struct as u16,
-        PersistentTypeKind::Array => object_kind == ObjectKind::Array as u16,
-        PersistentTypeKind::I31 => object_kind == ObjectKind::I31 as u16,
-        PersistentTypeKind::Extern => object_kind == ObjectKind::Extern as u16,
-        PersistentTypeKind::Func => object_kind == ObjectKind::Func as u16,
-    }
 }
 
 fn object_domain_matches_object_kind(domain: PackedGranuleDomain, object_kind: u16) -> bool {
@@ -824,19 +793,31 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_object_record_with_missing_type_layout_metadata() {
+    fn recovery_keeps_unreachable_object_record_with_missing_type_layout_metadata() {
         let region = sample_region_with_missing_object_type_layout_metadata();
-        let err = recover_region_for_test(&region).unwrap_err();
+        let recovered = recover_region_for_test(&region).unwrap();
+        let objects = recovered.committed_object_winners().unwrap();
 
-        assert!(err.to_string().contains("persistent type layout"));
+        assert!(recovered.root_object_ids.is_empty());
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].object_id, 41);
+        assert_eq!(objects[0].version, 1);
+        assert_eq!(objects[0].kind, ObjectKind::Struct as u16);
+        assert_eq!(objects[0].type_layout_id, 101);
     }
 
     #[test]
-    fn recovery_rejects_object_record_kind_layout_mismatch() {
+    fn recovery_keeps_unreachable_object_record_kind_layout_mismatch() {
         let region = sample_region_with_object_kind_layout_mismatch();
-        let err = recover_region_for_test(&region).unwrap_err();
+        let recovered = recover_region_for_test(&region).unwrap();
+        let objects = recovered.committed_object_winners().unwrap();
 
-        assert!(err.to_string().contains("does not match object kind"));
+        assert!(recovered.root_object_ids.is_empty());
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].object_id, 41);
+        assert_eq!(objects[0].version, 1);
+        assert_eq!(objects[0].kind, ObjectKind::Array as u16);
+        assert_eq!(objects[0].type_layout_id, 101);
     }
 
     #[test]
