@@ -514,6 +514,21 @@ fn clear_current_thread_transaction_for_test() {
     replace_current_thread_transaction(None);
 }
 
+#[cfg(test)]
+struct ClearCurrentThreadTransactionOnDrop;
+
+#[cfg(test)]
+impl Drop for ClearCurrentThreadTransactionOnDrop {
+    fn drop(&mut self) {
+        clear_current_thread_transaction_for_test();
+    }
+}
+
+#[cfg(test)]
+fn clear_current_thread_transaction_on_drop_for_test() -> ClearCurrentThreadTransactionOnDrop {
+    ClearCurrentThreadTransactionOnDrop
+}
+
 impl TransactionId {
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -8166,6 +8181,426 @@ mod tests {
         assert!(object_winners.is_empty());
     }
 
+    mod file_backed_object_layout_recovery {
+        use super::*;
+
+        #[test]
+        fn persistent_struct_with_only_scalars_recovers_payload_and_layout() {
+            let ((object, layout_id), recovered) =
+                recover_file_backed_object_layout_case_for_test(201, |objects, state| {
+                    let object = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x901,
+                            201,
+                            1,
+                            vec![ObjectValue::I32(1), ObjectValue::I64(2)],
+                        )?;
+                    let layout_id = objects.live_slot(object)?.type_layout_id;
+                    state.acquire_object_write(objects, object)?;
+                    state.stage_struct_field(objects, object, 0, ObjectValue::I32(9))?;
+                    Ok((object, layout_id))
+                })
+                .unwrap();
+
+            assert_eq!(recovered.object_winners.len(), 1);
+            assert_eq!(recovered.object_winners[0].object_id, object.object_index);
+            assert_eq!(recovered.object_winners[0].type_layout_id, layout_id);
+            assert_eq!(
+                recovered.rebuilt.payload(object).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(9), ObjectValue::I64(2)])
+            );
+            assert_eq!(recovered.rebuilt.live_slot(object).unwrap().type_layout_id, layout_id);
+            assert!(
+                recovered
+                    .recovered_region
+                    .type_layouts
+                    .contains(type_layout::TypeLayoutId::new(layout_id).unwrap())
+            );
+        }
+
+        #[test]
+        fn persistent_struct_with_object_reference_recovers_payload_and_identity() {
+            let ((owner, target, owner_layout_id), recovered) =
+                recover_file_backed_object_layout_case_for_test(202, |objects, state| {
+                    let target = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x902,
+                            202,
+                            2,
+                            vec![ObjectValue::I32(1)],
+                        )?;
+                    let owner = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x903,
+                            202,
+                            3,
+                            vec![ObjectValue::I32(4), ObjectValue::Ref(None)],
+                        )?;
+                    let owner_layout_id = objects.live_slot(owner)?.type_layout_id;
+                    state.acquire_object_write(objects, target)?;
+                    state.stage_struct_field(objects, target, 0, ObjectValue::I32(7))?;
+                    state.acquire_object_write(objects, owner)?;
+                    state.stage_struct_field(objects, owner, 0, ObjectValue::I32(9))?;
+                    state.stage_struct_field(objects, owner, 1, ObjectValue::Ref(Some(target)))?;
+                    Ok((owner, target, owner_layout_id))
+                })
+                .unwrap();
+
+            assert_eq!(
+                recovered.rebuilt.payload(target).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(7)])
+            );
+            assert_eq!(
+                recovered.rebuilt.payload(owner).unwrap(),
+                ObjectPayload::Struct(vec![
+                    ObjectValue::I32(9),
+                    ObjectValue::Ref(Some(target)),
+                ])
+            );
+            assert_eq!(recovered.rebuilt.trace_object_ids(owner).unwrap(), vec![target]);
+            assert_eq!(
+                recovered.rebuilt.live_slot(owner).unwrap().type_layout_id,
+                owner_layout_id
+            );
+        }
+
+        #[test]
+        fn persistent_array_of_scalars_recovers_payload_and_layout() {
+            let ((object, layout_id), recovered) =
+                recover_file_backed_object_layout_case_for_test(203, |objects, state| {
+                    let object = objects
+                        .allocate_persistent_array_for_gc_ref_with_wasmtime_fixed_type_namespace(
+                            0x904,
+                            203,
+                            4,
+                            4,
+                            false,
+                            vec![
+                                ObjectValue::I32(1),
+                                ObjectValue::I32(2),
+                                ObjectValue::I32(3),
+                            ],
+                        )?;
+                    let layout_id = objects.live_slot(object)?.type_layout_id;
+                    state.acquire_object_write(objects, object)?;
+                    state.stage_array_element(objects, object, 1, ObjectValue::I32(9))?;
+                    Ok((object, layout_id))
+                })
+                .unwrap();
+
+            assert_eq!(recovered.object_winners.len(), 1);
+            assert_eq!(recovered.object_winners[0].object_id, object.object_index);
+            assert_eq!(recovered.object_winners[0].type_layout_id, layout_id);
+            assert_eq!(
+                recovered.rebuilt.payload(object).unwrap(),
+                ObjectPayload::Array(vec![
+                    ObjectValue::I32(1),
+                    ObjectValue::I32(9),
+                    ObjectValue::I32(3),
+                ])
+            );
+            assert_eq!(recovered.rebuilt.live_slot(object).unwrap().type_layout_id, layout_id);
+        }
+
+        #[test]
+        fn persistent_array_of_object_references_recovers_payload_and_identity() {
+            let ((array, first, second, layout_id), recovered) =
+                recover_file_backed_object_layout_case_for_test(204, |objects, state| {
+                    let first = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x905,
+                            204,
+                            5,
+                            vec![ObjectValue::I32(1)],
+                        )?;
+                    let second = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x906,
+                            204,
+                            6,
+                            vec![ObjectValue::I32(2)],
+                        )?;
+                    let array = objects
+                        .allocate_persistent_array_for_gc_ref_with_wasmtime_fixed_type_namespace(
+                            0x907,
+                            204,
+                            7,
+                            PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+                            true,
+                            vec![ObjectValue::Ref(None), ObjectValue::Ref(Some(first))],
+                        )?;
+                    let layout_id = objects.live_slot(array)?.type_layout_id;
+                    state.acquire_object_write(objects, first)?;
+                    state.stage_struct_field(objects, first, 0, ObjectValue::I32(11))?;
+                    state.acquire_object_write(objects, second)?;
+                    state.stage_struct_field(objects, second, 0, ObjectValue::I32(22))?;
+                    state.acquire_object_write(objects, array)?;
+                    state.stage_array_element(objects, array, 0, ObjectValue::Ref(Some(second)))?;
+                    Ok((array, first, second, layout_id))
+                })
+                .unwrap();
+
+            assert_eq!(
+                recovered.rebuilt.payload(array).unwrap(),
+                ObjectPayload::Array(vec![
+                    ObjectValue::Ref(Some(second)),
+                    ObjectValue::Ref(Some(first)),
+                ])
+            );
+            assert_eq!(
+                recovered.rebuilt.trace_object_ids(array).unwrap(),
+                vec![second, first]
+            );
+            assert_eq!(recovered.rebuilt.live_slot(array).unwrap().type_layout_id, layout_id);
+        }
+
+        #[test]
+        fn missing_layout_metadata_rejects_recovery() {
+            let publication = encoded_object_publication_for_recovery_test(
+                41,
+                2,
+                701,
+                ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+            );
+
+            let err =
+                recover_file_backed_object_without_layout_metadata_for_test(&publication).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("missing persistent type layout id 701"),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn volatile_object_table_metadata_is_rebuilt_by_object_id_after_recovery() {
+            let ((target, owner), recovered) =
+                recover_file_backed_object_layout_case_for_test(205, |objects, state| {
+                    let target = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x908,
+                            205,
+                            8,
+                            vec![ObjectValue::I32(5)],
+                        )?;
+                    let owner = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x909,
+                            205,
+                            9,
+                            vec![ObjectValue::I32(6), ObjectValue::Ref(None)],
+                        )?;
+                    state.acquire_object_write(objects, target)?;
+                    state.stage_struct_field(objects, target, 0, ObjectValue::I32(15))?;
+                    state.acquire_object_write(objects, owner)?;
+                    state.stage_struct_field(objects, owner, 0, ObjectValue::I32(16))?;
+                    state.stage_struct_field(objects, owner, 1, ObjectValue::Ref(Some(target)))?;
+                    Ok((target, owner))
+                })
+                .unwrap();
+
+            assert!(recovered.rebuilt.gc_ref_to_object.is_empty());
+            assert!(recovered.rebuilt.object_to_gc_ref.is_empty());
+            assert!(recovered.rebuilt.func_ref_to_object.is_empty());
+            assert!(recovered.rebuilt.object_to_func_ref.is_empty());
+            assert_eq!(recovered.rebuilt.live_count(), 2);
+            assert_eq!(
+                recovered.rebuilt.payload(target).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(15)])
+            );
+            assert_eq!(
+                recovered.rebuilt.payload(owner).unwrap(),
+                ObjectPayload::Struct(vec![
+                    ObjectValue::I32(16),
+                    ObjectValue::Ref(Some(target)),
+                ])
+            );
+            assert_eq!(recovered.rebuilt.trace_object_ids(owner).unwrap(), vec![target]);
+        }
+    }
+
+    mod file_backed_mixed_tmemory_object_recovery {
+        use super::*;
+
+        #[test]
+        fn committed_transaction_keeps_tmemory_write_and_redoes_object_publication() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmemory_path = dir.path().join("tmemory.bin");
+            let tx_log_path = dir.path().join("tx-log.bin");
+            let mut tmemory = crate::runtime::vm::TMemory::new(
+                TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+                1,
+                Some(1),
+            )
+            .unwrap();
+            let old_granule = vec![0x11; TMEMORY_GRANULE_SIZE];
+            let new_granule = vec![0x22; TMEMORY_GRANULE_SIZE];
+            tmemory
+                .commit_staged_tmemory_granule(0, &old_granule)
+                .unwrap();
+
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(301),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let object = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0xA01,
+                    301,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+            let layout_id = objects.live_slot(object).unwrap().type_layout_id;
+
+            let undo = tmemory
+                .prepare_tmemory_undo_record(Some(7), 0, 0, &new_granule)
+                .unwrap();
+            let tmemory_marker = state
+                .publish_tmemory_undo_before_in_place_write(301, 301, &undo)
+                .unwrap();
+            tmemory
+                .commit_staged_tmemory_granule(0, &new_granule)
+                .unwrap();
+
+            state.acquire_object_write(&objects, object).unwrap();
+            state
+                .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+                .unwrap();
+            let mut publications = Vec::new();
+            assert!(
+                state
+                    .commit_object_payloads_into(&mut objects, &mut publications)
+                    .unwrap()
+            );
+            let object_marker = state
+                .publish_object_publications_before_commit(301, 301, &objects, &publications)
+                .unwrap();
+            state
+                .publish_commit_lp(301, 301, object_marker.unwrap_or(tmemory_marker))
+                .unwrap();
+            drop(state);
+
+            let recovered = TxDurableLog::recover_file_backed_for_test(&tx_log_path).unwrap();
+            assert!(recovered.tmemory_undo_rollbacks.is_empty());
+            tmemory
+                .apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
+                    recovered.tmemory_undo_rollbacks,
+                )
+                .unwrap();
+            assert_eq!(
+                tmemory.read_committed(0..TMEMORY_GRANULE_SIZE).unwrap(),
+                new_granule
+            );
+            let tmemory_file = std::fs::read(&tmemory_path).unwrap();
+            assert_eq!(
+                &tmemory_file[..TMEMORY_GRANULE_SIZE],
+                new_granule.as_slice()
+            );
+
+            let rebuilt = recover_file_backed_objects_from_path_for_test(&tx_log_path).unwrap();
+            assert_eq!(rebuilt.object_winners.len(), 1);
+            assert_eq!(rebuilt.object_winners[0].object_id, object.object_index);
+            assert_eq!(rebuilt.object_winners[0].type_layout_id, layout_id);
+            assert_eq!(
+                rebuilt.rebuilt.payload(object).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(9)])
+            );
+            assert_eq!(rebuilt.rebuilt.live_slot(object).unwrap().type_layout_id, layout_id);
+            assert_eq!(
+                rebuilt.rebuilt.pending_publication_for_test(object).unwrap().version,
+                2
+            );
+        }
+
+        #[test]
+        fn loose_end_rolls_back_tmemory_and_drops_object_publication() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmemory_path = dir.path().join("tmemory.bin");
+            let tx_log_path = dir.path().join("tx-log.bin");
+            let mut tmemory = crate::runtime::vm::TMemory::new(
+                TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+                1,
+                Some(1),
+            )
+            .unwrap();
+            let old_granule = vec![0x33; TMEMORY_GRANULE_SIZE];
+            let new_granule = vec![0x44; TMEMORY_GRANULE_SIZE];
+            tmemory
+                .commit_staged_tmemory_granule(0, &old_granule)
+                .unwrap();
+
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(302),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let object = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0xA02,
+                    302,
+                    2,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+
+            let undo = tmemory
+                .prepare_tmemory_undo_record(Some(7), 0, 0, &new_granule)
+                .unwrap();
+            state
+                .publish_tmemory_undo_before_in_place_write(302, 302, &undo)
+                .unwrap();
+            tmemory
+                .commit_staged_tmemory_granule(0, &new_granule)
+                .unwrap();
+
+            state.acquire_object_write(&objects, object).unwrap();
+            state
+                .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+                .unwrap();
+            let mut publications = Vec::new();
+            assert!(
+                state
+                    .commit_object_payloads_into(&mut objects, &mut publications)
+                    .unwrap()
+            );
+            state
+                .publish_object_publications_before_commit(302, 302, &objects, &publications)
+                .unwrap();
+            drop(state);
+
+            let recovered = TxDurableLog::recover_file_backed_for_test(&tx_log_path).unwrap();
+            assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+            assert!(recovered.object_winners.is_empty());
+            tmemory
+                .apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
+                    recovered.tmemory_undo_rollbacks,
+                )
+                .unwrap();
+            assert_eq!(
+                tmemory.read_committed(0..TMEMORY_GRANULE_SIZE).unwrap(),
+                old_granule
+            );
+            let tmemory_file = std::fs::read(&tmemory_path).unwrap();
+            assert_eq!(
+                &tmemory_file[..TMEMORY_GRANULE_SIZE],
+                old_granule.as_slice()
+            );
+
+            let object_winners = crate::runtime::vm::block_region::reopen_and_recover_file_backed_object_winners_for_test(
+                &tx_log_path,
+            )
+            .unwrap();
+            assert!(object_winners.is_empty());
+        }
+    }
+
     #[test]
     fn transaction_state_does_not_duplicate_persisted_layout_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -11364,6 +11799,82 @@ mod tests {
             array_heap.trace_object_ids(array_handle).unwrap(),
             vec![ObjectId { object_index: 21 }, ObjectId { object_index: 22 }]
         );
+    }
+
+    struct FileBackedRecoveredObjectCase {
+        recovered_region: crate::runtime::vm::RecoveredRegion,
+        object_winners: Vec<crate::runtime::vm::RecoveredObjectWinner>,
+        rebuilt: ObjectTable,
+    }
+
+    fn recover_file_backed_object_layout_case_for_test<T, F>(
+        txid: u32,
+        prepare: F,
+    ) -> Result<(T, FileBackedRecoveredObjectCase)>
+    where
+        F: FnOnce(&mut ObjectTable, &mut TransactionState) -> Result<T>,
+    {
+        let dir = tempfile::tempdir()?;
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(u64::from(txid)),
+            durable_log,
+        );
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut objects = ObjectTable::default();
+        let expected = prepare(&mut objects, &mut state)?;
+        let mut publications = Vec::new();
+        ensure!(
+            state.commit_object_payloads_into(&mut objects, &mut publications)?,
+            "expected staged persistent object publications"
+        );
+        let marker = state
+            .publish_object_publications_before_commit(txid, txid, &objects, &publications)?
+            .context("expected committed persistent object publication")?;
+        state.publish_commit_lp(txid, txid, marker)?;
+        drop(state);
+        let recovered = recover_file_backed_objects_from_path_for_test(&tx_log_path)?;
+        Ok((expected, recovered))
+    }
+
+    fn recover_file_backed_objects_from_path_for_test(
+        path: &std::path::Path,
+    ) -> Result<FileBackedRecoveredObjectCase> {
+        let recovered_region =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_test(path)?;
+        let object_winners = recovered_region.committed_object_winners()?;
+        let mut rebuilt = ObjectTable::default();
+        rebuilt.rebuild_from_recovery_for_test(&recovered_region.type_layouts, &object_winners)?;
+        Ok(FileBackedRecoveredObjectCase {
+            recovered_region,
+            object_winners,
+            rebuilt,
+        })
+    }
+
+    fn recover_file_backed_object_without_layout_metadata_for_test(
+        publication: &persist::PendingPublication,
+    ) -> Result<crate::runtime::vm::RecoveredRegion> {
+        let dir = tempfile::tempdir()?;
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let mut durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+        let stream_id = 41;
+        let txid = 41;
+        let marker = {
+            let mut sink = durable_log.stream_sink(stream_id);
+            let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+            publisher.publish_object_publication_before_commit(publication)?
+        };
+        {
+            let mut sink = durable_log.stream_sink(stream_id);
+            let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+            publisher.publish_commit_lp(marker)?;
+        }
+        drop(durable_log);
+        crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_test(
+            &tx_log_path,
+        )
     }
 
     fn sample_region_with_two_object_winners()
