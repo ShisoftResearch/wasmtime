@@ -10,10 +10,18 @@ use std::path::{Path, PathBuf};
 
 #[path = "transaction/object_heap.rs"]
 mod object_heap;
+#[path = "transaction/object_gc.rs"]
+mod object_gc;
 #[path = "transaction/persist.rs"]
 mod persist;
 #[path = "transaction/type_layout.rs"]
 pub(crate) mod type_layout;
+#[allow(unused_imports)]
+pub(crate) use object_gc::{
+    DanglingObjectRef, DanglingObjectRefKind, PersistentGcBudget, PersistentGcState,
+    PersistentGcStepReport, PersistentObjectMarkReport, PersistentObjectMarker,
+    PersistentRootError, PersistentRootErrorKind,
+};
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
@@ -1919,107 +1927,6 @@ impl ObjectTable {
             }
         }
         Ok(objects)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PersistentRootErrorKind {
-    Missing,
-    NotPersistent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PersistentRootError {
-    pub(crate) root: ObjectId,
-    pub(crate) kind: PersistentRootErrorKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DanglingObjectRefKind {
-    Missing,
-    NotPersistent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DanglingObjectRef {
-    pub(crate) from: ObjectId,
-    pub(crate) to: ObjectId,
-    pub(crate) kind: DanglingObjectRefKind,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PersistentObjectMarkReport {
-    pub(crate) reachable: BTreeSet<ObjectId>,
-    pub(crate) unreachable_persistent: BTreeSet<ObjectId>,
-    pub(crate) dangling_refs: Vec<DanglingObjectRef>,
-    pub(crate) invalid_roots: Vec<PersistentRootError>,
-}
-
-pub(crate) struct PersistentObjectMarker;
-
-impl PersistentObjectMarker {
-    pub(crate) fn mark<I>(objects: &ObjectTable, roots: I) -> Result<PersistentObjectMarkReport>
-    where
-        I: IntoIterator<Item = ObjectId>,
-    {
-        ensure!(
-            current_thread_transaction().is_none(),
-            "persistent object marker cannot run while a transaction is active"
-        );
-
-        let mut report = PersistentObjectMarkReport::default();
-        let mut worklist = Vec::new();
-
-        for root in roots {
-            match objects.live_slot(root) {
-                Ok(slot) if slot.persistent => {
-                    if report.reachable.insert(root) {
-                        worklist.push(root);
-                    }
-                }
-                Ok(_) => report.invalid_roots.push(PersistentRootError {
-                    root,
-                    kind: PersistentRootErrorKind::NotPersistent,
-                }),
-                Err(_) => report.invalid_roots.push(PersistentRootError {
-                    root,
-                    kind: PersistentRootErrorKind::Missing,
-                }),
-            }
-        }
-
-        while let Some(object) = worklist.pop() {
-            for child in objects
-                .trace_object_ids(object)
-                .with_context(|| format!("failed to trace persistent object {object:?}"))?
-            {
-                match objects.live_slot(child) {
-                    Ok(slot) if slot.persistent => {
-                        if report.reachable.insert(child) {
-                            worklist.push(child);
-                        }
-                    }
-                    Ok(_) => report.dangling_refs.push(DanglingObjectRef {
-                        from: object,
-                        to: child,
-                        kind: DanglingObjectRefKind::NotPersistent,
-                    }),
-                    Err(_) => report.dangling_refs.push(DanglingObjectRef {
-                        from: object,
-                        to: child,
-                        kind: DanglingObjectRefKind::Missing,
-                    }),
-                }
-            }
-        }
-
-        report.unreachable_persistent = objects
-            .persistent_object_ids()?
-            .difference(&report.reachable)
-            .copied()
-            .collect();
-
-        Ok(report)
     }
 }
 
@@ -12333,6 +12240,66 @@ mod tests {
             .unwrap();
 
         let report = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+
+        assert_eq!(report.reachable, object_set([root, child, leaf]));
+        assert_eq!(report.unreachable_persistent, object_set([unreachable]));
+        assert!(report.invalid_roots.is_empty());
+        assert!(report.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_object_marker_budgeted_state_tracks_partial_progress() {
+        let mut objects = ObjectTable::default();
+        let leaf = objects
+            .allocate_persistent_struct_for_gc_ref(0x505, vec![ObjectValue::I32(5)])
+            .unwrap();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(0x506, vec![ObjectValue::Ref(Some(leaf))])
+            .unwrap();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x507, vec![ObjectValue::Ref(Some(child))])
+            .unwrap();
+        let unreachable = objects
+            .allocate_persistent_struct_for_gc_ref(0x508, vec![ObjectValue::I32(8)])
+            .unwrap();
+
+        let mut state = PersistentGcState::default();
+        state.seed_roots(&objects, [root]);
+
+        assert_eq!(
+            state
+                .mark_step(&objects, PersistentGcBudget::objects(1))
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 1,
+            }
+        );
+        assert!(!state.is_complete());
+
+        assert_eq!(
+            state
+                .mark_step(&objects, PersistentGcBudget::objects(1))
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 1,
+            }
+        );
+        assert!(!state.is_complete());
+
+        assert_eq!(
+            state
+                .mark_step(&objects, PersistentGcBudget::objects(1))
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 0,
+            }
+        );
+        assert!(state.is_complete());
+
+        let report = state.into_report(&objects).unwrap();
 
         assert_eq!(report.reachable, object_set([root, child, leaf]));
         assert_eq!(report.unreachable_persistent, object_set([unreachable]));
