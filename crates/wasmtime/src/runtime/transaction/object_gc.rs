@@ -36,6 +36,12 @@ pub(crate) struct PersistentObjectMarkReport {
     pub(crate) invalid_roots: Vec<PersistentRootError>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistentVolatileSweepReport {
+    pub(crate) removed_objects: Vec<ObjectId>,
+    pub(crate) retained_objects: Vec<ObjectId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct PersistentRecoveredRecordLocation {
     pub(crate) object_id: ObjectId,

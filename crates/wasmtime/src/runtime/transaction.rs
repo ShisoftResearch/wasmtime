@@ -26,6 +26,7 @@ use object_gc::{
     PersistentObjectEdge, PersistentObjectMarker,
 };
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
+pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
@@ -1675,6 +1676,23 @@ impl ObjectTable {
     }
 
     pub(crate) fn free(&mut self, object_id: ObjectId) -> Result<bool> {
+        if !self.clear_live_slot_for_volatile_gc(object_id)? {
+            return Ok(false);
+        }
+        self.bump_object_version()?;
+        self.free_list.push(object_id);
+        Ok(true)
+    }
+
+    fn live_slot(&self, object_id: ObjectId) -> Result<&ObjectTableSlot> {
+        let index = object_slot_index(object_id)?;
+        self.slots
+            .get(index)
+            .and_then(Option::as_ref)
+            .with_context(|| format!("object table slot is not live: {object_id:?}"))
+    }
+
+    fn clear_live_slot_for_volatile_gc(&mut self, object_id: ObjectId) -> Result<bool> {
         let index = object_slot_index(object_id)?;
         if index >= self.slots.len() {
             return Ok(false);
@@ -1689,21 +1707,11 @@ impl ObjectTable {
         if let Some(func_ref) = self.object_to_func_ref.remove(&object_id) {
             self.func_ref_to_object.remove(&func_ref);
         }
-        self.bump_object_version()?;
-        self.free_list.push(object_id);
         self.live_count = self
             .live_count
             .checked_sub(1)
             .context("object table live count underflow")?;
         Ok(true)
-    }
-
-    fn live_slot(&self, object_id: ObjectId) -> Result<&ObjectTableSlot> {
-        let index = object_slot_index(object_id)?;
-        self.slots
-            .get(index)
-            .and_then(Option::as_ref)
-            .with_context(|| format!("object table slot is not live: {object_id:?}"))
     }
 
     fn bump_object_version(&mut self) -> Result<u64> {
@@ -2122,6 +2130,23 @@ impl ObjectTable {
             }
         }
         Ok(objects)
+    }
+
+    pub(crate) fn apply_volatile_persistent_sweep(
+        &mut self,
+        mark: &PersistentObjectMarkReport,
+    ) -> Result<PersistentVolatileSweepReport> {
+        let mut report = PersistentVolatileSweepReport::default();
+        for object_id in self.persistent_object_ids()? {
+            if mark.reachable.contains(&object_id) {
+                report.retained_objects.push(object_id);
+            } else {
+                self.clear_live_slot_for_volatile_gc(object_id)?;
+                report.removed_objects.push(object_id);
+            }
+        }
+        self.rebuild_free_list_holes()?;
+        Ok(report)
     }
 }
 
@@ -12761,6 +12786,82 @@ mod tests {
         let report = state.into_report(&objects).unwrap();
         assert!(report.reachable.is_empty());
         assert_eq!(report.unreachable_persistent, object_set([owner, child]));
+    }
+
+    #[test]
+    fn persistent_gc_volatile_sweep_reports_unreachable_objects() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x550, vec![ObjectValue::Ref(None)])
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x551, vec![ObjectValue::I32(9)])
+            .unwrap();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(0x552, vec![ObjectValue::I32(3)])
+            .unwrap();
+        objects
+            .update_payload(root, ObjectPayload::Struct(vec![ObjectValue::Ref(Some(child))]))
+            .unwrap();
+
+        let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+        let report = objects.apply_volatile_persistent_sweep(&mark).unwrap();
+
+        assert_eq!(report.retained_objects, vec![root, child]);
+        assert_eq!(report.removed_objects, vec![garbage]);
+    }
+
+    #[test]
+    fn persistent_gc_volatile_sweep_removes_unreachable_slots_when_requested() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x553, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x554, vec![ObjectValue::I32(2)])
+            .unwrap();
+
+        let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+        let report = objects.apply_volatile_persistent_sweep(&mark).unwrap();
+
+        assert_eq!(report.retained_objects, vec![root]);
+        assert_eq!(report.removed_objects, vec![garbage]);
+        assert!(objects.live_slot(garbage).is_err());
+        assert_eq!(objects.known_object_id_for_gc_ref(0x553), Some(root));
+        assert_eq!(objects.known_object_id_for_gc_ref(0x554), None);
+    }
+
+    #[test]
+    fn persistent_gc_volatile_sweep_does_not_persist_dead_state() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x555, vec![ObjectValue::I32(5)])
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x556, vec![ObjectValue::I32(6)])
+            .unwrap();
+        let garbage_handle = objects.current_record_handle_for_test(garbage).unwrap();
+        let garbage_bytes = objects.heap.record_bytes_for_test(garbage_handle).unwrap();
+
+        let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+        objects.apply_volatile_persistent_sweep(&mark).unwrap();
+
+        assert!(objects.live_slot(garbage).is_err());
+        assert_eq!(
+            objects.heap.record_bytes_for_test(garbage_handle).unwrap(),
+            garbage_bytes
+        );
+
+        objects.rebuild_volatile_index_from_heap().unwrap();
+
+        assert_eq!(
+            objects.current_record_handle_for_test(garbage).unwrap(),
+            garbage_handle
+        );
+        assert_eq!(
+            objects.payload(garbage).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(6)])
+        );
     }
 
     #[test]
