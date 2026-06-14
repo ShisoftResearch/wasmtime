@@ -36,11 +36,22 @@ pub(crate) struct PersistentObjectMarkReport {
     pub(crate) invalid_roots: Vec<PersistentRootError>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct PersistentRecoveredRecordLocation {
+    pub(crate) object_id: ObjectId,
+    pub(crate) version: u32,
+    pub(crate) data_block: u32,
+    pub(crate) data_offset: u32,
+    pub(crate) record_len: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PersistentRecoveryGcReport {
     pub(crate) mark: PersistentObjectMarkReport,
     pub(crate) installed_winners: Vec<u64>,
     pub(crate) skipped_unreachable_winners: Vec<u64>,
+    pub(crate) reachable_record_locations: Vec<PersistentRecoveredRecordLocation>,
+    pub(crate) unreachable_record_locations: Vec<PersistentRecoveredRecordLocation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

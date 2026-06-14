@@ -17,13 +17,13 @@ mod persist;
 #[path = "transaction/type_layout.rs"]
 pub(crate) mod type_layout;
 pub(crate) use object_gc::{
-    DanglingObjectRef, DanglingObjectRefKind, PersistentObjectMarker, PersistentRecoveryGcReport,
-    PersistentRootError, PersistentRootErrorKind,
+    DanglingObjectRef, DanglingObjectRefKind, PersistentRecoveryGcReport, PersistentRootError,
+    PersistentRootErrorKind,
 };
 #[cfg(test)]
 use object_gc::{
     PersistentGcBudget, PersistentGcCommitDelta, PersistentGcState, PersistentGcStepReport,
-    PersistentObjectEdge,
+    PersistentObjectEdge, PersistentObjectMarker,
 };
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) use object_heap::TxObjectHeader;
@@ -1982,10 +1982,30 @@ impl ObjectTable {
             })
             .map(|winner| winner.object_id)
             .collect::<Vec<_>>();
+        let reachable_record_locations = winners
+            .iter()
+            .filter(|winner| {
+                mark.reachable.contains(&ObjectId {
+                    object_index: winner.object_id,
+                })
+            })
+            .map(recovered_record_location_from_winner)
+            .collect::<Vec<_>>();
+        let unreachable_record_locations = winners
+            .iter()
+            .filter(|winner| {
+                mark.unreachable_persistent.contains(&ObjectId {
+                    object_index: winner.object_id,
+                })
+            })
+            .map(recovered_record_location_from_winner)
+            .collect::<Vec<_>>();
         Ok(PersistentRecoveryGcReport {
             mark,
             installed_winners,
             skipped_unreachable_winners,
+            reachable_record_locations,
+            unreachable_record_locations,
         })
     }
 
@@ -2102,6 +2122,20 @@ impl ObjectTable {
             }
         }
         Ok(objects)
+    }
+}
+
+fn recovered_record_location_from_winner(
+    winner: &crate::runtime::vm::RecoveredObjectWinner,
+) -> object_gc::PersistentRecoveredRecordLocation {
+    object_gc::PersistentRecoveredRecordLocation {
+        object_id: ObjectId {
+            object_index: winner.object_id,
+        },
+        version: winner.version,
+        data_block: winner.data_block,
+        data_offset: winner.data_offset,
+        record_len: winner.record_len,
     }
 }
 
@@ -10424,13 +10458,7 @@ mod tests {
             let mut record_bytes = encode_object_record_for_test(7, 3, 207, &payload).unwrap();
             record_bytes[20..22].copy_from_slice(&(ObjectKind::Struct as u16).to_le_bytes());
 
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 7,
-                version: 3,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 207,
-                record_bytes,
-            }
+            recovered_object_winner_for_test(7, 3, ObjectKind::Struct as u16, 207, record_bytes)
         }
 
         #[test]
@@ -12234,6 +12262,60 @@ mod tests {
         .unwrap()
     }
 
+    fn recovered_object_winner_with_location_for_test(
+        object_id: u64,
+        version: u32,
+        kind: u16,
+        type_layout_id: u32,
+        data_block: u32,
+        data_offset: u32,
+        record_bytes: Vec<u8>,
+    ) -> crate::runtime::vm::RecoveredObjectWinner {
+        let record_len = u64::try_from(record_bytes.len()).unwrap();
+        crate::runtime::vm::RecoveredObjectWinner {
+            object_id,
+            version,
+            kind,
+            type_layout_id,
+            data_block,
+            data_offset,
+            record_len,
+            record_bytes,
+        }
+    }
+
+    fn recovered_object_winner_for_test(
+        object_id: u64,
+        version: u32,
+        kind: u16,
+        type_layout_id: u32,
+        record_bytes: Vec<u8>,
+    ) -> crate::runtime::vm::RecoveredObjectWinner {
+        recovered_object_winner_with_location_for_test(
+            object_id,
+            version,
+            kind,
+            type_layout_id,
+            1,
+            0,
+            record_bytes,
+        )
+    }
+
+    fn recovered_record_location_for_test(
+        winner: &crate::runtime::vm::RecoveredObjectWinner,
+    ) -> object_gc::PersistentRecoveredRecordLocation {
+        object_gc::PersistentRecoveredRecordLocation {
+            object_id: ObjectId {
+                object_index: winner.object_id,
+            },
+            version: winner.version,
+            data_block: winner.data_block,
+            data_offset: winner.data_offset,
+            record_len: winner.record_len,
+        }
+    }
+
     fn append_committed_object_winner(
         region: &mut crate::runtime::vm::block_region::VMemoryBlockRegion,
         stream_id: u32,
@@ -12421,12 +12503,12 @@ mod tests {
         rebuilt
             .rebuild_from_recovery_for_test(
                 &recovered_type_layouts,
-                &[crate::runtime::vm::RecoveredObjectWinner {
-                    object_id: 41,
-                    version: 3,
-                    kind: ObjectKind::Struct as u16,
-                    type_layout_id: 207,
-                    record_bytes: encode_object_record_for_test(
+                &[recovered_object_winner_for_test(
+                    41,
+                    3,
+                    ObjectKind::Struct as u16,
+                    207,
+                    encode_object_record_for_test(
                         41,
                         3,
                         207,
@@ -12436,7 +12518,7 @@ mod tests {
                         ]),
                     )
                     .unwrap(),
-                }],
+                )],
             )
             .unwrap();
 
@@ -12891,19 +12973,19 @@ mod tests {
         rebuilt
             .rebuild_from_recovery_for_test(
                 &recovered_type_layouts,
-                &[crate::runtime::vm::RecoveredObjectWinner {
-                    object_id: 41,
-                    version: 3,
-                    kind: ObjectKind::Struct as u16,
-                    type_layout_id: 307,
-                    record_bytes: encode_object_record_for_test(
+                &[recovered_object_winner_for_test(
+                    41,
+                    3,
+                    ObjectKind::Struct as u16,
+                    307,
+                    encode_object_record_for_test(
                         41,
                         3,
                         307,
                         &ObjectPayload::Struct(vec![ObjectValue::I32(1)]),
                     )
                     .unwrap(),
-                }],
+                )],
             )
             .unwrap();
 
@@ -12960,20 +13042,38 @@ mod tests {
         assert!(report.dangling_refs.is_empty());
     }
 
-    #[test]
-    fn persistent_gc_recovery_filter_installs_only_reachable_winners() {
-        let mut recovered_type_layouts = TypeLayoutRegistry::default();
-        recovered_type_layouts
-            .insert(recovery_test_struct_layout(7))
-            .unwrap();
+    mod persistent_gc_recovery_locations {
+        use super::*;
 
-        let winners = vec![
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 41,
-                version: 3,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+        #[test]
+        fn persistent_gc_recovery_winner_records_data_location() {
+            let region = sample_region_with_two_object_winners();
+            let recovered = crate::runtime::vm::recover_region_for_test(&region).unwrap();
+            let winners = recovered.committed_object_winners().unwrap();
+            let winner = winners
+                .into_iter()
+                .find(|winner| winner.object_id == 41)
+                .unwrap();
+
+            assert!(winner.data_block > 0);
+            assert!(winner.record_len > 0);
+        }
+
+        #[test]
+        fn persistent_gc_recovery_filter_reports_reachable_record_locations() {
+            let mut recovered_type_layouts = TypeLayoutRegistry::default();
+            recovered_type_layouts
+                .insert(recovery_test_struct_layout(7))
+                .unwrap();
+
+            let winner41 = recovered_object_winner_with_location_for_test(
+                41,
+                3,
+                ObjectKind::Struct as u16,
+                7,
+                11,
+                101,
+                encode_object_record_for_test(
                     41,
                     3,
                     7,
@@ -12983,33 +13083,174 @@ mod tests {
                     ]),
                 )
                 .unwrap(),
-            },
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 42,
-                version: 4,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            );
+            let winner42 = recovered_object_winner_with_location_for_test(
+                42,
+                4,
+                ObjectKind::Struct as u16,
+                7,
+                12,
+                202,
+                encode_object_record_for_test(
                     42,
                     4,
                     7,
                     &ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)]),
                 )
                 .unwrap(),
-            },
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 43,
-                version: 5,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            );
+            let winner43 = recovered_object_winner_with_location_for_test(
+                43,
+                5,
+                ObjectKind::Struct as u16,
+                7,
+                13,
+                303,
+                encode_object_record_for_test(
                     43,
                     5,
                     7,
                     &ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)]),
                 )
                 .unwrap(),
-            },
+            );
+
+            let report = ObjectTable::persistent_recovery_gc_report(
+                &recovered_type_layouts,
+                &[winner41.clone(), winner42.clone(), winner43],
+                &[41],
+            )
+            .unwrap();
+
+            assert_eq!(
+                report.reachable_record_locations,
+                vec![
+                    recovered_record_location_for_test(&winner41),
+                    recovered_record_location_for_test(&winner42),
+                ]
+            );
+        }
+
+        #[test]
+        fn persistent_gc_recovery_filter_reports_unreachable_record_locations() {
+            let mut recovered_type_layouts = TypeLayoutRegistry::default();
+            recovered_type_layouts
+                .insert(recovery_test_struct_layout(7))
+                .unwrap();
+
+            let winner41 = recovered_object_winner_with_location_for_test(
+                41,
+                3,
+                ObjectKind::Struct as u16,
+                7,
+                11,
+                101,
+                encode_object_record_for_test(
+                    41,
+                    3,
+                    7,
+                    &ObjectPayload::Struct(vec![
+                        ObjectValue::I32(1),
+                        ObjectValue::Ref(Some(ObjectId { object_index: 42 })),
+                    ]),
+                )
+                .unwrap(),
+            );
+            let winner42 = recovered_object_winner_with_location_for_test(
+                42,
+                4,
+                ObjectKind::Struct as u16,
+                7,
+                12,
+                202,
+                encode_object_record_for_test(
+                    42,
+                    4,
+                    7,
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)]),
+                )
+                .unwrap(),
+            );
+            let winner43 = recovered_object_winner_with_location_for_test(
+                43,
+                5,
+                ObjectKind::Struct as u16,
+                7,
+                13,
+                303,
+                encode_object_record_for_test(
+                    43,
+                    5,
+                    7,
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)]),
+                )
+                .unwrap(),
+            );
+
+            let report = ObjectTable::persistent_recovery_gc_report(
+                &recovered_type_layouts,
+                &[winner41, winner42, winner43.clone()],
+                &[41],
+            )
+            .unwrap();
+
+            assert_eq!(
+                report.unreachable_record_locations,
+                vec![recovered_record_location_for_test(&winner43)]
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_gc_recovery_filter_installs_only_reachable_winners() {
+        let mut recovered_type_layouts = TypeLayoutRegistry::default();
+        recovered_type_layouts
+            .insert(recovery_test_struct_layout(7))
+            .unwrap();
+
+        let winners = vec![
+            recovered_object_winner_for_test(
+                41,
+                3,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
+                    41,
+                    3,
+                    7,
+                    &ObjectPayload::Struct(vec![
+                        ObjectValue::I32(1),
+                        ObjectValue::Ref(Some(ObjectId { object_index: 42 })),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            recovered_object_winner_for_test(
+                42,
+                4,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
+                    42,
+                    4,
+                    7,
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)]),
+                )
+                .unwrap(),
+            ),
+            recovered_object_winner_for_test(
+                43,
+                5,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
+                    43,
+                    5,
+                    7,
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)]),
+                )
+                .unwrap(),
+            ),
         ];
 
         let mut rebuilt = ObjectTable::default();
@@ -13040,12 +13281,12 @@ mod tests {
             .unwrap();
 
         let winners = vec![
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 41,
-                version: 3,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            recovered_object_winner_for_test(
+                41,
+                3,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
                     41,
                     3,
                     7,
@@ -13055,20 +13296,20 @@ mod tests {
                     ]),
                 )
                 .unwrap(),
-            },
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 42,
-                version: 4,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            ),
+            recovered_object_winner_for_test(
+                42,
+                4,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
                     42,
                     4,
                     7,
                     &ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)]),
                 )
                 .unwrap(),
-            },
+            ),
         ];
 
         let mut rebuilt = ObjectTable::default();
@@ -13098,12 +13339,12 @@ mod tests {
             .unwrap();
 
         let winners = vec![
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 41,
-                version: 3,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            recovered_object_winner_for_test(
+                41,
+                3,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
                     41,
                     3,
                     7,
@@ -13113,33 +13354,33 @@ mod tests {
                     ]),
                 )
                 .unwrap(),
-            },
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 42,
-                version: 4,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            ),
+            recovered_object_winner_for_test(
+                42,
+                4,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
                     42,
                     4,
                     7,
                     &ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)]),
                 )
                 .unwrap(),
-            },
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 43,
-                version: 5,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            ),
+            recovered_object_winner_for_test(
+                43,
+                5,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
                     43,
                     5,
                     7,
                     &ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)]),
                 )
                 .unwrap(),
-            },
+            ),
         ];
 
         let mut rebuilt = ObjectTable::default();
@@ -13161,19 +13402,19 @@ mod tests {
 
     #[test]
     fn persistent_gc_recovery_filter_rejects_missing_type_layout() {
-        let winners = vec![crate::runtime::vm::RecoveredObjectWinner {
-            object_id: 41,
-            version: 3,
-            kind: ObjectKind::Struct as u16,
-            type_layout_id: 999,
-            record_bytes: encode_object_record_for_test(
+        let winners = vec![recovered_object_winner_for_test(
+            41,
+            3,
+            ObjectKind::Struct as u16,
+            999,
+            encode_object_record_for_test(
                 41,
                 3,
                 999,
                 &ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)]),
             )
             .unwrap(),
-        }];
+        )];
         let mut rebuilt = ObjectTable::default();
 
         let err = rebuilt
@@ -13199,32 +13440,32 @@ mod tests {
             .unwrap();
 
         let winners = vec![
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 41,
-                version: 3,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 7,
-                record_bytes: encode_object_record_for_test(
+            recovered_object_winner_for_test(
+                41,
+                3,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
                     41,
                     3,
                     7,
                     &ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)]),
                 )
                 .unwrap(),
-            },
-            crate::runtime::vm::RecoveredObjectWinner {
-                object_id: 43,
-                version: 5,
-                kind: ObjectKind::Struct as u16,
-                type_layout_id: 999,
-                record_bytes: encode_object_record_for_test(
+            ),
+            recovered_object_winner_for_test(
+                43,
+                5,
+                ObjectKind::Struct as u16,
+                999,
+                encode_object_record_for_test(
                     43,
                     5,
                     999,
                     &ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)]),
                 )
                 .unwrap(),
-            },
+            ),
         ];
 
         let mut rebuilt = ObjectTable::default();
@@ -13260,19 +13501,19 @@ mod tests {
         let sentinel_handle = objects.current_record_handle_for_test(sentinel).unwrap();
         let sentinel_live_count = objects.live_count();
 
-        let winners = vec![crate::runtime::vm::RecoveredObjectWinner {
-            object_id: 41,
-            version: 3,
-            kind: ObjectKind::Struct as u16,
-            type_layout_id: 999,
-            record_bytes: encode_object_record_for_test(
+        let winners = vec![recovered_object_winner_for_test(
+            41,
+            3,
+            ObjectKind::Struct as u16,
+            999,
+            encode_object_record_for_test(
                 41,
                 3,
                 999,
                 &ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)]),
             )
             .unwrap(),
-        }];
+        )];
 
         let err = objects
             .rebuild_reachable_from_recovery_for_test(

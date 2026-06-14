@@ -49,6 +49,9 @@ pub(crate) struct RecoveredObjectWinner {
     pub(crate) version: u32,
     pub(crate) kind: u16,
     pub(crate) type_layout_id: u32,
+    pub(crate) data_block: u32,
+    pub(crate) data_offset: u32,
+    pub(crate) record_len: u64,
     pub(crate) record_bytes: Vec<u8>,
 }
 
@@ -317,6 +320,9 @@ fn replay_object_winners(
             version: winner.version,
             kind: object_header.kind,
             type_layout_id: object_header.type_layout_id,
+            data_block: winner.data_block,
+            data_offset: winner.data_offset,
+            record_len: object_header.record_len,
             record_bytes,
         };
         match object_winners.get(&object_id) {
