@@ -1877,32 +1877,155 @@ impl ObjectTable {
         winners: &[crate::runtime::vm::RecoveredObjectWinner],
         root_object_ids: &[u64],
     ) -> Result<PersistentRecoveryGcReport> {
-        self.rebuild_from_recovered_object_winners(recovered_type_layouts, winners)?;
-        let roots = root_object_ids
+        let report =
+            Self::persistent_recovery_gc_report(recovered_type_layouts, winners, root_object_ids)?;
+        let reachable_winners = winners
             .iter()
-            .copied()
-            .map(|object_index| ObjectId { object_index });
-        let mark = PersistentObjectMarker::mark(self, roots)?;
-        let (reachable_winners, skipped_unreachable_winners): (Vec<_>, Vec<_>) =
-            winners.iter().cloned().partition(|winner| {
+            .filter(|winner| {
+                report.mark.reachable.contains(&ObjectId {
+                    object_index: winner.object_id,
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rebuilt = ObjectTable::default();
+        rebuilt
+            .rebuild_from_recovered_object_winners(recovered_type_layouts, &reachable_winners)?;
+        *self = rebuilt;
+        Ok(report)
+    }
+
+    fn persistent_recovery_gc_report(
+        recovered_type_layouts: &TypeLayoutRegistry,
+        winners: &[crate::runtime::vm::RecoveredObjectWinner],
+        root_object_ids: &[u64],
+    ) -> Result<PersistentRecoveryGcReport> {
+        let winner_map = winners.iter().try_fold(
+            BTreeMap::<u64, &crate::runtime::vm::RecoveredObjectWinner>::new(),
+            |mut winners_by_id, winner| {
+                ensure!(
+                    winners_by_id.insert(winner.object_id, winner).is_none(),
+                    "duplicate recovered object winner for object id {}",
+                    winner.object_id
+                );
+                Ok(winners_by_id)
+            },
+        )?;
+        let mut layout_table = ObjectTable::default();
+        layout_table.install_recovered_type_layouts(recovered_type_layouts)?;
+
+        let mut reachable = BTreeSet::new();
+        let mut grey = Vec::new();
+        let mut dangling_refs = Vec::new();
+        let mut invalid_roots = Vec::new();
+
+        for &object_index in root_object_ids {
+            let root = ObjectId { object_index };
+            if winner_map.contains_key(&object_index) {
+                if reachable.insert(root) {
+                    grey.push(root);
+                }
+            } else {
+                invalid_roots.push(PersistentRootError {
+                    root,
+                    kind: PersistentRootErrorKind::Missing,
+                });
+            }
+        }
+
+        while let Some(object) = grey.pop() {
+            let winner = winner_map
+                .get(&object.object_index)
+                .copied()
+                .context("reachable recovered object winner disappeared")?;
+            for child in Self::trace_recovered_winner_object_ids(&layout_table, winner)? {
+                if winner_map.contains_key(&child.object_index) {
+                    if reachable.insert(child) {
+                        grey.push(child);
+                    }
+                } else {
+                    dangling_refs.push(DanglingObjectRef {
+                        from: object,
+                        to: child,
+                        kind: DanglingObjectRefKind::Missing,
+                    });
+                }
+            }
+        }
+
+        let unreachable_persistent = winner_map
+            .keys()
+            .map(|&object_index| ObjectId { object_index })
+            .filter(|object_id| !reachable.contains(object_id))
+            .collect::<BTreeSet<_>>();
+        let mark = PersistentObjectMarkReport {
+            reachable,
+            unreachable_persistent,
+            dangling_refs,
+            invalid_roots,
+        };
+        let installed_winners = winners
+            .iter()
+            .filter(|winner| {
                 mark.reachable.contains(&ObjectId {
                     object_index: winner.object_id,
                 })
-            });
-        let installed_winners = reachable_winners
+            })
+            .map(|winner| winner.object_id)
+            .collect::<Vec<_>>();
+        let skipped_unreachable_winners = winners
             .iter()
+            .filter(|winner| {
+                mark.unreachable_persistent.contains(&ObjectId {
+                    object_index: winner.object_id,
+                })
+            })
             .map(|winner| winner.object_id)
             .collect::<Vec<_>>();
-        let skipped_unreachable_winners = skipped_unreachable_winners
-            .into_iter()
-            .map(|winner| winner.object_id)
-            .collect::<Vec<_>>();
-        self.rebuild_from_recovered_object_winners(recovered_type_layouts, &reachable_winners)?;
         Ok(PersistentRecoveryGcReport {
             mark,
             installed_winners,
             skipped_unreachable_winners,
         })
+    }
+
+    fn trace_recovered_winner_object_ids(
+        layouts: &ObjectTable,
+        winner: &crate::runtime::vm::RecoveredObjectWinner,
+    ) -> Result<Vec<ObjectId>> {
+        let header = TxObjectHeader::read_from_prefix(&winner.record_bytes)?;
+        let kind = object_kind_from_u16(header.kind)?;
+        let type_layout_id = TypeLayoutId::new(header.type_layout_id)
+            .context("recovered object record type layout id cannot be zero")?;
+
+        ensure!(
+            header.object_id == winner.object_id,
+            "recovered object record id does not match winner"
+        );
+        ensure!(
+            header.version == winner.version,
+            "recovered object record version does not match winner"
+        );
+        ensure!(
+            header.kind == winner.kind,
+            "recovered object record kind does not match winner"
+        );
+        ensure!(
+            header.type_layout_id == winner.type_layout_id,
+            "recovered object record type layout id does not match winner"
+        );
+        layouts.validate_type_layout_for_object_kind(kind, type_layout_id)?;
+
+        let mut heap = object_heap::ObjectHeap::default();
+        let handle = heap.install_record_bytes(&winner.record_bytes)?;
+        if uses_placeholder_persistent_trace_fallback(type_layout_id) {
+            return heap.trace_object_ids(handle);
+        }
+        let layout = layouts.require_type_layout(type_layout_id)?;
+        let payload = heap.payload_bytes(handle)?;
+        let mut out = Vec::new();
+        object_heap::trace_object_refs_with_layout(layout, &payload, &mut out)?;
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -13065,6 +13188,110 @@ mod tests {
             err.to_string()
                 .contains("unknown persistent type layout id: 999"),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_gc_recovery_filter_skips_unreachable_winner_with_missing_type_layout() {
+        let mut recovered_type_layouts = TypeLayoutRegistry::default();
+        recovered_type_layouts
+            .insert(recovery_test_struct_layout(7))
+            .unwrap();
+
+        let winners = vec![
+            crate::runtime::vm::RecoveredObjectWinner {
+                object_id: 41,
+                version: 3,
+                kind: ObjectKind::Struct as u16,
+                type_layout_id: 7,
+                record_bytes: encode_object_record_for_test(
+                    41,
+                    3,
+                    7,
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)]),
+                )
+                .unwrap(),
+            },
+            crate::runtime::vm::RecoveredObjectWinner {
+                object_id: 43,
+                version: 5,
+                kind: ObjectKind::Struct as u16,
+                type_layout_id: 999,
+                record_bytes: encode_object_record_for_test(
+                    43,
+                    5,
+                    999,
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(3), ObjectValue::Ref(None)]),
+                )
+                .unwrap(),
+            },
+        ];
+
+        let mut rebuilt = ObjectTable::default();
+        let report = rebuilt
+            .rebuild_reachable_from_recovery_for_test(&recovered_type_layouts, &winners, &[41])
+            .unwrap();
+
+        assert_eq!(report.installed_winners, vec![41]);
+        assert_eq!(report.skipped_unreachable_winners, vec![43]);
+        assert_eq!(
+            report.mark.reachable,
+            object_set([ObjectId { object_index: 41 }])
+        );
+        assert_eq!(
+            report.mark.unreachable_persistent,
+            object_set([ObjectId { object_index: 43 }])
+        );
+        assert_eq!(rebuilt.live_count(), 1);
+        assert_eq!(
+            rebuilt.payload(ObjectId { object_index: 41 }).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
+        );
+        assert!(rebuilt.payload(ObjectId { object_index: 43 }).is_err());
+    }
+
+    #[test]
+    fn persistent_gc_recovery_filter_preserves_destination_table_on_error() {
+        let mut objects = ObjectTable::default();
+        let sentinel = objects
+            .allocate_persistent_struct_for_gc_ref(0x601, vec![ObjectValue::I32(9)])
+            .unwrap();
+        let sentinel_payload = objects.payload(sentinel).unwrap();
+        let sentinel_handle = objects.current_record_handle_for_test(sentinel).unwrap();
+        let sentinel_live_count = objects.live_count();
+
+        let winners = vec![crate::runtime::vm::RecoveredObjectWinner {
+            object_id: 41,
+            version: 3,
+            kind: ObjectKind::Struct as u16,
+            type_layout_id: 999,
+            record_bytes: encode_object_record_for_test(
+                41,
+                3,
+                999,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)]),
+            )
+            .unwrap(),
+        }];
+
+        let err = objects
+            .rebuild_reachable_from_recovery_for_test(
+                &TypeLayoutRegistry::default(),
+                &winners,
+                &[41],
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unknown persistent type layout id: 999"),
+            "{err:?}"
+        );
+        assert_eq!(objects.live_count(), sentinel_live_count);
+        assert_eq!(objects.payload(sentinel).unwrap(), sentinel_payload);
+        assert_eq!(
+            objects.current_record_handle_for_test(sentinel).unwrap(),
+            sentinel_handle
         );
     }
 
