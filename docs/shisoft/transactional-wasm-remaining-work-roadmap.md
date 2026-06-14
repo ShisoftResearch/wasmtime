@@ -65,8 +65,9 @@ Current remaining mock categories:
 - Table/global object snapshots still need the final `ObjectId`-based durable
   representation.
 - `ttry`/`tfail` remains a later structured-failure workstream.
-- Persistent-object GC remains future work after the durable object format and
-  recovery path are stable.
+- Persistent-object GC has a runtime-only logical marker. Commit-coupled
+  incremental marking, durable deletion/tombstones, and reclamation remain
+  future work.
 - `FileBackedMemory` and `NVMemory` still need real recovery semantics; tests
   that require restart durability stay gated until hardware or restart harness
   support is ready.
@@ -87,9 +88,10 @@ Current remaining mock categories:
   index is rebuilt in DRAM during recovery.
 - Persistent object-index maintenance is future work behind a separate policy.
   Do not add persistent-index writes to the first Zen-style path.
-- Full persistent-object GC is a future workstream. Current object-runtime waves
-  must make records traceable by `kind`, `type_index`, and `ObjectId` fields,
-  but they do not need to reclaim persistent objects to pass proposal WAST.
+- Full durable persistent-object GC is a future workstream. The current runtime
+  marker proves `ObjectId` reachability over traceable records, but transaction
+  object work still does not need to reclaim persistent objects to pass proposal
+  WAST.
 - Reuse Wasmtime GC type/layout/cast/validation code where useful. Do not reuse
   `GcHeap`, `VMGcRef`, Wasmtime GC roots, or Wasmtime GC barriers as persistent
   object identity or storage.
@@ -1022,10 +1024,30 @@ git add crates/wasmtime/src/runtime/transaction.rs docs/shisoft/2026-06-14-persi
 git commit -m "Add persistent object marker"
 ```
 
-## Wave 9B: Persistent Object Sweep And Tombstones
+## Wave 9B: Commit-Coupled Incremental Persistent Marking
+
+**Purpose:** make persistent reachability advance incrementally at transaction
+commit, where persistent graph mutation actually becomes visible.
+
+Design direction:
+
+- do not add ordinary per-field write barriers to staged transaction writes
+- collect a commit barrier delta from committed object/root publications
+- enqueue new root `ObjectId`s directly
+- when a committed edge `A -> B` is published and `A` is already marked,
+  enqueue `B` directly
+- keep `PersistentGcState` volatile: mark epoch, reachable set, grey queue, and
+  current phase
+- run a bounded marking minibatch after each successful commit
+- initially budget by scanned object count; consider edge or byte budgets later
+- keep an explicit maintenance step as a later option for read-heavy workloads
+
+This wave still must not reclaim durable storage.
+
+## Wave 9C: Persistent Object Sweep And Tombstones
 
 **Purpose:** design and implement actual persistent-object reclamation after the
-logical marker has enough coverage.
+logical marker and commit-coupled incremental marker have enough coverage.
 
 Deferred scope:
 

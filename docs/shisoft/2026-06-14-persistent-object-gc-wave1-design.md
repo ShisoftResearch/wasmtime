@@ -201,16 +201,57 @@ cargo test -p wasmtime --test transaction_persistence -- --format terse
 
 ## Future Roadmap
 
-Wave 2 should add a non-durable sweep mode only after Wave 1 proves graph
-marking is reliable. It may remove unreachable objects from volatile runtime
-indices or report reclaim candidates to a test-only harness, but it should still
-avoid durable deletion.
+Wave 2 should add commit-coupled incremental marking before any sweep or durable
+deletion work. Persistent graph mutation only becomes visible at transaction
+commit, so the persistent collector does not need ordinary per-field write
+barriers on staged writes. Instead, the transaction commit path should produce a
+commit barrier record from the committed graph delta:
 
-Wave 3 should design durable tombstones and recovery behavior. A higher-version
+- newly published or updated persistent object records
+- newly published persistent roots from `TGlobal`/`TTable`
+- promoted objects that became persistent during commit
+- persistent ref edges introduced by those publications
+
+The first barrier policy should use direct child marking: when commit publishes
+an edge `A -> B` and `A` is already known reachable in the active mark cycle,
+enqueue `B` into the persistent GC grey queue. If `A` is not yet reachable, no
+immediate action is needed because `A` will be scanned if the current cycle
+later reaches it. Root publications enqueue their root `ObjectId`s directly.
+
+Commit should also perform a bounded marking minibatch. The collector keeps a
+volatile `PersistentGcState` with a mark epoch, reachable set, and grey queue.
+Each successful commit calls the barrier observer and then scans a small budget
+of queued objects. Budgets can initially be counted in scanned objects; later
+versions may budget by edges or payload bytes. This ties GC progress to
+transaction activity and avoids a periodic background collector for the first
+incremental version.
+
+The minibatch should run only after the commit graph is frozen and committed for
+runtime visibility. The current Wave 1 marker still rejects arbitrary active
+transactions. The future commit-coupled marker may run in a commit epilogue or
+under a store-level commit/GC gate, but it must not scan mutable staged
+workspaces as if they were committed graph state.
+
+This design is conservative. Removing a root or deleting an edge during an
+active mark cycle may keep the old target marked until the next cycle. That is
+acceptable before durable reclamation because over-marking only delays
+collection; it does not corrupt persistent reachability.
+
+If the workload becomes read-heavy with few commits, commit-coupled marking may
+not make progress. A later explicit maintenance API such as
+`persistent_gc_step(budget)` can reuse the same minibatch scanner without
+changing the commit-barrier design.
+
+Wave 3 should add a non-durable sweep/report mode only after commit-coupled
+incremental marking proves reliable. It may remove unreachable objects from
+volatile runtime indices or report reclaim candidates to a test-only harness,
+but it should still avoid durable deletion.
+
+Wave 4 should design durable tombstones and recovery behavior. A higher-version
 delete record should beat older live records, but that needs explicit rules for
 transaction ordering, root consistency, and duplicate-version corruption.
 
-Wave 4 should integrate Immix-style block/line reclamation using the existing
+Wave 5 should integrate Immix-style block/line reclamation using the existing
 Wizard-shaped block region. Immix should be a storage reuse policy under stable
 `ObjectId` identity, not a reason to change persistent reference encoding.
 

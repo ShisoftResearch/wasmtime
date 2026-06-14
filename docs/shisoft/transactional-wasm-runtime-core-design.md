@@ -731,9 +731,10 @@ promotion map.
 
 ## Persistent Object GC Strategy
 
-Full persistent-object GC is a future workstream, not a blocker for the first
-real object runtime or proposal WAST completion. The current object runtime must
-still be persistent-GC-ready from day one.
+Full durable persistent-object GC remains a future workstream, not a blocker for
+the first real object runtime or proposal WAST completion. The current branch
+has a runtime-only logical marker, and the object runtime must remain ready for
+incremental marking and later reclamation.
 
 The current implementation direction is:
 
@@ -752,7 +753,13 @@ transaction-local objects. The persistent object space must not reuse
 `GcHeap`, `VMGcRef`, Wasmtime GC roots, or Wasmtime GC barriers as durable
 object identity or durability mechanisms.
 
-The future persistent collector is an `ObjectId` graph collector:
+The implemented first persistent collector is a runtime-only `ObjectId` graph
+marker. It takes explicit persistent roots, walks committed object records
+through the volatile object table and recovered layout metadata, and returns a
+reachability report. It does not write persistent storage, mutate the object
+table, publish tombstones, or reclaim blocks.
+
+The future persistent collector remains an `ObjectId` graph collector:
 
 ```text
 persistent roots
@@ -761,10 +768,52 @@ persistent roots
           -> ObjectId fields in payloads
 ```
 
-The first collector should be non-moving mark/sweep and should run only when no
-transaction is active. Later versions can treat active transaction read sets,
-write sets, staged payloads, and promotion maps as temporary roots, then add
-Wizard-style Immix line/block reuse and durable recovery.
+Because persistent graph mutation becomes visible only at transaction commit,
+future incremental marking should use commit barriers rather than ordinary
+per-field write barriers on staged writes. Staged `tstruct`, `tarray`,
+`tglobal`, and `ttable` reference writes remain private transaction workspace
+state until commit. The commit path is the first point where those changes can
+become durable and visible to persistent reachability.
+
+A successful commit should emit a volatile GC delta from the committed graph
+publication:
+
+- updated persistent object records and their introduced `ObjectId` edges
+- new or updated persistent roots from committed `TGlobal`/`TTable` records
+- objects promoted from ordinary volatile GC values into persistent `ObjectId`s
+- root additions caused by explicit durable-root mechanisms added later
+
+The first incremental policy should use direct child marking. If commit
+publishes an edge `A -> B` and `A` is already marked reachable in the active
+cycle, enqueue `B` into the grey queue. If `A` is not marked yet, no immediate
+work is needed because scanning `A` later in the same cycle will observe the
+current committed record. New root publications enqueue their root `ObjectId`s
+directly.
+
+GC progress should initially be commit-coupled rather than periodic. The store
+keeps a volatile `PersistentGcState` with a mark epoch, reachable set, and grey
+queue. Each successful transaction commit observes the commit barrier delta and
+then performs a bounded marking minibatch. The first budget unit can be scanned
+object count; later versions may switch to edge count or payload bytes.
+
+The minibatch must not scan mutable staged workspaces as if they were committed
+state. It should run only after the commit graph is frozen and visible, either
+in a commit epilogue after the transaction is no longer considered active or
+under a store-level commit/GC gate that prevents concurrent graph mutation. The
+current full marker keeps the stricter rule and rejects arbitrary active
+transactions.
+
+This incremental design is conservative. Removing a root or deleting an edge
+during a mark cycle may leave the old target marked until a later cycle. That
+only delays reclamation and is acceptable before durable tombstones and block
+reuse exist. Actual sweep, tombstone publication, block reclamation, and
+Immix-style line reuse remain later phases after commit-coupled marking is
+tested.
+
+Read-heavy workloads with few commits may not advance commit-coupled marking.
+A later explicit maintenance API can expose the same minibatch scanner, for
+example `persistent_gc_step(budget)`, without changing the commit-barrier
+semantics.
 
 ## Runtime Permissions
 
@@ -1009,10 +1058,12 @@ order:
    persistent `ObjectId` graphs.
 6. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
    metadata so persistent GC can be added without changing committed formats.
-7. Decide and implement deletion/tombstone rules together with GC; do not add
+7. Add the runtime-only persistent `ObjectId` logical marker.
+8. Add commit-coupled incremental marking with commit barriers and bounded
+   marking minibatches.
+9. Decide and implement deletion/tombstone rules together with GC; do not add
    ad hoc deletion semantics before reclamation is designed.
-8. Add the first non-moving persistent `ObjectId` mark/sweep collector.
-9. Add optional persistent-index/object-table persistence only behind an
+10. Add optional persistent-index/object-table persistence only behind an
     explicit future feature/configuration switch if Zen-style recovery time is
     unacceptable.
 
