@@ -12873,7 +12873,10 @@ mod tests {
             .allocate_persistent_struct_for_gc_ref(0x552, vec![ObjectValue::I32(3)])
             .unwrap();
         objects
-            .update_payload(root, ObjectPayload::Struct(vec![ObjectValue::Ref(Some(child))]))
+            .update_payload(
+                root,
+                ObjectPayload::Struct(vec![ObjectValue::Ref(Some(child))]),
+            )
             .unwrap();
 
         let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
