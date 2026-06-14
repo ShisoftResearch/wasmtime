@@ -36,6 +36,13 @@ pub(crate) struct PersistentObjectMarkReport {
     pub(crate) invalid_roots: Vec<PersistentRootError>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistentRecoveryGcReport {
+    pub(crate) mark: PersistentObjectMarkReport,
+    pub(crate) installed_winners: Vec<u64>,
+    pub(crate) skipped_unreachable_winners: Vec<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PersistentGcBudget {
     objects: usize,
