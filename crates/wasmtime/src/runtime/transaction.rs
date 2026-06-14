@@ -1907,6 +1907,120 @@ impl ObjectTable {
         );
         Ok(())
     }
+
+    fn persistent_object_ids(&self) -> Result<BTreeSet<ObjectId>> {
+        let mut objects = BTreeSet::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.as_ref().is_some_and(|slot| slot.persistent) {
+                objects.insert(ObjectId {
+                    object_index: u64::try_from(index)
+                        .context("object table slot index does not fit u64")?,
+                });
+            }
+        }
+        Ok(objects)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PersistentRootErrorKind {
+    Missing,
+    NotPersistent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistentRootError {
+    pub(crate) root: ObjectId,
+    pub(crate) kind: PersistentRootErrorKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DanglingObjectRefKind {
+    Missing,
+    NotPersistent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DanglingObjectRef {
+    pub(crate) from: ObjectId,
+    pub(crate) to: ObjectId,
+    pub(crate) kind: DanglingObjectRefKind,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistentObjectMarkReport {
+    pub(crate) reachable: BTreeSet<ObjectId>,
+    pub(crate) unreachable_persistent: BTreeSet<ObjectId>,
+    pub(crate) dangling_refs: Vec<DanglingObjectRef>,
+    pub(crate) invalid_roots: Vec<PersistentRootError>,
+}
+
+pub(crate) struct PersistentObjectMarker;
+
+impl PersistentObjectMarker {
+    pub(crate) fn mark<I>(objects: &ObjectTable, roots: I) -> Result<PersistentObjectMarkReport>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        ensure!(
+            current_thread_transaction().is_none(),
+            "persistent object marker cannot run while a transaction is active"
+        );
+
+        let mut report = PersistentObjectMarkReport::default();
+        let mut worklist = Vec::new();
+
+        for root in roots {
+            match objects.live_slot(root) {
+                Ok(slot) if slot.persistent => {
+                    if report.reachable.insert(root) {
+                        worklist.push(root);
+                    }
+                }
+                Ok(_) => report.invalid_roots.push(PersistentRootError {
+                    root,
+                    kind: PersistentRootErrorKind::NotPersistent,
+                }),
+                Err(_) => report.invalid_roots.push(PersistentRootError {
+                    root,
+                    kind: PersistentRootErrorKind::Missing,
+                }),
+            }
+        }
+
+        while let Some(object) = worklist.pop() {
+            for child in objects
+                .trace_object_ids(object)
+                .with_context(|| format!("failed to trace persistent object {object:?}"))?
+            {
+                match objects.live_slot(child) {
+                    Ok(slot) if slot.persistent => {
+                        if report.reachable.insert(child) {
+                            worklist.push(child);
+                        }
+                    }
+                    Ok(_) => report.dangling_refs.push(DanglingObjectRef {
+                        from: object,
+                        to: child,
+                        kind: DanglingObjectRefKind::NotPersistent,
+                    }),
+                    Err(_) => report.dangling_refs.push(DanglingObjectRef {
+                        from: object,
+                        to: child,
+                        kind: DanglingObjectRefKind::Missing,
+                    }),
+                }
+            }
+        }
+
+        report.unreachable_persistent = objects
+            .persistent_object_ids()?
+            .difference(&report.reachable)
+            .copied()
+            .collect();
+
+        Ok(report)
+    }
 }
 
 fn default_type_layout_id_for_kind(kind: ObjectKind) -> TypeLayoutId {
@@ -12194,6 +12308,296 @@ mod tests {
             ])
         );
         assert_eq!(rebuilt.trace_object_ids(object).unwrap(), vec![second]);
+    }
+
+    #[test]
+    fn persistent_object_marker_marks_root_closure_and_reports_unreachable() {
+        let mut objects = ObjectTable::default();
+        let leaf = objects
+            .allocate_persistent_struct_for_gc_ref(0x501, vec![ObjectValue::I32(3)])
+            .unwrap();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x502,
+                vec![ObjectValue::Ref(Some(leaf)), ObjectValue::I64(2)],
+            )
+            .unwrap();
+        let root = objects
+            .allocate_persistent_array_for_gc_ref(
+                0x503,
+                vec![ObjectValue::Ref(Some(child)), ObjectValue::I32(1)],
+            )
+            .unwrap();
+        let unreachable = objects
+            .allocate_persistent_struct_for_gc_ref(0x504, vec![ObjectValue::I32(9)])
+            .unwrap();
+
+        let report = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+
+        assert_eq!(report.reachable, object_set([root, child, leaf]));
+        assert_eq!(report.unreachable_persistent, object_set([unreachable]));
+        assert!(report.invalid_roots.is_empty());
+        assert!(report.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_object_marker_handles_cycles_and_shared_children() {
+        let mut objects = ObjectTable::default();
+        let shared = objects
+            .allocate_persistent_struct_for_gc_ref(0x511, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let left = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x512,
+                vec![ObjectValue::Ref(Some(shared)), ObjectValue::Ref(None)],
+            )
+            .unwrap();
+        let right = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x513,
+                vec![ObjectValue::Ref(Some(shared)), ObjectValue::Ref(Some(left))],
+            )
+            .unwrap();
+        objects
+            .update_payload(
+                left,
+                ObjectPayload::Struct(vec![
+                    ObjectValue::Ref(Some(shared)),
+                    ObjectValue::Ref(Some(right)),
+                ]),
+            )
+            .unwrap();
+
+        let report = PersistentObjectMarker::mark(&objects, [left]).unwrap();
+
+        assert_eq!(report.reachable, object_set([left, right, shared]));
+        assert!(report.unreachable_persistent.is_empty());
+        assert!(report.invalid_roots.is_empty());
+        assert!(report.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_object_marker_reports_invalid_roots() {
+        let mut objects = ObjectTable::default();
+        let volatile = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        let missing = ObjectId { object_index: 999 };
+
+        let report = PersistentObjectMarker::mark(&objects, [volatile, missing]).unwrap();
+
+        assert!(report.reachable.is_empty());
+        assert!(report.unreachable_persistent.is_empty());
+        assert_eq!(
+            report.invalid_roots,
+            vec![
+                PersistentRootError {
+                    root: volatile,
+                    kind: PersistentRootErrorKind::NotPersistent,
+                },
+                PersistentRootError {
+                    root: missing,
+                    kind: PersistentRootErrorKind::Missing,
+                },
+            ]
+        );
+        assert!(report.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_object_marker_reports_dangling_child_refs() {
+        let mut objects = ObjectTable::default();
+        let missing = ObjectId { object_index: 99 };
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x521, vec![ObjectValue::Ref(Some(missing))])
+            .unwrap();
+
+        let report = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+
+        assert_eq!(report.reachable, object_set([root]));
+        assert!(report.unreachable_persistent.is_empty());
+        assert_eq!(
+            report.dangling_refs,
+            vec![DanglingObjectRef {
+                from: root,
+                to: missing,
+                kind: DanglingObjectRefKind::Missing,
+            }]
+        );
+        assert!(report.invalid_roots.is_empty());
+    }
+
+    #[test]
+    fn persistent_object_marker_rejects_layout_tracing_errors() {
+        let mut recovered_type_layouts = TypeLayoutRegistry::default();
+        recovered_type_layouts
+            .insert(type_layout::PersistentTypeLayout::Struct {
+                id: type_layout::TypeLayoutId::new(307).unwrap(),
+                fingerprint: 0x5354_5255_4354_0307,
+                body_size: 40,
+                fields: vec![type_layout::StructTraceField {
+                    field_index: 0,
+                    field_offset: 20,
+                    value_size: 20,
+                    kind: type_layout::TraceSlotKind::ObjectRef,
+                }],
+            })
+            .unwrap();
+        let mut rebuilt = ObjectTable::default();
+        rebuilt
+            .rebuild_from_recovery_for_test(
+                &recovered_type_layouts,
+                &[crate::runtime::vm::RecoveredObjectWinner {
+                    object_id: 41,
+                    version: 3,
+                    kind: ObjectKind::Struct as u16,
+                    type_layout_id: 307,
+                    record_bytes: encode_object_record_for_test(
+                        41,
+                        3,
+                        307,
+                        &ObjectPayload::Struct(vec![ObjectValue::I32(1)]),
+                    )
+                    .unwrap(),
+                }],
+            )
+            .unwrap();
+
+        let err =
+            PersistentObjectMarker::mark(&rebuilt, [ObjectId { object_index: 41 }]).unwrap_err();
+
+        let error = format!("{err:?}");
+        assert!(
+            error.contains("persistent struct trace field range exceeds payload length"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn persistent_object_marker_rejects_active_transaction() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x531, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let _state = TransactionState::new_for_test(TransactionId::from_raw(531));
+
+        let err = PersistentObjectMarker::mark(&objects, [object]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object marker cannot run while a transaction is active"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_object_marker_marks_recovered_root_ids() {
+        let region = sample_region_with_two_object_winners_and_global_root();
+        let recovered = crate::runtime::vm::recover_region_for_test(&region).unwrap();
+        let winners = recovered.committed_object_winners().unwrap();
+        let mut rebuilt = ObjectTable::default();
+        rebuilt
+            .rebuild_from_recovery_for_test(&recovered.type_layouts, &winners)
+            .unwrap();
+        let roots = recovered
+            .root_object_ids
+            .iter()
+            .map(|&object_index| ObjectId { object_index });
+
+        let report = PersistentObjectMarker::mark(&rebuilt, roots).unwrap();
+
+        assert_eq!(
+            report.reachable,
+            object_set([ObjectId { object_index: 42 }, ObjectId { object_index: 41 }])
+        );
+        assert!(report.unreachable_persistent.is_empty());
+        assert!(report.invalid_roots.is_empty());
+        assert!(report.dangling_refs.is_empty());
+    }
+
+    fn sample_region_with_two_object_winners_and_global_root()
+    -> crate::runtime::vm::block_region::VMemoryBlockRegion {
+        let mut region =
+            crate::runtime::vm::block_region::VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream1 = region.alloc_stream(1).unwrap();
+        let stream2 = region.alloc_stream(2).unwrap();
+        region
+            .append_type_layout_metadata(&recovery_test_struct_layout(7))
+            .unwrap();
+
+        let target = encoded_object_publication_for_recovery_test(
+            41,
+            1,
+            7,
+            ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)]),
+        );
+        let root = encoded_object_publication_for_recovery_test(
+            42,
+            1,
+            7,
+            ObjectPayload::Struct(vec![
+                ObjectValue::I32(2),
+                ObjectValue::Ref(Some(ObjectId { object_index: 41 })),
+            ]),
+        );
+
+        append_committed_object_winner(&mut region, 1, stream1, 0, &target);
+        append_committed_object_winner(&mut region, 2, stream2, 0, &root);
+
+        let stream = region.alloc_stream(3).unwrap();
+        append_committed_root_update_for_marker_test(
+            &mut region,
+            3,
+            stream,
+            0,
+            ((crate::runtime::vm::PackedGranuleDomain::TGlobal as u64) << 60) | 1,
+            1,
+            &[Some(42)],
+        );
+        region
+    }
+
+    fn append_committed_root_update_for_marker_test(
+        region: &mut crate::runtime::vm::block_region::VMemoryBlockRegion,
+        stream_id: u32,
+        stream: crate::runtime::vm::block_region::StreamCursor,
+        block_seq: u32,
+        logical_id: u64,
+        version: u32,
+        object_ids: &[Option<u64>],
+    ) {
+        let payload = encode_root_object_refs_for_marker_test(object_ids);
+        let record = TMemory::encode_publication_data_record(
+            logical_id,
+            version,
+            crate::runtime::vm::PackedGranuleDomain::TGlobal as u16,
+            0,
+            &payload,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
+        let entry = TMemory::publication_log_entry(
+            logical_id,
+            version,
+            stream_id << 1,
+            location.data_block,
+            location.data_offset,
+            true,
+        );
+        write_log_entry_for_recovery_test(region, log_block, entry);
+    }
+
+    fn encode_root_object_refs_for_marker_test(object_ids: &[Option<u64>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for object_id in object_ids {
+            let raw = object_id.map(|id| id + 1).unwrap_or(0);
+            bytes.extend_from_slice(&raw.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn object_set<const N: usize>(objects: [ObjectId; N]) -> BTreeSet<ObjectId> {
+        objects.into_iter().collect()
     }
 
     #[test]

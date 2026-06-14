@@ -2,6 +2,25 @@
 
 Date: 2026-06-14
 
+## Implementation Status
+
+Implemented on 2026-06-14 in
+`crates/wasmtime/src/runtime/transaction.rs` as `PersistentObjectMarker`.
+
+The implementation follows the mark-only scope below:
+
+- explicit `ObjectId` roots only
+- `ObjectTable` plus layout-guided tracing as the graph source
+- reachable, unreachable, dangling-ref, and invalid-root report sets
+- active transaction rejection through the transaction thread-local state
+- no mutation of the object table or durable storage
+
+Focused implementation tests use:
+
+```bash
+cargo test -p wasmtime --lib persistent_object_marker -- --format terse
+```
+
 ## Goal
 
 Add the first persistent-object GC proof point without touching durable
@@ -175,7 +194,7 @@ Unit tests should cover:
 Useful focused commands:
 
 ```bash
-cargo test -p wasmtime --lib persistent_object_gc -- --format terse
+cargo test -p wasmtime --lib persistent_object_marker -- --format terse
 cargo test -p wasmtime --lib transaction -- --format terse
 cargo test -p wasmtime --test transaction_persistence -- --format terse
 ```

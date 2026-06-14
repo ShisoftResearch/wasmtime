@@ -792,7 +792,7 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/sim
 WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal/simple-transactions/ttry-abort-commit.wast -- --format terse
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -937,35 +937,35 @@ git add crates/test-util/src/wast.rs docs/shisoft/transactional-wasm-implementat
 git commit -m "Remove transactional WAST normalization"
 ```
 
-## Wave 9: Persistent Object GC
+## Wave 9A: Persistent Object GC Logical Marker
 
-**Purpose:** add the first persistent-object collector after WAST-visible object
-semantics are stable.
+**Purpose:** add the first persistent-object collector proof point after
+WAST-visible object semantics are stable. This wave is intentionally mark-only:
+it proves persistent reachability without deleting, sweeping, tombstoning, or
+reclaiming storage.
 
 **Files:**
 
 - Modify: `crates/wasmtime/src/runtime/transaction.rs`
-- Modify: `crates/wasmtime/src/runtime/transaction/object_heap.rs`
-- Create: `crates/wasmtime/src/runtime/transaction/object_gc.rs`
-- Modify: `docs/shisoft/transactional-wasm-runtime-core-design.md`
+- Modify: `docs/shisoft/2026-06-14-persistent-object-gc-wave1-design.md`
 - Modify: `docs/shisoft/transactional-wasm-implementation-log.md`
+- Modify: `docs/shisoft/transactional-wasm-remaining-work-roadmap.md`
 
-- [ ] **Step 1: Add persistent root tests**
+- [x] **Step 1: Add persistent root tests**
 
 Add tests for a root set built from committed persistent state:
 
-- persistent `tglobal` refs
-- persistent `ttable` refs once table COW is implemented
-- explicit durable roots if they exist by this point
+- persistent `tglobal` refs through recovered root ids
+- explicit recovered root ids
 - no active transaction requirement for the first collector
 
 Run:
 
 ```bash
-cargo test -p wasmtime --lib persistent_object_roots -- --format terse
+cargo test -p wasmtime --lib persistent_object_marker -- --format terse
 ```
 
-- [ ] **Step 2: Add object graph tracing tests**
+- [x] **Step 2: Add object graph tracing tests**
 
 Add tests that trace:
 
@@ -974,38 +974,39 @@ Add tests that trace:
 - null refs
 - scalar-only objects
 - cyclic object graphs
+- shared children
 - untraceable payload layouts returning an explicit error
 
 Run:
 
 ```bash
-cargo test -p wasmtime --lib persistent_object_trace -- --format terse
+cargo test -p wasmtime --lib persistent_object_marker -- --format terse
 ```
 
-- [ ] **Step 3: Implement non-moving mark/sweep**
+- [x] **Step 3: Implement non-mutating mark report**
 
-Implement a stop-the-world persistent collector over `ObjectId`:
+Implement a stop-the-world logical marker over `ObjectId`:
 
 - reject collection while a transaction is active
-- mark from persistent roots
-- scan committed object records through `kind` and `type_index`
+- mark from explicit persistent roots
+- scan committed object records through `kind` and `type_layout_id`
 - mark reachable `ObjectId`s
-- sweep unmarked volatile object-index entries
-- reclaim volatile object-record storage where the backend supports it
-- increment slot versions when slots become free
+- report unreachable persistent `ObjectId`s
+- report missing/non-persistent roots
+- report missing/non-persistent child refs
+- return layout/tracing errors without mutating state
 
-Do not compact or move records in this first collector. The volatile object
-index should remain the only runtime structure that maps `ObjectId` to current
-record address.
+Do not compact, move, sweep, tombstone, free slots, or reclaim object-record
+storage in this first collector.
 
-- [ ] **Step 4: Verify no ordinary GC coupling**
+- [x] **Step 4: Verify no ordinary GC coupling**
 
 Run:
 
 ```bash
-rg -n "GcHeap|VMGcRef|Rooted|GcStore" crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/transaction/object_heap.rs crates/wasmtime/src/runtime/transaction/object_gc.rs
+rg -n "GcHeap|VMGcRef|Rooted|GcStore" crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/transaction/object_heap.rs
 cargo test -p wasmtime --lib transaction -- --format terse
-cargo test -p wasmtime --lib persistent_object -- --format terse
+cargo test -p wasmtime --lib persistent_object_marker -- --format terse
 ```
 
 Expected: ordinary Wasmtime GC names only appear at promotion or volatile bridge
@@ -1017,9 +1018,22 @@ Run:
 
 ```bash
 git diff --check
-git add crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/transaction/object_heap.rs crates/wasmtime/src/runtime/transaction/object_gc.rs docs/shisoft/transactional-wasm-runtime-core-design.md docs/shisoft/transactional-wasm-implementation-log.md
-git commit -m "Add persistent ObjectId mark sweep collector"
+git add crates/wasmtime/src/runtime/transaction.rs docs/shisoft/2026-06-14-persistent-object-gc-wave1-design.md docs/shisoft/transactional-wasm-implementation-log.md docs/shisoft/transactional-wasm-remaining-work-roadmap.md
+git commit -m "Add persistent object marker"
 ```
+
+## Wave 9B: Persistent Object Sweep And Tombstones
+
+**Purpose:** design and implement actual persistent-object reclamation after the
+logical marker has enough coverage.
+
+Deferred scope:
+
+- non-durable sweep/report-only mode, if useful for runtime cleanup tests
+- durable tombstone records and recovery precedence
+- root consistency rules across deletion
+- object-table slot/free-list handling
+- block/chunk reclamation and future Immix line reuse
 
 ## Wave 10: Durable Backends
 

@@ -21,6 +21,68 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+## Persistent Object GC Wave 1: Logical ObjectId Marking
+
+Date: 2026-06-14
+
+Persistent GC work has started with a stop-the-world logical marker over
+committed persistent `ObjectId` records. This is the first proof point for the
+persistent reachability pipeline; it intentionally does not reclaim storage.
+
+Implemented status:
+
+- Added `PersistentObjectMarker` in `transaction.rs`.
+- The marker takes explicit `ObjectId` roots and a borrowed `ObjectTable`.
+- It rejects marking while the current thread has an active transaction.
+- It walks persistent object edges through the existing object-table
+  `trace_object_ids` path, including layout-guided tracing for recovered
+  persistent records.
+- It returns a `PersistentObjectMarkReport` with:
+  - reachable persistent objects
+  - unreachable persistent objects
+  - dangling child references
+  - invalid roots split into missing and non-persistent roots
+- It does not mutate `ObjectTable`, publish tombstones, free slots, recycle
+  blocks, compact records, or integrate with ordinary Wasmtime GC.
+
+Test coverage added in this slice:
+
+- root closure plus unreachable-object reporting
+- cycles and shared children
+- missing and non-persistent root diagnostics
+- dangling child reference diagnostics
+- layout/tracing error propagation
+- active-transaction rejection
+- marking a recovery-rebuilt object table using recovered root IDs
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib persistent_object_marker -- --format terse
+test result: ok. 7 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 283 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib -- --format terse
+test result: ok. 591 passed; 0 failed; 2 ignored
+
+cargo fmt --check
+```
+
+Remaining boundaries:
+
+- No durable deletion/tombstone design yet.
+- No volatile sweep mode yet.
+- No block, chunk, or Immix line reclamation yet.
+- No root integration with Wasmtime stack/host roots; roots are explicit
+  persistent `ObjectId` inputs.
+- Active transaction workspaces and promotion maps are not treated as temporary
+  roots yet.
+
 ## Persistent Type Layout Metadata And File-Backed Object Recovery
 
 Date: 2026-06-14
