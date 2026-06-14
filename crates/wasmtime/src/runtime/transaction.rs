@@ -8741,6 +8741,66 @@ mod tests {
                 vec![target]
             );
         }
+
+        #[test]
+        fn persistent_gc_file_backed_recovery_rebuilds_only_reachable_object_table() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("persistent-gc-recovery.bin");
+            let root = ObjectId { object_index: 41 };
+            let garbage = ObjectId { object_index: 42 };
+
+            crate::runtime::vm::block_region::create_file_backed_region_image(&tx_log_path, 128)
+                .unwrap();
+            crate::runtime::vm::block_region::publish_committed_struct_object(
+                &tx_log_path,
+                1,
+                root.object_index,
+                1,
+                12,
+                &[1, 2],
+            )
+            .unwrap();
+            crate::runtime::vm::block_region::publish_committed_struct_object(
+                &tx_log_path,
+                2,
+                garbage.object_index,
+                1,
+                12,
+                &[9, 8],
+            )
+            .unwrap();
+            crate::runtime::vm::block_region::publish_committed_global_object_root(
+                &tx_log_path,
+                3,
+                root.object_index,
+            )
+            .unwrap();
+
+            let (recovered_region, object_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let mut rebuilt = ObjectTable::default();
+            let report = rebuilt
+                .rebuild_reachable_from_recovery_for_test(
+                    &recovered_region.type_layouts,
+                    &object_winners,
+                    &recovered_region.root_object_ids,
+                )
+                .unwrap();
+
+            assert_eq!(recovered_region.root_object_ids, vec![root.object_index]);
+            assert_eq!(report.installed_winners, vec![root.object_index]);
+            assert!(
+                report
+                    .skipped_unreachable_winners
+                    .contains(&garbage.object_index)
+            );
+            assert_eq!(
+                rebuilt.payload(root).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::I32(2)])
+            );
+            assert!(rebuilt.payload(garbage).is_err());
+            assert_eq!(rebuilt.live_count(), 1);
+        }
     }
 
     mod file_backed_mixed_tmemory_object_recovery {
@@ -12175,6 +12235,18 @@ mod tests {
             object_winners,
             rebuilt,
         })
+    }
+
+    fn recover_file_backed_recovery_inputs_for_test(
+        path: &std::path::Path,
+    ) -> Result<(
+        crate::runtime::vm::RecoveredRegion,
+        Vec<crate::runtime::vm::RecoveredObjectWinner>,
+    )> {
+        let recovered_region =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_test(path)?;
+        let object_winners = recovered_region.committed_object_winners()?;
+        Ok((recovered_region, object_winners))
     }
 
     fn recover_file_backed_object_without_layout_metadata_for_test(
