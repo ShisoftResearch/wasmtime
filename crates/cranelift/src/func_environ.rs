@@ -4243,11 +4243,22 @@ impl FuncEnvironment<'_> {
         let array_type = pos
             .ins()
             .iconst(I32, i64::try_from(array_type_index.index()).unwrap());
-        let element_count = pos.ins().iconst(I32, i64::try_from(elems.len()).unwrap());
-        pos.ins().call(
-            callee,
-            &[vmctx, array_ref, array_type, element_count, elements_ptr],
+        let element_is_object_ref = pos.ins().iconst(
+            I32,
+            if matches!(elem_ty, WasmStorageType::Val(WasmValType::Ref(_))) {
+                1
+            } else {
+                0
+            },
         );
+        let element_count = pos.ins().iconst(I32, i64::try_from(elems.len()).unwrap());
+        let mut args = vec![vmctx, array_ref, array_type];
+        if builtin == BuiltinFunctionIndex::transaction_tarray_static_new_fixed() {
+            args.push(element_is_object_ref);
+        }
+        args.push(element_count);
+        args.push(elements_ptr);
+        pos.ins().call(callee, &args);
         Ok(())
     }
 

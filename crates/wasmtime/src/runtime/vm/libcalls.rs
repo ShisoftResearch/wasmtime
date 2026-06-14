@@ -1484,22 +1484,29 @@ fn transaction_tstruct_new_impl(
 
 fn transaction_tstruct_static_new(
     store: &mut dyn VMStore,
-    _instance: InstanceId,
+    instance: InstanceId,
     gc_ref: u32,
     struct_type: u32,
     field_count: u32,
     fields: *mut u8,
 ) -> Result<()> {
-    let result =
-        transaction_tstruct_static_new_impl(store, gc_ref, struct_type, field_count, fields);
+    let result = transaction_tstruct_static_new_impl(
+        store,
+        instance,
+        gc_ref,
+        struct_type,
+        field_count,
+        fields,
+    );
     abort_active_transaction_on_error(store, &result);
     result
 }
 
 fn transaction_tstruct_static_new_impl(
     store: &mut dyn VMStore,
+    instance: InstanceId,
     gc_ref: u32,
-    _struct_type: u32,
+    struct_type: u32,
     field_count: u32,
     fields: *mut u8,
 ) -> Result<()> {
@@ -1520,7 +1527,12 @@ fn transaction_tstruct_static_new_impl(
     for abi in fields {
         values.push(object_value_from_transaction_abi(object_table, *abi)?);
     }
-    object_table.allocate_persistent_struct_for_gc_ref(gc_ref, values)?;
+    object_table.allocate_persistent_struct_for_gc_ref_with_wasmtime_type(
+        gc_ref,
+        Some(instance),
+        struct_type,
+        values,
+    )?;
     Ok(())
 }
 
@@ -1635,7 +1647,7 @@ fn transaction_tarray_new_impl(
 
 fn transaction_tarray_static_new(
     store: &mut dyn VMStore,
-    _instance: InstanceId,
+    instance: InstanceId,
     gc_ref: u32,
     array_type: u32,
     len: u32,
@@ -1643,15 +1655,18 @@ fn transaction_tarray_static_new(
     low: u64,
     high: u64,
 ) -> Result<()> {
-    let result = transaction_tarray_static_new_impl(store, gc_ref, array_type, len, tag, low, high);
+    let result = transaction_tarray_static_new_impl(
+        store, instance, gc_ref, array_type, len, tag, low, high,
+    );
     abort_active_transaction_on_error(store, &result);
     result
 }
 
 fn transaction_tarray_static_new_impl(
     store: &mut dyn VMStore,
+    instance: InstanceId,
     gc_ref: u32,
-    _array_type: u32,
+    array_type: u32,
     len: u32,
     tag: u32,
     low: u64,
@@ -1661,7 +1676,13 @@ fn transaction_tarray_static_new_impl(
     let abi = ObjectValueAbi::from_parts(tag, low, high)?;
     let object_table = store.store_opaque_mut().transaction_object_table_mut();
     let value = object_value_from_transaction_abi(object_table, abi)?;
-    object_table.allocate_persistent_array_for_gc_ref(gc_ref, vec![value; len])?;
+    object_table.allocate_persistent_array_for_gc_ref_with_wasmtime_type_and_initializer(
+        gc_ref,
+        Some(instance),
+        array_type,
+        value,
+        len,
+    )?;
     Ok(())
 }
 
@@ -1721,16 +1742,19 @@ fn transaction_tarray_new_fixed_impl(
 
 fn transaction_tarray_static_new_fixed(
     store: &mut dyn VMStore,
-    _instance: InstanceId,
+    instance: InstanceId,
     gc_ref: u32,
     array_type: u32,
+    element_is_object_ref: u32,
     element_count: u32,
     elements: *mut u8,
 ) -> Result<()> {
     let result = transaction_tarray_static_new_fixed_impl(
         store,
+        instance,
         gc_ref,
         array_type,
+        element_is_object_ref,
         element_count,
         elements,
     );
@@ -1740,11 +1764,17 @@ fn transaction_tarray_static_new_fixed(
 
 fn transaction_tarray_static_new_fixed_impl(
     store: &mut dyn VMStore,
+    instance: InstanceId,
     gc_ref: u32,
-    _array_type: u32,
+    array_type: u32,
+    element_is_object_ref: u32,
     element_count: u32,
     elements: *mut u8,
 ) -> Result<()> {
+    ensure!(
+        element_is_object_ref <= 1,
+        "transactional array fixed element kind flag must be 0 or 1"
+    );
     let element_count =
         usize::try_from(element_count).context("transactional array element count overflow")?;
     ensure!(
@@ -1762,7 +1792,17 @@ fn transaction_tarray_static_new_fixed_impl(
     for abi in elements {
         values.push(object_value_from_transaction_abi(object_table, *abi)?);
     }
-    object_table.allocate_persistent_array_for_gc_ref(gc_ref, values)?;
+    let namespace = instance
+        .as_u32()
+        .checked_add(1)
+        .context("transactional instance namespace overflow")?;
+    object_table.allocate_persistent_array_for_gc_ref_with_wasmtime_fixed_type_namespace(
+        gc_ref,
+        namespace,
+        array_type,
+        element_is_object_ref != 0,
+        values,
+    )?;
     Ok(())
 }
 

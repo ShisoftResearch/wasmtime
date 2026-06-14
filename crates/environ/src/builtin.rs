@@ -79,7 +79,7 @@ macro_rules! foreach_builtin_function {
             // Associates a newly allocated Wasmtime GC array with explicit transactional element records.
             transaction_tarray_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_count: u32, elements: pointer) -> bool;
             // Associates a module-initializer Wasmtime GC fixed array with committed transactional element records.
-            transaction_tarray_static_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_count: u32, elements: pointer) -> bool;
+            transaction_tarray_static_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_is_object_ref: u32, element_count: u32, elements: pointer) -> bool;
             // Associates a newly allocated Wasmtime GC numeric array initialized from data bytes.
             transaction_tarray_new_data(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
             // Associates a newly allocated Wasmtime GC reference array initialized from an element segment.

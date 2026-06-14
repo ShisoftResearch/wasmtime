@@ -35,7 +35,7 @@ impl TypeLayoutId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u16)]
 pub(crate) enum PersistentTypeKind {
     Struct = 1,
@@ -84,7 +84,7 @@ pub(crate) enum PersistentTypeLayout {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TypeLayoutRegistry {
     layouts: BTreeMap<TypeLayoutId, PersistentTypeLayout>,
-    fingerprints: BTreeMap<u64, TypeLayoutId>,
+    fingerprints: BTreeMap<u64, Vec<TypeLayoutId>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,7 +251,8 @@ impl PersistentTypeLayout {
             };
         let header = TypeLayoutRecordHeader {
             magic: TYPE_LAYOUT_RECORD_MAGIC,
-            record_len: u32::try_from(record_len).context("type layout record length exceeds u32")?,
+            record_len: u32::try_from(record_len)
+                .context("type layout record length exceeds u32")?,
             type_layout_id: self.id().get(),
             kind: self.kind() as u16,
             reserved: 0,
@@ -398,6 +399,60 @@ impl PersistentTypeLayout {
             | Self::Scalar { fingerprint, .. } => *fingerprint,
         }
     }
+
+    fn shape_eq_ignoring_id(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Struct {
+                    fingerprint: left_fingerprint,
+                    body_size: left_body_size,
+                    fields: left_fields,
+                    ..
+                },
+                Self::Struct {
+                    fingerprint: right_fingerprint,
+                    body_size: right_body_size,
+                    fields: right_fields,
+                    ..
+                },
+            ) => {
+                left_fingerprint == right_fingerprint
+                    && left_body_size == right_body_size
+                    && left_fields == right_fields
+            }
+            (
+                Self::Array {
+                    fingerprint: left_fingerprint,
+                    element_size: left_element_size,
+                    element_kind: left_element_kind,
+                    ..
+                },
+                Self::Array {
+                    fingerprint: right_fingerprint,
+                    element_size: right_element_size,
+                    element_kind: right_element_kind,
+                    ..
+                },
+            ) => {
+                left_fingerprint == right_fingerprint
+                    && left_element_size == right_element_size
+                    && left_element_kind == right_element_kind
+            }
+            (
+                Self::Scalar {
+                    fingerprint: left_fingerprint,
+                    kind: left_kind,
+                    ..
+                },
+                Self::Scalar {
+                    fingerprint: right_fingerprint,
+                    kind: right_kind,
+                    ..
+                },
+            ) => left_fingerprint == right_fingerprint && left_kind == right_kind,
+            _ => false,
+        }
+    }
 }
 
 impl TypeLayoutRegistry {
@@ -415,15 +470,25 @@ impl TypeLayoutRegistry {
         }
 
         let fingerprint = layout.fingerprint();
-        if let Some(existing_id) = self.fingerprints.get(&fingerprint).copied() {
-            ensure!(
-                existing_id == id,
-                "persistent type layout fingerprint {fingerprint:#x} is already registered to layout id {}",
-                existing_id.get()
-            );
+        if let Some(existing_ids) = self.fingerprints.get_mut(&fingerprint) {
+            for existing_id in existing_ids.iter().copied() {
+                let existing = self.layouts.get(&existing_id).with_context(|| {
+                    format!(
+                        "persistent type layout fingerprint {fingerprint:#x} is registered to missing layout id {}",
+                        existing_id.get()
+                    )
+                })?;
+                ensure!(
+                    existing.shape_eq_ignoring_id(&layout),
+                    "persistent type layout fingerprint {fingerprint:#x} is already registered to incompatible layout id {}",
+                    existing_id.get()
+                );
+            }
+            existing_ids.push(id);
+        } else {
+            self.fingerprints.insert(fingerprint, vec![id]);
         }
 
-        self.fingerprints.insert(fingerprint, id);
         self.layouts.insert(id, layout);
         Ok(())
     }
@@ -436,8 +501,14 @@ impl TypeLayoutRegistry {
         self.layouts.contains_key(&id)
     }
 
-    pub(crate) fn id_for_fingerprint(&self, fingerprint: u64) -> Option<TypeLayoutId> {
-        self.fingerprints.get(&fingerprint).copied()
+    pub(crate) fn ids_for_fingerprint(
+        &self,
+        fingerprint: u64,
+    ) -> impl Iterator<Item = TypeLayoutId> + '_ {
+        self.fingerprints
+            .get(&fingerprint)
+            .into_iter()
+            .flat_map(|ids| ids.iter().copied())
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &PersistentTypeLayout> {
@@ -832,8 +903,10 @@ mod tests {
 
         assert_eq!(registry.get(layout.id()), Some(&layout));
         assert_eq!(
-            registry.id_for_fingerprint(layout.fingerprint()),
-            Some(layout.id())
+            registry
+                .ids_for_fingerprint(layout.fingerprint())
+                .collect::<Vec<_>>(),
+            vec![layout.id()]
         );
     }
 
@@ -861,26 +934,98 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_duplicate_fingerprint_for_different_id() {
+    fn registry_allows_same_shape_fingerprint_for_distinct_ids() {
         let fingerprint = 0x2300_0000_0000_0001;
         let mut registry = TypeLayoutRegistry::default();
+        let first = PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(23).unwrap(),
+            fingerprint,
+            body_size: 20,
+            fields: vec![StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 20,
+                kind: TraceSlotKind::ObjectRef,
+            }],
+        };
+        let second = PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(24).unwrap(),
+            fingerprint,
+            body_size: 20,
+            fields: vec![StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 20,
+                kind: TraceSlotKind::ObjectRef,
+            }],
+        };
+
+        registry.insert(first.clone()).unwrap();
+        registry.insert(second.clone()).unwrap();
+
+        assert_eq!(registry.get(first.id()), Some(&first));
+        assert_eq!(registry.get(second.id()), Some(&second));
+        assert_eq!(
+            registry
+                .ids_for_fingerprint(fingerprint)
+                .collect::<Vec<_>>(),
+            vec![first.id(), second.id()]
+        );
+    }
+
+    #[test]
+    fn registry_ids_for_fingerprint_survives_encode_decode_round_trip() {
+        let fingerprint = 0x2600_0000_0000_0001;
+        let first = PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(26).unwrap(),
+            fingerprint,
+            element_size: 20,
+            element_kind: TraceSlotKind::ObjectRef,
+        };
+        let second = PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(27).unwrap(),
+            fingerprint,
+            element_size: 20,
+            element_kind: TraceSlotKind::ObjectRef,
+        };
+        let mut registry = TypeLayoutRegistry::default();
+        registry.insert(first).unwrap();
+        registry.insert(second).unwrap();
+
+        let decoded = TypeLayoutRegistry::decode_all(&registry.encode_all().unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.ids_for_fingerprint(fingerprint).collect::<Vec<_>>(),
+            vec![
+                TypeLayoutId::new(26).unwrap(),
+                TypeLayoutId::new(27).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_rejects_conflicting_same_id_even_when_shape_differs() {
+        let id = TypeLayoutId::new(25).unwrap();
+        let mut registry = TypeLayoutRegistry::default();
         registry
-            .insert(PersistentTypeLayout::Scalar {
-                id: TypeLayoutId::new(23).unwrap(),
-                fingerprint,
-                kind: PersistentTypeKind::I31,
+            .insert(PersistentTypeLayout::Array {
+                id,
+                fingerprint: 0x2500_0000_0000_0001,
+                element_size: 20,
+                element_kind: TraceSlotKind::Scalar,
             })
             .unwrap();
 
         let err = registry
-            .insert(PersistentTypeLayout::Scalar {
-                id: TypeLayoutId::new(24).unwrap(),
-                fingerprint,
-                kind: PersistentTypeKind::Extern,
+            .insert(PersistentTypeLayout::Array {
+                id,
+                fingerprint: 0x2500_0000_0000_0001,
+                element_size: 20,
+                element_kind: TraceSlotKind::ObjectRef,
             })
             .unwrap_err();
 
-        assert!(err.to_string().contains("fingerprint"));
+        assert!(err.to_string().contains("conflicting"));
     }
 
     #[test]
