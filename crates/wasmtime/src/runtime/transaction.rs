@@ -21,7 +21,10 @@ pub(crate) use object_gc::{
     PersistentRootErrorKind,
 };
 #[cfg(test)]
-use object_gc::{PersistentGcBudget, PersistentGcState, PersistentGcStepReport};
+use object_gc::{
+    PersistentGcBudget, PersistentGcCommitDelta, PersistentGcState, PersistentGcStepReport,
+    PersistentObjectEdge,
+};
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
@@ -3843,6 +3846,40 @@ impl TransactionState {
         })
     }
 
+    fn persistent_gc_commit_delta(
+        &self,
+        object_table: &ObjectTable,
+        publications: &[persist::PendingPublication],
+    ) -> Result<object_gc::PersistentGcCommitDelta> {
+        self.ensure_active()?;
+        let mut delta = object_gc::PersistentGcCommitDelta::default();
+        for &value in self.staged_globals.values() {
+            if let Some(root) = persistent_root_object_id_for_global_snapshot(object_table, value)? {
+                delta.new_roots.insert(root);
+            }
+        }
+        for &value in self.staged_table_elements.values() {
+            if let Some(root) =
+                persistent_root_object_id_for_table_element_snapshot(object_table, value)?
+            {
+                delta.new_roots.insert(root);
+            }
+        }
+        for publication in publications {
+            let (_, object_index) =
+                crate::runtime::vm::unpack_object_granule_id(publication.logical_id)?;
+            let from = ObjectId { object_index };
+            for to in object_table.trace_object_ids(from)? {
+                if let Ok(slot) = object_table.live_slot(to)
+                    && slot.persistent
+                {
+                    delta.edges.insert(object_gc::PersistentObjectEdge { from, to });
+                }
+            }
+        }
+        Ok(delta)
+    }
+
     fn commit_object_payloads_with<F>(
         &mut self,
         object_table: &mut ObjectTable,
@@ -4331,6 +4368,28 @@ impl TransactionState {
         }
         replace_current_thread_transaction(None);
         self.install_workspace(TransactionWorkspace::default());
+    }
+}
+
+fn persistent_root_object_id_for_global_snapshot(
+    object_table: &ObjectTable,
+    value: GlobalSnapshot,
+) -> Result<Option<ObjectId>> {
+    match value {
+        GlobalSnapshot::GcRef(gc_ref) => object_table.known_persistent_object_id_for_gc_ref(gc_ref),
+        _ => Ok(None),
+    }
+}
+
+fn persistent_root_object_id_for_table_element_snapshot(
+    object_table: &ObjectTable,
+    value: TableElementSnapshot,
+) -> Result<Option<ObjectId>> {
+    match value {
+        TableElementSnapshot::GcRef(gc_ref) => {
+            object_table.known_persistent_object_id_for_gc_ref(gc_ref)
+        }
+        TableElementSnapshot::FuncRef(_) => Ok(None),
     }
 }
 
@@ -12305,6 +12364,142 @@ mod tests {
         assert_eq!(report.unreachable_persistent, object_set([unreachable]));
         assert!(report.invalid_roots.is_empty());
         assert!(report.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_gc_commit_barrier_enqueues_new_root() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x540, vec![ObjectValue::I32(4)])
+            .unwrap();
+
+        let delta = {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(540));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x540)).unwrap();
+            state.persistent_gc_commit_delta(&objects, &[]).unwrap()
+        };
+
+        assert_eq!(
+            delta,
+            PersistentGcCommitDelta {
+                new_roots: object_set([root]),
+                edges: BTreeSet::new(),
+            }
+        );
+
+        let mut state = PersistentGcState::new(&objects, []).unwrap();
+        assert_eq!(
+            state
+                .observe_commit_delta(&objects, &delta, PersistentGcBudget::objects(1))
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 0,
+            }
+        );
+        assert!(state.is_complete());
+        assert_eq!(state.into_report(&objects).unwrap().reachable, object_set([root]));
+    }
+
+    #[test]
+    fn persistent_gc_commit_barrier_enqueues_child_when_owner_is_marked() {
+        let mut objects = ObjectTable::default();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(0x541, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let owner = objects
+            .allocate_persistent_struct_for_gc_ref(0x542, vec![ObjectValue::Ref(None)])
+            .unwrap();
+
+        let mut state = PersistentGcState::new(&objects, [owner]).unwrap();
+        assert_eq!(
+            state
+                .mark_step(&objects, PersistentGcBudget::objects(1))
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 0,
+            }
+        );
+        assert!(state.is_complete());
+
+        let delta = {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut tx = TransactionState::new_for_test(TransactionId::from_raw(541));
+            tx.acquire_object_write(&objects, owner).unwrap();
+            tx.stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
+                .unwrap();
+            let mut publications = Vec::new();
+            tx.commit_object_payloads_into(&mut objects, &mut publications)
+                .unwrap();
+            tx.persistent_gc_commit_delta(&objects, &publications).unwrap()
+        };
+
+        assert_eq!(
+            delta,
+            PersistentGcCommitDelta {
+                new_roots: BTreeSet::new(),
+                edges: BTreeSet::from([PersistentObjectEdge {
+                    from: owner,
+                    to: child,
+                }]),
+            }
+        );
+
+        assert_eq!(
+            state
+                .observe_commit_delta(&objects, &delta, PersistentGcBudget::objects(1))
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 0,
+            }
+        );
+        assert!(state.is_complete());
+        assert_eq!(
+            state.into_report(&objects).unwrap().reachable,
+            object_set([owner, child])
+        );
+    }
+
+    #[test]
+    fn persistent_gc_commit_barrier_ignores_child_when_owner_is_unmarked() {
+        let mut objects = ObjectTable::default();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(0x543, vec![ObjectValue::I32(2)])
+            .unwrap();
+        let owner = objects
+            .allocate_persistent_struct_for_gc_ref(0x544, vec![ObjectValue::Ref(None)])
+            .unwrap();
+
+        let delta = {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut tx = TransactionState::new_for_test(TransactionId::from_raw(542));
+            tx.acquire_object_write(&objects, owner).unwrap();
+            tx.stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
+                .unwrap();
+            let mut publications = Vec::new();
+            tx.commit_object_payloads_into(&mut objects, &mut publications)
+                .unwrap();
+            tx.persistent_gc_commit_delta(&objects, &publications).unwrap()
+        };
+
+        let mut state = PersistentGcState::new(&objects, []).unwrap();
+        assert_eq!(
+            state
+                .observe_commit_delta(&objects, &delta, PersistentGcBudget::objects(1))
+                .unwrap(),
+            PersistentGcStepReport {
+                scanned_objects: 0,
+                enqueued_objects: 0,
+            }
+        );
+        assert!(state.is_complete());
+
+        let report = state.into_report(&objects).unwrap();
+        assert!(report.reachable.is_empty());
+        assert_eq!(report.unreachable_persistent, object_set([owner, child]));
     }
 
     #[test]

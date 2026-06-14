@@ -53,6 +53,18 @@ pub(crate) struct PersistentGcStepReport {
     pub(crate) enqueued_objects: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct PersistentObjectEdge {
+    pub(crate) from: ObjectId,
+    pub(crate) to: ObjectId,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistentGcCommitDelta {
+    pub(crate) new_roots: BTreeSet<ObjectId>,
+    pub(crate) edges: BTreeSet<PersistentObjectEdge>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PersistentGcState {
     reachable: BTreeSet<ObjectId>,
@@ -79,6 +91,24 @@ impl PersistentGcState {
         Ok(state)
     }
 
+    pub(crate) fn observe_commit_delta(
+        &mut self,
+        objects: &ObjectTable,
+        delta: &PersistentGcCommitDelta,
+        budget: PersistentGcBudget,
+    ) -> Result<PersistentGcStepReport> {
+        ensure_marker_inactive()?;
+        for &root in &delta.new_roots {
+            self.enqueue_reachable(root);
+        }
+        for edge in &delta.edges {
+            if self.reachable.contains(&edge.from) {
+                self.enqueue_reachable(edge.to);
+            }
+        }
+        self.mark_step(objects, budget)
+    }
+
     pub(crate) fn mark_step(
         &mut self,
         objects: &ObjectTable,
@@ -101,7 +131,7 @@ impl PersistentGcState {
             {
                 match objects.live_slot(child) {
                     Ok(slot) if slot.persistent => {
-                        if self.mark_reachable(child) {
+                        if self.enqueue_reachable(child) {
                             report.enqueued_objects += 1;
                         }
                     }
@@ -144,7 +174,7 @@ impl PersistentGcState {
         })
     }
 
-    fn mark_reachable(&mut self, object: ObjectId) -> bool {
+    fn enqueue_reachable(&mut self, object: ObjectId) -> bool {
         if self.reachable.insert(object) {
             self.grey.push(object);
             true
@@ -156,7 +186,7 @@ impl PersistentGcState {
     fn seed_root(&mut self, objects: &ObjectTable, root: ObjectId) {
         match objects.live_slot(root) {
             Ok(slot) if slot.persistent => {
-                self.mark_reachable(root);
+                self.enqueue_reachable(root);
             }
             Ok(_) => self.invalid_roots.push(PersistentRootError {
                 root,
