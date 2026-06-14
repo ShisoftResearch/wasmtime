@@ -1,4 +1,8 @@
-use super::{ObjectId, ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi};
+use super::type_layout::{PersistentTypeLayout, TraceSlotKind};
+use super::{
+    OBJECT_VALUE_ABI_TAG_REF, ObjectId, ObjectKind, ObjectPayload, ObjectRefValue, ObjectValue,
+    ObjectValueAbi,
+};
 use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::vm::block_region::{BLOCK_SIZE, LINE_MARKED};
@@ -214,6 +218,19 @@ impl ObjectHeap {
 
     pub(crate) fn payload(&self, handle: TxRecordHandle) -> Result<&ObjectPayload> {
         Ok(&self.record(handle)?.payload)
+    }
+
+    pub(crate) fn payload_bytes(&self, handle: TxRecordHandle) -> Result<Vec<u8>> {
+        let record = self.record(handle)?;
+        let payload_start = record
+            .offset
+            .checked_add(payload_offset(record.array_length))
+            .context("object heap payload offset overflow")?;
+        let payload_len = usize::try_from(record.header.record_len)
+            .context("record length does not fit usize")?
+            .checked_sub(payload_offset(record.array_length))
+            .context("object heap payload length underflow")?;
+        self.region()?.read(payload_start, payload_len)
     }
 
     pub(crate) fn trace_descriptor(&self, handle: TxRecordHandle) -> Result<TraceDescriptor> {
@@ -432,11 +449,15 @@ fn record_index(handle: TxRecordHandle) -> Result<usize> {
     usize::try_from(raw).context("record handle does not fit usize")
 }
 
-fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Result<u64> {
-    let header_len = match array_length {
+fn payload_offset(array_length: Option<u32>) -> usize {
+    match array_length {
         Some(_) => size_of::<TxArrayHeader>(),
         None => size_of::<TxObjectHeader>(),
-    };
+    }
+}
+
+fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Result<u64> {
+    let header_len = payload_offset(array_length);
     let payload_len = match payload {
         ObjectPayload::Struct(fields) | ObjectPayload::Array(fields) => {
             u64::try_from(fields.len()).context("object payload field count overflow")?
@@ -504,10 +525,7 @@ fn decode_payload_bytes(
     array_length: Option<u32>,
     bytes: &[u8],
 ) -> Result<ObjectPayload> {
-    let payload_start = match array_length {
-        Some(_) => size_of::<TxArrayHeader>(),
-        None => size_of::<TxObjectHeader>(),
-    };
+    let payload_start = payload_offset(array_length);
     ensure!(
         bytes.len() >= payload_start,
         "serialized object record is shorter than expected"
@@ -579,6 +597,96 @@ fn decode_object_values(bytes: &[u8]) -> Result<Vec<ObjectValue>> {
         .collect()
 }
 
+pub(crate) fn trace_object_refs_with_layout(
+    layout: &PersistentTypeLayout,
+    payload: &[u8],
+    out: &mut Vec<ObjectId>,
+) -> Result<()> {
+    match layout {
+        PersistentTypeLayout::Struct { fields, .. } => {
+            for field in fields {
+                if field.kind != TraceSlotKind::ObjectRef {
+                    continue;
+                }
+                ensure!(
+                    field.value_size == OBJECT_VALUE_RECORD_LEN as u32,
+                    "persistent struct object-ref field must use object value ABI size"
+                );
+                let field_offset = usize::try_from(field.field_offset)
+                    .context("persistent struct trace field offset does not fit usize")?;
+                let bytes = object_ref_slot_bytes(
+                    payload,
+                    field_offset,
+                    "persistent struct trace field range exceeds payload length",
+                )?;
+                if let Some(object_id) = decode_object_ref_slot(bytes)? {
+                    out.push(object_id);
+                }
+            }
+            Ok(())
+        }
+        PersistentTypeLayout::Array {
+            element_size,
+            element_kind,
+            ..
+        } => {
+            if *element_kind == TraceSlotKind::Scalar {
+                return Ok(());
+            }
+            let element_size = usize::try_from(*element_size)
+                .context("persistent object-ref array element size does not fit usize")?;
+            ensure!(
+                element_size == OBJECT_VALUE_RECORD_LEN,
+                "persistent object-ref array elements must use object value ABI size"
+            );
+            ensure!(
+                payload.len() % element_size == 0,
+                "persistent object-ref array payload length is not divisible by element size"
+            );
+            for element_offset in (0..payload.len()).step_by(element_size) {
+                let bytes = object_ref_slot_bytes(
+                    payload,
+                    element_offset,
+                    "persistent object-ref array element range exceeds payload length",
+                )?;
+                if let Some(object_id) = decode_object_ref_slot(bytes)? {
+                    out.push(object_id);
+                }
+            }
+            Ok(())
+        }
+        PersistentTypeLayout::Scalar { .. } => Ok(()),
+    }
+}
+
+fn object_ref_slot_bytes<'a>(
+    payload: &'a [u8],
+    offset: usize,
+    err: &'static str,
+) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(OBJECT_VALUE_RECORD_LEN)
+        .context("persistent object reference trace range overflow")?;
+    ensure!(end <= payload.len(), "{}", err);
+    Ok(&payload[offset..end])
+}
+
+fn decode_object_ref_slot(bytes: &[u8]) -> Result<Option<ObjectId>> {
+    ensure!(
+        bytes.len() == OBJECT_VALUE_RECORD_LEN,
+        "persistent object reference trace slot length mismatch"
+    );
+    let tag = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let low = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+    let high = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    ensure!(
+        tag == OBJECT_VALUE_ABI_TAG_REF,
+        "persistent object reference slot is not encoded as a ref ABI value"
+    );
+    let _ = ObjectValueAbi::from_parts(tag, low, high)?;
+    Ok(ObjectRefValue::from_raw(low).decode())
+}
+
 fn trace_value_kind(value: &ObjectValue) -> TraceValueKind {
     match value {
         ObjectValue::Ref(_) => TraceValueKind::ObjectIdRef,
@@ -625,7 +733,50 @@ fn logical_object_value_len(_value: &ObjectValue) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectKind, ObjectPayload, TxObjectHeader, encode_object_record};
+    use super::{
+        OBJECT_VALUE_RECORD_LEN, ObjectId, ObjectKind, ObjectPayload, ObjectValue, TxObjectHeader,
+        encode_object_record, trace_object_refs_with_layout,
+    };
+    use crate::runtime::transaction::type_layout::{
+        PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId,
+    };
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+
+    fn layout_test_struct(fields: Vec<StructTraceField>) -> PersistentTypeLayout {
+        PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(99).unwrap(),
+            fingerprint: 0x5354_5255_4354_0099,
+            body_size: 0,
+            fields,
+        }
+    }
+
+    fn object_ref_slot(offset: u32) -> StructTraceField {
+        StructTraceField {
+            field_index: offset / u32::try_from(OBJECT_VALUE_RECORD_LEN).unwrap(),
+            field_offset: offset,
+            value_size: OBJECT_VALUE_RECORD_LEN as u32,
+            kind: TraceSlotKind::ObjectRef,
+        }
+    }
+
+    fn scalar_slot(offset: u32) -> StructTraceField {
+        StructTraceField {
+            field_index: offset / u32::try_from(OBJECT_VALUE_RECORD_LEN).unwrap(),
+            field_offset: offset,
+            value_size: 8,
+            kind: TraceSlotKind::Scalar,
+        }
+    }
+
+    fn encode_payload(values: &[ObjectValue]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in values {
+            super::append_object_value_bytes(&mut bytes, value).unwrap();
+        }
+        bytes
+    }
 
     #[test]
     fn object_record_header_uses_type_layout_id() {
@@ -640,5 +791,175 @@ mod tests {
         let header = TxObjectHeader::read_from_prefix(record.as_slice()).unwrap();
 
         assert_eq!(header.type_layout_id, 23);
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_struct_finds_object_refs() {
+        let layout = layout_test_struct(vec![
+            scalar_slot(0),
+            object_ref_slot(OBJECT_VALUE_RECORD_LEN as u32),
+            scalar_slot((OBJECT_VALUE_RECORD_LEN * 2) as u32),
+            object_ref_slot((OBJECT_VALUE_RECORD_LEN * 3) as u32),
+        ]);
+        let payload = encode_payload(&[
+            ObjectValue::I32(7),
+            ObjectValue::Ref(Some(ObjectId { object_index: 11 })),
+            ObjectValue::V128([0; 16]),
+            ObjectValue::Ref(Some(ObjectId { object_index: 12 })),
+        ]);
+
+        let mut out = Vec::new();
+        trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![ObjectId { object_index: 11 }, ObjectId { object_index: 12 }]
+        );
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_struct_ignores_scalar_slots() {
+        let layout = layout_test_struct(vec![
+            scalar_slot(0),
+            object_ref_slot(OBJECT_VALUE_RECORD_LEN as u32),
+        ]);
+        let payload = encode_payload(&[
+            ObjectValue::Ref(Some(ObjectId { object_index: 1 })),
+            ObjectValue::Ref(Some(ObjectId { object_index: 2 })),
+        ]);
+
+        let mut out = Vec::new();
+        trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap();
+
+        assert_eq!(out, vec![ObjectId { object_index: 2 }]);
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_array_finds_object_refs() {
+        let layout = PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(100).unwrap(),
+            fingerprint: 0x4152_5241_5900_0100,
+            element_size: OBJECT_VALUE_RECORD_LEN as u32,
+            element_kind: TraceSlotKind::ObjectRef,
+        };
+        let payload = encode_payload(&[
+            ObjectValue::Ref(None),
+            ObjectValue::Ref(Some(ObjectId { object_index: 21 })),
+            ObjectValue::Ref(Some(ObjectId { object_index: 22 })),
+        ]);
+
+        let mut out = Vec::new();
+        trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            vec![ObjectId { object_index: 21 }, ObjectId { object_index: 22 }]
+        );
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_rejects_bad_struct_field_offset() {
+        let layout = layout_test_struct(vec![object_ref_slot(1)]);
+        let payload = encode_payload(&[ObjectValue::Ref(Some(ObjectId { object_index: 11 }))]);
+        let mut out = Vec::new();
+
+        let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent struct trace field range exceeds payload length")
+        );
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_rejects_bad_array_payload_length() {
+        let layout = PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(101).unwrap(),
+            fingerprint: 0x4152_5241_5900_0101,
+            element_size: OBJECT_VALUE_RECORD_LEN as u32,
+            element_kind: TraceSlotKind::ObjectRef,
+        };
+        let mut payload = encode_payload(&[ObjectValue::Ref(Some(ObjectId { object_index: 21 }))]);
+        payload.push(0);
+        let mut out = Vec::new();
+
+        let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
+
+        assert!(err.to_string().contains(
+            "persistent object-ref array payload length is not divisible by element size"
+        ));
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_rejects_non_abi_sized_struct_ref_field() {
+        let layout = layout_test_struct(vec![StructTraceField {
+            field_index: 0,
+            field_offset: 0,
+            value_size: 8,
+            kind: TraceSlotKind::ObjectRef,
+        }]);
+        let payload = encode_payload(&[ObjectValue::Ref(Some(ObjectId { object_index: 11 }))]);
+        let mut out = Vec::new();
+
+        let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
+
+        assert!(err.to_string().contains(
+            "persistent struct object-ref field must use object value ABI size"
+        ));
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_rejects_non_abi_sized_array_elements() {
+        let layout = PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(102).unwrap(),
+            fingerprint: 0x4152_5241_5900_0102,
+            element_size: 8,
+            element_kind: TraceSlotKind::ObjectRef,
+        };
+        let payload = encode_payload(&[ObjectValue::Ref(Some(ObjectId { object_index: 21 }))]);
+        let mut out = Vec::new();
+
+        let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("persistent object-ref array elements must use object value ABI size"));
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_rejects_non_ref_abi_tag() {
+        let layout = layout_test_struct(vec![StructTraceField {
+            field_index: 0,
+            field_offset: 0,
+            value_size: OBJECT_VALUE_RECORD_LEN as u32,
+            kind: TraceSlotKind::ObjectRef,
+        }]);
+        let payload = encode_payload(&[ObjectValue::I32(7)]);
+        let mut out = Vec::new();
+
+        let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("persistent object reference slot is not encoded as a ref ABI value"));
+    }
+
+    #[test]
+    fn trace_object_refs_with_layout_rejects_noncanonical_ref_abi_payload() {
+        let layout = layout_test_struct(vec![StructTraceField {
+            field_index: 0,
+            field_offset: 0,
+            value_size: OBJECT_VALUE_RECORD_LEN as u32,
+            kind: TraceSlotKind::ObjectRef,
+        }]);
+        let mut payload = encode_payload(&[ObjectValue::Ref(Some(ObjectId { object_index: 11 }))]);
+        payload[12..20].copy_from_slice(&1u64.to_le_bytes());
+        let mut out = Vec::new();
+
+        let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("non-canonical ref object value ABI payload"));
     }
 }

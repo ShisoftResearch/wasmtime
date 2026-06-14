@@ -988,7 +988,24 @@ impl ObjectTable {
 
     pub(crate) fn trace_object_ids(&self, object_id: ObjectId) -> Result<Vec<ObjectId>> {
         let slot = self.live_slot(object_id)?;
-        self.heap.trace_object_ids(slot.current_record)
+        if !slot.persistent {
+            return self.heap.trace_object_ids(slot.current_record);
+        }
+
+        let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
+            .context("persistent object table slot type layout id cannot be zero")?;
+        let layout = self.require_type_layout(type_layout_id)?;
+        // Wave 7 still allocates persistent structs/arrays through builtin
+        // placeholder layouts with no durable ref-slot metadata. Keep the
+        // payload-derived path for those placeholders until Wave 8 starts
+        // assigning real per-shape layouts during persistent allocation.
+        if uses_placeholder_persistent_trace_fallback(type_layout_id) {
+            return self.heap.trace_object_ids(slot.current_record);
+        }
+        let payload = self.heap.payload_bytes(slot.current_record)?;
+        let mut out = Vec::new();
+        object_heap::trace_object_refs_with_layout(layout, &payload, &mut out)?;
+        Ok(out)
     }
 
     pub(crate) fn update_payload(
@@ -1322,6 +1339,13 @@ fn persistent_type_kind_matches_object_kind(
             | (PersistentTypeKind::I31, ObjectKind::I31)
             | (PersistentTypeKind::Extern, ObjectKind::Extern)
             | (PersistentTypeKind::Func, ObjectKind::Func)
+    )
+}
+
+fn uses_placeholder_persistent_trace_fallback(type_layout_id: TypeLayoutId) -> bool {
+    matches!(
+        type_layout_id,
+        TypeLayoutId::DEFAULT_STRUCT | TypeLayoutId::DEFAULT_ARRAY
     )
 }
 
@@ -10104,7 +10128,7 @@ mod tests {
         type_layout::PersistentTypeLayout::Struct {
             id: type_layout::TypeLayoutId::new(layout_id).unwrap(),
             fingerprint: 0x5354_5255_4354_2000 | u64::from(layout_id),
-            body_size: 16,
+            body_size: 40,
             fields: vec![
                 type_layout::StructTraceField {
                     field_index: 0,
@@ -10114,8 +10138,8 @@ mod tests {
                 },
                 type_layout::StructTraceField {
                     field_index: 1,
-                    field_offset: 8,
-                    value_size: 8,
+                    field_offset: 20,
+                    value_size: 20,
                     kind: type_layout::TraceSlotKind::ObjectRef,
                 },
             ],
@@ -10126,7 +10150,7 @@ mod tests {
         type_layout::PersistentTypeLayout::Array {
             id: type_layout::TypeLayoutId::new(layout_id).unwrap(),
             fingerprint: 0x4152_5241_5900_2000 | u64::from(layout_id),
-            element_size: 8,
+            element_size: 20,
             element_kind: type_layout::TraceSlotKind::ObjectRef,
         }
     }
@@ -10260,6 +10284,106 @@ mod tests {
             objects.trace_object_ids(object).unwrap(),
             vec![second, first]
         );
+    }
+
+    #[test]
+    fn persistent_default_struct_layout_tracing_falls_back_to_payload_refs() {
+        let mut objects = ObjectTable::default();
+        let first = ObjectId { object_index: 8 };
+        let second = ObjectId { object_index: 9 };
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(
+                0x401,
+                vec![
+                    ObjectValue::I32(1),
+                    ObjectValue::Ref(Some(first)),
+                    ObjectValue::Ref(Some(second)),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(objects.trace_object_ids(object).unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn persistent_default_array_layout_tracing_falls_back_to_payload_refs() {
+        let mut objects = ObjectTable::default();
+        let first = ObjectId { object_index: 18 };
+        let second = ObjectId { object_index: 19 };
+        let object = objects
+            .allocate_persistent_array_for_gc_ref(
+                0x402,
+                vec![
+                    ObjectValue::Ref(None),
+                    ObjectValue::Ref(Some(first)),
+                    ObjectValue::I64(7),
+                    ObjectValue::Ref(Some(second)),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(objects.trace_object_ids(object).unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn object_recovery_reference_graph_uses_layout_metadata_for_persistent_objects() {
+        let mut recovered_type_layouts = TypeLayoutRegistry::default();
+        recovered_type_layouts
+            .insert(type_layout::PersistentTypeLayout::Struct {
+                id: type_layout::TypeLayoutId::new(207).unwrap(),
+                fingerprint: 0x5354_5255_4354_0207,
+                body_size: 40,
+                fields: vec![
+                    type_layout::StructTraceField {
+                        field_index: 0,
+                        field_offset: 0,
+                        value_size: 8,
+                        kind: type_layout::TraceSlotKind::Scalar,
+                    },
+                    type_layout::StructTraceField {
+                        field_index: 1,
+                        field_offset: 20,
+                        value_size: 20,
+                        kind: type_layout::TraceSlotKind::ObjectRef,
+                    },
+                ],
+            })
+            .unwrap();
+
+        let first = ObjectId { object_index: 8 };
+        let second = ObjectId { object_index: 9 };
+        let mut rebuilt = ObjectTable::default();
+        rebuilt
+            .rebuild_from_recovery_for_test(
+                &recovered_type_layouts,
+                &[crate::runtime::vm::RecoveredObjectWinner {
+                    object_id: 41,
+                    version: 3,
+                    kind: ObjectKind::Struct as u16,
+                    type_layout_id: 207,
+                    record_bytes: encode_object_record_for_test(
+                        41,
+                        3,
+                        207,
+                        &ObjectPayload::Struct(vec![
+                            ObjectValue::Ref(Some(first)),
+                            ObjectValue::Ref(Some(second)),
+                        ]),
+                    )
+                    .unwrap(),
+                }],
+            )
+            .unwrap();
+
+        let object = ObjectId { object_index: 41 };
+        assert_eq!(
+            rebuilt.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![
+                ObjectValue::Ref(Some(first)),
+                ObjectValue::Ref(Some(second)),
+            ])
+        );
+        assert_eq!(rebuilt.trace_object_ids(object).unwrap(), vec![second]);
     }
 
     #[test]
