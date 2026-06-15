@@ -4214,9 +4214,13 @@ impl TransactionState {
         ensure!(
             matches!(
                 kind,
-                ObjectKind::Struct | ObjectKind::Array | ObjectKind::I31
+                ObjectKind::Struct
+                    | ObjectKind::Array
+                    | ObjectKind::I31
+                    | ObjectKind::Extern
+                    | ObjectKind::Func
             ),
-            "transactional promotion currently supports struct, array, and i31 object payloads"
+            "transactional promotion currently supports struct, array, i31, extern, and func object payloads"
         );
         let type_layout_id = TypeLayoutId::new(object_table.live_slot(source)?.type_layout_id)
             .context("promoted object source layout id cannot be zero")?;
@@ -4231,7 +4235,15 @@ impl TransactionState {
             .cloned()
             .unwrap_or(object_table.payload(source)?);
         let promoted_payload =
-            self.rewrite_payload_refs_for_promotion(object_table, source_payload)?;
+            match self.rewrite_payload_refs_for_promotion(object_table, source_payload) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    self.promoted_objects.remove(&source);
+                    self.staged_objects.remove(&promoted);
+                    let _ = object_table.free(promoted);
+                    return Err(err);
+                }
+            };
         object_table.validate_persistent_payload_refs(&promoted_payload)?;
         self.staged_objects.insert(promoted, promoted_payload);
         Ok(promoted)
@@ -13363,6 +13375,40 @@ mod tests {
             assert_eq!(
                 state.staged_object_payload_for_test(promoted).unwrap(),
                 &ObjectPayload::I31(-17)
+            );
+        }
+
+        #[test]
+        fn promotion_rejects_func_source_with_symbolic_identity_error() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects.allocate_payload(ObjectPayload::Func(0x725)).unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(725));
+
+            let err = state
+                .promote_transaction_object_graph_for_test(&mut objects, source)
+                .unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "transactional promotion requires symbolic durable identity for function and external references"
+            );
+        }
+
+        #[test]
+        fn promotion_rejects_extern_source_with_symbolic_identity_error() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects.allocate_payload(ObjectPayload::Extern(0x726)).unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(726));
+
+            let err = state
+                .promote_transaction_object_graph_for_test(&mut objects, source)
+                .unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "transactional promotion requires symbolic durable identity for function and external references"
             );
         }
     }
