@@ -143,6 +143,9 @@ impl DataChunkHeader {
 
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Keep this entry exactly one half cache line. Promotion metadata must live in
+// object data records or type-layout records, not in the fixed transaction log
+// entry, so two entries can share one 64-byte cache line.
 pub(crate) struct TxLogEntry {
     pub(crate) logical_id: u64,
     pub(crate) version: u32,
@@ -444,6 +447,12 @@ mod tests {
 
         assert_eq!(entry.role().unwrap(), TxLogEntryRole::TMemoryUndo);
         assert!(entry.validate_crc32());
+    }
+
+    #[test]
+    fn tx_log_entry_fits_half_cache_line() {
+        assert_eq!(core::mem::size_of::<TxLogEntry>(), 32);
+        assert_eq!(core::mem::align_of::<TxLogEntry>(), 32);
     }
 
     #[test]
