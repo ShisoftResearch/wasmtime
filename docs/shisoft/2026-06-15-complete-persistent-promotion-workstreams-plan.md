@@ -171,8 +171,10 @@ index from Wasmtime export metadata.
 External references use an embedded durable externref host-data wrapper in the
 internal test seam. Store-local registered-function resolution exists for
 loaded exported functions after they are explicitly registered in that store;
-public identity APIs, recovered-payload reintegration, and multi-instance/module
-namespace policy remain pending.
+registered live `tfuncref` values can now roundtrip through transactional
+object get/set helpers in that same store. Public identity APIs,
+recovered-payload reintegration, `texternref` live reverse resolution, and
+multi-instance/module namespace policy remain pending.
 
 The object value ABI can store durable function/external identities, but runtime
 helpers still need authoritative identity encoders at the boundaries where raw
@@ -182,6 +184,10 @@ Wasmtime refs are observed.
   `tfuncref` values when retained module bytecode is available.
 - [x] Add a store-local `tfuncref` resolver for explicitly registered loaded
   exported module functions, rejecting ambiguous duplicate identity bindings.
+- [x] Use the store-local `tfuncref` resolver at the live helper boundary so
+  registered raw `funcref` values encode as inline durable leaves and durable
+  `FuncRef` leaves resolve back to live `funcref` values on `tstruct`/`tarray`
+  reads in the same store.
 - [ ] Define full public/recovery-time `tfuncref` resolution semantics,
   including recovered-payload reintegration and multi-instance/module namespace
   policy.
@@ -202,6 +208,11 @@ Wasmtime refs are observed.
 Status: started. Persistent object records and recovered root records now use
 the central `PersistentObjectRefRaw` ABI for durable heap-object references:
 `0` is null and every non-zero value is `ObjectId.object_index + 1`.
+The live helper boundary can also roundtrip registered `tfuncref` leaves
+through the current Wasmtime-compatible ref bridge, but this is not the final
+`ObjectId`-carrying live `tref` ABI. This bridge uses the `ObjectValueAbi`
+high word as a live-only ref-kind discriminator for compiled-code-to-libcall
+values; persistent object records still require `REF` high = 0.
 
 The branch still has Wasmtime-compatible volatile bridges for some parser,
 lowering, and libcall paths. The final form should use `ObjectId` for

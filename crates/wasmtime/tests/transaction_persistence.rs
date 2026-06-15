@@ -284,6 +284,51 @@ fn real_tfunc_promotes_exported_funcref_leaf_and_recovers() -> Result<()> {
 }
 
 #[test]
+fn real_tstruct_registered_funcref_leaf_roundtrips_through_get() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("roundtrip-funcref-root.tmemory");
+    let tx_log_path = dir.path().join("roundtrip-funcref-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (type $s (tstruct (field (mut funcref))))
+              (func $target (export "target"))
+              (elem declare func $target)
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (tstruct.new $s (ref.func $target))))
+              (tfunc (export "leaf-is-null") (result i32)
+                (ref.is_null
+                  (tstruct.get $s 0
+                    (tref.cast_read (ref.as_non_null (tglobal.get $root)))))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path,
+        64,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    wasmtime::_internal::transaction_persistence::register_exported_durable_func_ref_for_test(
+        &mut store, &instance, "target", 1,
+    )?;
+
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())?;
+    let leaf_is_null = instance.get_typed_func::<(), i32>(&mut store, "leaf-is-null")?;
+    assert_eq!(leaf_is_null.call(&mut store, ())?, 0);
+
+    Ok(())
+}
+
+#[test]
 fn durable_funcref_registration_rejects_conflicting_identity() -> Result<()> {
     let engine = transaction_root_engine()?;
     let mut store = Store::new(&engine, ());

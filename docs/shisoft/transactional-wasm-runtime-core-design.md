@@ -757,9 +757,15 @@ Promotion is graph-based:
   retained original Wasm bytecode and function indices from Wasmtime export
   metadata, and an embedded durable host-data wrapper for test external refs.
   Store-local function resolution is available after a loaded exported function
-  has been explicitly registered in that store, and ambiguous duplicate
-  identity bindings are rejected; public identity APIs, recovered-payload
-  reintegration, and multi-instance/module namespace policy remain future work.
+  has been explicitly registered in that store. Registered raw `tfuncref`
+  values can enter transactional object payloads as inline durable `FuncRef`
+  leaves, and same-store `tstruct`/`tarray` reads can resolve those leaves back
+  to live `tfuncref` values. The live compiled-code-to-libcall bridge tags
+  reference kind in the `ObjectValueAbi` high word to disambiguate `VMGcRef`,
+  `VMFuncRef`, and inline `ti31`; persistent object records still require
+  `REF` high = 0. Ambiguous duplicate identity bindings are rejected; public
+  identity APIs, recovered-payload reintegration, `texternref` live reverse
+  resolution, and multi-instance/module namespace policy remain future work.
 
 After commit, persistent reachability contains persistent roots, `ObjectId`
 heap-object edges, and inline durable scalar/reference leaves. Transaction

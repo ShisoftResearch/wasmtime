@@ -200,6 +200,40 @@ cargo test -p wasmtime --test transaction_persistence -- --format terse
 test result: ok. 15 passed; 0 failed; 0 ignored
 ```
 
+## Current Status: Registered Funcref Live Helper Roundtrip
+
+Date: 2026-06-15
+
+The transactional object live helper boundary now uses the store-local durable
+function registry for registered `tfuncref` values:
+
+- `tstruct`/`tarray` constructors, setters, fill/init helpers, and getters now
+  thread `DurableReferenceRegistry` through `ObjectValueAbi` conversion.
+- Cranelift tags live reference kind in the `ObjectValueAbi` high word for
+  compiled-code-to-libcall values, so runtime decoding can distinguish
+  `VMGcRef`, `VMFuncRef`, and inline `ti31` without weakening persistent
+  record validation.
+- Incoming registered raw `funcref` values encode as inline
+  `ObjectValue::FuncRef(DurableFuncIdentity)` leaves instead of falling through
+  to the volatile object-id bridge.
+- Same-store reads of durable `FuncRef` leaves resolve back to live
+  `VMFuncRef` values through the registry, so Wasm code can observe them as
+  ordinary `funcref` results.
+
+Still pending:
+
+- `texternref` live reverse resolution.
+- Public durable reference APIs.
+- Automatic reintegration of recovered `FuncRef` payload leaves into a fresh
+  store without explicit module/function registration.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --test transaction_persistence real_tstruct_registered_funcref_leaf_roundtrips_through_get -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Internal Exported Function Durable Identity
 
 Date: 2026-06-15

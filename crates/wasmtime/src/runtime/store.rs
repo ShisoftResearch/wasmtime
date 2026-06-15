@@ -1757,6 +1757,29 @@ impl StoreOpaque {
         )
     }
 
+    pub(crate) fn transaction_durable_refs_and_object_table_mut(
+        &mut self,
+    ) -> (&DurableReferenceRegistry, &mut ObjectTable) {
+        (
+            &self.transaction_durable_refs,
+            &mut self.transaction_object_table,
+        )
+    }
+
+    pub(crate) fn transaction_durable_refs_state_and_object_table_mut(
+        &mut self,
+    ) -> (
+        &DurableReferenceRegistry,
+        &mut TransactionState,
+        &mut ObjectTable,
+    ) {
+        (
+            &self.transaction_durable_refs,
+            &mut self.transaction_state,
+            &mut self.transaction_object_table,
+        )
+    }
+
     #[cfg(feature = "transaction")]
     pub(crate) fn transaction_register_durable_func_ref_for_test(
         &mut self,

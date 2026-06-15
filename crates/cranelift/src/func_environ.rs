@@ -60,6 +60,9 @@ const TRANSACTION_OBJECT_VALUE_ABI_TAG_F32: u32 = 2;
 const TRANSACTION_OBJECT_VALUE_ABI_TAG_F64: u32 = 3;
 const TRANSACTION_OBJECT_VALUE_ABI_TAG_V128: u32 = 4;
 const TRANSACTION_OBJECT_VALUE_ABI_TAG_REF: u32 = 5;
+const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_GC: u64 = 1;
+const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC: u64 = 2;
+const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_I31: u64 = 3;
 const TRANSACTION_PERSISTENT_OBJECT_VALUE_RECORD_SIZE: u32 = 20;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_SIZE: u32 = 16;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_INDEX_OFFSET: i32 = 0;
@@ -3494,10 +3497,18 @@ impl FuncEnvironment<'_> {
                 } else {
                     builder.ins().uextend(I64, value)
                 };
+                let live_ref_kind = if ref_ty.heap_type == WasmHeapType::I31 {
+                    TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_I31
+                } else if matches!(ref_ty.heap_type.top(), WasmHeapTopType::Func) {
+                    TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC
+                } else {
+                    TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_GC
+                };
+                let high = builder.ins().iconst(I64, live_ref_kind as i64);
                 (
                     tag(builder, TRANSACTION_OBJECT_VALUE_ABI_TAG_REF),
                     low,
-                    zero_high,
+                    high,
                 )
             }
             WasmStorageType::Val(WasmValType::Ref(_)) => {

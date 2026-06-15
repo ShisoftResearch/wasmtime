@@ -872,6 +872,10 @@ pub(crate) const OBJECT_VALUE_ABI_TAG_REF: u32 = 5;
 pub(crate) const OBJECT_VALUE_ABI_TAG_FUNCREF: u32 = 6;
 pub(crate) const OBJECT_VALUE_ABI_TAG_EXTERNREF: u32 = 7;
 pub(crate) const OBJECT_VALUE_ABI_TAG_I31: u32 = 8;
+pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED: u64 = 0;
+pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_GC: u64 = 1;
+pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC: u64 = 2;
+pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_I31: u64 = 3;
 const VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED: &str =
     "volatile GC reference promotion into persistent object graph is not implemented yet";
 
@@ -916,6 +920,23 @@ impl ObjectValueAbi {
             }
             _ => bail!("unknown object value ABI tag: {tag}"),
         }
+        Ok(Self { tag, low, high })
+    }
+
+    pub(crate) fn from_live_parts(tag: u32, low: u64, high: u64) -> Result<Self> {
+        if tag != OBJECT_VALUE_ABI_TAG_REF {
+            return Self::from_parts(tag, low, high);
+        }
+        ensure!(
+            matches!(
+                high,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED
+                    | OBJECT_VALUE_ABI_LIVE_REF_KIND_GC
+                    | OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC
+                    | OBJECT_VALUE_ABI_LIVE_REF_KIND_I31
+            ),
+            "unknown live ref object value ABI kind"
+        );
         Ok(Self { tag, low, high })
     }
 
