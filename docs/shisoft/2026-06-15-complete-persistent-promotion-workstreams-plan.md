@@ -124,19 +124,29 @@ Status: implemented for current `tstruct`/`tarray` object-table payloads.
 
 ## Workstream 3: Ordinary Wasmtime GC Heap Promotion Adapter
 
-Status: pending.
+Status: adapter contract implemented; real Wasmtime GC heap reader pending.
 
 The current promotion path handles objects that are already mirrored in the
 transactional `ObjectTable`. Arbitrary ordinary Wasmtime GC heap objects remain
 outside the durable promotion path.
 
-- [ ] Add an adapter that can classify ordinary Wasmtime GC heap references as
+- [x] Add an adapter that can classify ordinary Wasmtime GC heap references as
   struct, array, i31, function, external, null, or unsupported.
+- [x] Wire the commit prepass through an `OrdinaryGcPromotionAdapter` seam.
+- [x] Keep the production default conservative with a no-op adapter that
+  preserves the existing unsupported-ref failure.
+- [x] Add fake-adapter tests that promote ordinary-GC-shaped struct/array
+  graphs, rewrite nested/shared refs, preserve self-cycles, encode raw i31
+  leaves inline, remember top-level durable leaf refs as non-object roots, and
+  roll back on unsupported child objects.
+- [ ] Implement the real store-backed adapter that inspects `VMGcRef` headers,
+  classifies struct/array/i31/extern/function refs, and reads struct fields or
+  array elements from Wasmtime GC storage.
 - [ ] For ordinary struct/array objects, extract payload values and type layout
   facts into the persistent object value model.
-- [ ] Convert ordinary heap object references into either promoted `ObjectId`
-  edges or inline durable leaves.
-- [ ] Fail before commit if an ordinary heap object cannot be encoded durably.
+- [ ] Convert real ordinary heap object references into either promoted
+  `ObjectId` edges or inline durable leaves.
+- [x] Fail before commit if an ordinary heap object cannot be encoded durably.
 - [ ] Add tests that mutate a persistent root to reference an ordinary Wasmtime
   GC struct/array and recover the promoted persistent graph.
 

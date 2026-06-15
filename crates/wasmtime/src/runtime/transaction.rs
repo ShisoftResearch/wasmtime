@@ -573,6 +573,8 @@ pub(crate) struct TransactionState {
     original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
+    promoted_gc_refs: BTreeMap<u32, ObjectId>,
+    durable_leaf_gc_refs: BTreeSet<u32>,
     allocated_objects: Vec<ObjectId>,
     granule_versions: BTreeMap<GranuleId, u64>,
     read_granules: BTreeSet<GranuleId>,
@@ -592,6 +594,8 @@ struct TransactionWorkspace {
     original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
+    promoted_gc_refs: BTreeMap<u32, ObjectId>,
+    durable_leaf_gc_refs: BTreeSet<u32>,
     allocated_objects: Vec<ObjectId>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
@@ -603,6 +607,8 @@ struct PromotionAttempt {
     initial_allocated_object_count: usize,
     promoted_sources: Vec<ObjectId>,
     promoted_objects: Vec<ObjectId>,
+    promoted_gc_refs: Vec<u32>,
+    durable_leaf_gc_refs: Vec<u32>,
 }
 
 impl PromotionAttempt {
@@ -611,6 +617,8 @@ impl PromotionAttempt {
             initial_allocated_object_count: state.allocated_objects.len(),
             promoted_sources: Vec::new(),
             promoted_objects: Vec::new(),
+            promoted_gc_refs: Vec::new(),
+            durable_leaf_gc_refs: Vec::new(),
         }
     }
 
@@ -619,7 +627,22 @@ impl PromotionAttempt {
         self.promoted_objects.push(promoted);
     }
 
+    fn record_promoted_gc_ref(&mut self, gc_ref: u32, promoted: ObjectId) {
+        self.promoted_gc_refs.push(gc_ref);
+        self.promoted_objects.push(promoted);
+    }
+
+    fn record_durable_leaf_gc_ref(&mut self, gc_ref: u32) {
+        self.durable_leaf_gc_refs.push(gc_ref);
+    }
+
     fn rollback(self, state: &mut TransactionState, object_table: &mut ObjectTable) -> Result<()> {
+        for gc_ref in self.durable_leaf_gc_refs {
+            state.durable_leaf_gc_refs.remove(&gc_ref);
+        }
+        for gc_ref in self.promoted_gc_refs {
+            state.promoted_gc_refs.remove(&gc_ref);
+        }
         for source in self.promoted_sources {
             state.promoted_objects.remove(&source);
         }
@@ -659,6 +682,8 @@ impl Default for TransactionState {
             original_table_elements: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             promoted_objects: BTreeMap::new(),
+            promoted_gc_refs: BTreeMap::new(),
+            durable_leaf_gc_refs: BTreeSet::new(),
             allocated_objects: Vec::new(),
             granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
@@ -979,6 +1004,53 @@ impl ObjectPayload {
                 )
             }
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OrdinaryGcPromotionValue {
+    I31(i32),
+    I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
+    V128([u8; 16]),
+    GcRef(Option<u32>),
+    FuncRef(DurableFuncIdentity),
+    ExternRef(DurableExternIdentity),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OrdinaryGcPromotionSource {
+    Struct {
+        type_layout_id: TypeLayoutId,
+        fields: Vec<OrdinaryGcPromotionValue>,
+    },
+    Array {
+        type_layout_id: TypeLayoutId,
+        elements: Vec<OrdinaryGcPromotionValue>,
+    },
+    I31(i32),
+    FuncRef(DurableFuncIdentity),
+    ExternRef(DurableExternIdentity),
+    Unsupported(&'static str),
+}
+
+pub(crate) trait OrdinaryGcPromotionAdapter {
+    fn promotion_source_for_gc_ref(
+        &mut self,
+        gc_ref: u32,
+    ) -> Result<Option<OrdinaryGcPromotionSource>>;
+}
+
+struct NoOrdinaryGcPromotionAdapter;
+
+impl OrdinaryGcPromotionAdapter for NoOrdinaryGcPromotionAdapter {
+    fn promotion_source_for_gc_ref(
+        &mut self,
+        _gc_ref: u32,
+    ) -> Result<Option<OrdinaryGcPromotionSource>> {
+        Ok(None)
     }
 }
 
@@ -4316,10 +4388,51 @@ impl TransactionState {
         )))
     }
 
-    fn persistent_object_id_for_gc_ref_after_promotion(
+    fn ordinary_gc_value_to_object_value_in_attempt<A: OrdinaryGcPromotionAdapter>(
+        &mut self,
+        object_table: &mut ObjectTable,
+        value: OrdinaryGcPromotionValue,
+        adapter: &mut A,
+        attempt: &mut PromotionAttempt,
+    ) -> Result<ObjectValue> {
+        Ok(match value {
+            OrdinaryGcPromotionValue::I31(value) => ObjectValue::I31(value),
+            OrdinaryGcPromotionValue::I32(value) => ObjectValue::I32(value),
+            OrdinaryGcPromotionValue::I64(value) => ObjectValue::I64(value),
+            OrdinaryGcPromotionValue::F32(value) => ObjectValue::F32(value),
+            OrdinaryGcPromotionValue::F64(value) => ObjectValue::F64(value),
+            OrdinaryGcPromotionValue::V128(value) => ObjectValue::V128(value),
+            OrdinaryGcPromotionValue::FuncRef(identity) => ObjectValue::FuncRef(identity),
+            OrdinaryGcPromotionValue::ExternRef(identity) => ObjectValue::ExternRef(identity),
+            OrdinaryGcPromotionValue::GcRef(None) => ObjectValue::Ref(None),
+            OrdinaryGcPromotionValue::GcRef(Some(gc_ref)) => {
+                if ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
+                    ObjectValue::I31(ObjectTable::decode_raw_i31_ref(u64::from(gc_ref))?)
+                } else {
+                    let object_id = self
+                        .promote_gc_ref_for_persistence_in_attempt(
+                            object_table,
+                            gc_ref,
+                            adapter,
+                            attempt,
+                        )?
+                        .with_context(|| {
+                            format!(
+                                "ordinary GC ref {gc_ref:#x} is an inline durable value, not a heap object edge"
+                            )
+                        })?;
+                    ObjectValue::Ref(Some(object_id))
+                }
+            }
+        })
+    }
+
+    fn promote_gc_ref_for_persistence_in_attempt<A: OrdinaryGcPromotionAdapter>(
         &mut self,
         object_table: &mut ObjectTable,
         gc_ref: u32,
+        adapter: &mut A,
+        attempt: &mut PromotionAttempt,
     ) -> Result<Option<ObjectId>> {
         if gc_ref == 0 {
             return Ok(None);
@@ -4329,13 +4442,115 @@ impl TransactionState {
                 return Ok(Some(object_id));
             }
             return self
-                .promote_transaction_object_graph(object_table, object_id)
+                .promote_transaction_object_graph_in_attempt(object_table, object_id, attempt)
                 .map(Some);
         }
         if ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
             return Ok(None);
         }
-        bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+        if let Some(promoted) = self.promoted_gc_refs.get(&gc_ref).copied() {
+            return Ok(Some(promoted));
+        }
+        if self.durable_leaf_gc_refs.contains(&gc_ref) {
+            return Ok(None);
+        }
+
+        let Some(source) = adapter.promotion_source_for_gc_ref(gc_ref)? else {
+            bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+        };
+        match source {
+            OrdinaryGcPromotionSource::I31(_)
+            | OrdinaryGcPromotionSource::FuncRef(_)
+            | OrdinaryGcPromotionSource::ExternRef(_) => {
+                if self.durable_leaf_gc_refs.insert(gc_ref) {
+                    attempt.record_durable_leaf_gc_ref(gc_ref);
+                }
+                Ok(None)
+            }
+            OrdinaryGcPromotionSource::Unsupported(reason) => {
+                bail!("ordinary Wasmtime GC reference cannot be promoted: {reason}")
+            }
+            OrdinaryGcPromotionSource::Struct {
+                type_layout_id,
+                fields,
+            } => {
+                let promoted = object_table.reserve_persistent_object_id_for_promotion(
+                    ObjectKind::Struct,
+                    type_layout_id,
+                )?;
+                self.record_allocated_object(promoted)?;
+                self.promoted_gc_refs.insert(gc_ref, promoted);
+                attempt.record_promoted_gc_ref(gc_ref, promoted);
+                let fields = fields
+                    .into_iter()
+                    .map(|value| {
+                        self.ordinary_gc_value_to_object_value_in_attempt(
+                            object_table,
+                            value,
+                            adapter,
+                            attempt,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let payload = ObjectPayload::Struct(fields);
+                object_table.validate_persistent_payload_refs(&payload)?;
+                self.staged_objects.insert(promoted, payload);
+                Ok(Some(promoted))
+            }
+            OrdinaryGcPromotionSource::Array {
+                type_layout_id,
+                elements,
+            } => {
+                let promoted = object_table.reserve_persistent_object_id_for_promotion(
+                    ObjectKind::Array,
+                    type_layout_id,
+                )?;
+                self.record_allocated_object(promoted)?;
+                self.promoted_gc_refs.insert(gc_ref, promoted);
+                attempt.record_promoted_gc_ref(gc_ref, promoted);
+                let elements = elements
+                    .into_iter()
+                    .map(|value| {
+                        self.ordinary_gc_value_to_object_value_in_attempt(
+                            object_table,
+                            value,
+                            adapter,
+                            attempt,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let payload = ObjectPayload::Array(elements);
+                object_table.validate_persistent_payload_refs(&payload)?;
+                self.staged_objects.insert(promoted, payload);
+                Ok(Some(promoted))
+            }
+        }
+    }
+
+    fn persistent_object_id_for_gc_ref_after_promotion(
+        &mut self,
+        object_table: &mut ObjectTable,
+        gc_ref: u32,
+    ) -> Result<Option<ObjectId>> {
+        let mut adapter = NoOrdinaryGcPromotionAdapter;
+        self.persistent_object_id_for_gc_ref_after_promotion_with_adapter(
+            object_table,
+            gc_ref,
+            &mut adapter,
+        )
+    }
+
+    fn persistent_object_id_for_gc_ref_after_promotion_with_adapter<
+        A: OrdinaryGcPromotionAdapter,
+    >(
+        &mut self,
+        object_table: &mut ObjectTable,
+        gc_ref: u32,
+        adapter: &mut A,
+    ) -> Result<Option<ObjectId>> {
+        self.run_promotion_attempt(object_table, |state, object_table, attempt| {
+            state.promote_gc_ref_for_persistence_in_attempt(object_table, gc_ref, adapter, attempt)
+        })
     }
 
     fn persistent_object_id_for_gc_ref_after_completed_promotion(
@@ -4363,6 +4578,12 @@ impl TransactionState {
             return Ok(Some(promoted));
         }
         if ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
+            return Ok(None);
+        }
+        if let Some(promoted) = self.promoted_gc_refs.get(&gc_ref).copied() {
+            return Ok(Some(promoted));
+        }
+        if self.durable_leaf_gc_refs.contains(&gc_ref) {
             return Ok(None);
         }
         bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
@@ -4416,16 +4637,33 @@ impl TransactionState {
         &mut self,
         object_table: &mut ObjectTable,
     ) -> Result<bool> {
+        let mut adapter = NoOrdinaryGcPromotionAdapter;
+        self.promote_persistent_references_before_commit_with_adapter(object_table, &mut adapter)
+    }
+
+    pub(crate) fn promote_persistent_references_before_commit_with_adapter<
+        A: OrdinaryGcPromotionAdapter,
+    >(
+        &mut self,
+        object_table: &mut ObjectTable,
+        adapter: &mut A,
+    ) -> Result<bool> {
         self.ensure_active()?;
 
         let initial_promoted_objects = self.promoted_objects.len();
+        let initial_promoted_gc_refs = self.promoted_gc_refs.len();
+        let initial_durable_leaf_gc_refs = self.durable_leaf_gc_refs.len();
         let initial_staged_object_count = self.staged_objects.len();
         let mut changed = false;
 
         let staged_globals = self.staged_globals.values().copied().collect::<Vec<_>>();
         for value in staged_globals {
             if let GlobalSnapshot::GcRef(gc_ref) = value {
-                self.persistent_object_id_for_gc_ref_after_promotion(object_table, gc_ref)?;
+                self.persistent_object_id_for_gc_ref_after_promotion_with_adapter(
+                    object_table,
+                    gc_ref,
+                    adapter,
+                )?;
             }
         }
 
@@ -4436,7 +4674,11 @@ impl TransactionState {
             .collect::<Vec<_>>();
         for value in staged_table_elements {
             if let TableElementSnapshot::GcRef(gc_ref) = value {
-                self.persistent_object_id_for_gc_ref_after_promotion(object_table, gc_ref)?;
+                self.persistent_object_id_for_gc_ref_after_promotion_with_adapter(
+                    object_table,
+                    gc_ref,
+                    adapter,
+                )?;
             }
         }
 
@@ -4459,6 +4701,8 @@ impl TransactionState {
 
         Ok(changed
             || self.promoted_objects.len() != initial_promoted_objects
+            || self.promoted_gc_refs.len() != initial_promoted_gc_refs
+            || self.durable_leaf_gc_refs.len() != initial_durable_leaf_gc_refs
             || self.staged_objects.len() != initial_staged_object_count)
     }
 
@@ -5210,6 +5454,8 @@ impl TransactionState {
             original_table_elements: mem::take(&mut self.original_table_elements),
             staged_objects: mem::take(&mut self.staged_objects),
             promoted_objects: mem::take(&mut self.promoted_objects),
+            promoted_gc_refs: mem::take(&mut self.promoted_gc_refs),
+            durable_leaf_gc_refs: mem::take(&mut self.durable_leaf_gc_refs),
             allocated_objects: mem::take(&mut self.allocated_objects),
             read_granules: mem::take(&mut self.read_granules),
             write_granules: mem::take(&mut self.write_granules),
@@ -5227,6 +5473,8 @@ impl TransactionState {
         self.original_table_elements = workspace.original_table_elements;
         self.staged_objects = workspace.staged_objects;
         self.promoted_objects = workspace.promoted_objects;
+        self.promoted_gc_refs = workspace.promoted_gc_refs;
+        self.durable_leaf_gc_refs = workspace.durable_leaf_gc_refs;
         self.allocated_objects = workspace.allocated_objects;
         self.read_granules = workspace.read_granules;
         self.write_granules = workspace.write_granules;
@@ -5319,6 +5567,10 @@ impl TransactionState {
 
     fn promoted_object_for_test(&self, source: ObjectId) -> Option<ObjectId> {
         self.promoted_objects.get(&source).copied()
+    }
+
+    fn promoted_gc_ref_for_test(&self, gc_ref: u32) -> Option<ObjectId> {
+        self.promoted_gc_refs.get(&gc_ref).copied()
     }
 
     fn staged_object_payload_for_test(&self, object_id: ObjectId) -> Option<&ObjectPayload> {
@@ -13663,6 +13915,27 @@ mod tests {
     mod persistent_promotion_commit {
         use super::*;
 
+        #[derive(Default)]
+        struct FakeOrdinaryGcPromotionAdapter {
+            sources: BTreeMap<u32, OrdinaryGcPromotionSource>,
+        }
+
+        impl FakeOrdinaryGcPromotionAdapter {
+            fn with_source(mut self, gc_ref: u32, source: OrdinaryGcPromotionSource) -> Self {
+                self.sources.insert(gc_ref, source);
+                self
+            }
+        }
+
+        impl OrdinaryGcPromotionAdapter for FakeOrdinaryGcPromotionAdapter {
+            fn promotion_source_for_gc_ref(
+                &mut self,
+                gc_ref: u32,
+            ) -> Result<Option<OrdinaryGcPromotionSource>> {
+                Ok(self.sources.get(&gc_ref).cloned())
+            }
+        }
+
         #[test]
         fn root_delta_promotes_known_non_persistent_gc_ref() {
             clear_current_thread_transaction_for_test();
@@ -13690,6 +13963,203 @@ mod tests {
                     .unwrap(),
                 object_set([promoted])
             );
+        }
+
+        #[test]
+        fn root_delta_promotes_adapter_struct_gc_ref() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let mut adapter = FakeOrdinaryGcPromotionAdapter::default().with_source(
+                0x900,
+                OrdinaryGcPromotionSource::Struct {
+                    type_layout_id: type_layout::TypeLayoutId::DEFAULT_STRUCT,
+                    fields: vec![OrdinaryGcPromotionValue::I32(90)],
+                },
+            );
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(900));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x900)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit_with_adapter(
+                    &mut objects,
+                    &mut adapter,
+                )
+                .unwrap();
+            let promoted = state.promoted_gc_ref_for_test(0x900).unwrap();
+            let delta = state.staged_persistent_root_delta(&objects).unwrap();
+
+            assert!(objects.is_persistent(promoted).unwrap());
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(90)])
+            );
+            assert_eq!(
+                delta
+                    .roots
+                    .get(&PersistentRootKey::Global {
+                        instance: None,
+                        global_index: 0
+                    })
+                    .cloned()
+                    .unwrap(),
+                object_set([promoted])
+            );
+        }
+
+        #[test]
+        fn adapter_promotion_rewrites_nested_refs_and_inline_i31_leaves() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let raw_i31 = ObjectTable::encode_raw_i31_ref(17) as u32;
+            let mut adapter = FakeOrdinaryGcPromotionAdapter::default()
+                .with_source(
+                    0x910,
+                    OrdinaryGcPromotionSource::Struct {
+                        type_layout_id: type_layout::TypeLayoutId::DEFAULT_STRUCT,
+                        fields: vec![
+                            OrdinaryGcPromotionValue::GcRef(Some(0x912)),
+                            OrdinaryGcPromotionValue::GcRef(Some(0x912)),
+                            OrdinaryGcPromotionValue::GcRef(Some(raw_i31)),
+                        ],
+                    },
+                )
+                .with_source(
+                    0x912,
+                    OrdinaryGcPromotionSource::Array {
+                        type_layout_id: type_layout::TypeLayoutId::DEFAULT_ARRAY,
+                        elements: vec![OrdinaryGcPromotionValue::I64(91)],
+                    },
+                );
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(910));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x910)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit_with_adapter(
+                    &mut objects,
+                    &mut adapter,
+                )
+                .unwrap();
+
+            let promoted_root = state.promoted_gc_ref_for_test(0x910).unwrap();
+            let promoted_child = state.promoted_gc_ref_for_test(0x912).unwrap();
+            assert_ne!(promoted_root, promoted_child);
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted_root).unwrap(),
+                &ObjectPayload::Struct(vec![
+                    ObjectValue::Ref(Some(promoted_child)),
+                    ObjectValue::Ref(Some(promoted_child)),
+                    ObjectValue::I31(17),
+                ])
+            );
+            assert_eq!(
+                state
+                    .staged_object_payload_for_test(promoted_child)
+                    .unwrap(),
+                &ObjectPayload::Array(vec![ObjectValue::I64(91)])
+            );
+        }
+
+        #[test]
+        fn adapter_promotion_preserves_self_cycles() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let mut adapter = FakeOrdinaryGcPromotionAdapter::default().with_source(
+                0x930,
+                OrdinaryGcPromotionSource::Struct {
+                    type_layout_id: type_layout::TypeLayoutId::DEFAULT_STRUCT,
+                    fields: vec![OrdinaryGcPromotionValue::GcRef(Some(0x930))],
+                },
+            );
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(930));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x930)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit_with_adapter(
+                    &mut objects,
+                    &mut adapter,
+                )
+                .unwrap();
+
+            let promoted = state.promoted_gc_ref_for_test(0x930).unwrap();
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::Ref(Some(promoted))])
+            );
+        }
+
+        #[test]
+        fn adapter_promotion_remembers_top_level_durable_leaf_refs() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let func = DurableFuncIdentity {
+                module_fingerprint: 0x940,
+                function_index: 1,
+                type_layout_id: type_layout::TypeLayoutId::BUILTIN_FUNC,
+            };
+            let mut adapter = FakeOrdinaryGcPromotionAdapter::default()
+                .with_source(0x940, OrdinaryGcPromotionSource::FuncRef(func));
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(940));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x940)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit_with_adapter(
+                    &mut objects,
+                    &mut adapter,
+                )
+                .unwrap();
+            let root_delta = state.staged_persistent_root_delta(&objects).unwrap();
+            let gc_delta = state.persistent_gc_commit_delta(&objects, &[]).unwrap();
+
+            assert_eq!(state.promoted_gc_ref_for_test(0x940), None);
+            assert!(
+                root_delta
+                    .roots
+                    .get(&PersistentRootKey::Global {
+                        instance: None,
+                        global_index: 0,
+                    })
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(gc_delta.new_roots.is_empty());
+        }
+
+        #[test]
+        fn adapter_promotion_rolls_back_on_unsupported_child() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let mut adapter = FakeOrdinaryGcPromotionAdapter::default()
+                .with_source(
+                    0x920,
+                    OrdinaryGcPromotionSource::Struct {
+                        type_layout_id: type_layout::TypeLayoutId::DEFAULT_STRUCT,
+                        fields: vec![OrdinaryGcPromotionValue::GcRef(Some(0x922))],
+                    },
+                )
+                .with_source(
+                    0x922,
+                    OrdinaryGcPromotionSource::Unsupported("host opaque object"),
+                );
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(920));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x920)).unwrap();
+
+            let err = state
+                .promote_persistent_references_before_commit_with_adapter(
+                    &mut objects,
+                    &mut adapter,
+                )
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains(
+                    "ordinary Wasmtime GC reference cannot be promoted: host opaque object"
+                ),
+                "{err:?}"
+            );
+            assert_eq!(state.promoted_gc_ref_for_test(0x920), None);
+            assert_eq!(state.promoted_gc_ref_for_test(0x922), None);
+            assert_eq!(state.allocated_object_count_for_test(), 0);
+            assert_eq!(objects.live_count(), 0);
         }
 
         #[test]

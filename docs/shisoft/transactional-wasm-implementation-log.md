@@ -68,6 +68,48 @@ cargo test -p wasmtime --lib transaction -- --format terse
 test result: ok. 350 passed; 0 failed; 0 ignored
 ```
 
+## Current Status: Ordinary GC Promotion Adapter Contract
+
+Date: 2026-06-15
+
+Workstream 3 now has the first adapter seam for ordinary Wasmtime GC heap
+promotion:
+
+- `OrdinaryGcPromotionAdapter` classifies raw ordinary GC refs into persistent
+  promotion sources.
+- `OrdinaryGcPromotionSource` models struct, array, inline i31, durable
+  function refs, durable external refs, and explicitly unsupported sources.
+- `OrdinaryGcPromotionValue` models fields/elements using scalars, raw GC-ref
+  edges, inline i31, and durable function/external leaves.
+- Adapter-classified top-level durable leaf refs are remembered by the
+  transaction workspace so later persistent-root and persistent-GC delta
+  extraction can treat them as non-object roots.
+- The commit prepass has a `_with_adapter` entry point. The production wrapper
+  still uses a no-op adapter and therefore preserves the existing conservative
+  unsupported-ref behavior until real `GcStore`/`VMGcRef` inspection is wired.
+- Fake-adapter tests cover root promotion, nested/shared refs, inline i31
+  leaves, top-level durable leaf refs, self-cycles, and rollback after an
+  unsupported child source.
+
+Still pending:
+
+- Pass store/GC context into the production commit prepass.
+- Implement a real adapter over `VMGcRef`, `GcStore`, `VMStructRef`, and
+  `VMArrayRef`.
+- Map Wasmtime runtime type/layout facts into persistent `TypeLayoutId`s for
+  ordinary struct/array refs.
+- Resolve durable identity sources for function and external refs.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --lib adapter_promotion -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 355 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Wave 11 VMGcRef Commit Promotion
 
 Date: 2026-06-15
