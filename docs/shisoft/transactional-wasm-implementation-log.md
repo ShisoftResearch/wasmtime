@@ -320,7 +320,8 @@ silent-reference hole at the persistent graph boundary.
 Implemented status:
 
 - Durable root publications now exist for persistent `TGlobal` and `TTable`
-  roots, using `ObjectId + 1` encoding so zero remains the null/no-root value.
+  roots, using the centralized `PersistentObjectRefRaw` ABI so zero remains
+  the null/no-root value.
 - `TransactionState` keeps a volatile committed persistent-root index keyed by
   global coordinates and exact table-element coordinates.
 - Real transaction commits publish staged persistent root records before LP,

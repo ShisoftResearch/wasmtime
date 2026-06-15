@@ -4,6 +4,8 @@ use super::{
     TxDataRecordRole, TxLogEntry, TxLogEntryRole, packed_granule_domain, unpack_object_granule_id,
 };
 use crate::prelude::*;
+#[cfg(test)]
+use crate::runtime::transaction::PersistentObjectRefRaw;
 use crate::runtime::transaction::{
     ObjectKind, TxObjectHeader,
     type_layout::{TypeLayoutId, TypeLayoutRegistry},
@@ -1581,7 +1583,9 @@ mod tests {
     fn encode_root_object_refs(object_ids: &[Option<u64>]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for object_id in object_ids {
-            let raw = object_id.map(|id| id + 1).unwrap_or(0);
+            let raw = PersistentObjectRefRaw::from_optional_object_index(*object_id)
+                .unwrap()
+                .as_raw();
             bytes.extend_from_slice(&raw.to_le_bytes());
         }
         bytes

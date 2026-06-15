@@ -1,4 +1,6 @@
 use crate::prelude::*;
+#[cfg(test)]
+use crate::runtime::transaction::PersistentObjectRefRaw;
 use crate::runtime::transaction::type_layout::{
     PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
 };
@@ -2524,7 +2526,9 @@ mod tests {
         fn encode_root_object_ids(object_ids: &[Option<u64>]) -> Vec<u8> {
             let mut payload = Vec::with_capacity(object_ids.len() * size_of::<u64>());
             for object_id in object_ids {
-                let raw = object_id.map(|id| id + 1).unwrap_or(0);
+                let raw = PersistentObjectRefRaw::from_optional_object_index(*object_id)
+                    .unwrap()
+                    .as_raw();
                 payload.extend_from_slice(&raw.to_le_bytes());
             }
             payload

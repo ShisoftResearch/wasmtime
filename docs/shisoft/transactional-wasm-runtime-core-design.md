@@ -779,7 +779,8 @@ The current implementation direction is:
 - allocate persistent object records in `ObjectHeapRegion`
 - publish records through stable `ObjectId` identities and volatile table slots
 - keep payloads traceable by `kind` and recovered `type_layout_id` metadata
-- store persistent references as `ObjectId`
+- store persistent object references through `PersistentObjectRefRaw`, where
+  `0` is null and non-zero values encode `ObjectId.object_index + 1`
 - reject or promote volatile `VMGcRef` values before commit
 - defer durable block/chunk reuse until recovery can safely ignore retired
   object-data ranges
@@ -1189,7 +1190,9 @@ design point, the remaining architecture work should proceed in this order:
 2. Extend commit-time promotion beyond transaction-mirrored objects by adding a
    Wasmtime GC-heap introspection adapter for ordinary volatile GC objects.
 3. Replace volatile `VMGcRef -> ObjectId` bridges with the final
-   `ObjectId`-carrying `tref` ABI for persistent references.
+   `ObjectId`-carrying live `tref` ABI for transactional helper boundaries.
+   Persistent object records and recovered root records already use the
+   centralized `PersistentObjectRefRaw` durable encoding.
 4. Finish durable symbolic identity encoders for `tfuncref` and `texternref`
    inline values. First-class persistent function/external wrapper objects
    remain a separate future design and must not be implied by raw ref

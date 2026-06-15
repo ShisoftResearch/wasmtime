@@ -270,7 +270,7 @@ fn root_publication_kind(logical_id: u64) -> u16 {
 }
 ```
 
-The encoded root payload stores `object_id + 1` little-endian and `0` for nulls, matching `decode_root_object_refs`.
+The encoded root payload uses the centralized `PersistentObjectRefRaw` little-endian ABI, where `0` is null and non-zero values encode `ObjectId.object_index + 1`.
 
 - [ ] **Step 4: Add exact mixed scenarios**
 

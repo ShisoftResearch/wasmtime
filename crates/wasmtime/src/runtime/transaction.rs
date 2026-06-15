@@ -820,16 +820,27 @@ pub(crate) enum ObjectValue {
     ExternRef(DurableExternIdentity),
 }
 
+/// Durable raw ABI for persistent heap-object references in object payloads and
+/// recovered root records.
+///
+/// This is intentionally separate from the live Wasm reference helper ABI:
+/// lowering/libcalls may still see process-local `VMGcRef` handles or inline
+/// i31 immediates while executing a transaction. Persistent object records
+/// only store `ObjectId` identity here: `0` is null and every non-zero value is
+/// `ObjectId.object_index + 1`.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObjectRefValue(u64);
+pub(crate) struct PersistentObjectRefRaw(u64);
 
-impl ObjectRefValue {
+impl PersistentObjectRefRaw {
     pub(crate) fn from_optional_object_id(object_id: Option<ObjectId>) -> Result<Self> {
-        Ok(match object_id {
-            Some(object_id) => Self(
-                object_id
-                    .object_index
+        Self::from_optional_object_index(object_id.map(|object_id| object_id.object_index))
+    }
+
+    pub(crate) fn from_optional_object_index(object_index: Option<u64>) -> Result<Self> {
+        Ok(match object_index {
+            Some(object_index) => Self(
+                object_index
                     .checked_add(1)
                     .context("object reference encoding overflow")?,
             ),
@@ -933,7 +944,7 @@ impl ObjectValueAbi {
             }
             ObjectValue::Ref(object_id) => Self::from_parts(
                 OBJECT_VALUE_ABI_TAG_REF,
-                ObjectRefValue::from_optional_object_id(*object_id)?.as_raw(),
+                PersistentObjectRefRaw::from_optional_object_id(*object_id)?.as_raw(),
                 0,
             ),
             ObjectValue::FuncRef(identity) => Self::from_parts(
@@ -964,7 +975,9 @@ impl ObjectValueAbi {
                 bytes[8..16].copy_from_slice(&high.to_le_bytes());
                 ObjectValue::V128(bytes)
             }
-            OBJECT_VALUE_ABI_TAG_REF => ObjectValue::Ref(ObjectRefValue::from_raw(low).decode()),
+            OBJECT_VALUE_ABI_TAG_REF => {
+                ObjectValue::Ref(PersistentObjectRefRaw::from_raw(low).decode())
+            }
             OBJECT_VALUE_ABI_TAG_FUNCREF => ObjectValue::FuncRef(DurableFuncIdentity {
                 module_fingerprint: low,
                 function_index: u32::try_from(high & u64::from(u32::MAX)).unwrap(),
@@ -9042,27 +9055,28 @@ mod tests {
     }
 
     #[test]
-    fn transaction_object_abi_encodes_null_and_object_ids() {
-        let null = ObjectRefValue::from_optional_object_id(None).unwrap();
+    fn persistent_object_ref_raw_encodes_null_and_object_ids() {
+        let null = PersistentObjectRefRaw::from_optional_object_id(None).unwrap();
         assert_eq!(null.as_raw(), 0);
-        assert_eq!(ObjectRefValue::from_raw(0).decode(), None);
+        assert_eq!(PersistentObjectRefRaw::from_raw(0).decode(), None);
 
         let object = ObjectId { object_index: 41 };
-        let encoded = ObjectRefValue::from_optional_object_id(Some(object)).unwrap();
+        let encoded = PersistentObjectRefRaw::from_optional_object_id(Some(object)).unwrap();
         assert_eq!(encoded.as_raw(), 42);
         assert_eq!(encoded.decode(), Some(object));
 
         let max_encodable_object = ObjectId {
             object_index: u64::MAX - 1,
         };
-        let encoded = ObjectRefValue::from_optional_object_id(Some(max_encodable_object)).unwrap();
+        let encoded =
+            PersistentObjectRefRaw::from_optional_object_id(Some(max_encodable_object)).unwrap();
         assert_eq!(encoded.as_raw(), u64::MAX);
         assert_eq!(encoded.decode(), Some(max_encodable_object));
     }
 
     #[test]
-    fn transaction_object_abi_rejects_ref_encoding_overflow() {
-        let error = ObjectRefValue::from_optional_object_id(Some(ObjectId {
+    fn persistent_object_ref_raw_rejects_ref_encoding_overflow() {
+        let error = PersistentObjectRefRaw::from_optional_object_id(Some(ObjectId {
             object_index: u64::MAX,
         }))
         .unwrap_err();
@@ -9077,11 +9091,11 @@ mod tests {
     #[test]
     fn transaction_object_abi_layout_is_explicit() {
         assert_eq!(
-            core::mem::size_of::<ObjectRefValue>(),
+            core::mem::size_of::<PersistentObjectRefRaw>(),
             core::mem::size_of::<u64>()
         );
         assert_eq!(
-            core::mem::align_of::<ObjectRefValue>(),
+            core::mem::align_of::<PersistentObjectRefRaw>(),
             core::mem::align_of::<u64>()
         );
         assert_eq!(core::mem::size_of::<ObjectValueAbi>(), 24);
@@ -16359,7 +16373,9 @@ mod tests {
     fn encode_root_object_refs_for_marker_test(object_ids: &[Option<u64>]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for object_id in object_ids {
-            let raw = object_id.map(|id| id + 1).unwrap_or(0);
+            let raw = PersistentObjectRefRaw::from_optional_object_index(*object_id)
+                .unwrap()
+                .as_raw();
             bytes.extend_from_slice(&raw.to_le_bytes());
         }
         bytes

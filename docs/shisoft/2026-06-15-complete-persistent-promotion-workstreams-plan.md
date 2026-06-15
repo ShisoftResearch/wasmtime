@@ -199,14 +199,19 @@ Wasmtime refs are observed.
 
 ## Workstream 5: Final Persistent Reference ABI
 
-Status: pending.
+Status: started. Persistent object records and recovered root records now use
+the central `PersistentObjectRefRaw` ABI for durable heap-object references:
+`0` is null and every non-zero value is `ObjectId.object_index + 1`.
 
 The branch still has Wasmtime-compatible volatile bridges for some parser,
 lowering, and libcall paths. The final form should use `ObjectId` for
 persistent heap-object refs and inline durable leaves for scalar/function/
 external values.
 
-- [ ] Define the final transactional reference raw ABI.
+- [x] Define and centralize the persistent object-reference raw ABI used by
+  object payloads and recovered root records.
+- [ ] Define the final live transactional reference raw ABI at the
+  lowering/libcall boundary.
 - [ ] Update Cranelift libcall signatures and lowering to pass the final ABI.
 - [ ] Remove remaining process-local `VMGcRef -> ObjectId` assumptions from
   persistent paths.
