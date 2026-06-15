@@ -403,6 +403,18 @@ impl TxDurableLog {
             events,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn recording_backend_with_retire_failure_for_test()
+    -> (Self, Arc<Mutex<Vec<RecordingBackendEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self::with_backend(RecordingTxDurableLogBackend::new_with_retire_failure(
+                events.clone(),
+            )),
+            events,
+        )
+    }
 }
 
 impl TxDurableLogBackend for InMemoryTxDurableLog {
@@ -792,8 +804,9 @@ where
         self.sink.flush_log()?;
         self.sink.fence()?;
         if marker.role == TxLogEntryRole::TMemoryUndo {
-            self.sink
-                .retire_committed_linear_undo_chunk(marker.chunk_start_block)?;
+            let _ = self
+                .sink
+                .retire_committed_linear_undo_chunk(marker.chunk_start_block);
         }
 
         Ok(())
@@ -814,6 +827,7 @@ pub(crate) enum RecordingBackendEvent {
     FlushData,
     FlushLog,
     Fence,
+    RetireCommittedLinearUndoChunk(u32),
 }
 
 #[cfg(test)]
@@ -822,6 +836,7 @@ struct RecordingTxDurableLogBackend {
     events: Arc<Mutex<Vec<RecordingBackendEvent>>>,
     next_data_block: u32,
     type_layouts: TypeLayoutRegistry,
+    fail_retire_committed_linear_undo: bool,
 }
 
 #[cfg(test)]
@@ -831,6 +846,14 @@ impl RecordingTxDurableLogBackend {
             events,
             next_data_block: 0,
             type_layouts: TypeLayoutRegistry::default(),
+            fail_retire_committed_linear_undo: false,
+        }
+    }
+
+    fn new_with_retire_failure(events: Arc<Mutex<Vec<RecordingBackendEvent>>>) -> Self {
+        Self {
+            fail_retire_committed_linear_undo: true,
+            ..Self::new(events)
         }
     }
 
@@ -888,6 +911,16 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
 
     fn fence(&mut self) -> Result<()> {
         self.push_event(RecordingBackendEvent::Fence);
+        Ok(())
+    }
+
+    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
+        self.push_event(RecordingBackendEvent::RetireCommittedLinearUndoChunk(
+            chunk_start_block,
+        ));
+        if self.fail_retire_committed_linear_undo {
+            bail!("recording backend post-LP cleanup failure")
+        }
         Ok(())
     }
 
@@ -949,6 +982,64 @@ impl RecordingDurability {
 
     fn events(&self) -> &[DurabilityEvent] {
         &self.events
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RetirementFailingDurability {
+    inner: RecordingDurability,
+    retired_chunks: Vec<u32>,
+}
+
+#[cfg(test)]
+impl DurableSink for RetirementFailingDurability {
+    fn append_data_record(
+        &mut self,
+        record: &[u8],
+        data_stream: DurableDataStream,
+    ) -> Result<DurableDataRecordPointer> {
+        self.inner.append_data_record(record, data_stream)
+    }
+
+    fn append_log_entry(
+        &mut self,
+        logical_id: u64,
+        version: u32,
+        tx_meta: u32,
+        data_block: u32,
+        data_offset: u32,
+        data_block_generation: u32,
+        is_final: bool,
+        role: TxLogEntryRole,
+    ) -> Result<()> {
+        self.inner.append_log_entry(
+            logical_id,
+            version,
+            tx_meta,
+            data_block,
+            data_offset,
+            data_block_generation,
+            is_final,
+            role,
+        )
+    }
+
+    fn flush_data(&mut self) -> Result<()> {
+        self.inner.flush_data()
+    }
+
+    fn flush_log(&mut self) -> Result<()> {
+        self.inner.flush_log()
+    }
+
+    fn fence(&mut self) -> Result<()> {
+        self.inner.fence()
+    }
+
+    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
+        self.retired_chunks.push(chunk_start_block);
+        bail!("post-LP cleanup failure")
     }
 }
 
@@ -1168,6 +1259,20 @@ mod tests {
             recorder.roles,
             vec![TxLogEntryRole::TMemoryUndo, TxLogEntryRole::TMemoryUndo]
         );
+    }
+
+    #[test]
+    fn publish_commit_lp_succeeds_when_post_lp_linear_undo_retirement_fails() {
+        let mut durability = RetirementFailingDurability::default();
+        let mut publisher = StreamPublisher::new_for_test(&mut durability, 5, 12);
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![9, 8, 7, 6]);
+
+        let marker = publisher
+            .publish_tmemory_undo_before_in_place_write(&undo)
+            .unwrap();
+        assert!(publisher.publish_commit_lp(marker).is_ok());
+        assert_eq!(durability.retired_chunks, vec![marker.chunk_start_block]);
+        assert_eq!(durability.inner.final_lp_count(), 1);
     }
 
     #[test]

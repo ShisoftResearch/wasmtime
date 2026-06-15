@@ -588,6 +588,7 @@ pub(crate) struct TransactionState {
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
     pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
+    post_commit_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
     durable_log: TxDurableLog,
@@ -641,6 +642,7 @@ impl Default for TransactionState {
             read_granules: BTreeSet::new(),
             write_granules: BTreeSet::new(),
             pending_linear_undo_chunks: BTreeMap::new(),
+            post_commit_linear_undo_chunks: BTreeMap::new(),
             scratch: Vec::new(),
             pending_memory_store: None,
             durable_log: TxDurableLog::default(),
@@ -3142,9 +3144,12 @@ impl TransactionState {
             publisher.publish_commit_lp(marker)?;
         }
         if let Some(chunk_starts) = self.pending_linear_undo_chunks.remove(&stream_id) {
-            self.durable_log
-                .retire_committed_linear_undo_chunks(chunk_starts)?;
+            self.post_commit_linear_undo_chunks
+                .entry(stream_id)
+                .or_default()
+                .extend(chunk_starts);
         }
+        self.retry_post_commit_linear_undo_retirement_for_stream(stream_id);
         Ok(())
     }
 
@@ -3323,6 +3328,7 @@ impl TransactionState {
 
     pub(crate) fn complete_commit(&mut self) -> Result<()> {
         self.ensure_active()?;
+        self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
         self.clear_active();
         Ok(())
@@ -5172,6 +5178,31 @@ impl TransactionState {
         }
         replace_current_thread_transaction(None);
         self.install_workspace(TransactionWorkspace::default());
+    }
+
+    fn retry_post_commit_linear_undo_retirement(&mut self) {
+        let streams = self
+            .post_commit_linear_undo_chunks
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for stream_id in streams {
+            self.retry_post_commit_linear_undo_retirement_for_stream(stream_id);
+        }
+    }
+
+    fn retry_post_commit_linear_undo_retirement_for_stream(&mut self, stream_id: u32) {
+        let Some(chunk_starts) = self.post_commit_linear_undo_chunks.get(&stream_id).cloned()
+        else {
+            return;
+        };
+        if self
+            .durable_log
+            .retire_committed_linear_undo_chunks(chunk_starts)
+            .is_ok()
+        {
+            self.post_commit_linear_undo_chunks.remove(&stream_id);
+        }
     }
 }
 
@@ -8903,6 +8934,38 @@ mod tests {
         assert_eq!(recovered.object_winners.len(), 1);
         assert_eq!(recovered.object_winners[0].object_id, object.object_index);
         assert_eq!(recovered.object_winners[0].version, 2);
+    }
+
+    #[test]
+    fn transaction_state_publish_commit_lp_succeeds_when_post_lp_retirement_fails() {
+        let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failure_for_test();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(18),
+            durable_log,
+        );
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
+
+        let marker = state
+            .publish_tmemory_undo_before_in_place_write(18, 18, &undo)
+            .unwrap();
+        assert!(state.publish_commit_lp(18, 18, marker).is_ok());
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            state
+                .post_commit_linear_undo_chunks
+                .get(&18)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![marker.chunk_start_block]
+        );
+        assert!(events.lock().unwrap().contains(
+            &persist::RecordingBackendEvent::RetireCommittedLinearUndoChunk(
+                marker.chunk_start_block
+            )
+        ));
     }
 
     #[test]
