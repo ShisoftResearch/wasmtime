@@ -7,7 +7,13 @@ use wasmtime::_internal::transaction_persistence::{
     publish_committed_struct_object, publish_committed_tmemory_update,
     reopen_and_recover_file_backed_region,
 };
-use wasmtime::{Config, Engine, Instance, Module, Result, Store};
+use wasmtime::{
+    Config, Engine, ExternRef, Func, Global, GlobalType, Instance, Module, Mutability, Result,
+    Store, ValType,
+};
+
+const OBJECT_VALUE_ABI_TAG_FUNCREF_FOR_TEST: u32 = 6;
+const OBJECT_VALUE_ABI_TAG_EXTERNREF_FOR_TEST: u32 = 7;
 
 #[test]
 fn file_backed_region_recovers_committed_tmemory_update() {
@@ -191,6 +197,263 @@ fn real_tfunc_promotes_ordinary_ref_array_with_i31_leaf_and_child_object() -> Re
     );
 
     Ok(())
+}
+
+#[test]
+fn real_tfunc_promotes_registered_funcref_leaf_and_recovers() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("promote-funcref-root.tmemory");
+    let tx_log_path = dir.path().join("promote-funcref-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (type $s (struct (field (mut funcref))))
+              (func $target (export "target"))
+              (elem declare func $target)
+              (global $source (ref $s) (struct.new $s (ref.func $target)))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (global.get $source))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path.clone(),
+        64,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let target = instance
+        .get_func(&mut store, "target")
+        .expect("target function export");
+    wasmtime::_internal::transaction_persistence::register_durable_func_ref_for_test(
+        &mut store,
+        &target,
+        0x1111_2222_3333_4444,
+        0,
+        1,
+    )?;
+
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids.len(), 1);
+    assert_eq!(recovered.object_winners.len(), 1);
+    assert_eq!(
+        recovered_field_abi_parts(&recovered.object_winners[0].record_bytes),
+        (
+            OBJECT_VALUE_ABI_TAG_FUNCREF_FOR_TEST,
+            0x1111_2222_3333_4444,
+            1_u64 << 32,
+        )
+    );
+
+    Ok(())
+}
+
+#[test]
+fn durable_funcref_registration_rejects_conflicting_identity() -> Result<()> {
+    let engine = transaction_root_engine()?;
+    let mut store = Store::new(&engine, ());
+    let func = Func::wrap(&mut store, || {});
+
+    wasmtime::_internal::transaction_persistence::register_durable_func_ref_for_test(
+        &mut store, &func, 1, 2, 3,
+    )?;
+    wasmtime::_internal::transaction_persistence::register_durable_func_ref_for_test(
+        &mut store, &func, 1, 2, 3,
+    )?;
+
+    let err = wasmtime::_internal::transaction_persistence::register_durable_func_ref_for_test(
+        &mut store, &func, 1, 99, 3,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("durable function reference identity registration conflict"),
+        "{err:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn real_tfunc_rejects_unregistered_funcref_leaf_before_commit() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("reject-funcref-root.tmemory");
+    let tx_log_path = dir.path().join("reject-funcref-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (type $s (struct (field (mut funcref))))
+              (func $target)
+              (elem declare func $target)
+              (global $source (ref $s) (struct.new $s (ref.func $target)))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (global.get $source))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path,
+        64,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+
+    let err = publish.call(&mut store, ()).unwrap_err();
+    let err = format!("{err:?}");
+    assert!(
+        err.contains("without registered durable function identity"),
+        "{err}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn real_tfunc_promotes_durable_externref_leaf_and_recovers() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("promote-externref-root.tmemory");
+    let tx_log_path = dir.path().join("promote-externref-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "source" (global $source externref))
+              (type $s (struct (field (mut externref))))
+              (global $boxed (ref $s) (struct.new $s (global.get $source)))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (global.get $boxed))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path.clone(),
+        64,
+    )?;
+    let extern_ref = wasmtime::_internal::transaction_persistence::new_durable_extern_ref_for_test(
+        &mut store,
+        7,
+        0x5555_6666_7777_8888,
+        2,
+    )?;
+    let source_global = Global::new(
+        &mut store,
+        GlobalType::new(ValType::EXTERNREF, Mutability::Const),
+        extern_ref.into(),
+    )?;
+    let instance = Instance::new(&mut store, &module, &[source_global.into()])?;
+
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids.len(), 1);
+    assert_eq!(recovered.object_winners.len(), 1);
+    assert_eq!(
+        recovered_field_abi_parts(&recovered.object_winners[0].record_bytes),
+        (
+            OBJECT_VALUE_ABI_TAG_EXTERNREF_FOR_TEST,
+            0x5555_6666_7777_8888,
+            7 | (2_u64 << 32),
+        )
+    );
+
+    Ok(())
+}
+
+#[test]
+fn real_tfunc_rejects_unregistered_externref_leaf_before_commit() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("reject-externref-root.tmemory");
+    let tx_log_path = dir.path().join("reject-externref-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "source" (global $source externref))
+              (type $s (struct (field (mut externref))))
+              (global $boxed (ref $s) (struct.new $s (global.get $source)))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (global.get $boxed))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path,
+        64,
+    )?;
+    let extern_ref = ExternRef::new(&mut store, "durable-host-value")?;
+    let source_global = Global::new(
+        &mut store,
+        GlobalType::new(ValType::EXTERNREF, Mutability::Const),
+        extern_ref.into(),
+    )?;
+    let instance = Instance::new(&mut store, &module, &[source_global.into()])?;
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+
+    let err = publish.call(&mut store, ()).unwrap_err();
+    let err = format!("{err:?}");
+    assert!(
+        err.contains("without embedded durable external identity"),
+        "{err}"
+    );
+
+    Ok(())
+}
+
+fn recovered_field_abi_parts(record_bytes: &[u8]) -> (u32, u64, u64) {
+    let field_offset = record_bytes
+        .len()
+        .checked_sub(20)
+        .expect("recovered object record should contain one packed value slot");
+    (
+        u32::from_le_bytes(
+            record_bytes[field_offset..field_offset + 4]
+                .try_into()
+                .unwrap(),
+        ),
+        u64::from_le_bytes(
+            record_bytes[field_offset + 4..field_offset + 12]
+                .try_into()
+                .unwrap(),
+        ),
+        u64::from_le_bytes(
+            record_bytes[field_offset + 12..field_offset + 20]
+                .try_into()
+                .unwrap(),
+        ),
+    )
 }
 
 fn transaction_root_engine() -> Result<Engine> {

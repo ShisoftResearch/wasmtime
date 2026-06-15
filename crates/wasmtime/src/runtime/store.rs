@@ -83,7 +83,8 @@ use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
 use crate::runtime::transaction::{
-    ObjectId, ObjectTable, TMemoryBackend, TransactionConfig, TransactionState,
+    DurableFuncIdentity, DurableReferenceRegistry, ObjectId, ObjectTable, TMemoryBackend,
+    TransactionConfig, TransactionState,
 };
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
@@ -486,6 +487,7 @@ pub struct StoreOpaque {
     file_backed_tmemory_count: usize,
     #[allow(dead_code)]
     transaction_object_table: ObjectTable,
+    transaction_durable_refs: DurableReferenceRegistry,
     // GC-related fields.
     gc_store: Option<GcStore>,
     gc_roots: RootSet,
@@ -788,6 +790,7 @@ impl<T> Store<T> {
             transaction_config: TransactionConfig::default(),
             file_backed_tmemory_count: 0,
             transaction_object_table: ObjectTable::default(),
+            transaction_durable_refs: DurableReferenceRegistry::default(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
             memory_count: 0,
@@ -920,6 +923,17 @@ impl<T> Store<T> {
     ) -> Result<()> {
         self.inner
             .transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_register_durable_func_ref_for_test(
+        &mut self,
+        func: &crate::Func,
+        identity: DurableFuncIdentity,
+    ) -> Result<()> {
+        let func_ref = func.vm_func_ref(&self.inner);
+        self.inner
+            .transaction_register_durable_func_ref_for_test(func_ref.as_ptr().addr(), identity)
     }
 
     /// Access the underlying `T` data owned by this `Store`.
@@ -1724,17 +1738,29 @@ impl StoreOpaque {
         )
     }
 
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_register_durable_func_ref_for_test(
+        &mut self,
+        vm_func_ref_addr: usize,
+        identity: DurableFuncIdentity,
+    ) -> Result<()> {
+        self.transaction_durable_refs
+            .register_func_ref(vm_func_ref_addr, identity)
+    }
+
     pub(crate) fn transaction_promotion_context_mut(
         &mut self,
     ) -> (
         &Engine,
         Option<&mut GcStore>,
+        &DurableReferenceRegistry,
         &mut TransactionState,
         &mut ObjectTable,
     ) {
         (
             &self.engine,
             self.gc_store.as_mut(),
+            &self.transaction_durable_refs,
             &mut self.transaction_state,
             &mut self.transaction_object_table,
         )

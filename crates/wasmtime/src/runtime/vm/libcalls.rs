@@ -58,16 +58,18 @@ use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
-    GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue,
-    ObjectValueAbi, OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource,
-    OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord,
-    TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
+    DurableExternRefHostData, DurableReferenceRegistry, GlobalSnapshot, GranuleId,
+    OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue, ObjectValueAbi,
+    OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource, OrdinaryGcPromotionValue,
+    PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot,
+    TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
     WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
     collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
-    self, GcStore, HostResultHasUnwindSentinel, TableElementType, VMStore, f32x4, f64x2, i8x16,
+    self, FuncRefTableId, GcStore, HostResultHasUnwindSentinel, TableElementType, VMStore, f32x4,
+    f64x2, i8x16,
 };
 use crate::{ArrayType, Engine, HeapType, StorageType, StructType, ValType};
 use alloc::collections::BTreeMap;
@@ -347,11 +349,20 @@ pub(crate) fn transaction_commit_selected_for_host(
 struct StoreBackedOrdinaryGcPromotionAdapter<'a> {
     engine: &'a Engine,
     gc_store: Option<&'a mut GcStore>,
+    durable_refs: &'a DurableReferenceRegistry,
 }
 
 impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
-    fn new(engine: &'a Engine, gc_store: Option<&'a mut GcStore>) -> Self {
-        Self { engine, gc_store }
+    fn new(
+        engine: &'a Engine,
+        gc_store: Option<&'a mut GcStore>,
+        durable_refs: &'a DurableReferenceRegistry,
+    ) -> Self {
+        Self {
+            engine,
+            gc_store,
+            durable_refs,
+        }
     }
 
     fn gc_store_mut(&mut self) -> Result<&mut GcStore> {
@@ -387,16 +398,13 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
             }
             StorageType::ValType(ValType::Ref(ref_type)) => {
                 let raw = data.read_u32(offset)?;
-                if raw == 0 {
-                    return Ok(OrdinaryGcPromotionValue::GcRef(None));
-                }
                 match ref_type.heap_type() {
-                    HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => bail!(
-                        "ordinary GC promotion cannot encode function references until durable function identity is wired"
-                    ),
-                    HeapType::Extern | HeapType::NoExtern => bail!(
-                        "ordinary GC promotion cannot encode external references until durable external identity is wired"
-                    ),
+                    HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => {
+                        return self.read_func_ref_value(raw);
+                    }
+                    HeapType::Extern | HeapType::NoExtern => {
+                        return self.read_extern_ref_value(raw);
+                    }
                     HeapType::Cont | HeapType::ConcreteCont(_) | HeapType::NoCont => {
                         bail!("ordinary GC promotion cannot encode continuation references durably")
                     }
@@ -410,10 +418,58 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
                     | HeapType::ConcreteArray(_)
                     | HeapType::Struct
                     | HeapType::ConcreteStruct(_)
-                    | HeapType::None => OrdinaryGcPromotionValue::GcRef(Some(raw)),
+                    | HeapType::None => {
+                        if raw == 0 {
+                            OrdinaryGcPromotionValue::GcRef(None)
+                        } else {
+                            OrdinaryGcPromotionValue::GcRef(Some(raw))
+                        }
+                    }
                 }
             }
         })
+    }
+
+    fn read_func_ref_value(&mut self, raw_func_ref_id: u32) -> Result<OrdinaryGcPromotionValue> {
+        let vm_func_ref_addr = {
+            let func_ref_id = FuncRefTableId::from_raw(raw_func_ref_id);
+            let Some(func_ref) = self
+                .gc_store_mut()?
+                .func_ref_table
+                .get_untyped(func_ref_id)?
+            else {
+                return Ok(OrdinaryGcPromotionValue::GcRef(None));
+            };
+            func_ref.as_non_null().as_ptr().addr()
+        };
+        let identity = self
+            .durable_refs
+            .resolve_func_ref(vm_func_ref_addr)
+            .context("ordinary GC promotion cannot encode function reference without registered durable function identity")?;
+        Ok(OrdinaryGcPromotionValue::FuncRef(identity))
+    }
+
+    fn read_extern_ref_value(&mut self, raw_gc_ref: u32) -> Result<OrdinaryGcPromotionValue> {
+        if raw_gc_ref == 0 {
+            return Ok(OrdinaryGcPromotionValue::GcRef(None));
+        }
+        let Some(gc_ref) = VMGcRef::from_raw_u32(raw_gc_ref) else {
+            bail!("ordinary GC promotion cannot encode invalid external reference");
+        };
+        let identity = {
+            let gc_store = self.gc_store_mut()?;
+            let Some(extern_ref) = gc_ref.as_externref(&*gc_store.gc_heap) else {
+                bail!("ordinary GC promotion expected an external reference");
+            };
+            gc_store
+                .externref_host_data(extern_ref)?
+                .downcast_ref::<DurableExternRefHostData>()
+                .map(DurableExternRefHostData::identity)
+                .context(
+                    "ordinary GC promotion cannot encode external reference without embedded durable external identity",
+                )?
+        };
+        Ok(OrdinaryGcPromotionValue::ExternRef(identity))
     }
 
     fn storage_type_traces_object_refs(ty: &StorageType) -> bool {
@@ -632,8 +688,10 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
 
     {
         let store = store.store_opaque_mut();
-        let (engine, gc_store, state, object_table) = store.transaction_promotion_context_mut();
-        let mut adapter = StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store);
+        let (engine, gc_store, durable_refs, state, object_table) =
+            store.transaction_promotion_context_mut();
+        let mut adapter =
+            StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
         state
             .promote_persistent_references_before_commit_with_adapter(object_table, &mut adapter)?;
         state.validate_active_object_reads(&*object_table)?;

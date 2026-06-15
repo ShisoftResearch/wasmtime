@@ -585,6 +585,47 @@ pub mod _internal {
             store.transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
         }
 
+        pub fn register_durable_func_ref_for_test<T>(
+            store: &mut crate::Store<T>,
+            func: &crate::Func,
+            module_fingerprint: u64,
+            function_index: u32,
+            type_layout_id: u32,
+        ) -> crate::Result<()> {
+            let type_layout_id =
+                crate::runtime::transaction::type_layout::TypeLayoutId::new(type_layout_id)
+                    .context("durable function ref type layout id cannot be zero")?;
+            store.transaction_register_durable_func_ref_for_test(
+                func,
+                crate::runtime::transaction::DurableFuncIdentity {
+                    module_fingerprint,
+                    function_index,
+                    type_layout_id,
+                },
+            )
+        }
+
+        pub fn new_durable_extern_ref_for_test<T>(
+            store: &mut crate::Store<T>,
+            namespace: u32,
+            handle: u64,
+            type_layout_id: u32,
+        ) -> crate::Result<crate::Rooted<crate::ExternRef>> {
+            let type_layout_id =
+                crate::runtime::transaction::type_layout::TypeLayoutId::new(type_layout_id)
+                    .context("durable external ref type layout id cannot be zero")?;
+            crate::ExternRef::new(
+                &mut *store,
+                crate::runtime::transaction::DurableExternRefHostData::new(
+                    crate::runtime::transaction::DurableExternIdentity {
+                        namespace,
+                        handle,
+                        type_layout_id,
+                    },
+                ),
+            )
+        }
+
         pub fn fail_next_commit_before_lp_for_test<T>(store: &mut crate::Store<T>) {
             store
                 .transaction_state_mut()

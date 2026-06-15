@@ -163,19 +163,27 @@ edges. Function/external durable identity remains outside this slice.
 
 ## Workstream 4: Durable Func/Extern Identity Sources
 
-Status: pending beyond the inline storage format.
+Status: partially implemented. Function references use explicit per-store
+registered identities; external references use an embedded durable externref
+host-data wrapper in the internal test seam. Automatic module fingerprinting,
+restart-time function resolution, and public identity APIs remain pending.
 
 The object value ABI can store durable function/external identities, but runtime
 helpers still need authoritative identity encoders at the boundaries where raw
 Wasmtime refs are observed.
 
-- [ ] Define module/function fingerprints for `tfuncref` values that survive
-  restart and can be resolved against loaded modules.
-- [ ] Define external-reference namespaces and handles for `texternref`.
-- [ ] Add host/module registration APIs for external durable identity encoders.
-- [ ] Reject raw function/external references that have no durable identity
+- [ ] Define automatic module/function fingerprints for `tfuncref` values that
+  survive restart and can be resolved against loaded modules.
+- [x] Define explicit external-reference namespaces and handles for
+  `texternref` values.
+- [x] Add internal per-store registration APIs for durable function identities
+  and internal durable externref host-data construction for durable external
+  identities. Public host/module APIs remain future API work.
+- [x] Wire the store-backed ordinary GC adapter to encode registered non-null
+  function refs and embedded durable externrefs as inline durable leaves.
+- [x] Reject raw function/external references that have no durable identity
   before commit.
-- [ ] Add recovery tests for object payloads containing inline `FuncRef` and
+- [x] Add recovery tests for object payloads containing inline `FuncRef` and
   `ExternRef` values.
 
 ## Workstream 5: Final Persistent Reference ABI

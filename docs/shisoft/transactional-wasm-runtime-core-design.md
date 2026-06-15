@@ -724,10 +724,13 @@ references.
 
 Volatile ordinary objects may refer to persistent objects only as short-lived
 transaction-local values. A committed persistent object graph cannot depend on an
-ordinary volatile GC object. The first implemented promotion wave covers
-transaction-mirrored volatile `tstruct`/`tarray` objects that already have
-`ObjectTable` payloads. During commit, if a staged persistent root or
-persistent object payload refers to one of those objects, the commit path
+ordinary volatile GC object. Promotion now covers transaction-mirrored volatile
+`tstruct`/`tarray` objects that already have `ObjectTable` payloads and the
+first store-backed subset of ordinary Wasmtime GC heap objects: `struct` and
+`array` objects whose fields/elements can be encoded as supported scalars,
+nulls, inline `ti31` leaves, promoted `ObjectId` edges, or explicitly registered
+durable function/external identities. During commit, if a staged persistent root
+or persistent object payload refers to one of those objects, the commit path
 promotes it into the persistent object space first and stores the promoted
 `ObjectId`. Inline `ti31`, durable function, and durable external references
 inside those payloads are preserved as values and do not allocate promoted
@@ -747,9 +750,11 @@ Promotion is graph-based:
 - Acquire optimistic object reads for promoted struct/array source payloads
   before commit applies live memory/global/table/object mutations.
 - Abort the transaction if a value cannot be promoted into the persistent object
-  format. Arbitrary ordinary Wasmtime GC heap objects remain rejected until a
-  GC-heap introspection adapter exists. `tfuncref` and `texternref` values are
-  durable only when the runtime can encode their symbolic identities inline.
+  format. Non-null `tfuncref` and `texternref` values are durable only when the
+  runtime can encode their symbolic identities inline. The current branch uses
+  an explicit per-store durable identity registry for function refs and an
+  embedded durable host-data wrapper for test external refs, while automatic
+  module fingerprinting and public identity APIs remain future work.
 
 After commit, persistent reachability contains persistent roots, `ObjectId`
 heap-object edges, and inline durable scalar/reference leaves. Transaction

@@ -2491,6 +2491,8 @@ pub struct TransactionPersistenceRecoveredObjectWinner {
     pub object_id: u64,
     /// Committed object version selected by recovery.
     pub version: u32,
+    /// Serialized object record bytes selected by recovery.
+    pub record_bytes: Vec<u8>,
 }
 
 /// Narrow recovered linear-memory undo rollback summary exported for
@@ -2744,6 +2746,7 @@ pub fn reopen_and_recover_file_backed_region(
             .map(|winner| TransactionPersistenceRecoveredObjectWinner {
                 object_id: winner.object_id,
                 version: winner.version,
+                record_bytes: winner.record_bytes,
             })
             .collect(),
         root_object_ids: recovered.root_object_ids,

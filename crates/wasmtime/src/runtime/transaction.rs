@@ -27,7 +27,9 @@ pub(crate) use object_gc::{
 use object_gc::{PersistentObjectEdge, PersistentObjectMarker};
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
-pub(crate) use durable_ref::{DurableExternIdentity, DurableFuncIdentity};
+pub(crate) use durable_ref::{
+    DurableExternIdentity, DurableExternRefHostData, DurableFuncIdentity, DurableReferenceRegistry,
+};
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]

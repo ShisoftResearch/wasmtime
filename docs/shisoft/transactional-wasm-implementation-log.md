@@ -144,8 +144,8 @@ commit path:
 
 Still pending:
 
-- Durable identity encoding for function and external references. Non-null
-  function/external refs still fail before commit.
+- Automatic module/function fingerprinting, restart-time function resolution,
+  and public host/module identity registration APIs.
 - Durable identity encoding for continuation and exception references remains
   unsupported.
 
@@ -159,10 +159,45 @@ cargo test -p wasmtime --lib transaction -- --format terse
 test result: ok. 356 passed; 0 failed; 0 ignored
 
 cargo test -p wasmtime --test transaction_persistence -- --format terse
-test result: ok. 8 passed; 0 failed; 0 ignored
+test result: ok. 12 passed; 0 failed; 0 ignored
 
 cargo test -p wasmtime --lib trace_object_refs_with_layout_ -- --format terse
 test result: ok. 10 passed; 0 failed; 0 ignored
+```
+
+## Current Status: Registered Durable Func/Extern Leaves
+
+Date: 2026-06-15
+
+Workstream 4 now has the first production adapter path for inline durable
+function and external reference leaves:
+
+- `StoreOpaque` owns a per-store `DurableReferenceRegistry` for function
+  references.
+- The `_internal::transaction_persistence` test surface can register durable
+  identities for a `Func`, and can construct a durable test `ExternRef` whose
+  host data embeds the durable external identity, without allocating
+  function/external object-table payload records.
+- The store-backed ordinary GC promotion adapter decodes Wasmtime `funcref`
+  fields through `FuncRefTableId`, resolves registered function identities, and
+  emits `ObjectValue::FuncRef`.
+- The adapter reads non-null `externref` host data, downcasts the internal
+  durable host-data wrapper, and emits `ObjectValue::ExternRef`.
+- Unregistered non-null `funcref` and `externref` values still fail before
+  commit with explicit durable-identity errors.
+
+Still pending:
+
+- Automatic module/function fingerprinting and restart-time function resolution
+  against loaded modules.
+- Public host/module durable identity APIs beyond the internal test seam.
+- Durable identity support for continuation and exception references.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 13 passed; 0 failed; 0 ignored
 ```
 
 ## Current Status: Wave 11 VMGcRef Commit Promotion
