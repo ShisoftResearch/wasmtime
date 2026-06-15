@@ -2728,9 +2728,7 @@ pub fn corrupt_first_log_crc(path: &Path) -> Result<()> {
 pub fn reopen_and_recover_file_backed_region(
     path: &Path,
 ) -> Result<TransactionPersistenceRecoveredRegion> {
-    let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
-    let recovered =
-        super::recovery::recover_region(&region.view(), region.load_type_layout_metadata()?)?;
+    let recovered = reopen_and_recover_file_backed_region_for_runtime(path)?;
     Ok(TransactionPersistenceRecoveredRegion {
         winners: recovered
             .winners
@@ -2764,12 +2762,18 @@ pub fn reopen_and_recover_file_backed_region(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn reopen_and_recover_file_backed_region_for_test(
+pub(crate) fn reopen_and_recover_file_backed_region_for_runtime(
     path: &Path,
 ) -> Result<super::recovery::RecoveredRegion> {
     let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
     super::recovery::recover_region(&region.view(), region.load_type_layout_metadata()?)
+}
+
+#[cfg(test)]
+pub(crate) fn reopen_and_recover_file_backed_region_for_test(
+    path: &Path,
+) -> Result<super::recovery::RecoveredRegion> {
+    reopen_and_recover_file_backed_region_for_runtime(path)
 }
 
 #[cfg(test)]

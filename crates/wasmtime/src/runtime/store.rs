@@ -1729,7 +1729,16 @@ impl StoreOpaque {
     ) -> Result<()> {
         let config = TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path)?;
         let recovered =
-            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region(&tx_log_path)?;
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(
+                &tx_log_path,
+            )?;
+        let object_winners = recovered.committed_object_winners()?;
+        let mut recovered_object_table = ObjectTable::default();
+        recovered_object_table.rebuild_reachable_from_recovered_object_winners(
+            &recovered.type_layouts,
+            &object_winners,
+            &recovered.root_object_ids,
+        )?;
         let recovered_roots = recovered
             .root_object_ids
             .iter()
@@ -1743,6 +1752,7 @@ impl StoreOpaque {
             .install_recovered_persistent_root_state(recovered_roots, recovered_versions)?;
         self.transaction_state
             .open_file_backed_durable_log(&tx_log_path)?;
+        self.transaction_object_table = recovered_object_table;
         self.transaction_config = config;
         Ok(())
     }
@@ -3117,6 +3127,46 @@ mod tests {
         let reopened = TMemory::new(open_config, 1, Some(1)).unwrap();
 
         assert_eq!(reopened.read_committed(64..68).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(all(feature = "transaction", unix))]
+    #[test]
+    fn store_transaction_open_file_backed_storage_rebuilds_recovered_object_table() {
+        use crate::runtime::transaction::{ObjectId, ObjectPayload, ObjectValue};
+        use crate::runtime::vm::TMemory;
+        use crate::runtime::vm::block_region::{
+            create_file_backed_region_image, publish_committed_global_object_root,
+            publish_committed_struct_object,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let root = ObjectId { object_index: 41 };
+        let garbage = ObjectId { object_index: 42 };
+
+        let tmemory_config =
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap();
+        drop(TMemory::new(tmemory_config, 1, Some(1)).unwrap());
+        create_file_backed_region_image(&tx_log_path, 64).unwrap();
+        publish_committed_struct_object(&tx_log_path, 1, root.object_index, 1, 12, &[7, 9])
+            .unwrap();
+        publish_committed_struct_object(&tx_log_path, 2, garbage.object_index, 1, 12, &[1, 3])
+            .unwrap();
+        publish_committed_global_object_root(&tx_log_path, 3, root.object_index).unwrap();
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        store
+            .transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
+            .unwrap();
+
+        assert_eq!(store.transaction_object_table().live_count(), 1);
+        assert_eq!(
+            store.transaction_object_table().payload(root).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(7), ObjectValue::I32(9)])
+        );
+        assert!(store.transaction_object_table().payload(garbage).is_err());
     }
 
     #[cfg(all(feature = "transaction", unix, has_virtual_memory))]

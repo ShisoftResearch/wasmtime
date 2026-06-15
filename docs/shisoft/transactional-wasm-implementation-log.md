@@ -30,6 +30,31 @@ for the current persistent-promotion roadmap. It supersedes the older
 plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
 payloads.
 
+## Current Status: Store Reopen Rebuilds Persistent Objects
+
+Date: 2026-06-15
+
+The file-backed transaction storage reopen path now rebuilds the runtime
+transaction object table from committed, reachable persistent object winners:
+
+- `StoreOpaque::transaction_open_file_backed_storage_for_test` uses the internal
+  recovered region so it can preserve type layouts and full object winner
+  metadata.
+- Reopen calls `ObjectTable::rebuild_reachable_from_recovered_object_winners`
+  before opening the durable log for new appends.
+- The rebuild installs only objects reachable from recovered persistent roots.
+  Recovered inline durable leaves remain scalar leaves for tracing.
+- The final end-to-end compiled-code ABI is still tracked by Workstream 5:
+  recovered persistent refs are durable `ObjectId`s, while some live helper
+  boundaries still need the final `ObjectId`-carrying tref ABI.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --lib store_transaction_open_file_backed_storage_rebuilds_recovered_object_table -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Promotion Module Split
 
 Date: 2026-06-15

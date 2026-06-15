@@ -243,14 +243,14 @@ external values.
 
 ## Workstream 6: Recovery And GC Integration
 
-Status: partially implemented for persistent object winners and reachable
-struct/array graphs.
+Status: implemented for persistent object winners and reachable struct/array
+graphs, including the file-backed `Store` reopen path.
 
 - [x] Rebuild volatile object-table slots from committed reachable object
   winners.
 - [x] Trace reachable `ObjectId` edges through struct/array payloads.
 - [x] Treat inline durable leaves as non-traced values.
-- [ ] Finish recovery integration for promoted ordinary Wasmtime GC heap
+- [x] Finish recovery integration for promoted ordinary Wasmtime GC heap
   objects once Workstream 3 lands.
 - [ ] Add durable block/chunk reclamation and reuse after recovery can identify
   retired object-data ranges safely.

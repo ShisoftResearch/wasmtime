@@ -2085,7 +2085,7 @@ impl ObjectTable {
         Ok(())
     }
 
-    fn rebuild_reachable_from_recovered_object_winners(
+    pub(crate) fn rebuild_reachable_from_recovered_object_winners(
         &mut self,
         recovered_type_layouts: &TypeLayoutRegistry,
         winners: &[crate::runtime::vm::RecoveredObjectWinner],
