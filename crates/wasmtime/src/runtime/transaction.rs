@@ -4140,6 +4140,45 @@ impl TransactionState {
         Ok(delta)
     }
 
+    pub(crate) fn persistent_root_publications(
+        &self,
+        delta: &PersistentRootDelta,
+    ) -> Result<Vec<persist::PendingPublication>> {
+        self.ensure_active()?;
+        let mut publications = Vec::new();
+        for (&key, roots) in &delta.roots {
+            let version = self
+                .persistent_root_versions
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .context("persistent root publication version overflow")?;
+            match key {
+                PersistentRootKey::Global { global_index, .. } => {
+                    let roots = roots
+                        .iter()
+                        .map(|root| Some(root.object_index))
+                        .chain(roots.is_empty().then_some(None));
+                    publications.push(persist::PendingPublication::persistent_global_root(
+                        u64::from(global_index),
+                        version,
+                        roots,
+                    )?);
+                }
+                PersistentRootKey::TableElement(key) => {
+                    publications.push(persist::PendingPublication::persistent_table_root(
+                        pack_persistent_table_root_index(key)?,
+                        version,
+                        roots.iter().map(|root| Some(root.object_index)),
+                    )?);
+                }
+                PersistentRootKey::Recovered => {}
+            }
+        }
+        Ok(publications)
+    }
+
     pub(crate) fn persistent_gc_commit_delta(
         &self,
         object_table: &ObjectTable,
@@ -4192,17 +4231,24 @@ impl TransactionState {
         if delta.invalidates_reachable_cache {
             self.persistent_gc_state = None;
         }
+        let committed_roots = if self.persistent_gc_state.is_none() {
+            Some(self.persistent_root_ids())
+        } else {
+            None
+        };
         if self.persistent_gc_state.is_none()
             && delta.new_roots.is_empty()
             && delta.edges.is_empty()
+            && committed_roots.as_ref().is_none_or(BTreeSet::is_empty)
         {
             return Ok(PersistentGcStepReport::default());
         }
         let state = match self.persistent_gc_state.as_mut() {
             Some(state) => state,
-            None => self
-                .persistent_gc_state
-                .insert(PersistentGcState::new(object_table, [])?),
+            None => self.persistent_gc_state.insert(PersistentGcState::new(
+                object_table,
+                committed_roots.unwrap_or_default(),
+            )?),
         };
         state.observe_commit_delta(object_table, delta, PersistentGcBudget::objects(1))
     }
@@ -4221,7 +4267,10 @@ impl TransactionState {
         }
     }
 
-    fn apply_committed_persistent_root_delta(&mut self, delta: PersistentRootDelta) -> Result<()> {
+    pub(crate) fn apply_committed_persistent_root_delta(
+        &mut self,
+        delta: PersistentRootDelta,
+    ) -> Result<()> {
         ensure!(
             self.active.is_none() && current_thread_transaction().is_none(),
             "committed persistent root delta can only be applied after complete_commit"
@@ -4991,6 +5040,31 @@ fn table_element_key(
         table_index,
         element_index,
     }
+}
+
+fn pack_persistent_table_root_index(key: TableElementKey) -> Result<u64> {
+    // Mirror the packed tmemory logical-id layout so table root records stay
+    // unique across instance/table/element coordinates within the 60-bit
+    // payload budget.
+    let instance_code = match key.instance {
+        Some(instance) => u64::from(instance)
+            .checked_add(1)
+            .context("persistent table root instance id overflow")?,
+        None => 0,
+    };
+    ensure!(
+        instance_code < (1u64 << 20),
+        "persistent table root instance id does not fit in packed granule id payload"
+    );
+    ensure!(
+        key.table_index < (1u32 << 12),
+        "persistent table root table index does not fit in packed granule id payload"
+    );
+    ensure!(
+        key.element_index < (1u64 << 28),
+        "persistent table root element index does not fit in packed granule id payload"
+    );
+    Ok((instance_code << 40) | (u64::from(key.table_index) << 28) | key.element_index)
 }
 
 fn table_size_granule_id(owner_instance: Option<InstanceId>, table_index: u32) -> GranuleId {
@@ -12435,6 +12509,47 @@ mod tests {
         Ok((recovered_region, object_winners))
     }
 
+    fn commit_file_backed_publications_for_test<T, F>(
+        txid: u32,
+        prepare: F,
+    ) -> Result<(
+        T,
+        crate::runtime::vm::RecoveredRegion,
+        Vec<crate::runtime::vm::RecoveredObjectWinner>,
+    )>
+    where
+        F: FnOnce(&mut ObjectTable, &mut TransactionState) -> Result<T>,
+    {
+        let dir = tempfile::tempdir()?;
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(u64::from(txid)),
+            durable_log,
+        );
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut objects = ObjectTable::default();
+        let expected = prepare(&mut objects, &mut state)?;
+
+        let mut publications = Vec::new();
+        state.commit_object_payloads_into(&mut objects, &mut publications)?;
+        let root_delta = state.staged_persistent_root_delta(&objects)?;
+        publications.extend(state.persistent_root_publications(&root_delta)?);
+
+        if let Some(marker) =
+            state.publish_object_publications_before_commit(txid, txid, &objects, &publications)?
+        {
+            state.publish_commit_lp(txid, txid, marker)?;
+        }
+        state.complete_commit()?;
+        state.apply_committed_persistent_root_delta(root_delta)?;
+        drop(state);
+
+        let (recovered_region, object_winners) =
+            recover_file_backed_recovery_inputs_for_test(&tx_log_path)?;
+        Ok((expected, recovered_region, object_winners))
+    }
+
     fn recover_file_backed_object_without_layout_metadata_for_test(
         publication: &persist::PendingPublication,
     ) -> Result<crate::runtime::vm::RecoveredRegion> {
@@ -12457,6 +12572,39 @@ mod tests {
         crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_test(
             &tx_log_path,
         )
+    }
+
+    #[test]
+    fn persistent_root_commit_publishes_global_root_record() {
+        let (root, recovered_region, _) =
+            commit_file_backed_publications_for_test(701, |objects, state| {
+                let root = objects
+                    .allocate_persistent_struct_for_gc_ref(0x701, vec![ObjectValue::I32(1)])
+                    .unwrap();
+                state.acquire_object_write(objects, root)?;
+                state.stage_struct_field(objects, root, 0, ObjectValue::I32(9))?;
+                state.stage_global(0, GlobalSnapshot::GcRef(0x701))?;
+                Ok(root)
+            })
+            .unwrap();
+
+        assert_eq!(recovered_region.root_object_ids, vec![root.object_index]);
+    }
+
+    #[test]
+    fn persistent_root_commit_root_only_writes_final_marker() {
+        let (root, recovered_region, object_winners) =
+            commit_file_backed_publications_for_test(702, |objects, state| {
+                let root = objects
+                    .allocate_persistent_struct_for_gc_ref(0x702, vec![ObjectValue::I32(2)])
+                    .unwrap();
+                state.stage_global(0, GlobalSnapshot::GcRef(0x702))?;
+                Ok(root)
+            })
+            .unwrap();
+
+        assert!(object_winners.is_empty());
+        assert_eq!(recovered_region.root_object_ids, vec![root.object_index]);
     }
 
     fn sample_region_with_two_object_winners()
@@ -13053,7 +13201,10 @@ mod tests {
         state
             .apply_committed_persistent_root_delta_for_test(install_delta)
             .unwrap();
-        assert_eq!(state.persistent_root_ids_for_test(), object_set([root0, root1]));
+        assert_eq!(
+            state.persistent_root_ids_for_test(),
+            object_set([root0, root1])
+        );
 
         state.begin().unwrap();
         state

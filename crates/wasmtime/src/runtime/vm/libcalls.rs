@@ -376,12 +376,17 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         apply_staged_transaction_record(store, instance, record)?;
     }
 
-    let mut object_publications = Vec::new();
-    let persistent_gc_delta = {
+    let (object_publications, root_delta, persistent_gc_delta) = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
+        let mut object_publications = Vec::new();
         state.commit_object_payloads_into(object_table, &mut object_publications)?;
-        state.persistent_gc_commit_delta(&*object_table, &object_publications)?
+        let root_delta = state.staged_persistent_root_delta(&*object_table)?;
+        let root_publications = state.persistent_root_publications(&root_delta)?;
+        let persistent_gc_delta =
+            state.persistent_gc_commit_delta(&*object_table, &object_publications)?;
+        object_publications.extend(root_publications);
+        (object_publications, root_delta, persistent_gc_delta)
     };
     if !object_publications.is_empty() {
         let object_marker = {
@@ -417,6 +422,7 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
 
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
+    state.apply_committed_persistent_root_delta(root_delta)?;
     // The transaction is already committed at this point. Persistent GC
     // observation is opportunistic runtime maintenance and must not turn a
     // completed commit into an apparent failure.
