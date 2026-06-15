@@ -605,6 +605,58 @@ pub mod _internal {
             )
         }
 
+        pub fn register_exported_durable_func_ref_for_test<T>(
+            store: &mut crate::Store<T>,
+            instance: &crate::Instance,
+            export_name: &str,
+            type_layout_id: u32,
+        ) -> crate::Result<crate::Func> {
+            let module = instance.module(&mut *store).clone();
+            let export = module
+                .get_export_index(export_name)
+                .with_context(|| format!("module does not export `{export_name}`"))?;
+            let function_index = match export.entity {
+                wasmtime_environ::EntityIndex::Function(index) => index.as_u32(),
+                _ => crate::bail!("module export `{export_name}` is not a function"),
+            };
+            let func = instance
+                .get_module_export(&mut *store, &export)
+                .and_then(|export| export.into_func())
+                .with_context(|| {
+                    format!("instance export `{export_name}` is not a function export")
+                })?;
+            register_durable_func_ref_for_test(
+                store,
+                &func,
+                module_fingerprint_for_test(&module)?,
+                function_index,
+                type_layout_id,
+            )?;
+            Ok(func)
+        }
+
+        pub fn module_fingerprint_for_test(module: &crate::Module) -> crate::Result<u64> {
+            let bytecode = module.debug_bytecode().context(
+                "durable function module fingerprint requires retained Wasm bytecode; enable Config::guest_debug(true)",
+            )?;
+            let mut fingerprint =
+                stable_fingerprint_bytes(0xcbf2_9ce4_8422_2325, b"shisoft-transaction-module-v1");
+            fingerprint = stable_fingerprint_u8(fingerprint, 1);
+            Ok(stable_fingerprint_bytes(fingerprint, bytecode))
+        }
+
+        fn stable_fingerprint_u8(fingerprint: u64, value: u8) -> u64 {
+            stable_fingerprint_bytes(fingerprint, &[value])
+        }
+
+        fn stable_fingerprint_bytes(mut fingerprint: u64, bytes: &[u8]) -> u64 {
+            for byte in bytes {
+                fingerprint ^= u64::from(*byte);
+                fingerprint = fingerprint.wrapping_mul(0x0000_0001_0000_01b3);
+            }
+            fingerprint
+        }
+
         pub fn new_durable_extern_ref_for_test<T>(
             store: &mut crate::Store<T>,
             namespace: u32,

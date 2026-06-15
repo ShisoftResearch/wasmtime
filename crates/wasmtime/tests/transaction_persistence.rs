@@ -200,7 +200,7 @@ fn real_tfunc_promotes_ordinary_ref_array_with_i31_leaf_and_child_object() -> Re
 }
 
 #[test]
-fn real_tfunc_promotes_registered_funcref_leaf_and_recovers() -> Result<()> {
+fn real_tfunc_promotes_exported_funcref_leaf_and_recovers() -> Result<()> {
     let dir = tempdir()?;
     let tmemory_path = dir.path().join("promote-funcref-root.tmemory");
     let tx_log_path = dir.path().join("promote-funcref-root.txlog");
@@ -229,15 +229,10 @@ fn real_tfunc_promotes_registered_funcref_leaf_and_recovers() -> Result<()> {
         64,
     )?;
     let instance = Instance::new(&mut store, &module, &[])?;
-    let target = instance
-        .get_func(&mut store, "target")
-        .expect("target function export");
-    wasmtime::_internal::transaction_persistence::register_durable_func_ref_for_test(
-        &mut store,
-        &target,
-        0x1111_2222_3333_4444,
-        0,
-        1,
+    let expected_module_fingerprint =
+        wasmtime::_internal::transaction_persistence::module_fingerprint_for_test(&module)?;
+    wasmtime::_internal::transaction_persistence::register_exported_durable_func_ref_for_test(
+        &mut store, &instance, "target", 1,
     )?;
 
     let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
@@ -250,7 +245,7 @@ fn real_tfunc_promotes_registered_funcref_leaf_and_recovers() -> Result<()> {
         recovered_field_abi_parts(&recovered.object_winners[0].record_bytes),
         (
             OBJECT_VALUE_ABI_TAG_FUNCREF_FOR_TEST,
-            0x1111_2222_3333_4444,
+            expected_module_fingerprint,
             1_u64 << 32,
         )
     );
@@ -278,6 +273,21 @@ fn durable_funcref_registration_rejects_conflicting_identity() -> Result<()> {
     assert!(
         err.to_string()
             .contains("durable function reference identity registration conflict"),
+        "{err:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exported_funcref_auto_identity_requires_retained_module_bytecode() -> Result<()> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, r#"(module (func (export "target")))"#)?;
+
+    let err = wasmtime::_internal::transaction_persistence::module_fingerprint_for_test(&module)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires retained Wasm bytecode"),
         "{err:?}"
     );
 
@@ -462,7 +472,8 @@ fn transaction_root_engine() -> Result<Engine> {
         .wasm_gc(true)
         .wasm_reference_types(true)
         .wasm_function_references(true)
-        .wasm_tail_call(true);
+        .wasm_tail_call(true)
+        .guest_debug(true);
     Engine::new(&config)
 }
 

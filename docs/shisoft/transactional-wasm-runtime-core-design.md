@@ -752,9 +752,11 @@ Promotion is graph-based:
 - Abort the transaction if a value cannot be promoted into the persistent object
   format. Non-null `tfuncref` and `texternref` values are durable only when the
   runtime can encode their symbolic identities inline. The current branch uses
-  an explicit per-store durable identity registry for function refs and an
-  embedded durable host-data wrapper for test external refs, while automatic
-  module fingerprinting and public identity APIs remain future work.
+  an explicit per-store durable identity registry for function refs, an
+  internal exported-function helper that derives module fingerprints from
+  retained original Wasm bytecode and function indices from Wasmtime export
+  metadata, and an embedded durable host-data wrapper for test external refs.
+  Restart-time function resolution and public identity APIs remain future work.
 
 After commit, persistent reachability contains persistent roots, `ObjectId`
 heap-object edges, and inline durable scalar/reference leaves. Transaction

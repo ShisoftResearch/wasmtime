@@ -165,16 +165,20 @@ identities.
 ## Workstream 4: Durable Func/Extern Identity Sources
 
 Status: partially implemented. Function references use explicit per-store
-registered identities; external references use an embedded durable externref
-host-data wrapper in the internal test seam. Automatic module fingerprinting,
-restart-time function resolution, and public identity APIs remain pending.
+registered identities, with an internal exported-function helper that derives
+the module fingerprint from retained original Wasm bytecode and the function
+index from Wasmtime export metadata.
+External references use an embedded durable externref host-data wrapper in the
+internal test seam. Restart-time function resolution and public identity APIs
+remain pending.
 
 The object value ABI can store durable function/external identities, but runtime
 helpers still need authoritative identity encoders at the boundaries where raw
 Wasmtime refs are observed.
 
-- [ ] Define automatic module/function fingerprints for `tfuncref` values that
-  survive restart and can be resolved against loaded modules.
+- [x] Define internal automatic module/function fingerprints for exported
+  `tfuncref` values when retained module bytecode is available.
+- [ ] Add restart-time `tfuncref` resolution against loaded modules.
 - [x] Define explicit external-reference namespaces and handles for
   `texternref` values.
 - [x] Add internal per-store registration APIs for durable function identities

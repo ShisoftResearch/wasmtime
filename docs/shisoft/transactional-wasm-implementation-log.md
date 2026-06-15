@@ -200,6 +200,28 @@ cargo test -p wasmtime --test transaction_persistence -- --format terse
 test result: ok. 13 passed; 0 failed; 0 ignored
 ```
 
+## Current Status: Internal Exported Function Durable Identity
+
+Date: 2026-06-15
+
+Workstream 4 now has an internal automatic identity helper for exported
+`tfuncref` values:
+
+- `_internal::transaction_persistence::register_exported_durable_func_ref_for_test`
+  derives the durable function index from `Module::get_export_index`.
+- The module fingerprint is derived from retained original Wasm bytecode. The
+  helper fails closed when bytecode is unavailable, so tests that use automatic
+  durable function identity enable `Config::guest_debug(true)`.
+- The file-backed persistence test now registers the exported `target`
+  function through this helper and verifies that the recovered object payload
+  contains the derived fingerprint and function index.
+
+Still pending:
+
+- Restart-time resolution from durable function identity back to loaded module
+  functions.
+- Public host/module durable identity APIs.
+
 ## Current Status: Wave 11 VMGcRef Commit Promotion
 
 Date: 2026-06-15
