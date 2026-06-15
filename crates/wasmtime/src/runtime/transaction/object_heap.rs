@@ -2,8 +2,10 @@ use super::type_layout::{PersistentTypeLayout, TraceSlotKind};
 use super::{ObjectId, ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi};
 use crate::prelude::*;
 #[cfg(test)]
-use crate::runtime::vm::block_region::{BLOCK_SIZE, LINE_MARKED};
-use crate::runtime::vm::block_region::{IMMIX_LINE_SIZE, VMemoryBlockRegion};
+use crate::runtime::vm::block_region::LINE_MARKED;
+use crate::runtime::vm::block_region::{
+    BLOCK_SIZE, IMMIX_LINE_SIZE, RegionChunk, VMemoryBlockRegion,
+};
 use alloc::vec::Vec;
 use core::mem::size_of;
 
@@ -13,6 +15,15 @@ const OBJECT_VALUE_RECORD_LEN: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TxRecordHandle(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectRecordLocation {
+    pub(crate) chunk_start_block: u32,
+    pub(crate) chunk_blocks: u32,
+    pub(crate) data_block: u32,
+    pub(crate) data_offset: u32,
+    pub(crate) record_len: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +105,7 @@ struct ObjectRecord {
     array_length: Option<u32>,
     payload: ObjectPayload,
     offset: usize,
+    location: ObjectRecordLocation,
 }
 
 #[derive(Debug, Default)]
@@ -133,12 +145,13 @@ impl ObjectHeap {
             type_layout_id,
         };
         let bytes = serialize_record(&header, array_length, payload)?;
-        let offset = self.region_mut()?.allocate(&bytes)?;
+        let location = self.region_mut()?.allocate(&bytes)?;
         self.records.push(ObjectRecord {
             header,
             array_length,
             payload: payload.clone(),
-            offset,
+            offset: location.absolute_offset()?,
+            location,
         });
         let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
         Ok(TxRecordHandle(handle))
@@ -166,12 +179,13 @@ impl ObjectHeap {
             None
         };
         let payload = decode_payload_bytes(header, array_length, bytes)?;
-        let offset = self.region_mut()?.allocate(bytes)?;
+        let location = self.region_mut()?.allocate(bytes)?;
         self.records.push(ObjectRecord {
             header,
             array_length,
             payload,
-            offset,
+            offset: location.absolute_offset()?,
+            location,
         });
         let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
         Ok(TxRecordHandle(handle))
@@ -194,6 +208,10 @@ impl ObjectHeap {
 
     pub(crate) fn record_len(&self, handle: TxRecordHandle) -> Result<u64> {
         Ok(self.record(handle)?.header.record_len)
+    }
+
+    pub(crate) fn record_location(&self, handle: TxRecordHandle) -> Result<ObjectRecordLocation> {
+        Ok(self.record(handle)?.location)
     }
 
     pub(crate) fn record_bytes(&self, handle: TxRecordHandle) -> Result<Vec<u8>> {
@@ -317,6 +335,14 @@ impl ObjectHeap {
     }
 
     #[cfg(test)]
+    pub(crate) fn record_location_for_test(
+        &self,
+        handle: TxRecordHandle,
+    ) -> Result<ObjectRecordLocation> {
+        self.record_location(handle)
+    }
+
+    #[cfg(test)]
     pub(crate) fn block_region_block_size_for_test(&self) -> usize {
         BLOCK_SIZE
     }
@@ -378,6 +404,7 @@ pub(crate) fn encode_object_record_for_test(
 #[derive(Debug)]
 struct ObjectHeapRegion {
     backend: VMemoryBlockRegion,
+    current_chunk: RegionChunk,
     cursor: usize,
     limit: usize,
 }
@@ -390,16 +417,20 @@ impl ObjectHeapRegion {
         let range = chunk.byte_range();
         Ok(Self {
             backend,
+            current_chunk: chunk,
             cursor: range.start,
             limit: range.end,
         })
     }
 
-    fn allocate(&mut self, bytes: &[u8]) -> Result<usize> {
+    fn allocate(&mut self, bytes: &[u8]) -> Result<ObjectRecordLocation> {
         ensure!(
             !bytes.is_empty(),
             "object heap cannot allocate an empty record"
         );
+        if !self.current_chunk_can_fit(bytes.len())? {
+            self.allocate_next_chunk(bytes.len())?;
+        }
         let offset = align_up(self.cursor, OBJECT_RECORD_ALIGN)?;
         let end = offset
             .checked_add(bytes.len())
@@ -408,7 +439,22 @@ impl ObjectHeapRegion {
         self.backend.write(offset, bytes)?;
         self.mark_allocated_lines(offset, bytes.len())?;
         self.cursor = end;
-        Ok(offset)
+        let record_len = u64::try_from(bytes.len()).context("object record length overflow")?;
+        let chunk_start_block = u32::try_from(self.current_chunk.start_block())
+            .context("object heap chunk start block overflow")?;
+        let chunk_blocks = u32::try_from(self.current_chunk.block_count())
+            .context("object heap chunk block count overflow")?;
+        let data_block =
+            u32::try_from(offset / BLOCK_SIZE).context("object data block overflow")?;
+        let data_offset =
+            u32::try_from(offset % BLOCK_SIZE).context("object data block offset overflow")?;
+        Ok(ObjectRecordLocation {
+            chunk_start_block,
+            chunk_blocks,
+            data_block,
+            data_offset,
+            record_len,
+        })
     }
 
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -437,6 +483,51 @@ impl ObjectHeapRegion {
             self.backend.mark_line(line)?;
         }
         Ok(())
+    }
+
+    fn current_chunk_can_fit(&self, bytes_len: usize) -> Result<bool> {
+        let offset = align_up(self.cursor, OBJECT_RECORD_ALIGN)?;
+        let end = offset
+            .checked_add(bytes_len)
+            .context("object heap allocation range overflow")?;
+        Ok(end <= self.limit)
+    }
+
+    fn allocate_next_chunk(&mut self, bytes_len: usize) -> Result<()> {
+        let required_blocks = required_object_chunk_blocks(bytes_len)?;
+        let chunk_blocks = required_blocks.max(DEFAULT_OBJECT_HEAP_BLOCKS);
+        let chunk = match self.backend.alloc_chunk(chunk_blocks) {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                let new_block_count = self
+                    .backend
+                    .num_blocks()
+                    .checked_add(chunk_blocks)
+                    .context("object heap block region growth overflow")?;
+                self.backend
+                    .grow_to_blocks(new_block_count)?
+                    .context("object heap block region did not grow")?
+            }
+        };
+        self.backend.reset_line_marks(chunk)?;
+        let range = chunk.byte_range();
+        self.current_chunk = chunk;
+        self.cursor = range.start;
+        self.limit = range.end;
+        Ok(())
+    }
+}
+
+impl ObjectRecordLocation {
+    fn absolute_offset(self) -> Result<usize> {
+        let data_block =
+            usize::try_from(self.data_block).context("object data block index overflow")?;
+        let data_offset =
+            usize::try_from(self.data_offset).context("object data offset overflow")?;
+        data_block
+            .checked_mul(BLOCK_SIZE)
+            .and_then(|offset| offset.checked_add(data_offset))
+            .context("object record absolute offset overflow")
     }
 }
 
@@ -695,6 +786,17 @@ fn align_up(value: usize, align: usize) -> Result<usize> {
         .checked_add(mask)
         .map(|value| value & !mask)
         .context("object heap alignment overflow")
+}
+
+fn required_object_chunk_blocks(bytes_len: usize) -> Result<usize> {
+    ensure!(
+        bytes_len > 0,
+        "object heap cannot allocate an empty record chunk"
+    );
+    bytes_len
+        .checked_add(BLOCK_SIZE - 1)
+        .map(|bytes| bytes / BLOCK_SIZE)
+        .context("object heap chunk size overflow")
 }
 
 fn object_value_offset(values: &[ObjectValue], field_index: usize) -> Result<u32> {

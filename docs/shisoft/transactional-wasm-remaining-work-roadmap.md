@@ -73,7 +73,8 @@ Current remaining mock categories:
 - `ttry`/`tfail` remains a later structured-failure workstream.
 - Persistent-object GC now has a runtime marker, commit-coupled incremental
   marking, tombstone-less recovery filtering, recovered record location
-  reporting, volatile sweep/reporting, and file-backed end-to-end coverage.
+  reporting, volatile sweep/reporting, growable object-record staging chunks,
+  and file-backed end-to-end coverage.
   Durable block/chunk retirement, durable block reuse, and explicit
   `ObjectId` reuse remain future work. Per-object tombstones are not the
   baseline design.
@@ -1087,6 +1088,8 @@ Implemented status:
   unreachable garbage is not installed into the runtime object index.
 - Recovered winners carry `data_block`, `data_offset`, and `record_len`, and
   recovery reports reachable and unreachable durable record locations.
+- Runtime object-record staging uses growable block/chunk allocation and keeps
+  block-derived record locations for each staged object record.
 - Runtime volatile sweep/reporting updates volatile indices and block summaries
   without persisting dead-object state.
 - File-backed end-to-end coverage exercises tombstone-less recovery and the

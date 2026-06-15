@@ -12634,6 +12634,75 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_heap_grows_past_initial_chunk() {
+        let mut heap = object_heap::ObjectHeap::default();
+        let payload = ObjectPayload::Array(vec![
+            ObjectValue::I32(7);
+            (heap.block_region_block_size_for_test() * 4 / 20)
+                + 1
+        ]);
+
+        let handle = heap
+            .allocate_record(
+                ObjectId { object_index: 4 },
+                1,
+                ObjectKind::Array,
+                0,
+                0,
+                &payload,
+            )
+            .unwrap();
+        let location = heap.record_location_for_test(handle).unwrap();
+
+        assert!(location.chunk_blocks > 4);
+        assert_eq!(location.data_block, location.chunk_start_block);
+        assert_eq!(
+            heap.record_bytes_for_test(handle).unwrap().len() as u64,
+            heap.record_len(handle).unwrap()
+        );
+        assert!(heap.line_mark_for_record_for_test(handle).unwrap());
+    }
+
+    #[test]
+    fn transaction_object_heap_records_block_locations() {
+        let mut heap = object_heap::ObjectHeap::default();
+        let payload = ObjectPayload::Struct(vec![ObjectValue::I64(1)]);
+
+        let first = heap
+            .allocate_record(
+                ObjectId { object_index: 5 },
+                1,
+                ObjectKind::Struct,
+                0,
+                0,
+                &payload,
+            )
+            .unwrap();
+        let second = heap
+            .allocate_record(
+                ObjectId { object_index: 6 },
+                1,
+                ObjectKind::Struct,
+                0,
+                0,
+                &payload,
+            )
+            .unwrap();
+
+        let first_location = heap.record_location_for_test(first).unwrap();
+        let second_location = heap.record_location_for_test(second).unwrap();
+
+        assert_eq!(first_location.chunk_start_block, 0);
+        assert_eq!(first_location.data_block, 0);
+        assert_eq!(first_location.data_offset, 0);
+        assert_eq!(first_location.record_len, heap.record_len(first).unwrap());
+        assert_eq!(first_location.chunk_blocks, 4);
+        assert_eq!(second_location.chunk_start_block, 0);
+        assert_eq!(second_location.data_block, 0);
+        assert!(second_location.data_offset > first_location.data_offset);
+    }
+
+    #[test]
     fn transaction_object_id_stays_stable_when_record_handle_changes() {
         let mut objects = ObjectTable::default();
         let object = objects

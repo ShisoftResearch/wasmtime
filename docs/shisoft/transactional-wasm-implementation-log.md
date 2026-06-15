@@ -48,6 +48,34 @@ restart-stable and remains tagged `SHISOFT-TWASM-MOCK`; the final work is to
 replace it with restart-stable function/external symbolic identities and the
 dedicated `ObjectId`-carrying live `tref` ABI.
 
+## Current Status: Growable Object Block Staging
+
+Date: 2026-06-15
+
+The volatile object-record staging heap now uses growable block/chunk allocation
+instead of a fixed four-block append buffer. `ObjectHeap` records keep block
+location metadata (`chunk_start_block`, `chunk_blocks`, `data_block`,
+`data_offset`, and `record_len`) alongside the byte offset used for local reads.
+Small and medium records pack into the current default chunk. Records that do
+not fit the current chunk allocate a new chunk, and large records receive enough
+contiguous blocks for the serialized object record. `VMemoryBlockRegion` now
+has the same grow-to-block-count operation that the file-backed region already
+had.
+
+Verified with:
+
+```text
+cargo test -p wasmtime --lib transaction_object_heap -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib vmemory_block_region_grows_and_returns_new_chunk -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+This is still staging/runtime block metadata, not durable block retirement or
+reuse. Durable object-data block cleaning, generation/checkpoint metadata, and
+`ObjectId` reuse remain later workstreams.
+
 ## Current Status: Persistent Ref Quality Pass
 
 Date: 2026-06-15

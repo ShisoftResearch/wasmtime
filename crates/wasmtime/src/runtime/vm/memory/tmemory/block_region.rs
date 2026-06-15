@@ -1263,6 +1263,42 @@ impl VMemoryBlockRegion {
         Ok(())
     }
 
+    pub(crate) fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
+        let old_block_count = self.num_blocks();
+        ensure!(
+            new_block_count >= old_block_count,
+            "transactional block region cannot shrink"
+        );
+        if new_block_count == old_block_count {
+            return Ok(None);
+        }
+
+        let bytes_len = new_block_count
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional block region size overflow")?;
+        let additional_blocks = new_block_count - old_block_count;
+        self.data.resize(bytes_len, 0);
+        self.block_entries
+            .resize(new_block_count, BlockEntry::default());
+        for entry in &mut self.block_entries[old_block_count..new_block_count] {
+            entry.used = 1;
+            entry.list_num = ListKind::Used as i16;
+        }
+
+        let line_count = bytes_len / IMMIX_LINE_SIZE;
+        self.line_marks.resize(
+            line_count,
+            LineMark {
+                mark: IMMIX_LINE_MARK_RESET_VALUE,
+            },
+        );
+
+        Ok(Some(RegionChunk {
+            start_block: old_block_count,
+            block_count: additional_blocks,
+        }))
+    }
+
     fn alloc_data_chunk_for_class(
         &mut self,
         stream_id: u32,
@@ -1467,6 +1503,10 @@ impl BlockRegionBackend for VMemoryBlockRegion {
 
     fn fence(&self) -> Result<()> {
         self.fence()
+    }
+
+    fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
+        self.grow_to_blocks(new_block_count)
     }
 }
 
@@ -2901,6 +2941,31 @@ mod tests {
         assert_eq!(multi.start_block(), 1);
         assert_eq!(multi.block_count(), 3);
         assert_eq!(multi.byte_range(), BLOCK_SIZE..(4 * BLOCK_SIZE));
+    }
+
+    #[test]
+    fn vmemory_block_region_grows_and_returns_new_chunk() {
+        let mut region = VMemoryBlockRegion::new(1).unwrap();
+        let first = region.alloc_chunk(1).unwrap();
+        let first_range = first.byte_range();
+        region.write(first_range.start + 16, &[1, 2, 3, 4]).unwrap();
+
+        let grown = region.grow_to_blocks(3).unwrap().unwrap();
+
+        assert_eq!(grown.start_block(), 1);
+        assert_eq!(grown.block_count(), 2);
+        assert_eq!(region.num_blocks(), 3);
+        assert_eq!(
+            region.read(first_range.start + 16, 4).unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        region
+            .write(grown.byte_range().start, &[5, 6, 7, 8])
+            .unwrap();
+        assert_eq!(
+            region.read(grown.byte_range().start, 4).unwrap(),
+            vec![5, 6, 7, 8]
+        );
     }
 
     #[test]

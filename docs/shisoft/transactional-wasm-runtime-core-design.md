@@ -1121,8 +1121,11 @@ Object-table-facing constraints:
   owns access policy; `TMemoryRegion`, `ObjectHeapRegion`, and durable log/data
   streams own their logical interpretations.
 - The persistent object heap is a not-necessarily-contiguous collection of
-  object chunks. Small objects usually use chunks of one block; objects larger
-  than a block may use larger chunks.
+  object chunks. The current volatile object-record staging heap allocates from
+  growable `VMemoryBlockRegion` chunks, records each object's
+  `chunk_start_block`, `chunk_blocks`, `data_block`, `data_offset`, and
+  `record_len`, packs small/medium records into default chunks, and allocates
+  multi-block chunks for records larger than the current chunk can hold.
 - Persistent object payloads store references as `ObjectId`s, never raw
   `VMGcRef`s, `VMFuncRef`s, process-local pointers, or PMEM addresses.
 - Persistent transactional function references are stored as `ObjectId`s whose
@@ -1224,9 +1227,10 @@ design point, the remaining architecture work should proceed in this order:
    `VMGcRef` bridges.
 6. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
    metadata while extending coverage for promotion and root reintegration paths.
-7. Add durable block/chunk retirement metadata, safe persistent block reuse,
-   and any required allocator repair for future ownership-generation
-   transitions.
+7. Extend the object-record staging heap's block/chunk metadata into the durable
+   object-data stream where needed, then add durable block/chunk retirement
+   metadata, safe persistent block reuse, and any required allocator repair for
+   future ownership-generation transitions.
 8. Design explicit `ObjectId` reuse rules only after durable block retirement
    and reuse semantics exist.
 9. Add optional persistent-index/object-table persistence only behind an
