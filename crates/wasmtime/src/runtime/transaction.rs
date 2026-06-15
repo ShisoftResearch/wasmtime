@@ -12995,6 +12995,138 @@ mod tests {
                 TypeLayoutId::DEFAULT_ARRAY.get()
             );
         }
+
+        #[test]
+        fn promotion_fill_preserves_registered_non_default_type_layout() {
+            let mut objects = ObjectTable::default();
+            let layout = type_layout::PersistentTypeLayout::Struct {
+                id: type_layout::TypeLayoutId::new(111).unwrap(),
+                fingerprint: 0x0111_0000_0000_0011,
+                body_size: 16,
+                fields: vec![type_layout::StructTraceField {
+                    field_index: 0,
+                    field_offset: 0,
+                    value_size: 8,
+                    kind: type_layout::TraceSlotKind::Scalar,
+                }],
+            };
+            objects.register_type_layout(layout.clone()).unwrap();
+
+            let promoted = objects
+                .reserve_persistent_object_id_for_promotion(ObjectKind::Struct, layout.id())
+                .unwrap();
+
+            assert_eq!(
+                objects.live_slot(promoted).unwrap().type_layout_id,
+                layout.id().get()
+            );
+
+            objects
+                .fill_reserved_persistent_object_for_promotion(
+                    promoted,
+                    ObjectPayload::Struct(vec![ObjectValue::I32(3)]),
+                )
+                .unwrap();
+
+            assert_eq!(
+                objects.live_slot(promoted).unwrap().type_layout_id,
+                layout.id().get()
+            );
+            assert_eq!(
+                objects.payload(promoted).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(3)])
+            );
+        }
+
+        #[test]
+        fn promotion_fill_rejects_non_persistent_target() {
+            let mut objects = ObjectTable::default();
+            let target = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+
+            let err = objects
+                .fill_reserved_persistent_object_for_promotion(
+                    target,
+                    ObjectPayload::Struct(vec![ObjectValue::I32(2)]),
+                )
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("promotion target object must be persistent")
+            );
+        }
+
+        #[test]
+        fn promotion_fill_rejects_kind_mismatch() {
+            let mut objects = ObjectTable::default();
+            let target = objects
+                .reserve_persistent_object_id_for_promotion(
+                    ObjectKind::Struct,
+                    TypeLayoutId::DEFAULT_STRUCT,
+                )
+                .unwrap();
+
+            let err = objects
+                .fill_reserved_persistent_object_for_promotion(
+                    target,
+                    ObjectPayload::Array(vec![ObjectValue::I32(2)]),
+                )
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("promotion target object kind does not match promoted payload")
+            );
+        }
+
+        #[test]
+        fn promotion_fill_rejects_payload_with_volatile_object_ref() {
+            let mut objects = ObjectTable::default();
+            let volatile = objects.allocate_struct(vec![ObjectValue::I32(4)]).unwrap();
+            let target = objects
+                .reserve_persistent_object_id_for_promotion(
+                    ObjectKind::Struct,
+                    TypeLayoutId::DEFAULT_STRUCT,
+                )
+                .unwrap();
+
+            let err = objects
+                .fill_reserved_persistent_object_for_promotion(
+                    target,
+                    ObjectPayload::Struct(vec![ObjectValue::Ref(Some(volatile))]),
+                )
+                .unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "volatile GC reference promotion into persistent object graph is not implemented yet"
+            );
+        }
+
+        #[test]
+        fn promotion_fill_rejects_payload_with_missing_object_ref() {
+            let mut objects = ObjectTable::default();
+            let target = objects
+                .reserve_persistent_object_id_for_promotion(
+                    ObjectKind::Struct,
+                    TypeLayoutId::DEFAULT_STRUCT,
+                )
+                .unwrap();
+
+            let err = objects
+                .fill_reserved_persistent_object_for_promotion(
+                    target,
+                    ObjectPayload::Struct(vec![ObjectValue::Ref(Some(ObjectId {
+                        object_index: 404,
+                    }))]),
+                )
+                .unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "volatile GC reference promotion into persistent object graph is not implemented yet"
+            );
+        }
     }
 
     mod ti31_persistent_object_domain {
