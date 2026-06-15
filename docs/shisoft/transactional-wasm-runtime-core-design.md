@@ -714,7 +714,9 @@ transaction-mirrored volatile `tstruct`/`tarray` objects that already have
 `ObjectTable` payloads and raw `ti31` immediates. During commit, if a staged
 persistent root or persistent object payload refers to one of those values, the
 commit path promotes it into the persistent object space first and stores the
-promoted `ObjectId`.
+promoted `ObjectId`. The source `VMGcRef` and its transaction-local object-table
+association remain volatile runtime wrappers; the durable identity is the new
+persistent `ObjectId` stored in object records and root publications.
 
 Promotion is graph-based:
 

@@ -113,9 +113,11 @@ Implemented status:
 - File-backed reopen installs recovered root IDs and recovered root versions,
   then reuses recovered stream cursors so later commits append without root
   version collisions.
-- Unknown or non-persistent non-null `VMGcRef` values are rejected before they
-  can enter persistent roots or persistent object payload publications. The
-  diagnostic is:
+- At the Wave 10 boundary, unknown or non-persistent non-null `VMGcRef` values
+  were rejected before they could enter persistent roots or persistent object
+  payload publications. Wave 11 supersedes that for transaction-mirrored
+  `tstruct`/`tarray` objects and raw `ti31` values, but arbitrary ordinary
+  Wasmtime GC refs still use the same diagnostic:
 
 ```text
 volatile GC reference promotion into persistent object graph is not implemented yet
@@ -123,8 +125,8 @@ volatile GC reference promotion into persistent object graph is not implemented 
 
 Still deferred:
 
-- recursive promotion of ordinary volatile Wasmtime GC graphs into persistent
-  `ObjectId` graphs
+- recursive promotion of ordinary volatile Wasmtime GC heap graphs that are not
+  already transaction-mirrored in `ObjectTable`
 - ordinary Wasmtime GC root-closure integration for persistent roots
 - durable block/chunk retirement and persistent block reuse
 
@@ -201,8 +203,8 @@ Still deferred:
 
 - durable block/chunk retirement, durable block reuse, and Immix line reuse
 - explicit `ObjectId` reuse
-- commit-time promotion from volatile `VMGcRef` graphs into persistent object
-  graphs
+- commit-time promotion for arbitrary ordinary Wasmtime GC heap graphs beyond
+  the transaction-mirrored object graphs implemented in Wave 11
 - full runtime reintegration of recovered persistent roots into Wasmtime
   GC-facing root closure
 
