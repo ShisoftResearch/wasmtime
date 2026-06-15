@@ -24,6 +24,75 @@ criteria.
 Use `docs/shisoft/2026-06-15-persistent-roots-and-promotion-plan.md` for the
 completed persistent-root and promotion-boundary wave.
 
+Use `docs/shisoft/2026-06-15-vmgcref-commit-promotion-plan.md` for the
+completed first commit-time `VMGcRef` promotion wave.
+
+## Current Status: Wave 11 VMGcRef Commit Promotion
+
+Date: 2026-06-15
+
+Wave 11 promotes the first supported class of volatile transaction references
+into durable persistent object records during transaction commit.
+
+Implemented status:
+
+- Durable `ti31` object records now use a dedicated packed object granule
+  domain and recover as scalar `ObjectPayload::I31` records.
+- `ObjectTable` can reserve persistent `ObjectId` slots for promotion, fill
+  those slots after recursive rewrite, and map raw `ti31` immediates to
+  promoted scalar object records.
+- `TransactionState` keeps transaction-local promotion maps for
+  `ObjectId -> ObjectId` and raw `ti31 -> ObjectId`.
+- Promotion handles transaction-mirrored volatile `tstruct` and `tarray`
+  objects whose payloads are already represented in `ObjectTable`, including
+  shared references and cycles.
+- Staged persistent roots and staged persistent object payloads are rewritten
+  before commit publication so recovered graphs contain persistent `ObjectId`
+  references, not raw `VMGcRef` values.
+- Promotion registers optimistic reads for promoted struct/array source
+  payloads and validates them before the real commit path mutates live
+  `tmemory`, globals, tables, or object records.
+- Abort cleanup frees promoted targets, clears promotion maps, and drops staged
+  promoted payloads through the existing allocated-object cleanup path.
+- File-backed end-to-end coverage now runs real WAT through the real engine:
+  a `tfunc` creates a `tstruct`, stores it in a `tglobal`, commits, reopens the
+  file-backed log, and recovers one matching root/object winner.
+
+Still deferred:
+
+- Promotion of arbitrary ordinary Wasmtime GC heap objects that are not already
+  transaction-mirrored in `ObjectTable`.
+- Symbolic durable identity for `tfuncref` and `texternref` promotion.
+- Replacement of the remaining volatile `VMGcRef -> ObjectId` execution bridge
+  with the final `ObjectId`-carrying persistent `tref` ABI.
+- Full runtime reintegration of recovered persistent roots into the ordinary
+  Wasmtime GC-facing root closure.
+
+Verification commands for this slice:
+
+```text
+cargo test -p wasmtime --lib persistent_promotion_commit -- --format terse
+test result: ok. 6 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_promotion_commit_path -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_promotion_abort -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_root_commit -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_gc_commit -- --format terse
+test result: ok. 5 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 351 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 6 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Wave 10 Persistent Roots And Promotion Boundary
 
 Date: 2026-06-15

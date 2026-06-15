@@ -1,7 +1,7 @@
 # Transactional Wasm Runtime Core Design
 
 Date: 2026-06-04
-Last updated: 2026-06-14
+Last updated: 2026-06-15
 
 ## Feature Switch Policy
 
@@ -709,21 +709,29 @@ and supported immediate values.
 
 Volatile ordinary objects may refer to persistent objects only as short-lived
 transaction-local values. A committed persistent object graph cannot depend on an
-ordinary volatile GC object. During commit, if a staged persistent object refers
-to an ordinary volatile object, the commit path promotes that volatile object
-into the persistent object space first and stores the promoted `ObjectId`.
+ordinary volatile GC object. The first implemented promotion wave covers
+transaction-mirrored volatile `tstruct`/`tarray` objects that already have
+`ObjectTable` payloads and raw `ti31` immediates. During commit, if a staged
+persistent root or persistent object payload refers to one of those values, the
+commit path promotes it into the persistent object space first and stores the
+promoted `ObjectId`.
 
 Promotion is graph-based:
 
 - Maintain a transaction-local `VMGcRef` to `ObjectId` promotion map.
+- Maintain a transaction-local raw `ti31` immediate to `ObjectId` promotion map.
 - Reuse the same promoted `ObjectId` when the same volatile object is encountered
   multiple times.
 - Reserve `ObjectId`s before filling payload records so cyclic volatile graphs
   can be promoted.
 - Recursively promote volatile objects reachable from promoted objects when they
   become part of the committed persistent graph.
-- Abort the transaction if an object cannot be promoted into the persistent
-  object format, such as an unsupported host-only `externref`.
+- Acquire optimistic object reads for promoted struct/array source payloads
+  before commit applies live memory/global/table/object mutations.
+- Abort the transaction if a value cannot be promoted into the persistent object
+  format. Arbitrary ordinary Wasmtime GC heap objects remain rejected until a
+  GC-heap introspection adapter exists. `tfuncref` and `texternref` promotion
+  requires symbolic durable identities and is still deferred.
 
 After commit, persistent reachability contains only persistent roots and
 `ObjectId` references. Transaction abort discards uncommitted records and the
@@ -937,9 +945,11 @@ therefore lockable through `tref.cast_read/write`. Ordinary runtime
 `tstruct.new` and `tarray.new` allocations are volatile transaction objects for
 now: they are still indexed by the volatile object table so field/element
 helpers can find their payloads, but permission casts only update validator
-type-state and do not acquire persistent object locks for them. Future
-promotion work will turn reachable volatile objects into persistent objects at
-commit when a persistent object stores a reference to them.
+type-state and do not acquire persistent object locks for them. The current
+commit-time promotion pass can turn those transaction-mirrored volatile objects
+into persistent objects when persistent roots or persistent object payloads make
+them reachable. Promotion records optimistic source-object reads and validates
+them before commit mutates live storage.
 
 The runtime still uses `GranuleId` internally for concurrency control and
 commit validation. For persistent object references, `tref.cast_read/write`
@@ -1148,17 +1158,17 @@ design point, the remaining architecture work should proceed in this order:
 1. Keep the executable `tfunc`, `tmemory`, `tglobal`, `ttable`, SIMD, `ttry`,
    `tfail`, object, and conflict paths stable while removing remaining parser
    or harness scaffolds outside the current passing WAST tranche.
-2. Replace volatile `VMGcRef -> ObjectId` bridges with the final
+2. Extend commit-time promotion beyond transaction-mirrored objects by adding a
+   Wasmtime GC-heap introspection adapter for ordinary volatile GC objects.
+3. Replace volatile `VMGcRef -> ObjectId` bridges with the final
    `ObjectId`-carrying `tref` ABI for persistent references.
-3. Define transactional function objects so persistent `tfunc` and function
+4. Define transactional function objects so persistent `tfunc` and function
    references use `ObjectId` identity while Wasmtime function indices remain
    payload metadata.
-4. Complete runtime reintegration for recovered `tglobal` and `ttable`
+5. Complete runtime reintegration for recovered `tglobal` and `ttable`
    reference-bearing roots. Recovery already reconstructs root `ObjectId`s from
    committed `TGlobal`/`TTable` winners, but the recovered roots still need to
    be wired into the persistent object runtime and GC-facing root closure.
-5. Add commit-time promotion from transaction-local volatile `VMGcRef` graphs to
-   persistent `ObjectId` graphs.
 6. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
    metadata while extending coverage for promotion and root reintegration paths.
 7. Add durable block/chunk retirement metadata, safe persistent block reuse,
