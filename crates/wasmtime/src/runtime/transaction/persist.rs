@@ -85,6 +85,55 @@ impl DurableDataStream {
 }
 
 impl PendingPublication {
+    fn persistent_root(
+        domain: PackedGranuleDomain,
+        root_index: u64,
+        version: u32,
+        roots: impl IntoIterator<Item = Option<u64>>,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(
+                domain,
+                PackedGranuleDomain::TGlobal | PackedGranuleDomain::TTable
+            ),
+            "persistent root publication domain must be TGlobal or TTable"
+        );
+        let logical_id = ((domain as u64) << 60) | root_index;
+        let mut payload = Vec::new();
+        for root in roots {
+            let encoded = match root {
+                Some(object_id) => object_id
+                    .checked_add(1)
+                    .context("persistent root object id encoding overflow")?,
+                None => 0,
+            };
+            payload.extend_from_slice(&encoded.to_le_bytes());
+        }
+        Ok(Self {
+            logical_id,
+            version,
+            kind: domain as u16,
+            type_layout_id: 0,
+            payload,
+        })
+    }
+
+    pub(crate) fn persistent_global_root(
+        global_index: u64,
+        version: u32,
+        roots: impl IntoIterator<Item = Option<u64>>,
+    ) -> Result<Self> {
+        Self::persistent_root(PackedGranuleDomain::TGlobal, global_index, version, roots)
+    }
+
+    pub(crate) fn persistent_table_root(
+        table_index: u64,
+        version: u32,
+        roots: impl IntoIterator<Item = Option<u64>>,
+    ) -> Result<Self> {
+        Self::persistent_root(PackedGranuleDomain::TTable, table_index, version, roots)
+    }
+
     pub(crate) fn persistent_object(
         domain: PackedGranuleDomain,
         object_id: u64,
@@ -1438,6 +1487,37 @@ mod tests {
         assert_eq!(object_id, 41);
         assert_eq!(pub_.version, 7);
         assert_eq!(pub_.type_layout_id, 12);
+    }
+
+    #[test]
+    fn persistent_root_publication_encodes_global_object_id() {
+        let publication = PendingPublication::persistent_global_root(0, 7, [Some(41_u64)])
+            .unwrap();
+        assert_eq!(
+            publication.logical_id,
+            (PackedGranuleDomain::TGlobal as u64) << 60
+        );
+        assert_eq!(publication.version, 7);
+        assert_eq!(publication.kind, PackedGranuleDomain::TGlobal as u16);
+        assert_eq!(publication.type_layout_id, 0);
+        assert_eq!(publication.payload, (42_u64).to_le_bytes());
+    }
+
+    #[test]
+    fn persistent_root_publication_encodes_table_object_ids() {
+        let publication =
+            PendingPublication::persistent_table_root(3, 9, [Some(41_u64), None, Some(99_u64)])
+                .unwrap();
+        let logical_id = ((PackedGranuleDomain::TTable as u64) << 60) | 3;
+        assert_eq!(publication.logical_id, logical_id);
+        assert_eq!(publication.version, 9);
+        assert_eq!(publication.kind, PackedGranuleDomain::TTable as u16);
+        assert_eq!(publication.type_layout_id, 0);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&42_u64.to_le_bytes());
+        expected.extend_from_slice(&0_u64.to_le_bytes());
+        expected.extend_from_slice(&100_u64.to_le_bytes());
+        assert_eq!(publication.payload, expected);
     }
 
     mod model_recovery {
