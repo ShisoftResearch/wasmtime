@@ -12478,6 +12478,7 @@ mod tests {
             crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
         assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TStruct);
         assert_eq!(object_id, object.object_index);
+        assert_eq!(pub_.kind, crate::runtime::vm::PackedGranuleDomain::TStruct as u16);
         assert_eq!(pub_.version, 1);
     }
 
@@ -12493,6 +12494,7 @@ mod tests {
             crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
         assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TArray);
         assert_eq!(object_id, object.object_index);
+        assert_eq!(pub_.kind, crate::runtime::vm::PackedGranuleDomain::TArray as u16);
         assert_eq!(pub_.version, 1);
     }
 
@@ -12925,7 +12927,31 @@ mod tests {
 
             assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TI31);
             assert_eq!(object_id, object.object_index);
-            assert_eq!(pub_.kind, ObjectKind::I31 as u16);
+            assert_eq!(pub_.kind, crate::runtime::vm::PackedGranuleDomain::TI31 as u16);
+        }
+
+        #[test]
+        fn committed_ti31_publication_recovers_i31_payload() {
+            let mut objects = ObjectTable::default();
+            let object = objects.allocate_payload(ObjectPayload::I31(-7)).unwrap();
+            let publication = objects.pending_publication_for_test(object).unwrap();
+
+            let recovered_region =
+                recover_file_backed_object_without_layout_metadata_for_test(&publication).unwrap();
+            let winners = recovered_region.committed_object_winners().unwrap();
+
+            assert_eq!(winners.len(), 1);
+            assert_eq!(winners[0].object_id, object.object_index);
+            assert_eq!(winners[0].kind, ObjectKind::I31 as u16);
+
+            let mut rebuilt = ObjectTable::default();
+            rebuilt
+                .rebuild_from_recovery_for_test(&recovered_region.type_layouts, &winners)
+                .unwrap();
+            assert_eq!(
+                rebuilt.payload(ObjectId { object_index: object.object_index }).unwrap(),
+                ObjectPayload::I31(-7)
+            );
         }
     }
 

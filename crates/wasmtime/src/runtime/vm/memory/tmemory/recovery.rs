@@ -275,7 +275,7 @@ fn replay_object_winners(
             "recovered object publication data record has non-publication role"
         );
         ensure!(
-            object_domain_matches_object_kind(domain, data_header.kind),
+            data_header.kind == domain as u16,
             "recovered object publication kind does not match object domain"
         );
         let object_header = TxObjectHeader::read_from_prefix(&record_bytes)?;
@@ -288,12 +288,12 @@ fn replay_object_winners(
             "recovered object record version does not match log winner"
         );
         ensure!(
-            data_header.kind == object_header.kind,
-            "recovered object publication outer kind does not match object record kind"
-        );
-        ensure!(
             data_header.type_info == object_header.type_layout_id,
             "recovered object publication outer type layout id does not match object record"
+        );
+        ensure!(
+            object_domain_matches_object_kind(domain, object_header.kind),
+            "recovered object publication outer kind does not match object record kind"
         );
         TypeLayoutId::new(object_header.type_layout_id)
             .context("recovered object record type layout id cannot be zero")?;
@@ -1647,20 +1647,13 @@ mod tests {
         type_layout_id: u32,
         payload: ObjectPayload,
     ) -> (u32, DataRecordLocation) {
-        let (_, object_id) = unpack_object_granule_id(logical_id).unwrap();
-        let kind = match &payload {
-            ObjectPayload::Struct(_) => ObjectKind::Struct as u16,
-            ObjectPayload::Array(_) => ObjectKind::Array as u16,
-            ObjectPayload::I31(_) => ObjectKind::I31 as u16,
-            ObjectPayload::Extern(_) => ObjectKind::Extern as u16,
-            ObjectPayload::Func(_) => ObjectKind::Func as u16,
-        };
+        let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
         let object_record =
             encode_object_record_for_test(object_id, version, type_layout_id, &payload).unwrap();
         let publication = TMemory::encode_publication_data_record(
             logical_id,
             version,
-            kind,
+            domain as u16,
             type_layout_id,
             &object_record,
         )
