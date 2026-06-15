@@ -1619,6 +1619,31 @@ impl VMemoryBlockRegion {
             .context("test block metadata index out of bounds")
     }
 
+    #[cfg(test)]
+    pub(crate) fn bump_block_generation_for_test(&mut self, block: u32) -> Result<()> {
+        let block = usize::try_from(block).context("test block index overflow")?;
+        let meta = self
+            .block_metas
+            .get_mut(block)
+            .context("test block metadata index out of bounds")?;
+        meta.generation = meta
+            .generation
+            .checked_add(1)
+            .context("test block generation overflow")?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_block_meta_for_test(&mut self, block: u32, meta: BlockMeta) -> Result<()> {
+        let block = usize::try_from(block).context("test block index overflow")?;
+        let dest = self
+            .block_metas
+            .get_mut(block)
+            .context("test block metadata index out of bounds")?;
+        *dest = meta;
+        Ok(())
+    }
+
     fn write_log_block_header(&mut self, start_block: u32, header: LogBlockHeader) -> Result<()> {
         self.write(self.block_offset(start_block)?, &header.as_bytes())
     }
@@ -3189,6 +3214,48 @@ pub fn corrupt_first_log_crc(path: &Path) -> Result<()> {
     }
 
     bail!("transactional file-backed region image does not contain a log block")
+}
+
+/// Bumps the first object-data block generation in a file-backed region image.
+pub fn bump_first_object_data_block_generation_for_test(path: &Path) -> Result<()> {
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    for block in 0..region.num_blocks() {
+        let meta = region
+            .block_meta(u32::try_from(block).context("transactional block index overflow")?)?;
+        if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+            continue;
+        }
+        let chunk_start =
+            usize::try_from(meta.chunk_start).context("object-data chunk start block overflow")?;
+        let chunk_blocks =
+            usize::try_from(meta.chunk_blocks).context("object-data chunk block count overflow")?;
+        let chunk_end = chunk_start
+            .checked_add(chunk_blocks)
+            .context("object-data chunk block range overflow")?;
+        ensure!(
+            chunk_end <= region.num_blocks(),
+            "object-data chunk metadata range is out of bounds"
+        );
+        let next_generation = meta
+            .generation
+            .checked_add(1)
+            .context("object-data block generation overflow")?;
+        let updated = BlockMeta::active(
+            BlockKind::ObjectData,
+            next_generation,
+            meta.owner_thread,
+            meta.chunk_start,
+            meta.chunk_blocks,
+        );
+        for chunk_block in chunk_start..chunk_end {
+            region.write_block_meta(chunk_block, updated)?;
+        }
+        region.flush_block_meta_range(chunk_start, chunk_blocks)?;
+        region.fence()?;
+        return Ok(());
+    }
+
+    bail!("transactional file-backed region image does not contain an object-data block")
 }
 
 /// Reopens a file-backed durable region image and runs region recovery.

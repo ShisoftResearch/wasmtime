@@ -560,7 +560,8 @@ pub mod _internal {
 
         pub use crate::vm::block_region::{
             TransactionPersistenceRecoveredObjectWinner, TransactionPersistenceRecoveredRegion,
-            TransactionPersistenceRecoveredWinner, corrupt_first_log_crc,
+            TransactionPersistenceRecoveredWinner,
+            bump_first_object_data_block_generation_for_test, corrupt_first_log_crc,
             create_file_backed_region_image, publish_committed_global_object_root,
             publish_committed_struct_object, publish_committed_tmemory_update,
             reopen_and_recover_file_backed_region,

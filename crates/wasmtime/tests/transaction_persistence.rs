@@ -3,7 +3,8 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use wasmtime::_internal::transaction_persistence::{
-    corrupt_first_log_crc, create_file_backed_region_image, publish_committed_global_object_root,
+    bump_first_object_data_block_generation_for_test, corrupt_first_log_crc,
+    create_file_backed_region_image, publish_committed_global_object_root,
     publish_committed_struct_object, publish_committed_tmemory_update,
     reopen_and_recover_file_backed_region,
 };
@@ -54,6 +55,21 @@ fn file_backed_region_recovers_committed_struct_object() {
     assert_eq!(recovered.object_winners.len(), 1);
     assert_eq!(recovered.object_winners[0].object_id, 41);
     assert_eq!(recovered.object_winners[0].version, 1);
+}
+
+#[test]
+fn file_backed_recovery_ignores_stale_generation_object_publication() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stale-generation-region.bin");
+
+    create_file_backed_region_image(&path, 128).unwrap();
+    publish_committed_struct_object(&path, 1, 41, 1, 12, &[9, 8, 7]).unwrap();
+    bump_first_object_data_block_generation_for_test(&path).unwrap();
+
+    let recovered = reopen_and_recover_file_backed_region(&path).unwrap();
+
+    assert!(recovered.winners.is_empty());
+    assert!(recovered.object_winners.is_empty());
 }
 
 #[test]

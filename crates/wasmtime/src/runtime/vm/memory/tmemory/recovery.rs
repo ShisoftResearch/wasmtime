@@ -1,4 +1,5 @@
 use super::block_region::BlockRegionBackendView;
+use super::durable_log::BlockKind;
 use super::{
     DATA_CHUNK_MAGIC, DataChunkHeader, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader,
     TxDataRecordRole, TxLogEntry, TxLogEntryRole, packed_granule_domain, unpack_object_granule_id,
@@ -516,8 +517,17 @@ fn discover_region(region: &BlockRegionBackendView<'_>) -> Result<DiscoveredRegi
 
     while block < region.num_blocks() {
         let start_block = u32::try_from(block).context("transactional recovery block overflow")?;
+        let meta = region.block_meta(start_block)?;
+        if !meta.is_active_or_sealed()? {
+            block += 1;
+            continue;
+        }
         match region.block_magic(start_block)? {
             LOG_BLOCK_MAGIC => {
+                if meta.kind()? != BlockKind::Log {
+                    block += 1;
+                    continue;
+                }
                 let header = region.log_block_header(start_block)?;
                 streams
                     .entry(header.stream_id)
@@ -527,6 +537,10 @@ fn discover_region(region: &BlockRegionBackendView<'_>) -> Result<DiscoveredRegi
                 block += 1;
             }
             DATA_CHUNK_MAGIC => {
+                if !matches!(meta.kind()?, BlockKind::ObjectData | BlockKind::LinearUndo) {
+                    block += 1;
+                    continue;
+                }
                 let header = region.data_chunk_header(start_block)?;
                 let chunk_blocks = validated_chunk_blocks(region, block, start_block, header)?;
                 streams
@@ -568,6 +582,27 @@ fn discover_region(region: &BlockRegionBackendView<'_>) -> Result<DiscoveredRegi
     })
 }
 
+fn expected_data_kind(role: TxLogEntryRole) -> BlockKind {
+    match role {
+        TxLogEntryRole::TObjectPub => BlockKind::ObjectData,
+        TxLogEntryRole::TMemoryUndo => BlockKind::LinearUndo,
+    }
+}
+
+fn validate_entry_data_block(
+    region: &BlockRegionBackendView<'_>,
+    entry: TxLogEntry,
+) -> Result<bool> {
+    let meta = region.block_meta(entry.data_block)?;
+    if !meta.is_active_or_sealed()? {
+        return Ok(false);
+    }
+    if meta.kind()? != expected_data_kind(entry.role()?) {
+        return Ok(false);
+    }
+    Ok(meta.generation == entry.data_block_generation())
+}
+
 fn replay_stream(
     region: &BlockRegionBackendView<'_>,
     stream: &RecoveredStream,
@@ -606,6 +641,9 @@ fn replay_stream(
             if is_final_lp(entry) {
                 txn.entries.push(entry);
                 for committed in &txn.entries {
+                    if !validate_entry_data_block(region, *committed)? {
+                        continue;
+                    }
                     validate_committed_entry(region, data_chunk_index, *committed)?;
                     if committed.role()? == TxLogEntryRole::TObjectPub {
                         replay.winners.push(RecoveryWinner {
@@ -680,6 +718,9 @@ fn loose_end_tmemory_undo_rollbacks(
         if entry.role()? != TxLogEntryRole::TMemoryUndo {
             continue;
         }
+        if !validate_entry_data_block(region, entry)? {
+            continue;
+        }
         let (data_header, old_granule_bytes) = load_publication_payload(
             region,
             data_chunk_index,
@@ -734,6 +775,7 @@ mod tests {
         ObjectPayload, ObjectValue, encode_object_record_for_test,
         type_layout::{PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId},
     };
+    use crate::runtime::vm::memory::tmemory::durable_log::{BlockKind, BlockMeta};
     use crate::runtime::vm::memory::tmemory::metadata::{
         TYPE_LAYOUT_METADATA_HEADER_LEN, TYPE_LAYOUT_METADATA_START_BLOCK,
     };
@@ -903,6 +945,24 @@ mod tests {
             recovered.tmemory_undo_rollbacks[0].old_granule_bytes,
             vec![9, 8, 7, 6]
         );
+    }
+
+    #[test]
+    fn recovery_skips_stale_generation_committed_entry_before_payload_decode() {
+        let region = sample_region_with_stale_generation_committed_entry();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert!(recovered.winners.is_empty());
+        assert!(recovered.object_winners.is_empty());
+    }
+
+    #[test]
+    fn recovery_skips_stale_generation_loose_end_tmemory_undo_before_payload_decode() {
+        let region = sample_region_with_stale_generation_loose_end_tmemory_undo();
+        let recovered = recover_region_for_test(&region).unwrap();
+
+        assert_eq!(recovered.winners.len(), 0);
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 0);
     }
 
     #[test]
@@ -1287,6 +1347,28 @@ mod tests {
         region
     }
 
+    fn sample_region_with_stale_generation_loose_end_tmemory_undo() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let (_, location) = append_tmemory_undo_record(
+            &mut region,
+            1,
+            stream,
+            0,
+            pack_test_granule_id(PackedGranuleDomain::TMemory, 7),
+            3,
+            &[9, 8, 7, 6],
+            false,
+        );
+        region
+            .bump_block_generation_for_test(location.data_block)
+            .unwrap();
+        rewrite_data_record_header(&mut region, location, |header| {
+            header.role = 0xa5a5;
+        });
+        region
+    }
+
     fn sample_region_with_committed_tmemory_undo() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream = region.alloc_stream(1).unwrap();
@@ -1300,6 +1382,32 @@ mod tests {
             &[9, 8, 7, 6],
             true,
         );
+        region
+    }
+
+    fn sample_region_with_stale_generation_committed_entry() -> VMemoryBlockRegion {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        region
+            .append_type_layout_metadata(&struct_layout(22))
+            .unwrap();
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let (_, location) = append_committed_object_update_raw(
+            &mut region,
+            1,
+            stream,
+            0,
+            logical_id,
+            9,
+            22,
+            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        );
+        region
+            .bump_block_generation_for_test(location.data_block)
+            .unwrap();
+        rewrite_data_record_header(&mut region, location, |header| {
+            header.role = 0xa5a5;
+        });
         region
     }
 
@@ -1337,22 +1445,19 @@ mod tests {
     fn sample_region_with_committed_entry_role_mismatch() -> VMemoryBlockRegion {
         let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
         let stream = region.alloc_stream(1).unwrap();
-        region
-            .append_type_layout_metadata(&struct_layout(22))
-            .unwrap();
-        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
-        let (log_block, _) = append_committed_object_update_raw(
+        let logical_id = pack_test_granule_id(PackedGranuleDomain::TMemory, 7);
+        let (_, location) = append_tmemory_undo_record(
             &mut region,
             1,
             stream,
             0,
             logical_id,
-            9,
-            22,
-            ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+            3,
+            &[9, 8, 7, 6],
+            true,
         );
-        rewrite_log_entry(&mut region, log_block, 0, |entry| {
-            entry.set_role(TxLogEntryRole::TMemoryUndo);
+        rewrite_data_record_header(&mut region, location, |header| {
+            header.set_role(TxDataRecordRole::TObjectPub);
         });
         region
     }
@@ -1397,10 +1502,17 @@ mod tests {
             22,
             ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
         );
+        let stray_block = region.alloc_log_block(2, 0).unwrap();
         rewrite_log_entry(&mut region, log_block, 0, |entry| {
-            entry.data_block = log_block;
+            entry.data_block = stray_block;
             entry.data_offset = 0;
         });
+        region
+            .write_block_meta_for_test(
+                stray_block,
+                BlockMeta::active(BlockKind::ObjectData, 0, 2, stray_block, 1),
+            )
+            .unwrap();
         region
     }
 
@@ -1557,7 +1669,7 @@ mod tests {
         version: u32,
         old_granule_bytes: &[u8],
         is_final_lp: bool,
-    ) {
+    ) -> (u32, DataRecordLocation) {
         let record = TMemory::encode_granule_undo_data_record(
             logical_id,
             version,
@@ -1583,6 +1695,7 @@ mod tests {
         entry.set_role(TxLogEntryRole::TMemoryUndo);
         entry.seal_crc32();
         write_log_entries(region, log_block, &[entry]);
+        (log_block, location)
     }
 
     fn encode_root_object_refs(object_ids: &[Option<u64>]) -> Vec<u8> {
@@ -1716,7 +1829,17 @@ mod tests {
         version: u32,
         fill: u8,
     ) -> (u32, DataRecordLocation) {
-        let filler = vec![0xa5; BLOCK_SIZE - size_of::<DataChunkHeader>() + 1];
+        let filler = TMemory::encode_publication_data_record(
+            0x2000,
+            1,
+            PackedGranuleDomain::TMemory as u16,
+            0,
+            &vec![
+                0xa5;
+                BLOCK_SIZE - size_of::<DataChunkHeader>() + 1 - size_of::<TxDataRecordHeader>()
+            ],
+        )
+        .unwrap();
         let filler_location = region.append_data_record(stream, &filler).unwrap();
         let (log_block, location) = append_publication_record(
             region, stream_id, stream, block_seq, logical_id, version, fill,
