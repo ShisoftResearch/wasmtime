@@ -1,7 +1,7 @@
 use super::type_layout::{PersistentTypeLayout, TraceSlotKind};
 use super::{
-    OBJECT_VALUE_ABI_TAG_REF, ObjectId, ObjectKind, ObjectPayload, ObjectRefValue, ObjectValue,
-    ObjectValueAbi,
+    DurableExternIdentity, DurableFuncIdentity, OBJECT_VALUE_ABI_TAG_REF, ObjectId, ObjectKind,
+    ObjectPayload, ObjectRefValue, ObjectValue, ObjectValueAbi,
 };
 use crate::prelude::*;
 #[cfg(test)]
@@ -465,8 +465,7 @@ fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Res
                     .context("object value ABI size does not fit u64")?
         }
         ObjectPayload::I31(_) => 4,
-        ObjectPayload::Extern(_) => 8,
-        ObjectPayload::Func(_) => 8,
+        ObjectPayload::Extern(_) | ObjectPayload::Func(_) => 16,
     };
     let header_len = u64::try_from(header_len).context("record header length overflow")?;
     header_len
@@ -505,8 +504,16 @@ fn append_payload_bytes(bytes: &mut Vec<u8>, payload: &ObjectPayload) -> Result<
             }
         }
         ObjectPayload::I31(value) => bytes.extend_from_slice(&value.to_le_bytes()),
-        ObjectPayload::Extern(value) => bytes.extend_from_slice(&value.to_le_bytes()),
-        ObjectPayload::Func(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+        ObjectPayload::Extern(value) => {
+            bytes.extend_from_slice(&value.namespace.to_le_bytes());
+            bytes.extend_from_slice(&value.handle.to_le_bytes());
+            bytes.extend_from_slice(&value.type_layout_id.get().to_le_bytes());
+        }
+        ObjectPayload::Func(value) => {
+            bytes.extend_from_slice(&value.module_fingerprint.to_le_bytes());
+            bytes.extend_from_slice(&value.function_index.to_le_bytes());
+            bytes.extend_from_slice(&value.type_layout_id.get().to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -561,17 +568,31 @@ fn decode_payload_bytes(
         }
         x if x == ObjectKind::Extern as u16 => {
             ensure!(
-                payload_bytes.len() == 8,
+                payload_bytes.len() == 16,
                 "serialized extern payload length is invalid"
             );
-            ObjectPayload::Extern(u64::from_le_bytes(payload_bytes.try_into().unwrap()))
+            ObjectPayload::Extern(DurableExternIdentity {
+                namespace: u32::from_le_bytes(payload_bytes[0..4].try_into().unwrap()),
+                handle: u64::from_le_bytes(payload_bytes[4..12].try_into().unwrap()),
+                type_layout_id: super::type_layout::TypeLayoutId::new(u32::from_le_bytes(
+                    payload_bytes[12..16].try_into().unwrap(),
+                ))
+                .context("serialized extern payload type layout id cannot be zero")?,
+            })
         }
         x if x == ObjectKind::Func as u16 => {
             ensure!(
-                payload_bytes.len() == 8,
+                payload_bytes.len() == 16,
                 "serialized func payload length is invalid"
             );
-            ObjectPayload::Func(u64::from_le_bytes(payload_bytes.try_into().unwrap()))
+            ObjectPayload::Func(DurableFuncIdentity {
+                module_fingerprint: u64::from_le_bytes(payload_bytes[0..8].try_into().unwrap()),
+                function_index: u32::from_le_bytes(payload_bytes[8..12].try_into().unwrap()),
+                type_layout_id: super::type_layout::TypeLayoutId::new(u32::from_le_bytes(
+                    payload_bytes[12..16].try_into().unwrap(),
+                ))
+                .context("serialized func payload type layout id cannot be zero")?,
+            })
         }
         _ => bail!(
             "unknown object kind tag in persistent record header: {}",

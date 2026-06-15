@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use core::{cell::Cell, mem, ops::Range};
 use std::path::{Path, PathBuf};
 
+#[path = "transaction/durable_ref.rs"]
+mod durable_ref;
 #[path = "transaction/object_gc.rs"]
 mod object_gc;
 #[path = "transaction/object_heap.rs"]
@@ -25,6 +27,8 @@ pub(crate) use object_gc::{
 use object_gc::{PersistentObjectEdge, PersistentObjectMarker};
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
+#[allow(unused_imports)]
+pub(crate) use durable_ref::{DurableExternIdentity, DurableFuncIdentity, DurableRefValue};
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
@@ -925,10 +929,8 @@ pub(crate) enum ObjectPayload {
     Struct(Vec<ObjectValue>),
     Array(Vec<ObjectValue>),
     I31(i32),
-    Extern(u64),
-    // The payload stores Wasmtime/module-local function metadata. The function
-    // object's identity is the `ObjectId` table slot that owns this payload.
-    Func(u64),
+    Extern(DurableExternIdentity),
+    Func(DurableFuncIdentity),
 }
 
 impl ObjectPayload {
@@ -947,8 +949,8 @@ impl ObjectPayload {
             ObjectKind::Struct => ObjectPayload::Struct(Vec::new()),
             ObjectKind::Array => ObjectPayload::Array(Vec::new()),
             ObjectKind::I31 => ObjectPayload::I31(0),
-            ObjectKind::Extern => ObjectPayload::Extern(0),
-            ObjectKind::Func => ObjectPayload::Func(0),
+            ObjectKind::Extern => ObjectPayload::Extern(default_durable_extern_identity()),
+            ObjectKind::Func => ObjectPayload::Func(default_durable_func_identity()),
         }
     }
 }
@@ -1501,7 +1503,8 @@ impl ObjectTable {
             return Ok(object_id);
         }
 
-        let object_id = self.allocate_payload(ObjectPayload::Func(raw_ref))?;
+        let object_id =
+            self.allocate_payload(ObjectPayload::Func(default_durable_func_identity()))?;
         self.associate_func_ref(raw_ref, object_id)?;
         Ok(object_id)
     }
@@ -2370,6 +2373,22 @@ fn default_type_layout_id_for_kind(kind: ObjectKind) -> TypeLayoutId {
         ObjectKind::I31 => TypeLayoutId::BUILTIN_I31,
         ObjectKind::Extern => TypeLayoutId::BUILTIN_EXTERN,
         ObjectKind::Func => TypeLayoutId::BUILTIN_FUNC,
+    }
+}
+
+fn default_durable_extern_identity() -> DurableExternIdentity {
+    DurableExternIdentity {
+        namespace: 0,
+        handle: 0,
+        type_layout_id: default_type_layout_id_for_kind(ObjectKind::Extern),
+    }
+}
+
+fn default_durable_func_identity() -> DurableFuncIdentity {
+    DurableFuncIdentity {
+        module_fingerprint: 0,
+        function_index: 0,
+        type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
     }
 }
 
@@ -13671,7 +13690,11 @@ mod tests {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
             let source = objects
-                .allocate_payload(ObjectPayload::Func(0x725))
+                .allocate_payload(ObjectPayload::Func(DurableFuncIdentity {
+                    module_fingerprint: 0x725,
+                    function_index: 1,
+                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
+                }))
                 .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(725));
 
@@ -13690,7 +13713,11 @@ mod tests {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
             let source = objects
-                .allocate_payload(ObjectPayload::Extern(0x726))
+                .allocate_payload(ObjectPayload::Extern(DurableExternIdentity {
+                    namespace: 7,
+                    handle: 0x726,
+                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Extern),
+                }))
                 .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(726));
 
@@ -13712,7 +13739,11 @@ mod tests {
                 .allocate_struct_for_gc_ref(0x727, vec![ObjectValue::I32(1)])
                 .unwrap();
             let bad_child = objects
-                .allocate_payload(ObjectPayload::Func(0x727))
+                .allocate_payload(ObjectPayload::Func(DurableFuncIdentity {
+                    module_fingerprint: 0x727,
+                    function_index: 2,
+                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
+                }))
                 .unwrap();
             let parent = objects
                 .allocate_struct_for_gc_ref(
@@ -13746,10 +13777,18 @@ mod tests {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
             let func = objects
-                .allocate_payload(ObjectPayload::Func(0x729))
+                .allocate_payload(ObjectPayload::Func(DurableFuncIdentity {
+                    module_fingerprint: 0x729,
+                    function_index: 3,
+                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
+                }))
                 .unwrap();
             let extern_ = objects
-                .allocate_payload(ObjectPayload::Extern(0x72a))
+                .allocate_payload(ObjectPayload::Extern(DurableExternIdentity {
+                    namespace: 8,
+                    handle: 0x72a,
+                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Extern),
+                }))
                 .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(729));
 
@@ -14057,6 +14096,50 @@ mod tests {
                     .unwrap(),
                 ObjectPayload::I31(-7)
             );
+        }
+
+        #[test]
+        fn durable_func_identity_round_trips_through_object_payload() {
+            let identity = DurableFuncIdentity {
+                module_fingerprint: 0x10_20_30_40_50_60_70_80,
+                function_index: 7,
+                type_layout_id: type_layout::TypeLayoutId::new(3).unwrap(),
+            };
+            let payload = ObjectPayload::Func(identity);
+            let encoded = encode_object_record_for_test(
+                9,
+                1,
+                default_type_layout_id_for_kind(ObjectKind::Func).get(),
+                &payload,
+            )
+            .unwrap();
+
+            let mut heap = object_heap::ObjectHeap::default();
+            let handle = heap.install_record_bytes(&encoded).unwrap();
+
+            assert_eq!(heap.payload(handle).unwrap(), &payload);
+        }
+
+        #[test]
+        fn durable_extern_identity_round_trips_through_object_payload() {
+            let identity = DurableExternIdentity {
+                namespace: 4,
+                handle: 0xabc,
+                type_layout_id: type_layout::TypeLayoutId::new(8).unwrap(),
+            };
+            let payload = ObjectPayload::Extern(identity);
+            let encoded = encode_object_record_for_test(
+                10,
+                1,
+                default_type_layout_id_for_kind(ObjectKind::Extern).get(),
+                &payload,
+            )
+            .unwrap();
+
+            let mut heap = object_heap::ObjectHeap::default();
+            let handle = heap.install_record_bytes(&encoded).unwrap();
+
+            assert_eq!(heap.payload(handle).unwrap(), &payload);
         }
     }
 
