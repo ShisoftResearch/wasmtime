@@ -21,6 +21,75 @@ tests, generated `proptest` histories, file-backed recovery checks, bounded
 `LockBased` state-space tests, permission-state tests, and later `loom` entry
 criteria.
 
+Use `docs/shisoft/2026-06-15-persistent-roots-and-promotion-plan.md` for the
+completed persistent-root and promotion-boundary wave.
+
+## Current Status: Wave 10 Persistent Roots And Promotion Boundary
+
+Date: 2026-06-15
+
+Wave 10 makes persistent roots first-class durable records and closes the
+silent-reference hole at the persistent graph boundary.
+
+Implemented status:
+
+- Durable root publications now exist for persistent `TGlobal` and `TTable`
+  roots, using `ObjectId + 1` encoding so zero remains the null/no-root value.
+- `TransactionState` keeps a volatile committed persistent-root index keyed by
+  global coordinates and exact table-element coordinates.
+- Real transaction commits publish staged persistent root records before LP,
+  then apply the committed root index after `complete_commit()`.
+- Commit-coupled persistent GC now seeds from the committed root index after
+  root/object commits invalidate cached reachability.
+- File-backed reopen installs recovered root IDs and recovered root versions,
+  then reuses recovered stream cursors so later commits append without root
+  version collisions.
+- Unknown or non-persistent non-null `VMGcRef` values are rejected before they
+  can enter persistent roots or persistent object payload publications. The
+  diagnostic is:
+
+```text
+volatile GC reference promotion into persistent object graph is not implemented yet
+```
+
+Still deferred:
+
+- recursive promotion of ordinary volatile Wasmtime GC graphs into persistent
+  `ObjectId` graphs
+- ordinary Wasmtime GC root-closure integration for persistent roots
+- durable block/chunk retirement and persistent block reuse
+
+Verification commands for this slice:
+
+```text
+cargo fmt --check
+ok
+
+cargo test -p wasmtime --lib persistent_root_publication -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_root_index -- --format terse
+test result: ok. 6 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_root_commit -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_root_recovery_installs_root_index_for_gc -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_ref_promotion_boundary -- --format terse
+test result: ok. 3 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib persistent_gc_commit -- --format terse
+test result: ok. 5 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 325 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 5 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Wave 9B/9C Persistent Object GC
 
 Date: 2026-06-14
