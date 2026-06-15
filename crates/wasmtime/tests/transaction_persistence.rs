@@ -90,6 +90,38 @@ fn real_tfunc_root_publication_reopens_without_version_collision() -> Result<()>
     Ok(())
 }
 
+#[test]
+fn real_tfunc_promotes_tstruct_root_and_recovers() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("promote-root.tmemory");
+    let tx_log_path = dir.path().join("promote-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (type $s (tstruct (field (mut i32))))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (tstruct.new $s (i32.const 77)))))
+            "#,
+        )?,
+    )?;
+
+    call_publish_root(&engine, &module, &tmemory_path, &tx_log_path, true)?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids.len(), 1);
+    assert_eq!(recovered.object_winners.len(), 1);
+    assert_eq!(
+        recovered.root_object_ids[0],
+        recovered.object_winners[0].object_id
+    );
+
+    Ok(())
+}
+
 fn transaction_root_engine() -> Result<Engine> {
     let mut config = Config::new();
     config
