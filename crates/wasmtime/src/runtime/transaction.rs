@@ -557,6 +557,8 @@ pub(crate) struct TransactionState {
     failure_code: u32,
     fail_next_commit_before_lp_for_test: bool,
     persistent_gc_state: Option<PersistentGcState>,
+    persistent_roots: BTreeMap<PersistentRootKey, BTreeSet<ObjectId>>,
+    persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     next_id: u64,
     locks: LockBased,
     suspended: BTreeMap<TransactionId, TransactionWorkspace>,
@@ -600,6 +602,8 @@ impl Default for TransactionState {
             failure_code: 0,
             fail_next_commit_before_lp_for_test: false,
             persistent_gc_state: None,
+            persistent_roots: BTreeMap::new(),
+            persistent_root_versions: BTreeMap::new(),
             next_id: 10_001,
             locks: LockBased::default(),
             suspended: BTreeMap::new(),
@@ -679,6 +683,30 @@ pub(crate) enum TableElementSnapshot {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ObjectId {
     pub(crate) object_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PersistentRootKey {
+    Global {
+        instance: Option<u32>,
+        global_index: u32,
+    },
+    Table {
+        instance: Option<u32>,
+        table_index: u32,
+    },
+    Recovered,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistentRootDelta {
+    roots: BTreeMap<PersistentRootKey, BTreeSet<ObjectId>>,
+}
+
+impl PersistentRootDelta {
+    fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4076,6 +4104,48 @@ impl TransactionState {
         })
     }
 
+    pub(crate) fn staged_persistent_root_delta(
+        &self,
+        object_table: &ObjectTable,
+    ) -> Result<PersistentRootDelta> {
+        self.ensure_active()?;
+        let mut delta = PersistentRootDelta::default();
+
+        for (&key, &value) in &self.staged_globals {
+            let GranuleId::TGlobal {
+                instance,
+                global_index,
+            } = key
+            else {
+                bail!("staged global map contains non-global key");
+            };
+            let root_key = PersistentRootKey::Global {
+                instance,
+                global_index,
+            };
+            let roots = delta.roots.entry(root_key).or_default();
+            if let Some(root) = persistent_root_object_id_for_global_snapshot(object_table, value)?
+            {
+                roots.insert(root);
+            }
+        }
+
+        for (&key, &value) in &self.staged_table_elements {
+            let root_key = PersistentRootKey::Table {
+                instance: key.instance,
+                table_index: key.table_index,
+            };
+            let roots = delta.roots.entry(root_key).or_default();
+            if let Some(root) =
+                persistent_root_object_id_for_table_element_snapshot(object_table, value)?
+            {
+                roots.insert(root);
+            }
+        }
+
+        Ok(delta)
+    }
+
     pub(crate) fn persistent_gc_commit_delta(
         &self,
         object_table: &ObjectTable,
@@ -4155,6 +4225,28 @@ impl TransactionState {
                 PersistentGcStepReport::default()
             }
         }
+    }
+
+    fn apply_committed_persistent_root_delta(&mut self, delta: PersistentRootDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        for (key, roots) in delta.roots {
+            if roots.is_empty() {
+                self.persistent_roots.remove(&key);
+            } else {
+                self.persistent_roots.insert(key, roots);
+            }
+            let version = self.persistent_root_versions.entry(key).or_insert(0);
+            *version = version.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn persistent_root_ids(&self) -> BTreeSet<ObjectId> {
+        self.persistent_roots
+            .values()
+            .flat_map(|roots| roots.iter().copied())
+            .collect()
     }
 
     fn commit_object_payloads_with<F>(
@@ -4692,6 +4784,21 @@ impl TransactionState {
 
     fn stage_granule_for_test(&mut self, granule: GranuleId, bytes: Vec<u8>) {
         self.staged_granules.insert(granule, bytes);
+    }
+
+    fn staged_persistent_root_delta_for_test(
+        &self,
+        objects: &ObjectTable,
+    ) -> Result<PersistentRootDelta> {
+        self.staged_persistent_root_delta(objects)
+    }
+
+    fn apply_committed_persistent_root_delta_for_test(&mut self, delta: PersistentRootDelta) {
+        self.apply_committed_persistent_root_delta(delta);
+    }
+
+    fn persistent_root_ids_for_test(&self) -> BTreeSet<ObjectId> {
+        self.persistent_root_ids()
     }
 
     fn read_tmemory_range_for_test(
@@ -12816,6 +12923,81 @@ mod tests {
             state.into_report(&objects).unwrap().reachable,
             object_set([root])
         );
+    }
+
+    #[test]
+    fn persistent_root_index_tracks_committed_global_root() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x590, vec![ObjectValue::I32(9)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(590));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x590)).unwrap();
+
+        let delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+
+        state.complete_commit().unwrap();
+        state.apply_committed_persistent_root_delta_for_test(delta);
+
+        assert_eq!(state.persistent_root_ids_for_test(), object_set([root]));
+    }
+
+    #[test]
+    fn persistent_root_index_removes_global_root_on_non_ref_commit() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x591, vec![ObjectValue::I32(10)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(591));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x591)).unwrap();
+        let install_delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state.apply_committed_persistent_root_delta_for_test(install_delta);
+        assert_eq!(state.persistent_root_ids_for_test(), object_set([root]));
+
+        state.begin().unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(0)).unwrap();
+        let removal_delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state.apply_committed_persistent_root_delta_for_test(removal_delta);
+
+        assert_eq!(state.persistent_root_ids_for_test(), object_set([]));
+    }
+
+    #[test]
+    fn persistent_root_index_tracks_table_element_roots() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x592, vec![ObjectValue::I32(11)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(592));
+        state
+            .stage_table_element_owned(None, 3, 0, TableElementSnapshot::GcRef(0x592))
+            .unwrap();
+        state
+            .stage_table_element_owned(None, 3, 1, TableElementSnapshot::GcRef(0))
+            .unwrap();
+
+        let delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+
+        state.complete_commit().unwrap();
+        state.apply_committed_persistent_root_delta_for_test(delta);
+
+        assert_eq!(state.persistent_root_ids_for_test(), object_set([root]));
     }
 
     #[test]
