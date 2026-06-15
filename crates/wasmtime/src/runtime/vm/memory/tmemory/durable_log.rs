@@ -9,6 +9,207 @@ pub(crate) const REGION_MAGIC: u32 = 0x5452_4547;
 pub(crate) const LOG_BLOCK_MAGIC: u32 = 0x544c_4f47;
 pub(crate) const DATA_CHUNK_MAGIC: u32 = 0x5444_4154;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockState {
+    Free = 0,
+    Active = 1,
+    Sealed = 2,
+    Retired = 3,
+}
+
+impl BlockState {
+    pub(crate) fn from_byte(byte: u8) -> Result<Self> {
+        Ok(match byte {
+            0 => BlockState::Free,
+            1 => BlockState::Active,
+            2 => BlockState::Sealed,
+            3 => BlockState::Retired,
+            state => bail!("unknown durable block state {state}"),
+        })
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockKind {
+    Free = 0,
+    Log = 1,
+    ObjectData = 2,
+    LinearUndo = 3,
+    Metadata = 4,
+}
+
+impl BlockKind {
+    pub(crate) fn from_byte(byte: u8) -> Result<Self> {
+        Ok(match byte {
+            0 => BlockKind::Free,
+            1 => BlockKind::Log,
+            2 => BlockKind::ObjectData,
+            3 => BlockKind::LinearUndo,
+            4 => BlockKind::Metadata,
+            kind => bail!("unknown durable block kind {kind}"),
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockMeta {
+    pub(crate) state: u8,
+    pub(crate) kind: u8,
+    pub(crate) reserved0: u16,
+    pub(crate) generation: u32,
+    pub(crate) owner_thread: u32,
+    pub(crate) chunk_start: u32,
+    pub(crate) chunk_blocks: u32,
+    pub(crate) reserved1: u64,
+}
+
+impl Default for BlockMeta {
+    fn default() -> Self {
+        Self::free()
+    }
+}
+
+impl BlockMeta {
+    pub(crate) const BYTE_LEN: usize = 32;
+
+    pub(crate) fn free() -> Self {
+        Self {
+            state: BlockState::Free as u8,
+            kind: BlockKind::Free as u8,
+            reserved0: 0,
+            generation: 0,
+            owner_thread: 0,
+            chunk_start: NO_NEXT_BLOCK,
+            chunk_blocks: 0,
+            reserved1: 0,
+        }
+    }
+
+    pub(crate) fn active(
+        kind: BlockKind,
+        generation: u32,
+        owner_thread: u32,
+        chunk_start: u32,
+        chunk_blocks: u32,
+    ) -> Self {
+        Self {
+            state: BlockState::Active as u8,
+            kind: kind as u8,
+            reserved0: 0,
+            generation,
+            owner_thread,
+            chunk_start,
+            chunk_blocks,
+            reserved1: 0,
+        }
+    }
+
+    pub(crate) fn state(&self) -> Result<BlockState> {
+        BlockState::from_byte(self.state)
+    }
+
+    pub(crate) fn kind(&self) -> Result<BlockKind> {
+        BlockKind::from_byte(self.kind)
+    }
+
+    pub(crate) fn is_active_or_sealed(&self) -> Result<bool> {
+        Ok(matches!(
+            self.state()?,
+            BlockState::Active | BlockState::Sealed
+        ))
+    }
+
+    pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0] = self.state;
+        bytes[1] = self.kind;
+        bytes[2..4].copy_from_slice(&self.reserved0.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.generation.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.owner_thread.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.chunk_start.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.chunk_blocks.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.reserved1.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        ensure!(
+            bytes.len() == Self::BYTE_LEN,
+            "durable block metadata length mismatch"
+        );
+        let meta = Self {
+            state: bytes[0],
+            kind: bytes[1],
+            reserved0: u16::from_le_bytes(bytes[2..4].try_into().unwrap()),
+            generation: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            owner_thread: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            chunk_start: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            chunk_blocks: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            reserved1: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        };
+        ensure!(
+            meta.reserved0 == 0,
+            "durable block metadata reserved0 must be zero"
+        );
+        ensure!(
+            bytes[20..24] == [0; 4],
+            "durable block metadata padding must be zero"
+        );
+        ensure!(
+            meta.reserved1 == 0,
+            "durable block metadata reserved1 must be zero"
+        );
+        meta.validate()?;
+        Ok(meta)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let state = self.state()?;
+        let kind = self.kind()?;
+
+        match state {
+            BlockState::Free => {
+                ensure!(
+                    kind == BlockKind::Free,
+                    "durable free block metadata must use free kind"
+                );
+                ensure!(
+                    self.owner_thread == 0,
+                    "durable free block metadata must have zero owner thread"
+                );
+                ensure!(
+                    self.chunk_start == NO_NEXT_BLOCK,
+                    "durable free block metadata must use NO_NEXT_BLOCK chunk start"
+                );
+                ensure!(
+                    self.chunk_blocks == 0,
+                    "durable free block metadata must have zero chunk blocks"
+                );
+            }
+            BlockState::Active | BlockState::Sealed | BlockState::Retired => {
+                ensure!(
+                    kind != BlockKind::Free,
+                    "durable non-free block metadata must not use free kind"
+                );
+                ensure!(
+                    self.chunk_start != NO_NEXT_BLOCK,
+                    "durable non-free block metadata must have a chunk start"
+                );
+                ensure!(
+                    self.chunk_blocks > 0,
+                    "durable non-free block metadata must have positive chunk blocks"
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionHeader {
@@ -524,6 +725,79 @@ mod tests {
             .to_string();
 
         assert!(err.contains("data block generation exceeds log entry capacity"));
+    }
+
+    #[test]
+    fn block_meta_roundtrips_active_object_data_chunk() {
+        let meta = BlockMeta {
+            state: BlockState::Active as u8,
+            kind: BlockKind::ObjectData as u8,
+            reserved0: 0,
+            generation: 9,
+            owner_thread: 7,
+            chunk_start: 11,
+            chunk_blocks: 3,
+            reserved1: 0,
+        };
+
+        let decoded = BlockMeta::from_bytes(&meta.as_bytes()).unwrap();
+
+        assert_eq!(decoded.state().unwrap(), BlockState::Active);
+        assert_eq!(decoded.kind().unwrap(), BlockKind::ObjectData);
+        assert_eq!(decoded.generation, 9);
+        assert_eq!(decoded.owner_thread, 7);
+        assert_eq!(decoded.chunk_start, 11);
+        assert_eq!(decoded.chunk_blocks, 3);
+    }
+
+    #[test]
+    fn block_meta_rejects_unknown_state() {
+        let mut meta = BlockMeta::free();
+        meta.state = 0xff;
+
+        let err = BlockMeta::from_bytes(&meta.as_bytes())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown durable block state"));
+    }
+
+    #[test]
+    fn block_meta_rejects_nonzero_padding_bytes() {
+        let mut bytes = BlockMeta::free().as_bytes();
+        bytes[20] = 1;
+
+        let err = BlockMeta::from_bytes(bytes).unwrap_err().to_string();
+
+        assert!(err.contains("durable block metadata padding must be zero"));
+    }
+
+    #[test]
+    fn block_meta_rejects_active_with_free_kind() {
+        let meta = BlockMeta {
+            state: BlockState::Active as u8,
+            kind: BlockKind::Free as u8,
+            reserved0: 0,
+            generation: 9,
+            owner_thread: 7,
+            chunk_start: 11,
+            chunk_blocks: 3,
+            reserved1: 0,
+        };
+
+        let err = BlockMeta::from_bytes(meta.as_bytes()).unwrap_err().to_string();
+
+        assert!(err.contains("durable non-free block metadata must not use free kind"));
+    }
+
+    #[test]
+    fn block_meta_rejects_free_with_chunk_blocks() {
+        let mut meta = BlockMeta::free();
+        meta.chunk_blocks = 1;
+
+        let err = BlockMeta::from_bytes(meta.as_bytes()).unwrap_err().to_string();
+
+        assert!(err.contains("durable free block metadata must have zero chunk blocks"));
     }
 
     #[test]
