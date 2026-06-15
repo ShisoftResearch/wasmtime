@@ -243,9 +243,7 @@ pub(crate) fn packed_granule_domain(logical_id: u64) -> Result<PackedGranuleDoma
 
 pub(crate) fn pack_object_granule_id(domain: PackedGranuleDomain, object_id: u64) -> Result<u64> {
     match domain {
-        PackedGranuleDomain::TStruct
-        | PackedGranuleDomain::TArray
-        | PackedGranuleDomain::TI31 => {
+        PackedGranuleDomain::TStruct | PackedGranuleDomain::TArray | PackedGranuleDomain::TI31 => {
             ensure!(
                 object_id < (1u64 << 60),
                 "object id does not fit in packed granule id payload"
@@ -308,9 +306,7 @@ pub(crate) fn unpack_object_granule_id(logical_id: u64) -> Result<(PackedGranule
     ensure!(
         matches!(
             domain,
-            PackedGranuleDomain::TStruct
-                | PackedGranuleDomain::TArray
-                | PackedGranuleDomain::TI31
+            PackedGranuleDomain::TStruct | PackedGranuleDomain::TArray | PackedGranuleDomain::TI31
         ),
         "logical id {logical_id:#x} is not an object granule"
     );

@@ -1040,7 +1040,10 @@ impl ObjectTable {
     }
 
     fn decode_raw_i31_ref(raw_ref: u64) -> Result<i32> {
-        ensure!(Self::is_raw_i31_ref(raw_ref), "raw ref is not an i31 immediate");
+        ensure!(
+            Self::is_raw_i31_ref(raw_ref),
+            "raw ref is not an i31 immediate"
+        );
         Ok((raw_ref as u32 as i32) >> 1)
     }
 
@@ -4444,18 +4447,16 @@ impl TransactionState {
                 .promoted_i31_refs
                 .get(&gc_ref)
                 .copied()
-                .with_context(|| format!("raw i31 GC ref {gc_ref:#x} was not promoted before commit"))
+                .with_context(|| {
+                    format!("raw i31 GC ref {gc_ref:#x} was not promoted before commit")
+                })
                 .context(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED)?;
             return Ok(Some(object_id));
         }
         bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
     }
 
-    fn run_promotion_attempt<T, F>(
-        &mut self,
-        object_table: &mut ObjectTable,
-        f: F,
-    ) -> Result<T>
+    fn run_promotion_attempt<T, F>(&mut self, object_table: &mut ObjectTable, f: F) -> Result<T>
     where
         F: FnOnce(&mut Self, &mut ObjectTable, &mut PromotionAttempt) -> Result<T>,
     {
@@ -4464,11 +4465,9 @@ impl TransactionState {
             Ok(value) => Ok(value),
             Err(err) => {
                 let rollback_context = err.to_string();
-                attempt
-                    .rollback(self, object_table)
-                    .with_context(|| {
-                        format!("promotion rollback failed after error: {rollback_context}")
-                    })?;
+                attempt.rollback(self, object_table).with_context(|| {
+                    format!("promotion rollback failed after error: {rollback_context}")
+                })?;
                 Err(err)
             }
         }
@@ -4539,7 +4538,8 @@ impl TransactionState {
             if !object_table.is_persistent(object_id)? {
                 continue;
             }
-            let rewritten = self.rewrite_payload_refs_for_promotion(object_table, payload.clone())?;
+            let rewritten =
+                self.rewrite_payload_refs_for_promotion(object_table, payload.clone())?;
             if rewritten != payload {
                 self.staged_objects.insert(object_id, rewritten);
                 changed = true;
@@ -12903,7 +12903,10 @@ mod tests {
             crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
         assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TStruct);
         assert_eq!(object_id, object.object_index);
-        assert_eq!(pub_.kind, crate::runtime::vm::PackedGranuleDomain::TStruct as u16);
+        assert_eq!(
+            pub_.kind,
+            crate::runtime::vm::PackedGranuleDomain::TStruct as u16
+        );
         assert_eq!(pub_.version, 1);
     }
 
@@ -12919,7 +12922,10 @@ mod tests {
             crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
         assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TArray);
         assert_eq!(object_id, object.object_index);
-        assert_eq!(pub_.kind, crate::runtime::vm::PackedGranuleDomain::TArray as u16);
+        assert_eq!(
+            pub_.kind,
+            crate::runtime::vm::PackedGranuleDomain::TArray as u16
+        );
         assert_eq!(pub_.version, 1);
     }
 
@@ -13178,8 +13184,8 @@ mod tests {
         }
         state.complete_commit()?;
         state.apply_committed_persistent_root_delta(root_delta)?;
-        let _ =
-            state.observe_persistent_gc_commit_delta_after_commit(&objects, &persistent_gc_delta)?;
+        let _ = state
+            .observe_persistent_gc_commit_delta_after_commit(&objects, &persistent_gc_delta)?;
         drop(state);
 
         let (recovered_region, object_winners) =
@@ -13664,7 +13670,9 @@ mod tests {
         fn promotion_rejects_func_source_with_symbolic_identity_error() {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
-            let source = objects.allocate_payload(ObjectPayload::Func(0x725)).unwrap();
+            let source = objects
+                .allocate_payload(ObjectPayload::Func(0x725))
+                .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(725));
 
             let err = state
@@ -13681,7 +13689,9 @@ mod tests {
         fn promotion_rejects_extern_source_with_symbolic_identity_error() {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
-            let source = objects.allocate_payload(ObjectPayload::Extern(0x726)).unwrap();
+            let source = objects
+                .allocate_payload(ObjectPayload::Extern(0x726))
+                .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(726));
 
             let err = state
@@ -13701,7 +13711,9 @@ mod tests {
             let good_child = objects
                 .allocate_struct_for_gc_ref(0x727, vec![ObjectValue::I32(1)])
                 .unwrap();
-            let bad_child = objects.allocate_payload(ObjectPayload::Func(0x727)).unwrap();
+            let bad_child = objects
+                .allocate_payload(ObjectPayload::Func(0x727))
+                .unwrap();
             let parent = objects
                 .allocate_struct_for_gc_ref(
                     0x728,
@@ -13733,8 +13745,12 @@ mod tests {
         fn direct_unsupported_promotion_keeps_allocated_object_bookkeeping_unchanged() {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
-            let func = objects.allocate_payload(ObjectPayload::Func(0x729)).unwrap();
-            let extern_ = objects.allocate_payload(ObjectPayload::Extern(0x72a)).unwrap();
+            let func = objects
+                .allocate_payload(ObjectPayload::Func(0x729))
+                .unwrap();
+            let extern_ = objects
+                .allocate_payload(ObjectPayload::Extern(0x72a))
+                .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(729));
 
             assert_eq!(state.allocated_object_count_for_test(), 0);
@@ -13822,7 +13838,8 @@ mod tests {
             let promoted = state.promoted_object_for_test(source).unwrap();
 
             assert_eq!(
-                delta.roots
+                delta
+                    .roots
                     .get(&PersistentRootKey::Global {
                         instance: None,
                         global_index: 0
@@ -13839,7 +13856,9 @@ mod tests {
             let mut objects = ObjectTable::default();
             let raw_i31 = ObjectTable::encode_raw_i31_ref(19) as u32;
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(732));
-            state.stage_global(0, GlobalSnapshot::GcRef(raw_i31)).unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(raw_i31))
+                .unwrap();
 
             state
                 .promote_persistent_references_before_commit(&mut objects)
@@ -13848,7 +13867,8 @@ mod tests {
             let promoted = state.promoted_i31_ref_for_test(raw_i31).unwrap();
 
             assert_eq!(
-                delta.roots
+                delta
+                    .roots
                     .get(&PersistentRootKey::Global {
                         instance: None,
                         global_index: 0
@@ -13889,7 +13909,9 @@ mod tests {
                 &ObjectPayload::Struct(vec![ObjectValue::Ref(Some(promoted_child))])
             );
             assert_eq!(
-                state.staged_object_payload_for_test(promoted_child).unwrap(),
+                state
+                    .staged_object_payload_for_test(promoted_child)
+                    .unwrap(),
                 &ObjectPayload::Struct(vec![ObjectValue::I32(31)])
             );
         }
@@ -13953,7 +13975,9 @@ mod tests {
             let raw_i31 = ObjectTable::encode_raw_i31_ref(37) as u32;
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(736));
             state.stage_global(0, GlobalSnapshot::GcRef(0x736)).unwrap();
-            state.stage_global(1, GlobalSnapshot::GcRef(raw_i31)).unwrap();
+            state
+                .stage_global(1, GlobalSnapshot::GcRef(raw_i31))
+                .unwrap();
 
             state
                 .promote_persistent_references_before_commit(&mut objects)
@@ -13963,7 +13987,11 @@ mod tests {
             let promoted_i31 = state.promoted_i31_ref_for_test(raw_i31).unwrap();
 
             assert_eq!(state.allocated_object_count_for_test(), 2);
-            assert!(state.staged_object_payload_for_test(promoted_object).is_some());
+            assert!(
+                state
+                    .staged_object_payload_for_test(promoted_object)
+                    .is_some()
+            );
             assert!(state.staged_object_payload_for_test(promoted_i31).is_some());
 
             state.abort_allocated_objects(&mut objects).unwrap();
@@ -13971,7 +13999,11 @@ mod tests {
             assert_eq!(state.active_transaction(), None);
             assert_eq!(state.promoted_object_for_test(source), None);
             assert_eq!(state.promoted_i31_ref_for_test(raw_i31), None);
-            assert!(state.staged_object_payload_for_test(promoted_object).is_none());
+            assert!(
+                state
+                    .staged_object_payload_for_test(promoted_object)
+                    .is_none()
+            );
             assert!(state.staged_object_payload_for_test(promoted_i31).is_none());
             assert_eq!(state.allocated_object_count_for_test(), 0);
             assert!(objects.kind(promoted_object).is_err());
@@ -13993,7 +14025,10 @@ mod tests {
 
             assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TI31);
             assert_eq!(object_id, object.object_index);
-            assert_eq!(pub_.kind, crate::runtime::vm::PackedGranuleDomain::TI31 as u16);
+            assert_eq!(
+                pub_.kind,
+                crate::runtime::vm::PackedGranuleDomain::TI31 as u16
+            );
         }
 
         #[test]
@@ -14015,7 +14050,11 @@ mod tests {
                 .rebuild_from_recovery_for_test(&recovered_region.type_layouts, &winners)
                 .unwrap();
             assert_eq!(
-                rebuilt.payload(ObjectId { object_index: object.object_index }).unwrap(),
+                rebuilt
+                    .payload(ObjectId {
+                        object_index: object.object_index
+                    })
+                    .unwrap(),
                 ObjectPayload::I31(-7)
             );
         }
