@@ -6,7 +6,9 @@ use super::{
     DATA_CHUNK_MAGIC, DataChunkClass, DataChunkHeader, DataRecordLocation, LOG_BLOCK_MAGIC,
     LogBlockHeader, NO_NEXT_BLOCK, PackedGranuleDomain, REGION_MAGIC, RegionHeader,
     SMALL_DATA_LIMIT, TMemory, TxLogEntry,
-    durable_log::BlockMeta,
+    durable_log::{
+        BlockKind, BlockMeta, BlockState, TxDataRecordHeader, TxDataRecordRole, TxEntryMeta,
+    },
     metadata::{
         BLOCK_TABLE_START_BLOCK, METADATA_DESC_BLOCK_COUNT, REGION_HEADER_BLOCK,
         TYPE_LAYOUT_META_KIND, TYPE_LAYOUT_METADATA_BLOCK_COUNT, append_type_layout_to_block,
@@ -670,6 +672,9 @@ pub(crate) trait BlockRegionBackend {
     fn bytes_len(&self) -> usize;
     fn line_mark_count(&self) -> usize;
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk>;
+    fn block_meta(&self, _block: u32) -> Result<BlockMeta> {
+        bail!("transactional block region backend does not expose block metadata")
+    }
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
     fn flush(&self, offset: usize, len: usize) -> Result<()>;
@@ -711,6 +716,14 @@ impl<'a> BlockRegionBackendView<'a> {
         DataChunkHeader::from_bytes(
             self.read_header_bytes(start_block, size_of::<DataChunkHeader>())?,
         )
+    }
+
+    pub(crate) fn block_meta(&self, block: u32) -> Result<BlockMeta> {
+        self.backend.block_meta(block)
+    }
+
+    pub(crate) fn block_generation(&self, block: u32) -> Result<u32> {
+        Ok(self.block_meta(block)?.generation)
     }
 
     pub(crate) fn valid_data_chunk_header(
@@ -788,6 +801,76 @@ fn decode_tx_log_entry(bytes: impl AsRef<[u8]>) -> Result<TxLogEntry> {
         crc32: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
         entry_meta: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
     })
+}
+
+fn block_kind_for_data_record(bytes: &[u8]) -> Result<BlockKind> {
+    let header = TxDataRecordHeader::from_bytes(
+        bytes
+            .get(..size_of::<TxDataRecordHeader>())
+            .context("transactional data record is shorter than its header")?,
+    )?;
+    Ok(match header.role()? {
+        TxDataRecordRole::TObjectPub => BlockKind::ObjectData,
+        TxDataRecordRole::TMemoryUndo => BlockKind::LinearUndo,
+    })
+}
+
+fn next_chunk_generation(generation: u32) -> Result<u32> {
+    ensure!(
+        generation < TxEntryMeta::MAX_DATA_BLOCK_GENERATION,
+        "durable block generation exhausted for chunk reuse"
+    );
+    Ok(generation + 1)
+}
+
+fn reusable_chunk_generation(
+    block_metas: &[BlockMeta],
+    start: usize,
+    block_count: usize,
+) -> Result<Option<u32>> {
+    let end = start
+        .checked_add(block_count)
+        .context("transactional chunk metadata range overflow")?;
+    let chunk_start = u32::try_from(start).context("transactional chunk start block overflow")?;
+    let chunk_blocks =
+        u32::try_from(block_count).context("transactional chunk block count overflow")?;
+    let mut chunk_state = None;
+    let mut generation = None;
+
+    for meta in &block_metas[start..end] {
+        let state = meta.state()?;
+        match state {
+            BlockState::Free | BlockState::Retired => {}
+            BlockState::Active | BlockState::Sealed => return Ok(None),
+        }
+        if let Some(expected_state) = chunk_state {
+            if expected_state != state {
+                return Ok(None);
+            }
+        } else {
+            chunk_state = Some(state);
+        }
+
+        let block_generation = match state {
+            BlockState::Free => meta.generation,
+            BlockState::Retired => {
+                if meta.chunk_start != chunk_start || meta.chunk_blocks != chunk_blocks {
+                    return Ok(None);
+                }
+                next_chunk_generation(meta.generation)?
+            }
+            BlockState::Active | BlockState::Sealed => unreachable!(),
+        };
+        if let Some(expected_generation) = generation {
+            if expected_generation != block_generation {
+                return Ok(None);
+            }
+        } else {
+            generation = Some(block_generation);
+        }
+    }
+
+    Ok(generation)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -922,7 +1005,7 @@ impl VMemoryBlockRegion {
     }
 
     pub(crate) fn alloc_log_block(&mut self, stream_id: u32, block_seq: u32) -> Result<u32> {
-        let chunk = self.alloc_chunk(1)?;
+        let chunk = self.alloc_chunk_for_kind(1, BlockKind::Log, stream_id)?;
         let start_block = u32::try_from(chunk.start_block())
             .context("transactional log block start block overflow")?;
         let header = LogBlockHeader {
@@ -942,6 +1025,16 @@ impl VMemoryBlockRegion {
         chunk_seq: u32,
         total_bytes: usize,
     ) -> Result<u32> {
+        self.alloc_data_chunk_for_kind(stream_id, chunk_seq, BlockKind::ObjectData, total_bytes)
+    }
+
+    fn alloc_data_chunk_for_kind(
+        &mut self,
+        stream_id: u32,
+        chunk_seq: u32,
+        kind: BlockKind,
+        total_bytes: usize,
+    ) -> Result<u32> {
         let class = if total_bytes <= SMALL_DATA_LIMIT {
             DataChunkClass::Small
         } else if total_bytes <= self.block_payload_capacity() {
@@ -949,7 +1042,7 @@ impl VMemoryBlockRegion {
         } else {
             DataChunkClass::Large
         };
-        self.alloc_data_chunk_for_class(stream_id, chunk_seq, class, total_bytes)
+        self.alloc_data_chunk_for_class(stream_id, chunk_seq, class, kind, total_bytes)
     }
 
     pub(crate) fn alloc_stream(&mut self, stream_id: u32) -> Result<StreamCursor> {
@@ -971,18 +1064,21 @@ impl VMemoryBlockRegion {
         stream: StreamCursor,
         bytes: &[u8],
     ) -> Result<DataRecordLocation> {
+        let kind = block_kind_for_data_record(bytes)?;
         let mut state = *self.streams.get(&stream.stream_id).with_context(|| {
             format!("transactional stream {} is not allocated", stream.stream_id)
         })?;
 
         let chunk_start_block = if let Some(start_block) = state.current_data_chunk_start {
             let header = self.data_chunk_header(start_block)?;
-            if self.chunk_remaining_capacity(header)? >= bytes.len() {
+            let current_kind = self.block_meta(start_block)?.kind()?;
+            if current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len() {
                 start_block
             } else {
-                let next_chunk_start = self.alloc_data_chunk(
+                let next_chunk_start = self.alloc_data_chunk_for_kind(
                     stream.stream_id,
                     state.next_data_chunk_seq,
+                    kind,
                     bytes.len(),
                 )?;
                 let mut previous = header;
@@ -996,8 +1092,12 @@ impl VMemoryBlockRegion {
                 next_chunk_start
             }
         } else {
-            let start_block =
-                self.alloc_data_chunk(stream.stream_id, state.next_data_chunk_seq, bytes.len())?;
+            let start_block = self.alloc_data_chunk_for_kind(
+                stream.stream_id,
+                state.next_data_chunk_seq,
+                kind,
+                bytes.len(),
+            )?;
             state.next_data_chunk_seq = state
                 .next_data_chunk_seq
                 .checked_add(1)
@@ -1164,22 +1264,46 @@ impl VMemoryBlockRegion {
     }
 
     pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        self.alloc_chunk_for_kind(block_count, BlockKind::ObjectData, 0)
+    }
+
+    fn alloc_chunk_for_kind(
+        &mut self,
+        block_count: usize,
+        kind: BlockKind,
+        owner_thread: u32,
+    ) -> Result<RegionChunk> {
         ensure!(block_count > 0, "transactional chunk must contain a block");
         ensure!(
             block_count <= self.num_blocks(),
             "transactional chunk exceeds region size"
         );
+        ensure!(
+            kind != BlockKind::Free,
+            "transactional chunk allocations require a durable non-free kind"
+        );
 
         let last_start = self.num_blocks() - block_count;
         for start in 0..=last_start {
             let end = start + block_count;
-            if self.block_entries[start..end]
-                .iter()
-                .all(|entry| entry.used == 0)
-            {
+            if self.block_entries[start..end].iter().all(|entry| entry.used == 0) {
+                let Some(generation) =
+                    reusable_chunk_generation(&self.block_metas, start, block_count)?
+                else {
+                    continue;
+                };
+                let chunk_start =
+                    u32::try_from(start).context("transactional chunk start block overflow")?;
+                let chunk_blocks = u32::try_from(block_count)
+                    .context("transactional chunk block count overflow")?;
                 for entry in &mut self.block_entries[start..end] {
                     entry.used = 1;
                     entry.list_num = ListKind::Used as i16;
+                }
+                let meta =
+                    BlockMeta::active(kind, generation, owner_thread, chunk_start, chunk_blocks);
+                for block_meta in &mut self.block_metas[start..end] {
+                    *block_meta = meta;
                 }
                 return Ok(RegionChunk {
                     start_block: start,
@@ -1309,13 +1433,14 @@ impl VMemoryBlockRegion {
         stream_id: u32,
         chunk_seq: u32,
         class: DataChunkClass,
+        kind: BlockKind,
         total_bytes: usize,
     ) -> Result<u32> {
         let chunk_blocks = match class {
             DataChunkClass::Small | DataChunkClass::Medium => 1,
             DataChunkClass::Large => self.required_data_chunk_blocks(total_bytes)?,
         };
-        let chunk = self.alloc_chunk(chunk_blocks)?;
+        let chunk = self.alloc_chunk_for_kind(chunk_blocks, kind, stream_id)?;
         let start_block = u32::try_from(chunk.start_block())
             .context("transactional data chunk start block overflow")?;
         let header = DataChunkHeader {
@@ -1468,6 +1593,22 @@ impl VMemoryBlockRegion {
         self.read(self.block_offset(start_block)?, len)
     }
 
+    pub(crate) fn block_meta(&self, block: u32) -> Result<BlockMeta> {
+        let block = usize::try_from(block).context("transactional block index overflow")?;
+        self.block_metas
+            .get(block)
+            .copied()
+            .context("transactional block metadata index out of bounds")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_meta_for_test(&self, block: usize) -> Result<BlockMeta> {
+        self.block_metas
+            .get(block)
+            .copied()
+            .context("test block metadata index out of bounds")
+    }
+
     fn write_log_block_header(&mut self, start_block: u32, header: LogBlockHeader) -> Result<()> {
         self.write(self.block_offset(start_block)?, &header.as_bytes())
     }
@@ -1496,6 +1637,10 @@ impl BlockRegionBackend for VMemoryBlockRegion {
 
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
         self.alloc_chunk(block_count)
+    }
+
+    fn block_meta(&self, block: u32) -> Result<BlockMeta> {
+        self.block_meta(block)
     }
 
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -1574,6 +1719,15 @@ impl NVMemoryBlockRegion {
     }
 
     pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        self.alloc_chunk_for_kind(block_count, BlockKind::ObjectData, 0)
+    }
+
+    fn alloc_chunk_for_kind(
+        &mut self,
+        block_count: usize,
+        kind: BlockKind,
+        owner_thread: u32,
+    ) -> Result<RegionChunk> {
         ensure!(
             block_count > 0,
             "transactional NVMemory chunk must contain a block"
@@ -1582,17 +1736,32 @@ impl NVMemoryBlockRegion {
             block_count <= self.num_blocks(),
             "transactional NVMemory chunk exceeds region size"
         );
+        ensure!(
+            kind != BlockKind::Free,
+            "transactional NVMemory chunk allocations require a durable non-free kind"
+        );
 
         let last_start = self.num_blocks() - block_count;
         for start in 0..=last_start {
             let end = start + block_count;
-            if self.block_entries[start..end]
-                .iter()
-                .all(|entry| entry.used == 0)
-            {
+            if self.block_entries[start..end].iter().all(|entry| entry.used == 0) {
+                let Some(generation) =
+                    reusable_chunk_generation(&self.block_metas, start, block_count)?
+                else {
+                    continue;
+                };
+                let chunk_start =
+                    u32::try_from(start).context("transactional chunk start block overflow")?;
+                let chunk_blocks = u32::try_from(block_count)
+                    .context("transactional chunk block count overflow")?;
                 for entry in &mut self.block_entries[start..end] {
                     entry.used = 1;
                     entry.list_num = ListKind::Used as i16;
+                }
+                let meta =
+                    BlockMeta::active(kind, generation, owner_thread, chunk_start, chunk_blocks);
+                for block_meta in &mut self.block_metas[start..end] {
+                    *block_meta = meta;
                 }
                 return Ok(RegionChunk {
                     start_block: start,
@@ -1645,6 +1814,14 @@ impl NVMemoryBlockRegion {
     pub(crate) fn fence(&self) -> Result<()> {
         self.persist.fence()
     }
+
+    pub(crate) fn block_meta(&self, block: u32) -> Result<BlockMeta> {
+        let block = usize::try_from(block).context("transactional block index overflow")?;
+        self.block_metas
+            .get(block)
+            .copied()
+            .context("transactional NVMemory block metadata index out of bounds")
+    }
 }
 
 impl BlockRegionBackend for NVMemoryBlockRegion {
@@ -1666,6 +1843,10 @@ impl BlockRegionBackend for NVMemoryBlockRegion {
 
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
         self.alloc_chunk(block_count)
+    }
+
+    fn block_meta(&self, block: u32) -> Result<BlockMeta> {
+        self.block_meta(block)
     }
 
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -1785,6 +1966,15 @@ impl FileBackedMemoryBlockRegion {
     }
 
     pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        self.alloc_chunk_for_kind(block_count, BlockKind::ObjectData, 0)
+    }
+
+    fn alloc_chunk_for_kind(
+        &mut self,
+        block_count: usize,
+        kind: BlockKind,
+        owner_thread: u32,
+    ) -> Result<RegionChunk> {
         ensure!(
             block_count > 0,
             "transactional FileBackedMemory chunk must contain a block"
@@ -1793,18 +1983,35 @@ impl FileBackedMemoryBlockRegion {
             block_count <= self.num_blocks(),
             "transactional FileBackedMemory chunk exceeds region size"
         );
+        ensure!(
+            kind != BlockKind::Free,
+            "transactional FileBackedMemory chunk allocations require a durable non-free kind"
+        );
 
         let last_start = self.num_blocks() - block_count;
         for start in 0..=last_start {
             let end = start + block_count;
-            if self.block_entries[start..end]
-                .iter()
-                .all(|entry| entry.used == 0)
-            {
+            if self.block_entries[start..end].iter().all(|entry| entry.used == 0) {
+                let Some(generation) =
+                    reusable_chunk_generation(&self.block_metas, start, block_count)?
+                else {
+                    continue;
+                };
+                let chunk_start =
+                    u32::try_from(start).context("transactional chunk start block overflow")?;
+                let chunk_blocks = u32::try_from(block_count)
+                    .context("transactional chunk block count overflow")?;
                 for entry in &mut self.block_entries[start..end] {
                     entry.used = 1;
                     entry.list_num = ListKind::Used as i16;
                 }
+                let meta =
+                    BlockMeta::active(kind, generation, owner_thread, chunk_start, chunk_blocks);
+                for block in start..end {
+                    self.write_block_meta(block, meta)?;
+                }
+                self.flush_block_meta_range(start, block_count)?;
+                self.fence()?;
                 return Ok(RegionChunk {
                     start_block: start,
                     block_count,
@@ -1816,7 +2023,7 @@ impl FileBackedMemoryBlockRegion {
     }
 
     pub(crate) fn alloc_log_block(&mut self, stream_id: u32, block_seq: u32) -> Result<u32> {
-        let chunk = self.alloc_chunk(1)?;
+        let chunk = self.alloc_chunk_for_kind(1, BlockKind::Log, stream_id)?;
         let start_block = u32::try_from(chunk.start_block())
             .context("transactional log block start block overflow")?;
         let header = LogBlockHeader {
@@ -1836,6 +2043,16 @@ impl FileBackedMemoryBlockRegion {
         chunk_seq: u32,
         total_bytes: usize,
     ) -> Result<u32> {
+        self.alloc_data_chunk_for_kind(stream_id, chunk_seq, BlockKind::ObjectData, total_bytes)
+    }
+
+    fn alloc_data_chunk_for_kind(
+        &mut self,
+        stream_id: u32,
+        chunk_seq: u32,
+        kind: BlockKind,
+        total_bytes: usize,
+    ) -> Result<u32> {
         let class = if total_bytes <= SMALL_DATA_LIMIT {
             DataChunkClass::Small
         } else if total_bytes <= self.block_payload_capacity() {
@@ -1843,7 +2060,7 @@ impl FileBackedMemoryBlockRegion {
         } else {
             DataChunkClass::Large
         };
-        self.alloc_data_chunk_for_class(stream_id, chunk_seq, class, total_bytes)
+        self.alloc_data_chunk_for_class(stream_id, chunk_seq, class, kind, total_bytes)
     }
 
     pub(crate) fn alloc_stream(&mut self, stream_id: u32) -> Result<StreamCursor> {
@@ -1865,18 +2082,21 @@ impl FileBackedMemoryBlockRegion {
         stream: StreamCursor,
         bytes: &[u8],
     ) -> Result<DataRecordLocation> {
+        let kind = block_kind_for_data_record(bytes)?;
         let mut state = *self.streams.get(&stream.stream_id).with_context(|| {
             format!("transactional stream {} is not allocated", stream.stream_id)
         })?;
 
         let chunk_start_block = if let Some(start_block) = state.current_data_chunk_start {
             let header = self.data_chunk_header(start_block)?;
-            if self.chunk_remaining_capacity(header)? >= bytes.len() {
+            let current_kind = self.block_meta(start_block)?.kind()?;
+            if current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len() {
                 start_block
             } else {
-                let next_chunk_start = self.alloc_data_chunk(
+                let next_chunk_start = self.alloc_data_chunk_for_kind(
                     stream.stream_id,
                     state.next_data_chunk_seq,
+                    kind,
                     bytes.len(),
                 )?;
                 let mut previous = header;
@@ -1890,8 +2110,12 @@ impl FileBackedMemoryBlockRegion {
                 next_chunk_start
             }
         } else {
-            let start_block =
-                self.alloc_data_chunk(stream.stream_id, state.next_data_chunk_seq, bytes.len())?;
+            let start_block = self.alloc_data_chunk_for_kind(
+                stream.stream_id,
+                state.next_data_chunk_seq,
+                kind,
+                bytes.len(),
+            )?;
             state.next_data_chunk_seq = state
                 .next_data_chunk_seq
                 .checked_add(1)
@@ -2273,16 +2497,19 @@ impl FileBackedMemoryBlockRegion {
 
     fn rebuild_state_from_image(&mut self) -> Result<()> {
         self.reset_recovered_state();
-        self.mark_blocks_used(0, reserved_metadata_blocks(self.num_blocks())?)?;
+        let reserved_metadata_blocks = reserved_metadata_blocks(self.num_blocks())?;
+        self.mark_blocks_used(0, reserved_metadata_blocks)?;
 
         let mut chunk_tails = BTreeMap::<u32, (u32, u32)>::new();
         let mut log_tails = BTreeMap::<u32, (u32, u32)>::new();
-        let mut block = reserved_metadata_blocks(self.num_blocks())?;
+        let mut covered_blocks = vec![false; self.num_blocks()];
+        let mut block = reserved_metadata_blocks;
         while block < self.num_blocks() {
             let start_block = u32::try_from(block).context("transactional block index overflow")?;
             match self.block_magic(start_block)? {
                 LOG_BLOCK_MAGIC => {
                     let header = self.log_block_header(start_block)?;
+                    covered_blocks[block] = true;
                     self.mark_blocks_used(block, 1)?;
                     let state = self.streams.entry(header.stream_id).or_default();
                     let next_log_seq = header
@@ -2310,6 +2537,7 @@ impl FileBackedMemoryBlockRegion {
                         block + chunk_blocks <= self.num_blocks(),
                         "transactional data chunk at block {start_block} exceeds region"
                     );
+                    covered_blocks[block..block + chunk_blocks].fill(true);
                     self.mark_blocks_used(block, chunk_blocks)?;
                     let state = self.streams.entry(header.stream_id).or_default();
                     let next_chunk_seq = header
@@ -2329,6 +2557,44 @@ impl FileBackedMemoryBlockRegion {
                     block += 1;
                 }
             }
+        }
+
+        let mut repaired_runs = Vec::new();
+        let mut repair_start = None;
+        let mut repair_len = 0usize;
+        for (block, covered) in covered_blocks.iter().copied().enumerate().skip(reserved_metadata_blocks)
+        {
+            let meta = self.block_metas[block];
+            let state = meta.state()?;
+            let kind = meta.kind()?;
+            let orphaned_reservation = !covered
+                && kind != BlockKind::Metadata
+                && matches!(state, BlockState::Active | BlockState::Sealed);
+            if orphaned_reservation {
+                self.write_block_meta(block, BlockMeta::free())?;
+                self.block_entries[block] = BlockEntry::default();
+                if let Some(start) = repair_start {
+                    if start + repair_len == block {
+                        repair_len += 1;
+                    } else {
+                        repaired_runs.push((start, repair_len));
+                        repair_start = Some(block);
+                        repair_len = 1;
+                    }
+                } else {
+                    repair_start = Some(block);
+                    repair_len = 1;
+                }
+            }
+        }
+        if let Some(start) = repair_start {
+            repaired_runs.push((start, repair_len));
+        }
+        if !repaired_runs.is_empty() {
+            for (start, len) in repaired_runs {
+                self.flush_block_meta_range(start, len)?;
+            }
+            self.fence()?;
         }
 
         for (stream_id, (_, start_block)) in chunk_tails {
@@ -2385,13 +2651,14 @@ impl FileBackedMemoryBlockRegion {
         stream_id: u32,
         chunk_seq: u32,
         class: DataChunkClass,
+        kind: BlockKind,
         total_bytes: usize,
     ) -> Result<u32> {
         let chunk_blocks = match class {
             DataChunkClass::Small | DataChunkClass::Medium => 1,
             DataChunkClass::Large => self.required_data_chunk_blocks(total_bytes)?,
         };
-        let chunk = self.alloc_chunk(chunk_blocks)?;
+        let chunk = self.alloc_chunk_for_kind(chunk_blocks, kind, stream_id)?;
         let start_block = u32::try_from(chunk.start_block())
             .context("transactional data chunk start block overflow")?;
         let header = DataChunkHeader {
@@ -2515,6 +2782,14 @@ impl FileBackedMemoryBlockRegion {
         self.read(self.block_offset(start_block)?, len)
     }
 
+    pub(crate) fn block_meta(&self, block: u32) -> Result<BlockMeta> {
+        let block = usize::try_from(block).context("transactional block index overflow")?;
+        self.block_metas
+            .get(block)
+            .copied()
+            .context("transactional FileBackedMemory block metadata index out of bounds")
+    }
+
     fn write_log_block_header(&mut self, start_block: u32, header: LogBlockHeader) -> Result<()> {
         self.write(self.block_offset(start_block)?, &header.as_bytes())
     }
@@ -2543,6 +2818,10 @@ impl BlockRegionBackend for FileBackedMemoryBlockRegion {
 
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
         self.alloc_chunk(block_count)
+    }
+
+    fn block_meta(&self, block: u32) -> Result<BlockMeta> {
+        self.block_meta(block)
     }
 
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -3134,6 +3413,65 @@ mod tests {
     }
 
     #[test]
+    fn block_region_tracks_log_and_data_chunk_kinds() {
+        let mut region = VMemoryBlockRegion::new_for_test(16).unwrap();
+        let stream = region.alloc_stream(3).unwrap();
+
+        let object_record = TMemory::encode_publication_data_record(
+            0x6000_0000_0000_002a,
+            1,
+            PackedGranuleDomain::TStruct as u16,
+            11,
+            &[1, 2, 3],
+        )
+        .unwrap();
+        let object_location = region.append_data_record(stream, &object_record).unwrap();
+        let log_block = region.alloc_log_block(3, 0).unwrap();
+
+        assert_eq!(
+            region
+                .block_meta_for_test(usize::try_from(object_location.data_block).unwrap())
+                .unwrap()
+                .kind()
+                .unwrap(),
+            BlockKind::ObjectData
+        );
+        assert_eq!(
+            region
+                .block_meta_for_test(usize::try_from(log_block).unwrap())
+                .unwrap()
+                .kind()
+                .unwrap(),
+            BlockKind::Log
+        );
+    }
+
+    #[test]
+    fn block_region_tracks_linear_undo_chunk_kind() {
+        let mut region = VMemoryBlockRegion::new_for_test(16).unwrap();
+        let stream = region.alloc_stream(9).unwrap();
+        let undo_record = TMemory::encode_granule_undo_data_record(
+            0x1000_0000_0000_0007,
+            2,
+            PackedGranuleDomain::TMemory as u16,
+            0,
+            &[0xaa; 16],
+        )
+        .unwrap();
+
+        let location = region.append_data_record(stream, &undo_record).unwrap();
+
+        assert_eq!(
+            region
+                .block_meta_for_test(usize::try_from(location.data_block).unwrap())
+                .unwrap()
+                .kind()
+                .unwrap(),
+            BlockKind::LinearUndo
+        );
+    }
+
+    #[test]
     fn vmemory_block_region_initializes_line_marks() {
         let mut region = VMemoryBlockRegion::new(2).unwrap();
         let chunk = region.alloc_chunk(1).unwrap();
@@ -3462,6 +3800,106 @@ mod tests {
 
         assert_eq!(region.num_blocks(), 64);
         assert_eq!(region.block_meta_for_test(63).unwrap(), BlockMeta::free());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reopen_repairs_orphaned_active_block_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan-block-meta-region.bin");
+        let orphan_block;
+
+        {
+            let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+            orphan_block = reserved_metadata_blocks(region.num_blocks()).unwrap();
+            region
+                .write_block_meta(
+                    orphan_block,
+                    BlockMeta::active(
+                        BlockKind::ObjectData,
+                        7,
+                        11,
+                        u32::try_from(orphan_block).unwrap(),
+                        1,
+                    ),
+                )
+                .unwrap();
+            region.flush_block_meta_range(orphan_block, 1).unwrap();
+            region.fence().unwrap();
+        }
+
+        {
+            let region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+            assert_eq!(region.block_meta_for_test(orphan_block).unwrap(), BlockMeta::free());
+            assert_eq!(region.block_entries[orphan_block].used, 0);
+        }
+
+        let recovered = reopen_and_recover_file_backed_region_for_test(&path).unwrap();
+        assert!(recovered.streams.is_empty());
+        assert!(recovered.winners.is_empty());
+
+        let mut region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        let stream = region.alloc_stream(5).unwrap();
+        let record = TMemory::encode_publication_data_record(
+            0x6000_0000_0000_0005,
+            1,
+            PackedGranuleDomain::TStruct as u16,
+            17,
+            &[1, 2, 3, 4],
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+
+        assert_eq!(usize::try_from(location.chunk_start_block).unwrap(), orphan_block);
+        assert_eq!(
+            region.block_meta_for_test(orphan_block).unwrap().kind().unwrap(),
+            BlockKind::ObjectData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reopen_keeps_multiblock_data_chunk_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multiblock-coverage-region.bin");
+        let chunk_start_block;
+        let chunk_blocks;
+
+        {
+            let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+            let stream = region.alloc_stream(7).unwrap();
+            let record = TMemory::encode_publication_data_record(
+                0x6000_0000_0000_0007,
+                1,
+                PackedGranuleDomain::TStruct as u16,
+                19,
+                &vec![0x5a; LARGE_DATA_RECORD_BYTES],
+            )
+            .unwrap();
+            let location = region.append_data_record(stream, &record).unwrap();
+            chunk_start_block = location.chunk_start_block;
+            chunk_blocks = region.data_chunk_header(chunk_start_block).unwrap().chunk_blocks;
+            region.flush_data_chunk(chunk_start_block).unwrap();
+            region.fence().unwrap();
+        }
+
+        let mut region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        assert!(chunk_blocks > 1);
+        for block in
+            usize::try_from(chunk_start_block).unwrap()..usize::try_from(chunk_start_block).unwrap()
+                + usize::try_from(chunk_blocks).unwrap()
+        {
+            let meta = region.block_meta_for_test(block).unwrap();
+            assert_eq!(meta.kind().unwrap(), BlockKind::ObjectData);
+            assert_eq!(meta.state().unwrap(), BlockState::Active);
+            assert_eq!(region.block_entries[block].used, 1);
+        }
+
+        let next_chunk = region.alloc_chunk(1).unwrap();
+        assert_eq!(
+            next_chunk.start_block(),
+            usize::try_from(chunk_start_block).unwrap() + usize::try_from(chunk_blocks).unwrap()
+        );
     }
 
     #[cfg(unix)]
