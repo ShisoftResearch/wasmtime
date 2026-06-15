@@ -165,9 +165,9 @@ identities.
 ## Workstream 4: Durable Func/Extern Identity Sources
 
 Status: partially implemented. Function references use explicit per-store
-registered identities, with an internal exported-function helper that derives
-the module fingerprint from retained original Wasm bytecode and the function
-index from Wasmtime export metadata.
+registered identities, with internal exported-function helpers that derive the
+module fingerprint from retained original Wasm bytecode and function indices
+from Wasmtime export metadata.
 External references use an embedded durable externref host-data wrapper in the
 internal test seam. Store-local registered-function resolution exists for
 loaded exported functions after they are explicitly registered in that store;
@@ -175,7 +175,8 @@ registered live `tfuncref` values can now roundtrip through transactional
 object get/set helpers in that same store. Internal durable `texternref` test
 values can also roundtrip through the same live helper boundary after
 store-local registration. Public identity APIs, recovered-payload
-reintegration, and multi-instance/module namespace policy remain pending.
+reintegration, public host APIs, and multi-instance/module namespace policy
+remain pending.
 
 The object value ABI can store durable function/external identities, but runtime
 helpers still need authoritative identity encoders at the boundaries where raw
@@ -189,9 +190,12 @@ Wasmtime refs are observed.
   registered raw `funcref` values encode as inline durable leaves and durable
   `FuncRef` leaves resolve back to live `funcref` values on `tstruct`/`tarray`
   reads in the same store.
-- [ ] Define full public/recovery-time `tfuncref` resolution semantics,
-  including recovered-payload reintegration and multi-instance/module namespace
-  policy.
+- [x] Add a recovery-time bulk exported-function registration helper so a
+  restarted store can register all defined function exports for an instantiated
+  module under the durable module fingerprint and Wasmtime function indices.
+  Imported function re-exports and non-function exports are ignored.
+- [ ] Define full public `tfuncref` resolution APIs, recovered-payload
+  reintegration, and multi-instance/module namespace policy.
 - [x] Define explicit external-reference namespaces and handles for
   `texternref` values.
 - [x] Add internal per-store registration APIs for durable function identities

@@ -555,6 +555,8 @@ pub mod _internal {
     #[cfg(feature = "transaction")]
     pub mod transaction_persistence {
         use crate::error::Context as _;
+        use alloc::string::{String, ToString};
+        use alloc::vec::Vec;
 
         pub use crate::vm::block_region::{
             TransactionPersistenceRecoveredObjectWinner, TransactionPersistenceRecoveredRegion,
@@ -611,6 +613,13 @@ pub mod _internal {
             )?)
         }
 
+        #[derive(Debug)]
+        pub struct RegisteredDurableFuncRefForTest {
+            pub export_name: String,
+            pub function_index: u32,
+            pub func: crate::Func,
+        }
+
         pub fn register_exported_durable_func_ref_for_test<T>(
             store: &mut crate::Store<T>,
             instance: &crate::Instance,
@@ -639,6 +648,54 @@ pub mod _internal {
                 type_layout_id,
             )?;
             Ok(func)
+        }
+
+        pub fn register_exported_durable_func_refs_for_test<T>(
+            store: &mut crate::Store<T>,
+            instance: &crate::Instance,
+            type_layout_id: u32,
+        ) -> crate::Result<Vec<RegisteredDurableFuncRefForTest>> {
+            let module = instance.module(&mut *store).clone();
+            let exports = module
+                .exports()
+                .filter_map(|export| {
+                    let module_export = module.get_export_index(export.name())?;
+                    match module_export.entity {
+                        wasmtime_environ::EntityIndex::Function(index)
+                            if module.env_module().defined_func_index(index).is_some() =>
+                        {
+                            Some((export.name().to_string(), module_export, index.as_u32()))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if exports.is_empty() {
+                return Ok(Vec::new());
+            }
+            let module_fingerprint = module_fingerprint_for_test(&module)?;
+            let mut registered = Vec::with_capacity(exports.len());
+            for (export_name, export, function_index) in exports {
+                let func = instance
+                    .get_module_export(&mut *store, &export)
+                    .and_then(|export| export.into_func())
+                    .with_context(|| {
+                        format!("instance export `{export_name}` is not a function export")
+                    })?;
+                register_durable_func_ref_for_test(
+                    store,
+                    &func,
+                    module_fingerprint,
+                    function_index,
+                    type_layout_id,
+                )?;
+                registered.push(RegisteredDurableFuncRefForTest {
+                    export_name,
+                    function_index,
+                    func,
+                });
+            }
+            Ok(registered)
         }
 
         pub fn module_fingerprint_for_test(module: &crate::Module) -> crate::Result<u64> {

@@ -56,6 +56,33 @@ cargo test -p wasmtime --lib adapter_promotion -- --format terse
 test result: ok. 4 passed; 0 failed; 0 ignored
 ```
 
+## Current Status: Recovery-Time Function Ref Registration
+
+Date: 2026-06-15
+
+Recovery-time durable `tfuncref` registration now has a bulk helper for the
+current internal API surface:
+
+- `_internal::transaction_persistence::register_exported_durable_func_refs_for_test`
+  walks an instantiated module's exports, registers every defined function
+  export under the module fingerprint and Wasmtime function index, and ignores
+  imported function re-exports and non-function exports. If no defined function
+  exports exist, it returns an empty list without requiring retained bytecode.
+- This documents the current recovery rule: after restart, instantiate the
+  module that owns durable function identities, bulk-register its function
+  exports in the restarted store, then recovered inline `FuncRef` leaves can
+  resolve through the store-local durable reference registry.
+- Duplicate module instances with the same durable function identity remain
+  rejected by the registry. A public host API and long-term multi-instance
+  namespace policy are still pending.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --test transaction_persistence durable_funcref_bulk_export_registration_resolves_recovered_identities -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Persistent Promotion Detour
 
 Date: 2026-06-15

@@ -380,6 +380,126 @@ fn durable_funcref_registration_rejects_ambiguous_identity() -> Result<()> {
 }
 
 #[test]
+fn durable_funcref_bulk_export_registration_resolves_recovered_identities() -> Result<()> {
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        r#"
+        (module
+          (func $first (export "first"))
+          (func $second (export "second"))
+          (global (export "not-a-func") i32 (i32.const 7)))
+        "#,
+    )?;
+    let expected_module_fingerprint =
+        wasmtime::_internal::transaction_persistence::module_fingerprint_for_test(&module)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let registered =
+        wasmtime::_internal::transaction_persistence::register_exported_durable_func_refs_for_test(
+            &mut store, &instance, 1,
+        )?;
+    let registered_names = registered
+        .iter()
+        .map(|entry| entry.export_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(registered_names, ["first", "second"]);
+
+    for entry in registered {
+        let resolved =
+            wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+                &mut store,
+                expected_module_fingerprint,
+                entry.function_index,
+                1,
+            )?
+            .expect("bulk-registered durable function identity should resolve");
+        assert_eq!(resolved.to_raw(&mut store), entry.func.to_raw(&mut store));
+    }
+
+    assert!(
+        wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+            &mut store,
+            expected_module_fingerprint,
+            2,
+            1,
+        )?
+        .is_none()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn durable_funcref_bulk_registration_ignores_non_function_exports_without_bytecode() -> Result<()> {
+    let engine = Engine::default();
+    let module = Module::new(
+        &engine,
+        r#"(module (global (export "not-a-func") i32 (i32.const 7)))"#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let registered =
+        wasmtime::_internal::transaction_persistence::register_exported_durable_func_refs_for_test(
+            &mut store, &instance, 1,
+        )?;
+    assert!(registered.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn durable_funcref_bulk_registration_skips_imported_function_exports() -> Result<()> {
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        r#"
+        (module
+          (import "" "host" (func $host))
+          (func $local (export "local"))
+          (export "host-reexport" (func $host)))
+        "#,
+    )?;
+    let expected_module_fingerprint =
+        wasmtime::_internal::transaction_persistence::module_fingerprint_for_test(&module)?;
+    let mut store = Store::new(&engine, ());
+    let host = Func::wrap(&mut store, || {});
+    let instance = Instance::new(&mut store, &module, &[host.into()])?;
+
+    let registered =
+        wasmtime::_internal::transaction_persistence::register_exported_durable_func_refs_for_test(
+            &mut store, &instance, 1,
+        )?;
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].export_name, "local");
+    assert_eq!(registered[0].function_index, 1);
+    assert!(
+        wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+            &mut store,
+            expected_module_fingerprint,
+            0,
+            1,
+        )?
+        .is_none()
+    );
+    let resolved = wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+        &mut store,
+        expected_module_fingerprint,
+        1,
+        1,
+    )?
+    .expect("defined exported function should be registered");
+    assert_eq!(
+        resolved.to_raw(&mut store),
+        registered[0].func.to_raw(&mut store)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn exported_funcref_auto_identity_requires_retained_module_bytecode() -> Result<()> {
     let engine = Engine::default();
     let module = Module::new(&engine, r#"(module (func (export "target")))"#)?;
