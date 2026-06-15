@@ -880,6 +880,13 @@ pub(crate) struct RegionChunk {
 }
 
 impl RegionChunk {
+    pub(crate) fn new(start_block: usize, block_count: usize) -> Self {
+        Self {
+            start_block,
+            block_count,
+        }
+    }
+
     pub(crate) fn start_block(&self) -> usize {
         self.start_block
     }

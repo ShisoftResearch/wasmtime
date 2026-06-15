@@ -5,8 +5,8 @@
 use crate::prelude::*;
 
 use super::block_region::{
-    BLOCK_SIZE, BlockRegionBackend, ChunkList, FileBackedMemoryBlockRegion, FileBackedRegionMode,
-    IMMIX_LINE_SIZE, NVMemoryBlockRegion, PersistenceMode, VMemoryBlockRegion,
+    BLOCK_SIZE, BlockRegionBackend, ChunkList, FileBackedMapping, FileBackedRegionMode,
+    IMMIX_LINE_SIZE, NVMemoryBlockRegion, PersistenceMode, RegionChunk, VMemoryBlockRegion,
 };
 
 pub(super) trait LinearRegionBackend:
@@ -55,7 +55,7 @@ impl TMemoryRegion {
         mode: FileBackedRegionMode,
     ) -> Result<Self> {
         let block_count = byte_capacity.div_ceil(BLOCK_SIZE);
-        let mut backend = FileBackedMemoryBlockRegion::new(block_count, mode)?;
+        let mut backend = FileBackedLinearRegion::new(block_count, mode)?;
         let chunks = if block_count == 0 {
             Vec::new()
         } else {
@@ -109,6 +109,99 @@ impl TMemoryRegion {
 
     pub(super) fn line_mark_count_for_test(&self) -> usize {
         self.linear.line_mark_count_for_test()
+    }
+}
+
+#[derive(Debug)]
+struct FileBackedLinearRegion {
+    mapping: FileBackedMapping,
+    next_free_block: usize,
+}
+
+impl FileBackedLinearRegion {
+    fn new(block_count: usize, mode: FileBackedRegionMode) -> Result<Self> {
+        let bytes_len = block_count
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional linear file-backed region size overflow")?;
+        Ok(Self {
+            mapping: FileBackedMapping::new(mode, bytes_len)?,
+            next_free_block: 0,
+        })
+    }
+}
+
+impl BlockRegionBackend for FileBackedLinearRegion {
+    fn block_size(&self) -> usize {
+        BLOCK_SIZE
+    }
+
+    fn num_blocks(&self) -> usize {
+        self.mapping.len() / BLOCK_SIZE
+    }
+
+    fn bytes_len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    fn line_mark_count(&self) -> usize {
+        self.mapping.len() / IMMIX_LINE_SIZE
+    }
+
+    fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
+        ensure!(
+            block_count > 0,
+            "transactional linear file-backed chunk must contain a block"
+        );
+        let start = self.next_free_block;
+        let end = start
+            .checked_add(block_count)
+            .context("transactional linear file-backed chunk range overflow")?;
+        ensure!(
+            end <= self.num_blocks(),
+            "transactional linear file-backed region is out of contiguous chunks"
+        );
+        self.next_free_block = end;
+        Ok(RegionChunk::new(start, block_count))
+    }
+
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.mapping.read(offset, len)
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.mapping.write(offset, bytes)
+    }
+
+    fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        self.mapping.flush(offset, len)
+    }
+
+    fn fence(&self) -> Result<()> {
+        self.mapping.fence_data()
+    }
+
+    fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
+        let old_block_count = self.num_blocks();
+        ensure!(
+            new_block_count >= old_block_count,
+            "transactional linear file-backed region cannot shrink"
+        );
+        if new_block_count == old_block_count {
+            return Ok(None);
+        }
+
+        let bytes_len = new_block_count
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional linear file-backed region size overflow")?;
+        self.mapping.remap_len(bytes_len)?;
+
+        let additional_blocks = new_block_count - old_block_count;
+        ensure!(
+            self.next_free_block == old_block_count,
+            "transactional linear file-backed region has unallocated gap before grow"
+        );
+        self.next_free_block = new_block_count;
+        Ok(Some(RegionChunk::new(old_block_count, additional_blocks)))
     }
 }
 
@@ -552,5 +645,30 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(&bytes[16..20], &[1, 2, 3, 4]);
         assert_eq!(&bytes[BLOCK_SIZE..BLOCK_SIZE + 4], &[5, 6, 7, 8]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reopens_raw_linear_payload_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linear-reopen.tmemory");
+        {
+            let mut region = TMemoryRegion::new_file_backed(
+                BLOCK_SIZE,
+                FileBackedRegionMode::Path(path.clone()),
+            )
+            .unwrap();
+            region.write(32, &[1, 2, 3, 4]).unwrap();
+            region.flush(32, 4).unwrap();
+            region.fence().unwrap();
+        }
+
+        let region = TMemoryRegion::new_file_backed(
+            BLOCK_SIZE,
+            FileBackedRegionMode::OpenExistingPath(path),
+        )
+        .unwrap();
+
+        assert_eq!(region.read(32, 4).unwrap(), vec![1, 2, 3, 4]);
     }
 }
