@@ -783,6 +783,8 @@ pub(crate) const OBJECT_VALUE_ABI_TAG_F32: u32 = 2;
 pub(crate) const OBJECT_VALUE_ABI_TAG_F64: u32 = 3;
 pub(crate) const OBJECT_VALUE_ABI_TAG_V128: u32 = 4;
 pub(crate) const OBJECT_VALUE_ABI_TAG_REF: u32 = 5;
+const VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED: &str =
+    "volatile GC reference promotion into persistent object graph is not implemented yet";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1576,6 +1578,23 @@ impl ObjectTable {
         }
     }
 
+    fn persistent_object_id_for_gc_ref_or_promotion_required(
+        &self,
+        gc_ref: u32,
+    ) -> Result<Option<ObjectId>> {
+        if gc_ref == 0 {
+            return Ok(None);
+        }
+        let Some(object_id) = self.known_object_id_for_gc_ref(gc_ref) else {
+            bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+        };
+        ensure!(
+            self.is_persistent(object_id)?,
+            VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED
+        );
+        Ok(Some(object_id))
+    }
+
     pub(crate) fn gc_ref_for_object_id(&self, object_id: ObjectId) -> Result<u32> {
         self.live_slot(object_id)?;
         self.object_to_gc_ref
@@ -1685,6 +1704,7 @@ impl ObjectTable {
         object_id: ObjectId,
     ) -> Result<persist::PendingPublication> {
         let handle = self.live_slot(object_id)?.current_record;
+        self.validate_persistent_payload_refs(self.heap.payload(handle)?)?;
         let (header, payload) = self.heap.publication_record(handle)?;
         let domain = match object_kind_from_u16(header.kind)? {
             ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
@@ -1698,6 +1718,24 @@ impl ObjectTable {
             header.type_layout_id,
             payload,
         )
+    }
+
+    fn validate_persistent_payload_refs(&self, payload: &ObjectPayload) -> Result<()> {
+        let values = match payload {
+            ObjectPayload::Struct(fields) => fields.as_slice(),
+            ObjectPayload::Array(elements) => elements.as_slice(),
+            ObjectPayload::I31(_) | ObjectPayload::Extern(_) | ObjectPayload::Func(_) => &[],
+        };
+        for value in values {
+            let ObjectValue::Ref(Some(object_id)) = value else {
+                continue;
+            };
+            let Ok(slot) = self.live_slot(*object_id) else {
+                bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+            };
+            ensure!(slot.persistent, VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+        }
+        Ok(())
     }
 
     pub(crate) fn free(&mut self, object_id: ObjectId) -> Result<bool> {
@@ -4384,8 +4422,12 @@ impl TransactionState {
             })
             .collect::<Result<Vec<_>>>()?;
         for (object_id, payload) in updates {
+            let persistent = object_table.is_persistent(object_id)?;
+            if persistent {
+                object_table.validate_persistent_payload_refs(&payload)?;
+            }
             object_table.update_payload(object_id, payload)?;
-            if object_table.is_persistent(object_id)? {
+            if persistent {
                 publish(object_table.object_pending_publication(object_id)?)?;
             }
         }
@@ -4855,7 +4897,9 @@ fn persistent_root_object_id_for_global_snapshot(
     value: GlobalSnapshot,
 ) -> Result<Option<ObjectId>> {
     match value {
-        GlobalSnapshot::GcRef(gc_ref) => object_table.known_persistent_object_id_for_gc_ref(gc_ref),
+        GlobalSnapshot::GcRef(gc_ref) => {
+            object_table.persistent_object_id_for_gc_ref_or_promotion_required(gc_ref)
+        }
         _ => Ok(None),
     }
 }
@@ -4866,7 +4910,7 @@ fn persistent_root_object_id_for_table_element_snapshot(
 ) -> Result<Option<ObjectId>> {
     match value {
         TableElementSnapshot::GcRef(gc_ref) => {
-            object_table.known_persistent_object_id_for_gc_ref(gc_ref)
+            object_table.persistent_object_id_for_gc_ref_or_promotion_required(gc_ref)
         }
         TableElementSnapshot::FuncRef(_) => Ok(None),
     }
@@ -7751,8 +7795,6 @@ mod tests {
             durable_log,
         );
         let mut objects = ObjectTable::default();
-        let first = ObjectId { object_index: 71 };
-        let second = ObjectId { object_index: 72 };
         let namespace = 41;
         let expected_layout_id = objects
             .persistent_type_layout_id_for_wasmtime_key(
@@ -7810,6 +7852,12 @@ mod tests {
             ],
         )
         .unwrap();
+        let first = objects
+            .allocate_persistent_struct_for_gc_ref(0x443, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let second = objects
+            .allocate_persistent_struct_for_gc_ref(0x444, vec![ObjectValue::I32(2)])
+            .unwrap();
 
         let object = objects
             .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
@@ -7909,8 +7957,6 @@ mod tests {
             durable_log,
         );
         let mut objects = ObjectTable::default();
-        let first = ObjectId { object_index: 81 };
-        let second = ObjectId { object_index: 82 };
         let namespace = 42;
         let expected_layout_id = objects
             .persistent_type_layout_id_for_wasmtime_key(
@@ -7922,6 +7968,12 @@ mod tests {
             .unwrap();
         let expected_layout =
             persistent_layout_for_wasmtime_array_type(expected_layout_id, 20, true);
+        let first = objects
+            .allocate_persistent_struct_for_gc_ref(0x553, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let second = objects
+            .allocate_persistent_struct_for_gc_ref(0x554, vec![ObjectValue::I32(2)])
+            .unwrap();
 
         let object = objects
             .allocate_persistent_array_for_gc_ref_with_wasmtime_type_namespace(
@@ -12743,6 +12795,70 @@ mod tests {
 
         assert_eq!(publications.len(), 2);
         assert_ne!(publications[0].logical_id, publications[1].logical_id);
+    }
+
+    mod persistent_ref_promotion_boundary {
+        use super::*;
+
+        #[test]
+        fn persistent_root_commit_rejects_unknown_volatile_gc_ref() {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let objects = ObjectTable::default();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(704));
+
+            state.stage_global(0, GlobalSnapshot::GcRef(0x704)).unwrap();
+            let err = state
+                .staged_persistent_root_delta(&objects)
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(
+                err,
+                "volatile GC reference promotion into persistent object graph is not implemented yet"
+            );
+        }
+
+        #[test]
+        fn persistent_root_commit_rejects_known_non_persistent_gc_ref() {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            objects
+                .allocate_struct_for_gc_ref(0x706, vec![ObjectValue::I32(6)])
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(706));
+
+            state.stage_global(0, GlobalSnapshot::GcRef(0x706)).unwrap();
+            let err = state
+                .staged_persistent_root_delta(&objects)
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(
+                err,
+                "volatile GC reference promotion into persistent object graph is not implemented yet"
+            );
+        }
+
+        #[test]
+        fn persistent_object_payload_commit_rejects_unknown_volatile_gc_ref() {
+            let mut objects = ObjectTable::default();
+            let object = objects
+                .allocate_persistent_struct_for_gc_ref(
+                    0x705,
+                    vec![ObjectValue::Ref(Some(ObjectId { object_index: 77 }))],
+                )
+                .unwrap();
+
+            let err = objects
+                .object_pending_publication(object)
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(
+                err,
+                "volatile GC reference promotion into persistent object graph is not implemented yet"
+            );
+        }
     }
 
     fn sample_region_with_two_object_winners()
