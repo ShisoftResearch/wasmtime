@@ -1,18 +1,48 @@
 #![allow(dead_code)]
 
 use super::block_region::BLOCK_SIZE;
+use super::durable_log::BlockMeta;
 use crate::prelude::*;
 use crate::runtime::transaction::type_layout::{PersistentTypeLayout, TypeLayoutRegistry};
 use alloc::vec;
 use alloc::vec::Vec;
 
 pub(crate) const TYPE_LAYOUT_META_KIND: u64 = 0x5459_5045_4c41_594f; // "TYPELAYO"
-pub(crate) const METADATA_DESC_START_BLOCK: u32 = 1;
+pub(crate) const REGION_HEADER_BLOCK: u32 = 0;
+pub(crate) const BLOCK_TABLE_START_BLOCK: u32 = 1;
 pub(crate) const METADATA_DESC_BLOCK_COUNT: u32 = 1;
-pub(crate) const TYPE_LAYOUT_METADATA_START_BLOCK: u32 = 2;
 pub(crate) const TYPE_LAYOUT_METADATA_BLOCK_COUNT: u32 = 1;
-pub(crate) const RESERVED_METADATA_BLOCKS: usize = 3;
 pub(crate) const TYPE_LAYOUT_METADATA_HEADER_LEN: usize = 4;
+#[cfg(test)]
+pub(crate) const TYPE_LAYOUT_METADATA_START_BLOCK: u32 = BLOCK_TABLE_START_BLOCK + 2;
+
+pub(crate) fn block_table_block_count(num_blocks: usize) -> Result<u32> {
+    let bytes = num_blocks
+        .checked_mul(BlockMeta::BYTE_LEN)
+        .context("transactional block metadata table size overflow")?;
+    let blocks = bytes.div_ceil(BLOCK_SIZE).max(1);
+    u32::try_from(blocks).context("transactional block metadata table block count overflow")
+}
+
+pub(crate) fn metadata_desc_start_block(num_blocks: usize) -> Result<u32> {
+    BLOCK_TABLE_START_BLOCK
+        .checked_add(block_table_block_count(num_blocks)?)
+        .context("transactional metadata descriptor start block overflow")
+}
+
+pub(crate) fn type_layout_metadata_start_block(num_blocks: usize) -> Result<u32> {
+    metadata_desc_start_block(num_blocks)?
+        .checked_add(METADATA_DESC_BLOCK_COUNT)
+        .context("transactional type-layout metadata start block overflow")
+}
+
+pub(crate) fn reserved_metadata_blocks(num_blocks: usize) -> Result<usize> {
+    let blocks = type_layout_metadata_start_block(num_blocks)?
+        .checked_add(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+        .context("transactional reserved metadata block count overflow")?;
+    usize::try_from(blocks)
+        .context("transactional reserved metadata block count conversion overflow")
+}
 
 pub(crate) fn empty_type_layout_metadata_block() -> Vec<u8> {
     let mut bytes = vec![0; TYPE_LAYOUT_METADATA_BLOCK_COUNT as usize * BLOCK_SIZE];
