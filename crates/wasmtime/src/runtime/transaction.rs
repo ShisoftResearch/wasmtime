@@ -691,10 +691,7 @@ enum PersistentRootKey {
         instance: Option<u32>,
         global_index: u32,
     },
-    Table {
-        instance: Option<u32>,
-        table_index: u32,
-    },
+    TableElement(TableElementKey),
     Recovered,
 }
 
@@ -4131,10 +4128,7 @@ impl TransactionState {
         }
 
         for (&key, &value) in &self.staged_table_elements {
-            let root_key = PersistentRootKey::Table {
-                instance: key.instance,
-                table_index: key.table_index,
-            };
+            let root_key = PersistentRootKey::TableElement(key);
             let roots = delta.roots.entry(root_key).or_default();
             if let Some(root) =
                 persistent_root_object_id_for_table_element_snapshot(object_table, value)?
@@ -4227,19 +4221,42 @@ impl TransactionState {
         }
     }
 
-    fn apply_committed_persistent_root_delta(&mut self, delta: PersistentRootDelta) {
+    fn apply_committed_persistent_root_delta(&mut self, delta: PersistentRootDelta) -> Result<()> {
+        ensure!(
+            self.active.is_none() && current_thread_transaction().is_none(),
+            "committed persistent root delta can only be applied after complete_commit"
+        );
         if delta.is_empty() {
-            return;
+            return Ok(());
         }
+
+        let next_versions = delta
+            .roots
+            .keys()
+            .copied()
+            .map(|key| {
+                let next_version = self
+                    .persistent_root_versions
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .context("persistent root version overflow")?;
+                Ok((key, next_version))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         for (key, roots) in delta.roots {
             if roots.is_empty() {
                 self.persistent_roots.remove(&key);
             } else {
                 self.persistent_roots.insert(key, roots);
             }
-            let version = self.persistent_root_versions.entry(key).or_insert(0);
-            *version = version.saturating_add(1);
         }
+        for (key, version) in next_versions {
+            self.persistent_root_versions.insert(key, version);
+        }
+        Ok(())
     }
 
     pub(crate) fn persistent_root_ids(&self) -> BTreeSet<ObjectId> {
@@ -4793,8 +4810,11 @@ impl TransactionState {
         self.staged_persistent_root_delta(objects)
     }
 
-    fn apply_committed_persistent_root_delta_for_test(&mut self, delta: PersistentRootDelta) {
-        self.apply_committed_persistent_root_delta(delta);
+    fn apply_committed_persistent_root_delta_for_test(
+        &mut self,
+        delta: PersistentRootDelta,
+    ) -> Result<()> {
+        self.apply_committed_persistent_root_delta(delta)
     }
 
     fn persistent_root_ids_for_test(&self) -> BTreeSet<ObjectId> {
@@ -12941,7 +12961,9 @@ mod tests {
             .unwrap();
 
         state.complete_commit().unwrap();
-        state.apply_committed_persistent_root_delta_for_test(delta);
+        state
+            .apply_committed_persistent_root_delta_for_test(delta)
+            .unwrap();
 
         assert_eq!(state.persistent_root_ids_for_test(), object_set([root]));
     }
@@ -12960,7 +12982,9 @@ mod tests {
             .staged_persistent_root_delta_for_test(&objects)
             .unwrap();
         state.complete_commit().unwrap();
-        state.apply_committed_persistent_root_delta_for_test(install_delta);
+        state
+            .apply_committed_persistent_root_delta_for_test(install_delta)
+            .unwrap();
         assert_eq!(state.persistent_root_ids_for_test(), object_set([root]));
 
         state.begin().unwrap();
@@ -12969,7 +12993,9 @@ mod tests {
             .staged_persistent_root_delta_for_test(&objects)
             .unwrap();
         state.complete_commit().unwrap();
-        state.apply_committed_persistent_root_delta_for_test(removal_delta);
+        state
+            .apply_committed_persistent_root_delta_for_test(removal_delta)
+            .unwrap();
 
         assert_eq!(state.persistent_root_ids_for_test(), object_set([]));
     }
@@ -12995,9 +13021,104 @@ mod tests {
             .unwrap();
 
         state.complete_commit().unwrap();
-        state.apply_committed_persistent_root_delta_for_test(delta);
+        state
+            .apply_committed_persistent_root_delta_for_test(delta)
+            .unwrap();
 
         assert_eq!(state.persistent_root_ids_for_test(), object_set([root]));
+    }
+
+    #[test]
+    fn persistent_root_index_preserves_untouched_table_root_on_partial_update() {
+        let mut objects = ObjectTable::default();
+        let root0 = objects
+            .allocate_persistent_struct_for_gc_ref(0x593, vec![ObjectValue::I32(12)])
+            .unwrap();
+        let root1 = objects
+            .allocate_persistent_struct_for_gc_ref(0x594, vec![ObjectValue::I32(13)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(593));
+        state
+            .stage_table_element_owned(None, 3, 0, TableElementSnapshot::GcRef(0x593))
+            .unwrap();
+        state
+            .stage_table_element_owned(None, 3, 1, TableElementSnapshot::GcRef(0x594))
+            .unwrap();
+        let install_delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state
+            .apply_committed_persistent_root_delta_for_test(install_delta)
+            .unwrap();
+        assert_eq!(state.persistent_root_ids_for_test(), object_set([root0, root1]));
+
+        state.begin().unwrap();
+        state
+            .stage_table_element_owned(None, 3, 0, TableElementSnapshot::GcRef(0))
+            .unwrap();
+        let partial_update_delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state
+            .apply_committed_persistent_root_delta_for_test(partial_update_delta)
+            .unwrap();
+
+        assert_eq!(state.persistent_root_ids_for_test(), object_set([root1]));
+    }
+
+    #[test]
+    fn persistent_root_index_requires_inactive_state_for_apply() {
+        let mut objects = ObjectTable::default();
+        objects
+            .allocate_persistent_struct_for_gc_ref(0x595, vec![ObjectValue::I32(14)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(595));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x595)).unwrap();
+        let delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+
+        let err = state
+            .apply_committed_persistent_root_delta_for_test(delta)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "committed persistent root delta can only be applied after complete_commit"
+        );
+    }
+
+    #[test]
+    fn persistent_root_index_reports_version_overflow() {
+        let mut objects = ObjectTable::default();
+        objects
+            .allocate_persistent_struct_for_gc_ref(0x596, vec![ObjectValue::I32(15)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(596));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x596)).unwrap();
+        let delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state.persistent_root_versions.insert(
+            PersistentRootKey::Global {
+                instance: None,
+                global_index: 0,
+            },
+            u32::MAX,
+        );
+
+        let err = state
+            .apply_committed_persistent_root_delta_for_test(delta)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "persistent root version overflow");
     }
 
     #[test]
