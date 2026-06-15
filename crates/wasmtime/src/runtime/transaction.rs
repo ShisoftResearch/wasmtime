@@ -598,6 +598,54 @@ struct TransactionWorkspace {
     pending_memory_store: Option<PendingMemoryStore>,
 }
 
+struct PromotionAttempt {
+    initial_allocated_object_count: usize,
+    promoted_sources: Vec<ObjectId>,
+    promoted_objects: Vec<ObjectId>,
+    promoted_raw_i31_refs: Vec<u32>,
+}
+
+impl PromotionAttempt {
+    fn new(state: &TransactionState) -> Self {
+        Self {
+            initial_allocated_object_count: state.allocated_objects.len(),
+            promoted_sources: Vec::new(),
+            promoted_objects: Vec::new(),
+            promoted_raw_i31_refs: Vec::new(),
+        }
+    }
+
+    fn record_promoted_object(&mut self, source: ObjectId, promoted: ObjectId) {
+        self.promoted_sources.push(source);
+        self.promoted_objects.push(promoted);
+    }
+
+    fn record_promoted_raw_i31_ref(&mut self, raw_ref: u32) {
+        self.promoted_raw_i31_refs.push(raw_ref);
+    }
+
+    fn rollback(self, state: &mut TransactionState, object_table: &mut ObjectTable) -> Result<()> {
+        for raw_ref in self.promoted_raw_i31_refs {
+            state.promoted_i31_refs.remove(&raw_ref);
+        }
+        for source in self.promoted_sources {
+            state.promoted_objects.remove(&source);
+        }
+        for promoted in &self.promoted_objects {
+            state.staged_objects.remove(promoted);
+        }
+        state
+            .allocated_objects
+            .truncate(self.initial_allocated_object_count);
+        for promoted in self.promoted_objects.into_iter().rev() {
+            if object_table.live_slot(promoted).is_ok() {
+                object_table.free(promoted)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for TransactionState {
     fn default() -> Self {
         Self {
@@ -4202,6 +4250,27 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         source: ObjectId,
     ) -> Result<ObjectId> {
+        self.run_promotion_attempt(object_table, |state, object_table, attempt| {
+            state.promote_transaction_object_graph_in_attempt(object_table, source, attempt)
+        })
+    }
+
+    fn rewrite_payload_refs_for_promotion(
+        &mut self,
+        object_table: &mut ObjectTable,
+        payload: ObjectPayload,
+    ) -> Result<ObjectPayload> {
+        self.run_promotion_attempt(object_table, |state, object_table, attempt| {
+            state.rewrite_payload_refs_for_promotion_in_attempt(object_table, payload, attempt)
+        })
+    }
+
+    fn promote_transaction_object_graph_in_attempt(
+        &mut self,
+        object_table: &mut ObjectTable,
+        source: ObjectId,
+        attempt: &mut PromotionAttempt,
+    ) -> Result<ObjectId> {
         self.ensure_active()?;
         if object_table.is_persistent(source)? {
             return Ok(source);
@@ -4228,41 +4297,42 @@ impl TransactionState {
             object_table.reserve_persistent_object_id_for_promotion(kind, type_layout_id)?;
         self.record_allocated_object(promoted)?;
         self.promoted_objects.insert(source, promoted);
+        attempt.record_promoted_object(source, promoted);
 
         let source_payload = self
             .staged_objects
             .get(&source)
             .cloned()
             .unwrap_or(object_table.payload(source)?);
-        let promoted_payload =
-            match self.rewrite_payload_refs_for_promotion(object_table, source_payload) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    self.promoted_objects.remove(&source);
-                    self.staged_objects.remove(&promoted);
-                    let _ = object_table.free(promoted);
-                    return Err(err);
-                }
-            };
+        let promoted_payload = self.rewrite_payload_refs_for_promotion_in_attempt(
+            object_table,
+            source_payload,
+            attempt,
+        )?;
         object_table.validate_persistent_payload_refs(&promoted_payload)?;
         self.staged_objects.insert(promoted, promoted_payload);
         Ok(promoted)
     }
 
-    fn rewrite_payload_refs_for_promotion(
+    fn rewrite_payload_refs_for_promotion_in_attempt(
         &mut self,
         object_table: &mut ObjectTable,
         payload: ObjectPayload,
+        attempt: &mut PromotionAttempt,
     ) -> Result<ObjectPayload> {
         match payload {
             ObjectPayload::Struct(fields) => fields
                 .into_iter()
-                .map(|value| self.rewrite_value_ref_for_promotion(object_table, value))
+                .map(|value| {
+                    self.rewrite_value_ref_for_promotion_in_attempt(object_table, value, attempt)
+                })
                 .collect::<Result<Vec<_>>>()
                 .map(ObjectPayload::Struct),
             ObjectPayload::Array(elements) => elements
                 .into_iter()
-                .map(|value| self.rewrite_value_ref_for_promotion(object_table, value))
+                .map(|value| {
+                    self.rewrite_value_ref_for_promotion_in_attempt(object_table, value, attempt)
+                })
                 .collect::<Result<Vec<_>>>()
                 .map(ObjectPayload::Array),
             ObjectPayload::I31(_) => Ok(payload),
@@ -4279,6 +4349,17 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         value: ObjectValue,
     ) -> Result<ObjectValue> {
+        self.run_promotion_attempt(object_table, |state, object_table, attempt| {
+            state.rewrite_value_ref_for_promotion_in_attempt(object_table, value, attempt)
+        })
+    }
+
+    fn rewrite_value_ref_for_promotion_in_attempt(
+        &mut self,
+        object_table: &mut ObjectTable,
+        value: ObjectValue,
+        attempt: &mut PromotionAttempt,
+    ) -> Result<ObjectValue> {
         let ObjectValue::Ref(Some(object_id)) = value else {
             return Ok(value);
         };
@@ -4286,7 +4367,7 @@ impl TransactionState {
             return Ok(ObjectValue::Ref(Some(object_id)));
         }
         Ok(ObjectValue::Ref(Some(
-            self.promote_transaction_object_graph(object_table, object_id)?,
+            self.promote_transaction_object_graph_in_attempt(object_table, object_id, attempt)?,
         )))
     }
 
@@ -4295,14 +4376,41 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         raw_ref: u32,
     ) -> Result<ObjectId> {
-        self.ensure_active()?;
-        if let Some(promoted) = self.promoted_i31_refs.get(&raw_ref).copied() {
-            return Ok(promoted);
+        self.run_promotion_attempt(object_table, |state, object_table, attempt| {
+            state.ensure_active()?;
+            if let Some(promoted) = state.promoted_i31_refs.get(&raw_ref).copied() {
+                return Ok(promoted);
+            }
+            let source = object_table.object_id_for_raw_i31_ref(u64::from(raw_ref))?;
+            let promoted =
+                state.promote_transaction_object_graph_in_attempt(object_table, source, attempt)?;
+            state.promoted_i31_refs.insert(raw_ref, promoted);
+            attempt.record_promoted_raw_i31_ref(raw_ref);
+            Ok(promoted)
+        })
+    }
+
+    fn run_promotion_attempt<T, F>(
+        &mut self,
+        object_table: &mut ObjectTable,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&mut Self, &mut ObjectTable, &mut PromotionAttempt) -> Result<T>,
+    {
+        let mut attempt = PromotionAttempt::new(self);
+        match f(self, object_table, &mut attempt) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let rollback_context = err.to_string();
+                attempt
+                    .rollback(self, object_table)
+                    .with_context(|| {
+                        format!("promotion rollback failed after error: {rollback_context}")
+                    })?;
+                Err(err)
+            }
         }
-        let source = object_table.object_id_for_raw_i31_ref(u64::from(raw_ref))?;
-        let promoted = self.promote_transaction_object_graph(object_table, source)?;
-        self.promoted_i31_refs.insert(raw_ref, promoted);
-        Ok(promoted)
     }
 
     pub(crate) fn promote_extern_ref_for_persistence(
@@ -5173,6 +5281,18 @@ impl TransactionState {
 
     fn staged_object_payload_for_test(&self, object_id: ObjectId) -> Option<&ObjectPayload> {
         self.staged_objects.get(&object_id)
+    }
+
+    fn promote_raw_i31_ref_for_test(
+        &mut self,
+        object_table: &mut ObjectTable,
+        raw_ref: u32,
+    ) -> Result<ObjectId> {
+        self.promote_raw_i31_ref(object_table, raw_ref)
+    }
+
+    fn allocated_object_count_for_test(&self) -> usize {
+        self.allocated_objects.len()
     }
 
     fn read_tmemory_range_for_test(
@@ -13410,6 +13530,113 @@ mod tests {
                 err.to_string(),
                 "transactional promotion requires symbolic durable identity for function and external references"
             );
+        }
+
+        #[test]
+        fn promotion_failure_rolls_back_earlier_promoted_siblings() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let good_child = objects
+                .allocate_struct_for_gc_ref(0x727, vec![ObjectValue::I32(1)])
+                .unwrap();
+            let bad_child = objects.allocate_payload(ObjectPayload::Func(0x727)).unwrap();
+            let parent = objects
+                .allocate_struct_for_gc_ref(
+                    0x728,
+                    vec![
+                        ObjectValue::Ref(Some(good_child)),
+                        ObjectValue::Ref(Some(bad_child)),
+                    ],
+                )
+                .unwrap();
+            let initial_live_count = objects.live_count();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(727));
+
+            let err = state
+                .promote_transaction_object_graph_for_test(&mut objects, parent)
+                .unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "transactional promotion requires symbolic durable identity for function and external references"
+            );
+            assert_eq!(state.promoted_object_for_test(parent), None);
+            assert_eq!(state.promoted_object_for_test(good_child), None);
+            assert_eq!(state.promoted_object_for_test(bad_child), None);
+            assert_eq!(state.allocated_object_count_for_test(), 0);
+            assert_eq!(objects.live_count(), initial_live_count);
+        }
+
+        #[test]
+        fn direct_unsupported_promotion_keeps_allocated_object_bookkeeping_unchanged() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let func = objects.allocate_payload(ObjectPayload::Func(0x729)).unwrap();
+            let extern_ = objects.allocate_payload(ObjectPayload::Extern(0x72a)).unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(729));
+
+            assert_eq!(state.allocated_object_count_for_test(), 0);
+            state
+                .promote_transaction_object_graph_for_test(&mut objects, func)
+                .unwrap_err();
+            assert_eq!(state.allocated_object_count_for_test(), 0);
+            state
+                .promote_transaction_object_graph_for_test(&mut objects, extern_)
+                .unwrap_err();
+            assert_eq!(state.allocated_object_count_for_test(), 0);
+        }
+
+        #[test]
+        fn promote_raw_i31_ref_dedupes_to_one_persistent_object() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let raw_ref = u32::try_from(ObjectTable::encode_raw_i31_ref(-19)).unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(730));
+
+            let first = state
+                .promote_raw_i31_ref_for_test(&mut objects, raw_ref)
+                .unwrap();
+            let second = state
+                .promote_raw_i31_ref_for_test(&mut objects, raw_ref)
+                .unwrap();
+
+            assert_eq!(first, second);
+            assert_eq!(state.promoted_i31_ref_for_test(raw_ref), Some(first));
+            assert_eq!(state.allocated_object_count_for_test(), 1);
+            assert!(objects.is_persistent(first).unwrap());
+        }
+
+        #[test]
+        fn promotion_maps_survive_suspend_resume_and_clear_on_abort() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects
+                .allocate_struct_for_gc_ref(0x731, vec![ObjectValue::I32(7)])
+                .unwrap();
+            let mut state = TransactionState::default();
+            let first = TransactionId::from_raw(731);
+            let second = TransactionId::from_raw(732);
+
+            assert_eq!(state.enter_transaction(first).unwrap(), None);
+            let promoted = state
+                .promote_transaction_object_graph_for_test(&mut objects, source)
+                .unwrap();
+            assert_eq!(state.promoted_object_for_test(source), Some(promoted));
+            assert!(state.staged_object_payload_for_test(promoted).is_some());
+
+            assert_eq!(state.enter_transaction(second).unwrap(), Some(first));
+            assert_eq!(state.promoted_object_for_test(source), None);
+
+            state.restore_transaction(Some(first)).unwrap();
+            assert_eq!(state.promoted_object_for_test(source), Some(promoted));
+            assert!(state.staged_object_payload_for_test(promoted).is_some());
+
+            state.abort_allocated_objects(&mut objects).unwrap();
+            assert_eq!(state.active_transaction(), None);
+            assert_eq!(state.promoted_object_for_test(source), None);
+            assert!(state.staged_object_payload_for_test(promoted).is_none());
+            assert_eq!(state.allocated_object_count_for_test(), 0);
+            assert!(objects.kind(promoted).is_err());
         }
     }
 
