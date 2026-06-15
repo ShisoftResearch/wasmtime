@@ -64,6 +64,7 @@ const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_GC: u64 = 1;
 const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC: u64 = 2;
 const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_I31: u64 = 3;
 const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN: u64 = 4;
+const TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT: u64 = 5;
 const TRANSACTION_PERSISTENT_OBJECT_VALUE_RECORD_SIZE: u32 = 20;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_SIZE: u32 = 16;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_INDEX_OFFSET: i32 = 0;
@@ -3544,8 +3545,20 @@ impl FuncEnvironment<'_> {
         let tag_matches = builder.ins().icmp(IntCC::Equal, tag, expected);
         self.trapz(builder, tag_matches, crate::TRAP_INTERNAL_ASSERT);
         let high_zero = builder.ins().icmp_imm(IntCC::Equal, high, 0);
-        if expected_tag != TRANSACTION_OBJECT_VALUE_ABI_TAG_V128 {
-            self.trapz(builder, high_zero, crate::TRAP_INTERNAL_ASSERT);
+        match expected_tag {
+            TRANSACTION_OBJECT_VALUE_ABI_TAG_REF => {
+                let max_live_ref_kind = builder.ins().iconst(
+                    I64,
+                    TRANSACTION_OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT as i64,
+                );
+                let invalid_live_ref_kind =
+                    builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThan, high, max_live_ref_kind);
+                self.trapnz(builder, invalid_live_ref_kind, crate::TRAP_INTERNAL_ASSERT);
+            }
+            TRANSACTION_OBJECT_VALUE_ABI_TAG_V128 => {}
+            _ => self.trapz(builder, high_zero, crate::TRAP_INTERNAL_ASSERT),
         }
 
         Ok(match ty {

@@ -225,13 +225,15 @@ roundtrip through the libcall conversion layer without a process-local
 object. This is still not the final `ObjectId`-carrying live `tref` ABI. This
 bridge uses the `ObjectValueAbi` high word as a live-only ref-kind discriminator
 for compiled-code-to-libcall values; persistent object records still require
-`REF` high = 0. Because the bridge reuses the old 32-bit raw ref lane,
+`REF` high = 0. The live helper boundary now has an explicit persistent-object
+ref kind for recovered object references that have no live `VMGcRef` mapping.
+Because the bridge still reuses the old 32-bit raw ref lane,
 `PersistentObjectRefRaw` values can overlap with raw i31 or process-local
-`VMGcRef` shapes. During this bridge only, a raw value is interpreted as a
-persistent object reference only when the object table proves that it names a
-live persistent object; otherwise the existing live i31/extern/GC handling
-continues to apply. Persistent object ids that do not fit this 32-bit bridge
-must wait for the final live `tref` ABI.
+`VMGcRef` shapes. During this bridge only, untyped/GC-shaped raw values are
+interpreted as persistent object references only when the object table proves
+that the raw value names a live persistent object; otherwise the existing live
+i31/extern/GC handling continues to apply. Persistent object ids that do not fit
+this 32-bit bridge must wait for the final live `tref` ABI.
 
 The branch still has Wasmtime-compatible volatile bridges for some parser,
 lowering, and libcall paths. The final form should use `ObjectId` for

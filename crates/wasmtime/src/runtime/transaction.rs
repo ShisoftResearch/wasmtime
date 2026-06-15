@@ -824,6 +824,7 @@ pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_GC: u64 = 1;
 pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC: u64 = 2;
 pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_I31: u64 = 3;
 pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN: u64 = 4;
+pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT: u64 = 5;
 const VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED: &str =
     "volatile GC reference promotion into persistent object graph is not implemented yet";
 
@@ -883,6 +884,7 @@ impl ObjectValueAbi {
                     | OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC
                     | OBJECT_VALUE_ABI_LIVE_REF_KIND_I31
                     | OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN
+                    | OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT
             ),
             "unknown live ref object value ABI kind"
         );
@@ -1780,9 +1782,13 @@ impl ObjectTable {
     }
 
     pub(crate) fn raw_ref_for_object_id(&self, object_id: ObjectId) -> Result<u64> {
+        Ok(self.live_ref_abi_for_object_id(object_id)?.0)
+    }
+
+    pub(crate) fn live_ref_abi_for_object_id(&self, object_id: ObjectId) -> Result<(u64, u64)> {
         self.live_slot(object_id)?;
         if let Some(gc_ref) = self.object_to_gc_ref.get(&object_id).copied() {
-            return Ok(u64::from(gc_ref));
+            return Ok((u64::from(gc_ref), OBJECT_VALUE_ABI_LIVE_REF_KIND_GC));
         }
         ensure!(
             self.is_persistent(object_id)?,
@@ -1796,7 +1802,7 @@ impl ObjectTable {
             u32::try_from(raw).is_ok(),
             "persistent object ref does not fit live transaction ref bridge"
         );
-        Ok(raw)
+        Ok((raw, OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT))
     }
 
     pub(crate) fn persistent_object_id_for_raw_ref(
@@ -8668,6 +8674,12 @@ mod tests {
             core::mem::align_of::<ObjectValueAbi>(),
             core::mem::align_of::<u64>()
         );
+        assert_eq!(OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED, 0);
+        assert_eq!(OBJECT_VALUE_ABI_LIVE_REF_KIND_GC, 1);
+        assert_eq!(OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, 2);
+        assert_eq!(OBJECT_VALUE_ABI_LIVE_REF_KIND_I31, 3);
+        assert_eq!(OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN, 4);
+        assert_eq!(OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, 5);
     }
 
     #[test]

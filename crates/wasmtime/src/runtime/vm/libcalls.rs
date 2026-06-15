@@ -61,10 +61,11 @@ use crate::runtime::transaction::{
     DurableExternRefHostData, DurableReferenceRegistry, GlobalSnapshot, GranuleId,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN, OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_GC, OBJECT_VALUE_ABI_LIVE_REF_KIND_I31,
-    OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable,
-    ObjectValue, ObjectValueAbi, OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource,
-    OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord,
-    TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
+    OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue, ObjectValueAbi,
+    OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource, OrdinaryGcPromotionValue,
+    PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot,
+    TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
     WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
     collect_tmemory_access_snapshot,
 };
@@ -2811,15 +2812,15 @@ fn transaction_abi_from_object_value(
     value: &ObjectValue,
 ) -> Result<ObjectValueAbi> {
     if let ObjectValue::I31(value) = value {
-        return ObjectValueAbi::from_parts(
+        return ObjectValueAbi::from_live_parts(
             OBJECT_VALUE_ABI_TAG_REF,
             ObjectTable::encode_raw_i31_ref(*value),
-            0,
+            OBJECT_VALUE_ABI_LIVE_REF_KIND_I31,
         );
     }
-    let raw = match value {
-        ObjectValue::Ref(Some(object_id)) => object_table.raw_ref_for_object_id(*object_id)?,
-        ObjectValue::Ref(None) => 0,
+    let (raw, kind) = match value {
+        ObjectValue::Ref(Some(object_id)) => object_table.live_ref_abi_for_object_id(*object_id)?,
+        ObjectValue::Ref(None) => (0, OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED),
         ObjectValue::FuncRef(identity) => {
             let vm_func_ref_addr = durable_refs.resolve_func_identity(*identity).with_context(|| {
                 format!(
@@ -2829,22 +2830,28 @@ fn transaction_abi_from_object_value(
                     identity.type_layout_id.get()
                 )
             })?;
-            u64::try_from(vm_func_ref_addr)
-                .context("durable function reference address does not fit u64")?
+            (
+                u64::try_from(vm_func_ref_addr)
+                    .context("durable function reference address does not fit u64")?,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC,
+            )
         }
         ObjectValue::ExternRef(identity) => {
-            u64::from(durable_refs.resolve_extern_identity(*identity).with_context(|| {
-                format!(
-                    "durable external identity is not registered in this store: namespace={} handle={:#x} layout={}",
-                    identity.namespace,
-                    identity.handle,
-                    identity.type_layout_id.get()
-                )
-            })?)
+            (
+                u64::from(durable_refs.resolve_extern_identity(*identity).with_context(|| {
+                    format!(
+                        "durable external identity is not registered in this store: namespace={} handle={:#x} layout={}",
+                        identity.namespace,
+                        identity.handle,
+                        identity.type_layout_id.get()
+                    )
+                })?),
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
+            )
         }
         _ => return ObjectValueAbi::from_object_value(value),
     };
-    ObjectValueAbi::from_parts(OBJECT_VALUE_ABI_TAG_REF, raw, 0)
+    ObjectValueAbi::from_live_parts(OBJECT_VALUE_ABI_TAG_REF, raw, kind)
 }
 
 fn live_ref_value_from_raw(
@@ -2853,6 +2860,12 @@ fn live_ref_value_from_raw(
     live_ref_kind: u64,
     raw: u64,
 ) -> Result<ObjectValue> {
+    if live_ref_kind == OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT {
+        let object_id = object_table
+            .persistent_object_id_for_raw_ref(raw)?
+            .context("live persistent object reference does not name a persistent object")?;
+        return Ok(ObjectValue::Ref(Some(object_id)));
+    }
     if raw == 0 {
         return Ok(ObjectValue::Ref(None));
     }
@@ -4297,7 +4310,8 @@ fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runtime::transaction::{
-        ObjectId, ObjectKind, encode_object_record_for_recovery, type_layout::TypeLayoutRegistry,
+        OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, ObjectId, ObjectKind,
+        encode_object_record_for_recovery, type_layout::TypeLayoutRegistry,
     };
 
     fn recovered_struct_winner(
@@ -4352,7 +4366,7 @@ mod tests {
         let (tag, low, high) = abi.as_parts();
         assert_eq!(tag, OBJECT_VALUE_ABI_TAG_REF);
         assert_eq!(low, child.object_index + 1);
-        assert_eq!(high, 0);
+        assert_eq!(high, OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT);
         assert_eq!(
             objects
                 .object_id_for_transaction_ref_raw(u32::try_from(low).unwrap())
@@ -4362,6 +4376,47 @@ mod tests {
         assert_eq!(
             object_value_from_transaction_abi(&durable_refs, &mut objects, abi).unwrap(),
             ObjectValue::Ref(Some(child))
+        );
+    }
+
+    #[test]
+    fn explicit_persistent_object_live_kind_rejects_i31_overlap_without_object() {
+        let raw = ObjectTable::encode_raw_i31_ref(21);
+        let abi = ObjectValueAbi::from_live_parts(
+            OBJECT_VALUE_ABI_TAG_REF,
+            raw,
+            OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
+        )
+        .unwrap();
+        let durable_refs = DurableReferenceRegistry::default();
+        let mut objects = ObjectTable::default();
+
+        let error = object_value_from_transaction_abi(&durable_refs, &mut objects, abi)
+            .expect_err("explicit persistent object refs must not fall back to i31");
+        assert!(
+            error
+                .to_string()
+                .contains("live persistent object reference does not name a persistent object")
+        );
+    }
+
+    #[test]
+    fn explicit_persistent_object_live_kind_rejects_null_raw_ref() {
+        let abi = ObjectValueAbi::from_live_parts(
+            OBJECT_VALUE_ABI_TAG_REF,
+            0,
+            OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
+        )
+        .unwrap();
+        let durable_refs = DurableReferenceRegistry::default();
+        let mut objects = ObjectTable::default();
+
+        let error = object_value_from_transaction_abi(&durable_refs, &mut objects, abi)
+            .expect_err("explicit persistent object refs must not decode null raw refs");
+        assert!(
+            error
+                .to_string()
+                .contains("live persistent object reference does not name a persistent object")
         );
     }
 

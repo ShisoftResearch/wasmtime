@@ -39,10 +39,13 @@ The current live helper boundary still uses the existing 24-byte
 process-local `VMGcRef` mapping can now roundtrip through the libcall conversion
 layer:
 
-- `ObjectTable::raw_ref_for_object_id` still prefers a live `VMGcRef` mapping
-  when one exists.
+- `ObjectTable::live_ref_abi_for_object_id` still prefers a live `VMGcRef`
+  mapping when one exists.
 - If no live mapping exists and the object is persistent, it falls back to the
   durable `PersistentObjectRefRaw` encoding.
+- Returned live helper values now tag that fallback with an explicit
+  persistent-object live ref kind in `ObjectValueAbi.high`; durable object
+  records still use `REF` with `high = 0`.
 - Decode only treats such a raw value as an object reference when the object
   table can prove it names a live persistent object; otherwise existing
   durable extern, live GC, and i31 handling remains available.
@@ -61,6 +64,8 @@ cargo test -p wasmtime --lib object_value_abi_roundtrips_recovered_persistent_ob
 test result: ok. 1 passed; 0 failed; 0 ignored
 cargo test -p wasmtime --lib live_ref_bridge_ -- --format terse
 test result: ok. 2 passed; 0 failed; 0 ignored
+cargo test -p wasmtime --lib explicit_persistent_object_live_kind_rejects_i31_overlap_without_object -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
 ```
 
 ## Current Status: Store Reopen Rebuilds Persistent Objects
