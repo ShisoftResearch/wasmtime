@@ -569,6 +569,8 @@ pub(crate) struct TransactionState {
     staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    promoted_objects: BTreeMap<ObjectId, ObjectId>,
+    promoted_i31_refs: BTreeMap<u32, ObjectId>,
     allocated_objects: Vec<ObjectId>,
     granule_versions: BTreeMap<GranuleId, u64>,
     read_granules: BTreeSet<GranuleId>,
@@ -587,6 +589,8 @@ struct TransactionWorkspace {
     staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    promoted_objects: BTreeMap<ObjectId, ObjectId>,
+    promoted_i31_refs: BTreeMap<u32, ObjectId>,
     allocated_objects: Vec<ObjectId>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
@@ -614,6 +618,8 @@ impl Default for TransactionState {
             staged_table_elements: BTreeMap::new(),
             original_table_elements: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
+            promoted_objects: BTreeMap::new(),
+            promoted_i31_refs: BTreeMap::new(),
             allocated_objects: Vec::new(),
             granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
@@ -4191,6 +4197,102 @@ impl TransactionState {
         Ok(I31Value::new(value))
     }
 
+    fn promote_transaction_object_graph(
+        &mut self,
+        object_table: &mut ObjectTable,
+        source: ObjectId,
+    ) -> Result<ObjectId> {
+        self.ensure_active()?;
+        if object_table.is_persistent(source)? {
+            return Ok(source);
+        }
+        if let Some(promoted) = self.promoted_objects.get(&source).copied() {
+            return Ok(promoted);
+        }
+
+        let kind = object_table.kind(source)?;
+        ensure!(
+            matches!(
+                kind,
+                ObjectKind::Struct | ObjectKind::Array | ObjectKind::I31
+            ),
+            "transactional promotion currently supports struct, array, and i31 object payloads"
+        );
+        let type_layout_id = TypeLayoutId::new(object_table.live_slot(source)?.type_layout_id)
+            .context("promoted object source layout id cannot be zero")?;
+        let promoted =
+            object_table.reserve_persistent_object_id_for_promotion(kind, type_layout_id)?;
+        self.record_allocated_object(promoted)?;
+        self.promoted_objects.insert(source, promoted);
+
+        let source_payload = self
+            .staged_objects
+            .get(&source)
+            .cloned()
+            .unwrap_or(object_table.payload(source)?);
+        let promoted_payload =
+            self.rewrite_payload_refs_for_promotion(object_table, source_payload)?;
+        object_table.validate_persistent_payload_refs(&promoted_payload)?;
+        self.staged_objects.insert(promoted, promoted_payload);
+        Ok(promoted)
+    }
+
+    fn rewrite_payload_refs_for_promotion(
+        &mut self,
+        object_table: &mut ObjectTable,
+        payload: ObjectPayload,
+    ) -> Result<ObjectPayload> {
+        match payload {
+            ObjectPayload::Struct(fields) => fields
+                .into_iter()
+                .map(|value| self.rewrite_value_ref_for_promotion(object_table, value))
+                .collect::<Result<Vec<_>>>()
+                .map(ObjectPayload::Struct),
+            ObjectPayload::Array(elements) => elements
+                .into_iter()
+                .map(|value| self.rewrite_value_ref_for_promotion(object_table, value))
+                .collect::<Result<Vec<_>>>()
+                .map(ObjectPayload::Array),
+            ObjectPayload::I31(_) => Ok(payload),
+            ObjectPayload::Extern(_) | ObjectPayload::Func(_) => {
+                bail!(
+                    "transactional promotion requires symbolic durable identity for function and external references"
+                )
+            }
+        }
+    }
+
+    fn rewrite_value_ref_for_promotion(
+        &mut self,
+        object_table: &mut ObjectTable,
+        value: ObjectValue,
+    ) -> Result<ObjectValue> {
+        let ObjectValue::Ref(Some(object_id)) = value else {
+            return Ok(value);
+        };
+        if object_table.is_persistent(object_id)? {
+            return Ok(ObjectValue::Ref(Some(object_id)));
+        }
+        Ok(ObjectValue::Ref(Some(
+            self.promote_transaction_object_graph(object_table, object_id)?,
+        )))
+    }
+
+    fn promote_raw_i31_ref(
+        &mut self,
+        object_table: &mut ObjectTable,
+        raw_ref: u32,
+    ) -> Result<ObjectId> {
+        self.ensure_active()?;
+        if let Some(promoted) = self.promoted_i31_refs.get(&raw_ref).copied() {
+            return Ok(promoted);
+        }
+        let source = object_table.object_id_for_raw_i31_ref(u64::from(raw_ref))?;
+        let promoted = self.promote_transaction_object_graph(object_table, source)?;
+        self.promoted_i31_refs.insert(raw_ref, promoted);
+        Ok(promoted)
+    }
+
     pub(crate) fn promote_extern_ref_for_persistence(
         &mut self,
         _extern_ref: u64,
@@ -4939,6 +5041,8 @@ impl TransactionState {
             staged_table_elements: mem::take(&mut self.staged_table_elements),
             original_table_elements: mem::take(&mut self.original_table_elements),
             staged_objects: mem::take(&mut self.staged_objects),
+            promoted_objects: mem::take(&mut self.promoted_objects),
+            promoted_i31_refs: mem::take(&mut self.promoted_i31_refs),
             allocated_objects: mem::take(&mut self.allocated_objects),
             read_granules: mem::take(&mut self.read_granules),
             write_granules: mem::take(&mut self.write_granules),
@@ -4955,6 +5059,8 @@ impl TransactionState {
         self.staged_table_elements = workspace.staged_table_elements;
         self.original_table_elements = workspace.original_table_elements;
         self.staged_objects = workspace.staged_objects;
+        self.promoted_objects = workspace.promoted_objects;
+        self.promoted_i31_refs = workspace.promoted_i31_refs;
         self.allocated_objects = workspace.allocated_objects;
         self.read_granules = workspace.read_granules;
         self.write_granules = workspace.write_granules;
@@ -5035,6 +5141,26 @@ impl TransactionState {
 
     fn persistent_root_ids_for_test(&self) -> BTreeSet<ObjectId> {
         self.persistent_root_ids()
+    }
+
+    fn promote_transaction_object_graph_for_test(
+        &mut self,
+        object_table: &mut ObjectTable,
+        source: ObjectId,
+    ) -> Result<ObjectId> {
+        self.promote_transaction_object_graph(object_table, source)
+    }
+
+    fn promoted_object_for_test(&self, source: ObjectId) -> Option<ObjectId> {
+        self.promoted_objects.get(&source).copied()
+    }
+
+    fn promoted_i31_ref_for_test(&self, raw_ref: u32) -> Option<ObjectId> {
+        self.promoted_i31_refs.get(&raw_ref).copied()
+    }
+
+    fn staged_object_payload_for_test(&self, object_id: ObjectId) -> Option<&ObjectPayload> {
+        self.staged_objects.get(&object_id)
     }
 
     fn read_tmemory_range_for_test(
@@ -13125,6 +13251,118 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 "volatile GC reference promotion into persistent object graph is not implemented yet"
+            );
+        }
+    }
+
+    mod persistent_promotion_graph {
+        use super::*;
+
+        #[test]
+        fn promotion_maps_volatile_struct_to_new_persistent_object_id() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects
+                .allocate_struct_for_gc_ref(0x720, vec![ObjectValue::I32(7)])
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(720));
+
+            let promoted = state
+                .promote_transaction_object_graph_for_test(&mut objects, source)
+                .unwrap();
+
+            assert_ne!(promoted, source);
+            assert!(!objects.is_persistent(source).unwrap());
+            assert!(objects.is_persistent(promoted).unwrap());
+            assert_eq!(state.promoted_object_for_test(source), Some(promoted));
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)])
+            );
+        }
+
+        #[test]
+        fn promotion_rewrites_child_refs_to_promoted_targets() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let child = objects
+                .allocate_struct_for_gc_ref(0x721, vec![ObjectValue::I32(1)])
+                .unwrap();
+            let root = objects
+                .allocate_struct_for_gc_ref(0x722, vec![ObjectValue::Ref(Some(child))])
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(721));
+
+            let promoted_root = state
+                .promote_transaction_object_graph_for_test(&mut objects, root)
+                .unwrap();
+            let promoted_child = state.promoted_object_for_test(child).unwrap();
+
+            assert_ne!(promoted_root, root);
+            assert_ne!(promoted_child, child);
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted_root).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::Ref(Some(promoted_child))])
+            );
+            assert_eq!(
+                state
+                    .staged_object_payload_for_test(promoted_child)
+                    .unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(1)])
+            );
+        }
+
+        #[test]
+        fn promotion_preserves_cycles_with_reserved_object_ids() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let left = objects
+                .allocate_struct_for_gc_ref(0x723, vec![ObjectValue::Ref(None)])
+                .unwrap();
+            let right = objects
+                .allocate_struct_for_gc_ref(0x724, vec![ObjectValue::Ref(Some(left))])
+                .unwrap();
+            objects
+                .update_payload(
+                    left,
+                    ObjectPayload::Struct(vec![ObjectValue::Ref(Some(right))]),
+                )
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(723));
+
+            let promoted_left = state
+                .promote_transaction_object_graph_for_test(&mut objects, left)
+                .unwrap();
+            let promoted_right = state.promoted_object_for_test(right).unwrap();
+
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted_left).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::Ref(Some(promoted_right))])
+            );
+            assert_eq!(
+                state
+                    .staged_object_payload_for_test(promoted_right)
+                    .unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::Ref(Some(promoted_left))])
+            );
+        }
+
+        #[test]
+        fn promotion_promotes_i31_scalar_to_persistent_object_id() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects.allocate_payload(ObjectPayload::I31(-17)).unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(724));
+
+            let promoted = state
+                .promote_transaction_object_graph_for_test(&mut objects, source)
+                .unwrap();
+
+            assert_ne!(promoted, source);
+            assert!(objects.is_persistent(promoted).unwrap());
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted).unwrap(),
+                &ObjectPayload::I31(-17)
             );
         }
     }
