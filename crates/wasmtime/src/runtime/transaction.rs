@@ -3031,6 +3031,7 @@ impl TransactionState {
             self.abort()?;
             return Ok(true);
         }
+        self.retry_post_commit_linear_undo_retirement();
         if let Some(workspace) = self.suspended.remove(&transaction) {
             self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
             self.locks.release_transaction(transaction);
@@ -3048,6 +3049,7 @@ impl TransactionState {
             self.abort_allocated_objects(object_table)?;
             return Ok(true);
         }
+        self.retry_post_commit_linear_undo_retirement();
         let Some(workspace) = self.suspended.remove(&transaction) else {
             return Ok(false);
         };
@@ -5675,6 +5677,38 @@ mod tests {
 
     fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
         crate::Module::new(engine, wat::parse_str(wat).unwrap()).unwrap()
+    }
+
+    fn count_retire_committed_linear_undo_attempts(
+        events: &[persist::RecordingBackendEvent],
+        chunk_start_block: u32,
+    ) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    persist::RecordingBackendEvent::RetireCommittedLinearUndoChunk(chunk)
+                        if *chunk == chunk_start_block
+                )
+            })
+            .count()
+    }
+
+    fn count_retire_committed_linear_undo_failures(
+        events: &[persist::RecordingBackendEvent],
+        chunk_start_block: u32,
+    ) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    persist::RecordingBackendEvent::RetireCommittedLinearUndoChunkFailed(chunk)
+                        if *chunk == chunk_start_block
+                )
+            })
+            .count()
     }
 
     #[test]
@@ -9019,22 +9053,13 @@ mod tests {
         state.abort().unwrap();
 
         assert!(!state.post_commit_linear_undo_chunks.contains_key(&19));
-        assert_eq!(
-            events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event,
-                        persist::RecordingBackendEvent::RetireCommittedLinearUndoChunk(
-                            chunk_start_block
-                        ) if *chunk_start_block == marker.chunk_start_block
-                    )
-                })
-                .count(),
-            5
-        );
+        let events = events.lock().unwrap();
+        let total_attempts =
+            count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
+        let failed_attempts =
+            count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
+        assert!(failed_attempts >= 1);
+        assert!(total_attempts > failed_attempts);
     }
 
     #[test]
@@ -9081,22 +9106,105 @@ mod tests {
         state.abort_allocated_objects(&mut objects).unwrap();
 
         assert!(!state.post_commit_linear_undo_chunks.contains_key(&20));
+        let events = events.lock().unwrap();
+        let total_attempts =
+            count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
+        let failed_attempts =
+            count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
+        assert!(failed_attempts >= 1);
+        assert!(total_attempts > failed_attempts);
+    }
+
+    #[test]
+    fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_and_drains_queue() {
+        let (durable_log, events) =
+            TxDurableLog::recording_backend_with_retire_failures_for_test(5);
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(21),
+            durable_log,
+        );
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0033, 5, vec![11, 12, 13, 14]);
+
+        let marker = state
+            .publish_tmemory_undo_before_in_place_write(21, 21, &undo)
+            .unwrap();
+        state.publish_commit_lp(21, 21, marker).unwrap();
+        state.complete_commit().unwrap();
+
+        let suspended = TransactionId::from_raw(121);
+        assert_eq!(state.enter_transaction(suspended).unwrap(), None);
+        state.restore_transaction(None).unwrap();
+        assert!(state.transaction_is_open(suspended));
         assert_eq!(
-            events
-                .lock()
+            state
+                .post_commit_linear_undo_chunks
+                .get(&21)
                 .unwrap()
                 .iter()
-                .filter(|event| {
-                    matches!(
-                        event,
-                        persist::RecordingBackendEvent::RetireCommittedLinearUndoChunk(
-                            chunk_start_block
-                        ) if *chunk_start_block == marker.chunk_start_block
-                    )
-                })
-                .count(),
-            5
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![marker.chunk_start_block]
         );
+        assert!(state.abort_transaction(suspended).unwrap());
+
+        assert!(!state.post_commit_linear_undo_chunks.contains_key(&21));
+        let events = events.lock().unwrap();
+        let total_attempts =
+            count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
+        let failed_attempts =
+            count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
+        assert!(failed_attempts >= 1);
+        assert!(total_attempts > failed_attempts);
+    }
+
+    #[test]
+    fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_allocated_objects_and_drains_queue()
+     {
+        let (durable_log, events) =
+            TxDurableLog::recording_backend_with_retire_failures_for_test(5);
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(22),
+            durable_log,
+        );
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0034, 6, vec![15, 16, 17, 18]);
+
+        let marker = state
+            .publish_tmemory_undo_before_in_place_write(22, 22, &undo)
+            .unwrap();
+        state.publish_commit_lp(22, 22, marker).unwrap();
+        state.complete_commit().unwrap();
+
+        let suspended = TransactionId::from_raw(122);
+        let mut objects = ObjectTable::default();
+        assert_eq!(state.enter_transaction(suspended).unwrap(), None);
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        state.record_allocated_object(object).unwrap();
+        state.restore_transaction(None).unwrap();
+        assert!(state.transaction_is_open(suspended));
+        assert_eq!(
+            state
+                .post_commit_linear_undo_chunks
+                .get(&22)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![marker.chunk_start_block]
+        );
+        assert!(
+            state
+                .abort_transaction_allocated_objects(&mut objects, suspended)
+                .unwrap()
+        );
+
+        assert!(!state.post_commit_linear_undo_chunks.contains_key(&22));
+        let events = events.lock().unwrap();
+        let total_attempts =
+            count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
+        let failed_attempts =
+            count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
+        assert!(failed_attempts >= 1);
+        assert!(total_attempts > failed_attempts);
     }
 
     #[test]
