@@ -14264,7 +14264,7 @@ mod tests {
         bytes[16..20].copy_from_slice(&entry.data_block.to_le_bytes());
         bytes[20..24].copy_from_slice(&entry.data_offset.to_le_bytes());
         bytes[24..28].copy_from_slice(&entry.crc32.to_le_bytes());
-        bytes[28..32].copy_from_slice(&entry.reserved.to_le_bytes());
+        bytes[28..32].copy_from_slice(&entry.entry_meta.to_le_bytes());
         bytes
     }
 

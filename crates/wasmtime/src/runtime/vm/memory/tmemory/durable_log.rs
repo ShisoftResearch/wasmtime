@@ -153,13 +153,69 @@ pub(crate) struct TxLogEntry {
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
     pub(crate) crc32: u32,
-    pub(crate) reserved: u32,
+    pub(crate) entry_meta: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TxLogEntryRole {
     TObjectPub,
     TMemoryUndo,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TxEntryMeta(u32);
+
+impl TxEntryMeta {
+    pub(crate) const ROLE_BITS: u32 = 0b11;
+    pub(crate) const GENERATION_SHIFT: u32 = 2;
+    pub(crate) const MAX_DATA_BLOCK_GENERATION: u32 = (1 << 30) - 1;
+
+    pub(crate) fn new(role: TxLogEntryRole, data_block_generation: u32) -> Result<Self> {
+        ensure!(
+            data_block_generation <= Self::MAX_DATA_BLOCK_GENERATION,
+            "data block generation exceeds log entry capacity"
+        );
+        Ok(Self(
+            role.to_bits() | (data_block_generation << Self::GENERATION_SHIFT),
+        ))
+    }
+
+    pub(crate) fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub(crate) fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) fn role(self) -> Result<TxLogEntryRole> {
+        TxLogEntryRole::from_bits(self.0 & Self::ROLE_BITS)
+    }
+
+    pub(crate) fn data_block_generation(self) -> u32 {
+        self.0 >> Self::GENERATION_SHIFT
+    }
+
+    pub(crate) fn with_role(self, role: TxLogEntryRole) -> Self {
+        Self((self.0 & !Self::ROLE_BITS) | role.to_bits())
+    }
+}
+
+impl TxLogEntryRole {
+    fn to_bits(self) -> u32 {
+        match self {
+            TxLogEntryRole::TObjectPub => 0,
+            TxLogEntryRole::TMemoryUndo => 1,
+        }
+    }
+
+    fn from_bits(bits: u32) -> Result<Self> {
+        Ok(match bits {
+            0 => TxLogEntryRole::TObjectPub,
+            1 => TxLogEntryRole::TMemoryUndo,
+            role => bail!("unknown transaction log entry role {role}"),
+        })
+    }
 }
 
 impl TxLogEntry {
@@ -177,7 +233,9 @@ impl TxLogEntry {
             data_block,
             data_offset,
             crc32: 0,
-            reserved: 0,
+            entry_meta: TxEntryMeta::new(TxLogEntryRole::TObjectPub, 0)
+                .unwrap()
+                .bits(),
         }
     }
 
@@ -190,18 +248,21 @@ impl TxLogEntry {
     }
 
     pub(crate) fn role(&self) -> Result<TxLogEntryRole> {
-        Ok(match self.reserved {
-            0 => TxLogEntryRole::TObjectPub,
-            1 => TxLogEntryRole::TMemoryUndo,
-            role => bail!("unknown transaction log entry role {role}"),
-        })
+        TxEntryMeta::from_bits(self.entry_meta).role()
     }
 
     pub(crate) fn set_role(&mut self, role: TxLogEntryRole) {
-        self.reserved = match role {
-            TxLogEntryRole::TObjectPub => 0,
-            TxLogEntryRole::TMemoryUndo => 1,
-        };
+        self.entry_meta = TxEntryMeta::from_bits(self.entry_meta).with_role(role).bits();
+    }
+
+    pub(crate) fn data_block_generation(&self) -> u32 {
+        TxEntryMeta::from_bits(self.entry_meta).data_block_generation()
+    }
+
+    pub(crate) fn set_data_block_generation(&mut self, generation: u32) -> Result<()> {
+        let role = self.role()?;
+        self.entry_meta = TxEntryMeta::new(role, generation)?.bits();
+        Ok(())
     }
 
     fn bytes_without_crc32(&self) -> [u8; 28] {
@@ -211,7 +272,7 @@ impl TxLogEntry {
         bytes[12..16].copy_from_slice(&self.tx_meta.to_le_bytes());
         bytes[16..20].copy_from_slice(&self.data_block.to_le_bytes());
         bytes[20..24].copy_from_slice(&self.data_offset.to_le_bytes());
-        bytes[24..28].copy_from_slice(&self.reserved.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.entry_meta.to_le_bytes());
         bytes
     }
 }
@@ -435,6 +496,34 @@ mod tests {
 
         assert_eq!(entry.role().unwrap(), TxLogEntryRole::TMemoryUndo);
         assert!(entry.validate_crc32());
+    }
+
+    #[test]
+    fn tx_log_entry_meta_roundtrips_role_and_generation() {
+        let mut entry = TxLogEntry::new(0x1000_0000_0000_0003, 7, 11 << 1, 4, 32);
+
+        assert_eq!(entry.role().unwrap(), TxLogEntryRole::TObjectPub);
+        assert_eq!(entry.data_block_generation(), 0);
+
+        entry.set_role(TxLogEntryRole::TMemoryUndo);
+        entry.set_data_block_generation(17).unwrap();
+        entry.seal_crc32();
+
+        assert_eq!(entry.role().unwrap(), TxLogEntryRole::TMemoryUndo);
+        assert_eq!(entry.data_block_generation(), 17);
+        assert!(entry.validate_crc32());
+    }
+
+    #[test]
+    fn tx_log_entry_meta_rejects_generation_overflow() {
+        let mut entry = TxLogEntry::new(0x1000_0000_0000_0003, 7, 11 << 1, 4, 32);
+
+        let err = entry
+            .set_data_block_generation(TxEntryMeta::MAX_DATA_BLOCK_GENERATION + 1)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("data block generation exceeds log entry capacity"));
     }
 
     #[test]
