@@ -656,8 +656,10 @@ fn decode_object_ref_slot(bytes: &[u8]) -> Result<Option<ObjectId>> {
     let high = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
     match ObjectValueAbi::from_parts(tag, low, high)?.to_object_value()? {
         ObjectValue::Ref(object_id) => Ok(object_id),
-        ObjectValue::I31(_) => Ok(None),
-        _ => bail!("persistent object reference slot is not encoded as a ref or i31 ABI value"),
+        ObjectValue::I31(_) | ObjectValue::FuncRef(_) | ObjectValue::ExternRef(_) => Ok(None),
+        _ => bail!(
+            "persistent object reference slot is not encoded as a ref, i31, funcref, or externref ABI value"
+        ),
     }
 }
 
@@ -911,6 +913,26 @@ mod tests {
     }
 
     #[test]
+    fn trace_object_refs_with_layout_ref_slot_ignores_inline_func_and_extern_leaves() {
+        let layout = PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(103).unwrap(),
+            fingerprint: 0x4152_5241_5900_0103,
+            element_size: OBJECT_VALUE_RECORD_LEN as u32,
+            element_kind: TraceSlotKind::ObjectRef,
+        };
+        let payload = encode_payload(&[
+            ObjectValue::FuncRef(durable_func_identity(5)),
+            ObjectValue::ExternRef(durable_extern_identity(6)),
+            ObjectValue::Ref(Some(ObjectId { object_index: 12 })),
+        ]);
+
+        let mut out = Vec::new();
+        trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap();
+
+        assert_eq!(out, vec![ObjectId { object_index: 12 }]);
+    }
+
+    #[test]
     fn trace_object_refs_with_layout_rejects_bad_struct_field_offset() {
         let layout = layout_test_struct(vec![object_ref_slot(1)]);
         let payload = encode_payload(&[ObjectValue::Ref(Some(ObjectId { object_index: 11 }))]);
@@ -996,7 +1018,7 @@ mod tests {
 
         assert!(
             err.to_string().contains(
-                "persistent object reference slot is not encoded as a ref or i31 ABI value"
+                "persistent object reference slot is not encoded as a ref, i31, funcref, or externref ABI value"
             )
         );
     }

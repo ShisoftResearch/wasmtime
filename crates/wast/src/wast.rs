@@ -89,6 +89,18 @@ enum Export<'a> {
     _Unused(std::convert::Infallible, &'a ()),
 }
 
+#[cfg(feature = "transaction")]
+fn configure_transaction_wast_store(store: &mut Store<()>) {
+    if std::env::var_os("WASMTIME_TEST_TRANSACTION_WAST").is_some() {
+        wasmtime::_internal::transaction_persistence::enable_live_wast_reference_fallbacks_for_test(
+            store,
+        );
+    }
+}
+
+#[cfg(not(feature = "transaction"))]
+fn configure_transaction_wast_store(_store: &mut Store<()>) {}
+
 /// Whether or not to use async APIs when calling wasm during wast testing.
 ///
 /// Passed to [`WastContext::new`].
@@ -129,6 +141,7 @@ impl WastContext {
             core_store: {
                 let mut store = Store::new(engine, ());
                 configure(&mut store);
+                configure_transaction_wast_store(&mut store);
                 store
             },
             modules: Default::default(),
@@ -224,6 +237,7 @@ impl WastContext {
     ) -> Result<Outcome<(component::Component, Store<()>, component::Instance)>> {
         let mut store = Store::new(self.engine(), ());
         (self.configure_store)(&mut store);
+        configure_transaction_wast_store(&mut store);
         let instance = match &self.async_runtime {
             Some(rt) => rt.block_on(
                 self.component_linker
@@ -795,6 +809,7 @@ impl WastContext {
                     core_store: {
                         let mut store = Store::new(self.engine(), ());
                         (self.configure_store)(&mut store);
+                        configure_transaction_wast_store(&mut store);
                         store
                     },
                     modules: self.modules.clone(),

@@ -965,6 +965,12 @@ impl<T> Store<T> {
             .transaction_register_durable_extern_ref_for_test(raw_gc_ref, identity)
     }
 
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_enable_live_wast_reference_fallbacks_for_test(&mut self) {
+        self.inner
+            .transaction_enable_live_wast_reference_fallbacks_for_test();
+    }
+
     /// Access the underlying `T` data owned by this `Store`.
     #[inline]
     pub fn data(&self) -> &T {
@@ -1779,9 +1785,9 @@ impl StoreOpaque {
 
     pub(crate) fn transaction_durable_refs_and_object_table_mut(
         &mut self,
-    ) -> (&DurableReferenceRegistry, &mut ObjectTable) {
+    ) -> (&mut DurableReferenceRegistry, &mut ObjectTable) {
         (
-            &self.transaction_durable_refs,
+            &mut self.transaction_durable_refs,
             &mut self.transaction_object_table,
         )
     }
@@ -1789,12 +1795,12 @@ impl StoreOpaque {
     pub(crate) fn transaction_durable_refs_state_and_object_table_mut(
         &mut self,
     ) -> (
-        &DurableReferenceRegistry,
+        &mut DurableReferenceRegistry,
         &mut TransactionState,
         &mut ObjectTable,
     ) {
         (
-            &self.transaction_durable_refs,
+            &mut self.transaction_durable_refs,
             &mut self.transaction_state,
             &mut self.transaction_object_table,
         )
@@ -1829,19 +1835,25 @@ impl StoreOpaque {
             .register_extern_ref(raw_gc_ref, identity)
     }
 
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_enable_live_wast_reference_fallbacks_for_test(&mut self) {
+        self.transaction_durable_refs
+            .enable_live_wast_reference_fallbacks_for_test();
+    }
+
     pub(crate) fn transaction_promotion_context_mut(
         &mut self,
     ) -> (
         &Engine,
         Option<&mut GcStore>,
-        &DurableReferenceRegistry,
+        &mut DurableReferenceRegistry,
         &mut TransactionState,
         &mut ObjectTable,
     ) {
         (
             &self.engine,
             self.gc_store.as_mut(),
-            &self.transaction_durable_refs,
+            &mut self.transaction_durable_refs,
             &mut self.transaction_state,
             &mut self.transaction_object_table,
         )

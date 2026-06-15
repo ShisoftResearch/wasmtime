@@ -61,11 +61,15 @@ Current remaining mock categories:
 - Durable object publication and Zen-style restart recovery are now implemented
   for committed object records, roots, type/layout metadata, and scan-critical
   region metadata.
-- Persistent roots now recover as `ObjectId`s from committed `TGlobal`/`TTable`
-  winners, but full runtime reintegration and GC-facing root closure remain
-  future work.
-- Commit-time promotion from volatile `VMGcRef` graphs into persistent
-  `ObjectId` graphs remains future work.
+- Persistent roots recover as `ObjectId`s from committed `TGlobal`/`TTable`
+  winners and seed the persistent-GC root set on file-backed reopen. Remaining
+  work is public/runtime surface reintegration and the final live helper ABI.
+- Commit-time promotion now handles transaction-mirrored object graphs and the
+  first store-backed ordinary-GC subset: i31 leaves, struct/array heap objects,
+  promoted `ObjectId` edges, durable function identities, durable extern
+  identities, and explicit harness-enabled live-only WAST fallback identities.
+  Remaining work is the final `ObjectId`-carrying `tref` ABI plus unsupported
+  future ref/payload forms.
 - `ttry`/`tfail` remains a later structured-failure workstream.
 - Persistent-object GC now has a runtime marker, commit-coupled incremental
   marking, tombstone-less recovery filtering, recovered record location
@@ -73,9 +77,11 @@ Current remaining mock categories:
   Durable block/chunk retirement, durable block reuse, and explicit
   `ObjectId` reuse remain future work. Per-object tombstones are not the
   baseline design.
-- `FileBackedMemory` and `NVMemory` still need real recovery semantics; tests
-  that require restart durability stay gated until hardware or restart harness
-  support is ready.
+- `FileBackedMemory` now has restart recovery coverage for the current
+  tmemory undo-log and object redo/root/type-metadata paths. `NVMemory` still
+  needs hardware-PMEM validation, and tests that require real PMEM crash
+  durability stay gated until suitable hardware or a stronger restart harness
+  is available.
 
 ## Ground Rules
 
@@ -100,8 +106,10 @@ Current remaining mock categories:
 - Reuse Wasmtime GC type/layout/cast/validation code where useful. Do not reuse
   `GcHeap`, `VMGcRef`, Wasmtime GC roots, or Wasmtime GC barriers as persistent
   object identity or storage.
-- `VMemory` is sufficient for WAST completion. `FileBackedMemory` and
-  `NVMemory` are important research backends but not blockers for all WAST.
+- `VMemory` is sufficient for WAST completion. `FileBackedMemory` is the
+  current filesystem-backed recovery backend for research tests, while
+  `NVMemory` is the PMEM-shaped backend path that still needs hardware
+  validation.
 - Each wave starts with focused failing unit tests or a currently ignored WAST
   file and ends with a recorded verification command.
 
@@ -182,35 +190,32 @@ Only `RebuildOnRecovery` is implemented in this phase.
 
 ### Post-WAST Workstreams
 
-1. **Durable object headers and publication metadata**
-   - make `TxObjectHeader` the canonical durable identity carrier
-   - add commit/publication fields needed for Zen-style visibility and recovery
-   - ensure new committed object records never require a separately persisted
-     object-index update
+Implemented baseline:
 
-2. **Recovery-rebuilt object index**
-   - scan persistent object storage on restart
-   - rebuild the volatile `ObjectTable` from committed object headers
-   - select the latest committed record for each `ObjectId`
-   - regenerate allocation/free metadata in DRAM where possible
+- `TxObjectHeader` is the canonical durable object identity carrier for
+  committed object records.
+- Zen-style recovery rebuilds the volatile object table from committed object
+  winners and recovered roots.
+- Persistent `TGlobal`/`TTable` roots publish `ObjectId` edges and seed the
+  persistent-GC root set after file-backed reopen.
+- Commit-time promotion covers transaction-mirrored objects plus the first
+  store-backed ordinary-GC subset.
+- `FileBackedMemory` restart recovery covers current tmemory undo-log and
+  object redo/root/type-metadata paths.
 
-3. **Persistent roots and promotion**
-   - make committed `tglobal`, `ttable`, and future explicit root sets publish
-     `ObjectId` edges only
-   - promote volatile Wasmtime objects during commit when they become reachable
-     from persistent state
+Remaining deltas:
 
-4. **Remove remaining volatile reference bridges**
+1. **Remove remaining volatile reference bridges**
    - replace `VMGcRef`/`VMFuncRef` scaffolding in transactional object and
      function-reference paths with real `ObjectId` runtime values
    - keep Wasmtime GC/type machinery only as layout/type knowledge
 
-5. **Durable backend recovery**
-   - finish FileBackedMemory restart recovery using sync-based durability
+2. **Durable backend validation**
+   - keep extending file-backed restart coverage as new object/ref paths land
    - finish NVMemory publication and recovery semantics with CLWB/SFENCE-shaped
-     plumbing
+     plumbing and hardware validation
 
-6. **Future optional persistent index**
+3. **Future optional persistent index**
    - evaluate whether Eliot's faster-restart requirement justifies persisting an
      object index
    - if needed, implement `PersistentIndex` as a second policy over the same
@@ -1128,7 +1133,8 @@ Add tests for:
 - `NVMemory` rejects unsupported targets or missing CLWB support unless the
   test explicitly selects a non-durable research mode.
 - real PMEM restart/recovery tests are gated with `WASMTIME_TEST_REAL_PMEM=1`.
-- `FileBackedMemory` remains represented but is deferred behind `NVMemory`.
+- `FileBackedMemory` is the current filesystem-backed restart-test backend;
+  `NVMemory` remains the hardware-PMEM validation path.
 - ordinary Wasmtime memories are unaffected by transaction backend selection.
 
 - [ ] **Step 2: Implement NVMemory block region**
@@ -1144,10 +1150,13 @@ Add the configuration and error boundaries for `NVMemory`. The first NVMemory
 implementation should use the same block/chunk API, name a PMEM path/device,
 and make unsupported platforms fail with an explicit backend-selection error.
 
-- [ ] **Step 4: Defer FileBackedMemory**
+- [x] **Step 4: FileBackedMemory supersedes the old defer step**
 
-Keep `FileBackedMemory` in the enum and configuration story, but leave it
-unsupported until after the thesis-specific `NVMemory` path exists.
+This historical step no longer applies. `FileBackedMemory` is implemented as
+the filesystem-backed recovery backend for current tmemory undo-log and object
+redo/root/type-metadata tests. `NVMemory` remains the thesis-specific
+hardware-PMEM path and should reuse the same backend abstraction where
+possible.
 
 - [ ] **Step 5: Verify**
 

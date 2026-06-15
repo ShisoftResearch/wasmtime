@@ -295,13 +295,13 @@ fn wasmtime_array_layout_from_element_layout(
 
 /// Storage backend selected for transactional memories.
 ///
-/// SHISOFT-TWASM-MOCK: selectable backend shape is present and
-/// `TransactionConfig` accepts the implemented in-tree backends.
+/// SHISOFT-TWASM-MOCK: backend selection still lives behind transaction
+/// research configuration rather than Wasmtime's public embedding API.
 ///
 /// Milestone runtime support currently implements `VMemory` and research
 /// `NVMemory` by default, with hardware-PMEM mode selectable for experiments.
-/// `FileBackedMemory` remains represented so transaction configuration keeps
-/// its later persistence shape without changing ordinary Wasmtime memories.
+/// `FileBackedMemory` is an opt-in mmap-backed durable test/research backend;
+/// ordinary Wasmtime memories still use their existing storage path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TMemoryBackend {
     VMemory,
@@ -334,9 +334,10 @@ pub(crate) enum ConcurrencyControl {
     LockBased,
 }
 
-/// SHISOFT-TWASM-MOCK: durability is still volatile rollback-only; research
-/// `NVMemory` can model PMEM-style flush/fence behavior, but true durability
-/// and crash recovery are future work.
+/// SHISOFT-TWASM-MOCK: durability policy selection is not yet public API.
+/// File-backed transaction storage has restart recovery for current
+/// tmemory/object-log tests, while broader policy selection and hardware-PMEM
+/// validation remain research work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DurabilityPolicy {
     VolatileRollbackOnly,
@@ -682,10 +683,9 @@ pub(crate) enum GlobalSnapshot {
     F32(u32),
     F64(u64),
     V128([u8; 16]),
-    /// SHISOFT-TWASM-MOCK: reference snapshots are raw Wasmtime reference
-    /// words for `tglobal.get` execution. Non-null staged reference globals
-    /// still need a rooted/object-table snapshot before `tglobal.set` is
-    /// enabled for references.
+    /// SHISOFT-TWASM-MOCK: live reference snapshots still use raw Wasmtime
+    /// reference words at some helper boundaries. Durable object/root records
+    /// use `ObjectId`; final live `tref` lowering must remove this bridge.
     GcRef(u32),
     FuncRef(usize),
 }
@@ -694,8 +694,9 @@ pub(crate) enum GlobalSnapshot {
 pub(crate) enum TableElementSnapshot {
     /// Raw `VMFuncRef` pointer address, with `0` representing null.
     FuncRef(usize),
-    /// Raw nullable `VMGcRef` word. This is a volatile scaffold until
-    /// persistent references use `ObjectId`.
+    /// Raw nullable `VMGcRef` word used at live table helper boundaries.
+    /// Durable roots use `ObjectId`; final live `tref` lowering must remove
+    /// this bridge.
     GcRef(u32),
 }
 
@@ -1026,12 +1027,10 @@ struct WasmtimeTypeLayoutKey {
 pub(crate) struct ObjectTable {
     slots: Vec<Option<ObjectTableSlot>>,
     free_list: Vec<ObjectId>,
-    // SHISOFT-TWASM-MOCK: these volatile side maps let the first transactional
-    // object libcalls use Wasmtime GC refs and VMFuncRef pointers while the
-    // persistent-object runtime is still coming online. The final form uses
-    // `ObjectId` as the canonical identifier for persistent objects and
-    // transactional function objects; raw Wasmtime refs are only live wrappers
-    // around that identity.
+    // SHISOFT-TWASM-MOCK: these volatile side maps let live transactional
+    // object libcalls interoperate with Wasmtime GC refs while the final
+    // `ObjectId`-carrying live `tref` ABI is still pending. Durable object
+    // storage and recovered roots use `ObjectId`.
     gc_ref_to_object: BTreeMap<u32, ObjectId>,
     object_to_gc_ref: BTreeMap<ObjectId, u32>,
     type_layouts: TypeLayoutRegistry,
@@ -2582,8 +2581,9 @@ pub(crate) trait TransactionConcurrencyControl {
 
 #[derive(Debug, Default)]
 pub(crate) struct LockBased {
-    // SHISOFT-TWASM-MOCK: versioned persistent backends are still incomplete,
-    // so some non-object granules feed version `0` through the lock manager.
+    // SHISOFT-TWASM-MOCK: not every non-object granule has durable version
+    // metadata yet, so those granules still feed version `0` through the lock
+    // manager.
     owners: BTreeMap<GranuleId, TransactionId>,
     read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
 }

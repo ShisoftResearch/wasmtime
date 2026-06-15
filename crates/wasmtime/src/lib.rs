@@ -758,6 +758,10 @@ pub mod _internal {
             Ok(extern_ref)
         }
 
+        pub fn enable_live_wast_reference_fallbacks_for_test<T>(store: &mut crate::Store<T>) {
+            store.transaction_enable_live_wast_reference_fallbacks_for_test();
+        }
+
         pub fn fail_next_commit_before_lp_for_test<T>(store: &mut crate::Store<T>) {
             store
                 .transaction_state_mut()

@@ -763,6 +763,9 @@ Promotion is graph-based:
   to live `tfuncref` values. Internal durable `texternref` test values register
   their current store raw externref and can roundtrip through the same helper
   boundary as `externref` leaves, `anyref`-converted leaves, and `tarray`
+  element values. Proposal-WAST live fallback identities are disabled by
+  default and are enabled only by an explicit WAST-harness store policy. They
+  are same-run execution bridges, not restart-stable persistent identities.
   elements. The live compiled-code-to-libcall bridge tags reference kind in the
   `ObjectValueAbi` high word to disambiguate `VMGcRef`, `VMFuncRef`, externref,
   and inline `ti31`; generic GC/untyped ref decoding also consults the
@@ -1197,20 +1200,28 @@ design point, the remaining architecture work should proceed in this order:
 1. Keep the executable `tfunc`, `tmemory`, `tglobal`, `ttable`, SIMD, `ttry`,
    `tfail`, object, and conflict paths stable while removing remaining parser
    or harness scaffolds outside the current passing WAST tranche.
-2. Extend commit-time promotion beyond transaction-mirrored objects by adding a
-   Wasmtime GC-heap introspection adapter for ordinary volatile GC objects.
+2. Extend commit-time promotion coverage beyond the first store-backed
+   Wasmtime GC adapter subset. The current adapter handles i31 leaves,
+   struct/array heap objects, promoted `ObjectId` edges, durable function and
+   external identities, plus explicit harness-enabled live-only WAST fallback
+   identities; future work is unsupported ref/payload forms and removal of the
+   fallback namespace.
 3. Replace volatile `VMGcRef -> ObjectId` bridges with the final
    `ObjectId`-carrying live `tref` ABI for transactional helper boundaries.
    Persistent object records and recovered root records already use the
    centralized `PersistentObjectRefRaw` durable encoding.
-4. Finish durable symbolic identity encoders for `tfuncref` and `texternref`
-   inline values. First-class persistent function/external wrapper objects
-   remain a separate future design and must not be implied by raw ref
-   promotion.
-5. Complete runtime reintegration for recovered `tglobal` and `ttable`
-   reference-bearing roots. Recovery already reconstructs root `ObjectId`s from
-   committed `TGlobal`/`TTable` winners, but the recovered roots still need to
-   be wired into the persistent object runtime and GC-facing root closure.
+4. Finish restart-stable namespace policy for `tfuncref` and `texternref`
+   inline values. Registered durable identities and embedded durable extern
+   identities exist; live-only WAST fallback identities are explicit harness
+   execution bridges, not a recovery-stable external/function namespace.
+   First-class persistent
+   function/external wrapper objects remain a separate future design and must
+   not be implied by raw ref promotion.
+5. Complete public/runtime surface reintegration for recovered `tglobal` and
+   `ttable` reference-bearing roots. Recovery already reconstructs root
+   `ObjectId`s from committed `TGlobal`/`TTable` winners and seeds persistent
+   GC; the final live helper ABI still needs to expose those roots without raw
+   `VMGcRef` bridges.
 6. Keep payload records traceable by `ObjectId` refs and Wasmtime-derived layout
    metadata while extending coverage for promotion and root reintegration paths.
 7. Add durable block/chunk retirement metadata, safe persistent block reuse,

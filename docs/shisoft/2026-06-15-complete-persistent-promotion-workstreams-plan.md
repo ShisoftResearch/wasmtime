@@ -137,8 +137,9 @@ identities.
 - [x] Add an adapter that can classify ordinary Wasmtime GC heap references as
   struct, array, i31, function, external, null, or unsupported.
 - [x] Wire the commit prepass through an `OrdinaryGcPromotionAdapter` seam.
-- [x] Keep the production default conservative with a no-op adapter that
-  preserves the existing unsupported-ref failure.
+- [x] Historical bootstrap step: the no-op adapter remains available for
+  narrow wrapper/unit tests, but the production commit path now uses the
+  store-backed adapter.
 - [x] Add fake-adapter tests that promote ordinary-GC-shaped struct/array
   graphs, rewrite nested/shared refs, preserve self-cycles, encode raw i31
   leaves inline, remember top-level durable leaf refs as non-object roots, and
@@ -152,7 +153,11 @@ identities.
 - [x] Convert real ordinary heap object references into either promoted
   `ObjectId` edges or inline durable leaves.
 - [x] Add durable function/external identity handling to the store-backed
-  adapter once Workstream 4 defines the identity sources.
+  adapter. Registered durable function identities and embedded durable externref
+  identities are supported by default. Live-only WAST fallback identities are
+  available only after the WAST harness explicitly opts the store into that
+  compatibility policy; the restart-stable namespace policy for every internal
+  function/external source remains part of the final ABI/identity cleanup.
 - [x] Make persistent trace-layout metadata type-driven so ref-capable
   struct fields and array elements keep tracing object edges even when the
   current value is null or an inline `i31` leaf.
@@ -219,7 +224,9 @@ the central `PersistentObjectRefRaw` ABI for durable heap-object references:
 The live helper boundary can also roundtrip registered `tfuncref` and internal
 durable `texternref` leaves through the current Wasmtime-compatible ref bridge,
 including generic `anyref` paths that recover the durable extern identity from
-the store-local registry. Recovered persistent `ObjectId` refs can now
+the store-local registry. Proposal-WAST live fallback identities are an explicit
+per-store harness policy and are disabled for normal/file-backed persistence.
+Recovered persistent `ObjectId` refs can now
 roundtrip through the libcall conversion layer without a process-local
 `VMGcRef` map when the object table proves the raw value names a live persistent
 object. This is still not the final `ObjectId`-carrying live `tref` ABI. This

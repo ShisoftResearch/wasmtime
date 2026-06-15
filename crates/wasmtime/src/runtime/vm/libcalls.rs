@@ -352,14 +352,14 @@ pub(crate) fn transaction_commit_selected_for_host(
 struct StoreBackedOrdinaryGcPromotionAdapter<'a> {
     engine: &'a Engine,
     gc_store: Option<&'a mut GcStore>,
-    durable_refs: &'a DurableReferenceRegistry,
+    durable_refs: &'a mut DurableReferenceRegistry,
 }
 
 impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
     fn new(
         engine: &'a Engine,
         gc_store: Option<&'a mut GcStore>,
-        durable_refs: &'a DurableReferenceRegistry,
+        durable_refs: &'a mut DurableReferenceRegistry,
     ) -> Self {
         Self {
             engine,
@@ -422,15 +422,34 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
                     | HeapType::Struct
                     | HeapType::ConcreteStruct(_)
                     | HeapType::None => {
-                        if raw == 0 {
-                            OrdinaryGcPromotionValue::GcRef(None)
-                        } else {
-                            OrdinaryGcPromotionValue::GcRef(Some(raw))
-                        }
+                        return self.read_generic_gc_ref_value(raw);
                     }
                 }
             }
         })
+    }
+
+    fn read_generic_gc_ref_value(&mut self, raw_gc_ref: u32) -> Result<OrdinaryGcPromotionValue> {
+        if raw_gc_ref == 0 {
+            return Ok(OrdinaryGcPromotionValue::GcRef(None));
+        }
+        let Some(gc_ref) = VMGcRef::from_raw_u32(raw_gc_ref) else {
+            bail!("ordinary GC promotion cannot encode invalid generic reference");
+        };
+        if gc_ref.is_i31() {
+            return Ok(OrdinaryGcPromotionValue::I31(
+                ObjectTable::decode_raw_i31_ref(u64::from(raw_gc_ref))?,
+            ));
+        }
+        if self.durable_refs.resolve_extern_ref(raw_gc_ref).is_some() {
+            return self.read_extern_ref_value(raw_gc_ref);
+        }
+        if let Some(gc_store) = self.gc_store.as_mut()
+            && gc_ref.as_externref(&*gc_store.gc_heap).is_some()
+        {
+            return self.read_extern_ref_value(raw_gc_ref);
+        }
+        Ok(OrdinaryGcPromotionValue::GcRef(Some(raw_gc_ref)))
     }
 
     fn read_func_ref_value(&mut self, raw_func_ref_id: u32) -> Result<OrdinaryGcPromotionValue> {
@@ -447,8 +466,7 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
         };
         let identity = self
             .durable_refs
-            .resolve_func_ref(vm_func_ref_addr)
-            .context("ordinary GC promotion cannot encode function reference without registered durable function identity")?;
+            .resolve_or_register_live_func_ref(vm_func_ref_addr)?;
         Ok(OrdinaryGcPromotionValue::FuncRef(identity))
     }
 
@@ -459,7 +477,7 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
         let Some(gc_ref) = VMGcRef::from_raw_u32(raw_gc_ref) else {
             bail!("ordinary GC promotion cannot encode invalid external reference");
         };
-        let identity = {
+        let embedded_identity = {
             let gc_store = self.gc_store_mut()?;
             let Some(extern_ref) = gc_ref.as_externref(&*gc_store.gc_heap) else {
                 bail!("ordinary GC promotion expected an external reference");
@@ -468,9 +486,16 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
                 .externref_host_data(extern_ref)?
                 .downcast_ref::<DurableExternRefHostData>()
                 .map(DurableExternRefHostData::identity)
-                .context(
-                    "ordinary GC promotion cannot encode external reference without embedded durable external identity",
-                )?
+        };
+        let identity = match embedded_identity {
+            Some(identity) => {
+                self.durable_refs
+                    .register_extern_ref(raw_gc_ref, identity)?;
+                identity
+            }
+            None => self
+                .durable_refs
+                .resolve_or_register_live_extern_ref(raw_gc_ref)?,
         };
         Ok(OrdinaryGcPromotionValue::ExternRef(identity))
     }
@@ -656,9 +681,12 @@ impl OrdinaryGcPromotionAdapter for StoreBackedOrdinaryGcPromotionAdapter<'_> {
                 .map(Some);
         }
         if kind.matches(VMGcKind::ExternRef) {
-            return Ok(Some(OrdinaryGcPromotionSource::Unsupported(
-                "durable external identity source is not wired",
-            )));
+            let OrdinaryGcPromotionValue::ExternRef(identity) =
+                self.read_extern_ref_value(gc_ref.as_raw_u32())?
+            else {
+                bail!("ordinary GC promotion expected durable external reference leaf");
+            };
+            return Ok(Some(OrdinaryGcPromotionSource::ExternRef(identity)));
         }
         Ok(Some(OrdinaryGcPromotionSource::Unsupported(
             "ordinary GC object kind is not supported for persistent promotion",
@@ -2413,7 +2441,7 @@ fn decode_transaction_array_data_values(
 }
 
 fn decode_transaction_array_elem_values(
-    durable_refs: &DurableReferenceRegistry,
+    durable_refs: &mut DurableReferenceRegistry,
     object_table: &mut ObjectTable,
     bytes: &[u8],
 ) -> Result<Vec<ObjectValue>> {
@@ -2795,7 +2823,7 @@ fn transaction_tarray_len_bytes_impl(
 }
 
 fn object_value_from_transaction_abi(
-    durable_refs: &DurableReferenceRegistry,
+    durable_refs: &mut DurableReferenceRegistry,
     object_table: &mut ObjectTable,
     abi: ObjectValueAbi,
 ) -> Result<ObjectValue> {
@@ -2855,7 +2883,7 @@ fn transaction_abi_from_object_value(
 }
 
 fn live_ref_value_from_raw(
-    durable_refs: &DurableReferenceRegistry,
+    durable_refs: &mut DurableReferenceRegistry,
     object_table: &mut ObjectTable,
     live_ref_kind: u64,
     raw: u64,
@@ -2876,9 +2904,7 @@ fn live_ref_value_from_raw(
         OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC => {
             let vm_func_ref_addr =
                 usize::try_from(raw).context("live function reference does not fit usize")?;
-            let identity = durable_refs
-                .resolve_func_ref(vm_func_ref_addr)
-                .context("ordinary GC promotion cannot encode function reference without registered durable function identity")?;
+            let identity = durable_refs.resolve_or_register_live_func_ref(vm_func_ref_addr)?;
             return Ok(ObjectValue::FuncRef(identity));
         }
         OBJECT_VALUE_ABI_LIVE_REF_KIND_GC => {
@@ -2892,9 +2918,6 @@ fn live_ref_value_from_raw(
             {
                 return Ok(ObjectValue::Ref(Some(object_id)));
             }
-            if let Some(object_id) = object_table.persistent_object_id_for_raw_ref(raw)? {
-                return Ok(ObjectValue::Ref(Some(object_id)));
-            }
             if ObjectTable::is_raw_i31_ref(raw) {
                 return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?));
             }
@@ -2902,9 +2925,7 @@ fn live_ref_value_from_raw(
         OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN => {
             let raw_gc_ref =
                 u32::try_from(raw).context("live external reference does not fit u32")?;
-            let identity = durable_refs.resolve_extern_ref(raw_gc_ref).context(
-                "ordinary GC promotion cannot encode external reference without registered durable external identity",
-            )?;
+            let identity = durable_refs.resolve_or_register_live_extern_ref(raw_gc_ref)?;
             return Ok(ObjectValue::ExternRef(identity));
         }
         OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED => {
@@ -2923,17 +2944,21 @@ fn live_ref_value_from_raw(
             {
                 return Ok(ObjectValue::Ref(Some(object_id)));
             }
-            if let Some(object_id) = object_table.persistent_object_id_for_raw_ref(raw)? {
-                return Ok(ObjectValue::Ref(Some(object_id)));
-            }
             if ObjectTable::is_raw_i31_ref(raw) {
                 return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?));
+            }
+            if u32::try_from(raw).is_err() {
+                let vm_func_ref_addr =
+                    usize::try_from(raw).context("live function reference does not fit usize")?;
+                let identity = durable_refs.resolve_or_register_live_func_ref(vm_func_ref_addr)?;
+                return Ok(ObjectValue::FuncRef(identity));
             }
         }
         _ => bail!("unknown live ref object value ABI kind"),
     }
+    let gc_ref = u32::try_from(raw).context("live GC reference does not fit u32")?;
     Ok(ObjectValue::Ref(Some(
-        object_table.object_id_for_raw_ref_or_func(raw)?,
+        object_table.object_id_for_gc_ref(gc_ref)?,
     )))
 }
 
@@ -4355,10 +4380,10 @@ mod tests {
                 &[root.object_index],
             )
             .unwrap();
-        let durable_refs = DurableReferenceRegistry::default();
+        let mut durable_refs = DurableReferenceRegistry::default();
 
         let abi = transaction_abi_from_object_value(
-            &durable_refs,
+            &mut durable_refs,
             &objects,
             &ObjectValue::Ref(Some(child)),
         )
@@ -4374,7 +4399,7 @@ mod tests {
             child
         );
         assert_eq!(
-            object_value_from_transaction_abi(&durable_refs, &mut objects, abi).unwrap(),
+            object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi).unwrap(),
             ObjectValue::Ref(Some(child))
         );
     }
@@ -4388,10 +4413,10 @@ mod tests {
             OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
         )
         .unwrap();
-        let durable_refs = DurableReferenceRegistry::default();
+        let mut durable_refs = DurableReferenceRegistry::default();
         let mut objects = ObjectTable::default();
 
-        let error = object_value_from_transaction_abi(&durable_refs, &mut objects, abi)
+        let error = object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi)
             .expect_err("explicit persistent object refs must not fall back to i31");
         assert!(
             error
@@ -4408,10 +4433,10 @@ mod tests {
             OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
         )
         .unwrap();
-        let durable_refs = DurableReferenceRegistry::default();
+        let mut durable_refs = DurableReferenceRegistry::default();
         let mut objects = ObjectTable::default();
 
-        let error = object_value_from_transaction_abi(&durable_refs, &mut objects, abi)
+        let error = object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi)
             .expect_err("explicit persistent object refs must not decode null raw refs");
         assert!(
             error
@@ -4421,7 +4446,7 @@ mod tests {
     }
 
     #[test]
-    fn live_ref_bridge_prefers_proven_persistent_object_over_i31_overlap() {
+    fn live_ref_bridge_requires_explicit_kind_for_recovered_persistent_object() {
         let object = ObjectId { object_index: 2 };
         let raw = object.object_index + 1;
         assert!(ObjectTable::is_raw_i31_ref(raw));
@@ -4438,23 +4463,78 @@ mod tests {
                 &[object.object_index],
             )
             .unwrap();
-        let durable_refs = DurableReferenceRegistry::default();
+        let mut durable_refs = DurableReferenceRegistry::default();
 
         assert_eq!(
             live_ref_value_from_raw(
-                &durable_refs,
+                &mut durable_refs,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
                 raw,
             )
             .unwrap(),
-            ObjectValue::Ref(Some(object))
+            ObjectValue::I31(1)
         );
         assert_eq!(
             live_ref_value_from_raw(
-                &durable_refs,
+                &mut durable_refs,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
+                raw,
+            )
+            .unwrap(),
+            ObjectValue::I31(1)
+        );
+        assert_eq!(
+            live_ref_value_from_raw(
+                &mut durable_refs,
+                &mut objects,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
+                raw,
+            )
+            .unwrap(),
+            ObjectValue::Ref(Some(object))
+        );
+    }
+
+    #[test]
+    fn live_ref_bridge_rejects_untyped_gc_raw_that_only_matches_persistent_object_id() {
+        let object = ObjectId { object_index: 41 };
+        let raw = object.object_index + 1;
+        assert!(!ObjectTable::is_raw_i31_ref(raw));
+
+        let mut objects = ObjectTable::default();
+        objects
+            .rebuild_reachable_from_recovered_object_winners(
+                &TypeLayoutRegistry::default(),
+                &[recovered_struct_winner(
+                    object,
+                    1,
+                    vec![ObjectValue::I32(7)],
+                )],
+                &[object.object_index],
+            )
+            .unwrap();
+        let mut durable_refs = DurableReferenceRegistry::default();
+
+        let err = live_ref_value_from_raw(
+            &mut durable_refs,
+            &mut objects,
+            OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
+            raw,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown transactional object GC ref"),
+            "{err:?}"
+        );
+
+        assert_eq!(
+            live_ref_value_from_raw(
+                &mut durable_refs,
+                &mut objects,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
                 raw,
             )
             .unwrap(),
@@ -4469,11 +4549,11 @@ mod tests {
         assert_eq!(raw, 43);
 
         let mut objects = ObjectTable::default();
-        let durable_refs = DurableReferenceRegistry::default();
+        let mut durable_refs = DurableReferenceRegistry::default();
 
         assert_eq!(
             live_ref_value_from_raw(
-                &durable_refs,
+                &mut durable_refs,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
                 raw,
@@ -4483,7 +4563,7 @@ mod tests {
         );
         assert_eq!(
             live_ref_value_from_raw(
-                &durable_refs,
+                &mut durable_refs,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
                 raw,

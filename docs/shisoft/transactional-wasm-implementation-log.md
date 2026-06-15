@@ -30,6 +30,63 @@ for the current persistent-promotion roadmap. It supersedes the older
 plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
 payloads.
 
+## Current Status: Explicit WAST Reference Fallback Policy
+
+Date: 2026-06-15
+
+The live-only `tref.tfunc`/`tref.textern` compatibility fallback is no longer
+enabled by a core-runtime read of `WASMTIME_TEST_TRANSACTION_WAST`.
+`DurableReferenceRegistry` defaults to strict durable-reference behavior:
+unregistered `tfuncref` values and external refs without embedded durable host
+identity are rejected before commit/promotion can publish them. The WAST runner
+explicitly enables the live fallback policy on stores it creates when it is
+running the transaction proposal suite.
+
+This keeps normal and file-backed persistence strict by default while preserving
+the current proposal-WAST execution bridge. The bridge is still not
+restart-stable and remains tagged `SHISOFT-TWASM-MOCK`; the final work is to
+replace it with restart-stable function/external symbolic identities and the
+dedicated `ObjectId`-carrying live `tref` ABI.
+
+## Current Status: Persistent Ref Quality Pass
+
+Date: 2026-06-15
+
+The full transaction proposal WAST gate is passing again after the persistent
+promotion/ABI quality pass:
+
+```text
+WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- --format terse
+test result: ok. 173 passed; 0 failed; 0 ignored; 0 measured
+```
+
+Fixes in this slice:
+
+- Generic `anyref`/`eqref` promotion now classifies inline `i31` and
+  durable/live external references before treating the value as a heap-object
+  edge.
+- Top-level ordinary `externref` promotion now encodes an inline external
+  identity instead of aborting with the old unsupported-source diagnostic.
+- Live transactional ABI decode now requires the explicit persistent-object
+  live-ref kind before interpreting `ObjectId + 1` raw values as persistent
+  refs. Generic `GC`/`UNTYPED` ABI values must resolve through a live GC-ref
+  association, existing durable extern/function registration, i31 encoding, or
+  the live-only function fallback.
+- Store-local live fallback identities were added for proposal-WAST
+  `tref.tfunc` and `tref.textern` values that do not yet have restart-stable
+  symbolic identities at the helper boundary. These are tagged
+  `SHISOFT-TWASM-MOCK` in code and are execution bridges, not durable
+  recovery-stable namespaces.
+- Persistent object trace slots now allow inline funcref and externref leaves
+  in addition to object refs and i31 leaves. They are valid payload values but
+  do not contribute `ObjectId` graph edges.
+
+Remaining boundary:
+
+- Replace the live-only fallback namespaces with final module/function and
+  external symbolic identity encoders, then remove the remaining raw
+  `VMGcRef`/`VMFuncRef` helper bridges as part of the final live `tref` ABI.
+
 ## Current Status: Recovered ObjectId Ref Conversion Bridge
 
 Date: 2026-06-15
@@ -616,10 +673,13 @@ cargo fmt --check
 ok
 
 cargo test -p wasmtime --lib persistent_gc -- --format terse
-test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 598 filtered out
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured
 
 cargo test -p wasmtime --lib persistent_object_marker -- --format terse
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 607 filtered out
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured
+
+cargo test -p wasmtime --lib persistent_root -- --format terse
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured
 
 cargo test -p wasmtime --lib persistent_gc_recovery_filter -- --format terse
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out
@@ -805,8 +865,9 @@ Remaining boundaries:
 
 - The final `ObjectId`-carrying `tref` ABI is not complete; some execution paths
   still use the volatile `VMGcRef -> ObjectId` bridge.
-- Commit-time promotion from volatile transaction objects into persistent
-  object records remains future work.
+- Commit-time promotion is implemented for transaction-mirrored object graphs
+  and the current store-backed ordinary-GC adapter subset. Arbitrary future
+  Wasmtime GC payload forms and the final live `tref` ABI remain incomplete.
 - Persistent transactional function objects are still not complete.
 - Recovery can reconstruct root `ObjectId`s from committed `TGlobal`/`TTable`
   winners, but those recovered roots still need runtime reintegration and
@@ -1506,17 +1567,19 @@ Changes in the closure tranche:
   handles the generated `br_on_tcast ... ti31` result-extraction shape while
   keeping the fixture on real transaction parser/runtime backends.
 
-## Persistent Object GC Decision
+## Historical Note: Persistent Object GC Decision
 
 Date: 2026-06-06
 
-Persistent-object GC is a future workstream, but the object heap/table work
-must be persistent-GC-ready immediately. Current implementation waves should
-produce `ObjectId`-addressed records with explicit headers, traceable payload
-layouts, and committed refs stored as `ObjectId`s. The branch may reuse
-Wasmtime GC type/layout/cast/validation code, but must not reuse `GcHeap`,
-`VMGcRef`, Wasmtime GC roots, or Wasmtime GC barriers as persistent object
-identity or storage.
+This was the design checkpoint before Wave 9A/9B/9C landed. Persistent-object
+GC is now implemented in the tombstone-less recovery/volatile-runtime form
+described in the current Wave 9B/9C section above. The durable-object invariants
+from this checkpoint still hold: committed objects use `ObjectId`-addressed
+records with explicit headers, traceable payload layouts, and committed refs
+stored as `ObjectId`s. The branch may reuse Wasmtime GC
+type/layout/cast/validation code, but must not reuse `GcHeap`, `VMGcRef`,
+Wasmtime GC roots, or Wasmtime GC barriers as persistent object identity or
+storage.
 
 ## Mock Registry and Tagging
 
@@ -1549,8 +1612,10 @@ Current tagged mock categories:
   `crates/wasmtime/src/runtime/transaction.rs`. Backend, durability,
   conflict-policy, and concurrency-control selection have the future shape,
   with store-local `LockBased` active, `VMemory` remaining the default backend,
-  and opt-in `NVMemory`/`FileBackedMemory` backend paths available while durable
-  restart recovery remains deferred.
+  and opt-in `NVMemory`/`FileBackedMemory` backend paths available. File-backed
+  transaction storage has restart recovery coverage for the current
+  tmemory/object-log paths; public durability-policy selection and
+  hardware-PMEM validation remain research surfaces.
 - Table bulk and element-object gaps in Cranelift/runtime lowering are narrowed
   to final persistent reference/object table semantics. The current funcref
   `ttable` paths acquire `TTable`/`TTableSize` ownership and the enabled table
@@ -1625,8 +1690,9 @@ Remaining tagged mock boundaries:
   execution, but it is not the final persistent object model.
 - Full proposal binary validation beyond the current WAST fixtures, including
   hardened diagnostics for every transactional type/ref encoding.
-- Durable restart/recovery metadata and loading for `FileBackedMemory` and
-  `NVMemory` backends.
+- `FileBackedMemory` restart/recovery is implemented for the current tmemory
+  undo-log and object redo/root/type-metadata paths. `NVMemory` still needs
+  hardware-PMEM validation and the final public durability-policy surface.
 
 Verification:
 
