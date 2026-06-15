@@ -1286,7 +1286,10 @@ impl VMemoryBlockRegion {
         let last_start = self.num_blocks() - block_count;
         for start in 0..=last_start {
             let end = start + block_count;
-            if self.block_entries[start..end].iter().all(|entry| entry.used == 0) {
+            if self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0)
+            {
                 let Some(generation) =
                     reusable_chunk_generation(&self.block_metas, start, block_count)?
                 else {
@@ -1744,7 +1747,10 @@ impl NVMemoryBlockRegion {
         let last_start = self.num_blocks() - block_count;
         for start in 0..=last_start {
             let end = start + block_count;
-            if self.block_entries[start..end].iter().all(|entry| entry.used == 0) {
+            if self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0)
+            {
                 let Some(generation) =
                     reusable_chunk_generation(&self.block_metas, start, block_count)?
                 else {
@@ -1991,7 +1997,10 @@ impl FileBackedMemoryBlockRegion {
         let last_start = self.num_blocks() - block_count;
         for start in 0..=last_start {
             let end = start + block_count;
-            if self.block_entries[start..end].iter().all(|entry| entry.used == 0) {
+            if self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0)
+            {
                 let Some(generation) =
                     reusable_chunk_generation(&self.block_metas, start, block_count)?
                 else {
@@ -2562,7 +2571,11 @@ impl FileBackedMemoryBlockRegion {
         let mut repaired_runs = Vec::new();
         let mut repair_start = None;
         let mut repair_len = 0usize;
-        for (block, covered) in covered_blocks.iter().copied().enumerate().skip(reserved_metadata_blocks)
+        for (block, covered) in covered_blocks
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(reserved_metadata_blocks)
         {
             let meta = self.block_metas[block];
             let state = meta.state()?;
@@ -2788,6 +2801,10 @@ impl FileBackedMemoryBlockRegion {
             .get(block)
             .copied()
             .context("transactional FileBackedMemory block metadata index out of bounds")
+    }
+
+    pub(crate) fn block_generation(&self, block: u32) -> Result<u32> {
+        Ok(self.block_meta(block)?.generation)
     }
 
     fn write_log_block_header(&mut self, start_block: u32, header: LogBlockHeader) -> Result<()> {
@@ -3088,8 +3105,9 @@ fn publish_committed_data_record_into_region(
         stream_id << 1,
         location.data_block,
         location.data_offset,
+        region.block_generation(location.data_block)?,
         true,
-    );
+    )?;
     write_log_entries_to_file_backed_region(&mut *region, log_block, &[entry])?;
     flush_chunk_for_recovery(region, location.chunk_start_block)?;
     region.flush(region.block_offset(log_block)?, BLOCK_SIZE)?;
@@ -3830,7 +3848,10 @@ mod tests {
 
         {
             let region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
-            assert_eq!(region.block_meta_for_test(orphan_block).unwrap(), BlockMeta::free());
+            assert_eq!(
+                region.block_meta_for_test(orphan_block).unwrap(),
+                BlockMeta::free()
+            );
             assert_eq!(region.block_entries[orphan_block].used, 0);
         }
 
@@ -3850,9 +3871,16 @@ mod tests {
         .unwrap();
         let location = region.append_data_record(stream, &record).unwrap();
 
-        assert_eq!(usize::try_from(location.chunk_start_block).unwrap(), orphan_block);
         assert_eq!(
-            region.block_meta_for_test(orphan_block).unwrap().kind().unwrap(),
+            usize::try_from(location.chunk_start_block).unwrap(),
+            orphan_block
+        );
+        assert_eq!(
+            region
+                .block_meta_for_test(orphan_block)
+                .unwrap()
+                .kind()
+                .unwrap(),
             BlockKind::ObjectData
         );
     }
@@ -3878,16 +3906,18 @@ mod tests {
             .unwrap();
             let location = region.append_data_record(stream, &record).unwrap();
             chunk_start_block = location.chunk_start_block;
-            chunk_blocks = region.data_chunk_header(chunk_start_block).unwrap().chunk_blocks;
+            chunk_blocks = region
+                .data_chunk_header(chunk_start_block)
+                .unwrap()
+                .chunk_blocks;
             region.flush_data_chunk(chunk_start_block).unwrap();
             region.fence().unwrap();
         }
 
         let mut region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
         assert!(chunk_blocks > 1);
-        for block in
-            usize::try_from(chunk_start_block).unwrap()..usize::try_from(chunk_start_block).unwrap()
-                + usize::try_from(chunk_blocks).unwrap()
+        for block in usize::try_from(chunk_start_block).unwrap()
+            ..usize::try_from(chunk_start_block).unwrap() + usize::try_from(chunk_blocks).unwrap()
         {
             let meta = region.block_meta_for_test(block).unwrap();
             assert_eq!(meta.kind().unwrap(), BlockKind::ObjectData);

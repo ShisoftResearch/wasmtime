@@ -1326,8 +1326,10 @@ mod tests {
             1 << 1,
             location.data_block,
             location.data_offset,
+            0,
             true,
-        );
+        )
+        .unwrap();
         write_log_entries(&mut region, log_block, &[entry, entry]);
         region
     }
@@ -1505,8 +1507,10 @@ mod tests {
             stream_id << 1,
             location.data_block,
             location.data_offset,
+            0,
             true,
-        );
+        )
+        .unwrap();
         write_log_entries(region, log_block, &[entry]);
     }
 
@@ -1531,15 +1535,16 @@ mod tests {
         .unwrap();
         let location = region.append_data_record(stream, &record).unwrap();
         let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
-        let mut entry = TMemory::publication_log_entry(
+        let entry = TMemory::publication_log_entry(
             logical_id,
             version,
             stream_id << 1,
             location.data_block,
             location.data_offset,
+            0,
             false,
-        );
-        entry.seal_crc32();
+        )
+        .unwrap();
         write_log_entries(region, log_block, &[entry]);
     }
 
@@ -1669,8 +1674,10 @@ mod tests {
             stream_id << 1,
             location.data_block,
             location.data_offset,
+            0,
             true,
-        );
+        )
+        .unwrap();
         write_log_entries(region, log_block, &[entry]);
         (log_block, location)
     }
@@ -1693,8 +1700,10 @@ mod tests {
             stream_id << 1,
             location.data_block,
             location.data_offset,
+            0,
             true,
-        );
+        )
+        .unwrap();
         write_log_entries(region, log_block, &[entry]);
     }
 
@@ -1718,8 +1727,10 @@ mod tests {
             stream_id << 1,
             location.data_block,
             location.data_offset,
+            0,
             true,
-        );
+        )
+        .unwrap();
         write_log_entries(region, log_block, &[entry]);
 
         assert_eq!(

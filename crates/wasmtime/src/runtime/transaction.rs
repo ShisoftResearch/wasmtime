@@ -14235,8 +14235,10 @@ mod tests {
             stream_id << 1,
             location.data_block,
             location.data_offset,
+            0,
             true,
-        );
+        )
+        .unwrap();
         write_log_entry_for_recovery_test(region, log_block, entry);
     }
 
@@ -16011,8 +16013,10 @@ mod tests {
             stream_id << 1,
             location.data_block,
             location.data_offset,
+            0,
             true,
-        );
+        )
+        .unwrap();
         write_log_entry_for_recovery_test(region, log_block, entry);
     }
 

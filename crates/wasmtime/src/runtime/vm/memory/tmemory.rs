@@ -210,14 +210,16 @@ impl TMemory {
         tx_meta: u32,
         data_block: u32,
         data_offset: u32,
+        data_block_generation: u32,
         is_final: bool,
-    ) -> TxLogEntry {
+    ) -> Result<TxLogEntry> {
         let mut entry = TxLogEntry::new(logical_id, version, tx_meta, data_block, data_offset);
+        entry.set_data_block_generation(data_block_generation)?;
         if is_final {
             entry.tx_meta |= 1;
-            entry.seal_crc32();
         }
-        entry
+        entry.seal_crc32();
+        Ok(entry)
     }
 
     pub(crate) fn backend(&self) -> TMemoryBackend {

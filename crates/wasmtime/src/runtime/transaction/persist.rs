@@ -49,6 +49,7 @@ pub(crate) struct PendingCommitLogEntry {
     pub(crate) version: u32,
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
+    pub(crate) data_block_generation: u32,
     pub(crate) role: TxLogEntryRole,
 }
 
@@ -211,12 +212,19 @@ impl PendingPublication {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DurableDataRecordPointer {
+    pub(crate) data_block: u32,
+    pub(crate) data_offset: u32,
+    pub(crate) data_block_generation: u32,
+}
+
 pub(crate) trait DurableSink {
     fn append_data_record(
         &mut self,
         record: &[u8],
         data_stream: DurableDataStream,
-    ) -> Result<(u32, u32)>;
+    ) -> Result<DurableDataRecordPointer>;
     fn append_log_entry(
         &mut self,
         logical_id: u64,
@@ -224,6 +232,7 @@ pub(crate) trait DurableSink {
         tx_meta: u32,
         data_block: u32,
         data_offset: u32,
+        data_block_generation: u32,
         is_final: bool,
         role: TxLogEntryRole,
     ) -> Result<()>;
@@ -251,7 +260,7 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
         transaction_stream_id: u32,
         data_stream: DurableDataStream,
         record: &[u8],
-    ) -> Result<(u32, u32)>;
+    ) -> Result<DurableDataRecordPointer>;
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()>;
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
@@ -391,7 +400,7 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
         transaction_stream_id: u32,
         _data_stream: DurableDataStream,
         record: &[u8],
-    ) -> Result<(u32, u32)> {
+    ) -> Result<DurableDataRecordPointer> {
         let state = self.streams.entry(transaction_stream_id).or_default();
         state.data_records.push(record.to_vec());
         let data_block = state.next_data_block;
@@ -399,7 +408,11 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
             .next_data_block
             .checked_add(1)
             .context("transaction durable data block overflow")?;
-        Ok((data_block, 0))
+        Ok(DurableDataRecordPointer {
+            data_block,
+            data_offset: 0,
+            data_block_generation: 0,
+        })
     }
 
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
@@ -462,12 +475,16 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         transaction_stream_id: u32,
         data_stream: DurableDataStream,
         record: &[u8],
-    ) -> Result<(u32, u32)> {
+    ) -> Result<DurableDataRecordPointer> {
         let data_stream_id = data_stream.file_backed_stream_id(transaction_stream_id)?;
         let stream = self.stream_cursor(data_stream_id)?;
         let location = self.region.append_data_record(stream, record)?;
         self.pending_data_chunks.insert(location.chunk_start_block);
-        Ok((location.data_block, location.data_offset))
+        Ok(DurableDataRecordPointer {
+            data_block: location.data_block,
+            data_offset: location.data_offset,
+            data_block_generation: self.region.block_generation(location.data_block)?,
+        })
     }
 
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
@@ -541,7 +558,7 @@ impl DurableSink for TxDurableLogSink<'_> {
         &mut self,
         record: &[u8],
         data_stream: DurableDataStream,
-    ) -> Result<(u32, u32)> {
+    ) -> Result<DurableDataRecordPointer> {
         self.log
             .storage
             .append_data_record(self.stream_id, data_stream, record)
@@ -554,6 +571,7 @@ impl DurableSink for TxDurableLogSink<'_> {
         tx_meta: u32,
         data_block: u32,
         data_offset: u32,
+        data_block_generation: u32,
         is_final: bool,
         role: TxLogEntryRole,
     ) -> Result<()> {
@@ -563,8 +581,9 @@ impl DurableSink for TxDurableLogSink<'_> {
             tx_meta,
             data_block,
             data_offset,
+            data_block_generation,
             is_final,
-        );
+        )?;
         entry.set_role(role);
         entry.seal_crc32();
         self.log.storage.append_log_entry(self.stream_id, entry)
@@ -607,43 +626,39 @@ where
         let mut ordinary = Vec::new();
         for pub_ in pubs {
             let record = encode_data_record(pub_)?;
-            let (data_block, data_offset) = self
+            let pointer = self
                 .sink
                 .append_data_record(&record, DurableDataStream::ObjectPublication)?;
-            ordinary.push((
-                pub_.logical_id,
-                pub_.version,
-                self.txid << 1,
-                data_block,
-                data_offset,
-            ));
+            ordinary.push((pub_.logical_id, pub_.version, self.txid << 1, pointer));
         }
 
         self.sink.flush_data()?;
         self.sink.fence()?;
 
-        for &(logical_id, version, tx_meta, data_block, data_offset) in
+        for &(logical_id, version, tx_meta, pointer) in
             ordinary.iter().take(ordinary.len().saturating_sub(1))
         {
             self.sink.append_log_entry(
                 logical_id,
                 version,
                 tx_meta,
-                data_block,
-                data_offset,
+                pointer.data_block,
+                pointer.data_offset,
+                pointer.data_block_generation,
                 false,
                 TxLogEntryRole::TObjectPub,
             )?;
         }
         self.sink.flush_log()?;
 
-        if let Some(&(logical_id, version, tx_meta, data_block, data_offset)) = ordinary.last() {
+        if let Some(&(logical_id, version, tx_meta, pointer)) = ordinary.last() {
             self.sink.append_log_entry(
                 logical_id,
                 version,
                 tx_meta,
-                data_block,
-                data_offset,
+                pointer.data_block,
+                pointer.data_offset,
+                pointer.data_block_generation,
                 true,
                 TxLogEntryRole::TObjectPub,
             )?;
@@ -661,7 +676,7 @@ where
         let _ = self.stream_id;
 
         let record = encode_undo_data_record(undo)?;
-        let (data_block, data_offset) = self
+        let pointer = self
             .sink
             .append_data_record(&record, DurableDataStream::TMemoryUndo)?;
 
@@ -672,8 +687,9 @@ where
             undo.logical_id,
             undo.version,
             self.txid << 1,
-            data_block,
-            data_offset,
+            pointer.data_block,
+            pointer.data_offset,
+            pointer.data_block_generation,
             false,
             TxLogEntryRole::TMemoryUndo,
         )?;
@@ -683,8 +699,9 @@ where
         Ok(PendingCommitLogEntry {
             logical_id: undo.logical_id,
             version: undo.version,
-            data_block,
-            data_offset,
+            data_block: pointer.data_block,
+            data_offset: pointer.data_offset,
+            data_block_generation: pointer.data_block_generation,
             role: TxLogEntryRole::TMemoryUndo,
         })
     }
@@ -696,7 +713,7 @@ where
         let _ = self.stream_id;
 
         let record = encode_data_record(pub_)?;
-        let (data_block, data_offset) = self
+        let pointer = self
             .sink
             .append_data_record(&record, DurableDataStream::ObjectPublication)?;
 
@@ -707,8 +724,9 @@ where
             pub_.logical_id,
             pub_.version,
             self.txid << 1,
-            data_block,
-            data_offset,
+            pointer.data_block,
+            pointer.data_offset,
+            pointer.data_block_generation,
             false,
             TxLogEntryRole::TObjectPub,
         )?;
@@ -718,8 +736,9 @@ where
         Ok(PendingCommitLogEntry {
             logical_id: pub_.logical_id,
             version: pub_.version,
-            data_block,
-            data_offset,
+            data_block: pointer.data_block,
+            data_offset: pointer.data_offset,
+            data_block_generation: pointer.data_block_generation,
             role: TxLogEntryRole::TObjectPub,
         })
     }
@@ -731,6 +750,7 @@ where
             self.txid << 1,
             marker.data_block,
             marker.data_offset,
+            marker.data_block_generation,
             true,
             marker.role,
         )?;
@@ -797,14 +817,18 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
         _transaction_stream_id: u32,
         data_stream: DurableDataStream,
         _record: &[u8],
-    ) -> Result<(u32, u32)> {
+    ) -> Result<DurableDataRecordPointer> {
         self.push_event(RecordingBackendEvent::AppendDataRecord(data_stream));
         let data_block = self.next_data_block;
         self.next_data_block = self
             .next_data_block
             .checked_add(1)
             .context("recording backend data block overflow")?;
-        Ok((data_block, 0))
+        Ok(DurableDataRecordPointer {
+            data_block,
+            data_offset: 0,
+            data_block_generation: 0,
+        })
     }
 
     fn append_log_entry(&mut self, _transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
@@ -894,7 +918,7 @@ impl DurableSink for RecordingDurability {
         &mut self,
         _record: &[u8],
         _data_stream: DurableDataStream,
-    ) -> Result<(u32, u32)> {
+    ) -> Result<DurableDataRecordPointer> {
         if self.events.last() != Some(&DurabilityEvent::DataWrite) {
             self.events.push(DurabilityEvent::DataWrite);
         }
@@ -903,7 +927,11 @@ impl DurableSink for RecordingDurability {
             .next_data_block
             .checked_add(1)
             .context("recording durability data block overflow")?;
-        Ok((data_block, 0))
+        Ok(DurableDataRecordPointer {
+            data_block,
+            data_offset: 0,
+            data_block_generation: 0,
+        })
     }
 
     fn append_log_entry(
@@ -913,6 +941,7 @@ impl DurableSink for RecordingDurability {
         tx_meta: u32,
         _data_block: u32,
         _data_offset: u32,
+        _data_block_generation: u32,
         is_final: bool,
         role: TxLogEntryRole,
     ) -> Result<()> {
@@ -1130,6 +1159,32 @@ mod tests {
     }
 
     #[test]
+    fn tx_durable_log_sink_preserves_non_zero_data_block_generation() {
+        let mut log = TxDurableLog::default();
+
+        {
+            let mut sink = log.stream_sink(7);
+            sink.append_log_entry(
+                0x1000_0000_0000_002a,
+                3,
+                11 << 1,
+                9,
+                64,
+                17,
+                true,
+                TxLogEntryRole::TMemoryUndo,
+            )
+            .unwrap();
+        }
+
+        let entries = log.log_entries_for_test(7);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data_block_generation(), 17);
+        assert_eq!(entries[0].role().unwrap(), TxLogEntryRole::TMemoryUndo);
+        assert!(entries[0].validate_crc32());
+    }
+
+    #[test]
     fn file_backed_object_publication_without_lp_is_not_committed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tx-log.bin");
@@ -1159,6 +1214,39 @@ mod tests {
 
         let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
         assert!(recovered.object_winners.is_empty());
+    }
+
+    #[test]
+    fn file_backed_publisher_stamps_data_block_generation_on_log_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("generation-log.bin");
+        let mut log = TxDurableLog::create_file_backed(&path, 64).unwrap();
+        let mut sink = log.stream_sink(7);
+        let mut publisher = StreamPublisher::new(&mut sink, 7, 11);
+
+        let publication = PendingPublication::persistent_object_for_test(
+            PackedGranuleDomain::TStruct,
+            41,
+            1,
+            12,
+            &encode_object_record_for_test(
+                41,
+                1,
+                12,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+            )
+            .unwrap(),
+        );
+        let marker = publisher
+            .publish_object_publication_before_commit(&publication)
+            .unwrap();
+        publisher.publish_commit_lp(marker).unwrap();
+
+        let entries = log.log_entries_for_test(7);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].data_block_generation(), 0);
+        assert_eq!(entries[1].data_block_generation(), 0);
     }
 
     #[test]
