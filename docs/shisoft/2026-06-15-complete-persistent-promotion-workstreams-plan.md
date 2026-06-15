@@ -124,14 +124,15 @@ Status: implemented for current `tstruct`/`tarray` object-table payloads.
 
 ## Workstream 3: Ordinary Wasmtime GC Heap Promotion Adapter
 
-Status: adapter contract and first store-backed reader implemented; durable
-function/external identity still pending.
+Status: adapter contract, first store-backed reader, and current durable
+function/external identity encoding paths implemented.
 
 The current promotion path handles transaction-mirrored objects and the first
 store-backed subset of ordinary Wasmtime GC heap objects: raw `i31` leaves plus
 `struct` and `array` heap objects whose fields/elements can be encoded as
-supported scalar values, nulls, inline `i31` leaves, or promoted `ObjectId`
-edges. Function/external durable identity remains outside this slice.
+supported scalar values, nulls, inline `i31` leaves, promoted `ObjectId` edges,
+registered durable function identities, or embedded durable externref
+identities.
 
 - [x] Add an adapter that can classify ordinary Wasmtime GC heap references as
   struct, array, i31, function, external, null, or unsupported.
@@ -150,7 +151,7 @@ edges. Function/external durable identity remains outside this slice.
   model.
 - [x] Convert real ordinary heap object references into either promoted
   `ObjectId` edges or inline durable leaves.
-- [ ] Add durable function/external identity handling to the store-backed
+- [x] Add durable function/external identity handling to the store-backed
   adapter once Workstream 4 defines the identity sources.
 - [x] Make persistent trace-layout metadata type-driven so ref-capable
   struct fields and array elements keep tracing object edges even when the
