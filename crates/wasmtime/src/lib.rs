@@ -592,17 +592,23 @@ pub mod _internal {
             function_index: u32,
             type_layout_id: u32,
         ) -> crate::Result<()> {
-            let type_layout_id =
-                crate::runtime::transaction::type_layout::TypeLayoutId::new(type_layout_id)
-                    .context("durable function ref type layout id cannot be zero")?;
             store.transaction_register_durable_func_ref_for_test(
                 func,
-                crate::runtime::transaction::DurableFuncIdentity {
-                    module_fingerprint,
-                    function_index,
-                    type_layout_id,
-                },
+                durable_func_identity_for_test(module_fingerprint, function_index, type_layout_id)?,
             )
+        }
+
+        pub fn resolve_durable_func_ref_for_test<T>(
+            store: &mut crate::Store<T>,
+            module_fingerprint: u64,
+            function_index: u32,
+            type_layout_id: u32,
+        ) -> crate::Result<Option<crate::Func>> {
+            store.transaction_resolve_durable_func_ref_for_test(durable_func_identity_for_test(
+                module_fingerprint,
+                function_index,
+                type_layout_id,
+            )?)
         }
 
         pub fn register_exported_durable_func_ref_for_test<T>(
@@ -655,6 +661,21 @@ pub mod _internal {
                 fingerprint = fingerprint.wrapping_mul(0x0000_0001_0000_01b3);
             }
             fingerprint
+        }
+
+        fn durable_func_identity_for_test(
+            module_fingerprint: u64,
+            function_index: u32,
+            type_layout_id: u32,
+        ) -> crate::Result<crate::runtime::transaction::DurableFuncIdentity> {
+            let type_layout_id =
+                crate::runtime::transaction::type_layout::TypeLayoutId::new(type_layout_id)
+                    .context("durable function ref type layout id cannot be zero")?;
+            Ok(crate::runtime::transaction::DurableFuncIdentity {
+                module_fingerprint,
+                function_index,
+                type_layout_id,
+            })
         }
 
         pub fn new_durable_extern_ref_for_test<T>(

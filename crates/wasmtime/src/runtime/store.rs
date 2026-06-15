@@ -936,6 +936,25 @@ impl<T> Store<T> {
             .transaction_register_durable_func_ref_for_test(func_ref.as_ptr().addr(), identity)
     }
 
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_resolve_durable_func_ref_for_test(
+        &mut self,
+        identity: DurableFuncIdentity,
+    ) -> Result<Option<crate::Func>> {
+        let Some(vm_func_ref_addr) = self
+            .inner
+            .transaction_resolve_durable_func_ref_for_test(identity)
+        else {
+            return Ok(None);
+        };
+        let vm_func_ref = core::ptr::with_exposed_provenance_mut::<VMFuncRef>(vm_func_ref_addr);
+        let vm_func_ref = NonNull::new(vm_func_ref)
+            .context("durable function identity resolved to a null function reference")?;
+        Ok(Some(unsafe {
+            crate::Func::from_vm_func_ref(self.inner.id(), vm_func_ref)
+        }))
+    }
+
     /// Access the underlying `T` data owned by this `Store`.
     #[inline]
     pub fn data(&self) -> &T {
@@ -1746,6 +1765,15 @@ impl StoreOpaque {
     ) -> Result<()> {
         self.transaction_durable_refs
             .register_func_ref(vm_func_ref_addr, identity)
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_resolve_durable_func_ref_for_test(
+        &self,
+        identity: DurableFuncIdentity,
+    ) -> Option<usize> {
+        self.transaction_durable_refs
+            .resolve_func_identity(identity)
     }
 
     pub(crate) fn transaction_promotion_context_mut(

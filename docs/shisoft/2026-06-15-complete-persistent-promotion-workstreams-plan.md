@@ -169,8 +169,10 @@ registered identities, with an internal exported-function helper that derives
 the module fingerprint from retained original Wasm bytecode and the function
 index from Wasmtime export metadata.
 External references use an embedded durable externref host-data wrapper in the
-internal test seam. Restart-time function resolution and public identity APIs
-remain pending.
+internal test seam. Store-local registered-function resolution exists for
+loaded exported functions after they are explicitly registered in that store;
+public identity APIs, recovered-payload reintegration, and multi-instance/module
+namespace policy remain pending.
 
 The object value ABI can store durable function/external identities, but runtime
 helpers still need authoritative identity encoders at the boundaries where raw
@@ -178,7 +180,11 @@ Wasmtime refs are observed.
 
 - [x] Define internal automatic module/function fingerprints for exported
   `tfuncref` values when retained module bytecode is available.
-- [ ] Add restart-time `tfuncref` resolution against loaded modules.
+- [x] Add a store-local `tfuncref` resolver for explicitly registered loaded
+  exported module functions, rejecting ambiguous duplicate identity bindings.
+- [ ] Define full public/recovery-time `tfuncref` resolution semantics,
+  including recovered-payload reintegration and multi-instance/module namespace
+  policy.
 - [x] Define explicit external-reference namespaces and handles for
   `texternref` values.
 - [x] Add internal per-store registration APIs for durable function identities

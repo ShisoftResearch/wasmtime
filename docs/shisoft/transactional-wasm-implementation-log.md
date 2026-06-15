@@ -188,16 +188,16 @@ function and external reference leaves:
 
 Still pending:
 
-- Automatic module/function fingerprinting and restart-time function resolution
-  against loaded modules.
 - Public host/module durable identity APIs beyond the internal test seam.
+- Full durable function resolution from recovered persistent payloads into the
+  runtime `Func` surface.
 - Durable identity support for continuation and exception references.
 
 Verification for this slice:
 
 ```text
 cargo test -p wasmtime --test transaction_persistence -- --format terse
-test result: ok. 13 passed; 0 failed; 0 ignored
+test result: ok. 15 passed; 0 failed; 0 ignored
 ```
 
 ## Current Status: Internal Exported Function Durable Identity
@@ -212,15 +212,32 @@ Workstream 4 now has an internal automatic identity helper for exported
 - The module fingerprint is derived from retained original Wasm bytecode. The
   helper fails closed when bytecode is unavailable, so tests that use automatic
   durable function identity enable `Config::guest_debug(true)`.
+- `DurableReferenceRegistry` now keeps a reverse
+  `DurableFuncIdentity -> VMFuncRef` map for store-local resolution after an
+  exported function has been registered in that store.
+- Registering the same durable function identity for multiple different
+  loaded function refs is rejected as ambiguous until the public
+  multi-instance/module namespace policy is designed.
 - The file-backed persistence test now registers the exported `target`
   function through this helper and verifies that the recovered object payload
-  contains the derived fingerprint and function index.
+  contains the derived fingerprint and function index, then demonstrates that
+  the same identity resolves in a fresh store after the module's exported
+  function has been explicitly registered there.
 
 Still pending:
 
-- Restart-time resolution from durable function identity back to loaded module
-  functions.
 - Public host/module durable identity APIs.
+- Full multi-instance/module namespace semantics for durable function identity
+  resolution.
+- Runtime reintegration that resolves recovered persistent function leaves into
+  live `Func` values automatically.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 15 passed; 0 failed; 0 ignored
+```
 
 ## Current Status: Wave 11 VMGcRef Commit Promotion
 

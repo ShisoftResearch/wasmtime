@@ -250,6 +250,36 @@ fn real_tfunc_promotes_exported_funcref_leaf_and_recovers() -> Result<()> {
         )
     );
 
+    let mut restart_store = Store::new(&engine, ());
+    let restart_instance = Instance::new(&mut restart_store, &module, &[])?;
+    assert!(
+        wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+            &mut restart_store,
+            expected_module_fingerprint,
+            0,
+            1,
+        )?
+        .is_none()
+    );
+    let restart_target =
+        wasmtime::_internal::transaction_persistence::register_exported_durable_func_ref_for_test(
+            &mut restart_store,
+            &restart_instance,
+            "target",
+            1,
+        )?;
+    let resolved = wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+        &mut restart_store,
+        expected_module_fingerprint,
+        0,
+        1,
+    )?
+    .expect("restarted store should resolve registered durable function identity");
+    assert_eq!(
+        resolved.to_raw(&mut restart_store),
+        restart_target.to_raw(&mut restart_store)
+    );
+
     Ok(())
 }
 
@@ -273,6 +303,31 @@ fn durable_funcref_registration_rejects_conflicting_identity() -> Result<()> {
     assert!(
         err.to_string()
             .contains("durable function reference identity registration conflict"),
+        "{err:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn durable_funcref_registration_rejects_ambiguous_identity() -> Result<()> {
+    let engine = transaction_root_engine()?;
+    let module = Module::new(&engine, r#"(module (func (export "target")))"#)?;
+    let mut store = Store::new(&engine, ());
+    let first = Instance::new(&mut store, &module, &[])?;
+    let second = Instance::new(&mut store, &module, &[])?;
+
+    wasmtime::_internal::transaction_persistence::register_exported_durable_func_ref_for_test(
+        &mut store, &first, "target", 1,
+    )?;
+    let err =
+        wasmtime::_internal::transaction_persistence::register_exported_durable_func_ref_for_test(
+            &mut store, &second, "target", 1,
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resolves to multiple function references"),
         "{err:?}"
     );
 

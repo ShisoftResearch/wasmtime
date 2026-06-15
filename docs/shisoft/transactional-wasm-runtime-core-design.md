@@ -756,7 +756,10 @@ Promotion is graph-based:
   internal exported-function helper that derives module fingerprints from
   retained original Wasm bytecode and function indices from Wasmtime export
   metadata, and an embedded durable host-data wrapper for test external refs.
-  Restart-time function resolution and public identity APIs remain future work.
+  Store-local function resolution is available after a loaded exported function
+  has been explicitly registered in that store, and ambiguous duplicate
+  identity bindings are rejected; public identity APIs, recovered-payload
+  reintegration, and multi-instance/module namespace policy remain future work.
 
 After commit, persistent reachability contains persistent roots, `ObjectId`
 heap-object edges, and inline durable scalar/reference leaves. Transaction

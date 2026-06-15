@@ -19,6 +19,7 @@ pub(crate) struct DurableExternIdentity {
 #[derive(Default)]
 pub(crate) struct DurableReferenceRegistry {
     funcs_by_vm_func_ref: BTreeMap<usize, DurableFuncIdentity>,
+    vm_func_refs_by_identity: BTreeMap<DurableFuncIdentity, usize>,
 }
 
 impl DurableReferenceRegistry {
@@ -32,14 +33,30 @@ impl DurableReferenceRegistry {
                 *existing == identity,
                 "durable function reference identity registration conflict"
             );
+        }
+        if let Some(existing) = self.vm_func_refs_by_identity.get(&identity) {
+            ensure!(
+                *existing == vm_func_ref_addr,
+                "durable function identity resolves to multiple function references"
+            );
+        }
+        if self.funcs_by_vm_func_ref.contains_key(&vm_func_ref_addr)
+            && self.vm_func_refs_by_identity.contains_key(&identity)
+        {
             return Ok(());
         }
         self.funcs_by_vm_func_ref.insert(vm_func_ref_addr, identity);
+        self.vm_func_refs_by_identity
+            .insert(identity, vm_func_ref_addr);
         Ok(())
     }
 
     pub(crate) fn resolve_func_ref(&self, vm_func_ref_addr: usize) -> Option<DurableFuncIdentity> {
         self.funcs_by_vm_func_ref.get(&vm_func_ref_addr).copied()
+    }
+
+    pub(crate) fn resolve_func_identity(&self, identity: DurableFuncIdentity) -> Option<usize> {
+        self.vm_func_refs_by_identity.get(&identity).copied()
     }
 }
 
