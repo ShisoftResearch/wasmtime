@@ -453,7 +453,9 @@ impl TxLogEntry {
     }
 
     pub(crate) fn set_role(&mut self, role: TxLogEntryRole) {
-        self.entry_meta = TxEntryMeta::from_bits(self.entry_meta).with_role(role).bits();
+        self.entry_meta = TxEntryMeta::from_bits(self.entry_meta)
+            .with_role(role)
+            .bits();
     }
 
     pub(crate) fn data_block_generation(&self) -> u32 {
@@ -785,7 +787,9 @@ mod tests {
             reserved1: 0,
         };
 
-        let err = BlockMeta::from_bytes(meta.as_bytes()).unwrap_err().to_string();
+        let err = BlockMeta::from_bytes(meta.as_bytes())
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("durable non-free block metadata must not use free kind"));
     }
@@ -795,7 +799,9 @@ mod tests {
         let mut meta = BlockMeta::free();
         meta.chunk_blocks = 1;
 
-        let err = BlockMeta::from_bytes(meta.as_bytes()).unwrap_err().to_string();
+        let err = BlockMeta::from_bytes(meta.as_bytes())
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("durable free block metadata must have zero chunk blocks"));
     }
