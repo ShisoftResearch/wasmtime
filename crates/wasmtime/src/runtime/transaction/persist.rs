@@ -415,6 +415,20 @@ impl TxDurableLog {
             events,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn recording_backend_with_retire_failures_for_test(
+        failures_remaining: u32,
+    ) -> (Self, Arc<Mutex<Vec<RecordingBackendEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self::with_backend(RecordingTxDurableLogBackend::new_with_retire_failures(
+                events.clone(),
+                failures_remaining,
+            )),
+            events,
+        )
+    }
 }
 
 impl TxDurableLogBackend for InMemoryTxDurableLog {
@@ -828,6 +842,7 @@ pub(crate) enum RecordingBackendEvent {
     FlushLog,
     Fence,
     RetireCommittedLinearUndoChunk(u32),
+    RetireCommittedLinearUndoChunkFailed(u32),
 }
 
 #[cfg(test)]
@@ -836,7 +851,7 @@ struct RecordingTxDurableLogBackend {
     events: Arc<Mutex<Vec<RecordingBackendEvent>>>,
     next_data_block: u32,
     type_layouts: TypeLayoutRegistry,
-    fail_retire_committed_linear_undo: bool,
+    retire_committed_linear_undo_failures_remaining: u32,
 }
 
 #[cfg(test)]
@@ -846,13 +861,20 @@ impl RecordingTxDurableLogBackend {
             events,
             next_data_block: 0,
             type_layouts: TypeLayoutRegistry::default(),
-            fail_retire_committed_linear_undo: false,
+            retire_committed_linear_undo_failures_remaining: 0,
         }
     }
 
     fn new_with_retire_failure(events: Arc<Mutex<Vec<RecordingBackendEvent>>>) -> Self {
+        Self::new_with_retire_failures(events, u32::MAX)
+    }
+
+    fn new_with_retire_failures(
+        events: Arc<Mutex<Vec<RecordingBackendEvent>>>,
+        failures_remaining: u32,
+    ) -> Self {
         Self {
-            fail_retire_committed_linear_undo: true,
+            retire_committed_linear_undo_failures_remaining: failures_remaining,
             ..Self::new(events)
         }
     }
@@ -918,7 +940,11 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
         self.push_event(RecordingBackendEvent::RetireCommittedLinearUndoChunk(
             chunk_start_block,
         ));
-        if self.fail_retire_committed_linear_undo {
+        if self.retire_committed_linear_undo_failures_remaining > 0 {
+            self.retire_committed_linear_undo_failures_remaining -= 1;
+            self.push_event(RecordingBackendEvent::RetireCommittedLinearUndoChunkFailed(
+                chunk_start_block,
+            ));
             bail!("recording backend post-LP cleanup failure")
         }
         Ok(())

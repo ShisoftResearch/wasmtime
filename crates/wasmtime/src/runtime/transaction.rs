@@ -2961,6 +2961,7 @@ impl TransactionConcurrencyControl for LockBased {
 
 impl TransactionState {
     pub(crate) fn begin(&mut self) -> Result<TransactionId> {
+        self.retry_post_commit_linear_undo_retirement();
         ensure!(
             !self.failed,
             "cannot begin transaction while structured ttry failure is pending"
@@ -2983,6 +2984,7 @@ impl TransactionState {
         &mut self,
         transaction: TransactionId,
     ) -> Result<Option<TransactionId>> {
+        self.retry_post_commit_linear_undo_retirement();
         ensure!(
             !self.failed,
             "cannot enter transaction while structured ttry failure is pending"
@@ -3000,6 +3002,7 @@ impl TransactionState {
     }
 
     pub(crate) fn restore_transaction(&mut self, previous: Option<TransactionId>) -> Result<()> {
+        self.retry_post_commit_linear_undo_retirement();
         self.suspend_active_workspace()?;
         match previous {
             Some(transaction) => {
@@ -3408,6 +3411,7 @@ impl TransactionState {
 
     pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
+        self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
         self.clear_active();
         Ok(())
@@ -8966,6 +8970,70 @@ mod tests {
                 marker.chunk_start_block
             )
         ));
+        assert!(events.lock().unwrap().contains(
+            &persist::RecordingBackendEvent::RetireCommittedLinearUndoChunkFailed(
+                marker.chunk_start_block
+            )
+        ));
+    }
+
+    #[test]
+    fn post_commit_linear_undo_cleanup_retries_on_abort_and_drains_queue() {
+        let (durable_log, events) =
+            TxDurableLog::recording_backend_with_retire_failures_for_test(4);
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(19),
+            durable_log,
+        );
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0031, 3, vec![4, 5, 6, 7]);
+
+        let marker = state
+            .publish_tmemory_undo_before_in_place_write(19, 19, &undo)
+            .unwrap();
+        state.publish_commit_lp(19, 19, marker).unwrap();
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            state
+                .post_commit_linear_undo_chunks
+                .get(&19)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![marker.chunk_start_block]
+        );
+
+        state.begin().unwrap();
+        assert_eq!(
+            state
+                .post_commit_linear_undo_chunks
+                .get(&19)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![marker.chunk_start_block]
+        );
+        state.abort().unwrap();
+
+        assert!(!state.post_commit_linear_undo_chunks.contains_key(&19));
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        persist::RecordingBackendEvent::RetireCommittedLinearUndoChunk(
+                            chunk_start_block
+                        ) if *chunk_start_block == marker.chunk_start_block
+                    )
+                })
+                .count(),
+            5
+        );
     }
 
     #[test]
