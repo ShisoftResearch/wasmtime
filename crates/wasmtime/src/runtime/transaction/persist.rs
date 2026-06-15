@@ -98,6 +98,10 @@ impl PendingPublication {
             ),
             "persistent root publication domain must be TGlobal or TTable"
         );
+        ensure!(
+            root_index < (1u64 << 60),
+            "persistent root index does not fit in packed granule id payload"
+        );
         let logical_id = ((domain as u64) << 60) | root_index;
         let mut payload = Vec::new();
         for root in roots {
@@ -1518,6 +1522,18 @@ mod tests {
         expected.extend_from_slice(&0_u64.to_le_bytes());
         expected.extend_from_slice(&100_u64.to_le_bytes());
         assert_eq!(publication.payload, expected);
+    }
+
+    #[test]
+    fn persistent_root_publication_rejects_oversized_root_index() {
+        let err =
+            PendingPublication::persistent_global_root(1u64 << 60, 7, [Some(41_u64)]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent root index does not fit in packed granule id payload"),
+            "{err:?}"
+        );
     }
 
     mod model_recovery {
