@@ -30,6 +30,32 @@ for the current persistent-promotion roadmap. It supersedes the older
 plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
 payloads.
 
+## Current Status: Promotion Module Split
+
+Date: 2026-06-15
+
+The commit-time persistent promotion implementation moved out of the main
+runtime transaction file into `crates/wasmtime/src/runtime/transaction/promotion.rs`.
+This is a behavior-preserving split:
+
+- `OrdinaryGcPromotionValue`, `OrdinaryGcPromotionSource`, and
+  `OrdinaryGcPromotionAdapter` are re-exported from `transaction.rs` for the
+  existing libcall and test call sites.
+- Promotion attempt rollback state and promotion graph rewrite methods now live
+  with the adapter/source logic.
+- Commit publication, persistent root delta, and persistent-GC delta logic
+  remain in `transaction.rs`.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --lib persistent_promotion -- --format terse
+test result: ok. 25 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib adapter_promotion -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Persistent Promotion Detour
 
 Date: 2026-06-15

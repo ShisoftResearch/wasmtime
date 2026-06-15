@@ -119,7 +119,7 @@ Status: implemented for current `tstruct`/`tarray` object-table payloads.
 - [x] Preserve inline `I31`, `FuncRef`, and `ExternRef` values during rewrite.
 - [x] Register optimistic reads for promoted source payloads.
 - [x] Roll back reserved/promoted objects if promotion fails.
-- [ ] Move promotion implementation into a dedicated
+- [x] Move promotion implementation into a dedicated
   `transaction/promotion.rs` module once the final ABI work stabilizes.
 
 ## Workstream 3: Ordinary Wasmtime GC Heap Promotion Adapter
