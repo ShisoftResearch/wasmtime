@@ -4291,6 +4291,9 @@ impl TransactionState {
             ),
             "transactional promotion currently supports struct, array, i31, extern, and func object payloads"
         );
+        if matches!(kind, ObjectKind::Struct | ObjectKind::Array) {
+            self.acquire_object_read(object_table, source)?;
+        }
         let type_layout_id = TypeLayoutId::new(object_table.live_slot(source)?.type_layout_id)
             .context("promoted object source layout id cannot be zero")?;
         let promoted =
@@ -13162,8 +13165,10 @@ mod tests {
         let expected = prepare(&mut objects, &mut state)?;
 
         let mut publications = Vec::new();
+        state.promote_persistent_references_before_commit(&mut objects)?;
         state.commit_object_payloads_into(&mut objects, &mut publications)?;
         let root_delta = state.staged_persistent_root_delta(&objects)?;
+        let persistent_gc_delta = state.persistent_gc_commit_delta(&objects, &publications)?;
         publications.extend(state.persistent_root_publications(&root_delta)?);
 
         if let Some(marker) =
@@ -13173,6 +13178,8 @@ mod tests {
         }
         state.complete_commit()?;
         state.apply_committed_persistent_root_delta(root_delta)?;
+        let _ =
+            state.observe_persistent_gc_commit_delta_after_commit(&objects, &persistent_gc_delta)?;
         drop(state);
 
         let (recovered_region, object_winners) =
@@ -13219,6 +13226,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(recovered_region.root_object_ids, vec![root.object_index]);
+    }
+
+    #[test]
+    fn persistent_promotion_commit_path_publishes_promoted_root_object() {
+        let (source, recovered_region, object_winners) =
+            commit_file_backed_publications_for_test(703, |objects, state| {
+                let source = objects
+                    .allocate_struct_for_gc_ref(0x736, vec![ObjectValue::I32(36)])
+                    .unwrap();
+                state.stage_global(0, GlobalSnapshot::GcRef(0x736))?;
+                Ok(source)
+            })
+            .unwrap();
+
+        assert_ne!(recovered_region.root_object_ids, vec![source.object_index]);
+        assert_eq!(object_winners.len(), 1);
+        assert_eq!(
+            recovered_region.root_object_ids,
+            vec![object_winners[0].object_id]
+        );
     }
 
     #[test]
@@ -13884,6 +13911,32 @@ mod tests {
             let delta = state.persistent_gc_commit_delta(&objects, &[]).unwrap();
 
             assert_eq!(delta.new_roots, object_set([promoted]));
+        }
+
+        #[test]
+        fn promotion_registers_source_object_read_for_validation() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects
+                .allocate_struct_for_gc_ref(0x735, vec![ObjectValue::I32(35)])
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(735));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x735)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit(&mut objects)
+                .unwrap();
+            objects
+                .update_payload(source, ObjectPayload::Struct(vec![ObjectValue::I32(36)]))
+                .unwrap();
+
+            let error = state.commit_object_payloads(&mut objects).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("optimistic read version changed")
+            );
         }
     }
 

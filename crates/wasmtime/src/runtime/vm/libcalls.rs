@@ -363,6 +363,13 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
             .validate_active_read(granule, current_version)?;
     }
 
+    {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.promote_persistent_references_before_commit(object_table)?;
+        state.validate_active_object_reads(&*object_table)?;
+    }
+
     let transaction_id = {
         let state = store.store_opaque_mut().transaction_state_mut();
         state.active_transaction_required_raw()?
