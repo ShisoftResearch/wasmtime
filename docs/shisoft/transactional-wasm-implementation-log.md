@@ -30,6 +30,42 @@ for the current persistent-promotion roadmap. It supersedes the older
 plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
 payloads.
 
+## Current Status: Durable Block Reuse
+
+Date: 2026-06-15
+
+The file-backed transaction region now has durable block metadata for coarse
+block/chunk reuse. `TxLogEntry` remains 32 bytes and packs the log-entry role
+plus data-block generation into `entry_meta`. Recovery accepts committed object
+or linear-undo records only when the referenced data block is active or sealed,
+has the expected block kind, and still has the generation recorded in the log
+entry.
+
+Implemented reuse paths:
+
+- Whole-dead object-data chunks can be retired and later reused with incremented
+  block generations.
+- Completed linear-memory undo chunks can be retired and later reused without
+  letting old committed undo entries roll back recovered memory.
+- Mixed object+tmemory transactions track tmemory undo chunks independently of
+  the final LP marker role, so object-final commits can still retire their
+  committed undo chunks.
+- Post-LP linear-undo retirement is best-effort cleanup: LP durability errors
+  still fail commit publication, but cleanup errors after a durable LP do not
+  make the transaction look failed.
+- File-backed durable-log open scans committed versus loose-end undo chunks and
+  retires committed chunks left active by an earlier process.
+
+Still outside this milestone:
+
+- Mixed-block object-data copying cleanup.
+- Line-level Immix-style reuse inside active chunks.
+- `ObjectId` reuse.
+- Persistent object table storage.
+- A full maintenance API for retrying deferred cleanup independently of normal
+  transaction lifecycle activity.
+- Durable clean-abort rollback completion and reclamation of non-LP undo chunks.
+
 ## Current Status: Explicit WAST Reference Fallback Policy
 
 Date: 2026-06-15

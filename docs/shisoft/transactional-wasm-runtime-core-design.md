@@ -380,20 +380,65 @@ struct TxLogEntry {
     data_block: u32,
     data_offset: u32,
     crc32: u32,
-    reserved: u32,
+    entry_meta: u32,
 }
 ```
 
 `data_block` is a block index and `data_offset` is an offset within that block.
 `tx_meta` bit 0 is LP. The remaining bits carry the transaction id in the
-current implementation (`txid << 1`). `reserved` carries the log-entry role:
-zero is a `TObjectPub` entry, and one is a `TMemoryUndo` entry. Log
+current implementation (`txid << 1`). `entry_meta` keeps the entry
+half-cache-line sized while carrying role and block-generation validation data:
+
+```text
+entry_meta:
+  low 2 bits   = TxLogEntryRole
+  high 30 bits = data_block_generation
+```
+
+Role zero is a `TObjectPub` entry, and role one is a `TMemoryUndo` entry. Log
 entries carry CRC32 because recovery scans them directly and must reject torn or
 corrupt entries. Data records do not carry a checksum in this design: they are
 not scanned independently, and their completeness is guaranteed by
 data-before-log or undo-before-write ordering, flushes, fences, and LP
 publication. Data corruption detection is left to future storage-layer
 integrity work.
+
+If 30 generation bits are not enough for a long-running region, the region must
+checkpoint/rebuild or stop reusing that block until the generation namespace is
+renewed. The log-entry generation is not object metadata; it is recovery
+validation metadata that prevents stale log entries from naming a block after
+that block has been recycled.
+
+Reusable persistent blocks add durable block metadata:
+
+```rust
+#[repr(C)]
+struct BlockMeta {
+    state: BlockState,        // Free | Active | Sealed | Retired
+    kind: BlockKind,          // Log | ObjectData | LinearUndo | Metadata
+    generation: u32,
+    owner_thread: u32,
+    chunk_start: u32,
+    chunk_blocks: u32,
+}
+```
+
+The recovery rule is:
+
+```text
+read log entry
+validate CRC and LP/transaction commit status
+read BlockMeta for entry.data_block
+accept entry only if:
+  BlockMeta.state is Active or Sealed
+  BlockMeta.kind matches TxLogEntryRole
+  BlockMeta.generation == entry.data_block_generation
+ignore entry as stale otherwise
+```
+
+This generation check is the core safety condition for block reuse. Without it,
+recovery can scan an old committed log entry and incorrectly treat bytes in a
+reused block as the old object or undo record.
 
 `TxDataRecordHeader` is a minimal 24-byte prefix before each data payload:
 
@@ -952,10 +997,78 @@ Durable storage reuse is a block/chunk-cleaning problem, not a per-object
 tombstone problem. Old unreachable object data remains in object-data blocks
 until a cleaner copies live records into new blocks and publishes durable
 block-generation or checkpoint metadata that lets recovery ignore retired
-blocks. Until that block-retirement mechanism exists, 9C may report reclaim
-candidates and rebuild volatile free knowledge, but must not reuse persistent
-blocks whose old records would still be scanned by recovery. `ObjectId`s remain
-non-reused until generation/reuse rules are explicitly designed.
+blocks. The current milestone implements only coarse whole-chunk reuse:
+whole-dead object-data chunks and completed linear-undo chunks can be retired
+and reused after their durable block generations make old log entries stale.
+`ObjectId`s remain non-reused until generation/reuse rules are explicitly
+designed for identity reuse.
+
+The first block-reuse design is coarse block/chunk reuse with generations, not
+line-level Immix reuse. Line marks remain volatile allocator/collector metadata
+until the block-level recovery invariant is implemented. A block may be reused
+only after durable metadata makes all older log entries that point into that
+block stale by generation mismatch.
+
+Object-data block reuse proceeds in two stages.
+
+Stage 1 reclaims whole-dead blocks only:
+
+1. Recovery or runtime marking reports reachable and unreachable record
+   locations.
+2. Build a volatile summary for each object-data block: live current records,
+   dead records, and live bytes.
+3. If a block contains no live current object records, seal and retire the
+   block.
+4. Persist the retired state and then move the block to the reusable pool.
+5. When reusing the block, increment its generation, mark it active for
+   object-data use, flush/fence the metadata, then allocate new records there.
+
+Stage 2 adds a copying cleaner for mixed blocks:
+
+1. Select an object-data block whose live-byte ratio is low enough to clean.
+2. Copy each live current record to a new object-data block.
+3. Publish each copied record as a normal `TObjectPub` entry with a higher
+   per-`ObjectId` version.
+4. Commit the copy transaction with LP.
+5. After the copy transaction is durable, retire the old block.
+6. Recovery before the retirement sees both old and copied records and chooses
+   the higher committed version. Recovery after the retirement ignores old
+   entries by block-generation mismatch.
+
+Linear-memory undo block reuse follows the same block-generation rule, but the
+liveness condition is transaction completion rather than object reachability.
+Undo records are needed only for uncommitted or loose-end transactions. Once
+recovery or a checkpoint proves the transaction is committed or fully aborted,
+its undo blocks may be retired and later reused with incremented generations.
+On the runtime commit path, retirement happens only after the final LP log entry
+has been written, flushed, and fenced. Cleanup failure after that point is
+best-effort maintenance, not transaction failure; queued cleanup is retried by
+later transaction lifecycle activity. File-backed reopen also scans the durable
+log and retires committed undo chunks that were left active by an earlier
+process, so post-LP cleanup failures do not become permanent leaks across
+restart. Recovery can still ignore stale entries through block state, kind, and
+generation validation.
+
+Loose-end undo chunks without LP are different. They must remain active until
+the runtime has durably restored the old linear-memory bytes or a future abort
+record/checkpoint proves that rollback is complete. Retiring those chunks
+without a durable rollback-applied signal would make a crash lose the only copy
+needed to undo in-place linear-memory writes. Clean-abort undo reclamation is
+therefore a separate future workstream from committed-undo cleanup.
+
+The staged rollout is:
+
+1. Add durable `BlockMeta` and the packed log-entry generation field.
+2. Teach recovery to reject stale log entries by block generation.
+3. Implement whole-dead object-data block retirement/reuse.
+4. Implement linear-undo block retirement/reuse.
+5. Add a recovery/maintenance pass that retries deferred post-commit cleanup
+   until the durable free pool catches up.
+6. Add durable clean-abort rollback completion so non-LP undo chunks can be
+   reclaimed after abort without weakening crash recovery.
+7. Add the copying cleaner for mixed object-data blocks.
+8. Add line-level reuse inside active object chunks only after block-level
+   generation reuse is proven correct.
 
 Read-heavy workloads with few commits may not advance commit-coupled marking.
 A later explicit maintenance API can expose the same minibatch scanner, for

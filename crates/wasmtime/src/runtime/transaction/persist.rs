@@ -372,8 +372,9 @@ impl TxDurableLog {
     }
 
     pub(crate) fn open_file_backed(path: &Path) -> Result<Self> {
-        let region =
+        let mut region =
             crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
+        crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
         Ok(Self::from_file_backed_region(region))
     }
 
@@ -1158,6 +1159,28 @@ mod tests {
 
     const TEST_STRUCT_TYPE_LAYOUT_ID: u32 = 12;
 
+    fn first_active_linear_undo_chunk_for_test(path: &Path) -> (u32, u32) {
+        let region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)
+                .unwrap();
+        for block in 0..region.view().num_blocks() {
+            let block = u32::try_from(block).unwrap();
+            let Ok(entries) = region.view().log_block_entries(block) else {
+                continue;
+            };
+            for entry in entries {
+                if entry.role().unwrap() != TxLogEntryRole::TMemoryUndo {
+                    continue;
+                }
+                let meta = region.block_meta(entry.data_block).unwrap();
+                if meta.is_active_or_sealed().unwrap() {
+                    return (meta.chunk_start, meta.generation);
+                }
+            }
+        }
+        panic!("expected an active linear undo chunk");
+    }
+
     fn sample_struct_type_layout(id: u32, fingerprint: u64) -> PersistentTypeLayout {
         PersistentTypeLayout::Struct {
             id: TypeLayoutId::new(id).unwrap(),
@@ -1686,6 +1709,40 @@ mod tests {
             recovered.tmemory_undo_rollbacks[0].old_granule_bytes,
             vec![1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn file_backed_open_retires_committed_linear_undo_chunks_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        crate::runtime::vm::block_region::create_file_backed_region_image(&path, 64).unwrap();
+        crate::runtime::vm::block_region::publish_committed_tmemory_undo_for_test(
+            &path,
+            12,
+            0x1000_0000_0000_002a,
+            13,
+            &[1, 2, 3, 4],
+        )
+        .unwrap();
+
+        let (old_chunk_start, old_generation) = {
+            let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+            assert!(recovered.tmemory_undo_rollbacks.is_empty());
+            first_active_linear_undo_chunk_for_test(&path)
+        };
+
+        let mut log = TxDurableLog::open_file_backed(&path).unwrap();
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_002b, 14, vec![5, 6, 7, 8]);
+        let marker = {
+            let mut sink = log.stream_sink(13);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap()
+        };
+
+        assert_eq!(marker.chunk_start_block, old_chunk_start);
+        assert_eq!(marker.data_block_generation, old_generation + 1);
     }
 
     #[test]

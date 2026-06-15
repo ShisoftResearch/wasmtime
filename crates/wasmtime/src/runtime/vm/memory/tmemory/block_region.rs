@@ -3531,15 +3531,22 @@ pub fn reopen_and_recover_file_backed_region(
 }
 
 /// Retires committed linear undo chunks that are not still needed for loose-end rollback.
-pub fn retire_completed_linear_undo_chunks_for_test(path: &Path) -> Result<Vec<u32>> {
-    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
-    let (committed_chunks, loose_end_chunks) = collect_linear_undo_chunk_starts(&region)?;
+pub(crate) fn retire_completed_linear_undo_chunks(
+    region: &mut FileBackedMemoryBlockRegion,
+) -> Result<Vec<u32>> {
+    let (committed_chunks, loose_end_chunks) = collect_linear_undo_chunk_starts(region)?;
     region.retire_linear_undo_chunks(
         committed_chunks
             .difference(&loose_end_chunks)
             .copied()
             .collect::<Vec<_>>(),
     )
+}
+
+/// Retires committed linear undo chunks in a file-backed test image.
+pub fn retire_completed_linear_undo_chunks_for_test(path: &Path) -> Result<Vec<u32>> {
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    retire_completed_linear_undo_chunks(&mut region)
 }
 
 fn collect_linear_undo_chunk_starts(
