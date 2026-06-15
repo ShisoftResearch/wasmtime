@@ -1486,13 +1486,13 @@ impl ObjectTable {
 
     pub(crate) fn object_id_for_raw_ref_or_func(&mut self, raw_ref: u64) -> Result<ObjectId> {
         ensure!(raw_ref != 0, "transactional object cannot use null ref");
-        if Self::is_raw_i31_ref(raw_ref) {
-            return self.object_id_for_raw_i31_ref(raw_ref);
-        }
         if let Ok(gc_ref) = u32::try_from(raw_ref)
             && let Some(object_id) = self.gc_ref_to_object.get(&gc_ref).copied()
         {
             return Ok(object_id);
+        }
+        if Self::is_raw_i31_ref(raw_ref) {
+            return self.object_id_for_raw_i31_ref(raw_ref);
         }
         if let Some(object_id) = self.func_ref_to_object.get(&raw_ref).copied() {
             return Ok(object_id);
@@ -4390,6 +4390,64 @@ impl TransactionState {
         })
     }
 
+    fn persistent_object_id_for_gc_ref_after_promotion(
+        &mut self,
+        object_table: &mut ObjectTable,
+        gc_ref: u32,
+    ) -> Result<Option<ObjectId>> {
+        if gc_ref == 0 {
+            return Ok(None);
+        }
+        if let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref) {
+            if object_table.is_persistent(object_id)? {
+                return Ok(Some(object_id));
+            }
+            return self
+                .promote_transaction_object_graph(object_table, object_id)
+                .map(Some);
+        }
+        if ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
+            return self.promote_raw_i31_ref(object_table, gc_ref).map(Some);
+        }
+        bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+    }
+
+    fn persistent_object_id_for_gc_ref_after_completed_promotion(
+        &self,
+        object_table: &ObjectTable,
+        gc_ref: u32,
+    ) -> Result<Option<ObjectId>> {
+        if gc_ref == 0 {
+            return Ok(None);
+        }
+        if let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref) {
+            if object_table.is_persistent(object_id)? {
+                return Ok(Some(object_id));
+            }
+            let promoted = self
+                .promoted_objects
+                .get(&object_id)
+                .copied()
+                .with_context(|| {
+                    format!(
+                        "transactional GC ref {gc_ref:#x} backing object {object_id:?} was not promoted before commit"
+                    )
+                })
+                .context(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED)?;
+            return Ok(Some(promoted));
+        }
+        if ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
+            let object_id = self
+                .promoted_i31_refs
+                .get(&gc_ref)
+                .copied()
+                .with_context(|| format!("raw i31 GC ref {gc_ref:#x} was not promoted before commit"))
+                .context(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED)?;
+            return Ok(Some(object_id));
+        }
+        bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+    }
+
     fn run_promotion_attempt<T, F>(
         &mut self,
         object_table: &mut ObjectTable,
@@ -4440,6 +4498,57 @@ impl TransactionState {
         })
     }
 
+    pub(crate) fn promote_persistent_references_before_commit(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+
+        let initial_promoted_objects = self.promoted_objects.len();
+        let initial_promoted_i31_refs = self.promoted_i31_refs.len();
+        let initial_staged_object_count = self.staged_objects.len();
+        let mut changed = false;
+
+        let staged_globals = self.staged_globals.values().copied().collect::<Vec<_>>();
+        for value in staged_globals {
+            if let GlobalSnapshot::GcRef(gc_ref) = value {
+                self.persistent_object_id_for_gc_ref_after_promotion(object_table, gc_ref)?;
+            }
+        }
+
+        let staged_table_elements = self
+            .staged_table_elements
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        for value in staged_table_elements {
+            if let TableElementSnapshot::GcRef(gc_ref) = value {
+                self.persistent_object_id_for_gc_ref_after_promotion(object_table, gc_ref)?;
+            }
+        }
+
+        let staged_objects = self
+            .staged_objects
+            .iter()
+            .map(|(&object_id, payload)| (object_id, payload.clone()))
+            .collect::<Vec<_>>();
+        for (object_id, payload) in staged_objects {
+            if !object_table.is_persistent(object_id)? {
+                continue;
+            }
+            let rewritten = self.rewrite_payload_refs_for_promotion(object_table, payload.clone())?;
+            if rewritten != payload {
+                self.staged_objects.insert(object_id, rewritten);
+                changed = true;
+            }
+        }
+
+        Ok(changed
+            || self.promoted_objects.len() != initial_promoted_objects
+            || self.promoted_i31_refs.len() != initial_promoted_i31_refs
+            || self.staged_objects.len() != initial_staged_object_count)
+    }
+
     pub(crate) fn staged_persistent_root_delta(
         &self,
         object_table: &ObjectTable,
@@ -4460,8 +4569,15 @@ impl TransactionState {
                 global_index,
             };
             let roots = delta.roots.entry(root_key).or_default();
-            if let Some(root) = persistent_root_object_id_for_global_snapshot(object_table, value)?
-            {
+            let root = match value {
+                GlobalSnapshot::GcRef(gc_ref) => self
+                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                        object_table,
+                        gc_ref,
+                    )?,
+                _ => None,
+            };
+            if let Some(root) = root {
                 roots.insert(root);
             }
         }
@@ -4469,9 +4585,15 @@ impl TransactionState {
         for (&key, &value) in &self.staged_table_elements {
             let root_key = PersistentRootKey::TableElement(key);
             let roots = delta.roots.entry(root_key).or_default();
-            if let Some(root) =
-                persistent_root_object_id_for_table_element_snapshot(object_table, value)?
-            {
+            let root = match value {
+                TableElementSnapshot::GcRef(gc_ref) => self
+                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                        object_table,
+                        gc_ref,
+                    )?,
+                TableElementSnapshot::FuncRef(_) => None,
+            };
+            if let Some(root) = root {
                 roots.insert(root);
             }
         }
@@ -4532,15 +4654,28 @@ impl TransactionState {
             || !self.staged_table_elements.is_empty()
             || !publications.is_empty();
         for &value in self.staged_globals.values() {
-            if let Some(root) = persistent_root_object_id_for_global_snapshot(object_table, value)?
-            {
+            let root = match value {
+                GlobalSnapshot::GcRef(gc_ref) => self
+                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                        object_table,
+                        gc_ref,
+                    )?,
+                _ => None,
+            };
+            if let Some(root) = root {
                 delta.new_roots.insert(root);
             }
         }
         for &value in self.staged_table_elements.values() {
-            if let Some(root) =
-                persistent_root_object_id_for_table_element_snapshot(object_table, value)?
-            {
+            let root = match value {
+                TableElementSnapshot::GcRef(gc_ref) => self
+                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                        object_table,
+                        gc_ref,
+                    )?,
+                TableElementSnapshot::FuncRef(_) => None,
+            };
+            if let Some(root) = root {
                 delta.new_roots.insert(root);
             }
         }
@@ -13637,6 +13772,118 @@ mod tests {
             assert!(state.staged_object_payload_for_test(promoted).is_none());
             assert_eq!(state.allocated_object_count_for_test(), 0);
             assert!(objects.kind(promoted).is_err());
+        }
+    }
+
+    mod persistent_promotion_commit {
+        use super::*;
+
+        #[test]
+        fn root_delta_promotes_known_non_persistent_gc_ref() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects
+                .allocate_struct_for_gc_ref(0x730, vec![ObjectValue::I32(30)])
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(730));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x730)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit(&mut objects)
+                .unwrap();
+            let delta = state.staged_persistent_root_delta(&objects).unwrap();
+            let promoted = state.promoted_object_for_test(source).unwrap();
+
+            assert_eq!(
+                delta.roots
+                    .get(&PersistentRootKey::Global {
+                        instance: None,
+                        global_index: 0
+                    })
+                    .cloned()
+                    .unwrap(),
+                object_set([promoted])
+            );
+        }
+
+        #[test]
+        fn root_delta_promotes_i31_gc_ref_immediate() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let raw_i31 = ObjectTable::encode_raw_i31_ref(19) as u32;
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(732));
+            state.stage_global(0, GlobalSnapshot::GcRef(raw_i31)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit(&mut objects)
+                .unwrap();
+            let delta = state.staged_persistent_root_delta(&objects).unwrap();
+            let promoted = state.promoted_i31_ref_for_test(raw_i31).unwrap();
+
+            assert_eq!(
+                delta.roots
+                    .get(&PersistentRootKey::Global {
+                        instance: None,
+                        global_index: 0
+                    })
+                    .cloned()
+                    .unwrap(),
+                object_set([promoted])
+            );
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted).unwrap(),
+                &ObjectPayload::I31(19)
+            );
+        }
+
+        #[test]
+        fn persistent_owner_payload_ref_promotes_child_before_publication() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let child = objects
+                .allocate_struct_for_gc_ref(0x731, vec![ObjectValue::I32(31)])
+                .unwrap();
+            let owner = objects
+                .allocate_persistent_struct_for_gc_ref(0x732, vec![ObjectValue::Ref(None)])
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(731));
+            state.acquire_object_write(&objects, owner).unwrap();
+            state
+                .stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
+                .unwrap();
+
+            state
+                .promote_persistent_references_before_commit(&mut objects)
+                .unwrap();
+            let promoted_child = state.promoted_object_for_test(child).unwrap();
+
+            assert_eq!(
+                state.staged_object_payload_for_test(owner).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::Ref(Some(promoted_child))])
+            );
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted_child).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(31)])
+            );
+        }
+
+        #[test]
+        fn persistent_gc_delta_uses_promoted_root_after_precommit() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects
+                .allocate_struct_for_gc_ref(0x734, vec![ObjectValue::I32(34)])
+                .unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(734));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x734)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit(&mut objects)
+                .unwrap();
+            let promoted = state.promoted_object_for_test(source).unwrap();
+            let delta = state.persistent_gc_commit_delta(&objects, &[]).unwrap();
+
+            assert_eq!(delta.new_roots, object_set([promoted]));
         }
     }
 
