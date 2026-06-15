@@ -13940,6 +13940,45 @@ mod tests {
         }
     }
 
+    mod persistent_promotion_abort {
+        use super::*;
+
+        #[test]
+        fn abort_frees_promoted_objects_and_clears_promotion_map() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let source = objects
+                .allocate_struct_for_gc_ref(0x736, vec![ObjectValue::I32(36)])
+                .unwrap();
+            let raw_i31 = ObjectTable::encode_raw_i31_ref(37) as u32;
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(736));
+            state.stage_global(0, GlobalSnapshot::GcRef(0x736)).unwrap();
+            state.stage_global(1, GlobalSnapshot::GcRef(raw_i31)).unwrap();
+
+            state
+                .promote_persistent_references_before_commit(&mut objects)
+                .unwrap();
+
+            let promoted_object = state.promoted_object_for_test(source).unwrap();
+            let promoted_i31 = state.promoted_i31_ref_for_test(raw_i31).unwrap();
+
+            assert_eq!(state.allocated_object_count_for_test(), 2);
+            assert!(state.staged_object_payload_for_test(promoted_object).is_some());
+            assert!(state.staged_object_payload_for_test(promoted_i31).is_some());
+
+            state.abort_allocated_objects(&mut objects).unwrap();
+
+            assert_eq!(state.active_transaction(), None);
+            assert_eq!(state.promoted_object_for_test(source), None);
+            assert_eq!(state.promoted_i31_ref_for_test(raw_i31), None);
+            assert!(state.staged_object_payload_for_test(promoted_object).is_none());
+            assert!(state.staged_object_payload_for_test(promoted_i31).is_none());
+            assert_eq!(state.allocated_object_count_for_test(), 0);
+            assert!(objects.kind(promoted_object).is_err());
+            assert!(objects.kind(promoted_i31).is_err());
+        }
+    }
+
     mod ti31_persistent_object_domain {
         use super::*;
 
