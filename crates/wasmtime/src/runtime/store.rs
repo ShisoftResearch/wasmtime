@@ -1724,6 +1724,22 @@ impl StoreOpaque {
         )
     }
 
+    pub(crate) fn transaction_promotion_context_mut(
+        &mut self,
+    ) -> (
+        &Engine,
+        Option<&mut GcStore>,
+        &mut TransactionState,
+        &mut ObjectTable,
+    ) {
+        (
+            &self.engine,
+            self.gc_store.as_mut(),
+            &mut self.transaction_state,
+            &mut self.transaction_object_table,
+        )
+    }
+
     #[cfg(feature = "debug")]
     pub(crate) fn breakpoints_and_registry_mut(
         &mut self,

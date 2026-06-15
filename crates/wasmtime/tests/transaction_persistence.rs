@@ -122,6 +122,77 @@ fn real_tfunc_promotes_tstruct_root_and_recovers() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn real_tfunc_promotes_ordinary_array_root_and_recovers() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("promote-array-root.tmemory");
+    let tx_log_path = dir.path().join("promote-array-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (type $a (array (mut i32)))
+              (global $source (ref $a) (array.new $a (i32.const 9) (i32.const 3)))
+              (tglobal $root (mut (ref null $a)) (ref.null $a))
+              (tfunc (export "publish")
+                (tglobal.set $root (global.get $source))))
+            "#,
+        )?,
+    )?;
+
+    call_publish_root(&engine, &module, &tmemory_path, &tx_log_path, true)?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids.len(), 1);
+    assert_eq!(recovered.object_winners.len(), 1);
+    assert_eq!(
+        recovered.root_object_ids[0],
+        recovered.object_winners[0].object_id
+    );
+
+    Ok(())
+}
+
+#[test]
+fn real_tfunc_promotes_ordinary_ref_array_with_i31_leaf_and_child_object() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("promote-ref-array-root.tmemory");
+    let tx_log_path = dir.path().join("promote-ref-array-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (type $s (struct (field i32)))
+              (type $a (array (mut eqref)))
+              (tglobal $root (mut (ref null $a)) (ref.null $a))
+              (tfunc (export "publish")
+                (tglobal.set $root
+                  (array.new_fixed $a 2
+                    (ref.i31 (i32.const 7))
+                    (struct.new $s (i32.const 9))))))
+            "#,
+        )?,
+    )?;
+
+    call_publish_root(&engine, &module, &tmemory_path, &tx_log_path, true)?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids.len(), 1);
+    assert_eq!(recovered.object_winners.len(), 2);
+    assert!(
+        recovered
+            .object_winners
+            .iter()
+            .any(|winner| winner.object_id == recovered.root_object_ids[0])
+    );
+
+    Ok(())
+}
+
 fn transaction_root_engine() -> Result<Engine> {
     let mut config = Config::new();
     config

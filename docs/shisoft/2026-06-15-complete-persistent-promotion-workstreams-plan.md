@@ -124,11 +124,14 @@ Status: implemented for current `tstruct`/`tarray` object-table payloads.
 
 ## Workstream 3: Ordinary Wasmtime GC Heap Promotion Adapter
 
-Status: adapter contract implemented; real Wasmtime GC heap reader pending.
+Status: adapter contract and first store-backed reader implemented; durable
+function/external identity still pending.
 
-The current promotion path handles objects that are already mirrored in the
-transactional `ObjectTable`. Arbitrary ordinary Wasmtime GC heap objects remain
-outside the durable promotion path.
+The current promotion path handles transaction-mirrored objects and the first
+store-backed subset of ordinary Wasmtime GC heap objects: raw `i31` leaves plus
+`struct` and `array` heap objects whose fields/elements can be encoded as
+supported scalar values, nulls, inline `i31` leaves, or promoted `ObjectId`
+edges. Function/external durable identity remains outside this slice.
 
 - [x] Add an adapter that can classify ordinary Wasmtime GC heap references as
   struct, array, i31, function, external, null, or unsupported.
@@ -139,16 +142,24 @@ outside the durable promotion path.
   graphs, rewrite nested/shared refs, preserve self-cycles, encode raw i31
   leaves inline, remember top-level durable leaf refs as non-object roots, and
   roll back on unsupported child objects.
-- [ ] Implement the real store-backed adapter that inspects `VMGcRef` headers,
-  classifies struct/array/i31/extern/function refs, and reads struct fields or
-  array elements from Wasmtime GC storage.
-- [ ] For ordinary struct/array objects, extract payload values and type layout
-  facts into the persistent object value model.
-- [ ] Convert real ordinary heap object references into either promoted
+- [x] Implement the first real store-backed adapter that inspects `VMGcRef`
+  headers, classifies i31/struct/array/extern refs, and reads supported struct
+  fields or array elements from Wasmtime GC storage.
+- [x] For ordinary struct/array objects, extract supported scalar/ref payload
+  values and persistent trace-layout facts into the persistent object value
+  model.
+- [x] Convert real ordinary heap object references into either promoted
   `ObjectId` edges or inline durable leaves.
+- [ ] Add durable function/external identity handling to the store-backed
+  adapter once Workstream 4 defines the identity sources.
+- [x] Make persistent trace-layout metadata type-driven so ref-capable
+  struct fields and array elements keep tracing object edges even when the
+  current value is null or an inline `i31` leaf.
 - [x] Fail before commit if an ordinary heap object cannot be encoded durably.
-- [ ] Add tests that mutate a persistent root to reference an ordinary Wasmtime
-  GC struct/array and recover the promoted persistent graph.
+- [x] Keep the existing file-backed test that mutates a persistent root to
+  reference an ordinary Wasmtime GC struct global and recovers the promoted
+  persistent graph.
+- [x] Add a dedicated ordinary Wasmtime GC array recovery test.
 
 ## Workstream 4: Durable Func/Extern Identity Sources
 

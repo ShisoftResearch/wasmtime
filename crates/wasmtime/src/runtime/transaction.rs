@@ -40,7 +40,7 @@ use type_layout::{
     TypeLayoutRegistry,
 };
 
-const PERSISTENT_OBJECT_ABI_SLOT_SIZE: u32 = 20;
+pub(crate) const PERSISTENT_OBJECT_ABI_SLOT_SIZE: u32 = 20;
 const WASMTIME_LAYOUT_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const WASMTIME_LAYOUT_FINGERPRINT_PRIME: u64 = 0x0000_0001_0000_01b3;
 
@@ -1039,6 +1039,7 @@ pub(crate) enum OrdinaryGcPromotionSource {
 pub(crate) trait OrdinaryGcPromotionAdapter {
     fn promotion_source_for_gc_ref(
         &mut self,
+        object_table: &mut ObjectTable,
         gc_ref: u32,
     ) -> Result<Option<OrdinaryGcPromotionSource>>;
 }
@@ -1048,6 +1049,7 @@ struct NoOrdinaryGcPromotionAdapter;
 impl OrdinaryGcPromotionAdapter for NoOrdinaryGcPromotionAdapter {
     fn promotion_source_for_gc_ref(
         &mut self,
+        _object_table: &mut ObjectTable,
         _gc_ref: u32,
     ) -> Result<Option<OrdinaryGcPromotionSource>> {
         Ok(None)
@@ -1272,6 +1274,26 @@ impl ObjectTable {
         self.allocate_persistent_struct_for_gc_ref_with_type_layout_id(gc_ref, fields, layout.id())
     }
 
+    pub(crate) fn ensure_persistent_struct_layout_for_wasmtime_type_layout_namespace(
+        &mut self,
+        type_namespace: u32,
+        type_index: u32,
+        field_layouts: Vec<WasmtimePersistentFieldLayout>,
+    ) -> Result<TypeLayoutId> {
+        let body_size = validate_wasmtime_struct_field_layouts(&field_layouts)?;
+        let fingerprint = wasmtime_struct_layout_fingerprint(body_size, &field_layouts)?;
+        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+            type_namespace,
+            type_index,
+            PersistentTypeKind::Struct,
+            fingerprint,
+        )?;
+        let layout =
+            persistent_layout_for_wasmtime_struct_type(type_layout_id, body_size, &field_layouts)?;
+        self.register_type_layout(layout.clone())?;
+        Ok(layout.id())
+    }
+
     #[cfg(test)]
     pub(crate) fn allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
         &mut self,
@@ -1455,6 +1477,31 @@ impl ObjectTable {
         )?;
         self.register_type_layout(layout.clone())?;
         self.allocate_persistent_array_for_gc_ref_with_type_layout_id(gc_ref, elements, layout.id())
+    }
+
+    pub(crate) fn ensure_persistent_array_layout_for_wasmtime_type_layout_namespace(
+        &mut self,
+        type_namespace: u32,
+        type_index: u32,
+        element_size: u32,
+        element_is_object_ref: bool,
+    ) -> Result<TypeLayoutId> {
+        let element_size =
+            validate_wasmtime_array_element_layout(element_size, element_is_object_ref)?;
+        let fingerprint = wasmtime_array_layout_fingerprint(element_size, element_is_object_ref);
+        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+            type_namespace,
+            type_index,
+            PersistentTypeKind::Array,
+            fingerprint,
+        )?;
+        let layout = wasmtime_array_layout_from_element_layout(
+            type_layout_id,
+            element_size,
+            element_is_object_ref,
+        )?;
+        self.register_type_layout(layout.clone())?;
+        Ok(layout.id())
     }
 
     pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer_namespace(
@@ -4455,7 +4502,7 @@ impl TransactionState {
             return Ok(None);
         }
 
-        let Some(source) = adapter.promotion_source_for_gc_ref(gc_ref)? else {
+        let Some(source) = adapter.promotion_source_for_gc_ref(object_table, gc_ref)? else {
             bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
         };
         match source {
@@ -13930,6 +13977,7 @@ mod tests {
         impl OrdinaryGcPromotionAdapter for FakeOrdinaryGcPromotionAdapter {
             fn promotion_source_for_gc_ref(
                 &mut self,
+                _object_table: &mut ObjectTable,
                 gc_ref: u32,
             ) -> Result<Option<OrdinaryGcPromotionSource>> {
                 Ok(self.sources.get(&gc_ref).cloned())

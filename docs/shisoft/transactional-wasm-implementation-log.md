@@ -68,9 +68,13 @@ cargo test -p wasmtime --lib transaction -- --format terse
 test result: ok. 350 passed; 0 failed; 0 ignored
 ```
 
-## Current Status: Ordinary GC Promotion Adapter Contract
+## Historical Status: Ordinary GC Promotion Adapter Contract
 
 Date: 2026-06-15
+
+This entry is superseded by the later store-backed adapter entry below. It
+records the first adapter-contract slice before production commit used real
+`GcStore`/`VMGcRef` inspection.
 
 Workstream 3 now has the first adapter seam for ordinary Wasmtime GC heap
 promotion:
@@ -107,7 +111,58 @@ cargo test -p wasmtime --lib adapter_promotion -- --format terse
 test result: ok. 4 passed; 0 failed; 0 ignored
 
 cargo test -p wasmtime --lib transaction -- --format terse
-test result: ok. 355 passed; 0 failed; 0 ignored
+test result: ok. 356 passed; 0 failed; 0 ignored
+```
+
+## Current Status: Store-Backed Ordinary GC Promotion
+
+Date: 2026-06-15
+
+Workstream 3 now has a first real store-backed adapter in the transaction
+commit path:
+
+- `transaction_commit_impl` builds a `StoreBackedOrdinaryGcPromotionAdapter`
+  from the active `StoreOpaque` engine and optional `GcStore`.
+- The adapter inspects ordinary `VMGcRef` headers, handles raw `i31`, and
+  promotes ordinary Wasmtime `struct` and `array` heap objects into persistent
+  `ObjectId` records before commit.
+- Struct fields and array elements are read directly from Wasmtime GC object
+  storage using the registered GC layout and runtime storage types.
+- Supported scalar/ref payloads are converted into `OrdinaryGcPromotionValue`
+  and then into the persistent `ObjectValue` model.
+- Persistent trace-layout metadata is registered during promotion, using the
+  existing Wasmtime type-layout key/fingerprint path. The trace layout is
+  derived from Wasm storage types, not current slot values, so ref-capable
+  slots keep tracing object edges even when a particular committed value is
+  null or an inline `i31` leaf.
+- The file-backed recovery tests now include ordinary Wasmtime GC array roots
+  and a mixed `eqref` array containing both an inline `i31` leaf and a child
+  struct object.
+- The production path now uses this adapter; the no-op adapter remains for the
+  core transaction wrapper and unit tests that intentionally preserve the old
+  unsupported-ref behavior.
+
+Still pending:
+
+- Durable identity encoding for function and external references. Non-null
+  function/external refs still fail before commit.
+- Durable identity encoding for continuation and exception references remains
+  unsupported.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --lib adapter_promotion -- --format terse
+test result: ok. 4 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 356 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 8 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib trace_object_refs_with_layout_ -- --format terse
+test result: ok. 10 passed; 0 failed; 0 ignored
 ```
 
 ## Current Status: Wave 11 VMGcRef Commit Promotion

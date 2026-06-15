@@ -1,8 +1,5 @@
 use super::type_layout::{PersistentTypeLayout, TraceSlotKind};
-use super::{
-    OBJECT_VALUE_ABI_TAG_REF, ObjectId, ObjectKind, ObjectPayload, ObjectRefValue, ObjectValue,
-    ObjectValueAbi,
-};
+use super::{ObjectId, ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi};
 use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::vm::block_region::{BLOCK_SIZE, LINE_MARKED};
@@ -657,12 +654,11 @@ fn decode_object_ref_slot(bytes: &[u8]) -> Result<Option<ObjectId>> {
     let tag = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let low = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
     let high = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    ensure!(
-        tag == OBJECT_VALUE_ABI_TAG_REF,
-        "persistent object reference slot is not encoded as a ref ABI value"
-    );
-    let _ = ObjectValueAbi::from_parts(tag, low, high)?;
-    Ok(ObjectRefValue::from_raw(low).decode())
+    match ObjectValueAbi::from_parts(tag, low, high)?.to_object_value()? {
+        ObjectValue::Ref(object_id) => Ok(object_id),
+        ObjectValue::I31(_) => Ok(None),
+        _ => bail!("persistent object reference slot is not encoded as a ref or i31 ABI value"),
+    }
 }
 
 fn trace_value_kind(value: &ObjectValue) -> TraceValueKind {
@@ -898,6 +894,23 @@ mod tests {
     }
 
     #[test]
+    fn trace_object_refs_with_layout_ref_slot_ignores_inline_i31_leaf() {
+        let layout = layout_test_struct(vec![
+            object_ref_slot(0),
+            object_ref_slot(OBJECT_VALUE_RECORD_LEN as u32),
+        ]);
+        let payload = encode_payload(&[
+            ObjectValue::I31(7),
+            ObjectValue::Ref(Some(ObjectId { object_index: 12 })),
+        ]);
+
+        let mut out = Vec::new();
+        trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap();
+
+        assert_eq!(out, vec![ObjectId { object_index: 12 }]);
+    }
+
+    #[test]
     fn trace_object_refs_with_layout_rejects_bad_struct_field_offset() {
         let layout = layout_test_struct(vec![object_ref_slot(1)]);
         let payload = encode_payload(&[ObjectValue::Ref(Some(ObjectId { object_index: 11 }))]);
@@ -982,8 +995,9 @@ mod tests {
         let err = trace_object_refs_with_layout(&layout, &payload, &mut out).unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("persistent object reference slot is not encoded as a ref ABI value")
+            err.to_string().contains(
+                "persistent object reference slot is not encoded as a ref or i31 ABI value"
+            )
         );
     }
 

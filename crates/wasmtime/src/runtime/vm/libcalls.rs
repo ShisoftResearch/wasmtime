@@ -59,14 +59,17 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue,
-    ObjectValueAbi, PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend,
-    TableElementSnapshot, TransactionId, TransactionState, WasmtimePersistentFieldLayoutAbi,
+    ObjectValueAbi, OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource,
+    OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord,
+    TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
+    WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
     collect_tmemory_access_snapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
-    self, HostResultHasUnwindSentinel, TableElementType, VMStore, f32x4, f64x2, i8x16,
+    self, GcStore, HostResultHasUnwindSentinel, TableElementType, VMStore, f32x4, f64x2, i8x16,
 };
+use crate::{ArrayType, Engine, HeapType, StorageType, StructType, ValType};
 use alloc::collections::BTreeMap;
 use core::convert::Infallible;
 use core::ptr::NonNull;
@@ -74,8 +77,9 @@ use core::ptr::NonNull;
 use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
-    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GlobalIndex, MemoryIndex,
-    PassiveElemIndex, TableIndex, Trap, WasmHeapTopType, WasmValType,
+    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GcLayout, GlobalIndex,
+    MemoryIndex, PassiveElemIndex, TableIndex, Trap, VMGcKind, VMSharedTypeIndex, WasmHeapTopType,
+    WasmValType,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::AccessError::{
@@ -340,6 +344,269 @@ pub(crate) fn transaction_commit_selected_for_host(
     Ok(true)
 }
 
+struct StoreBackedOrdinaryGcPromotionAdapter<'a> {
+    engine: &'a Engine,
+    gc_store: Option<&'a mut GcStore>,
+}
+
+impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
+    fn new(engine: &'a Engine, gc_store: Option<&'a mut GcStore>) -> Self {
+        Self { engine, gc_store }
+    }
+
+    fn gc_store_mut(&mut self) -> Result<&mut GcStore> {
+        self.gc_store
+            .as_deref_mut()
+            .context("ordinary Wasmtime GC promotion requires a GC store")
+    }
+
+    fn read_storage_value(
+        &mut self,
+        gc_ref: &VMGcRef,
+        ty: &StorageType,
+        offset: u32,
+    ) -> Result<OrdinaryGcPromotionValue> {
+        let data = self.gc_store_mut()?.gc_object_data(gc_ref)?;
+        Ok(match ty {
+            StorageType::I8 => OrdinaryGcPromotionValue::I32(i32::from(data.read_u8(offset)?)),
+            StorageType::I16 => OrdinaryGcPromotionValue::I32(i32::from(data.read_u16(offset)?)),
+            StorageType::ValType(ValType::I32) => {
+                OrdinaryGcPromotionValue::I32(data.read_i32(offset)?)
+            }
+            StorageType::ValType(ValType::I64) => {
+                OrdinaryGcPromotionValue::I64(data.read_i64(offset)?)
+            }
+            StorageType::ValType(ValType::F32) => {
+                OrdinaryGcPromotionValue::F32(data.read_u32(offset)?)
+            }
+            StorageType::ValType(ValType::F64) => {
+                OrdinaryGcPromotionValue::F64(data.read_u64(offset)?)
+            }
+            StorageType::ValType(ValType::V128) => {
+                OrdinaryGcPromotionValue::V128(data.read_v128(offset)?.as_u128().to_le_bytes())
+            }
+            StorageType::ValType(ValType::Ref(ref_type)) => {
+                let raw = data.read_u32(offset)?;
+                if raw == 0 {
+                    return Ok(OrdinaryGcPromotionValue::GcRef(None));
+                }
+                match ref_type.heap_type() {
+                    HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => bail!(
+                        "ordinary GC promotion cannot encode function references until durable function identity is wired"
+                    ),
+                    HeapType::Extern | HeapType::NoExtern => bail!(
+                        "ordinary GC promotion cannot encode external references until durable external identity is wired"
+                    ),
+                    HeapType::Cont | HeapType::ConcreteCont(_) | HeapType::NoCont => {
+                        bail!("ordinary GC promotion cannot encode continuation references durably")
+                    }
+                    HeapType::Exn | HeapType::ConcreteExn(_) | HeapType::NoExn => {
+                        bail!("ordinary GC promotion cannot encode exception references durably")
+                    }
+                    HeapType::Any
+                    | HeapType::Eq
+                    | HeapType::I31
+                    | HeapType::Array
+                    | HeapType::ConcreteArray(_)
+                    | HeapType::Struct
+                    | HeapType::ConcreteStruct(_)
+                    | HeapType::None => OrdinaryGcPromotionValue::GcRef(Some(raw)),
+                }
+            }
+        })
+    }
+
+    fn storage_type_traces_object_refs(ty: &StorageType) -> bool {
+        match ty {
+            StorageType::I8 | StorageType::I16 => false,
+            StorageType::ValType(ty) => match ty {
+                ValType::Ref(ref_type) => matches!(
+                    ref_type.heap_type(),
+                    HeapType::Any
+                        | HeapType::Eq
+                        | HeapType::Array
+                        | HeapType::ConcreteArray(_)
+                        | HeapType::Struct
+                        | HeapType::ConcreteStruct(_)
+                ),
+                ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64 | ValType::V128 => false,
+            },
+        }
+    }
+
+    fn canonical_field_layouts(
+        field_types: &[StorageType],
+    ) -> Result<Vec<WasmtimePersistentFieldLayout>> {
+        field_types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                let field_index =
+                    u32::try_from(index).context("ordinary GC struct field index overflow")?;
+                let field_offset = field_index
+                    .checked_mul(PERSISTENT_OBJECT_ABI_SLOT_SIZE)
+                    .context("ordinary GC struct field offset overflow")?;
+                Ok(WasmtimePersistentFieldLayout {
+                    field_index,
+                    field_offset,
+                    value_size: PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+                    is_object_ref: Self::storage_type_traces_object_refs(ty),
+                })
+            })
+            .collect()
+    }
+
+    fn promote_struct_source(
+        &mut self,
+        object_table: &mut ObjectTable,
+        gc_ref: &VMGcRef,
+        type_index: VMSharedTypeIndex,
+    ) -> Result<OrdinaryGcPromotionSource> {
+        let layout = self
+            .engine
+            .signatures()
+            .layout(type_index)
+            .with_context(|| {
+                format!(
+                    "ordinary GC struct type {} has no registered GC layout",
+                    type_index.bits()
+                )
+            })?;
+        let GcLayout::Struct(layout) = layout else {
+            bail!("ordinary GC struct type layout is not a struct layout");
+        };
+        let field_types = StructType::from_shared_type_index(self.engine, type_index)
+            .fields()
+            .map(|field| field.element_type().clone())
+            .collect::<Vec<_>>();
+        ensure!(
+            field_types.len() == layout.fields.len(),
+            "ordinary GC struct layout field count mismatch"
+        );
+        let mut fields = Vec::with_capacity(field_types.len());
+        for (field_type, field_layout) in field_types.iter().zip(layout.fields.iter()) {
+            fields.push(self.read_storage_value(gc_ref, field_type, field_layout.offset)?);
+        }
+        let field_layouts = Self::canonical_field_layouts(&field_types)?;
+        let type_layout_id = object_table
+            .ensure_persistent_struct_layout_for_wasmtime_type_layout_namespace(
+                // VMSharedTypeIndex is engine-global, so ordinary Wasmtime GC
+                // promotion uses the stable engine-level namespace.
+                0,
+                type_index.bits(),
+                field_layouts,
+            )?;
+        Ok(OrdinaryGcPromotionSource::Struct {
+            type_layout_id,
+            fields,
+        })
+    }
+
+    fn promote_array_source(
+        &mut self,
+        object_table: &mut ObjectTable,
+        gc_ref: &VMGcRef,
+        type_index: VMSharedTypeIndex,
+    ) -> Result<OrdinaryGcPromotionSource> {
+        let layout = self
+            .engine
+            .signatures()
+            .layout(type_index)
+            .with_context(|| {
+                format!(
+                    "ordinary GC array type {} has no registered GC layout",
+                    type_index.bits()
+                )
+            })?;
+        let GcLayout::Array(layout) = layout else {
+            bail!("ordinary GC array type layout is not an array layout");
+        };
+        let element_type =
+            ArrayType::from_shared_type_index(self.engine, type_index).element_type();
+        let len = {
+            let gc_store = self.gc_store_mut()?;
+            let array_ref = gc_ref
+                .as_arrayref(&*gc_store.gc_heap)
+                .context("ordinary GC ref is not an arrayref")?;
+            gc_store.array_len(array_ref)?
+        };
+        let mut elements = Vec::with_capacity(
+            usize::try_from(len).context("ordinary GC array length exceeds usize")?,
+        );
+        for index in 0..len {
+            let offset = layout
+                .elem_offset(index)
+                .context("ordinary GC array element offset overflow")?;
+            elements.push(self.read_storage_value(gc_ref, &element_type, offset)?);
+        }
+        let element_is_object_ref = Self::storage_type_traces_object_refs(&element_type);
+        let type_layout_id = object_table
+            .ensure_persistent_array_layout_for_wasmtime_type_layout_namespace(
+                // VMSharedTypeIndex is engine-global, so ordinary Wasmtime GC
+                // promotion uses the stable engine-level namespace.
+                0,
+                type_index.bits(),
+                PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+                element_is_object_ref,
+            )?;
+        Ok(OrdinaryGcPromotionSource::Array {
+            type_layout_id,
+            elements,
+        })
+    }
+}
+
+impl OrdinaryGcPromotionAdapter for StoreBackedOrdinaryGcPromotionAdapter<'_> {
+    fn promotion_source_for_gc_ref(
+        &mut self,
+        object_table: &mut ObjectTable,
+        gc_ref: u32,
+    ) -> Result<Option<OrdinaryGcPromotionSource>> {
+        let Some(gc_ref) = VMGcRef::from_raw_u32(gc_ref) else {
+            return Ok(None);
+        };
+        if gc_ref.is_i31() {
+            return Ok(Some(OrdinaryGcPromotionSource::I31(
+                ObjectTable::decode_raw_i31_ref(u64::from(gc_ref.as_raw_u32()))?,
+            )));
+        }
+        let Some(gc_store) = self.gc_store.as_mut() else {
+            return Ok(None);
+        };
+        let (kind, type_index) = {
+            let header = match gc_store.header(&gc_ref) {
+                Ok(header) => header,
+                Err(_) => {
+                    return Ok(Some(OrdinaryGcPromotionSource::Unsupported(
+                        "ordinary GC reference is not valid in this store",
+                    )));
+                }
+            };
+            (header.kind(), header.ty())
+        };
+        if kind.matches(VMGcKind::StructRef) {
+            let type_index = type_index.context("ordinary GC struct has no concrete type")?;
+            return self
+                .promote_struct_source(object_table, &gc_ref, type_index)
+                .map(Some);
+        }
+        if kind.matches(VMGcKind::ArrayRef) {
+            let type_index = type_index.context("ordinary GC array has no concrete type")?;
+            return self
+                .promote_array_source(object_table, &gc_ref, type_index)
+                .map(Some);
+        }
+        if kind.matches(VMGcKind::ExternRef) {
+            return Ok(Some(OrdinaryGcPromotionSource::Unsupported(
+                "durable external identity source is not wired",
+            )));
+        }
+        Ok(Some(OrdinaryGcPromotionSource::Unsupported(
+            "ordinary GC object kind is not supported for persistent promotion",
+        )))
+    }
+}
+
 fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
@@ -365,8 +632,10 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
 
     {
         let store = store.store_opaque_mut();
-        let (state, object_table) = store.transaction_state_and_object_table_mut();
-        state.promote_persistent_references_before_commit(object_table)?;
+        let (engine, gc_store, state, object_table) = store.transaction_promotion_context_mut();
+        let mut adapter = StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store);
+        state
+            .promote_persistent_references_before_commit_with_adapter(object_table, &mut adapter)?;
         state.validate_active_object_reads(&*object_table)?;
     }
 
