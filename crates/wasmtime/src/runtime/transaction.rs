@@ -3428,6 +3428,7 @@ impl TransactionState {
 
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
         self.ensure_active()?;
+        self.retry_post_commit_linear_undo_retirement();
         for object_id in self.allocated_objects.iter().rev().copied() {
             object_table.free(object_id)?;
         }
@@ -9018,6 +9019,68 @@ mod tests {
         state.abort().unwrap();
 
         assert!(!state.post_commit_linear_undo_chunks.contains_key(&19));
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        persist::RecordingBackendEvent::RetireCommittedLinearUndoChunk(
+                            chunk_start_block
+                        ) if *chunk_start_block == marker.chunk_start_block
+                    )
+                })
+                .count(),
+            5
+        );
+    }
+
+    #[test]
+    fn post_commit_linear_undo_cleanup_retries_on_abort_allocated_objects_and_drains_queue() {
+        let (durable_log, events) =
+            TxDurableLog::recording_backend_with_retire_failures_for_test(4);
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(20),
+            durable_log,
+        );
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0032, 4, vec![7, 8, 9, 10]);
+
+        let marker = state
+            .publish_tmemory_undo_before_in_place_write(20, 20, &undo)
+            .unwrap();
+        state.publish_commit_lp(20, 20, marker).unwrap();
+        state.complete_commit().unwrap();
+
+        assert_eq!(
+            state
+                .post_commit_linear_undo_chunks
+                .get(&20)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![marker.chunk_start_block]
+        );
+
+        let mut objects = ObjectTable::default();
+        state.begin().unwrap();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+        state.record_allocated_object(object).unwrap();
+        assert_eq!(
+            state
+                .post_commit_linear_undo_chunks
+                .get(&20)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![marker.chunk_start_block]
+        );
+        state.abort_allocated_objects(&mut objects).unwrap();
+
+        assert!(!state.post_commit_linear_undo_chunks.contains_key(&20));
         assert_eq!(
             events
                 .lock()
