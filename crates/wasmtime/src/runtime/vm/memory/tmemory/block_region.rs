@@ -23,7 +23,8 @@ use crate::runtime::transaction::type_layout::{
     PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId, TypeLayoutRegistry,
 };
 use crate::runtime::transaction::{
-    ObjectKind, ObjectPayload, ObjectValue, encode_object_record_for_recovery,
+    ObjectKind, ObjectPayload, ObjectValue, PersistentRecoveredRecordLocation,
+    encode_object_record_for_recovery,
 };
 use crate::runtime::vm::SendSyncPtr;
 use core::{
@@ -871,6 +872,40 @@ fn reusable_chunk_generation(
     }
 
     Ok(generation)
+}
+
+fn data_record_block_range(
+    data_block: u32,
+    data_offset: u32,
+    record_len: u64,
+) -> Result<Range<usize>> {
+    ensure!(
+        record_len > 0,
+        "transactional data record length must be nonzero"
+    );
+
+    let start_block =
+        usize::try_from(data_block).context("transactional data record block overflow")?;
+    let start_offset =
+        usize::try_from(data_offset).context("transactional data record offset overflow")?;
+    ensure!(
+        start_offset < BLOCK_SIZE,
+        "transactional data record offset exceeds block size"
+    );
+    let record_len =
+        usize::try_from(record_len).context("transactional data record length overflow")?;
+    let end_offset = start_offset
+        .checked_add(record_len)
+        .context("transactional data record length overflow")?;
+    let covered_blocks = end_offset
+        .checked_sub(1)
+        .context("transactional data record length must be nonzero")?
+        / BLOCK_SIZE;
+    let end_block = start_block
+        .checked_add(covered_blocks)
+        .and_then(|last_block| last_block.checked_add(1))
+        .context("transactional data record block range overflow")?;
+    Ok(start_block..end_block)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2289,6 +2324,105 @@ impl FileBackedMemoryBlockRegion {
         )
     }
 
+    pub(crate) fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        let mut live_blocks = vec![false; self.num_blocks()];
+        for location in reachable {
+            let range = data_record_block_range(
+                location.data_block,
+                location.data_offset,
+                location.record_len,
+            )?;
+            ensure!(
+                range.end <= self.num_blocks(),
+                "reachable object record blocks exceed region bounds"
+            );
+            for block in range {
+                live_blocks[block] = true;
+            }
+        }
+
+        let mut candidate_chunks = BTreeMap::<u32, usize>::new();
+        for location in unreachable {
+            let record_range = data_record_block_range(
+                location.data_block,
+                location.data_offset,
+                location.record_len,
+            )?;
+            ensure!(
+                record_range.end <= self.num_blocks(),
+                "unreachable object record blocks exceed region bounds"
+            );
+
+            let meta = self.block_meta(location.data_block)?;
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+                continue;
+            }
+
+            let chunk_start =
+                usize::try_from(meta.chunk_start).context("retired chunk start block overflow")?;
+            let chunk_blocks =
+                usize::try_from(meta.chunk_blocks).context("retired chunk block count overflow")?;
+            let chunk_end = chunk_start
+                .checked_add(chunk_blocks)
+                .context("retired chunk block range overflow")?;
+            ensure!(
+                chunk_end <= self.num_blocks(),
+                "retired chunk metadata range is out of bounds"
+            );
+            ensure!(
+                record_range.start >= chunk_start && record_range.end <= chunk_end,
+                "recovered object record extends outside chunk metadata"
+            );
+
+            candidate_chunks.insert(meta.chunk_start, chunk_blocks);
+        }
+
+        let mut retired = Vec::new();
+        for (chunk_start_block, chunk_blocks) in candidate_chunks {
+            let chunk_start =
+                usize::try_from(chunk_start_block).context("retired chunk start block overflow")?;
+            let chunk_end = chunk_start
+                .checked_add(chunk_blocks)
+                .context("retired chunk block range overflow")?;
+            if live_blocks[chunk_start..chunk_end].iter().any(|live| *live) {
+                continue;
+            }
+
+            let meta = self.block_metas[chunk_start];
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+                continue;
+            }
+
+            let retired_meta = BlockMeta {
+                state: BlockState::Retired as u8,
+                kind: meta.kind,
+                reserved0: 0,
+                generation: meta.generation,
+                owner_thread: meta.owner_thread,
+                chunk_start: meta.chunk_start,
+                chunk_blocks: meta.chunk_blocks,
+                reserved1: 0,
+            };
+            for block in chunk_start..chunk_end {
+                self.block_entries[block] = BlockEntry::default();
+                self.block_entries[block].list_num = ListKind::LargeFree as i16;
+                self.write_block_meta(block, retired_meta)?;
+            }
+            self.flush_block_meta_range(chunk_start, chunk_blocks)?;
+            retired.push(chunk_start_block);
+        }
+
+        if !retired.is_empty() {
+            self.fence()?;
+        }
+
+        Ok(retired)
+    }
+
     pub(crate) fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry> {
         let desc = self.load_validated_type_layout_metadata_desc()?;
         let offset =
@@ -2547,8 +2681,17 @@ impl FileBackedMemoryBlockRegion {
         let mut block = reserved_metadata_blocks;
         while block < self.num_blocks() {
             let start_block = u32::try_from(block).context("transactional block index overflow")?;
+            let meta = self.block_metas[block];
+            if !meta.is_active_or_sealed()? {
+                block += 1;
+                continue;
+            }
             match self.block_magic(start_block)? {
                 LOG_BLOCK_MAGIC => {
+                    if meta.kind()? != BlockKind::Log {
+                        block += 1;
+                        continue;
+                    }
                     let header = self.log_block_header(start_block)?;
                     covered_blocks[block] = true;
                     self.mark_blocks_used(block, 1)?;
@@ -2567,6 +2710,10 @@ impl FileBackedMemoryBlockRegion {
                     block += 1;
                 }
                 DATA_CHUNK_MAGIC => {
+                    if !matches!(meta.kind()?, BlockKind::ObjectData | BlockKind::LinearUndo) {
+                        block += 1;
+                        continue;
+                    }
                     let header = self.data_chunk_header(start_block)?;
                     let chunk_blocks = usize::try_from(header.chunk_blocks)
                         .context("transactional data chunk block count overflow")?;
@@ -3956,6 +4103,67 @@ mod tests {
                 .kind()
                 .unwrap(),
             BlockKind::ObjectData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reuses_retired_object_chunk_with_incremented_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retired-object-reuse-region.bin");
+        let retired_chunk;
+        let old_generation;
+
+        {
+            let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+            let stream = region.alloc_stream(7).unwrap();
+            let record = TMemory::encode_publication_data_record(
+                pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+                1,
+                PackedGranuleDomain::TStruct as u16,
+                19,
+                &[1, 2, 3, 4],
+            )
+            .unwrap();
+            let location = region.append_data_record(stream, &record).unwrap();
+            retired_chunk = location.chunk_start_block;
+            old_generation = region
+                .block_meta_for_test(usize::try_from(location.data_block).unwrap())
+                .unwrap()
+                .generation;
+            region
+                .retire_whole_dead_object_chunks(
+                    &[],
+                    &[PersistentRecoveredRecordLocation {
+                        object_id: crate::runtime::transaction::ObjectId { object_index: 41 },
+                        version: 1,
+                        data_block: location.data_block,
+                        data_offset: location.data_offset,
+                        record_len: u64::try_from(record.len()).unwrap(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let mut region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        let stream = region.alloc_stream(8).unwrap();
+        let record = TMemory::encode_publication_data_record(
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 42).unwrap(),
+            1,
+            PackedGranuleDomain::TStruct as u16,
+            19,
+            &[5, 6, 7, 8],
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+
+        assert_eq!(location.chunk_start_block, retired_chunk);
+        assert_eq!(
+            region
+                .block_meta_for_test(usize::try_from(location.data_block).unwrap())
+                .unwrap()
+                .generation,
+            old_generation + 1
         );
     }
 

@@ -6,7 +6,7 @@ use wasmtime::_internal::transaction_persistence::{
     bump_first_object_data_block_generation_for_test, corrupt_first_log_crc,
     create_file_backed_region_image, publish_committed_global_object_root,
     publish_committed_struct_object, publish_committed_tmemory_update,
-    reopen_and_recover_file_backed_region,
+    reopen_and_recover_file_backed_region, retire_unreachable_object_chunks_for_test,
 };
 use wasmtime::{
     Config, Engine, ExternRef, Func, Global, GlobalType, Instance, Module, Mutability, Result,
@@ -70,6 +70,27 @@ fn file_backed_recovery_ignores_stale_generation_object_publication() {
 
     assert!(recovered.winners.is_empty());
     assert!(recovered.object_winners.is_empty());
+}
+
+#[test]
+fn file_backed_object_chunk_reuse_does_not_resurrect_old_object() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("object-reuse-region.bin");
+
+    create_file_backed_region_image(&path, 128).unwrap();
+    publish_committed_struct_object(&path, 1, 41, 1, 12, &[1, 1, 1]).unwrap();
+
+    retire_unreachable_object_chunks_for_test(&path, &[41]).unwrap();
+    publish_committed_struct_object(&path, 2, 42, 1, 12, &[2, 2, 2]).unwrap();
+
+    let recovered = reopen_and_recover_file_backed_region(&path).unwrap();
+    let object_ids = recovered
+        .object_winners
+        .iter()
+        .map(|winner| winner.object_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(object_ids, vec![42]);
 }
 
 #[test]

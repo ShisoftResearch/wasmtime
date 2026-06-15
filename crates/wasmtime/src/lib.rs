@@ -558,6 +558,7 @@ pub mod _internal {
         use alloc::string::{String, ToString};
         use alloc::vec::Vec;
 
+        pub use crate::runtime::transaction::retire_unreachable_object_chunks_for_test;
         pub use crate::vm::block_region::{
             TransactionPersistenceRecoveredObjectWinner, TransactionPersistenceRecoveredRegion,
             TransactionPersistenceRecoveredWinner,

@@ -2,7 +2,7 @@
 
 use crate::prelude::*;
 use crate::runtime::store::InstanceId;
-use crate::runtime::vm::{PackedGranuleDomain, TMemory};
+use crate::runtime::vm::{PackedGranuleDomain, TMemory, TxDataRecordHeader};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::{cell::Cell, mem, ops::Range};
@@ -22,8 +22,8 @@ mod promotion;
 pub(crate) mod type_layout;
 pub(crate) use object_gc::{
     DanglingObjectRef, DanglingObjectRefKind, PersistentGcBudget, PersistentGcCommitDelta,
-    PersistentGcState, PersistentGcStepReport, PersistentRecoveryGcReport, PersistentRootError,
-    PersistentRootErrorKind,
+    PersistentGcState, PersistentGcStepReport, PersistentRecoveredRecordLocation,
+    PersistentRecoveryGcReport, PersistentRootError, PersistentRootErrorKind,
 };
 #[cfg(test)]
 use object_gc::{PersistentObjectEdge, PersistentObjectMarker};
@@ -2420,6 +2420,10 @@ impl ObjectTable {
 fn recovered_record_location_from_winner(
     winner: &crate::runtime::vm::RecoveredObjectWinner,
 ) -> object_gc::PersistentRecoveredRecordLocation {
+    let durable_record_len = winner
+        .record_len
+        .checked_add(u64::try_from(mem::size_of::<TxDataRecordHeader>()).unwrap())
+        .expect("persistent recovered record length overflow");
     object_gc::PersistentRecoveredRecordLocation {
         object_id: ObjectId {
             object_index: winner.object_id,
@@ -2427,8 +2431,38 @@ fn recovered_record_location_from_winner(
         version: winner.version,
         data_block: winner.data_block,
         data_offset: winner.data_offset,
-        record_len: winner.record_len,
+        record_len: durable_record_len,
     }
+}
+
+/// Retires whole-dead object-data chunks in a recovered file-backed region image.
+pub fn retire_unreachable_object_chunks_for_test(
+    path: &Path,
+    unreachable_object_ids: &[u64],
+) -> Result<Vec<u32>> {
+    let recovered =
+        crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(path)?;
+    let unreachable_object_ids = unreachable_object_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut reachable = Vec::new();
+    let mut unreachable = Vec::new();
+
+    for winner in recovered.committed_object_winners()? {
+        let location = recovered_record_location_from_winner(&winner);
+        if unreachable_object_ids.contains(&winner.object_id) {
+            unreachable.push(location);
+        } else {
+            reachable.push(location);
+        }
+    }
+
+    let mut region =
+        crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let retired = region.retire_whole_dead_object_chunks(&reachable, &unreachable)?;
+    region.fence()?;
+    Ok(retired)
 }
 
 fn default_type_layout_id_for_kind(kind: ObjectKind) -> TypeLayoutId {
@@ -14201,6 +14235,10 @@ mod tests {
     fn recovered_record_location_for_test(
         winner: &crate::runtime::vm::RecoveredObjectWinner,
     ) -> object_gc::PersistentRecoveredRecordLocation {
+        let durable_record_len = winner
+            .record_len
+            .checked_add(u64::try_from(mem::size_of::<TxDataRecordHeader>()).unwrap())
+            .unwrap();
         object_gc::PersistentRecoveredRecordLocation {
             object_id: ObjectId {
                 object_index: winner.object_id,
@@ -14208,7 +14246,7 @@ mod tests {
             version: winner.version,
             data_block: winner.data_block,
             data_offset: winner.data_offset,
-            record_len: winner.record_len,
+            record_len: durable_record_len,
         }
     }
 
