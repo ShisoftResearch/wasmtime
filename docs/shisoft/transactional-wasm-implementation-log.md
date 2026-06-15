@@ -24,12 +24,58 @@ criteria.
 Use `docs/shisoft/2026-06-15-persistent-roots-and-promotion-plan.md` for the
 completed persistent-root and promotion-boundary wave.
 
-Use `docs/shisoft/2026-06-15-vmgcref-commit-promotion-plan.md` for the
-completed first commit-time `VMGcRef` promotion wave.
+Use `docs/shisoft/2026-06-15-complete-persistent-promotion-workstreams-plan.md`
+for the current persistent-promotion roadmap. It supersedes the older
+`docs/shisoft/2026-06-15-vmgcref-commit-promotion-plan.md` where that older
+plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
+payloads.
+
+## Current Status: Persistent Promotion Detour
+
+Date: 2026-06-15
+
+The current promotion value model is:
+
+- Persistent heap objects use `ObjectId` and object-table payload records.
+- The current persistent object-table payload records are `Struct` and `Array`.
+- `ti31` is encoded inline as `ObjectValue::I31`.
+- `tfuncref` is encoded inline as
+  `ObjectValue::FuncRef(DurableFuncIdentity)`.
+- `texternref` is encoded inline as
+  `ObjectValue::ExternRef(DurableExternIdentity)`.
+- Inline durable values are stored inside struct/array payload slots. They are
+  not object-table payloads, do not allocate standalone `ObjectId`s, and are not
+  traced as persistent-GC object edges.
+- The old raw-i31-to-object and promoted-i31 side maps have been removed.
+
+Implemented in this detour:
+
+- Object value ABI tags for inline `i31`, durable function refs, and durable
+  external refs.
+- Object heap encode/decode and trace handling for inline durable values.
+- Transaction promotion preserves inline durable leaves while promoting
+  transaction-mirrored struct/array object graphs.
+- Runtime helpers convert raw i31 values into inline object values at object
+  boundaries instead of allocating object-table records.
+
+Verification for this detour:
+
+```text
+cargo test -p wasmtime --lib durable_ -- --format terse
+test result: ok. 22 passed; 0 failed; 0 ignored
+
+cargo test -p wasmtime --lib transaction -- --format terse
+test result: ok. 350 passed; 0 failed; 0 ignored
+```
 
 ## Current Status: Wave 11 VMGcRef Commit Promotion
 
 Date: 2026-06-15
+
+Historical note: this section describes the state before the persistent
+promotion detour above. The detour supersedes any statements below that say
+`ti31` becomes `ObjectPayload::I31` or that function/external references are
+standalone object-table payloads.
 
 Wave 11 promotes the first supported class of volatile transaction references
 into durable persistent object records during transaction commit.

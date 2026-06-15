@@ -490,6 +490,7 @@ fn transaction_helper_i31_for_ref(
         return 0;
     };
     let value = match value {
+        ObjectValue::I31(value) => *value,
         ObjectValue::I32(value) => *value,
         ObjectValue::I64(value) => *value as i32,
         ObjectValue::F32(value) => *value as i32,
@@ -498,6 +499,7 @@ fn transaction_helper_i31_for_ref(
         // a `ti31` helper extraction. There is no scalar-preserving conversion
         // for that shape, so keep the compatibility path deterministic.
         ObjectValue::V128(_) => 0,
+        ObjectValue::FuncRef(_) | ObjectValue::ExternRef(_) => 0,
         ObjectValue::Ref(_) => return 0,
     };
     (value as u32).wrapping_shl(1) | 1
@@ -2067,12 +2069,15 @@ fn decode_transaction_array_elem_values(
         .chunks_exact(16)
         .map(|chunk| {
             let raw = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-            let object_id = if raw == 0 {
-                None
+            if raw == 0 {
+                Ok(ObjectValue::Ref(None))
+            } else if ObjectTable::is_raw_i31_ref(raw) {
+                Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?))
             } else {
-                Some(object_table.object_id_for_raw_ref_or_func(raw)?)
-            };
-            Ok(ObjectValue::Ref(object_id))
+                Ok(ObjectValue::Ref(Some(
+                    object_table.object_id_for_raw_ref_or_func(raw)?,
+                )))
+            }
         })
         .collect()
 }
@@ -2443,6 +2448,8 @@ fn object_value_from_transaction_abi(
     ensure!(high == 0, "non-canonical ref object value ABI payload");
     let object_id = if low == 0 {
         None
+    } else if ObjectTable::is_raw_i31_ref(low) {
+        return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(low)?));
     } else {
         Some(object_table.object_id_for_raw_ref_or_func(low)?)
     };
@@ -2453,6 +2460,13 @@ fn transaction_abi_from_object_value(
     object_table: &ObjectTable,
     value: &ObjectValue,
 ) -> Result<ObjectValueAbi> {
+    if let ObjectValue::I31(value) = value {
+        return ObjectValueAbi::from_parts(
+            OBJECT_VALUE_ABI_TAG_REF,
+            ObjectTable::encode_raw_i31_ref(*value),
+            0,
+        );
+    }
     let ObjectValue::Ref(object_id) = value else {
         return ObjectValueAbi::from_object_value(value);
     };

@@ -27,8 +27,7 @@ pub(crate) use object_gc::{
 use object_gc::{PersistentObjectEdge, PersistentObjectMarker};
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
-#[allow(unused_imports)]
-pub(crate) use durable_ref::{DurableExternIdentity, DurableFuncIdentity, DurableRefValue};
+pub(crate) use durable_ref::{DurableExternIdentity, DurableFuncIdentity};
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
@@ -574,7 +573,6 @@ pub(crate) struct TransactionState {
     original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
-    promoted_i31_refs: BTreeMap<u32, ObjectId>,
     allocated_objects: Vec<ObjectId>,
     granule_versions: BTreeMap<GranuleId, u64>,
     read_granules: BTreeSet<GranuleId>,
@@ -594,7 +592,6 @@ struct TransactionWorkspace {
     original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
-    promoted_i31_refs: BTreeMap<u32, ObjectId>,
     allocated_objects: Vec<ObjectId>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
@@ -606,7 +603,6 @@ struct PromotionAttempt {
     initial_allocated_object_count: usize,
     promoted_sources: Vec<ObjectId>,
     promoted_objects: Vec<ObjectId>,
-    promoted_raw_i31_refs: Vec<u32>,
 }
 
 impl PromotionAttempt {
@@ -615,7 +611,6 @@ impl PromotionAttempt {
             initial_allocated_object_count: state.allocated_objects.len(),
             promoted_sources: Vec::new(),
             promoted_objects: Vec::new(),
-            promoted_raw_i31_refs: Vec::new(),
         }
     }
 
@@ -624,14 +619,7 @@ impl PromotionAttempt {
         self.promoted_objects.push(promoted);
     }
 
-    fn record_promoted_raw_i31_ref(&mut self, raw_ref: u32) {
-        self.promoted_raw_i31_refs.push(raw_ref);
-    }
-
     fn rollback(self, state: &mut TransactionState, object_table: &mut ObjectTable) -> Result<()> {
-        for raw_ref in self.promoted_raw_i31_refs {
-            state.promoted_i31_refs.remove(&raw_ref);
-        }
         for source in self.promoted_sources {
             state.promoted_objects.remove(&source);
         }
@@ -671,7 +659,6 @@ impl Default for TransactionState {
             original_table_elements: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             promoted_objects: BTreeMap::new(),
-            promoted_i31_refs: BTreeMap::new(),
             allocated_objects: Vec::new(),
             granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
@@ -795,12 +782,15 @@ pub(crate) enum ObjectKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ObjectValue {
+    I31(i32),
     I32(i32),
     I64(i64),
     F32(u32),
     F64(u64),
     V128([u8; 16]),
     Ref(Option<ObjectId>),
+    FuncRef(DurableFuncIdentity),
+    ExternRef(DurableExternIdentity),
 }
 
 #[repr(transparent)]
@@ -841,6 +831,9 @@ pub(crate) const OBJECT_VALUE_ABI_TAG_F32: u32 = 2;
 pub(crate) const OBJECT_VALUE_ABI_TAG_F64: u32 = 3;
 pub(crate) const OBJECT_VALUE_ABI_TAG_V128: u32 = 4;
 pub(crate) const OBJECT_VALUE_ABI_TAG_REF: u32 = 5;
+pub(crate) const OBJECT_VALUE_ABI_TAG_FUNCREF: u32 = 6;
+pub(crate) const OBJECT_VALUE_ABI_TAG_EXTERNREF: u32 = 7;
+pub(crate) const OBJECT_VALUE_ABI_TAG_I31: u32 = 8;
 const VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED: &str =
     "volatile GC reference promotion into persistent object graph is not implemented yet";
 
@@ -859,6 +852,10 @@ impl ObjectValueAbi {
                 high == 0 && low <= u64::from(u32::MAX),
                 "non-canonical i32 object value ABI payload"
             ),
+            OBJECT_VALUE_ABI_TAG_I31 => ensure!(
+                high == 0 && low <= u64::from(I31Value::MASK),
+                "non-canonical i31 object value ABI payload"
+            ),
             OBJECT_VALUE_ABI_TAG_I64 => {
                 ensure!(high == 0, "non-canonical i64 object value ABI payload")
             }
@@ -873,6 +870,12 @@ impl ObjectValueAbi {
             OBJECT_VALUE_ABI_TAG_REF => {
                 ensure!(high == 0, "non-canonical ref object value ABI payload")
             }
+            OBJECT_VALUE_ABI_TAG_FUNCREF | OBJECT_VALUE_ABI_TAG_EXTERNREF => {
+                ensure!(
+                    u32::try_from(high >> 32).unwrap() != 0,
+                    "non-canonical durable ref object value ABI payload"
+                );
+            }
             _ => bail!("unknown object value ABI tag: {tag}"),
         }
         Ok(Self { tag, low, high })
@@ -884,6 +887,10 @@ impl ObjectValueAbi {
 
     pub(crate) fn from_object_value(value: &ObjectValue) -> Result<Self> {
         match value {
+            ObjectValue::I31(value) => {
+                let raw = u64::from((*value as u32) & I31Value::MASK);
+                Self::from_parts(OBJECT_VALUE_ABI_TAG_I31, raw, 0)
+            }
             ObjectValue::I32(value) => {
                 Self::from_parts(OBJECT_VALUE_ABI_TAG_I32, u64::from(*value as u32), 0)
             }
@@ -902,12 +909,24 @@ impl ObjectValueAbi {
                 ObjectRefValue::from_optional_object_id(*object_id)?.as_raw(),
                 0,
             ),
+            ObjectValue::FuncRef(identity) => Self::from_parts(
+                OBJECT_VALUE_ABI_TAG_FUNCREF,
+                identity.module_fingerprint,
+                u64::from(identity.function_index)
+                    | (u64::from(identity.type_layout_id.get()) << 32),
+            ),
+            ObjectValue::ExternRef(identity) => Self::from_parts(
+                OBJECT_VALUE_ABI_TAG_EXTERNREF,
+                identity.handle,
+                u64::from(identity.namespace) | (u64::from(identity.type_layout_id.get()) << 32),
+            ),
         }
     }
 
     pub(crate) fn to_object_value(self) -> Result<ObjectValue> {
         let Self { tag, low, high } = Self::from_parts(self.tag, self.low, self.high)?;
         Ok(match tag {
+            OBJECT_VALUE_ABI_TAG_I31 => ObjectValue::I31(I31Value::new(low as u32 as i32).get_s()),
             OBJECT_VALUE_ABI_TAG_I32 => ObjectValue::I32(low as u32 as i32),
             OBJECT_VALUE_ABI_TAG_I64 => ObjectValue::I64(low as i64),
             OBJECT_VALUE_ABI_TAG_F32 => ObjectValue::F32(low as u32),
@@ -919,6 +938,18 @@ impl ObjectValueAbi {
                 ObjectValue::V128(bytes)
             }
             OBJECT_VALUE_ABI_TAG_REF => ObjectValue::Ref(ObjectRefValue::from_raw(low).decode()),
+            OBJECT_VALUE_ABI_TAG_FUNCREF => ObjectValue::FuncRef(DurableFuncIdentity {
+                module_fingerprint: low,
+                function_index: u32::try_from(high & u64::from(u32::MAX)).unwrap(),
+                type_layout_id: TypeLayoutId::new(u32::try_from(high >> 32).unwrap())
+                    .context("durable func ref type layout id cannot be zero")?,
+            }),
+            OBJECT_VALUE_ABI_TAG_EXTERNREF => ObjectValue::ExternRef(DurableExternIdentity {
+                namespace: u32::try_from(high & u64::from(u32::MAX)).unwrap(),
+                handle: low,
+                type_layout_id: TypeLayoutId::new(u32::try_from(high >> 32).unwrap())
+                    .context("durable extern ref type layout id cannot be zero")?,
+            }),
             _ => unreachable!(),
         })
     }
@@ -928,9 +959,6 @@ impl ObjectValueAbi {
 pub(crate) enum ObjectPayload {
     Struct(Vec<ObjectValue>),
     Array(Vec<ObjectValue>),
-    I31(i32),
-    Extern(DurableExternIdentity),
-    Func(DurableFuncIdentity),
 }
 
 impl ObjectPayload {
@@ -938,20 +966,19 @@ impl ObjectPayload {
         match self {
             ObjectPayload::Struct(_) => ObjectKind::Struct,
             ObjectPayload::Array(_) => ObjectKind::Array,
-            ObjectPayload::I31(_) => ObjectKind::I31,
-            ObjectPayload::Extern(_) => ObjectKind::Extern,
-            ObjectPayload::Func(_) => ObjectKind::Func,
         }
     }
 
-    fn default_for_kind(kind: ObjectKind) -> Self {
-        match kind {
-            ObjectKind::Struct => ObjectPayload::Struct(Vec::new()),
-            ObjectKind::Array => ObjectPayload::Array(Vec::new()),
-            ObjectKind::I31 => ObjectPayload::I31(0),
-            ObjectKind::Extern => ObjectPayload::Extern(default_durable_extern_identity()),
-            ObjectKind::Func => ObjectPayload::Func(default_durable_func_identity()),
-        }
+    fn default_for_kind(kind: ObjectKind) -> Result<Self> {
+        Ok(match kind {
+            ObjectKind::Struct => Self::Struct(Vec::new()),
+            ObjectKind::Array => Self::Array(Vec::new()),
+            ObjectKind::I31 | ObjectKind::Extern | ObjectKind::Func => {
+                bail!(
+                    "i31, function, and external references are durable values, not object-table payloads"
+                )
+            }
+        })
     }
 }
 
@@ -995,10 +1022,6 @@ pub(crate) struct ObjectTable {
     // around that identity.
     gc_ref_to_object: BTreeMap<u32, ObjectId>,
     object_to_gc_ref: BTreeMap<ObjectId, u32>,
-    i31_ref_to_object: BTreeMap<u32, ObjectId>,
-    object_to_i31_ref: BTreeMap<ObjectId, u32>,
-    func_ref_to_object: BTreeMap<u64, ObjectId>,
-    object_to_func_ref: BTreeMap<ObjectId, u64>,
     type_layouts: TypeLayoutRegistry,
     wasmtime_type_layout_ids: BTreeMap<WasmtimeTypeLayoutKey, TypeLayoutId>,
     next_dynamic_type_layout_id: Option<u32>,
@@ -1015,10 +1038,6 @@ impl Default for ObjectTable {
             free_list: Vec::new(),
             gc_ref_to_object: BTreeMap::new(),
             object_to_gc_ref: BTreeMap::new(),
-            i31_ref_to_object: BTreeMap::new(),
-            object_to_i31_ref: BTreeMap::new(),
-            func_ref_to_object: BTreeMap::new(),
-            object_to_func_ref: BTreeMap::new(),
             type_layouts: TypeLayoutRegistry::default(),
             wasmtime_type_layout_ids: BTreeMap::new(),
             next_dynamic_type_layout_id: Some(TypeLayoutId::BUILTIN_FUNC.get() + 1),
@@ -1037,11 +1056,11 @@ impl Default for ObjectTable {
 }
 
 impl ObjectTable {
-    fn is_raw_i31_ref(raw_ref: u64) -> bool {
+    pub(crate) fn is_raw_i31_ref(raw_ref: u64) -> bool {
         raw_ref <= u64::from(u32::MAX) && (raw_ref & 1) == 1
     }
 
-    fn decode_raw_i31_ref(raw_ref: u64) -> Result<i32> {
+    pub(crate) fn decode_raw_i31_ref(raw_ref: u64) -> Result<i32> {
         ensure!(
             Self::is_raw_i31_ref(raw_ref),
             "raw ref is not an i31 immediate"
@@ -1049,24 +1068,8 @@ impl ObjectTable {
         Ok((raw_ref as u32 as i32) >> 1)
     }
 
-    fn encode_raw_i31_ref(value: i32) -> u64 {
+    pub(crate) fn encode_raw_i31_ref(value: i32) -> u64 {
         u64::from(((value as u32) << 1) | 1)
-    }
-
-    fn object_id_for_raw_i31_ref(&mut self, raw_ref: u64) -> Result<ObjectId> {
-        let raw_ref = u32::try_from(raw_ref).context("raw i31 ref does not fit u32")?;
-        if let Some(object_id) = self.i31_ref_to_object.get(&raw_ref).copied()
-            && self.live_slot(object_id).is_ok()
-        {
-            return Ok(object_id);
-        }
-        self.i31_ref_to_object.remove(&raw_ref);
-
-        let value = Self::decode_raw_i31_ref(u64::from(raw_ref))?;
-        let object_id = self.allocate_payload(ObjectPayload::I31(value))?;
-        self.i31_ref_to_object.insert(raw_ref, object_id);
-        self.object_to_i31_ref.insert(object_id, raw_ref);
-        Ok(object_id)
     }
 
     fn install_recovered_type_layouts(
@@ -1146,7 +1149,7 @@ impl ObjectTable {
     }
 
     pub(crate) fn allocate(&mut self, kind: ObjectKind) -> Result<ObjectId> {
-        self.allocate_payload(ObjectPayload::default_for_kind(kind))
+        self.allocate_payload(ObjectPayload::default_for_kind(kind)?)
     }
 
     pub(crate) fn allocate_struct(&mut self, fields: Vec<ObjectValue>) -> Result<ObjectId> {
@@ -1497,16 +1500,9 @@ impl ObjectTable {
             return Ok(object_id);
         }
         if Self::is_raw_i31_ref(raw_ref) {
-            return self.object_id_for_raw_i31_ref(raw_ref);
+            bail!("raw i31 refs are inline durable values, not object-table payloads");
         }
-        if let Some(object_id) = self.func_ref_to_object.get(&raw_ref).copied() {
-            return Ok(object_id);
-        }
-
-        let object_id =
-            self.allocate_payload(ObjectPayload::Func(default_durable_func_identity()))?;
-        self.associate_func_ref(raw_ref, object_id)?;
-        Ok(object_id)
+        bail!("transactional function reference promotion requires durable function identity")
     }
 
     pub(crate) fn allocate_payload(&mut self, payload: ObjectPayload) -> Result<ObjectId> {
@@ -1584,7 +1580,7 @@ impl ObjectTable {
         type_layout_id: TypeLayoutId,
     ) -> Result<ObjectId> {
         self.allocate_payload_with_type_layout_id(
-            ObjectPayload::default_for_kind(kind),
+            ObjectPayload::default_for_kind(kind)?,
             type_layout_id,
             true,
         )
@@ -1648,32 +1644,6 @@ impl ObjectTable {
         Ok(())
     }
 
-    pub(crate) fn associate_func_ref(&mut self, func_ref: u64, object_id: ObjectId) -> Result<()> {
-        ensure!(
-            func_ref != 0,
-            "transactional function object cannot use null VMFuncRef"
-        );
-        ensure!(
-            self.kind(object_id)? == ObjectKind::Func,
-            "transactional function ref can only be associated with function objects"
-        );
-        if let Some(existing) = self.func_ref_to_object.get(&func_ref).copied() {
-            ensure!(
-                existing == object_id,
-                "transactional function ref is already associated"
-            );
-        }
-        if let Some(existing) = self.object_to_func_ref.get(&object_id).copied() {
-            ensure!(
-                existing == func_ref,
-                "transactional function object is already associated with another VMFuncRef"
-            );
-        }
-        self.func_ref_to_object.insert(func_ref, object_id);
-        self.object_to_func_ref.insert(object_id, func_ref);
-        Ok(())
-    }
-
     pub(crate) fn object_id_for_gc_ref(&self, gc_ref: u32) -> Result<ObjectId> {
         ensure!(gc_ref != 0, "transactional object cannot use null GC ref");
         self.gc_ref_to_object
@@ -1732,15 +1702,6 @@ impl ObjectTable {
 
     pub(crate) fn raw_ref_for_object_id(&self, object_id: ObjectId) -> Result<u64> {
         self.live_slot(object_id)?;
-        if let Some(raw_ref) = self.object_to_i31_ref.get(&object_id).copied() {
-            return Ok(u64::from(raw_ref));
-        }
-        if let ObjectPayload::I31(value) = self.payload(object_id)? {
-            return Ok(Self::encode_raw_i31_ref(value));
-        }
-        if let Some(func_ref) = self.object_to_func_ref.get(&object_id).copied() {
-            return Ok(func_ref);
-        }
         Ok(u64::from(self.gc_ref_for_object_id(object_id)?))
     }
 
@@ -1825,7 +1786,9 @@ impl ObjectTable {
             ObjectKind::Struct => Ok(GranuleId::TStruct { object_id }),
             ObjectKind::Array => Ok(GranuleId::TArray { object_id }),
             ObjectKind::I31 | ObjectKind::Extern | ObjectKind::Func => {
-                bail!("object kind does not have a transactional granule yet")
+                bail!(
+                    "object kind is encoded as an inline durable value, not a transactional granule"
+                )
             }
         }
     }
@@ -1840,7 +1803,6 @@ impl ObjectTable {
         let domain = match object_kind_from_u16(header.kind)? {
             ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
             ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
-            ObjectKind::I31 => crate::runtime::vm::PackedGranuleDomain::TI31,
             other => bail!("object kind {other:?} is not a persistent object granule"),
         };
         persist::PendingPublication::persistent_object(
@@ -1856,7 +1818,6 @@ impl ObjectTable {
         let values = match payload {
             ObjectPayload::Struct(fields) => fields.as_slice(),
             ObjectPayload::Array(elements) => elements.as_slice(),
-            ObjectPayload::I31(_) | ObjectPayload::Extern(_) | ObjectPayload::Func(_) => &[],
         };
         for value in values {
             let ObjectValue::Ref(Some(object_id)) = value else {
@@ -1899,14 +1860,6 @@ impl ObjectTable {
         if let Some(gc_ref) = self.object_to_gc_ref.remove(&object_id) {
             self.gc_ref_to_object.remove(&gc_ref);
         }
-        if let Some(raw_ref) = self.object_to_i31_ref.remove(&object_id) {
-            if self.i31_ref_to_object.get(&raw_ref) == Some(&object_id) {
-                self.i31_ref_to_object.remove(&raw_ref);
-            }
-        }
-        if let Some(func_ref) = self.object_to_func_ref.remove(&object_id) {
-            self.func_ref_to_object.remove(&func_ref);
-        }
         self.live_count = self
             .live_count
             .checked_sub(1)
@@ -1935,10 +1888,6 @@ impl ObjectTable {
         self.free_list.clear();
         self.gc_ref_to_object.clear();
         self.object_to_gc_ref.clear();
-        self.i31_ref_to_object.clear();
-        self.object_to_i31_ref.clear();
-        self.func_ref_to_object.clear();
-        self.object_to_func_ref.clear();
         self.next_version = 0;
         self.next_record_version = 0;
         self.live_count = 0;
@@ -2373,22 +2322,6 @@ fn default_type_layout_id_for_kind(kind: ObjectKind) -> TypeLayoutId {
         ObjectKind::I31 => TypeLayoutId::BUILTIN_I31,
         ObjectKind::Extern => TypeLayoutId::BUILTIN_EXTERN,
         ObjectKind::Func => TypeLayoutId::BUILTIN_FUNC,
-    }
-}
-
-fn default_durable_extern_identity() -> DurableExternIdentity {
-    DurableExternIdentity {
-        namespace: 0,
-        handle: 0,
-        type_layout_id: default_type_layout_id_for_kind(ObjectKind::Extern),
-    }
-}
-
-fn default_durable_func_identity() -> DurableFuncIdentity {
-    DurableFuncIdentity {
-        module_fingerprint: 0,
-        function_index: 0,
-        type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
     }
 }
 
@@ -4303,15 +4236,8 @@ impl TransactionState {
 
         let kind = object_table.kind(source)?;
         ensure!(
-            matches!(
-                kind,
-                ObjectKind::Struct
-                    | ObjectKind::Array
-                    | ObjectKind::I31
-                    | ObjectKind::Extern
-                    | ObjectKind::Func
-            ),
-            "transactional promotion currently supports struct, array, i31, extern, and func object payloads"
+            matches!(kind, ObjectKind::Struct | ObjectKind::Array),
+            "transactional promotion currently supports struct and array object payloads"
         );
         if matches!(kind, ObjectKind::Struct | ObjectKind::Array) {
             self.acquire_object_read(object_table, source)?;
@@ -4360,12 +4286,6 @@ impl TransactionState {
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(ObjectPayload::Array),
-            ObjectPayload::I31(_) => Ok(payload),
-            ObjectPayload::Extern(_) | ObjectPayload::Func(_) => {
-                bail!(
-                    "transactional promotion requires symbolic durable identity for function and external references"
-                )
-            }
         }
     }
 
@@ -4396,25 +4316,6 @@ impl TransactionState {
         )))
     }
 
-    fn promote_raw_i31_ref(
-        &mut self,
-        object_table: &mut ObjectTable,
-        raw_ref: u32,
-    ) -> Result<ObjectId> {
-        self.run_promotion_attempt(object_table, |state, object_table, attempt| {
-            state.ensure_active()?;
-            if let Some(promoted) = state.promoted_i31_refs.get(&raw_ref).copied() {
-                return Ok(promoted);
-            }
-            let source = object_table.object_id_for_raw_i31_ref(u64::from(raw_ref))?;
-            let promoted =
-                state.promote_transaction_object_graph_in_attempt(object_table, source, attempt)?;
-            state.promoted_i31_refs.insert(raw_ref, promoted);
-            attempt.record_promoted_raw_i31_ref(raw_ref);
-            Ok(promoted)
-        })
-    }
-
     fn persistent_object_id_for_gc_ref_after_promotion(
         &mut self,
         object_table: &mut ObjectTable,
@@ -4432,7 +4333,7 @@ impl TransactionState {
                 .map(Some);
         }
         if ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
-            return self.promote_raw_i31_ref(object_table, gc_ref).map(Some);
+            return Ok(None);
         }
         bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
     }
@@ -4462,15 +4363,7 @@ impl TransactionState {
             return Ok(Some(promoted));
         }
         if ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
-            let object_id = self
-                .promoted_i31_refs
-                .get(&gc_ref)
-                .copied()
-                .with_context(|| {
-                    format!("raw i31 GC ref {gc_ref:#x} was not promoted before commit")
-                })
-                .context(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED)?;
-            return Ok(Some(object_id));
+            return Ok(None);
         }
         bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
     }
@@ -4526,7 +4419,6 @@ impl TransactionState {
         self.ensure_active()?;
 
         let initial_promoted_objects = self.promoted_objects.len();
-        let initial_promoted_i31_refs = self.promoted_i31_refs.len();
         let initial_staged_object_count = self.staged_objects.len();
         let mut changed = false;
 
@@ -4567,7 +4459,6 @@ impl TransactionState {
 
         Ok(changed
             || self.promoted_objects.len() != initial_promoted_objects
-            || self.promoted_i31_refs.len() != initial_promoted_i31_refs
             || self.staged_objects.len() != initial_staged_object_count)
     }
 
@@ -5319,7 +5210,6 @@ impl TransactionState {
             original_table_elements: mem::take(&mut self.original_table_elements),
             staged_objects: mem::take(&mut self.staged_objects),
             promoted_objects: mem::take(&mut self.promoted_objects),
-            promoted_i31_refs: mem::take(&mut self.promoted_i31_refs),
             allocated_objects: mem::take(&mut self.allocated_objects),
             read_granules: mem::take(&mut self.read_granules),
             write_granules: mem::take(&mut self.write_granules),
@@ -5337,7 +5227,6 @@ impl TransactionState {
         self.original_table_elements = workspace.original_table_elements;
         self.staged_objects = workspace.staged_objects;
         self.promoted_objects = workspace.promoted_objects;
-        self.promoted_i31_refs = workspace.promoted_i31_refs;
         self.allocated_objects = workspace.allocated_objects;
         self.read_granules = workspace.read_granules;
         self.write_granules = workspace.write_granules;
@@ -5432,20 +5321,8 @@ impl TransactionState {
         self.promoted_objects.get(&source).copied()
     }
 
-    fn promoted_i31_ref_for_test(&self, raw_ref: u32) -> Option<ObjectId> {
-        self.promoted_i31_refs.get(&raw_ref).copied()
-    }
-
     fn staged_object_payload_for_test(&self, object_id: ObjectId) -> Option<&ObjectPayload> {
         self.staged_objects.get(&object_id)
-    }
-
-    fn promote_raw_i31_ref_for_test(
-        &mut self,
-        object_table: &mut ObjectTable,
-        raw_ref: u32,
-    ) -> Result<ObjectId> {
-        self.promote_raw_i31_ref(object_table, raw_ref)
     }
 
     fn allocated_object_count_for_test(&self) -> usize {
@@ -8798,45 +8675,34 @@ mod tests {
     }
 
     #[test]
-    fn object_table_scalar_allocations_use_builtin_layout_ids() {
+    fn object_table_rejects_inline_value_kind_allocations() {
         let mut objects = ObjectTable::default();
 
-        let i31_object = objects.allocate(ObjectKind::I31).unwrap();
-        let extern_object = objects.allocate(ObjectKind::Extern).unwrap();
-        let func_object = objects.allocate(ObjectKind::Func).unwrap();
+        for kind in [ObjectKind::I31, ObjectKind::Extern, ObjectKind::Func] {
+            let err = objects.allocate(kind).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("durable values, not object-table payloads"),
+                "{err:?}"
+            );
+        }
+        assert_eq!(objects.live_count(), 0);
+    }
 
-        let i31_handle = objects.current_record_handle_for_test(i31_object).unwrap();
-        let extern_handle = objects
-            .current_record_handle_for_test(extern_object)
-            .unwrap();
-        let func_handle = objects.current_record_handle_for_test(func_object).unwrap();
+    #[test]
+    fn object_id_for_raw_ref_or_func_rejects_unknown_function_ref_without_durable_identity() {
+        let mut objects = ObjectTable::default();
+        let raw_ref = u64::from(u32::MAX) + 2;
 
-        assert_eq!(
-            objects.live_slot(i31_object).unwrap().type_layout_id,
-            type_layout::TypeLayoutId::BUILTIN_I31.get()
-        );
-        assert_eq!(
-            objects.heap.header(i31_handle).unwrap().type_layout_id,
-            type_layout::TypeLayoutId::BUILTIN_I31.get()
-        );
+        let err = objects.object_id_for_raw_ref_or_func(raw_ref).unwrap_err();
 
-        assert_eq!(
-            objects.live_slot(extern_object).unwrap().type_layout_id,
-            type_layout::TypeLayoutId::BUILTIN_EXTERN.get()
+        assert!(
+            err.to_string().contains(
+                "transactional function reference promotion requires durable function identity"
+            ),
+            "{err:?}"
         );
-        assert_eq!(
-            objects.heap.header(extern_handle).unwrap().type_layout_id,
-            type_layout::TypeLayoutId::BUILTIN_EXTERN.get()
-        );
-
-        assert_eq!(
-            objects.live_slot(func_object).unwrap().type_layout_id,
-            type_layout::TypeLayoutId::BUILTIN_FUNC.get()
-        );
-        assert_eq!(
-            objects.heap.header(func_handle).unwrap().type_layout_id,
-            type_layout::TypeLayoutId::BUILTIN_FUNC.get()
-        );
+        assert_eq!(objects.live_count(), 0);
     }
 
     #[test]
@@ -8926,7 +8792,18 @@ mod tests {
 
     #[test]
     fn transaction_object_abi_roundtrips_object_values() {
+        let func = DurableFuncIdentity {
+            module_fingerprint: 0x10_20_30_40_50_60_70_80,
+            function_index: 7,
+            type_layout_id: type_layout::TypeLayoutId::BUILTIN_FUNC,
+        };
+        let extern_ = DurableExternIdentity {
+            namespace: 4,
+            handle: 0xabc,
+            type_layout_id: type_layout::TypeLayoutId::BUILTIN_EXTERN,
+        };
         let values = [
+            ObjectValue::I31(-17),
             ObjectValue::I32(-17),
             ObjectValue::I64(-18),
             ObjectValue::F32(0x7fc0_0001),
@@ -8934,6 +8811,8 @@ mod tests {
             ObjectValue::V128([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
             ObjectValue::Ref(None),
             ObjectValue::Ref(Some(ObjectId { object_index: 8 })),
+            ObjectValue::FuncRef(func),
+            ObjectValue::ExternRef(extern_),
         ];
 
         for value in values {
@@ -8975,6 +8854,15 @@ mod tests {
             error
                 .to_string()
                 .contains("non-canonical i32 object value ABI payload")
+        );
+
+        let error =
+            ObjectValueAbi::from_parts(OBJECT_VALUE_ABI_TAG_I31, u64::from(I31Value::MASK) + 1, 0)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("non-canonical i31 object value ABI payload")
         );
 
         let error = ObjectValueAbi::from_parts(OBJECT_VALUE_ABI_TAG_REF, 0, 1).unwrap_err();
@@ -9635,8 +9523,6 @@ mod tests {
 
             assert!(recovered.rebuilt.gc_ref_to_object.is_empty());
             assert!(recovered.rebuilt.object_to_gc_ref.is_empty());
-            assert!(recovered.rebuilt.func_ref_to_object.is_empty());
-            assert!(recovered.rebuilt.object_to_func_ref.is_empty());
             assert_eq!(recovered.rebuilt.live_count(), 2);
             assert_eq!(
                 recovered.rebuilt.payload(target).unwrap(),
@@ -12974,8 +12860,6 @@ mod tests {
         objects.free_list.clear();
         objects.gc_ref_to_object.clear();
         objects.object_to_gc_ref.clear();
-        objects.func_ref_to_object.clear();
-        objects.object_to_func_ref.clear();
         objects.next_version = 0;
         objects.live_count = 0;
 
@@ -13018,8 +12902,6 @@ mod tests {
         );
         assert!(objects.gc_ref_to_object.is_empty());
         assert!(objects.object_to_gc_ref.is_empty());
-        assert!(objects.func_ref_to_object.is_empty());
-        assert!(objects.object_to_func_ref.is_empty());
         assert_eq!(
             objects.kind(ObjectId { object_index: 41 }).unwrap(),
             ObjectKind::Struct
@@ -13667,10 +13549,33 @@ mod tests {
         }
 
         #[test]
-        fn promotion_promotes_i31_scalar_to_persistent_object_id() {
+        fn promotion_preserves_inline_durable_values_inside_payload() {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
-            let source = objects.allocate_payload(ObjectPayload::I31(-17)).unwrap();
+            let func = DurableFuncIdentity {
+                module_fingerprint: 0x724,
+                function_index: 1,
+                type_layout_id: type_layout::TypeLayoutId::BUILTIN_FUNC,
+            };
+            let extern_ = DurableExternIdentity {
+                namespace: 7,
+                handle: 0x726,
+                type_layout_id: type_layout::TypeLayoutId::BUILTIN_EXTERN,
+            };
+            let payload = ObjectPayload::Struct(vec![
+                ObjectValue::I31(-17),
+                ObjectValue::FuncRef(func),
+                ObjectValue::ExternRef(extern_),
+            ]);
+            let source = objects
+                .allocate_struct_for_gc_ref(
+                    0x724,
+                    match &payload {
+                        ObjectPayload::Struct(fields) => fields.clone(),
+                        ObjectPayload::Array(_) => unreachable!(),
+                    },
+                )
+                .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(724));
 
             let promoted = state
@@ -13679,55 +13584,10 @@ mod tests {
 
             assert_ne!(promoted, source);
             assert!(objects.is_persistent(promoted).unwrap());
+            assert_eq!(state.allocated_object_count_for_test(), 1);
             assert_eq!(
                 state.staged_object_payload_for_test(promoted).unwrap(),
-                &ObjectPayload::I31(-17)
-            );
-        }
-
-        #[test]
-        fn promotion_rejects_func_source_with_symbolic_identity_error() {
-            clear_current_thread_transaction_for_test();
-            let mut objects = ObjectTable::default();
-            let source = objects
-                .allocate_payload(ObjectPayload::Func(DurableFuncIdentity {
-                    module_fingerprint: 0x725,
-                    function_index: 1,
-                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
-                }))
-                .unwrap();
-            let mut state = TransactionState::new_for_test(TransactionId::from_raw(725));
-
-            let err = state
-                .promote_transaction_object_graph_for_test(&mut objects, source)
-                .unwrap_err();
-
-            assert_eq!(
-                err.to_string(),
-                "transactional promotion requires symbolic durable identity for function and external references"
-            );
-        }
-
-        #[test]
-        fn promotion_rejects_extern_source_with_symbolic_identity_error() {
-            clear_current_thread_transaction_for_test();
-            let mut objects = ObjectTable::default();
-            let source = objects
-                .allocate_payload(ObjectPayload::Extern(DurableExternIdentity {
-                    namespace: 7,
-                    handle: 0x726,
-                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Extern),
-                }))
-                .unwrap();
-            let mut state = TransactionState::new_for_test(TransactionId::from_raw(726));
-
-            let err = state
-                .promote_transaction_object_graph_for_test(&mut objects, source)
-                .unwrap_err();
-
-            assert_eq!(
-                err.to_string(),
-                "transactional promotion requires symbolic durable identity for function and external references"
+                &payload
             );
         }
 
@@ -13738,13 +13598,7 @@ mod tests {
             let good_child = objects
                 .allocate_struct_for_gc_ref(0x727, vec![ObjectValue::I32(1)])
                 .unwrap();
-            let bad_child = objects
-                .allocate_payload(ObjectPayload::Func(DurableFuncIdentity {
-                    module_fingerprint: 0x727,
-                    function_index: 2,
-                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
-                }))
-                .unwrap();
+            let bad_child = ObjectId { object_index: 999 };
             let parent = objects
                 .allocate_struct_for_gc_ref(
                     0x728,
@@ -13763,64 +13617,13 @@ mod tests {
 
             assert_eq!(
                 err.to_string(),
-                "transactional promotion requires symbolic durable identity for function and external references"
+                "object table slot is not live: ObjectId { object_index: 999 }"
             );
             assert_eq!(state.promoted_object_for_test(parent), None);
             assert_eq!(state.promoted_object_for_test(good_child), None);
             assert_eq!(state.promoted_object_for_test(bad_child), None);
             assert_eq!(state.allocated_object_count_for_test(), 0);
             assert_eq!(objects.live_count(), initial_live_count);
-        }
-
-        #[test]
-        fn direct_unsupported_promotion_keeps_allocated_object_bookkeeping_unchanged() {
-            clear_current_thread_transaction_for_test();
-            let mut objects = ObjectTable::default();
-            let func = objects
-                .allocate_payload(ObjectPayload::Func(DurableFuncIdentity {
-                    module_fingerprint: 0x729,
-                    function_index: 3,
-                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Func),
-                }))
-                .unwrap();
-            let extern_ = objects
-                .allocate_payload(ObjectPayload::Extern(DurableExternIdentity {
-                    namespace: 8,
-                    handle: 0x72a,
-                    type_layout_id: default_type_layout_id_for_kind(ObjectKind::Extern),
-                }))
-                .unwrap();
-            let mut state = TransactionState::new_for_test(TransactionId::from_raw(729));
-
-            assert_eq!(state.allocated_object_count_for_test(), 0);
-            state
-                .promote_transaction_object_graph_for_test(&mut objects, func)
-                .unwrap_err();
-            assert_eq!(state.allocated_object_count_for_test(), 0);
-            state
-                .promote_transaction_object_graph_for_test(&mut objects, extern_)
-                .unwrap_err();
-            assert_eq!(state.allocated_object_count_for_test(), 0);
-        }
-
-        #[test]
-        fn promote_raw_i31_ref_dedupes_to_one_persistent_object() {
-            clear_current_thread_transaction_for_test();
-            let mut objects = ObjectTable::default();
-            let raw_ref = u32::try_from(ObjectTable::encode_raw_i31_ref(-19)).unwrap();
-            let mut state = TransactionState::new_for_test(TransactionId::from_raw(730));
-
-            let first = state
-                .promote_raw_i31_ref_for_test(&mut objects, raw_ref)
-                .unwrap();
-            let second = state
-                .promote_raw_i31_ref_for_test(&mut objects, raw_ref)
-                .unwrap();
-
-            assert_eq!(first, second);
-            assert_eq!(state.promoted_i31_ref_for_test(raw_ref), Some(first));
-            assert_eq!(state.allocated_object_count_for_test(), 1);
-            assert!(objects.is_persistent(first).unwrap());
         }
 
         #[test]
@@ -13890,7 +13693,7 @@ mod tests {
         }
 
         #[test]
-        fn root_delta_promotes_i31_gc_ref_immediate() {
+        fn root_delta_ignores_inline_i31_gc_ref_immediate() {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();
             let raw_i31 = ObjectTable::encode_raw_i31_ref(19) as u32;
@@ -13903,9 +13706,8 @@ mod tests {
                 .promote_persistent_references_before_commit(&mut objects)
                 .unwrap();
             let delta = state.staged_persistent_root_delta(&objects).unwrap();
-            let promoted = state.promoted_i31_ref_for_test(raw_i31).unwrap();
 
-            assert_eq!(
+            assert!(
                 delta
                     .roots
                     .get(&PersistentRootKey::Global {
@@ -13913,12 +13715,8 @@ mod tests {
                         global_index: 0
                     })
                     .cloned()
-                    .unwrap(),
-                object_set([promoted])
-            );
-            assert_eq!(
-                state.staged_object_payload_for_test(promoted).unwrap(),
-                &ObjectPayload::I31(19)
+                    .unwrap_or_default()
+                    .is_empty()
             );
         }
 
@@ -14023,115 +13821,52 @@ mod tests {
                 .unwrap();
 
             let promoted_object = state.promoted_object_for_test(source).unwrap();
-            let promoted_i31 = state.promoted_i31_ref_for_test(raw_i31).unwrap();
 
-            assert_eq!(state.allocated_object_count_for_test(), 2);
+            assert_eq!(state.allocated_object_count_for_test(), 1);
             assert!(
                 state
                     .staged_object_payload_for_test(promoted_object)
                     .is_some()
             );
-            assert!(state.staged_object_payload_for_test(promoted_i31).is_some());
 
             state.abort_allocated_objects(&mut objects).unwrap();
 
             assert_eq!(state.active_transaction(), None);
             assert_eq!(state.promoted_object_for_test(source), None);
-            assert_eq!(state.promoted_i31_ref_for_test(raw_i31), None);
             assert!(
                 state
                     .staged_object_payload_for_test(promoted_object)
                     .is_none()
             );
-            assert!(state.staged_object_payload_for_test(promoted_i31).is_none());
             assert_eq!(state.allocated_object_count_for_test(), 0);
             assert!(objects.kind(promoted_object).is_err());
-            assert!(objects.kind(promoted_i31).is_err());
         }
     }
 
-    mod ti31_persistent_object_domain {
+    mod inline_durable_reference_values {
         use super::*;
 
         #[test]
-        fn i31_pending_publication_uses_ti31_domain() {
-            let mut objects = ObjectTable::default();
-            let object = objects.allocate_payload(ObjectPayload::I31(-7)).unwrap();
-
-            let pub_ = objects.object_pending_publication(object).unwrap();
-            let (domain, object_id) =
-                crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
-
-            assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TI31);
-            assert_eq!(object_id, object.object_index);
-            assert_eq!(
-                pub_.kind,
-                crate::runtime::vm::PackedGranuleDomain::TI31 as u16
-            );
-        }
-
-        #[test]
-        fn committed_ti31_publication_recovers_i31_payload() {
-            let mut objects = ObjectTable::default();
-            let object = objects.allocate_payload(ObjectPayload::I31(-7)).unwrap();
-            let publication = objects.pending_publication_for_test(object).unwrap();
-
-            let recovered_region =
-                recover_file_backed_object_without_layout_metadata_for_test(&publication).unwrap();
-            let winners = recovered_region.committed_object_winners().unwrap();
-
-            assert_eq!(winners.len(), 1);
-            assert_eq!(winners[0].object_id, object.object_index);
-            assert_eq!(winners[0].kind, ObjectKind::I31 as u16);
-
-            let mut rebuilt = ObjectTable::default();
-            rebuilt
-                .rebuild_from_recovery_for_test(&recovered_region.type_layouts, &winners)
-                .unwrap();
-            assert_eq!(
-                rebuilt
-                    .payload(ObjectId {
-                        object_index: object.object_index
-                    })
-                    .unwrap(),
-                ObjectPayload::I31(-7)
-            );
-        }
-
-        #[test]
-        fn durable_func_identity_round_trips_through_object_payload() {
-            let identity = DurableFuncIdentity {
+        fn inline_i31_func_and_extern_values_round_trip_through_struct_payload() {
+            let func = DurableFuncIdentity {
                 module_fingerprint: 0x10_20_30_40_50_60_70_80,
                 function_index: 7,
-                type_layout_id: type_layout::TypeLayoutId::new(3).unwrap(),
+                type_layout_id: type_layout::TypeLayoutId::BUILTIN_FUNC,
             };
-            let payload = ObjectPayload::Func(identity);
-            let encoded = encode_object_record_for_test(
-                9,
-                1,
-                default_type_layout_id_for_kind(ObjectKind::Func).get(),
-                &payload,
-            )
-            .unwrap();
-
-            let mut heap = object_heap::ObjectHeap::default();
-            let handle = heap.install_record_bytes(&encoded).unwrap();
-
-            assert_eq!(heap.payload(handle).unwrap(), &payload);
-        }
-
-        #[test]
-        fn durable_extern_identity_round_trips_through_object_payload() {
-            let identity = DurableExternIdentity {
+            let extern_ = DurableExternIdentity {
                 namespace: 4,
                 handle: 0xabc,
-                type_layout_id: type_layout::TypeLayoutId::new(8).unwrap(),
+                type_layout_id: type_layout::TypeLayoutId::BUILTIN_EXTERN,
             };
-            let payload = ObjectPayload::Extern(identity);
+            let payload = ObjectPayload::Struct(vec![
+                ObjectValue::I31(-7),
+                ObjectValue::FuncRef(func),
+                ObjectValue::ExternRef(extern_),
+            ]);
             let encoded = encode_object_record_for_test(
                 10,
                 1,
-                default_type_layout_id_for_kind(ObjectKind::Extern).get(),
+                type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
                 &payload,
             )
             .unwrap();
@@ -14140,6 +13875,20 @@ mod tests {
             let handle = heap.install_record_bytes(&encoded).unwrap();
 
             assert_eq!(heap.payload(handle).unwrap(), &payload);
+        }
+
+        #[test]
+        fn inline_value_object_kinds_are_rejected_as_standalone_objects() {
+            let mut objects = ObjectTable::default();
+
+            for kind in [ObjectKind::I31, ObjectKind::Func, ObjectKind::Extern] {
+                let err = objects.allocate(kind).unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("durable values, not object-table payloads"),
+                    "{err:?}"
+                );
+            }
         }
     }
 

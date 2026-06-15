@@ -42,12 +42,13 @@ The executable runtime core includes:
 The persistent object direction adds:
 
 - `ObjectId` as the runtime identity for persistent transactional objects.
-- `ObjectId` as the persistent identity for transactional function objects and
-  persistent function references.
 - A persistent transactional object heap separate from ordinary Wasmtime GC.
 - A volatile object table/index that is rebuilt from committed object log
   winners during recovery, rather than a persisted object-table log.
 - Backend object records with explicit object headers.
+- Inline durable reference values for `ti31`, `tfuncref`, and `texternref`
+  inside persistent struct fields and array elements. These are not object-table
+  payloads and do not allocate standalone `ObjectId`s.
 - Zen-style fixed-size transaction log entries plus append-only variable data
   records for `tmemory`, globals, tables, and object records.
 - Commit-time promotion from transaction-local volatile objects into persistent
@@ -610,15 +611,17 @@ The runtime identity split is:
 ordinary volatile object runtime identity = VMGcRef
 persistent object runtime identity        = ObjectId
 ordinary Wasmtime function metadata       = FuncIndex / compiled code handles
-persistent transactional function identity = ObjectId
+persistent transactional function ref      = durable symbolic function identity
+persistent transactional external ref      = durable symbolic external identity
 ```
 
-`ObjectId` is used at runtime only for persistent transactional objects. It is
-the durable object identity stored in object headers and the object granule used
-for transaction conflicts. `VMGcRef` remains the handle for ordinary Wasmtime GC
-objects and must not become the persistent object identity because it is
-collector-owned, may require rooting and barriers, may move under a moving
-collector, and can encode immediate `i31ref` values that are not heap records.
+`ObjectId` is used at runtime only for persistent transactional heap objects
+that have durable object records. It is the durable object identity stored in
+object headers and the object granule used for transaction conflicts. `VMGcRef`
+remains the handle for ordinary Wasmtime GC objects and must not become the
+persistent object identity because it is collector-owned, may require rooting
+and barriers, may move under a moving collector, and can encode immediate
+`i31ref` values that are not heap records.
 
 Transactional references should end as `ObjectId`-carrying runtime values, not
 ordinary GC references backed by a durable side table. The current branch still
@@ -626,13 +629,21 @@ uses a volatile Wasmtime-compatible `VMGcRef -> ObjectId` bridge for some parser
 lowering, and ABI paths. That bridge is process-local scaffolding only: the
 semantic identity of a persistent `tref` is `ObjectId`.
 
-The same rule applies to transactional function references. Wasmtime
-`FuncIndex`, `VMFuncRef`, and compiled-code handles identify executable code
-inside the current process/module, but they are not persistent identity. A
-persistent transactional function reference is a function object table entry
-identified by `ObjectId`; its payload may point to module/function metadata,
-signature metadata, and compiled entry stubs, but the stable reference stored in
-persistent objects, roots, tables, and transaction workspaces is the `ObjectId`.
+`ti31`, `tfuncref`, and `texternref` are not persistent heap objects in the
+current design. They are inline durable values that can appear inside
+persistent struct fields and array elements:
+
+- `ti31` stores the scalar immediate directly.
+- `tfuncref` stores a durable symbolic function identity such as module
+  fingerprint, function index, and layout id.
+- `texternref` stores a durable symbolic external identity such as namespace,
+  handle, and layout id.
+
+These values do not allocate object-table slots and do not participate in
+object-granule locking. If a later design needs first-class persistent
+function/external wrapper objects, that must be introduced as an explicit
+object kind rather than by implicitly allocating `Func`, `Extern`, or `I31`
+payload records.
 
 Persistent object records live in `ObjectHeapRegion` and are reached through the
 volatile object table/index rebuilt at startup:
@@ -666,8 +677,11 @@ struct TxArrayHeader {
 }
 ```
 
-The `kind` field identifies the persistent object payload kind, such as struct,
-array, external object wrapper, or future persistent runtime object kinds.
+The `kind` field identifies the persistent object payload kind. The current
+recoverable object-table payloads are `Struct` and `Array`; future persistent
+runtime wrapper objects may add more explicit kinds. Inline durable values such
+as `ti31`, `tfuncref`, and `texternref` are encoded in struct/array payload
+slots rather than as object records.
 `version` is the durable object-record version used by log recovery.
 `type_layout_id` points at durable trace metadata in region metadata space. It
 is not the Wasmtime type identity used for validation or casts. Wasmtime module
@@ -687,8 +701,8 @@ The registry is keyed by nonzero `TypeLayoutId`s and contains:
   field index, payload offset, value size, and scalar/object-reference kind.
 - `Array` layouts: deterministic fingerprint, element size, and scalar or
   object-reference element kind.
-- `Scalar` layouts for built-in persistent `i31`, extern, and function-object
-  cases.
+- Built-in scalar/reference slot encodings for inline `ti31`, durable function
+  identities, and durable external identities.
 
 The durable transaction data header still has a generic `type_info` wire field,
 but object publication APIs map that field to `type_layout_id` at the runtime
@@ -704,24 +718,26 @@ durable roots -> ObjectId graph -> persistent object records
 
 Committed persistent payloads must not contain raw `VMGcRef`s, process-local
 pointers, or PMEM addresses to other objects. Persistent object fields and array
-elements store `ObjectId` references for persistent refs, plus scalars, nulls,
-and supported immediate values.
+elements store `ObjectId` references for persistent heap-object refs, plus
+scalars, nulls, `ti31` immediates, and durable symbolic function/external
+references.
 
 Volatile ordinary objects may refer to persistent objects only as short-lived
 transaction-local values. A committed persistent object graph cannot depend on an
 ordinary volatile GC object. The first implemented promotion wave covers
 transaction-mirrored volatile `tstruct`/`tarray` objects that already have
-`ObjectTable` payloads and raw `ti31` immediates. During commit, if a staged
-persistent root or persistent object payload refers to one of those values, the
-commit path promotes it into the persistent object space first and stores the
-promoted `ObjectId`. The source `VMGcRef` and its transaction-local object-table
-association remain volatile runtime wrappers; the durable identity is the new
-persistent `ObjectId` stored in object records and root publications.
+`ObjectTable` payloads. During commit, if a staged persistent root or
+persistent object payload refers to one of those objects, the commit path
+promotes it into the persistent object space first and stores the promoted
+`ObjectId`. Inline `ti31`, durable function, and durable external references
+inside those payloads are preserved as values and do not allocate promoted
+objects. The source `VMGcRef` and its transaction-local object-table association
+remain volatile runtime wrappers; the durable identity is the new persistent
+`ObjectId` stored in object records and root publications.
 
 Promotion is graph-based:
 
 - Maintain a transaction-local `VMGcRef` to `ObjectId` promotion map.
-- Maintain a transaction-local raw `ti31` immediate to `ObjectId` promotion map.
 - Reuse the same promoted `ObjectId` when the same volatile object is encountered
   multiple times.
 - Reserve `ObjectId`s before filling payload records so cyclic volatile graphs
@@ -732,12 +748,12 @@ Promotion is graph-based:
   before commit applies live memory/global/table/object mutations.
 - Abort the transaction if a value cannot be promoted into the persistent object
   format. Arbitrary ordinary Wasmtime GC heap objects remain rejected until a
-  GC-heap introspection adapter exists. `tfuncref` and `texternref` promotion
-  requires symbolic durable identities and is still deferred.
+  GC-heap introspection adapter exists. `tfuncref` and `texternref` values are
+  durable only when the runtime can encode their symbolic identities inline.
 
-After commit, persistent reachability contains only persistent roots and
-`ObjectId` references. Transaction abort discards uncommitted records and the
-promotion map.
+After commit, persistent reachability contains persistent roots, `ObjectId`
+heap-object edges, and inline durable scalar/reference leaves. Transaction
+abort discards uncommitted records and the promotion map.
 
 ## Persistent Object GC Strategy
 
@@ -1164,9 +1180,10 @@ design point, the remaining architecture work should proceed in this order:
    Wasmtime GC-heap introspection adapter for ordinary volatile GC objects.
 3. Replace volatile `VMGcRef -> ObjectId` bridges with the final
    `ObjectId`-carrying `tref` ABI for persistent references.
-4. Define transactional function objects so persistent `tfunc` and function
-   references use `ObjectId` identity while Wasmtime function indices remain
-   payload metadata.
+4. Finish durable symbolic identity encoders for `tfuncref` and `texternref`
+   inline values. First-class persistent function/external wrapper objects
+   remain a separate future design and must not be implied by raw ref
+   promotion.
 5. Complete runtime reintegration for recovered `tglobal` and `ttable`
    reference-bearing roots. Recovery already reconstructs root `ObjectId`s from
    committed `TGlobal`/`TTable` winners, but the recovered roots still need to

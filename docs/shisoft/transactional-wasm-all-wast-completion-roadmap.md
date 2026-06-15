@@ -210,7 +210,8 @@ Implement:
 
 - `ObjectTable` with dense stable `ObjectId` allocation, freelist reuse, live
   slot lookup, update, free, and per-slot version metadata.
-- object kind metadata for `TStruct`, `TArray`, `TI31`, `TExtern`, and `TFunc`.
+- object kind metadata for `TStruct` and `TArray`, with `ti31`, `tfuncref`,
+  and `texternref` encoded as inline durable values inside object payloads.
 - object granule helper methods that map object slots to
   `GranuleId::TStruct` and `GranuleId::TArray` for permission and conflict
   acquisition.

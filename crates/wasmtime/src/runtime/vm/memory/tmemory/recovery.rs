@@ -329,7 +329,6 @@ fn object_domain_matches_object_kind(domain: PackedGranuleDomain, object_kind: u
     match domain {
         PackedGranuleDomain::TStruct => object_kind == ObjectKind::Struct as u16,
         PackedGranuleDomain::TArray => object_kind == ObjectKind::Array as u16,
-        PackedGranuleDomain::TI31 => object_kind == ObjectKind::I31 as u16,
         _ => false,
     }
 }

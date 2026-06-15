@@ -1,7 +1,7 @@
 use super::type_layout::{PersistentTypeLayout, TraceSlotKind};
 use super::{
-    DurableExternIdentity, DurableFuncIdentity, OBJECT_VALUE_ABI_TAG_REF, ObjectId, ObjectKind,
-    ObjectPayload, ObjectRefValue, ObjectValue, ObjectValueAbi,
+    OBJECT_VALUE_ABI_TAG_REF, ObjectId, ObjectKind, ObjectPayload, ObjectRefValue, ObjectValue,
+    ObjectValueAbi,
 };
 use crate::prelude::*;
 #[cfg(test)]
@@ -254,9 +254,6 @@ impl ObjectHeap {
                 element_kind: trace_array_element_kind(elements),
                 length: record.array_length.unwrap_or(0),
             }),
-            ObjectPayload::I31(_) | ObjectPayload::Extern(_) | ObjectPayload::Func(_) => {
-                TraceDescriptor::Scalar
-            }
         })
     }
 
@@ -268,14 +265,16 @@ impl ObjectHeap {
                 .filter_map(|value| match value {
                     ObjectValue::Ref(Some(object_id)) => Some(*object_id),
                     ObjectValue::Ref(None)
+                    | ObjectValue::I31(_)
                     | ObjectValue::I32(_)
                     | ObjectValue::I64(_)
                     | ObjectValue::F32(_)
                     | ObjectValue::F64(_)
-                    | ObjectValue::V128(_) => None,
+                    | ObjectValue::V128(_)
+                    | ObjectValue::FuncRef(_)
+                    | ObjectValue::ExternRef(_) => None,
                 })
                 .collect(),
-            ObjectPayload::I31(_) | ObjectPayload::Extern(_) | ObjectPayload::Func(_) => Vec::new(),
         })
     }
 
@@ -464,8 +463,6 @@ fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Res
                 * u64::try_from(OBJECT_VALUE_RECORD_LEN)
                     .context("object value ABI size does not fit u64")?
         }
-        ObjectPayload::I31(_) => 4,
-        ObjectPayload::Extern(_) | ObjectPayload::Func(_) => 16,
     };
     let header_len = u64::try_from(header_len).context("record header length overflow")?;
     header_len
@@ -502,17 +499,6 @@ fn append_payload_bytes(bytes: &mut Vec<u8>, payload: &ObjectPayload) -> Result<
             for field in fields {
                 append_object_value_bytes(bytes, field)?;
             }
-        }
-        ObjectPayload::I31(value) => bytes.extend_from_slice(&value.to_le_bytes()),
-        ObjectPayload::Extern(value) => {
-            bytes.extend_from_slice(&value.namespace.to_le_bytes());
-            bytes.extend_from_slice(&value.handle.to_le_bytes());
-            bytes.extend_from_slice(&value.type_layout_id.get().to_le_bytes());
-        }
-        ObjectPayload::Func(value) => {
-            bytes.extend_from_slice(&value.module_fingerprint.to_le_bytes());
-            bytes.extend_from_slice(&value.function_index.to_le_bytes());
-            bytes.extend_from_slice(&value.type_layout_id.get().to_le_bytes());
         }
     }
     Ok(())
@@ -560,39 +546,10 @@ fn decode_payload_bytes(
             ObjectPayload::Array(decode_object_values(payload_bytes)?)
         }
         x if x == ObjectKind::I31 as u16 => {
-            ensure!(
-                payload_bytes.len() == 4,
-                "serialized i31 payload length is invalid"
-            );
-            ObjectPayload::I31(i32::from_le_bytes(payload_bytes.try_into().unwrap()))
+            bail!("i31 values are encoded inline, not as object-table records")
         }
-        x if x == ObjectKind::Extern as u16 => {
-            ensure!(
-                payload_bytes.len() == 16,
-                "serialized extern payload length is invalid"
-            );
-            ObjectPayload::Extern(DurableExternIdentity {
-                namespace: u32::from_le_bytes(payload_bytes[0..4].try_into().unwrap()),
-                handle: u64::from_le_bytes(payload_bytes[4..12].try_into().unwrap()),
-                type_layout_id: super::type_layout::TypeLayoutId::new(u32::from_le_bytes(
-                    payload_bytes[12..16].try_into().unwrap(),
-                ))
-                .context("serialized extern payload type layout id cannot be zero")?,
-            })
-        }
-        x if x == ObjectKind::Func as u16 => {
-            ensure!(
-                payload_bytes.len() == 16,
-                "serialized func payload length is invalid"
-            );
-            ObjectPayload::Func(DurableFuncIdentity {
-                module_fingerprint: u64::from_le_bytes(payload_bytes[0..8].try_into().unwrap()),
-                function_index: u32::from_le_bytes(payload_bytes[8..12].try_into().unwrap()),
-                type_layout_id: super::type_layout::TypeLayoutId::new(u32::from_le_bytes(
-                    payload_bytes[12..16].try_into().unwrap(),
-                ))
-                .context("serialized func payload type layout id cannot be zero")?,
-            })
+        x if x == ObjectKind::Extern as u16 || x == ObjectKind::Func as u16 => {
+            bail!("function and external references are durable values, not object-table records")
         }
         _ => bail!(
             "unknown object kind tag in persistent record header: {}",
@@ -711,11 +668,14 @@ fn decode_object_ref_slot(bytes: &[u8]) -> Result<Option<ObjectId>> {
 fn trace_value_kind(value: &ObjectValue) -> TraceValueKind {
     match value {
         ObjectValue::Ref(_) => TraceValueKind::ObjectIdRef,
-        ObjectValue::I32(_)
+        ObjectValue::I31(_)
+        | ObjectValue::I32(_)
         | ObjectValue::I64(_)
         | ObjectValue::F32(_)
         | ObjectValue::F64(_)
-        | ObjectValue::V128(_) => TraceValueKind::Scalar,
+        | ObjectValue::V128(_)
+        | ObjectValue::FuncRef(_)
+        | ObjectValue::ExternRef(_) => TraceValueKind::Scalar,
     }
 }
 
@@ -755,12 +715,13 @@ fn logical_object_value_len(_value: &ObjectValue) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBJECT_VALUE_RECORD_LEN, ObjectId, ObjectKind, ObjectPayload, ObjectValue, TxObjectHeader,
-        encode_object_record, trace_object_refs_with_layout,
+        OBJECT_VALUE_RECORD_LEN, ObjectHeap, ObjectId, ObjectKind, ObjectPayload, ObjectValue,
+        TxObjectHeader, encode_object_record, trace_object_refs_with_layout,
     };
     use crate::runtime::transaction::type_layout::{
         PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId,
     };
+    use crate::runtime::transaction::{DurableExternIdentity, DurableFuncIdentity};
     use alloc::string::ToString;
     use alloc::vec::Vec;
 
@@ -799,6 +760,22 @@ mod tests {
         bytes
     }
 
+    fn durable_func_identity(layout_id: u32) -> DurableFuncIdentity {
+        DurableFuncIdentity {
+            module_fingerprint: 0x10_20_30_40_50_60_70_80,
+            function_index: 7,
+            type_layout_id: TypeLayoutId::new(layout_id).unwrap(),
+        }
+    }
+
+    fn durable_extern_identity(layout_id: u32) -> DurableExternIdentity {
+        DurableExternIdentity {
+            namespace: 9,
+            handle: 0xab_cd_ef,
+            type_layout_id: TypeLayoutId::new(layout_id).unwrap(),
+        }
+    }
+
     #[test]
     fn object_record_header_uses_type_layout_id() {
         let record = encode_object_record(
@@ -812,6 +789,48 @@ mod tests {
         let header = TxObjectHeader::read_from_prefix(record.as_slice()).unwrap();
 
         assert_eq!(header.type_layout_id, 23);
+    }
+
+    #[test]
+    fn durable_func_value_round_trips_inside_struct_payload() {
+        let value = ObjectValue::FuncRef(durable_func_identity(5));
+        let record = encode_object_record(
+            7,
+            1,
+            ObjectKind::Struct as u16,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            &ObjectPayload::Struct(vec![value.clone()]),
+        )
+        .unwrap();
+
+        let mut heap = ObjectHeap::default();
+        let handle = heap.install_record_bytes(&record).unwrap();
+
+        assert_eq!(
+            heap.payload(handle).unwrap(),
+            &ObjectPayload::Struct(vec![value])
+        );
+    }
+
+    #[test]
+    fn durable_extern_value_round_trips_inside_struct_payload() {
+        let value = ObjectValue::ExternRef(durable_extern_identity(6));
+        let record = encode_object_record(
+            8,
+            1,
+            ObjectKind::Struct as u16,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            &ObjectPayload::Struct(vec![value.clone()]),
+        )
+        .unwrap();
+
+        let mut heap = ObjectHeap::default();
+        let handle = heap.install_record_bytes(&record).unwrap();
+
+        assert_eq!(
+            heap.payload(handle).unwrap(),
+            &ObjectPayload::Struct(vec![value])
+        );
     }
 
     #[test]

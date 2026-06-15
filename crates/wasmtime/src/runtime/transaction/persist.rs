@@ -148,9 +148,7 @@ impl PendingPublication {
         ensure!(
             matches!(
                 domain,
-                PackedGranuleDomain::TStruct
-                    | PackedGranuleDomain::TArray
-                    | PackedGranuleDomain::TI31
+                PackedGranuleDomain::TStruct | PackedGranuleDomain::TArray
             ),
             "persistent object publication domain must be a durable object domain"
         );
