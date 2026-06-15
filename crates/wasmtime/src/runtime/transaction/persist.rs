@@ -433,7 +433,7 @@ impl FileBackedTxDurableLog {
         if let Some(stream) = self.streams.get(&stream_id).copied() {
             return Ok(stream);
         }
-        let stream = self.region.alloc_stream(stream_id)?;
+        let stream = self.region.stream_cursor(stream_id);
         self.streams.insert(stream_id, stream);
         Ok(stream)
     }
@@ -1495,8 +1495,7 @@ mod tests {
 
     #[test]
     fn persistent_root_publication_encodes_global_object_id() {
-        let publication = PendingPublication::persistent_global_root(0, 7, [Some(41_u64)])
-            .unwrap();
+        let publication = PendingPublication::persistent_global_root(0, 7, [Some(41_u64)]).unwrap();
         assert_eq!(
             publication.logical_id,
             (PackedGranuleDomain::TGlobal as u64) << 60

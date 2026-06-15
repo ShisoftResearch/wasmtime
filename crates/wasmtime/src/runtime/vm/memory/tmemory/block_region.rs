@@ -957,6 +957,11 @@ impl VMemoryBlockRegion {
         Ok(StreamCursor { stream_id })
     }
 
+    pub(crate) fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
+        self.streams.entry(stream_id).or_default();
+        StreamCursor { stream_id }
+    }
+
     pub(crate) fn append_data_record(
         &mut self,
         stream: StreamCursor,
@@ -1792,6 +1797,11 @@ impl FileBackedMemoryBlockRegion {
         );
         self.streams.insert(stream_id, StreamState::default());
         Ok(StreamCursor { stream_id })
+    }
+
+    pub(crate) fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
+        self.streams.entry(stream_id).or_default();
+        StreamCursor { stream_id }
     }
 
     pub(crate) fn append_data_record(

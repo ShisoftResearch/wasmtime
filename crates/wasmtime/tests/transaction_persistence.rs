@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use tempfile::tempdir;
 
 use wasmtime::_internal::transaction_persistence::{
@@ -5,6 +7,7 @@ use wasmtime::_internal::transaction_persistence::{
     publish_committed_struct_object, publish_committed_tmemory_update,
     reopen_and_recover_file_backed_region,
 };
+use wasmtime::{Config, Engine, Instance, Module, Result, Store};
 
 #[test]
 fn file_backed_region_recovers_committed_tmemory_update() {
@@ -60,4 +63,82 @@ fn file_backed_region_recovers_object_rooted_by_global() {
     assert_eq!(recovered.object_winners.len(), 1);
     assert_eq!(recovered.object_winners[0].object_id, 41);
     assert_eq!(recovered.root_object_ids, vec![41]);
+}
+
+#[test]
+fn real_tfunc_root_publication_reopens_without_version_collision() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("real-root.tmemory");
+    let tx_log_path = dir.path().join("real-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = persistent_root_module(&engine)?;
+
+    call_publish_root(&engine, &module, &tmemory_path, &tx_log_path, true)?;
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids, vec![0]);
+
+    call_publish_root(&engine, &module, &tmemory_path, &tx_log_path, false)?;
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids, vec![0]);
+    let root_winner = recovered
+        .winners
+        .iter()
+        .find(|winner| winner.logical_id >> 60 == 3)
+        .expect("expected recovered tglobal root winner");
+    assert_eq!(root_winner.version, 2);
+
+    Ok(())
+}
+
+fn transaction_root_engine() -> Result<Engine> {
+    let mut config = Config::new();
+    config
+        .wasm_gc(true)
+        .wasm_reference_types(true)
+        .wasm_function_references(true)
+        .wasm_tail_call(true);
+    Engine::new(&config)
+}
+
+fn persistent_root_module(engine: &Engine) -> Result<Module> {
+    Module::new(
+        engine,
+        wat::parse_str(
+            r#"
+            (module
+              (type $s (tstruct (field (mut i32))))
+              (global $source (ref $s) (tstruct.new $s (i32.const 41)))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (global.get $source))))
+            "#,
+        )?,
+    )
+}
+
+fn call_publish_root(
+    engine: &Engine,
+    module: &Module,
+    tmemory_path: &Path,
+    tx_log_path: &Path,
+    create: bool,
+) -> Result<()> {
+    let mut store = Store::new(engine, ());
+    if create {
+        wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+            &mut store,
+            tmemory_path.to_path_buf(),
+            tx_log_path.to_path_buf(),
+            64,
+        )?;
+    } else {
+        wasmtime::_internal::transaction_persistence::open_file_backed_storage_for_test(
+            &mut store,
+            tmemory_path.to_path_buf(),
+            tx_log_path.to_path_buf(),
+        )?;
+    }
+    let instance = Instance::new(&mut store, module, &[])?;
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())
 }

@@ -83,7 +83,7 @@ use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
 use crate::runtime::transaction::{
-    ObjectTable, TMemoryBackend, TransactionConfig, TransactionState,
+    ObjectId, ObjectTable, TMemoryBackend, TransactionConfig, TransactionState,
 };
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
@@ -1685,6 +1685,19 @@ impl StoreOpaque {
         tx_log_path: PathBuf,
     ) -> Result<()> {
         let config = TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path)?;
+        let recovered =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region(&tx_log_path)?;
+        let recovered_roots = recovered
+            .root_object_ids
+            .iter()
+            .copied()
+            .map(|object_index| ObjectId { object_index });
+        let recovered_versions = recovered
+            .winners
+            .iter()
+            .map(|winner| (winner.logical_id, winner.version));
+        self.transaction_state
+            .install_recovered_persistent_root_state(recovered_roots, recovered_versions)?;
         self.transaction_state
             .open_file_backed_durable_log(&tx_log_path)?;
         self.transaction_config = config;

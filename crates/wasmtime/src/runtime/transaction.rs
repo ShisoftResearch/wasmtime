@@ -2,7 +2,7 @@
 
 use crate::prelude::*;
 use crate::runtime::store::InstanceId;
-use crate::runtime::vm::TMemory;
+use crate::runtime::vm::{PackedGranuleDomain, TMemory};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::{cell::Cell, mem, ops::Range};
@@ -4155,13 +4155,16 @@ impl TransactionState {
                 .checked_add(1)
                 .context("persistent root publication version overflow")?;
             match key {
-                PersistentRootKey::Global { global_index, .. } => {
+                PersistentRootKey::Global {
+                    instance,
+                    global_index,
+                } => {
                     let roots = roots
                         .iter()
                         .map(|root| Some(root.object_index))
                         .chain(roots.is_empty().then_some(None));
                     publications.push(persist::PendingPublication::persistent_global_root(
-                        u64::from(global_index),
+                        pack_persistent_global_root_index(instance, global_index)?,
                         version,
                         roots,
                     )?);
@@ -4313,6 +4316,47 @@ impl TransactionState {
             .values()
             .flat_map(|roots| roots.iter().copied())
             .collect()
+    }
+
+    pub(crate) fn install_recovered_persistent_roots<I>(&mut self, roots: I) -> Result<()>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        ensure!(
+            self.active.is_none() && current_thread_transaction().is_none(),
+            "recovered persistent roots can only be installed outside an active transaction"
+        );
+        let roots = roots.into_iter().collect::<BTreeSet<_>>();
+        if roots.is_empty() {
+            self.persistent_roots.remove(&PersistentRootKey::Recovered);
+        } else {
+            self.persistent_roots
+                .insert(PersistentRootKey::Recovered, roots);
+        }
+        self.persistent_gc_state = None;
+        Ok(())
+    }
+
+    pub(crate) fn install_recovered_persistent_root_state<I, J>(
+        &mut self,
+        roots: I,
+        versions: J,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = ObjectId>,
+        J: IntoIterator<Item = (u64, u32)>,
+    {
+        self.install_recovered_persistent_roots(roots)?;
+        for (logical_id, version) in versions {
+            let Some(key) = persistent_root_key_from_logical_id(logical_id)? else {
+                continue;
+            };
+            self.persistent_root_versions
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(version))
+                .or_insert(version);
+        }
+        Ok(())
     }
 
     fn commit_object_payloads_with<F>(
@@ -5042,20 +5086,26 @@ fn table_element_key(
     }
 }
 
+fn pack_persistent_global_root_index(instance: Option<u32>, global_index: u32) -> Result<u64> {
+    Ok((persistent_root_instance_code(instance)? << 32) | u64::from(global_index))
+}
+
+fn unpack_persistent_global_root_index(root_index: u64) -> Result<PersistentRootKey> {
+    ensure!(
+        root_index < (1u64 << 52),
+        "persistent global root index does not fit in packed coordinate payload"
+    );
+    Ok(PersistentRootKey::Global {
+        instance: persistent_root_instance_from_code(root_index >> 32)?,
+        global_index: root_index as u32,
+    })
+}
+
 fn pack_persistent_table_root_index(key: TableElementKey) -> Result<u64> {
     // Mirror the packed tmemory logical-id layout so table root records stay
     // unique across instance/table/element coordinates within the 60-bit
     // payload budget.
-    let instance_code = match key.instance {
-        Some(instance) => u64::from(instance)
-            .checked_add(1)
-            .context("persistent table root instance id overflow")?,
-        None => 0,
-    };
-    ensure!(
-        instance_code < (1u64 << 20),
-        "persistent table root instance id does not fit in packed granule id payload"
-    );
+    let instance_code = persistent_root_instance_code(key.instance)?;
     ensure!(
         key.table_index < (1u32 << 12),
         "persistent table root table index does not fit in packed granule id payload"
@@ -5065,6 +5115,60 @@ fn pack_persistent_table_root_index(key: TableElementKey) -> Result<u64> {
         "persistent table root element index does not fit in packed granule id payload"
     );
     Ok((instance_code << 40) | (u64::from(key.table_index) << 28) | key.element_index)
+}
+
+fn unpack_persistent_table_root_index(root_index: u64) -> Result<PersistentRootKey> {
+    ensure!(
+        root_index < (1u64 << 60),
+        "persistent table root index does not fit in packed coordinate payload"
+    );
+    Ok(PersistentRootKey::TableElement(TableElementKey {
+        instance: persistent_root_instance_from_code(root_index >> 40)?,
+        table_index: ((root_index >> 28) & ((1u64 << 12) - 1)) as u32,
+        element_index: root_index & ((1u64 << 28) - 1),
+    }))
+}
+
+fn persistent_root_instance_code(instance: Option<u32>) -> Result<u64> {
+    let code = match instance {
+        Some(instance) => u64::from(instance)
+            .checked_add(1)
+            .context("persistent root instance id overflow")?,
+        None => 0,
+    };
+    ensure!(
+        code < (1u64 << 20),
+        "persistent root instance id does not fit in packed granule id payload"
+    );
+    Ok(code)
+}
+
+fn persistent_root_instance_from_code(code: u64) -> Result<Option<u32>> {
+    ensure!(
+        code < (1u64 << 20),
+        "persistent root instance id does not fit in packed granule id payload"
+    );
+    if code == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(
+            u32::try_from(code - 1).context("persistent root instance id overflow")?,
+        ))
+    }
+}
+
+fn persistent_root_key_from_logical_id(logical_id: u64) -> Result<Option<PersistentRootKey>> {
+    let domain = match logical_id >> 60 {
+        value if value == PackedGranuleDomain::TGlobal as u64 => PackedGranuleDomain::TGlobal,
+        value if value == PackedGranuleDomain::TTable as u64 => PackedGranuleDomain::TTable,
+        _ => return Ok(None),
+    };
+    let root_index = logical_id & ((1u64 << 60) - 1);
+    match domain {
+        PackedGranuleDomain::TGlobal => Ok(Some(unpack_persistent_global_root_index(root_index)?)),
+        PackedGranuleDomain::TTable => Ok(Some(unpack_persistent_table_root_index(root_index)?)),
+        _ => Ok(None),
+    }
 }
 
 fn table_size_granule_id(owner_instance: Option<InstanceId>, table_index: u32) -> GranuleId {
@@ -12607,6 +12711,40 @@ mod tests {
         assert_eq!(recovered_region.root_object_ids, vec![root.object_index]);
     }
 
+    #[test]
+    fn persistent_root_publications_distinguish_global_instances() {
+        let mut objects = ObjectTable::default();
+        objects
+            .allocate_persistent_struct_for_gc_ref(0x703, vec![ObjectValue::I32(3)])
+            .unwrap();
+        objects
+            .allocate_persistent_struct_for_gc_ref(0x704, vec![ObjectValue::I32(4)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(703));
+        state
+            .stage_global_owned(
+                Some(InstanceId::from_u32(1)),
+                0,
+                GlobalSnapshot::GcRef(0x703),
+            )
+            .unwrap();
+        state
+            .stage_global_owned(
+                Some(InstanceId::from_u32(2)),
+                0,
+                GlobalSnapshot::GcRef(0x704),
+            )
+            .unwrap();
+
+        let delta = state.staged_persistent_root_delta(&objects).unwrap();
+        let publications = state.persistent_root_publications(&delta).unwrap();
+
+        assert_eq!(publications.len(), 2);
+        assert_ne!(publications[0].logical_id, publications[1].logical_id);
+    }
+
     fn sample_region_with_two_object_winners()
     -> crate::runtime::vm::block_region::VMemoryBlockRegion {
         let mut region =
@@ -13270,6 +13408,21 @@ mod tests {
             .apply_committed_persistent_root_delta_for_test(delta)
             .unwrap_err();
         assert_eq!(err.to_string(), "persistent root version overflow");
+    }
+
+    #[test]
+    fn persistent_root_recovery_installs_root_index_for_gc() {
+        clear_current_thread_transaction_for_test();
+        let mut state = TransactionState::default();
+
+        state
+            .install_recovered_persistent_roots([ObjectId { object_index: 41 }])
+            .unwrap();
+
+        assert_eq!(
+            state.persistent_root_ids_for_test(),
+            object_set([ObjectId { object_index: 41 }])
+        );
     }
 
     #[test]
