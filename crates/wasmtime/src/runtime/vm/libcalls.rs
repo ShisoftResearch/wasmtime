@@ -59,12 +59,12 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::{
     DurableExternRefHostData, DurableReferenceRegistry, GlobalSnapshot, GranuleId,
-    OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
-    OBJECT_VALUE_ABI_LIVE_REF_KIND_I31, OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
-    OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue, ObjectValueAbi,
-    OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource, OrdinaryGcPromotionValue,
-    PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot,
-    TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN, OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_GC, OBJECT_VALUE_ABI_LIVE_REF_KIND_I31,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable,
+    ObjectValue, ObjectValueAbi, OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource,
+    OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord,
+    TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
     WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
     collect_tmemory_access_snapshot,
 };
@@ -2832,8 +2832,15 @@ fn transaction_abi_from_object_value(
             u64::try_from(vm_func_ref_addr)
                 .context("durable function reference address does not fit u64")?
         }
-        ObjectValue::ExternRef(_) => {
-            bail!("durable external reference live resolution is not implemented yet")
+        ObjectValue::ExternRef(identity) => {
+            u64::from(durable_refs.resolve_extern_identity(*identity).with_context(|| {
+                format!(
+                    "durable external identity is not registered in this store: namespace={} handle={:#x} layout={}",
+                    identity.namespace,
+                    identity.handle,
+                    identity.type_layout_id.get()
+                )
+            })?)
         }
         _ => return ObjectValueAbi::from_object_value(value),
     };
@@ -2866,10 +2873,23 @@ fn live_ref_value_from_raw(
                 return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?));
             }
             if let Ok(gc_ref) = u32::try_from(raw)
+                && let Some(identity) = durable_refs.resolve_extern_ref(gc_ref)
+            {
+                return Ok(ObjectValue::ExternRef(identity));
+            }
+            if let Ok(gc_ref) = u32::try_from(raw)
                 && let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref)
             {
                 return Ok(ObjectValue::Ref(Some(object_id)));
             }
+        }
+        OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN => {
+            let raw_gc_ref =
+                u32::try_from(raw).context("live external reference does not fit u32")?;
+            let identity = durable_refs.resolve_extern_ref(raw_gc_ref).context(
+                "ordinary GC promotion cannot encode external reference without registered durable external identity",
+            )?;
+            return Ok(ObjectValue::ExternRef(identity));
         }
         OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED => {
             if ObjectTable::is_raw_i31_ref(raw) {
@@ -2879,6 +2899,11 @@ fn live_ref_value_from_raw(
                 && let Some(identity) = durable_refs.resolve_func_ref(vm_func_ref_addr)
             {
                 return Ok(ObjectValue::FuncRef(identity));
+            }
+            if let Ok(gc_ref) = u32::try_from(raw)
+                && let Some(identity) = durable_refs.resolve_extern_ref(gc_ref)
+            {
+                return Ok(ObjectValue::ExternRef(identity));
             }
             if let Ok(gc_ref) = u32::try_from(raw)
                 && let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref)

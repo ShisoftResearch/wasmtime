@@ -955,6 +955,16 @@ impl<T> Store<T> {
         }))
     }
 
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_register_durable_extern_ref_for_test(
+        &mut self,
+        raw_gc_ref: u32,
+        identity: crate::runtime::transaction::DurableExternIdentity,
+    ) -> Result<()> {
+        self.inner
+            .transaction_register_durable_extern_ref_for_test(raw_gc_ref, identity)
+    }
+
     /// Access the underlying `T` data owned by this `Store`.
     #[inline]
     pub fn data(&self) -> &T {
@@ -1797,6 +1807,16 @@ impl StoreOpaque {
     ) -> Option<usize> {
         self.transaction_durable_refs
             .resolve_func_identity(identity)
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_register_durable_extern_ref_for_test(
+        &mut self,
+        raw_gc_ref: u32,
+        identity: crate::runtime::transaction::DurableExternIdentity,
+    ) -> Result<()> {
+        self.transaction_durable_refs
+            .register_extern_ref(raw_gc_ref, identity)
     }
 
     pub(crate) fn transaction_promotion_context_mut(

@@ -172,9 +172,10 @@ External references use an embedded durable externref host-data wrapper in the
 internal test seam. Store-local registered-function resolution exists for
 loaded exported functions after they are explicitly registered in that store;
 registered live `tfuncref` values can now roundtrip through transactional
-object get/set helpers in that same store. Public identity APIs,
-recovered-payload reintegration, `texternref` live reverse resolution, and
-multi-instance/module namespace policy remain pending.
+object get/set helpers in that same store. Internal durable `texternref` test
+values can also roundtrip through the same live helper boundary after
+store-local registration. Public identity APIs, recovered-payload
+reintegration, and multi-instance/module namespace policy remain pending.
 
 The object value ABI can store durable function/external identities, but runtime
 helpers still need authoritative identity encoders at the boundaries where raw
@@ -196,6 +197,9 @@ Wasmtime refs are observed.
 - [x] Add internal per-store registration APIs for durable function identities
   and internal durable externref host-data construction for durable external
   identities. Public host/module APIs remain future API work.
+- [x] Add same-store durable `texternref` live helper roundtrip for internal
+  durable externref test values, including `tstruct`, `tarray`, and
+  `anyref`-converted generic reference paths.
 - [x] Wire the store-backed ordinary GC adapter to encode registered non-null
   function refs and embedded durable externrefs as inline durable leaves.
 - [x] Reject raw function/external references that have no durable identity
@@ -208,11 +212,13 @@ Wasmtime refs are observed.
 Status: started. Persistent object records and recovered root records now use
 the central `PersistentObjectRefRaw` ABI for durable heap-object references:
 `0` is null and every non-zero value is `ObjectId.object_index + 1`.
-The live helper boundary can also roundtrip registered `tfuncref` leaves
-through the current Wasmtime-compatible ref bridge, but this is not the final
-`ObjectId`-carrying live `tref` ABI. This bridge uses the `ObjectValueAbi`
-high word as a live-only ref-kind discriminator for compiled-code-to-libcall
-values; persistent object records still require `REF` high = 0.
+The live helper boundary can also roundtrip registered `tfuncref` and internal
+durable `texternref` leaves through the current Wasmtime-compatible ref bridge,
+including generic `anyref` paths that recover the durable extern identity from
+the store-local registry. This is not the final `ObjectId`-carrying live `tref`
+ABI. This bridge uses the `ObjectValueAbi` high word as a live-only ref-kind
+discriminator for compiled-code-to-libcall values; persistent object records
+still require `REF` high = 0.
 
 The branch still has Wasmtime-compatible volatile bridges for some parser,
 lowering, and libcall paths. The final form should use `ObjectId` for

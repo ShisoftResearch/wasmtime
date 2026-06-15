@@ -9,7 +9,7 @@ use wasmtime::_internal::transaction_persistence::{
 };
 use wasmtime::{
     Config, Engine, ExternRef, Func, Global, GlobalType, Instance, Module, Mutability, Result,
-    Store, ValType,
+    Rooted, Store, ValType,
 };
 
 const OBJECT_VALUE_ABI_TAG_FUNCREF_FOR_TEST: u32 = 6;
@@ -491,6 +491,172 @@ fn real_tfunc_promotes_durable_externref_leaf_and_recovers() -> Result<()> {
             7 | (2_u64 << 32),
         )
     );
+
+    Ok(())
+}
+
+#[test]
+fn real_tstruct_registered_externref_leaf_roundtrips_through_get() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("roundtrip-externref-root.tmemory");
+    let tx_log_path = dir.path().join("roundtrip-externref-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "source" (global $source externref))
+              (type $s (tstruct (field (mut externref))))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (tstruct.new $s (global.get $source))))
+              (tfunc (export "leaf") (result externref)
+                (tstruct.get $s 0
+                  (tref.cast_read (ref.as_non_null (tglobal.get $root))))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path,
+        64,
+    )?;
+    let extern_ref = wasmtime::_internal::transaction_persistence::new_durable_extern_ref_for_test(
+        &mut store,
+        9,
+        0x1234_5678_90ab_cdef,
+        2,
+    )?;
+    let source_global = Global::new(
+        &mut store,
+        GlobalType::new(ValType::EXTERNREF, Mutability::Const),
+        extern_ref.into(),
+    )?;
+    let instance = Instance::new(&mut store, &module, &[source_global.into()])?;
+
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())?;
+    let leaf = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, "leaf")?;
+    let returned = leaf
+        .call(&mut store, ())?
+        .expect("registered durable externref should roundtrip");
+    assert_eq!(returned.to_raw(&mut store)?, extern_ref.to_raw(&mut store)?);
+
+    Ok(())
+}
+
+#[test]
+fn real_tstruct_registered_externref_as_anyref_roundtrips_through_get() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("roundtrip-extern-any-root.tmemory");
+    let tx_log_path = dir.path().join("roundtrip-extern-any-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "source" (global $source externref))
+              (type $s (tstruct (field (mut anyref))))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root
+                  (tstruct.new $s (any.convert_extern (global.get $source)))))
+              (tfunc (export "leaf") (result externref)
+                (extern.convert_any
+                  (tstruct.get $s 0
+                    (tref.cast_read (ref.as_non_null (tglobal.get $root)))))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path,
+        64,
+    )?;
+    let extern_ref = wasmtime::_internal::transaction_persistence::new_durable_extern_ref_for_test(
+        &mut store,
+        10,
+        0x2234_5678_90ab_cdef,
+        2,
+    )?;
+    let source_global = Global::new(
+        &mut store,
+        GlobalType::new(ValType::EXTERNREF, Mutability::Const),
+        extern_ref.into(),
+    )?;
+    let instance = Instance::new(&mut store, &module, &[source_global.into()])?;
+
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())?;
+    let leaf = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, "leaf")?;
+    let returned = leaf
+        .call(&mut store, ())?
+        .expect("registered durable externref stored as anyref should roundtrip");
+    assert_eq!(returned.to_raw(&mut store)?, extern_ref.to_raw(&mut store)?);
+
+    Ok(())
+}
+
+#[test]
+fn real_tarray_registered_externref_leaf_roundtrips_through_get() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("roundtrip-externref-array-root.tmemory");
+    let tx_log_path = dir.path().join("roundtrip-externref-array-root.txlog");
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "source" (global $source externref))
+              (type $a (tarray (mut externref)))
+              (tglobal $root (mut (ref null $a)) (ref.null $a))
+              (tfunc (export "publish")
+                (tglobal.set $root
+                  (tarray.new $a (global.get $source) (i32.const 2))))
+              (tfunc (export "leaf") (result externref)
+                (tarray.get $a
+                  (tref.cast_read (ref.as_non_null (tglobal.get $root)))
+                  (i32.const 1))))
+            "#,
+        )?,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::create_file_backed_storage_for_test(
+        &mut store,
+        tmemory_path,
+        tx_log_path,
+        64,
+    )?;
+    let extern_ref = wasmtime::_internal::transaction_persistence::new_durable_extern_ref_for_test(
+        &mut store,
+        11,
+        0x3234_5678_90ab_cdef,
+        2,
+    )?;
+    let source_global = Global::new(
+        &mut store,
+        GlobalType::new(ValType::EXTERNREF, Mutability::Const),
+        extern_ref.into(),
+    )?;
+    let instance = Instance::new(&mut store, &module, &[source_global.into()])?;
+
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())?;
+    let leaf = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, "leaf")?;
+    let returned = leaf
+        .call(&mut store, ())?
+        .expect("registered durable externref array element should roundtrip");
+    assert_eq!(returned.to_raw(&mut store)?, extern_ref.to_raw(&mut store)?);
 
     Ok(())
 }

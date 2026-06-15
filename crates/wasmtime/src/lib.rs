@@ -687,16 +687,18 @@ pub mod _internal {
             let type_layout_id =
                 crate::runtime::transaction::type_layout::TypeLayoutId::new(type_layout_id)
                     .context("durable external ref type layout id cannot be zero")?;
-            crate::ExternRef::new(
+            let identity = crate::runtime::transaction::DurableExternIdentity {
+                namespace,
+                handle,
+                type_layout_id,
+            };
+            let extern_ref = crate::ExternRef::new(
                 &mut *store,
-                crate::runtime::transaction::DurableExternRefHostData::new(
-                    crate::runtime::transaction::DurableExternIdentity {
-                        namespace,
-                        handle,
-                        type_layout_id,
-                    },
-                ),
-            )
+                crate::runtime::transaction::DurableExternRefHostData::new(identity),
+            )?;
+            let raw_gc_ref = extern_ref.to_raw(&mut *store)?;
+            store.transaction_register_durable_extern_ref_for_test(raw_gc_ref, identity)?;
+            Ok(extern_ref)
         }
 
         pub fn fail_next_commit_before_lp_for_test<T>(store: &mut crate::Store<T>) {

@@ -876,6 +876,7 @@ pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED: u64 = 0;
 pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_GC: u64 = 1;
 pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC: u64 = 2;
 pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_I31: u64 = 3;
+pub(crate) const OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN: u64 = 4;
 const VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED: &str =
     "volatile GC reference promotion into persistent object graph is not implemented yet";
 
@@ -934,6 +935,7 @@ impl ObjectValueAbi {
                     | OBJECT_VALUE_ABI_LIVE_REF_KIND_GC
                     | OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC
                     | OBJECT_VALUE_ABI_LIVE_REF_KIND_I31
+                    | OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN
             ),
             "unknown live ref object value ABI kind"
         );

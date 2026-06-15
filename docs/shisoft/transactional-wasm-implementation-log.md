@@ -234,6 +234,39 @@ cargo test -p wasmtime --test transaction_persistence real_tstruct_registered_fu
 test result: ok. 1 passed; 0 failed; 0 ignored
 ```
 
+## Current Status: Durable Externref Live Helper Roundtrip
+
+Date: 2026-06-15
+
+The internal durable `texternref` test seam now has same-store live helper
+roundtrip support:
+
+- `DurableReferenceRegistry` keeps store-local raw externref to
+  `DurableExternIdentity` maps, mirroring the function-reference registry.
+- `_internal::transaction_persistence::new_durable_extern_ref_for_test`
+  registers the raw externref it constructs, so subsequent transactional object
+  helpers can encode it as an inline durable `ExternRef` leaf.
+- Cranelift emits a distinct live EXTERN ref-kind in the `ObjectValueAbi` high
+  word, and runtime decoding uses that kind instead of falling through to the
+  object/function bridge.
+- Same-store reads of durable `ExternRef` leaves resolve back to raw externrefs
+  through the registry. Generic GC/untyped decoding also checks that registry,
+  so `anyref`-converted durable externrefs do not fall through to the
+  function/object promotion path.
+
+Still pending:
+
+- Public durable external-reference APIs.
+- Automatic reintegration of recovered `ExternRef` payload leaves into a fresh
+  store without explicit host registration.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --test transaction_persistence externref -- --format terse
+test result: ok. 5 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Internal Exported Function Durable Identity
 
 Date: 2026-06-15
