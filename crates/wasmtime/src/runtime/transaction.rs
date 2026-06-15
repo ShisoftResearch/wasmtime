@@ -1518,6 +1518,35 @@ impl ObjectTable {
         Ok(object_id)
     }
 
+    fn reserve_persistent_object_id_for_promotion(
+        &mut self,
+        kind: ObjectKind,
+        type_layout_id: TypeLayoutId,
+    ) -> Result<ObjectId> {
+        self.allocate_payload_with_type_layout_id(
+            ObjectPayload::default_for_kind(kind),
+            type_layout_id,
+            true,
+        )
+    }
+
+    fn fill_reserved_persistent_object_for_promotion(
+        &mut self,
+        object_id: ObjectId,
+        payload: ObjectPayload,
+    ) -> Result<()> {
+        ensure!(
+            self.is_persistent(object_id)?,
+            "promotion target object must be persistent"
+        );
+        ensure!(
+            self.kind(object_id)? == payload.kind(),
+            "promotion target object kind does not match promoted payload"
+        );
+        self.validate_persistent_payload_refs(&payload)?;
+        self.update_payload(object_id, payload)
+    }
+
     pub(crate) fn register_type_layout(&mut self, layout: PersistentTypeLayout) -> Result<()> {
         let id = layout.id();
         self.type_layouts.insert(layout)?;
@@ -12909,6 +12938,61 @@ mod tests {
             assert_eq!(
                 err,
                 "volatile GC reference promotion into persistent object graph is not implemented yet"
+            );
+        }
+    }
+
+    mod persistent_promotion_reservation {
+        use super::*;
+
+        #[test]
+        fn promotion_reserves_new_persistent_object_id_without_reusing_source() {
+            let mut objects = ObjectTable::default();
+            let source = objects
+                .allocate_struct_for_gc_ref(0x710, vec![ObjectValue::I32(7)])
+                .unwrap();
+
+            let promoted = objects
+                .reserve_persistent_object_id_for_promotion(
+                    ObjectKind::Struct,
+                    TypeLayoutId::DEFAULT_STRUCT,
+                )
+                .unwrap();
+
+            assert_ne!(promoted, source);
+            assert!(!objects.is_persistent(source).unwrap());
+            assert!(objects.is_persistent(promoted).unwrap());
+            assert_eq!(
+                objects.payload(promoted).unwrap(),
+                ObjectPayload::Struct(Vec::new())
+            );
+            assert_eq!(objects.known_object_id_for_gc_ref(0x710), Some(source));
+        }
+
+        #[test]
+        fn promotion_fill_preserves_payload_and_type_layout() {
+            let mut objects = ObjectTable::default();
+            let promoted = objects
+                .reserve_persistent_object_id_for_promotion(
+                    ObjectKind::Array,
+                    TypeLayoutId::DEFAULT_ARRAY,
+                )
+                .unwrap();
+
+            objects
+                .fill_reserved_persistent_object_for_promotion(
+                    promoted,
+                    ObjectPayload::Array(vec![ObjectValue::I32(1), ObjectValue::I32(2)]),
+                )
+                .unwrap();
+
+            assert_eq!(
+                objects.payload(promoted).unwrap(),
+                ObjectPayload::Array(vec![ObjectValue::I32(1), ObjectValue::I32(2)])
+            );
+            assert_eq!(
+                objects.live_slot(promoted).unwrap().type_layout_id,
+                TypeLayoutId::DEFAULT_ARRAY.get()
             );
         }
     }
