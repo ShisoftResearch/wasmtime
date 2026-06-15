@@ -587,6 +587,7 @@ pub(crate) struct TransactionState {
     granule_versions: BTreeMap<GranuleId, u64>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
+    pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
     durable_log: TxDurableLog,
@@ -607,6 +608,7 @@ struct TransactionWorkspace {
     allocated_objects: Vec<ObjectId>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
+    pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
 }
@@ -638,6 +640,7 @@ impl Default for TransactionState {
             granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
             write_granules: BTreeSet::new(),
+            pending_linear_undo_chunks: BTreeMap::new(),
             scratch: Vec::new(),
             pending_memory_store: None,
             durable_log: TxDurableLog::default(),
@@ -3089,7 +3092,12 @@ impl TransactionState {
     ) -> Result<PendingCommitLogEntry> {
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-        publisher.publish_tmemory_undo_before_in_place_write(undo)
+        let marker = publisher.publish_tmemory_undo_before_in_place_write(undo)?;
+        self.pending_linear_undo_chunks
+            .entry(stream_id)
+            .or_default()
+            .insert(marker.chunk_start_block);
+        Ok(marker)
     }
 
     pub(crate) fn publish_object_publications_before_commit(
@@ -3128,9 +3136,16 @@ impl TransactionState {
         txid: u32,
         marker: PendingCommitLogEntry,
     ) -> Result<()> {
-        let mut sink = self.durable_log.stream_sink(stream_id);
-        let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-        publisher.publish_commit_lp(marker)
+        {
+            let mut sink = self.durable_log.stream_sink(stream_id);
+            let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
+            publisher.publish_commit_lp(marker)?;
+        }
+        if let Some(chunk_starts) = self.pending_linear_undo_chunks.remove(&stream_id) {
+            self.durable_log
+                .retire_committed_linear_undo_chunks(chunk_starts)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -5126,6 +5141,7 @@ impl TransactionState {
             allocated_objects: mem::take(&mut self.allocated_objects),
             read_granules: mem::take(&mut self.read_granules),
             write_granules: mem::take(&mut self.write_granules),
+            pending_linear_undo_chunks: mem::take(&mut self.pending_linear_undo_chunks),
             scratch: mem::take(&mut self.scratch),
             pending_memory_store: self.pending_memory_store.take(),
         }
@@ -5145,6 +5161,7 @@ impl TransactionState {
         self.allocated_objects = workspace.allocated_objects;
         self.read_granules = workspace.read_granules;
         self.write_granules = workspace.write_granules;
+        self.pending_linear_undo_chunks = workspace.pending_linear_undo_chunks;
         self.scratch = workspace.scratch;
         self.pending_memory_store = workspace.pending_memory_store;
     }
@@ -9037,7 +9054,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_mixed_commit_recovers_tmemory_and_persistent_object() {
+    fn file_backed_mixed_commit_recovers_tmemory_and_reuses_committed_linear_undo_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let tmemory_path = dir.path().join("tmemory.bin");
         let tx_log_path = dir.path().join("tx-log.bin");
@@ -9122,6 +9139,28 @@ mod tests {
         assert_eq!(
             recovered_objects.payload(object).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(9)])
+        );
+
+        let mut region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(
+                &tx_log_path,
+            )
+            .unwrap();
+        let stream = region.alloc_stream(32).unwrap();
+        let record = crate::runtime::vm::TMemory::encode_granule_undo_data_record(
+            0x1000_0000_0000_0008,
+            1,
+            crate::runtime::vm::PackedGranuleDomain::TMemory as u16,
+            0,
+            &[0x33; 16],
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+
+        assert_eq!(location.chunk_start_block, tmemory_marker.chunk_start_block);
+        assert_eq!(
+            region.block_generation(location.data_block).unwrap(),
+            tmemory_marker.data_block_generation + 1
         );
     }
 

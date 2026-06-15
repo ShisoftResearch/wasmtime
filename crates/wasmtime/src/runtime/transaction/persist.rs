@@ -330,6 +330,17 @@ impl TxDurableLog {
         }
     }
 
+    pub(crate) fn retire_committed_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        for chunk_start_block in chunk_starts {
+            self.storage
+                .retire_committed_linear_undo_chunk(chunk_start_block)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
         self.storage.ensure_type_layout(layout)
     }
