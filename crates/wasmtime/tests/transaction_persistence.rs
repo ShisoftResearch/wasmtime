@@ -5,8 +5,9 @@ use tempfile::tempdir;
 use wasmtime::_internal::transaction_persistence::{
     bump_first_object_data_block_generation_for_test, corrupt_first_log_crc,
     create_file_backed_region_image, publish_committed_global_object_root,
-    publish_committed_struct_object, publish_committed_tmemory_update,
-    reopen_and_recover_file_backed_region, retire_unreachable_object_chunks_for_test,
+    publish_committed_struct_object, publish_committed_tmemory_undo_for_test,
+    publish_committed_tmemory_update, reopen_and_recover_file_backed_region,
+    retire_completed_linear_undo_chunks_for_test, retire_unreachable_object_chunks_for_test,
 };
 use wasmtime::{
     Config, Engine, ExternRef, Func, Global, GlobalType, Instance, Module, Mutability, Result,
@@ -91,6 +92,24 @@ fn file_backed_object_chunk_reuse_does_not_resurrect_old_object() {
         .collect::<Vec<_>>();
 
     assert_eq!(object_ids, vec![42]);
+}
+
+#[test]
+fn file_backed_linear_undo_chunk_reuse_does_not_roll_back_committed_transaction() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("undo-reuse-region.bin");
+
+    create_file_backed_region_image(&path, 128).unwrap();
+    publish_committed_tmemory_undo_for_test(&path, 1, 0x1000_0000_0000_0001, 1, &[1, 1, 1, 1])
+        .unwrap();
+    retire_completed_linear_undo_chunks_for_test(&path).unwrap();
+    publish_committed_struct_object(&path, 2, 42, 1, 12, &[2, 2, 2]).unwrap();
+
+    let recovered = reopen_and_recover_file_backed_region(&path).unwrap();
+
+    assert!(recovered.tmemory_undo_rollbacks.is_empty());
+    assert_eq!(recovered.object_winners.len(), 1);
+    assert_eq!(recovered.object_winners[0].object_id, 42);
 }
 
 #[test]

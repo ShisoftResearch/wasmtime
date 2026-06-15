@@ -47,6 +47,7 @@ pub(crate) struct PendingGranuleUndo {
 pub(crate) struct PendingCommitLogEntry {
     pub(crate) logical_id: u64,
     pub(crate) version: u32,
+    pub(crate) chunk_start_block: u32,
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
     pub(crate) data_block_generation: u32,
@@ -214,6 +215,7 @@ impl PendingPublication {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DurableDataRecordPointer {
+    pub(crate) chunk_start_block: u32,
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
     pub(crate) data_block_generation: u32,
@@ -239,6 +241,9 @@ pub(crate) trait DurableSink {
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
+    fn retire_committed_linear_undo_chunk(&mut self, _chunk_start_block: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -265,6 +270,9 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
+    fn retire_committed_linear_undo_chunk(&mut self, _chunk_start_block: u32) -> Result<()> {
+        Ok(())
+    }
 
     #[cfg(test)]
     fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry>;
@@ -409,6 +417,7 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
             .checked_add(1)
             .context("transaction durable data block overflow")?;
         Ok(DurableDataRecordPointer {
+            chunk_start_block: data_block,
             data_block,
             data_offset: 0,
             data_block_generation: 0,
@@ -481,6 +490,7 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         let location = self.region.append_data_record(stream, record)?;
         self.pending_data_chunks.insert(location.chunk_start_block);
         Ok(DurableDataRecordPointer {
+            chunk_start_block: location.chunk_start_block,
             data_block: location.data_block,
             data_offset: location.data_offset,
             data_block_generation: self.region.block_generation(location.data_block)?,
@@ -510,6 +520,12 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
 
     fn fence(&mut self) -> Result<()> {
         self.region.fence()
+    }
+
+    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
+        self.region
+            .retire_linear_undo_chunks(core::iter::once(chunk_start_block))?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -599,6 +615,12 @@ impl DurableSink for TxDurableLogSink<'_> {
 
     fn fence(&mut self) -> Result<()> {
         self.log.storage.fence()
+    }
+
+    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
+        self.log
+            .storage
+            .retire_committed_linear_undo_chunk(chunk_start_block)
     }
 }
 
@@ -699,6 +721,7 @@ where
         Ok(PendingCommitLogEntry {
             logical_id: undo.logical_id,
             version: undo.version,
+            chunk_start_block: pointer.chunk_start_block,
             data_block: pointer.data_block,
             data_offset: pointer.data_offset,
             data_block_generation: pointer.data_block_generation,
@@ -736,6 +759,7 @@ where
         Ok(PendingCommitLogEntry {
             logical_id: pub_.logical_id,
             version: pub_.version,
+            chunk_start_block: pointer.chunk_start_block,
             data_block: pointer.data_block,
             data_offset: pointer.data_offset,
             data_block_generation: pointer.data_block_generation,
@@ -756,6 +780,10 @@ where
         )?;
         self.sink.flush_log()?;
         self.sink.fence()?;
+        if marker.role == TxLogEntryRole::TMemoryUndo {
+            self.sink
+                .retire_committed_linear_undo_chunk(marker.chunk_start_block)?;
+        }
 
         Ok(())
     }
@@ -825,6 +853,7 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
             .checked_add(1)
             .context("recording backend data block overflow")?;
         Ok(DurableDataRecordPointer {
+            chunk_start_block: data_block,
             data_block,
             data_offset: 0,
             data_block_generation: 0,
@@ -928,6 +957,7 @@ impl DurableSink for RecordingDurability {
             .checked_add(1)
             .context("recording durability data block overflow")?;
         Ok(DurableDataRecordPointer {
+            chunk_start_block: data_block,
             data_block,
             data_offset: 0,
             data_block_generation: 0,

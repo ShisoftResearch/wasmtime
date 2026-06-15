@@ -564,8 +564,9 @@ pub mod _internal {
             TransactionPersistenceRecoveredWinner,
             bump_first_object_data_block_generation_for_test, corrupt_first_log_crc,
             create_file_backed_region_image, publish_committed_global_object_root,
-            publish_committed_struct_object, publish_committed_tmemory_update,
-            reopen_and_recover_file_backed_region,
+            publish_committed_struct_object, publish_committed_tmemory_undo_for_test,
+            publish_committed_tmemory_update, reopen_and_recover_file_backed_region,
+            retire_completed_linear_undo_chunks_for_test,
         };
 
         pub fn create_file_backed_storage_for_test<T>(

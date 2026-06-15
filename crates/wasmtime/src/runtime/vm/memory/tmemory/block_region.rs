@@ -5,7 +5,7 @@
 use super::{
     DATA_CHUNK_MAGIC, DataChunkClass, DataChunkHeader, DataRecordLocation, LOG_BLOCK_MAGIC,
     LogBlockHeader, NO_NEXT_BLOCK, PackedGranuleDomain, REGION_MAGIC, RegionHeader,
-    SMALL_DATA_LIMIT, TMemory, TxLogEntry,
+    SMALL_DATA_LIMIT, TMemory, TxLogEntry, TxLogEntryRole,
     durable_log::{
         BlockKind, BlockMeta, BlockState, TxDataRecordHeader, TxDataRecordRole, TxEntryMeta,
     },
@@ -33,7 +33,7 @@ use core::{
     ptr::NonNull,
     sync::atomic::{Ordering, compiler_fence},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -2324,6 +2324,71 @@ impl FileBackedMemoryBlockRegion {
         )
     }
 
+    fn retire_chunk(&mut self, chunk_start_block: u32, expected_kind: BlockKind) -> Result<()> {
+        let meta = self.block_meta(chunk_start_block)?;
+        if !meta.is_active_or_sealed()? || meta.kind()? != expected_kind {
+            return Ok(());
+        }
+        ensure!(
+            meta.chunk_start == chunk_start_block,
+            "transactional retired chunk input must point at the chunk start block"
+        );
+
+        let chunk_start =
+            usize::try_from(chunk_start_block).context("retired chunk start block overflow")?;
+        let chunk_blocks =
+            usize::try_from(meta.chunk_blocks).context("retired chunk block count overflow")?;
+        let chunk_end = chunk_start
+            .checked_add(chunk_blocks)
+            .context("retired chunk block range overflow")?;
+        ensure!(
+            chunk_end <= self.num_blocks(),
+            "retired chunk metadata range is out of bounds"
+        );
+
+        let retired_meta = BlockMeta {
+            state: BlockState::Retired as u8,
+            kind: meta.kind,
+            reserved0: 0,
+            generation: meta.generation,
+            owner_thread: meta.owner_thread,
+            chunk_start: meta.chunk_start,
+            chunk_blocks: meta.chunk_blocks,
+            reserved1: 0,
+        };
+        for block in chunk_start..chunk_end {
+            self.block_entries[block] = BlockEntry::default();
+            self.block_entries[block].list_num = ListKind::LargeFree as i16;
+            self.write_block_meta(block, retired_meta)?;
+        }
+        self.flush_block_meta_range(chunk_start, chunk_blocks)
+    }
+
+    pub(crate) fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut retired = Vec::new();
+        let mut seen = BTreeSet::new();
+        for chunk_start_block in chunk_starts {
+            if !seen.insert(chunk_start_block) {
+                continue;
+            }
+            let meta = self.block_meta(chunk_start_block)?;
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::LinearUndo {
+                continue;
+            }
+            self.retire_chunk(chunk_start_block, BlockKind::LinearUndo)?;
+            retired.push(chunk_start_block);
+        }
+
+        if !retired.is_empty() {
+            self.fence()?;
+        }
+
+        Ok(retired)
+    }
+
     pub(crate) fn retire_whole_dead_object_chunks(
         &mut self,
         reachable: &[PersistentRecoveredRecordLocation],
@@ -2397,22 +2462,7 @@ impl FileBackedMemoryBlockRegion {
                 continue;
             }
 
-            let retired_meta = BlockMeta {
-                state: BlockState::Retired as u8,
-                kind: meta.kind,
-                reserved0: 0,
-                generation: meta.generation,
-                owner_thread: meta.owner_thread,
-                chunk_start: meta.chunk_start,
-                chunk_blocks: meta.chunk_blocks,
-                reserved1: 0,
-            };
-            for block in chunk_start..chunk_end {
-                self.block_entries[block] = BlockEntry::default();
-                self.block_entries[block].list_num = ListKind::LargeFree as i16;
-                self.write_block_meta(block, retired_meta)?;
-            }
-            self.flush_block_meta_range(chunk_start, chunk_blocks)?;
+            self.retire_chunk(chunk_start_block, BlockKind::ObjectData)?;
             retired.push(chunk_start_block);
         }
 
@@ -3183,6 +3233,43 @@ pub fn publish_committed_tmemory_update(
     )
 }
 
+/// Publishes one committed tmemory undo record into a file-backed durable region image.
+pub fn publish_committed_tmemory_undo_for_test(
+    path: &Path,
+    stream_id: u32,
+    logical_id: u64,
+    version: u32,
+    payload: &[u8],
+) -> Result<()> {
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let stream = region.alloc_stream(stream_id)?;
+    let record = TMemory::encode_granule_undo_data_record(
+        logical_id,
+        version,
+        PackedGranuleDomain::TMemory as u16,
+        0,
+        payload,
+    )?;
+    let location = region.append_data_record(stream, &record)?;
+    let log_block = region.alloc_log_block(stream_id, 0)?;
+    let mut entry = TMemory::publication_log_entry(
+        logical_id,
+        version,
+        stream_id << 1,
+        location.data_block,
+        location.data_offset,
+        region.block_generation(location.data_block)?,
+        true,
+    )?;
+    entry.set_role(TxLogEntryRole::TMemoryUndo);
+    entry.seal_crc32();
+    write_log_entries_to_file_backed_region(&mut region, log_block, &[entry])?;
+    flush_chunk_for_recovery(&region, location.chunk_start_block)?;
+    region.flush(region.block_offset(log_block)?, BLOCK_SIZE)?;
+    region.fence()?;
+    Ok(())
+}
+
 /// Publishes one committed persistent struct object into a file-backed region.
 pub fn publish_committed_struct_object(
     path: &Path,
@@ -3441,6 +3528,127 @@ pub fn reopen_and_recover_file_backed_region(
             )
             .collect(),
     })
+}
+
+/// Retires committed linear undo chunks that are not still needed for loose-end rollback.
+pub fn retire_completed_linear_undo_chunks_for_test(path: &Path) -> Result<Vec<u32>> {
+    let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    let (committed_chunks, loose_end_chunks) = collect_linear_undo_chunk_starts(&region)?;
+    region.retire_linear_undo_chunks(
+        committed_chunks
+            .difference(&loose_end_chunks)
+            .copied()
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn collect_linear_undo_chunk_starts(
+    region: &FileBackedMemoryBlockRegion,
+) -> Result<(BTreeSet<u32>, BTreeSet<u32>)> {
+    let view = region.view();
+    let mut log_blocks_by_stream = BTreeMap::<u32, Vec<(u32, u32)>>::new();
+    let mut block = 1usize;
+
+    while block < view.num_blocks() {
+        let start_block = u32::try_from(block).context("transactional block index overflow")?;
+        let meta = view.block_meta(start_block)?;
+        if !meta.is_active_or_sealed()? {
+            block += 1;
+            continue;
+        }
+
+        match view.block_magic(start_block)? {
+            LOG_BLOCK_MAGIC => {
+                if meta.kind()? != BlockKind::Log {
+                    block += 1;
+                    continue;
+                }
+                let header = view.log_block_header(start_block)?;
+                log_blocks_by_stream
+                    .entry(header.stream_id)
+                    .or_default()
+                    .push((header.block_seq, start_block));
+                block += 1;
+            }
+            DATA_CHUNK_MAGIC => {
+                if !matches!(meta.kind()?, BlockKind::ObjectData | BlockKind::LinearUndo) {
+                    block += 1;
+                    continue;
+                }
+                let chunk_blocks =
+                    usize::try_from(view.data_chunk_header(start_block)?.chunk_blocks)
+                        .context("transactional data chunk block count overflow")?;
+                ensure!(
+                    chunk_blocks > 0,
+                    "transactional data chunk at block {start_block} has zero blocks"
+                );
+                block += chunk_blocks;
+            }
+            _ => {
+                block += 1;
+            }
+        }
+    }
+
+    let mut committed_chunks = BTreeSet::new();
+    let mut loose_end_chunks = BTreeSet::new();
+    for (stream_id, mut log_blocks) in log_blocks_by_stream {
+        log_blocks.sort_unstable();
+        let mut pending_txid = None;
+        let mut pending_chunks = BTreeSet::new();
+
+        for (_, log_block) in log_blocks {
+            for entry in view.log_block_entries(log_block)? {
+                ensure!(
+                    entry.validate_crc32(),
+                    "transactional recovery found corrupt log entry in stream {} block {}",
+                    stream_id,
+                    log_block
+                );
+                let txid = entry.tx_meta >> 1;
+                if pending_txid.is_some_and(|current| current != txid) {
+                    loose_end_chunks.extend(pending_chunks.iter().copied());
+                    pending_chunks.clear();
+                }
+                pending_txid = Some(txid);
+
+                if let Some(chunk_start_block) = linear_undo_chunk_start_for_entry(region, entry)? {
+                    pending_chunks.insert(chunk_start_block);
+                }
+
+                if (entry.tx_meta & 1) != 0 {
+                    committed_chunks.extend(pending_chunks.iter().copied());
+                    pending_chunks.clear();
+                    pending_txid = None;
+                }
+            }
+        }
+
+        if pending_txid.is_some() {
+            loose_end_chunks.extend(pending_chunks);
+        }
+    }
+
+    Ok((committed_chunks, loose_end_chunks))
+}
+
+fn linear_undo_chunk_start_for_entry(
+    region: &FileBackedMemoryBlockRegion,
+    entry: TxLogEntry,
+) -> Result<Option<u32>> {
+    if entry.role()? != TxLogEntryRole::TMemoryUndo {
+        return Ok(None);
+    }
+
+    let meta = region.block_meta(entry.data_block)?;
+    if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::LinearUndo {
+        return Ok(None);
+    }
+    if meta.generation != entry.data_block_generation() {
+        return Ok(None);
+    }
+
+    Ok(Some(meta.chunk_start))
 }
 
 pub(crate) fn reopen_and_recover_file_backed_region_for_runtime(
@@ -4152,6 +4360,58 @@ mod tests {
             1,
             PackedGranuleDomain::TStruct as u16,
             19,
+            &[5, 6, 7, 8],
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+
+        assert_eq!(location.chunk_start_block, retired_chunk);
+        assert_eq!(
+            region
+                .block_meta_for_test(usize::try_from(location.data_block).unwrap())
+                .unwrap()
+                .generation,
+            old_generation + 1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_region_reuses_retired_linear_undo_chunk_with_incremented_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retired-linear-undo-reuse-region.bin");
+        let retired_chunk;
+        let old_generation;
+
+        {
+            let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 32).unwrap();
+            let stream = region.alloc_stream(7).unwrap();
+            let record = TMemory::encode_granule_undo_data_record(
+                0x1000_0000_0000_0007,
+                1,
+                PackedGranuleDomain::TMemory as u16,
+                0,
+                &[1, 2, 3, 4],
+            )
+            .unwrap();
+            let location = region.append_data_record(stream, &record).unwrap();
+            retired_chunk = location.chunk_start_block;
+            old_generation = region
+                .block_meta_for_test(usize::try_from(location.data_block).unwrap())
+                .unwrap()
+                .generation;
+            region
+                .retire_linear_undo_chunks([location.chunk_start_block])
+                .unwrap();
+        }
+
+        let mut region = FileBackedMemoryBlockRegion::open_for_test(&path).unwrap();
+        let stream = region.alloc_stream(8).unwrap();
+        let record = TMemory::encode_granule_undo_data_record(
+            0x1000_0000_0000_0008,
+            1,
+            PackedGranuleDomain::TMemory as u16,
+            0,
             &[5, 6, 7, 8],
         )
         .unwrap();
