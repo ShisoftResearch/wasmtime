@@ -30,6 +30,39 @@ for the current persistent-promotion roadmap. It supersedes the older
 plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
 payloads.
 
+## Current Status: Recovered ObjectId Ref Conversion Bridge
+
+Date: 2026-06-15
+
+The current live helper boundary still uses the existing 24-byte
+`ObjectValueAbi`, but persistent object references recovered without any
+process-local `VMGcRef` mapping can now roundtrip through the libcall conversion
+layer:
+
+- `ObjectTable::raw_ref_for_object_id` still prefers a live `VMGcRef` mapping
+  when one exists.
+- If no live mapping exists and the object is persistent, it falls back to the
+  durable `PersistentObjectRefRaw` encoding.
+- Decode only treats such a raw value as an object reference when the object
+  table can prove it names a live persistent object; otherwise existing
+  durable extern, live GC, and i31 handling remains available.
+- This temporary bridge still uses the old 32-bit raw ref lane. Its
+  `ObjectId + 1` encoding can overlap with raw i31 or process-local
+  `VMGcRef` shapes, so the bridge treats persistent objects as authoritative
+  only when the object table proves the raw value is live and persistent.
+- This is an intermediate compatibility bridge. The final live transactional
+  reference ABI and Cranelift lowering rewrite are still tracked in Workstream
+  5.
+
+Verification for this slice:
+
+```text
+cargo test -p wasmtime --lib object_value_abi_roundtrips_recovered_persistent_object_ref_without_gc_ref -- --format terse
+test result: ok. 1 passed; 0 failed; 0 ignored
+cargo test -p wasmtime --lib live_ref_bridge_ -- --format terse
+test result: ok. 2 passed; 0 failed; 0 ignored
+```
+
 ## Current Status: Store Reopen Rebuilds Persistent Objects
 
 Date: 2026-06-15

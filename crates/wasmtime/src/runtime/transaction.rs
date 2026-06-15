@@ -1554,6 +1554,9 @@ impl ObjectTable {
         {
             return Ok(object_id);
         }
+        if let Some(object_id) = self.persistent_object_id_for_raw_ref(raw_ref)? {
+            return Ok(object_id);
+        }
         if Self::is_raw_i31_ref(raw_ref) {
             bail!("raw i31 refs are inline durable values, not object-table payloads");
         }
@@ -1707,6 +1710,17 @@ impl ObjectTable {
             .with_context(|| format!("unknown transactional object GC ref: {gc_ref:#x}"))
     }
 
+    pub(crate) fn object_id_for_transaction_ref_raw(&self, raw_ref: u32) -> Result<ObjectId> {
+        ensure!(raw_ref != 0, "transactional object cannot use null ref");
+        if let Some(object_id) = self.known_object_id_for_gc_ref(raw_ref) {
+            return Ok(object_id);
+        }
+        if let Some(object_id) = self.persistent_object_id_for_raw_ref(u64::from(raw_ref))? {
+            return Ok(object_id);
+        }
+        self.object_id_for_gc_ref(raw_ref)
+    }
+
     pub(crate) fn known_object_id_for_gc_ref(&self, gc_ref: u32) -> Option<ObjectId> {
         if gc_ref == 0 {
             return None;
@@ -1726,6 +1740,16 @@ impl ObjectTable {
         } else {
             Ok(None)
         }
+    }
+
+    pub(crate) fn known_persistent_object_id_for_transaction_ref_raw(
+        &self,
+        raw_ref: u32,
+    ) -> Result<Option<ObjectId>> {
+        if let Some(object_id) = self.known_persistent_object_id_for_gc_ref(raw_ref)? {
+            return Ok(Some(object_id));
+        }
+        self.persistent_object_id_for_raw_ref(u64::from(raw_ref))
     }
 
     fn persistent_object_id_for_gc_ref_or_promotion_required(
@@ -1757,7 +1781,39 @@ impl ObjectTable {
 
     pub(crate) fn raw_ref_for_object_id(&self, object_id: ObjectId) -> Result<u64> {
         self.live_slot(object_id)?;
-        Ok(u64::from(self.gc_ref_for_object_id(object_id)?))
+        if let Some(gc_ref) = self.object_to_gc_ref.get(&object_id).copied() {
+            return Ok(u64::from(gc_ref));
+        }
+        ensure!(
+            self.is_persistent(object_id)?,
+            "transactional object has no GC ref association: {object_id:?}"
+        );
+        // Transactional persistent refs still cross some live helper boundaries
+        // through the temporary 32-bit raw-ref bridge. The final live tref ABI
+        // must remove this narrowing.
+        let raw = PersistentObjectRefRaw::from_optional_object_id(Some(object_id))?.as_raw();
+        ensure!(
+            u32::try_from(raw).is_ok(),
+            "persistent object ref does not fit live transaction ref bridge"
+        );
+        Ok(raw)
+    }
+
+    pub(crate) fn persistent_object_id_for_raw_ref(
+        &self,
+        raw_ref: u64,
+    ) -> Result<Option<ObjectId>> {
+        let Some(object_id) = PersistentObjectRefRaw::from_raw(raw_ref).decode() else {
+            return Ok(None);
+        };
+        let Ok(slot) = self.live_slot(object_id) else {
+            return Ok(None);
+        };
+        if slot.persistent {
+            Ok(Some(object_id))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn slot_count(&self) -> usize {
@@ -4042,9 +4098,11 @@ impl TransactionState {
     pub(crate) fn acquire_tref_read_for_gc_ref(
         &mut self,
         object_table: &ObjectTable,
-        gc_ref: u32,
+        raw_ref: u32,
     ) -> Result<bool> {
-        let Some(object_id) = object_table.known_persistent_object_id_for_gc_ref(gc_ref)? else {
+        let Some(object_id) =
+            object_table.known_persistent_object_id_for_transaction_ref_raw(raw_ref)?
+        else {
             return Ok(false);
         };
         self.acquire_object_read(object_table, object_id)
@@ -4053,9 +4111,11 @@ impl TransactionState {
     pub(crate) fn acquire_tref_write_for_gc_ref(
         &mut self,
         object_table: &ObjectTable,
-        gc_ref: u32,
+        raw_ref: u32,
     ) -> Result<bool> {
-        let Some(object_id) = object_table.known_persistent_object_id_for_gc_ref(gc_ref)? else {
+        let Some(object_id) =
+            object_table.known_persistent_object_id_for_transaction_ref_raw(raw_ref)?
+        else {
             return Ok(false);
         };
         self.acquire_object_write(object_table, object_id)

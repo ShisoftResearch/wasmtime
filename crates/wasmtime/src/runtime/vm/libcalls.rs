@@ -809,7 +809,7 @@ fn transaction_helper_i31_for_ref(
     gc_ref: u32,
 ) -> u32 {
     let object_table = store.store_opaque_mut().transaction_object_table_mut();
-    let Ok(object_id) = object_table.object_id_for_gc_ref(gc_ref) else {
+    let Ok(object_id) = object_table.object_id_for_transaction_ref_raw(gc_ref) else {
         return 0;
     };
     let Ok(ObjectPayload::Struct(fields)) = object_table.payload(object_id) else {
@@ -1955,7 +1955,7 @@ fn transaction_tstruct_set_impl(
     let store = store.store_opaque_mut();
     let (durable_refs, state, object_table) =
         store.transaction_durable_refs_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+    let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
     let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
     state.stage_struct_field(object_table, object_id, field, value)
 }
@@ -1990,7 +1990,7 @@ fn transaction_tstruct_get_bytes_impl(
         let store = store.store_opaque_mut();
         let (durable_refs, state, object_table) =
             store.transaction_durable_refs_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+        let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
         let value = state.read_struct_field(object_table, object_id, field)?;
         transaction_abi_from_object_value(durable_refs, object_table, &value)?
     };
@@ -2476,7 +2476,7 @@ fn transaction_tarray_set_impl(
     let store = store.store_opaque_mut();
     let (durable_refs, state, object_table) =
         store.transaction_durable_refs_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+    let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
     let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
     state.stage_array_element(object_table, object_id, index, value)
 }
@@ -2515,7 +2515,7 @@ fn transaction_tarray_fill_impl(
     let (durable_refs, state, object_table) =
         store.transaction_durable_refs_state_and_object_table_mut();
     ensure!(gc_ref != 0, "null tarray reference");
-    let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+    let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
     let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
     state.fill_array_range(object_table, object_id, index, len, value)
 }
@@ -2554,8 +2554,8 @@ fn transaction_tarray_copy_impl(
     let len = usize::try_from(len).context("transactional array length overflow")?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let dst_object_id = object_table.object_id_for_gc_ref(dst_gc_ref)?;
-    let src_object_id = object_table.object_id_for_gc_ref(src_gc_ref)?;
+    let dst_object_id = object_table.object_id_for_transaction_ref_raw(dst_gc_ref)?;
+    let src_object_id = object_table.object_id_for_transaction_ref_raw(src_gc_ref)?;
     state.copy_array_range(
         object_table,
         dst_object_id,
@@ -2619,7 +2619,7 @@ fn transaction_tarray_init_data_impl(
     ensure!(element_size > 0, "transactional array element size is zero");
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+    let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
     let dst_end = dst
         .checked_add(len)
         .context("transactional array destination range overflow")?;
@@ -2689,7 +2689,7 @@ fn transaction_tarray_init_elem_impl(
     let store = store.store_opaque_mut();
     let (durable_refs, state, object_table) =
         store.transaction_durable_refs_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+    let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
     let dst_end = dst
         .checked_add(len)
         .context("transactional array destination range overflow")?;
@@ -2750,7 +2750,7 @@ fn transaction_tarray_get_bytes_impl(
         let store = store.store_opaque_mut();
         let (durable_refs, state, object_table) =
             store.transaction_durable_refs_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+        let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
         let value = state.read_array_element(object_table, object_id, index)?;
         transaction_abi_from_object_value(durable_refs, object_table, &value)?
     };
@@ -2783,7 +2783,7 @@ fn transaction_tarray_len_bytes_impl(
     let len = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_gc_ref(gc_ref)?;
+        let object_id = object_table.object_id_for_transaction_ref_raw(gc_ref)?;
         state.read_array_len(object_table, object_id)?
     };
     let len = u32::try_from(len).context("transactional array length does not fit i32")?;
@@ -2869,9 +2869,6 @@ fn live_ref_value_from_raw(
             return Ok(ObjectValue::FuncRef(identity));
         }
         OBJECT_VALUE_ABI_LIVE_REF_KIND_GC => {
-            if ObjectTable::is_raw_i31_ref(raw) {
-                return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?));
-            }
             if let Ok(gc_ref) = u32::try_from(raw)
                 && let Some(identity) = durable_refs.resolve_extern_ref(gc_ref)
             {
@@ -2881,6 +2878,12 @@ fn live_ref_value_from_raw(
                 && let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref)
             {
                 return Ok(ObjectValue::Ref(Some(object_id)));
+            }
+            if let Some(object_id) = object_table.persistent_object_id_for_raw_ref(raw)? {
+                return Ok(ObjectValue::Ref(Some(object_id)));
+            }
+            if ObjectTable::is_raw_i31_ref(raw) {
+                return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?));
             }
         }
         OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN => {
@@ -2892,9 +2895,6 @@ fn live_ref_value_from_raw(
             return Ok(ObjectValue::ExternRef(identity));
         }
         OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED => {
-            if ObjectTable::is_raw_i31_ref(raw) {
-                return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?));
-            }
             if let Ok(vm_func_ref_addr) = usize::try_from(raw)
                 && let Some(identity) = durable_refs.resolve_func_ref(vm_func_ref_addr)
             {
@@ -2909,6 +2909,12 @@ fn live_ref_value_from_raw(
                 && let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref)
             {
                 return Ok(ObjectValue::Ref(Some(object_id)));
+            }
+            if let Some(object_id) = object_table.persistent_object_id_for_raw_ref(raw)? {
+                return Ok(ObjectValue::Ref(Some(object_id)));
+            }
+            if ObjectTable::is_raw_i31_ref(raw) {
+                return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(raw)?));
             }
         }
         _ => bail!("unknown live ref object value ABI kind"),
@@ -4290,6 +4296,147 @@ fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::transaction::{
+        ObjectId, ObjectKind, encode_object_record_for_recovery, type_layout::TypeLayoutRegistry,
+    };
+
+    fn recovered_struct_winner(
+        object_id: ObjectId,
+        version: u32,
+        fields: Vec<ObjectValue>,
+    ) -> crate::runtime::vm::RecoveredObjectWinner {
+        let record_bytes = encode_object_record_for_recovery(
+            object_id.object_index,
+            version,
+            ObjectKind::Struct as u16,
+            crate::runtime::transaction::type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            &ObjectPayload::Struct(fields),
+        )
+        .unwrap();
+        crate::runtime::vm::RecoveredObjectWinner {
+            object_id: object_id.object_index,
+            version,
+            kind: ObjectKind::Struct as u16,
+            type_layout_id: crate::runtime::transaction::type_layout::TypeLayoutId::DEFAULT_STRUCT
+                .get(),
+            data_block: 0,
+            data_offset: 0,
+            record_len: record_bytes.len() as u64,
+            record_bytes,
+        }
+    }
+
+    #[test]
+    fn object_value_abi_roundtrips_recovered_persistent_object_ref_without_gc_ref() {
+        let root = ObjectId { object_index: 41 };
+        let child = ObjectId { object_index: 42 };
+        let mut objects = ObjectTable::default();
+        objects
+            .rebuild_reachable_from_recovered_object_winners(
+                &TypeLayoutRegistry::default(),
+                &[
+                    recovered_struct_winner(child, 1, vec![ObjectValue::I32(9)]),
+                    recovered_struct_winner(root, 1, vec![ObjectValue::Ref(Some(child))]),
+                ],
+                &[root.object_index],
+            )
+            .unwrap();
+        let durable_refs = DurableReferenceRegistry::default();
+
+        let abi = transaction_abi_from_object_value(
+            &durable_refs,
+            &objects,
+            &ObjectValue::Ref(Some(child)),
+        )
+        .unwrap();
+        let (tag, low, high) = abi.as_parts();
+        assert_eq!(tag, OBJECT_VALUE_ABI_TAG_REF);
+        assert_eq!(low, child.object_index + 1);
+        assert_eq!(high, 0);
+        assert_eq!(
+            objects
+                .object_id_for_transaction_ref_raw(u32::try_from(low).unwrap())
+                .unwrap(),
+            child
+        );
+        assert_eq!(
+            object_value_from_transaction_abi(&durable_refs, &mut objects, abi).unwrap(),
+            ObjectValue::Ref(Some(child))
+        );
+    }
+
+    #[test]
+    fn live_ref_bridge_prefers_proven_persistent_object_over_i31_overlap() {
+        let object = ObjectId { object_index: 2 };
+        let raw = object.object_index + 1;
+        assert!(ObjectTable::is_raw_i31_ref(raw));
+
+        let mut objects = ObjectTable::default();
+        objects
+            .rebuild_reachable_from_recovered_object_winners(
+                &TypeLayoutRegistry::default(),
+                &[recovered_struct_winner(
+                    object,
+                    1,
+                    vec![ObjectValue::I32(7)],
+                )],
+                &[object.object_index],
+            )
+            .unwrap();
+        let durable_refs = DurableReferenceRegistry::default();
+
+        assert_eq!(
+            live_ref_value_from_raw(
+                &durable_refs,
+                &mut objects,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
+                raw,
+            )
+            .unwrap(),
+            ObjectValue::Ref(Some(object))
+        );
+        assert_eq!(
+            live_ref_value_from_raw(
+                &durable_refs,
+                &mut objects,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
+                raw,
+            )
+            .unwrap(),
+            ObjectValue::Ref(Some(object))
+        );
+    }
+
+    #[test]
+    fn live_ref_bridge_keeps_i31_when_overlap_is_not_live_persistent_object() {
+        let i31 = 21;
+        let raw = ObjectTable::encode_raw_i31_ref(i31);
+        assert_eq!(raw, 43);
+
+        let mut objects = ObjectTable::default();
+        let durable_refs = DurableReferenceRegistry::default();
+
+        assert_eq!(
+            live_ref_value_from_raw(
+                &durable_refs,
+                &mut objects,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
+                raw,
+            )
+            .unwrap(),
+            ObjectValue::I31(i31)
+        );
+        assert_eq!(
+            live_ref_value_from_raw(
+                &durable_refs,
+                &mut objects,
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
+                raw,
+            )
+            .unwrap(),
+            ObjectValue::I31(i31)
+        );
+    }
 
     #[test]
     fn collect_tmemory_participants_groups_granules_by_memory() {

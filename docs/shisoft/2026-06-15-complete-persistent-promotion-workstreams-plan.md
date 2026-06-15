@@ -219,10 +219,19 @@ the central `PersistentObjectRefRaw` ABI for durable heap-object references:
 The live helper boundary can also roundtrip registered `tfuncref` and internal
 durable `texternref` leaves through the current Wasmtime-compatible ref bridge,
 including generic `anyref` paths that recover the durable extern identity from
-the store-local registry. This is not the final `ObjectId`-carrying live `tref`
-ABI. This bridge uses the `ObjectValueAbi` high word as a live-only ref-kind
-discriminator for compiled-code-to-libcall values; persistent object records
-still require `REF` high = 0.
+the store-local registry. Recovered persistent `ObjectId` refs can now
+roundtrip through the libcall conversion layer without a process-local
+`VMGcRef` map when the object table proves the raw value names a live persistent
+object. This is still not the final `ObjectId`-carrying live `tref` ABI. This
+bridge uses the `ObjectValueAbi` high word as a live-only ref-kind discriminator
+for compiled-code-to-libcall values; persistent object records still require
+`REF` high = 0. Because the bridge reuses the old 32-bit raw ref lane,
+`PersistentObjectRefRaw` values can overlap with raw i31 or process-local
+`VMGcRef` shapes. During this bridge only, a raw value is interpreted as a
+persistent object reference only when the object table proves that it names a
+live persistent object; otherwise the existing live i31/extern/GC handling
+continues to apply. Persistent object ids that do not fit this 32-bit bridge
+must wait for the final live `tref` ABI.
 
 The branch still has Wasmtime-compatible volatile bridges for some parser,
 lowering, and libcall paths. The final form should use `ObjectId` for
