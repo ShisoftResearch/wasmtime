@@ -939,6 +939,8 @@ pub(crate) struct ObjectTable {
     // around that identity.
     gc_ref_to_object: BTreeMap<u32, ObjectId>,
     object_to_gc_ref: BTreeMap<ObjectId, u32>,
+    i31_ref_to_object: BTreeMap<u32, ObjectId>,
+    object_to_i31_ref: BTreeMap<ObjectId, u32>,
     func_ref_to_object: BTreeMap<u64, ObjectId>,
     object_to_func_ref: BTreeMap<ObjectId, u64>,
     type_layouts: TypeLayoutRegistry,
@@ -957,6 +959,8 @@ impl Default for ObjectTable {
             free_list: Vec::new(),
             gc_ref_to_object: BTreeMap::new(),
             object_to_gc_ref: BTreeMap::new(),
+            i31_ref_to_object: BTreeMap::new(),
+            object_to_i31_ref: BTreeMap::new(),
             func_ref_to_object: BTreeMap::new(),
             object_to_func_ref: BTreeMap::new(),
             type_layouts: TypeLayoutRegistry::default(),
@@ -977,6 +981,35 @@ impl Default for ObjectTable {
 }
 
 impl ObjectTable {
+    fn is_raw_i31_ref(raw_ref: u64) -> bool {
+        raw_ref <= u64::from(u32::MAX) && (raw_ref & 1) == 1
+    }
+
+    fn decode_raw_i31_ref(raw_ref: u64) -> Result<i32> {
+        ensure!(Self::is_raw_i31_ref(raw_ref), "raw ref is not an i31 immediate");
+        Ok((raw_ref as u32 as i32) >> 1)
+    }
+
+    fn encode_raw_i31_ref(value: i32) -> u64 {
+        u64::from(((value as u32) << 1) | 1)
+    }
+
+    fn object_id_for_raw_i31_ref(&mut self, raw_ref: u64) -> Result<ObjectId> {
+        let raw_ref = u32::try_from(raw_ref).context("raw i31 ref does not fit u32")?;
+        if let Some(object_id) = self.i31_ref_to_object.get(&raw_ref).copied()
+            && self.live_slot(object_id).is_ok()
+        {
+            return Ok(object_id);
+        }
+        self.i31_ref_to_object.remove(&raw_ref);
+
+        let value = Self::decode_raw_i31_ref(u64::from(raw_ref))?;
+        let object_id = self.allocate_payload(ObjectPayload::I31(value))?;
+        self.i31_ref_to_object.insert(raw_ref, object_id);
+        self.object_to_i31_ref.insert(object_id, raw_ref);
+        Ok(object_id)
+    }
+
     fn install_recovered_type_layouts(
         &mut self,
         recovered_type_layouts: &TypeLayoutRegistry,
@@ -1399,6 +1432,9 @@ impl ObjectTable {
 
     pub(crate) fn object_id_for_raw_ref_or_func(&mut self, raw_ref: u64) -> Result<ObjectId> {
         ensure!(raw_ref != 0, "transactional object cannot use null ref");
+        if Self::is_raw_i31_ref(raw_ref) {
+            return self.object_id_for_raw_i31_ref(raw_ref);
+        }
         if let Ok(gc_ref) = u32::try_from(raw_ref)
             && let Some(object_id) = self.gc_ref_to_object.get(&gc_ref).copied()
         {
@@ -1607,6 +1643,12 @@ impl ObjectTable {
 
     pub(crate) fn raw_ref_for_object_id(&self, object_id: ObjectId) -> Result<u64> {
         self.live_slot(object_id)?;
+        if let Some(raw_ref) = self.object_to_i31_ref.get(&object_id).copied() {
+            return Ok(u64::from(raw_ref));
+        }
+        if let ObjectPayload::I31(value) = self.payload(object_id)? {
+            return Ok(Self::encode_raw_i31_ref(value));
+        }
         if let Some(func_ref) = self.object_to_func_ref.get(&object_id).copied() {
             return Ok(func_ref);
         }
@@ -1709,6 +1751,7 @@ impl ObjectTable {
         let domain = match object_kind_from_u16(header.kind)? {
             ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
             ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
+            ObjectKind::I31 => crate::runtime::vm::PackedGranuleDomain::TI31,
             other => bail!("object kind {other:?} is not a persistent object granule"),
         };
         persist::PendingPublication::persistent_object(
@@ -1767,6 +1810,11 @@ impl ObjectTable {
         if let Some(gc_ref) = self.object_to_gc_ref.remove(&object_id) {
             self.gc_ref_to_object.remove(&gc_ref);
         }
+        if let Some(raw_ref) = self.object_to_i31_ref.remove(&object_id) {
+            if self.i31_ref_to_object.get(&raw_ref) == Some(&object_id) {
+                self.i31_ref_to_object.remove(&raw_ref);
+            }
+        }
         if let Some(func_ref) = self.object_to_func_ref.remove(&object_id) {
             self.func_ref_to_object.remove(&func_ref);
         }
@@ -1798,6 +1846,8 @@ impl ObjectTable {
         self.free_list.clear();
         self.gc_ref_to_object.clear();
         self.object_to_gc_ref.clear();
+        self.i31_ref_to_object.clear();
+        self.object_to_i31_ref.clear();
         self.func_ref_to_object.clear();
         self.object_to_func_ref.clear();
         self.next_version = 0;
@@ -12861,6 +12911,24 @@ mod tests {
         }
     }
 
+    mod ti31_persistent_object_domain {
+        use super::*;
+
+        #[test]
+        fn i31_pending_publication_uses_ti31_domain() {
+            let mut objects = ObjectTable::default();
+            let object = objects.allocate_payload(ObjectPayload::I31(-7)).unwrap();
+
+            let pub_ = objects.object_pending_publication(object).unwrap();
+            let (domain, object_id) =
+                crate::runtime::vm::unpack_object_granule_id(pub_.logical_id).unwrap();
+
+            assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TI31);
+            assert_eq!(object_id, object.object_index);
+            assert_eq!(pub_.kind, ObjectKind::I31 as u16);
+        }
+    }
+
     fn sample_region_with_two_object_winners()
     -> crate::runtime::vm::block_region::VMemoryBlockRegion {
         let mut region =
@@ -15284,28 +15352,26 @@ mod tests {
     }
 
     #[test]
-    fn module_compilation_rejects_transaction_i31_reference_fields_for_now() {
+    fn transaction_i31_reference_fields_round_trip_as_scalars() {
         let mut config = crate::Config::new();
         config.wasm_gc(true);
         let engine = crate::Engine::new(&config).unwrap();
-        let error = crate::Module::new(
+        let module = transaction_test_module(
             &engine,
-            wat::parse_str(
-                r#"
-                (module
-                  (type $s (struct (field (mut (ref null i31)))))
-                  (tfunc (export "x")
-                    (drop (tstruct.new_default $s))))
-                "#,
-            )
-            .unwrap(),
-        )
-        .unwrap_err();
-        let error = format!("{error:?}");
-        assert!(
-            error.contains("transactional i31 reference ObjectId values are not implemented yet"),
-            "{error}"
+            r#"
+            (module
+              (type $s (tstruct (field (mut (ref null i31)))))
+              (tfunc (export "x") (result i32)
+                (local $s (tref $s))
+                (local.set $s (tstruct.new $s (tref.ti31 (i32.const 13))))
+                (i31.get_s (tstruct.get $s 0 (tref.cast_read (local.get $s))))))
+            "#,
         );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let x = instance.get_typed_func::<(), i32>(&mut store, "x").unwrap();
+
+        assert_eq!(x.call(&mut store, ()).unwrap(), 13);
     }
 
     #[test]

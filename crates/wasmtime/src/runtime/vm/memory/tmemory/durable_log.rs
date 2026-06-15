@@ -223,6 +223,7 @@ pub(crate) enum PackedGranuleDomain {
     TTableSize = 5,
     TStruct = 6,
     TArray = 7,
+    TI31 = 8,
 }
 
 pub(crate) fn packed_granule_domain(logical_id: u64) -> Result<PackedGranuleDomain> {
@@ -235,13 +236,16 @@ pub(crate) fn packed_granule_domain(logical_id: u64) -> Result<PackedGranuleDoma
         5 => PackedGranuleDomain::TTableSize,
         6 => PackedGranuleDomain::TStruct,
         7 => PackedGranuleDomain::TArray,
+        8 => PackedGranuleDomain::TI31,
         _ => bail!("unknown packed granule domain {domain_bits}"),
     })
 }
 
 pub(crate) fn pack_object_granule_id(domain: PackedGranuleDomain, object_id: u64) -> Result<u64> {
     match domain {
-        PackedGranuleDomain::TStruct | PackedGranuleDomain::TArray => {
+        PackedGranuleDomain::TStruct
+        | PackedGranuleDomain::TArray
+        | PackedGranuleDomain::TI31 => {
             ensure!(
                 object_id < (1u64 << 60),
                 "object id does not fit in packed granule id payload"
@@ -304,7 +308,9 @@ pub(crate) fn unpack_object_granule_id(logical_id: u64) -> Result<(PackedGranule
     ensure!(
         matches!(
             domain,
-            PackedGranuleDomain::TStruct | PackedGranuleDomain::TArray
+            PackedGranuleDomain::TStruct
+                | PackedGranuleDomain::TArray
+                | PackedGranuleDomain::TI31
         ),
         "logical id {logical_id:#x} is not an object granule"
     );
@@ -400,6 +406,16 @@ mod tests {
         let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
         assert_eq!(domain, PackedGranuleDomain::TArray);
         assert_eq!(object_id, 99);
+    }
+
+    #[test]
+    fn pack_ti31_object_granule_id_round_trips() {
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TI31, 31).unwrap();
+        assert_eq!(logical_id >> 60, PackedGranuleDomain::TI31 as u64);
+
+        let (domain, object_id) = unpack_object_granule_id(logical_id).unwrap();
+        assert_eq!(domain, PackedGranuleDomain::TI31);
+        assert_eq!(object_id, 31);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::prelude::*;
-use crate::runtime::transaction::type_layout::{
-    PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
+use crate::runtime::transaction::{
+    ObjectKind,
+    type_layout::{PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry},
 };
 #[cfg(test)]
 use crate::runtime::vm::unpack_object_granule_id;
@@ -145,18 +146,23 @@ impl PendingPublication {
         type_layout_id: u32,
         payload: Vec<u8>,
     ) -> Result<Self> {
+        let kind = match domain {
+            PackedGranuleDomain::TStruct => ObjectKind::Struct,
+            PackedGranuleDomain::TArray => ObjectKind::Array,
+            PackedGranuleDomain::TI31 => ObjectKind::I31,
+            _ => bail!("persistent object publication domain must be a durable object domain"),
+        };
         Ok(Self {
             logical_id: pack_object_granule_id(domain, object_id)?,
             version,
-            kind: domain as u16,
+            kind: kind as u16,
             type_layout_id,
             payload,
         })
     }
 
     pub(crate) fn persistent_object_type_layout_id(&self) -> Result<Option<TypeLayoutId>> {
-        if self.kind == PackedGranuleDomain::TStruct as u16
-            || self.kind == PackedGranuleDomain::TArray as u16
+        if self.kind == ObjectKind::Struct as u16 || self.kind == ObjectKind::Array as u16
         {
             return Ok(Some(TypeLayoutId::new(self.type_layout_id).context(
                 "persistent object publication type layout id cannot be zero",

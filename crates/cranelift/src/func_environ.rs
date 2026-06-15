@@ -3182,7 +3182,8 @@ impl FuncEnvironment<'_> {
     }
 
     fn transaction_object_ref_type_supported(ref_ty: WasmRefType) -> bool {
-        ref_ty.is_vmgcref_type_and_not_i31()
+        ref_ty.heap_type == WasmHeapType::I31
+            || ref_ty.is_vmgcref_type_and_not_i31()
             || matches!(ref_ty.heap_type.top(), WasmHeapTopType::Func)
     }
 
@@ -3567,13 +3568,17 @@ impl FuncEnvironment<'_> {
             WasmStorageType::Val(WasmValType::Ref(ref_ty))
                 if Self::transaction_object_ref_type_supported(ref_ty) =>
             {
-                match ref_ty.heap_type.top() {
-                    WasmHeapTopType::Func if self.pointer_type() == I64 => low,
-                    WasmHeapTopType::Func => builder.ins().ireduce(I32, low),
-                    WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
-                        builder.ins().ireduce(I32, low)
+                if ref_ty.heap_type == WasmHeapType::I31 {
+                    builder.ins().ireduce(I32, low)
+                } else {
+                    match ref_ty.heap_type.top() {
+                        WasmHeapTopType::Func if self.pointer_type() == I64 => low,
+                        WasmHeapTopType::Func => builder.ins().ireduce(I32, low),
+                        WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
+                            builder.ins().ireduce(I32, low)
+                        }
+                        WasmHeapTopType::Cont => unreachable!(),
                     }
-                    WasmHeapTopType::Cont => unreachable!(),
                 }
             }
             WasmStorageType::Val(WasmValType::Ref(_)) => {
