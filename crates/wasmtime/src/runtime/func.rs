@@ -1157,6 +1157,14 @@ impl Func {
         }
 
         for (ty, arg) in ty.params().zip(params) {
+            #[cfg(feature = "transaction")]
+            if store
+                .0
+                .transaction_wast_result_raw_from_val(arg, &ty)
+                .is_some()
+            {
+                continue;
+            }
             arg.ensure_matches_ty(store.0, &ty)
                 .context("argument type mismatch")?;
             if !arg.comes_from_same_store(store.0) {
@@ -1186,7 +1194,12 @@ impl Func {
         let mut values_vec = store.0.take_wasm_val_raw_storage();
         debug_assert!(values_vec.is_empty());
         values_vec.resize_with(values_vec_size, || ValRaw::v128(0))?;
-        for (arg, slot) in params.iter().cloned().zip(&mut values_vec) {
+        for ((arg, slot), ty) in params.iter().cloned().zip(&mut values_vec).zip(ty.params()) {
+            #[cfg(feature = "transaction")]
+            if let Some(transaction_ref) = store.0.transaction_wast_result_raw_from_val(&arg, &ty) {
+                *slot = transaction_ref;
+                continue;
+            }
             *slot = arg.to_raw(&mut *store)?;
         }
 
@@ -1199,6 +1212,11 @@ impl Func {
 
         for ((i, slot), val) in results.iter_mut().enumerate().zip(&values_vec) {
             let ty = ty.results().nth(i).unwrap();
+            #[cfg(feature = "transaction")]
+            if let Some(transaction_ref) = store.0.transaction_wast_result_val_from_raw(*val, &ty) {
+                *slot = transaction_ref;
+                continue;
+            }
             *slot = unsafe { Val::from_raw(&mut *store, *val, ty) };
         }
         values_vec.truncate(0);
@@ -2588,9 +2606,16 @@ impl HostFunc {
         let total = nparams + ty.results().len();
         val_vec.reserve(total)?;
 
-        let mut store = AutoAssertNoGc::new(store);
         for (i, ty) in ty.params().enumerate() {
-            val_vec.push(unsafe { Val::_from_raw(&mut store, params[i].assume_init(), &ty) })?;
+            let raw = unsafe { params[i].assume_init() };
+            #[cfg(feature = "transaction")]
+            if let Some(transaction_ref) = store.transaction_wast_result_val_from_raw(raw, &ty) {
+                val_vec.push(transaction_ref)?;
+                continue;
+            }
+
+            let mut store = AutoAssertNoGc::new(&mut *store);
+            val_vec.push(unsafe { Val::_from_raw(&mut store, raw, &ty) })?;
         }
 
         val_vec.try_extend((0..ty.results().len()).map(|_| Val::null_func_ref()))?;
@@ -2611,6 +2636,11 @@ impl HostFunc {
         // values, and we need to catch that here.
         let results = &args_then_results[ty.params().len()..];
         for (i, (ret, ty)) in results.iter().zip(ty.results()).enumerate() {
+            #[cfg(feature = "transaction")]
+            if let Some(transaction_ref) = store.0.transaction_wast_result_raw_from_val(ret, &ty) {
+                storage[i].write(transaction_ref);
+                continue;
+            }
             ret.ensure_matches_ty(store.0, &ty)
                 .context("function attempted to return an incompatible value")?;
             storage[i].write(ret.to_raw(store.as_context_mut())?);

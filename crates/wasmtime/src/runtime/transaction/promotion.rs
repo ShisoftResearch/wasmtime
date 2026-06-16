@@ -273,6 +273,14 @@ impl TransactionState {
         if gc_ref == 0 {
             return Ok(None);
         }
+        if let Some(object_id) = object_table.known_object_id_for_transaction_ref_handle(gc_ref) {
+            if object_table.is_persistent(object_id)? {
+                return Ok(Some(object_id));
+            }
+            return self
+                .promote_transaction_object_graph_in_attempt(object_table, object_id, attempt)
+                .map(Some);
+        }
         if let Some(object_id) = object_table.known_object_id_for_live_gc_ref_bridge(gc_ref) {
             if object_table.is_persistent(object_id)? {
                 return Ok(Some(object_id));
@@ -404,6 +412,22 @@ impl TransactionState {
     ) -> Result<Option<ObjectId>> {
         if gc_ref == 0 {
             return Ok(None);
+        }
+        if let Some(object_id) = object_table.known_object_id_for_transaction_ref_handle(gc_ref) {
+            if object_table.is_persistent(object_id)? {
+                return Ok(Some(object_id));
+            }
+            let promoted = self
+                .promoted_objects
+                .get(&object_id)
+                .copied()
+                .with_context(|| {
+                    format!(
+                        "transaction object ref handle {gc_ref:#x} backing object {object_id:?} was not promoted before commit"
+                    )
+                })
+                .context(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED)?;
+            return Ok(Some(promoted));
         }
         if let Some(object_id) = object_table.known_object_id_for_live_gc_ref_bridge(gc_ref) {
             if object_table.is_persistent(object_id)? {

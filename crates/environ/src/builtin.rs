@@ -190,10 +190,13 @@ macro_rules! foreach_builtin_function {
             transaction_failure_code(vmctx: vmctx) -> u32;
             // Compatibility helper for generated transaction fixtures that route scalar payloads through ti31.
             transaction_helper_i31_for_ref(vmctx: vmctx, gc_ref: u32) -> u32;
+            // Tests a transaction object ref handle against a reference type.
+            // Returns u32::MAX if the raw ref is not a transaction handle.
+            transaction_tref_test(vmctx: vmctx, raw_ref: u32, test_kind: u32, nullable: u32, expected_engine_type: u32) -> u32;
             // Acquires read permission for a known persistent transactional reference.
-            transaction_tref_cast_read(vmctx: vmctx, gc_ref: u32) -> bool;
+            transaction_tref_cast_read(vmctx: vmctx, ref_handle: u32) -> bool;
             // Acquires write permission for a known persistent transactional reference.
-            transaction_tref_cast_write(vmctx: vmctx, gc_ref: u32) -> bool;
+            transaction_tref_cast_write(vmctx: vmctx, ref_handle: u32) -> bool;
             // Returns a pointer to a staged transactional global cell.
             transaction_tglobal_get(vmctx: vmctx, global: u32) -> pointer;
             // Stages a transactional global write. `tag` identifies the value type.
@@ -230,26 +233,26 @@ macro_rules! foreach_builtin_function {
             transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
             // Stages a transactional table grow and returns the previous visible size.
             transaction_ttable_grow(vmctx: vmctx, table: u32, delta: u64, init: pointer) -> pointer;
-            // Associates a newly allocated Wasmtime GC struct with a transactional object record.
-            transaction_tstruct_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer) -> bool;
-            // Associates a module-initializer Wasmtime GC struct with a committed transactional object record.
-            transaction_tstruct_static_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer, layout_fields: pointer) -> bool;
+            // Allocates a transactional struct object record and returns its transaction ref handle.
+            transaction_tstruct_new(vmctx: vmctx, struct_type: u32, field_count: u32, fields: pointer) -> u32;
+            // Allocates a module-initializer transactional struct object record and returns its transaction ref handle.
+            transaction_tstruct_static_new(vmctx: vmctx, struct_type: u32, field_count: u32, fields: pointer, layout_fields: pointer) -> u32;
             // Stages a transactional struct field write.
             transaction_tstruct_set(vmctx: vmctx, gc_ref: u32, field: u32, tag: u32, low: u64, high: u64) -> bool;
             // Reads a transactional struct field as an ObjectValueAbi scratch pointer.
             transaction_tstruct_get(vmctx: vmctx, gc_ref: u32, field: u32) -> pointer;
-            // Associates a newly allocated Wasmtime GC array with a transactional object record.
-            transaction_tarray_new(vmctx: vmctx, gc_ref: u32, array_type: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
-            // Associates a module-initializer Wasmtime GC array with a committed transactional object record.
-            transaction_tarray_static_new(vmctx: vmctx, gc_ref: u32, array_type: u32, element_size: u32, element_is_object_ref: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
-            // Associates a newly allocated Wasmtime GC array with explicit transactional element records.
-            transaction_tarray_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_count: u32, elements: pointer) -> bool;
-            // Associates a module-initializer Wasmtime GC fixed array with committed transactional element records.
-            transaction_tarray_static_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_size: u32, element_is_object_ref: u32, element_count: u32, elements: pointer) -> bool;
-            // Associates a newly allocated Wasmtime GC numeric array initialized from data bytes.
-            transaction_tarray_new_data(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
-            // Associates a newly allocated Wasmtime GC reference array initialized from an element segment.
-            transaction_tarray_new_elem(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
+            // Allocates a transactional array object record and returns its transaction ref handle.
+            transaction_tarray_new(vmctx: vmctx, array_type: u32, len: u32, tag: u32, low: u64, high: u64) -> u32;
+            // Allocates a module-initializer transactional array object record and returns its transaction ref handle.
+            transaction_tarray_static_new(vmctx: vmctx, array_type: u32, element_size: u32, element_is_object_ref: u32, len: u32, tag: u32, low: u64, high: u64) -> u32;
+            // Allocates a transactional array object record with explicit element values and returns its transaction ref handle.
+            transaction_tarray_new_fixed(vmctx: vmctx, array_type: u32, element_count: u32, elements: pointer) -> u32;
+            // Allocates a module-initializer transactional fixed array object record and returns its transaction ref handle.
+            transaction_tarray_static_new_fixed(vmctx: vmctx, array_type: u32, element_size: u32, element_is_object_ref: u32, element_count: u32, elements: pointer) -> u32;
+            // Allocates a transactional numeric array object record initialized from data bytes and returns its transaction ref handle.
+            transaction_tarray_new_data(vmctx: vmctx, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> u32;
+            // Allocates a transactional reference array object record initialized from an element segment and returns its transaction ref handle.
+            transaction_tarray_new_elem(vmctx: vmctx, array_type: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> u32;
             // Stages a transactional array element write.
             transaction_tarray_set(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64) -> bool;
             // Stages a transactional array range fill.
@@ -463,6 +466,14 @@ impl BuiltinFunctionIndex {
             (@get gc_alloc_raw u32) => (TrapSentinel::Falsy);
             (@get array_new_data u32) => (TrapSentinel::Falsy);
             (@get array_new_elem u32) => (TrapSentinel::Falsy);
+            (@get transaction_tstruct_new u32) => (TrapSentinel::Falsy);
+            (@get transaction_tstruct_static_new u32) => (TrapSentinel::Falsy);
+            (@get transaction_tarray_new u32) => (TrapSentinel::Falsy);
+            (@get transaction_tarray_static_new u32) => (TrapSentinel::Falsy);
+            (@get transaction_tarray_new_fixed u32) => (TrapSentinel::Falsy);
+            (@get transaction_tarray_static_new_fixed u32) => (TrapSentinel::Falsy);
+            (@get transaction_tarray_new_data u32) => (TrapSentinel::Falsy);
+            (@get transaction_tarray_new_elem u32) => (TrapSentinel::Falsy);
 
             // The final epoch represents a trap
             (@get new_epoch u64) => (TrapSentinel::NegativeOne);
@@ -482,6 +493,7 @@ impl BuiltinFunctionIndex {
             (@get transaction_failure_pending u32) => (return None);
             (@get transaction_failure_code u32) => (return None);
             (@get transaction_helper_i31_for_ref u32) => (return None);
+            (@get transaction_tref_test u32) => (return None);
 
             // These libcalls can't trap
             (@get ref_func pointer) => (return None);

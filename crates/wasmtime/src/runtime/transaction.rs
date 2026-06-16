@@ -48,6 +48,7 @@ use type_layout::{
     PersistentTypeKind, PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId,
     TypeLayoutRegistry,
 };
+use wasmtime_environ::VMSharedTypeIndex;
 
 pub(crate) const PERSISTENT_OBJECT_ABI_SLOT_SIZE: u32 = 20;
 const WASMTIME_LAYOUT_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -817,6 +818,39 @@ impl PersistentObjectRefRaw {
     }
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransactionObjectRefRaw(u32);
+
+const FIRST_TRANSACTION_OBJECT_REF_HANDLE: u32 = 0x8000_0000;
+const TRANSACTION_OBJECT_REF_HANDLE_STEP: u32 = 2;
+
+impl TransactionObjectRefRaw {
+    pub(crate) fn from_optional_handle(handle: Option<u32>) -> Result<Self> {
+        Ok(match handle {
+            Some(0) => bail!("transaction object ref handle cannot be zero"),
+            Some(handle) => Self(handle),
+            None => Self(0),
+        })
+    }
+
+    pub(crate) fn from_handle(handle: u32) -> Result<Self> {
+        Self::from_optional_handle(Some(handle))
+    }
+
+    pub(crate) fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) fn as_raw(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) fn decode(self) -> Option<u32> {
+        (self.0 != 0).then_some(self.0)
+    }
+}
+
 pub(crate) const OBJECT_VALUE_ABI_TAG_I32: u32 = 0;
 pub(crate) const OBJECT_VALUE_ABI_TAG_I64: u32 = 1;
 pub(crate) const OBJECT_VALUE_ABI_TAG_F32: u32 = 2;
@@ -1017,6 +1051,7 @@ struct ObjectTableSlot {
     kind: ObjectKind,
     version: u64,
     type_layout_id: u32,
+    runtime_type_index: Option<VMSharedTypeIndex>,
     persistent: bool,
     current_record: object_heap::TxRecordHandle,
 }
@@ -1033,6 +1068,9 @@ struct WasmtimeTypeLayoutKey {
 pub(crate) struct ObjectTable {
     slots: Vec<Option<ObjectTableSlot>>,
     free_list: Vec<ObjectId>,
+    transaction_ref_handles_to_objects: BTreeMap<u32, ObjectId>,
+    objects_to_transaction_ref_handles: BTreeMap<ObjectId, u32>,
+    next_transaction_ref_handle: u32,
     // SHISOFT-TWASM-MOCK: live transaction ref bridge; persistent object records
     // must use ObjectId and must not call this helper.
     live_bridge_gc_refs_to_objects: BTreeMap<u32, ObjectId>,
@@ -1051,6 +1089,9 @@ impl Default for ObjectTable {
         let mut table = Self {
             slots: Vec::new(),
             free_list: Vec::new(),
+            transaction_ref_handles_to_objects: BTreeMap::new(),
+            objects_to_transaction_ref_handles: BTreeMap::new(),
+            next_transaction_ref_handle: FIRST_TRANSACTION_OBJECT_REF_HANDLE,
             live_bridge_gc_refs_to_objects: BTreeMap::new(),
             object_to_live_bridge_gc_ref: BTreeMap::new(),
             type_layouts: TypeLayoutRegistry::default(),
@@ -1215,6 +1256,47 @@ impl ObjectTable {
         self.allocate_persistent_struct_for_gc_ref_with_type_layout_id(gc_ref, fields, layout.id())
     }
 
+    pub(crate) fn allocate_persistent_struct_with_wasmtime_type_layout(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        type_index: u32,
+        field_layouts: Vec<WasmtimePersistentFieldLayout>,
+        fields: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        let namespace = wasmtime_type_layout_namespace(owner_instance)?;
+        self.allocate_persistent_struct_with_wasmtime_type_layout_namespace(
+            namespace,
+            type_index,
+            field_layouts,
+            fields,
+        )
+    }
+
+    pub(crate) fn allocate_persistent_struct_with_wasmtime_type_layout_namespace(
+        &mut self,
+        type_namespace: u32,
+        type_index: u32,
+        field_layouts: Vec<WasmtimePersistentFieldLayout>,
+        fields: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        ensure!(
+            field_layouts.len() == fields.len(),
+            "transactional persistent struct layout field count does not match payload field count"
+        );
+        let body_size = validate_wasmtime_struct_field_layouts(&field_layouts)?;
+        let fingerprint = wasmtime_struct_layout_fingerprint(body_size, &field_layouts)?;
+        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+            type_namespace,
+            type_index,
+            PersistentTypeKind::Struct,
+            fingerprint,
+        )?;
+        let layout =
+            persistent_layout_for_wasmtime_struct_type(type_layout_id, body_size, &field_layouts)?;
+        self.register_type_layout(layout.clone())?;
+        self.allocate_persistent_struct_with_type_layout_id(fields, layout.id())
+    }
+
     pub(crate) fn ensure_persistent_struct_layout_for_wasmtime_type_layout_namespace(
         &mut self,
         type_namespace: u32,
@@ -1276,14 +1358,7 @@ impl ObjectTable {
         fields: Vec<ObjectValue>,
         type_layout_id: TypeLayoutId,
     ) -> Result<ObjectId> {
-        ensure!(
-            gc_ref != 0,
-            "transactional struct object cannot use null GC ref"
-        );
-        ensure!(
-            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
-            "transactional object GC ref is already associated"
-        );
+        self.ensure_live_gc_ref_bridge_available(gc_ref, "struct")?;
         let object_id = self.allocate_payload_with_type_layout_id(
             ObjectPayload::Struct(fields),
             type_layout_id,
@@ -1293,19 +1368,24 @@ impl ObjectTable {
         Ok(object_id)
     }
 
+    fn allocate_persistent_struct_with_type_layout_id(
+        &mut self,
+        fields: Vec<ObjectValue>,
+        type_layout_id: TypeLayoutId,
+    ) -> Result<ObjectId> {
+        self.allocate_payload_with_type_layout_id(
+            ObjectPayload::Struct(fields),
+            type_layout_id,
+            true,
+        )
+    }
+
     pub(crate) fn allocate_struct_for_gc_ref(
         &mut self,
         gc_ref: u32,
         fields: Vec<ObjectValue>,
     ) -> Result<ObjectId> {
-        ensure!(
-            gc_ref != 0,
-            "transactional struct object cannot use null GC ref"
-        );
-        ensure!(
-            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
-            "transactional object GC ref is already associated"
-        );
+        self.ensure_live_gc_ref_bridge_available(gc_ref, "struct")?;
         let object_id = self.allocate_struct(fields)?;
         self.associate_live_gc_ref_for_transaction_bridge(gc_ref, object_id)?;
         Ok(object_id)
@@ -1342,6 +1422,26 @@ impl ObjectTable {
         let namespace = wasmtime_type_layout_namespace(owner_instance)?;
         self.allocate_persistent_array_for_gc_ref_with_wasmtime_element_layout_and_initializer_namespace(
             gc_ref,
+            namespace,
+            type_index,
+            element_size,
+            element_is_object_ref,
+            initializer,
+            len,
+        )
+    }
+
+    pub(crate) fn allocate_persistent_array_with_wasmtime_element_layout_and_initializer(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        type_index: u32,
+        element_size: u32,
+        element_is_object_ref: bool,
+        initializer: ObjectValue,
+        len: usize,
+    ) -> Result<ObjectId> {
+        let namespace = wasmtime_type_layout_namespace(owner_instance)?;
+        self.allocate_persistent_array_with_wasmtime_element_layout_and_initializer_namespace(
             namespace,
             type_index,
             element_size,
@@ -1420,6 +1520,32 @@ impl ObjectTable {
         self.allocate_persistent_array_for_gc_ref_with_type_layout_id(gc_ref, elements, layout.id())
     }
 
+    pub(crate) fn allocate_persistent_array_with_wasmtime_fixed_type_namespace(
+        &mut self,
+        type_namespace: u32,
+        type_index: u32,
+        element_size: u32,
+        element_is_object_ref: bool,
+        elements: Vec<ObjectValue>,
+    ) -> Result<ObjectId> {
+        let element_size =
+            validate_wasmtime_array_element_layout(element_size, element_is_object_ref)?;
+        let fingerprint = wasmtime_array_layout_fingerprint(element_size, element_is_object_ref);
+        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+            type_namespace,
+            type_index,
+            PersistentTypeKind::Array,
+            fingerprint,
+        )?;
+        let layout = wasmtime_array_layout_from_element_layout(
+            type_layout_id,
+            element_size,
+            element_is_object_ref,
+        )?;
+        self.register_type_layout(layout.clone())?;
+        self.allocate_persistent_array_with_type_layout_id(elements, layout.id())
+    }
+
     pub(crate) fn ensure_persistent_array_layout_for_wasmtime_type_layout_namespace(
         &mut self,
         type_namespace: u32,
@@ -1477,6 +1603,33 @@ impl ObjectTable {
         )
     }
 
+    pub(crate) fn allocate_persistent_array_with_wasmtime_element_layout_and_initializer_namespace(
+        &mut self,
+        type_namespace: u32,
+        type_index: u32,
+        element_size: u32,
+        element_is_object_ref: bool,
+        initializer: ObjectValue,
+        len: usize,
+    ) -> Result<ObjectId> {
+        let element_size =
+            validate_wasmtime_array_element_layout(element_size, element_is_object_ref)?;
+        let fingerprint = wasmtime_array_layout_fingerprint(element_size, element_is_object_ref);
+        let type_layout_id = self.persistent_type_layout_id_for_wasmtime_key(
+            type_namespace,
+            type_index,
+            PersistentTypeKind::Array,
+            fingerprint,
+        )?;
+        let layout = wasmtime_array_layout_from_element_layout(
+            type_layout_id,
+            element_size,
+            element_is_object_ref,
+        )?;
+        self.register_type_layout(layout.clone())?;
+        self.allocate_persistent_array_with_type_layout_id(vec![initializer; len], layout.id())
+    }
+
     #[cfg(test)]
     pub(crate) fn allocate_persistent_array_for_gc_ref_with_wasmtime_type_and_initializer_namespace(
         &mut self,
@@ -1517,14 +1670,7 @@ impl ObjectTable {
         elements: Vec<ObjectValue>,
         type_layout_id: TypeLayoutId,
     ) -> Result<ObjectId> {
-        ensure!(
-            gc_ref != 0,
-            "transactional array object cannot use null GC ref"
-        );
-        ensure!(
-            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
-            "transactional object GC ref is already associated"
-        );
+        self.ensure_live_gc_ref_bridge_available(gc_ref, "array")?;
         let object_id = self.allocate_payload_with_type_layout_id(
             ObjectPayload::Array(elements),
             type_layout_id,
@@ -1534,19 +1680,24 @@ impl ObjectTable {
         Ok(object_id)
     }
 
+    fn allocate_persistent_array_with_type_layout_id(
+        &mut self,
+        elements: Vec<ObjectValue>,
+        type_layout_id: TypeLayoutId,
+    ) -> Result<ObjectId> {
+        self.allocate_payload_with_type_layout_id(
+            ObjectPayload::Array(elements),
+            type_layout_id,
+            true,
+        )
+    }
+
     pub(crate) fn allocate_array_for_gc_ref(
         &mut self,
         gc_ref: u32,
         elements: Vec<ObjectValue>,
     ) -> Result<ObjectId> {
-        ensure!(
-            gc_ref != 0,
-            "transactional array object cannot use null GC ref"
-        );
-        ensure!(
-            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
-            "transactional object GC ref is already associated"
-        );
+        self.ensure_live_gc_ref_bridge_available(gc_ref, "array")?;
         let object_id = self.allocate_array(elements)?;
         self.associate_live_gc_ref_for_transaction_bridge(gc_ref, object_id)?;
         Ok(object_id)
@@ -1630,6 +1781,7 @@ impl ObjectTable {
             kind,
             version,
             type_layout_id: type_layout_id.get(),
+            runtime_type_index: None,
             persistent,
             current_record: record,
         });
@@ -1690,6 +1842,37 @@ impl ObjectTable {
         self.live_count
     }
 
+    #[cfg(test)]
+    fn live_object_ids_for_test(&self) -> Vec<ObjectId> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().map(|_| ObjectId {
+                    object_index: u64::try_from(index).unwrap(),
+                })
+            })
+            .collect()
+    }
+
+    fn ensure_live_gc_ref_bridge_available(&self, gc_ref: u32, object_kind: &str) -> Result<()> {
+        ensure!(
+            gc_ref != 0,
+            "transactional {object_kind} object cannot use null GC ref"
+        );
+        ensure!(
+            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
+            "transactional object GC ref is already associated"
+        );
+        ensure!(
+            !self
+                .transaction_ref_handles_to_objects
+                .contains_key(&gc_ref),
+            "transactional object GC ref collides with transaction object handle"
+        );
+        Ok(())
+    }
+
     pub(crate) fn associate_live_gc_ref_for_transaction_bridge(
         &mut self,
         gc_ref: u32,
@@ -1697,6 +1880,12 @@ impl ObjectTable {
     ) -> Result<()> {
         ensure!(gc_ref != 0, "transactional object cannot use null GC ref");
         self.live_slot(object_id)?;
+        ensure!(
+            !self
+                .transaction_ref_handles_to_objects
+                .contains_key(&gc_ref),
+            "transactional object GC ref collides with transaction object handle"
+        );
         if let Some(existing) = self.live_bridge_gc_refs_to_objects.get(&gc_ref).copied() {
             ensure!(
                 existing == object_id,
@@ -1723,11 +1912,112 @@ impl ObjectTable {
             .with_context(|| format!("unknown transactional object GC ref: {gc_ref:#x}"))
     }
 
+    pub(crate) fn transaction_ref_handle_for_object_id(
+        &mut self,
+        object_id: ObjectId,
+    ) -> Result<u32> {
+        self.transaction_ref_handle_for_object_id_avoiding(object_id, |_| false)
+    }
+
+    pub(crate) fn transaction_ref_handle_for_object_id_avoiding<F>(
+        &mut self,
+        object_id: ObjectId,
+        is_reserved_live_ref_raw: F,
+    ) -> Result<u32>
+    where
+        F: Fn(u32) -> bool,
+    {
+        self.live_slot(object_id)?;
+        if let Some(handle) = self
+            .objects_to_transaction_ref_handles
+            .get(&object_id)
+            .copied()
+        {
+            ensure!(
+                !is_reserved_live_ref_raw(handle),
+                "transaction object ref handle collides with registered live ref"
+            );
+            return Ok(handle);
+        }
+
+        let start = if self.next_transaction_ref_handle == 0 {
+            FIRST_TRANSACTION_OBJECT_REF_HANDLE
+        } else {
+            self.next_transaction_ref_handle
+        };
+        let mut candidate = start;
+        loop {
+            if !self
+                .transaction_ref_handles_to_objects
+                .contains_key(&candidate)
+                && !self.live_bridge_gc_refs_to_objects.contains_key(&candidate)
+                && !is_reserved_live_ref_raw(candidate)
+            {
+                self.transaction_ref_handles_to_objects
+                    .insert(candidate, object_id);
+                self.objects_to_transaction_ref_handles
+                    .insert(object_id, candidate);
+                self.next_transaction_ref_handle = candidate
+                    .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
+                    .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
+                return Ok(candidate);
+            }
+            candidate = candidate
+                .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
+                .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
+            ensure!(
+                candidate != start,
+                "transaction object ref handle space is exhausted"
+            );
+        }
+    }
+
+    pub(crate) fn object_id_for_transaction_ref_handle(&self, handle: u32) -> Result<ObjectId> {
+        let handle = TransactionObjectRefRaw::from_handle(handle)?.as_raw();
+        let object_id = self
+            .transaction_ref_handles_to_objects
+            .get(&handle)
+            .copied()
+            .with_context(|| format!("unknown transaction object ref handle: {handle:#x}"))?;
+        self.live_slot(object_id)?;
+        Ok(object_id)
+    }
+
+    pub(crate) fn known_persistent_object_id_for_transaction_ref_handle(
+        &self,
+        handle: u32,
+    ) -> Result<Option<ObjectId>> {
+        let Some(object_id) = self.known_object_id_for_transaction_ref_handle(handle) else {
+            return Ok(None);
+        };
+        if self.is_persistent(object_id)? {
+            Ok(Some(object_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn known_object_id_for_transaction_ref_handle(
+        &self,
+        handle: u32,
+    ) -> Option<ObjectId> {
+        let handle = TransactionObjectRefRaw::from_raw(handle).decode()?;
+        let object_id = self
+            .transaction_ref_handles_to_objects
+            .get(&handle)
+            .copied()?;
+        self.live_slot(object_id).ok()?;
+        Some(object_id)
+    }
+
     pub(crate) fn object_id_for_live_bridge_transaction_ref_raw(
         &self,
         raw_ref: u32,
     ) -> Result<ObjectId> {
         ensure!(raw_ref != 0, "transactional object cannot use null ref");
+        if let Some(object_id) = self.known_object_id_for_transaction_ref_handle(raw_ref) {
+            return Ok(object_id);
+        }
         if let Some(object_id) = self.known_object_id_for_live_gc_ref_bridge(raw_ref) {
             return Ok(object_id);
         }
@@ -1762,6 +2052,11 @@ impl ObjectTable {
         &self,
         raw_ref: u32,
     ) -> Result<Option<ObjectId>> {
+        if let Some(object_id) =
+            self.known_persistent_object_id_for_transaction_ref_handle(raw_ref)?
+        {
+            return Ok(Some(object_id));
+        }
         if let Some(object_id) = self.known_persistent_object_id_for_live_gc_ref_bridge(raw_ref)? {
             return Ok(Some(object_id));
         }
@@ -1866,6 +2161,27 @@ impl ObjectTable {
         Ok(self.live_slot(object_id)?.kind)
     }
 
+    pub(crate) fn runtime_type_index(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<Option<VMSharedTypeIndex>> {
+        Ok(self.live_slot(object_id)?.runtime_type_index)
+    }
+
+    pub(crate) fn set_runtime_type_index(
+        &mut self,
+        object_id: ObjectId,
+        runtime_type_index: VMSharedTypeIndex,
+    ) -> Result<()> {
+        let index = object_slot_index(object_id)?;
+        let slot = self.live_slot(object_id)?.clone();
+        self.slots[index] = Some(ObjectTableSlot {
+            runtime_type_index: Some(runtime_type_index),
+            ..slot
+        });
+        Ok(())
+    }
+
     pub(crate) fn version(&self, object_id: ObjectId) -> Result<u64> {
         Ok(self.live_slot(object_id)?.version)
     }
@@ -1913,6 +2229,7 @@ impl ObjectTable {
             "object payload kind does not match object table slot kind"
         );
         let type_layout_id = self.live_slot(object_id)?.type_layout_id;
+        let runtime_type_index = self.live_slot(object_id)?.runtime_type_index;
         let persistent = self.live_slot(object_id)?.persistent;
         let record_version = self.bump_record_version()?;
         let record = self.heap.allocate_record(
@@ -1928,6 +2245,7 @@ impl ObjectTable {
             kind,
             version,
             type_layout_id,
+            runtime_type_index,
             persistent,
             current_record: record,
         });
@@ -2009,6 +2327,9 @@ impl ObjectTable {
             return Ok(false);
         }
         self.slots[index] = None;
+        if let Some(handle) = self.objects_to_transaction_ref_handles.remove(&object_id) {
+            self.transaction_ref_handles_to_objects.remove(&handle);
+        }
         if let Some(gc_ref) = self.object_to_live_bridge_gc_ref.remove(&object_id) {
             self.live_bridge_gc_refs_to_objects.remove(&gc_ref);
         }
@@ -2038,6 +2359,9 @@ impl ObjectTable {
     fn clear_volatile_index(&mut self) {
         self.slots.clear();
         self.free_list.clear();
+        self.transaction_ref_handles_to_objects.clear();
+        self.objects_to_transaction_ref_handles.clear();
+        self.next_transaction_ref_handle = FIRST_TRANSACTION_OBJECT_REF_HANDLE;
         self.live_bridge_gc_refs_to_objects.clear();
         self.object_to_live_bridge_gc_ref.clear();
         self.next_version = 0;
@@ -2093,6 +2417,7 @@ impl ObjectTable {
                 kind,
                 version,
                 type_layout_id: header.type_layout_id,
+                runtime_type_index: None,
                 persistent: true,
                 current_record: handle,
             });
@@ -2169,6 +2494,7 @@ impl ObjectTable {
                 kind,
                 version,
                 type_layout_id: header.type_layout_id,
+                runtime_type_index: None,
                 persistent: true,
                 current_record: handle,
             });
@@ -4333,26 +4659,26 @@ impl TransactionState {
         Ok(acquired)
     }
 
-    pub(crate) fn acquire_tref_read_for_gc_ref(
+    pub(crate) fn acquire_tref_read_for_transaction_ref_handle(
         &mut self,
         object_table: &mut ObjectTable,
-        raw_ref: u32,
+        handle: u32,
     ) -> Result<bool> {
         let Some(object_id) =
-            object_table.known_persistent_object_id_for_live_bridge_transaction_ref_raw(raw_ref)?
+            object_table.known_persistent_object_id_for_transaction_ref_handle(handle)?
         else {
             return Ok(false);
         };
         self.acquire_object_read(object_table, object_id)
     }
 
-    pub(crate) fn acquire_tref_write_for_gc_ref(
+    pub(crate) fn acquire_tref_write_for_transaction_ref_handle(
         &mut self,
         object_table: &mut ObjectTable,
-        raw_ref: u32,
+        handle: u32,
     ) -> Result<bool> {
         let Some(object_id) =
-            object_table.known_persistent_object_id_for_live_bridge_transaction_ref_raw(raw_ref)?
+            object_table.known_persistent_object_id_for_transaction_ref_handle(handle)?
         else {
             return Ok(false);
         };
@@ -8373,7 +8699,7 @@ mod tests {
     }
 
     #[test]
-    fn tref_cast_acquires_object_permission_for_known_refs() {
+    fn tref_cast_acquires_object_permission_for_transaction_handles() {
         let mut objects = ObjectTable::default();
         let struct_object = objects
             .allocate_persistent_struct_for_gc_ref(0x11, vec![ObjectValue::I32(7)])
@@ -8381,13 +8707,19 @@ mod tests {
         let array_object = objects
             .allocate_persistent_array_for_gc_ref(0x22, vec![ObjectValue::I32(9)])
             .unwrap();
+        let struct_handle = objects
+            .transaction_ref_handle_for_object_id(struct_object)
+            .unwrap();
+        let array_handle = objects
+            .transaction_ref_handle_for_object_id(array_object)
+            .unwrap();
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
 
         assert!(
             state
-                .acquire_tref_read_for_gc_ref(&mut objects, 0x11)
+                .acquire_tref_read_for_transaction_ref_handle(&mut objects, struct_handle)
                 .unwrap()
         );
         assert!(state.owns_object_read(struct_object));
@@ -8395,7 +8727,7 @@ mod tests {
 
         assert!(
             state
-                .acquire_tref_write_for_gc_ref(&mut objects, 0x22)
+                .acquire_tref_write_for_transaction_ref_handle(&mut objects, array_handle)
                 .unwrap()
         );
         assert!(state.owns_object_read(array_object));
@@ -8412,10 +8744,14 @@ mod tests {
 
         state.begin().unwrap();
 
-        assert!(!state.acquire_tref_read_for_gc_ref(&mut objects, 0).unwrap());
         assert!(
             !state
-                .acquire_tref_write_for_gc_ref(&mut objects, 0x99)
+                .acquire_tref_read_for_transaction_ref_handle(&mut objects, 0)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .acquire_tref_write_for_transaction_ref_handle(&mut objects, 0x99)
                 .unwrap()
         );
         assert!(!state.owns_object_read(object));
@@ -8423,7 +8759,7 @@ mod tests {
     }
 
     #[test]
-    fn tref_cast_does_not_lock_volatile_gc_backed_objects() {
+    fn tref_cast_does_not_lock_ordinary_gc_bridge_refs_without_handle() {
         let mut objects = ObjectTable::default();
         let object = objects
             .allocate_struct_for_gc_ref(0x11, vec![ObjectValue::I32(7)])
@@ -8435,12 +8771,12 @@ mod tests {
         assert!(!objects.is_persistent(object).unwrap());
         assert!(
             !state
-                .acquire_tref_read_for_gc_ref(&mut objects, 0x11)
+                .acquire_tref_read_for_transaction_ref_handle(&mut objects, 0x11)
                 .unwrap()
         );
         assert!(
             !state
-                .acquire_tref_write_for_gc_ref(&mut objects, 0x11)
+                .acquire_tref_write_for_transaction_ref_handle(&mut objects, 0x11)
                 .unwrap()
         );
         assert!(!state.owns_object_read(object));
@@ -8460,6 +8796,9 @@ mod tests {
         let object = objects
             .allocate_persistent_struct_for_gc_ref(0x11, vec![ObjectValue::I32(7)])
             .unwrap();
+        let handle = objects
+            .transaction_ref_handle_for_object_id(object)
+            .unwrap();
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
@@ -8472,7 +8811,7 @@ mod tests {
         );
 
         state
-            .acquire_tref_read_for_gc_ref(&mut objects, 0x11)
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)
             .unwrap();
         assert_eq!(
             state.read_struct_field(&objects, object, 0).unwrap(),
@@ -8489,7 +8828,7 @@ mod tests {
         );
 
         state
-            .acquire_tref_write_for_gc_ref(&mut objects, 0x11)
+            .acquire_tref_write_for_transaction_ref_handle(&mut objects, handle)
             .unwrap();
         state
             .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
@@ -9480,6 +9819,49 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_receiver_handles_reject_gc_bridge_and_durable_raw_refs() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x715, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let durable_raw = PersistentObjectRefRaw::from_optional_object_id(Some(object))
+            .unwrap()
+            .as_raw();
+        let handle = objects
+            .transaction_ref_handle_for_object_id(object)
+            .unwrap();
+
+        assert_eq!(
+            objects
+                .object_id_for_transaction_ref_handle(handle)
+                .unwrap(),
+            object
+        );
+
+        let gc_bridge_error = objects
+            .object_id_for_transaction_ref_handle(0x715)
+            .unwrap_err();
+        assert!(
+            gc_bridge_error
+                .to_string()
+                .contains("unknown transaction object ref handle"),
+            "{gc_bridge_error:?}"
+        );
+
+        if let Ok(raw) = u32::try_from(durable_raw) {
+            let durable_raw_error = objects
+                .object_id_for_transaction_ref_handle(raw)
+                .unwrap_err();
+            assert!(
+                durable_raw_error
+                    .to_string()
+                    .contains("unknown transaction object ref handle"),
+                "{durable_raw_error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn transaction_object_abi_layout_is_explicit() {
         assert_eq!(
             core::mem::size_of::<PersistentObjectRefRaw>(),
@@ -9489,6 +9871,15 @@ mod tests {
             core::mem::align_of::<PersistentObjectRefRaw>(),
             core::mem::align_of::<u64>()
         );
+        assert_eq!(
+            core::mem::size_of::<TransactionObjectRefRaw>(),
+            core::mem::size_of::<u32>()
+        );
+        assert_eq!(
+            core::mem::align_of::<TransactionObjectRefRaw>(),
+            core::mem::align_of::<u32>()
+        );
+        assert_eq!(TransactionObjectRefRaw::from_raw(0).decode(), None);
         assert_eq!(core::mem::size_of::<ObjectValueAbi>(), 24);
         assert_eq!(
             core::mem::align_of::<ObjectValueAbi>(),
@@ -9596,6 +9987,96 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_ref_handle_supports_full_width_object_id() -> Result<()> {
+        let mut objects = ObjectTable::default();
+        let object_id =
+            objects.allocate_persistent_struct_for_gc_ref(0x711, vec![ObjectValue::I32(1)])?;
+        let missing_full_width_object_id = ObjectId {
+            object_index: u64::from(u32::MAX) + 1,
+        };
+
+        let durable_ref =
+            PersistentObjectRefRaw::from_optional_object_id(Some(missing_full_width_object_id))?;
+        assert!(durable_ref.as_raw() > u64::from(u32::MAX));
+
+        let handle = objects.transaction_ref_handle_for_object_id(object_id)?;
+        assert_ne!(handle, 0);
+        assert_eq!(
+            objects.object_id_for_transaction_ref_handle(handle)?,
+            object_id
+        );
+        assert_eq!(
+            objects.known_persistent_object_id_for_transaction_ref_handle(handle)?,
+            Some(object_id)
+        );
+        assert_eq!(
+            objects.transaction_ref_handle_for_object_id(object_id)?,
+            handle
+        );
+
+        let error = objects
+            .transaction_ref_handle_for_object_id(missing_full_width_object_id)
+            .unwrap_err();
+        assert!(error.to_string().contains("object table slot is not live"));
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_object_ref_handles_do_not_collide_with_live_gc_bridge_refs() -> Result<()> {
+        let mut objects = ObjectTable::default();
+        let gc_object = objects.allocate_persistent_struct_for_gc_ref(
+            FIRST_TRANSACTION_OBJECT_REF_HANDLE,
+            vec![ObjectValue::I32(1)],
+        )?;
+        let handle_object =
+            objects.allocate_persistent_struct_for_gc_ref(0x712, vec![ObjectValue::I32(2)])?;
+
+        assert_eq!(
+            objects.object_id_for_live_gc_ref_bridge(FIRST_TRANSACTION_OBJECT_REF_HANDLE)?,
+            gc_object
+        );
+        let handle = objects.transaction_ref_handle_for_object_id(handle_object)?;
+        assert_ne!(handle, FIRST_TRANSACTION_OBJECT_REF_HANDLE);
+        assert_eq!(
+            objects.object_id_for_transaction_ref_handle(handle)?,
+            handle_object
+        );
+        let live_count_before_collision = objects.live_count();
+
+        let error = objects
+            .allocate_struct_for_gc_ref(handle, vec![ObjectValue::I32(3)])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transactional object GC ref collides with transaction object handle")
+        );
+        assert_eq!(objects.live_count(), live_count_before_collision);
+
+        let error = objects
+            .allocate_persistent_struct_for_gc_ref(handle, vec![ObjectValue::I32(4)])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transactional object GC ref collides with transaction object handle")
+        );
+        assert_eq!(objects.live_count(), live_count_before_collision);
+
+        let other_object =
+            objects.allocate_persistent_struct_for_gc_ref(0x714, vec![ObjectValue::I32(3)])?;
+        let error = objects
+            .associate_live_gc_ref_for_transaction_bridge(handle, other_object)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transactional object GC ref collides with transaction object handle")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn persistent_ref_abi_live_bridge_rejects_overflow() {
         let error = ObjectTable::persistent_ref_raw_for_live_bridge(ObjectId {
             object_index: u64::from(u32::MAX),
@@ -9685,6 +10166,47 @@ mod tests {
             ObjectValueAbi::from_object_value(&ObjectValue::ExternRef(extern_))?
                 .to_object_value()?,
             ObjectValue::ExternRef(extern_)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_func_extern_registry_hooks_rebind_live_refs_after_reopen() -> Result<()> {
+        let engine = crate::Engine::default();
+        let mut store = crate::Store::new(&engine, ());
+        let func = crate::Func::wrap(&mut store, || {});
+        let func_identity = DurableFuncIdentity {
+            module_fingerprint: 0x5142_0000_0000_0001,
+            function_index: 4,
+            type_layout_id: TypeLayoutId::BUILTIN_FUNC,
+        };
+        let extern_identity = DurableExternIdentity {
+            namespace: 0x5142,
+            handle: 0x5142_0000_0000_0002,
+            type_layout_id: TypeLayoutId::BUILTIN_EXTERN,
+        };
+
+        assert!(
+            store
+                .transaction_resolve_durable_func_ref_for_test(func_identity)?
+                .is_none()
+        );
+        assert_eq!(
+            store.transaction_resolve_durable_extern_ref_for_test(extern_identity),
+            None
+        );
+
+        store.transaction_register_durable_func_ref_for_test(&func, func_identity)?;
+        store.transaction_register_durable_extern_ref_for_test(0x5142, extern_identity)?;
+
+        assert!(
+            store
+                .transaction_resolve_durable_func_ref_for_test(func_identity)?
+                .is_some()
+        );
+        assert_eq!(
+            store.transaction_resolve_durable_extern_ref_for_test(extern_identity),
+            Some(0x5142)
         );
         Ok(())
     }
@@ -10466,6 +10988,58 @@ mod tests {
         }
 
         #[test]
+        fn durable_func_extern_refs_survive_object_payload_recovery() {
+            let func = DurableFuncIdentity {
+                module_fingerprint: 0x2060_0000_0000_0001,
+                function_index: 3,
+                type_layout_id: type_layout::TypeLayoutId::BUILTIN_FUNC,
+            };
+            let extern_ = DurableExternIdentity {
+                namespace: 206,
+                handle: 0x2060_0000_0000_0002,
+                type_layout_id: type_layout::TypeLayoutId::BUILTIN_EXTERN,
+            };
+
+            let ((object, layout_id), recovered) =
+                recover_file_backed_object_layout_case_for_test(206, |objects, state| {
+                    let object = objects
+                        .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                            0x920,
+                            206,
+                            10,
+                            vec![ObjectValue::I32(0), ObjectValue::I32(0)],
+                        )?;
+                    let layout_id = objects.live_slot(object)?.type_layout_id;
+                    state.acquire_object_write(objects, object)?;
+                    state.stage_struct_field(objects, object, 0, ObjectValue::FuncRef(func))?;
+                    state.stage_struct_field(
+                        objects,
+                        object,
+                        1,
+                        ObjectValue::ExternRef(extern_),
+                    )?;
+                    Ok((object, layout_id))
+                })
+                .unwrap();
+
+            assert_eq!(recovered.object_winners.len(), 1);
+            assert_eq!(recovered.object_winners[0].object_id, object.object_index);
+            assert_eq!(recovered.object_winners[0].type_layout_id, layout_id);
+            assert_eq!(
+                recovered.rebuilt.payload(object).unwrap(),
+                ObjectPayload::Struct(vec![
+                    ObjectValue::FuncRef(func),
+                    ObjectValue::ExternRef(extern_),
+                ])
+            );
+            assert_eq!(
+                recovered.rebuilt.trace_object_ids(object).unwrap(),
+                Vec::new()
+            );
+            assert_eq!(recovered.rebuilt.live_count(), 1);
+        }
+
+        #[test]
         fn persistent_array_of_scalars_recovers_payload_and_layout() {
             let ((object, layout_id), recovered) =
                 recover_file_backed_object_layout_case_for_test(203, |objects, state| {
@@ -10698,13 +11272,130 @@ mod tests {
             assert!(rebuilt.payload(garbage).is_err());
             assert_eq!(rebuilt.live_count(), 1);
         }
+
+        #[test]
+        fn pre_gc_object_recovery_closure_file_backed_root_replacement_and_table_roots() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("pre-gc-root-closure.bin");
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(811),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+
+            let old_global_root = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8110,
+                    811,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+            let new_global_root = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8111,
+                    811,
+                    2,
+                    vec![ObjectValue::I32(2)],
+                )
+                .unwrap();
+            let table_root = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8112,
+                    811,
+                    3,
+                    vec![ObjectValue::I32(3)],
+                )
+                .unwrap();
+
+            state
+                .acquire_object_write(&mut objects, old_global_root)
+                .unwrap();
+            state
+                .stage_struct_field(&objects, old_global_root, 0, ObjectValue::I32(11))
+                .unwrap();
+            state
+                .acquire_object_write(&mut objects, new_global_root)
+                .unwrap();
+            state
+                .stage_struct_field(&objects, new_global_root, 0, ObjectValue::I32(22))
+                .unwrap();
+            state
+                .acquire_object_write(&mut objects, table_root)
+                .unwrap();
+            state
+                .stage_struct_field(&objects, table_root, 0, ObjectValue::I32(33))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x8110))
+                .unwrap();
+            state
+                .stage_table_element_owned(None, 4, 7, TableElementSnapshot::GcRef(0x8112))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(811, 811, &mut objects, &mut state)
+                .unwrap();
+
+            let second_tx = state.begin().unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x8111))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(
+                u32::try_from(second_tx.as_raw()).unwrap(),
+                u32::try_from(second_tx.as_raw()).unwrap(),
+                &mut objects,
+                &mut state,
+            )
+            .unwrap();
+            drop(state);
+
+            let (recovered_region, object_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let recovered_roots = recovered_region
+                .root_object_ids
+                .iter()
+                .copied()
+                .map(|object_index| ObjectId { object_index })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(recovered_roots, object_set([new_global_root, table_root]));
+
+            let mut rebuilt = ObjectTable::default();
+            let report = rebuilt
+                .rebuild_reachable_from_recovery_for_test(
+                    &recovered_region.type_layouts,
+                    &object_winners,
+                    &recovered_region.root_object_ids,
+                )
+                .unwrap();
+
+            assert_eq!(
+                report.mark.reachable,
+                object_set([new_global_root, table_root])
+            );
+            assert!(
+                report
+                    .skipped_unreachable_winners
+                    .contains(&old_global_root.object_index)
+            );
+            assert_eq!(
+                rebuilt.payload(new_global_root).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(22)])
+            );
+            assert_eq!(
+                rebuilt.payload(table_root).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(33)])
+            );
+            assert!(rebuilt.payload(old_global_root).is_err());
+            assert_eq!(rebuilt.live_count(), 2);
+        }
     }
 
     mod file_backed_mixed_tmemory_object_recovery {
         use super::*;
 
         #[test]
-        fn committed_transaction_keeps_tmemory_write_and_redoes_object_publication() {
+        fn pre_gc_object_recovery_closure_mixed_object_linear_memory_transaction_after_reopen() {
             let dir = tempfile::tempdir().unwrap();
             let tmemory_path = dir.path().join("tmemory.bin");
             let tx_log_path = dir.path().join("tx-log.bin");
@@ -14285,6 +14976,34 @@ mod tests {
         Ok((expected, recovered_region, object_winners))
     }
 
+    fn commit_active_file_backed_publications_for_test(
+        stream_id: u32,
+        txid: u32,
+        objects: &mut ObjectTable,
+        state: &mut TransactionState,
+    ) -> Result<()> {
+        let mut publications = Vec::new();
+        state.promote_persistent_references_before_commit(objects)?;
+        state.commit_object_payloads_into(objects, &mut publications)?;
+        let root_delta = state.staged_persistent_root_delta(objects)?;
+        let persistent_gc_delta = state.persistent_gc_commit_delta(objects, &publications)?;
+        publications.extend(state.persistent_root_publications(&root_delta)?);
+
+        if let Some(marker) = state.publish_object_publications_before_commit(
+            stream_id,
+            txid,
+            objects,
+            &publications,
+        )? {
+            state.publish_commit_lp(stream_id, txid, marker)?;
+        }
+        state.complete_commit()?;
+        state.apply_committed_persistent_root_delta(root_delta)?;
+        let _ =
+            state.observe_persistent_gc_commit_delta_after_commit(objects, &persistent_gc_delta)?;
+        Ok(())
+    }
+
     fn recover_file_backed_object_without_layout_metadata_for_test(
         publication: &persist::PendingPublication,
     ) -> Result<crate::runtime::vm::RecoveredRegion> {
@@ -14924,6 +15643,55 @@ mod tests {
                     .cloned()
                     .unwrap(),
                 object_set([promoted])
+            );
+        }
+
+        #[test]
+        fn transaction_ref_handle_roots_are_not_promoted_as_ordinary_gc_refs() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let root = objects
+                .allocate_persistent_struct_for_gc_ref(0x737, vec![ObjectValue::I32(77)])
+                .unwrap();
+            let handle = objects.transaction_ref_handle_for_object_id(root).unwrap();
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(737));
+
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(handle))
+                .unwrap();
+            state
+                .stage_table_element_owned(None, 2, 3, TableElementSnapshot::GcRef(handle))
+                .unwrap();
+
+            assert!(
+                !state
+                    .promote_persistent_references_before_commit(&mut objects)
+                    .unwrap()
+            );
+            let delta = state.staged_persistent_root_delta(&objects).unwrap();
+
+            assert_eq!(
+                delta
+                    .roots
+                    .get(&PersistentRootKey::Global {
+                        instance: None,
+                        global_index: 0,
+                    })
+                    .cloned()
+                    .unwrap(),
+                object_set([root])
+            );
+            assert_eq!(
+                delta
+                    .roots
+                    .get(&PersistentRootKey::TableElement(TableElementKey {
+                        instance: None,
+                        table_index: 2,
+                        element_index: 3,
+                    }))
+                    .cloned()
+                    .unwrap(),
+                object_set([root])
             );
         }
 
@@ -16870,6 +17638,107 @@ mod tests {
     }
 
     #[test]
+    fn pre_gc_object_recovery_closure_handles_cycles_nested_reachability_and_unreachable_winners() {
+        let mut recovered_type_layouts = TypeLayoutRegistry::default();
+        recovered_type_layouts
+            .insert(recovery_test_struct_layout(7))
+            .unwrap();
+
+        let winners = vec![
+            recovered_object_winner_for_test(
+                41,
+                3,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
+                    41,
+                    3,
+                    7,
+                    &ObjectPayload::Struct(vec![
+                        ObjectValue::I32(1),
+                        ObjectValue::Ref(Some(ObjectId { object_index: 42 })),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            recovered_object_winner_for_test(
+                42,
+                4,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
+                    42,
+                    4,
+                    7,
+                    &ObjectPayload::Struct(vec![
+                        ObjectValue::I32(2),
+                        ObjectValue::Ref(Some(ObjectId { object_index: 43 })),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            recovered_object_winner_for_test(
+                43,
+                5,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
+                    43,
+                    5,
+                    7,
+                    &ObjectPayload::Struct(vec![
+                        ObjectValue::I32(3),
+                        ObjectValue::Ref(Some(ObjectId { object_index: 41 })),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            recovered_object_winner_for_test(
+                44,
+                6,
+                ObjectKind::Struct as u16,
+                7,
+                encode_object_record_for_test(
+                    44,
+                    6,
+                    7,
+                    &ObjectPayload::Struct(vec![ObjectValue::I32(4), ObjectValue::Ref(None)]),
+                )
+                .unwrap(),
+            ),
+        ];
+
+        let mut rebuilt = ObjectTable::default();
+        let report = rebuilt
+            .rebuild_reachable_from_recovery_for_test(&recovered_type_layouts, &winners, &[41])
+            .unwrap();
+
+        assert_eq!(
+            report.mark.reachable,
+            object_set([
+                ObjectId { object_index: 41 },
+                ObjectId { object_index: 42 },
+                ObjectId { object_index: 43 },
+            ])
+        );
+        assert_eq!(
+            report.mark.unreachable_persistent,
+            object_set([ObjectId { object_index: 44 }])
+        );
+        assert_eq!(report.installed_winners, vec![41, 42, 43]);
+        assert_eq!(report.skipped_unreachable_winners, vec![44]);
+        assert_eq!(
+            rebuilt
+                .trace_object_ids(ObjectId { object_index: 43 })
+                .unwrap(),
+            vec![ObjectId { object_index: 41 }]
+        );
+        assert!(rebuilt.payload(ObjectId { object_index: 44 }).is_err());
+        assert!(rebuilt.payload(ObjectId { object_index: 45 }).is_err());
+        assert_eq!(rebuilt.live_count(), 3);
+    }
+
+    #[test]
     fn persistent_gc_recovery_filter_installs_only_reachable_winners() {
         let mut recovered_type_layouts = TypeLayoutRegistry::default();
         recovered_type_layouts
@@ -17830,6 +18699,49 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_tstruct_get_ref_roundtrips_into_object_operation() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $node (tstruct
+                (field (mut i32))
+                (field (mut (tref null $node)))))
+              (tfunc (export "read_child") (result i32)
+                (local $child (tref $node))
+                (local $parent (tref $node))
+                (local $copy (tref $node))
+                (local $roundtrip (tref null $node))
+                (local.set $child
+                  (tstruct.new $node (i32.const 7) (tref.null $node)))
+                (local.set $parent
+                  (tstruct.new $node (i32.const 0) (local.get $child)))
+                (local.set $copy
+                  (tstruct.new $node (i32.const 0) (tref.null $node)))
+                (local.set $roundtrip
+                  (tstruct.get $node 1 (tref.cast_read (local.get $parent))))
+                (tstruct.set $node 1
+                  (tref.cast_write (local.get $copy))
+                  (local.get $roundtrip))
+                (local.set $roundtrip
+                  (tstruct.get $node 1 (tref.cast_read (local.get $copy))))
+                (tstruct.get $node 0 (tref.cast_read (local.get $roundtrip)))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let read_child = instance
+            .get_typed_func::<(), i32>(&mut store, "read_child")
+            .unwrap();
+
+        assert_eq!(read_child.call(&mut store, ()).unwrap(), 7);
+        assert_eq!(store.transaction_object_table().live_count(), 3);
+    }
+
+    #[test]
     fn transaction_object_tstruct_tfail_frees_new_object_record() {
         let mut config = crate::Config::new();
         config.wasm_gc(true);
@@ -17904,58 +18816,56 @@ mod tests {
             r#"
             (module
               (type $s (struct (field (mut i32))))
-              (tfunc (export "new") (result (ref $s))
-                (tstruct.new $s (i32.const 1)))
-              (tfunc (export "read") (param (ref $s)) (result i32)
-                (tstruct.get $s 0 (tref.cast_read (local.get 0))))
-              (tfunc (export "write_fail") (param (ref $s))
-                (tstruct.set $s 0 (tref.cast_write (local.get 0)) (i32.const 99))
+              (global $slot (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "new") (result i32)
+                (global.set $slot (tstruct.new $s (i32.const 1)))
+                (tstruct.get $s 0 (tref.cast_read (global.get $slot))))
+              (tfunc (export "read") (result i32)
+                (tstruct.get $s 0 (tref.cast_read (global.get $slot))))
+              (tfunc (export "write_fail")
+                (tstruct.set $s 0 (tref.cast_write (global.get $slot)) (i32.const 99))
                 (tfail))
-              (tfunc (export "write_trap") (param (ref $s))
-                (tstruct.set $s 0 (tref.cast_write (local.get 0)) (i32.const 77))
+              (tfunc (export "write_trap")
+                (tstruct.set $s 0 (tref.cast_write (global.get $slot)) (i32.const 77))
                 (unreachable))
-              (tfunc (export "write_ok") (param (ref $s) i32)
-                (tstruct.set $s 0 (tref.cast_write (local.get 0)) (local.get 1))))
+              (tfunc (export "write_ok") (param i32)
+                (tstruct.set $s 0 (tref.cast_write (global.get $slot)) (local.get 0))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
         let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
-        let new = instance.get_func(&mut store, "new").unwrap();
-        let read = instance.get_func(&mut store, "read").unwrap();
-        let write_fail = instance.get_func(&mut store, "write_fail").unwrap();
-        let write_trap = instance.get_func(&mut store, "write_trap").unwrap();
-        let write_ok = instance.get_func(&mut store, "write_ok").unwrap();
-        let mut object_result = [crate::Val::null_any_ref()];
-        let mut read_result = [crate::Val::I32(0)];
-        let mut no_results: [crate::Val; 0] = [];
+        let new = instance
+            .get_typed_func::<(), i32>(&mut store, "new")
+            .unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+        let write_fail = instance
+            .get_typed_func::<(), ()>(&mut store, "write_fail")
+            .unwrap();
+        let write_trap = instance
+            .get_typed_func::<(), ()>(&mut store, "write_trap")
+            .unwrap();
+        let write_ok = instance
+            .get_typed_func::<i32, ()>(&mut store, "write_ok")
+            .unwrap();
 
-        new.call(&mut store, &[], &mut object_result).unwrap();
-        let object = object_result[0];
+        assert_eq!(new.call(&mut store, ()).unwrap(), 1);
         assert_eq!(store.transaction_object_table().live_count(), 1);
 
-        read.call(&mut store, &[object], &mut read_result).unwrap();
-        assert_eq!(read_result[0].unwrap_i32(), 1);
+        assert_eq!(read.call(&mut store, ()).unwrap(), 1);
 
-        write_fail
-            .call(&mut store, &[object], &mut no_results)
-            .unwrap();
+        write_fail.call(&mut store, ()).unwrap();
         assert_eq!(current_thread_transaction_for_test(), None);
-        read.call(&mut store, &[object], &mut read_result).unwrap();
-        assert_eq!(read_result[0].unwrap_i32(), 1);
+        assert_eq!(read.call(&mut store, ()).unwrap(), 1);
 
-        write_trap
-            .call(&mut store, &[object], &mut no_results)
-            .unwrap_err();
+        write_trap.call(&mut store, ()).unwrap_err();
         assert_eq!(current_thread_transaction_for_test(), None);
-        read.call(&mut store, &[object], &mut read_result).unwrap();
-        assert_eq!(read_result[0].unwrap_i32(), 1);
+        assert_eq!(read.call(&mut store, ()).unwrap(), 1);
 
-        write_ok
-            .call(&mut store, &[object, crate::Val::I32(5)], &mut no_results)
-            .unwrap();
+        write_ok.call(&mut store, 5).unwrap();
         assert_eq!(current_thread_transaction_for_test(), None);
-        read.call(&mut store, &[object], &mut read_result).unwrap();
-        assert_eq!(read_result[0].unwrap_i32(), 5);
+        assert_eq!(read.call(&mut store, ()).unwrap(), 5);
         assert_eq!(store.transaction_object_table().live_count(), 1);
     }
 
@@ -17996,6 +18906,114 @@ mod tests {
                 ObjectValue::I32(7),
                 ObjectValue::I32(42),
                 ObjectValue::I32(7)
+            ])
+        );
+    }
+
+    #[test]
+    fn transaction_object_constructors_return_transaction_ref_handles() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $s (tstruct (field (mut i32))))
+              (type $a (tarray (mut (tref null $s))))
+              (tfunc (export "exercise") (result i32)
+                (local $sref (tref $s))
+                (local $aref (tref $a))
+                (local $roundtrip (tref null $s))
+                (local.set $sref
+                  (tstruct.new $s (i32.const 41)))
+                (tstruct.set $s 0 (tref.cast_write (local.get $sref)) (i32.const 42))
+                (local.set $aref
+                  (tarray.new $a (local.get $sref) (i32.const 2)))
+                (tarray.set $a
+                  (tref.cast_write (local.get $aref))
+                  (i32.const 1)
+                  (tref.null $s))
+                (local.set $roundtrip
+                  (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 0)))
+                (i32.add
+                  (tstruct.get $s 0 (tref.cast_read (local.get $roundtrip)))
+                  (tarray.len (local.get $aref)))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let exercise = instance
+            .get_typed_func::<(), i32>(&mut store, "exercise")
+            .unwrap();
+
+        assert_eq!(exercise.call(&mut store, ()).unwrap(), 44);
+
+        let objects = store.transaction_object_table();
+        let live_ids = objects.live_object_ids_for_test();
+        let struct_id = live_ids
+            .iter()
+            .copied()
+            .find(|object_id| {
+                objects.payload(*object_id).unwrap()
+                    == ObjectPayload::Struct(vec![ObjectValue::I32(42)])
+            })
+            .unwrap();
+        let array_id = live_ids
+            .iter()
+            .copied()
+            .find(|object_id| {
+                objects.payload(*object_id).unwrap()
+                    == ObjectPayload::Array(vec![
+                        ObjectValue::Ref(Some(struct_id)),
+                        ObjectValue::Ref(None),
+                    ])
+            })
+            .unwrap();
+        let struct_handle = *objects
+            .objects_to_transaction_ref_handles
+            .get(&struct_id)
+            .unwrap();
+        let array_handle = *objects
+            .objects_to_transaction_ref_handles
+            .get(&array_id)
+            .unwrap();
+
+        assert_eq!(objects.live_count(), 2);
+        assert_eq!(live_ids.len(), 2);
+        assert!(objects.live_bridge_gc_refs_to_objects.is_empty());
+        assert!(objects.object_to_live_bridge_gc_ref.is_empty());
+        assert_eq!(objects.transaction_ref_handles_to_objects.len(), 2);
+        assert_eq!(objects.objects_to_transaction_ref_handles.len(), 2);
+        assert_eq!(
+            objects
+                .transaction_ref_handles_to_objects
+                .get(&struct_handle),
+            Some(&struct_id)
+        );
+        assert_eq!(
+            objects
+                .transaction_ref_handles_to_objects
+                .get(&array_handle),
+            Some(&array_id)
+        );
+        assert_eq!(
+            objects.known_object_id_for_live_gc_ref_bridge(struct_handle),
+            None
+        );
+        assert_eq!(
+            objects.known_object_id_for_live_gc_ref_bridge(array_handle),
+            None
+        );
+        assert_eq!(
+            objects.payload(struct_id).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(42)])
+        );
+        assert_eq!(
+            objects.payload(array_id).unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::Ref(Some(struct_id)),
+                ObjectValue::Ref(None)
             ])
         );
     }
@@ -18060,6 +19078,75 @@ mod tests {
     }
 
     #[test]
+    fn transaction_object_static_initializers_return_transaction_ref_handles() {
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (type $a (tarray (mut (tref null $s))))
+              (global $aref (mut (tref null $a))
+                (tarray.new_fixed $a 2
+                  (tstruct.new $s (i32.const 41))
+                  (tref.null $s)))
+              (tfunc (export "read") (result i32)
+                (local $roundtrip (tref null $s))
+                (local.set $roundtrip
+                  (tarray.get $a (tref.cast_read (global.get $aref)) (i32.const 0)))
+                (i32.add
+                  (tstruct.get $s 0 (tref.cast_read (local.get $roundtrip)))
+                  (tarray.len (global.get $aref)))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let read = instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap();
+
+        assert_eq!(read.call(&mut store, ()).unwrap(), 43);
+
+        let objects = store.transaction_object_table();
+        assert_eq!(objects.live_count(), 2);
+        assert!(objects.live_bridge_gc_refs_to_objects.is_empty());
+        assert_eq!(objects.transaction_ref_handles_to_objects.len(), 2);
+        let live_ids = objects.live_object_ids_for_test();
+        let struct_id = live_ids
+            .iter()
+            .copied()
+            .find(|object_id| {
+                objects.payload(*object_id).unwrap()
+                    == ObjectPayload::Struct(vec![ObjectValue::I32(41)])
+            })
+            .unwrap();
+        let array_id = live_ids
+            .iter()
+            .copied()
+            .find(|object_id| {
+                objects.payload(*object_id).unwrap()
+                    == ObjectPayload::Array(vec![
+                        ObjectValue::Ref(Some(struct_id)),
+                        ObjectValue::Ref(None),
+                    ])
+            })
+            .unwrap();
+        assert_eq!(
+            objects.payload(struct_id).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(41)])
+        );
+        assert_eq!(
+            objects.payload(array_id).unwrap(),
+            ObjectPayload::Array(vec![
+                ObjectValue::Ref(Some(struct_id)),
+                ObjectValue::Ref(None)
+            ])
+        );
+    }
+
+    #[test]
     fn exported_tfunc_returning_tarray_ref_enters_transaction() {
         let mut config = crate::Config::new();
         config.wasm_gc(true);
@@ -18069,22 +19156,25 @@ mod tests {
             r#"
             (module
               (type $a (array (mut f32)))
-              (tfunc $new (export "new") (result (ref $a))
-                (tarray.new_default $a (i32.const 2)))
+              (global $slot (mut (ref null $a)) (ref.null $a))
+              (tfunc (export "new") (result i32)
+                (global.set $slot (tarray.new_default $a (i32.const 2)))
+                (tarray.len (global.get $slot)))
               (tfunc (export "read") (result f32)
-                (tarray.get $a (tref.cast_read (tcall $new)) (i32.const 1))))
+                (tarray.get $a (tref.cast_read (global.get $slot)) (i32.const 1))))
             "#,
         );
         let mut store = crate::Store::new(&engine, ());
         let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
-        let new = instance.get_func(&mut store, "new").unwrap();
+        let new = instance
+            .get_typed_func::<(), i32>(&mut store, "new")
+            .unwrap();
         let read = instance
             .get_typed_func::<(), f32>(&mut store, "read")
             .unwrap();
-        let mut results = [crate::Val::null_any_ref()];
 
-        new.call(&mut store, &[], &mut results).unwrap();
+        assert_eq!(new.call(&mut store, ()).unwrap(), 2);
         assert_eq!(read.call(&mut store, ()).unwrap().to_bits(), 0);
-        assert_eq!(store.transaction_object_table().live_count(), 2);
+        assert_eq!(store.transaction_object_table().live_count(), 1);
     }
 }

@@ -765,6 +765,59 @@ pub mod _internal {
             store.transaction_enable_live_wast_reference_fallbacks_for_test();
         }
 
+        #[derive(Clone, Copy, Debug)]
+        pub enum TransactionWastRefExpectation {
+            Any,
+            Eq,
+            I31,
+            Struct,
+            Array,
+            Extern,
+        }
+
+        pub fn transaction_wast_ref_matches<T>(
+            store: &crate::Store<T>,
+            raw: i32,
+            expected: TransactionWastRefExpectation,
+        ) -> bool {
+            use crate::runtime::transaction::{ObjectKind, ObjectTable};
+
+            let raw = u32::from_ne_bytes(raw.to_ne_bytes());
+            if ObjectTable::is_raw_i31_ref(u64::from(raw)) {
+                return matches!(
+                    expected,
+                    TransactionWastRefExpectation::Any
+                        | TransactionWastRefExpectation::Eq
+                        | TransactionWastRefExpectation::I31
+                );
+            }
+
+            let object_table = store.transaction_object_table();
+            let Some(object_id) = object_table.known_object_id_for_transaction_ref_handle(raw)
+            else {
+                return false;
+            };
+            let Ok(kind) = object_table.kind(object_id) else {
+                return false;
+            };
+            match expected {
+                TransactionWastRefExpectation::Any => true,
+                TransactionWastRefExpectation::Eq => {
+                    matches!(
+                        kind,
+                        ObjectKind::Struct | ObjectKind::Array | ObjectKind::I31
+                    )
+                }
+                TransactionWastRefExpectation::I31 => kind == ObjectKind::I31,
+                TransactionWastRefExpectation::Struct => kind == ObjectKind::Struct,
+                TransactionWastRefExpectation::Array => kind == ObjectKind::Array,
+                // SHISOFT-TWASM-MOCK: pre-`TRefType` proposal WAST sometimes
+                // observes transaction object handles through externref-shaped
+                // helper boundaries.
+                TransactionWastRefExpectation::Extern => true,
+            }
+        }
+
         pub fn fail_next_commit_before_lp_for_test<T>(store: &mut crate::Store<T>) {
             store
                 .transaction_state_mut()

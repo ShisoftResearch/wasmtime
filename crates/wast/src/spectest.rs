@@ -326,7 +326,7 @@ where
             let state = state.clone();
             move |mut caller, params, results| {
                 let tid = match params {
-                    [Val::I32(tid), Val::FuncRef(_), Val::AnyRef(_)] => *tid,
+                    [Val::I32(tid), Val::FuncRef(_), Val::AnyRef(_) | Val::I32(_)] => *tid,
                     _ => {
                         results[0] = Val::I32(3);
                         results[1] = Val::AnyRef(None);

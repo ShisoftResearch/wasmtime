@@ -3001,6 +3001,86 @@ WASMTIME_TEST_TRANSACTION_WAST=1 cargo test --test wast transaction-proposal -- 
 test result: ok. 119 passed; 0 failed; 54 ignored; 0 measured; 3438 filtered out
 ```
 
+## Pre-GC Transactional Object Model Debt Closure
+
+Date: 2026-06-16
+
+Finished the pre-GC object-model freeze needed before persistent GC work.
+
+Runtime/lowering changes:
+
+- Live t-prefixed object references now use transaction-owned `u32` handles
+  that resolve to full-width `ObjectId` values in the object table.
+- Durable object payload records continue to encode persistent object edges with
+  `PersistentObjectRefRaw`/`ObjectId`, not live `VMGcRef`.
+- T-prefixed `tstruct`/`tarray` constructors now allocate persistent object
+  records directly and return transaction handles instead of constructing
+  ordinary Wasmtime GC objects.
+- T-prefixed object accessors, permission casts, static initializers, and
+  payload ABI conversion resolve handles through the object table.
+- Object table slots carry volatile runtime type metadata so transaction
+  handles can participate in `tref.cast`, `tref.test`, and branch-on-cast
+  without reading ordinary Wasmtime GC heap headers.
+- Durable `tfuncref` and `texternref` payload leaves remain scalar durable
+  identities and reintegrate through explicit host/store registry hooks.
+- WAST-only transaction-ref sentinels are converted at Wasm/host boundaries
+  only under `enable_live_wast_reference_fallbacks_for_test`.
+
+Verification:
+
+```text
+cargo fmt --check
+ok
+
+git diff --check
+ok
+
+CARGO_TARGET_DIR=/tmp/wasmtime-pre-gc-debt-target CARGO_INCREMENTAL=0 cargo test -p wasmtime transaction --lib -- --format terse
+test result: ok. 413 passed; 0 failed
+
+CARGO_TARGET_DIR=/tmp/wasmtime-pre-gc-debt-target CARGO_INCREMENTAL=0 cargo test -p wasmtime --test transaction_persistence -- --format terse
+test result: ok. 25 passed; 0 failed
+
+CARGO_TARGET_DIR=/tmp/wasmtime-pre-gc-debt-target CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_BUILD_JOBS=2 python3 ./ci/run-tests.py --locked --exclude=wasi-preview1-component-adapter -- --format terse
+exit code 0, including transaction WAST: 3641 passed; 0 failed
+
+PATH=/home/shisoft/Code/Research/wasm-tools-transaction/target/debug:$PATH ./ci/build-wasi-preview1-component-adapter.sh
+exit code 0
+```
+
+## Pre-GC Transactional Object Model Debt Closure
+
+Date: 2026-06-16
+
+Closed the pre-GC object-model debt work needed before persistent GC:
+
+- normal t-prefixed object constructors, accessors, permission casts, static
+  initializers, and persistent-object live ABI paths use transaction-owned
+  object ref handles instead of durable identity narrowing or recovered
+  `VMGcRef` maps.
+- the mixed live-ref resolver remains only as compatibility/promotion glue; it
+  is not a durable identity path.
+- Durable object payloads and roots continue to encode full-width `ObjectId`
+  values through `PersistentObjectRefRaw`.
+- Durable `tfuncref` and `texternref` payload leaves survive file-backed reopen
+  through explicit host/store rebind hooks and are not object-table entries.
+- Recovery closure now has focused coverage for reachable cycles, nested
+  reachable objects, unreachable committed winners, root replacement, table
+  element roots, and mixed object/linear-memory transactions after reopen.
+
+Still future work:
+
+- True `TRefType` stack/lowering ABI.
+- Persistent GC tracing/reclamation beyond the current pre-GC recovery and
+  block/chunk hygiene.
+
+Verification added in this tranche:
+
+```text
+cargo test -p wasmtime pre_gc_object_recovery_closure --lib -- --format terse
+test result: ok. 3 passed; 0 failed; 0 ignored
+```
+
 ## Rust Transaction Toolset
 
 Date: 2026-06-13

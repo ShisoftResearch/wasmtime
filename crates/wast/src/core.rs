@@ -149,6 +149,67 @@ pub fn match_val(store: &mut Store<()>, actual: &Val, expected: &CoreConst) -> R
             }
         }
 
+        #[cfg(feature = "transaction")]
+        (Val::I32(raw), CoreConst::AnyRef { value: None })
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                *raw,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Any,
+            ) =>
+        {
+            Ok(())
+        }
+        #[cfg(feature = "transaction")]
+        (Val::I32(raw), CoreConst::ExternRef { value: None })
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                *raw,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Extern,
+            ) =>
+        {
+            Ok(())
+        }
+        #[cfg(feature = "transaction")]
+        (Val::I32(raw), CoreConst::EqRef)
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                *raw,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Eq,
+            ) =>
+        {
+            Ok(())
+        }
+        #[cfg(feature = "transaction")]
+        (Val::I32(raw), CoreConst::I31Ref)
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                *raw,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::I31,
+            ) =>
+        {
+            Ok(())
+        }
+        #[cfg(feature = "transaction")]
+        (Val::I32(raw), CoreConst::StructRef)
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                *raw,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Struct,
+            ) =>
+        {
+            Ok(())
+        }
+        #[cfg(feature = "transaction")]
+        (Val::I32(raw), CoreConst::ArrayRef)
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                *raw,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Array,
+            ) =>
+        {
+            Ok(())
+        }
+
         (Val::AnyRef(Some(x)), CoreConst::EqRef) => {
             if x.is_eqref(store)? {
                 Ok(())

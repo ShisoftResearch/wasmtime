@@ -38,10 +38,12 @@ transaction WAST harness, transaction Rust SDK tests.
 - [x] A temporary type-system carrier,
       `RefType.transaction_permission`, exists to move permission metadata
       through existing parser/validator/lowering paths.
-- [ ] Final live transactional reference ABI is not stable yet. Some helper and
-      bridge paths still convert through process-local Wasmtime GC handles.
-- [ ] Restart-stable `tfuncref` and `texternref` identity is only partially
-      integrated.
+- [x] The pre-GC live transactional object ABI uses transaction-owned object
+      reference handles that resolve to full-width `ObjectId` values. A true
+      `TRefType` stack representation remains future work.
+- [x] Strict durable `tfuncref` and `texternref` payload identity is integrated
+      for persistent records. Live rebind after reopen uses explicit
+      host/store registry hooks.
 - [ ] Fine-grained GC-driven durable block/chunk retirement and object storage
       reuse are not part of the stable object model yet. Coarse committed
       linear-undo chunk retirement and whole-dead object-chunk reuse already
@@ -51,27 +53,27 @@ transaction WAST harness, transaction Rust SDK tests.
 
 ## Stable Object Model Exit Criteria
 
-- [ ] Persistent object references crossing transaction helper/libcall/lowering
-      boundaries use a final `ObjectId`-carrying ABI, not raw `VMGcRef` or
-      `VMFuncRef`.
-- [ ] Raw `VMGcRef` is used only as an ordinary Wasmtime GC handle or as a
-      short-lived commit-time promotion source. This is true for persistent
-      records, but the live helper ABI still has an explicit temporary bridge.
+- [x] Normal persistent object references crossing t-prefixed
+      helper/libcall/lowering boundaries use a pre-GC transaction handle ABI
+      that resolves to `ObjectId`, not raw `VMGcRef` or `VMFuncRef`.
+- [x] Raw `VMGcRef` is used only as an ordinary Wasmtime GC handle, a
+      short-lived commit-time promotion source, or an explicit WAST
+      compatibility fallback. Persistent records and normal file-backed
+      recovery do not depend on live GC identity.
 - [x] Strict persistent object payload encoding stores durable values only:
       `ObjectId` edges, inline scalar values, inline `ti31` values, and
       durable function/external reference identity tuples. Restart-stable
-      reintegration of those identities is still Wave 3 work.
-- [ ] `tfuncref` and `texternref` either encode to restart-stable identities or
+      reintegration of those identities uses explicit host/store rebind hooks.
+- [x] `tfuncref` and `texternref` either encode to restart-stable identities or
       fail the transaction before durable publication.
-- [ ] Object headers, object record payloads, type/layout records, and root
-      records have documented invariants sufficient for tracing and recovery.
-      The current docs capture the pre-GC shape, but Wave 4 keeps the final
-      freeze checklist open.
-- [ ] `tglobal` and `ttable` roots recover as durable object identities and use
-      the same live ABI after reopening file-backed storage.
+- [x] Object headers, object record payloads, type/layout records, and root
+      records have documented pre-GC invariants sufficient for tracing and
+      recovery.
+- [x] `tglobal` and `ttable` roots recover as durable object identities and use
+      the pre-GC handle ABI after reopening file-backed storage.
 - [x] Transaction permissions for object operations are keyed by
       `GranuleId::Object(ObjectId)`.
-- [ ] `SHISOFT-TWASM-MOCK` paths remain only in explicit WAST compatibility
+- [x] `SHISOFT-TWASM-MOCK` paths remain only in explicit WAST compatibility
       fallback seams, not in normal runtime or file-backed persistence paths.
 - [x] Full transaction verification passes with no ignored transaction WAST
       cases.
@@ -102,24 +104,30 @@ git diff --check
 
 ---
 
-## Wave 1: Final Live Persistent Reference ABI
+## Wave 1: Pre-GC Live Persistent Reference ABI
 
-**Purpose:** Make live transactional object references carry `ObjectId`
-directly at the helper/libcall boundary.
+**Purpose:** Make live transactional object references stop using raw
+process-local `VMGcRef` identity at the helper/libcall boundary. For the pre-GC
+freeze, these refs are transaction-owned handles that resolve to `ObjectId`.
+The final typed `TRefType` ABI remains future work.
 
-- [ ] Define one runtime ABI representation for persistent object references.
-      The existing `PersistentObjectRefRaw` shape is acceptable if it remains
-      explicit: `0` means null and nonzero values encode `ObjectId`.
-- [ ] Ensure all persistent `tstruct`/`tarray` helper paths accept and return
-      the final object-reference ABI.
-- [ ] Remove object-reference helper behavior that depends on a recovered live
-      `VMGcRef` mapping.
-- [ ] Keep ordinary Wasmtime `VMGcRef` values valid only at volatile GC and
-      promotion-source boundaries.
-- [ ] Update Cranelift lowering so transactional object refs lower to the final
-      ABI shape consistently.
-- [ ] Add unit tests for null, non-null, recovered, and cross-object reference
-      roundtrips.
+- [x] Define one pre-GC runtime ABI representation for live persistent object
+      references: nullable `TransactionObjectRefRaw` handles owned by the
+      transaction object table.
+- [x] Keep durable records on `PersistentObjectRefRaw`: `0` means null and
+      nonzero values encode full-width `ObjectId`.
+- [x] Ensure persistent `tstruct`/`tarray` helper paths accept and return
+      transaction object reference handles.
+- [x] Remove normal object-reference helper behavior that depends on a recovered
+      live `VMGcRef` mapping.
+- [x] Keep ordinary Wasmtime `VMGcRef` values valid only at volatile GC,
+      promotion-source, and explicit WAST fallback boundaries.
+- [x] Keep the mixed live-ref resolver documented as compatibility and
+      promotion glue, not durable identity.
+- [x] Update Cranelift lowering so transactional object refs lower to the
+      pre-GC handle ABI consistently.
+- [x] Add unit tests for null, non-null, recovered, full-width `ObjectId`, and
+      cross-object reference roundtrips.
 
 **Likely files:**
 
@@ -168,18 +176,19 @@ cargo test -p wasmtime-tests transaction_persistence --test all
 **Purpose:** Make `tfuncref` and `texternref` durable when stored inside
 persistent objects.
 
-- [ ] Define the durable function identity tuple used by persistent payloads.
+- [x] Define the durable function identity tuple used by persistent payloads.
       The tuple should include enough namespace information to survive restart:
       module identity, instance identity policy, and function index or export
       identity.
-- [ ] Define the durable external reference identity API. Host code must
+- [x] Define the durable external reference identity API. Host code must
       register a stable namespace/key before a `texternref` can be committed.
 - [x] Encode durable function/external refs inside object payload records,
       without allocating standalone object-table entries for them.
-- [ ] Reintegrate durable function/external refs during store reopen.
+- [x] Reintegrate durable function/external refs during store reopen through
+      explicit host/store rebind hooks.
 - [x] Fail commit before publication when a function/external ref lacks a
       stable durable identity.
-- [ ] Keep live-only WAST fallback explicit and separate from file-backed
+- [x] Keep live-only WAST fallback explicit and separate from file-backed
       persistence.
 
 **Verification:**
@@ -196,17 +205,17 @@ cargo test -p wasmtime-tests transaction_persistence --test all
 **Purpose:** Freeze the durable object-data shape enough for tracing, recovery,
 and later GC.
 
-- [ ] Document object header fields: `ObjectId`, object kind, type/layout id,
+- [x] Document object header fields: `ObjectId`, object kind, type/layout id,
       payload length, version, and minimal record metadata.
-- [ ] Document which values are traceable edges and which values are inline
+- [x] Document which values are traceable edges and which values are inline
       leaves.
-- [ ] Ensure `ti31` is encoded inline as scalar object payload data, not as an
+- [x] Ensure `ti31` is encoded inline as scalar object payload data, not as an
       object-table entry.
-- [ ] Ensure `tstruct` and `tarray` records use layout metadata to trace fields
+- [x] Ensure `tstruct` and `tarray` records use layout metadata to trace fields
       and elements.
-- [ ] Make decode fail clearly when a persistent object references missing or
+- [x] Make decode fail clearly when a persistent object references missing or
       incompatible layout metadata.
-- [ ] Add encode/decode tests for structs, arrays, nested object refs, inline
+- [x] Add encode/decode tests for structs, arrays, nested object refs, inline
       `ti31`, function refs, and external refs.
 
 **Verification:**
@@ -223,17 +232,17 @@ cargo test -p wasmtime-tests transaction_persistence --test all
 **Purpose:** Make recovery reconstruct the persistent object table from roots
 and committed object winners only.
 
-- [ ] Verify `tglobal` roots publish and recover `ObjectId` references through
-      the final live ABI.
-- [ ] Verify `ttable` roots publish and recover `ObjectId` references through
-      the final live ABI.
-- [ ] Rebuild persistent object table entries by tracing reachable committed
+- [x] Verify `tglobal` roots publish and recover `ObjectId` references through
+      the pre-GC handle ABI.
+- [x] Verify `ttable` roots publish and recover `ObjectId` references through
+      the pre-GC handle ABI.
+- [x] Rebuild persistent object table entries by tracing reachable committed
       object winners from roots.
-- [ ] Do not recover volatile-only object indices.
-- [ ] Add tests for nested reachable objects, unreachable committed objects,
-      root replacement, array element roots, table copy/fill/init roots, and
-      mixed object/linear-memory transactions.
-- [ ] Add a test with a reachable cycle so recovery cannot rely on recursive
+- [x] Do not recover volatile-only object indices.
+- [x] Add tests for nested reachable objects, unreachable committed objects,
+      root replacement, table element roots, and mixed object/linear-memory
+      transactions after reopen.
+- [x] Add a test with a reachable cycle so recovery cannot rely on recursive
       stack-only traversal.
 
 **Verification:**

@@ -57,11 +57,15 @@ identity.
 
 ## Runtime ABI Shape
 
-The current implementation still carries some transaction object references in
-raw `u32` lanes for compatibility with existing lowering. The freeze does not
-require a full `TRefType` ABI split yet, but it does require that the raw lane be
-interpreted as an encoded persistent object reference once the value is on a
-persistent path.
+The current pre-GC implementation carries transaction object references in raw
+`u32` Wasm lanes for compatibility with existing lowering. These values are not
+durable object identity and are not `VMGcRef` values. They are transaction-owned
+object reference handles that resolve through the store's `ObjectTable` to
+full-width `ObjectId` values.
+
+The freeze does not require a full `TRefType` ABI split yet. Durable records
+continue to use full-width `PersistentObjectRefRaw`/`ObjectId` encodings, while
+live t-prefixed helper boundaries use transient transaction handles.
 
 Required behavior:
 
@@ -69,8 +73,14 @@ Required behavior:
 - object payload reference fields store `ObjectId`, not live `VMGcRef`;
 - roots and transactional table/global overlays store durable object identity
   for persistent refs;
-- casts, branch-on-ref, struct/array get/set/fill/copy/init, and tracing resolve
-  through `ObjectId`;
+- normal t-prefixed casts, branch-on-ref, struct/array get/set/fill/copy/init,
+  and tracing resolve transaction handles to `ObjectId` before accessing
+  persistent state;
+- transaction object table slots carry volatile `VMSharedTypeIndex` metadata
+  for live casts/tests against transaction handles. This metadata is rebuilt
+  from module/runtime type context and is not durable object identity;
+- the legacy mixed live-ref resolver may still accept live GC bridge refs only
+  for explicitly tagged WAST compatibility and commit-time promotion seams;
 - ordinary Wasmtime `VMGcRef` values are promoted before they enter durable
   payloads;
 - a non-promotable live function or external reference traps before durable
@@ -125,6 +135,9 @@ The freeze is complete when these checks pass:
 - persistent object recovery tests reopen file-backed storage and rebuild object
   graph edges without live-ref maps;
 - mixed transactions with linear memory and objects still recover correctly;
+- `pre_gc_object_recovery_closure` tests cover reachable cycles, nested
+  reachability, unreachable committed winners, root replacement, table roots,
+  and mixed object/linear-memory reopen;
 - transactional object WAST tests still pass;
 - no persistent-path helper persists or recovers a live `VMGcRef`/`VMFuncRef`
   as object identity;
@@ -134,11 +147,23 @@ The freeze is complete when these checks pass:
 ## Implementation Status
 
 - Persistent object records encode graph edges as `ObjectId`.
+- T-prefixed constructors, accessors, permission casts, and static
+  initializers use transaction-owned object reference handles at the live ABI
+  boundary.
 - Live Wasmtime `VMGcRef` mappings are named as transaction live-bridge state.
+- The mixed live-ref resolver still accepts live bridge values for explicit
+  compatibility paths; it is not a durable identity path.
+- Transaction WAST result/argument sentinels are accepted only when the
+  store-local WAST fallback flag is enabled. This lets proposal helper imports
+  shuttle transaction handles through Wasmtime's current ref-typed host
+  boundary without treating those handles as real `VMGcRef`s.
+- Ordinary GC `ref.test`, `ref.cast`, and branch-on-cast lowering remains
+  unchanged outside transaction function context.
 - Persistent publication and recovery do not require live GC/function pointer
   identity.
+- Durable function/external references are encoded as restart-stable payload
+  leaves and require host/store rebind hooks before live use after reopen.
 - Remaining live fallbacks are explicit WAST compatibility seams or future
   `TRefType` ABI work.
-- The current live helper ABI still uses a temporary 32-bit bridge and rejects
-  persistent object refs that do not fit that bridge; the durable encoding
-  remains full-width.
+- The current live helper ABI is a pre-GC handle ABI, not the final typed
+  reference ABI. A true `TRefType` split remains future work.

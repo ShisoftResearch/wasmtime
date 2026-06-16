@@ -34,6 +34,10 @@ impl DurableReferenceRegistry {
         self.allow_live_wast_reference_fallbacks = true;
     }
 
+    pub(crate) fn live_wast_reference_fallbacks_enabled(&self) -> bool {
+        self.allow_live_wast_reference_fallbacks
+    }
+
     pub(crate) fn register_func_ref(
         &mut self,
         vm_func_ref_addr: usize,

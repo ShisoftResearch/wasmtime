@@ -72,6 +72,11 @@ const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_INDEX_OFFSET: i32 = 0;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_FIELD_OFFSET_OFFSET: i32 = 4;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_VALUE_SIZE_OFFSET: i32 = 8;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_IS_REF_OFFSET: i32 = 12;
+const TRANSACTION_TREF_TEST_NOT_TRANSACTION: i64 = -1;
+const TRANSACTION_TREF_TEST_EXPECTED_TYPE_NONE: i64 = -1;
+const TRANSACTION_TREF_TEST_KIND_EQ: u32 = 1;
+const TRANSACTION_TREF_TEST_KIND_STRUCT: u32 = 3;
+const TRANSACTION_TREF_TEST_KIND_ARRAY: u32 = 4;
 
 #[derive(Copy, Clone, Debug)]
 struct TransactionTryFrame {
@@ -2952,14 +2957,7 @@ impl FuncEnvironment<'_> {
         struct_type_index: TypeIndex,
         fields: StructFieldsVec,
     ) -> WasmResult<ir::Value> {
-        let struct_ref = self.translate_struct_new(builder, struct_type_index, fields.clone())?;
-        self.translate_transaction_tstruct_record_new(
-            builder,
-            struct_type_index,
-            struct_ref,
-            &fields,
-        )?;
-        Ok(struct_ref)
+        self.translate_transaction_tstruct_record_new(builder, struct_type_index, &fields)
     }
 
     pub fn translate_transaction_tstruct_new_default(
@@ -2972,14 +2970,7 @@ impl FuncEnvironment<'_> {
             .iter()
             .map(|ty| self.transaction_default_field_value(builder, ty))
             .collect::<WasmResult<StructFieldsVec>>()?;
-        let struct_ref = self.translate_struct_new(builder, struct_type_index, fields.clone())?;
-        self.translate_transaction_tstruct_record_new(
-            builder,
-            struct_type_index,
-            struct_ref,
-            &fields,
-        )?;
-        Ok(struct_ref)
+        self.translate_transaction_tstruct_record_new(builder, struct_type_index, &fields)
     }
 
     pub fn translate_transaction_tstruct_get(
@@ -3034,9 +3025,8 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         struct_type_index: TypeIndex,
-        struct_ref: ir::Value,
         fields: &[ir::Value],
-    ) -> WasmResult<()> {
+    ) -> WasmResult<ir::Value> {
         let field_types = self.transaction_struct_field_types(struct_type_index)?;
         debug_assert_eq!(field_types.len(), fields.len());
         let fields_ptr =
@@ -3051,20 +3041,18 @@ impl FuncEnvironment<'_> {
             .ins()
             .iconst(I32, i64::try_from(struct_type_index.index()).unwrap());
         let field_count = pos.ins().iconst(I32, i64::try_from(fields.len()).unwrap());
-        pos.ins().call(
-            callee,
-            &[vmctx, struct_ref, struct_type, field_count, fields_ptr],
-        );
-        Ok(())
+        let call = pos
+            .ins()
+            .call(callee, &[vmctx, struct_type, field_count, fields_ptr]);
+        Ok(pos.func.dfg.inst_results(call)[0])
     }
 
     fn translate_transaction_tstruct_static_record_new(
         &mut self,
         builder: &mut FunctionBuilder,
         struct_type_index: TypeIndex,
-        struct_ref: ir::Value,
         fields: &[ir::Value],
-    ) -> WasmResult<()> {
+    ) -> WasmResult<ir::Value> {
         let field_types = self.transaction_struct_field_types(struct_type_index)?;
         debug_assert_eq!(field_types.len(), fields.len());
         let fields_ptr =
@@ -3081,18 +3069,17 @@ impl FuncEnvironment<'_> {
             .ins()
             .iconst(I32, i64::try_from(struct_type_index.index()).unwrap());
         let field_count = pos.ins().iconst(I32, i64::try_from(fields.len()).unwrap());
-        pos.ins().call(
+        let call = pos.ins().call(
             callee,
             &[
                 vmctx,
-                struct_ref,
                 struct_type,
                 field_count,
                 fields_ptr,
                 layout_fields_ptr,
             ],
         );
-        Ok(())
+        Ok(pos.func.dfg.inst_results(call)[0])
     }
 
     fn transaction_struct_field_types(
@@ -3869,16 +3856,7 @@ impl FuncEnvironment<'_> {
         len: ir::Value,
     ) -> WasmResult<ir::Value> {
         let elem_ty = self.transaction_array_element_type(array_type_index)?;
-        let array_ref = self.translate_array_new(builder, array_type_index, elem, len)?;
-        self.translate_transaction_tarray_record_new(
-            builder,
-            array_type_index,
-            array_ref,
-            elem_ty,
-            elem,
-            len,
-        )?;
-        Ok(array_ref)
+        self.translate_transaction_tarray_record_new(builder, array_type_index, elem_ty, elem, len)
     }
 
     pub fn translate_transaction_tarray_new_default(
@@ -3889,16 +3867,7 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<ir::Value> {
         let elem_ty = self.transaction_array_element_type(array_type_index)?;
         let elem = self.transaction_default_field_value(builder, &elem_ty)?;
-        let array_ref = self.translate_array_new_default(builder, array_type_index, len)?;
-        self.translate_transaction_tarray_record_new(
-            builder,
-            array_type_index,
-            array_ref,
-            elem_ty,
-            elem,
-            len,
-        )?;
-        Ok(array_ref)
+        self.translate_transaction_tarray_record_new(builder, array_type_index, elem_ty, elem, len)
     }
 
     pub fn translate_transaction_tarray_new_fixed(
@@ -3908,16 +3877,14 @@ impl FuncEnvironment<'_> {
         elems: &[ir::Value],
     ) -> WasmResult<ir::Value> {
         let elem_ty = self.transaction_array_element_type(array_type_index)?;
-        let array_ref = self.translate_array_new_fixed(builder, array_type_index, elems)?;
         self.translate_transaction_tarray_fixed_record_new_with_builtin(
             builder,
             BuiltinFunctionIndex::transaction_tarray_new_fixed(),
             array_type_index,
-            array_ref,
+            None,
             elem_ty,
             elems,
-        )?;
-        Ok(array_ref)
+        )
     }
 
     pub fn translate_transaction_tarray_new_data(
@@ -3939,8 +3906,6 @@ impl FuncEnvironment<'_> {
         let tag = self.expected_transaction_object_value_abi_tag(elem_ty)?;
         let ty = self.module.types[array_type_index].unwrap_module_type_index();
         let element_size = self.array_layout(ty)?.elem_size;
-        let array_ref =
-            self.translate_array_new_data(builder, array_type_index, data_index, data_offset, len)?;
 
         let pointer_type = self.pointer_type();
         let (data, data_len) = match self.translation.runtime_data_map[data_index] {
@@ -3965,11 +3930,10 @@ impl FuncEnvironment<'_> {
         let data_len = cast_index_value_to_i64(&mut pos, data_len);
         let tag = pos.ins().iconst(I32, i64::from(tag));
         let element_size = pos.ins().iconst(I32, i64::from(element_size));
-        pos.ins().call(
+        let call = pos.ins().call(
             callee,
             &[
                 vmctx,
-                array_ref,
                 array_type,
                 data_offset,
                 len,
@@ -3979,7 +3943,7 @@ impl FuncEnvironment<'_> {
                 element_size,
             ],
         );
-        Ok(array_ref)
+        Ok(pos.func.dfg.inst_results(call)[0])
     }
 
     pub fn translate_transaction_tarray_new_elem(
@@ -4003,8 +3967,6 @@ impl FuncEnvironment<'_> {
                 "transactional array.new_elem requires reference element type".into(),
             ));
         }
-        let array_ref =
-            self.translate_array_new_elem(builder, array_type_index, elem_index, elem_offset, len)?;
 
         let pointer_type = self.pointer_type();
         let (elem, elem_len) = match self.translation.passive_elem_map[elem_index] {
@@ -4038,19 +4000,11 @@ impl FuncEnvironment<'_> {
             .ins()
             .iconst(I32, i64::try_from(array_type_index.index()).unwrap());
         let elem_len = cast_index_value_to_i64(&mut pos, elem_len);
-        pos.ins().call(
+        let call = pos.ins().call(
             callee,
-            &[
-                vmctx,
-                array_ref,
-                array_type,
-                elem_offset,
-                len,
-                elem,
-                elem_len,
-            ],
+            &[vmctx, array_type, elem_offset, len, elem, elem_len],
         );
-        Ok(array_ref)
+        Ok(pos.func.dfg.inst_results(call)[0])
     }
 
     pub fn translate_transaction_tarray_len(
@@ -4288,16 +4242,15 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         array_type_index: TypeIndex,
-        array_ref: ir::Value,
         elem_ty: WasmStorageType,
         elem: ir::Value,
         len: ir::Value,
-    ) -> WasmResult<()> {
+    ) -> WasmResult<ir::Value> {
         self.translate_transaction_tarray_record_new_with_builtin(
             builder,
             BuiltinFunctionIndex::transaction_tarray_new(),
             array_type_index,
-            array_ref,
+            None,
             elem_ty,
             elem,
             len,
@@ -4308,38 +4261,91 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         array_type_index: TypeIndex,
-        array_ref: ir::Value,
         elem_ty: WasmStorageType,
         elem: ir::Value,
         len: ir::Value,
-    ) -> WasmResult<()> {
-        self.translate_transaction_tarray_record_new_with_builtin(
-            builder,
+    ) -> WasmResult<ir::Value> {
+        let (tag, low, high) =
+            self.translate_transaction_object_value_to_abi_values(builder, elem_ty, elem)?;
+        let persistent_element_size =
+            self.transaction_persistent_array_element_size(array_type_index)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
             BuiltinFunctionIndex::transaction_tarray_static_new(),
-            array_type_index,
-            array_ref,
-            elem_ty,
-            elem,
-            len,
-        )
+        );
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let array_type = pos
+            .ins()
+            .iconst(I32, i64::try_from(array_type_index.index()).unwrap());
+        let persistent_element_size = pos.ins().iconst(I32, i64::from(persistent_element_size));
+        let element_is_object_ref = pos.ins().iconst(
+            I32,
+            if matches!(elem_ty, WasmStorageType::Val(WasmValType::Ref(_))) {
+                1
+            } else {
+                0
+            },
+        );
+        let call = pos.ins().call(
+            callee,
+            &[
+                vmctx,
+                array_type,
+                persistent_element_size,
+                element_is_object_ref,
+                len,
+                tag,
+                low,
+                high,
+            ],
+        );
+        Ok(pos.func.dfg.inst_results(call)[0])
     }
 
     fn translate_transaction_tarray_static_fixed_record_new(
         &mut self,
         builder: &mut FunctionBuilder,
         array_type_index: TypeIndex,
-        array_ref: ir::Value,
         elems: &[ir::Value],
-    ) -> WasmResult<()> {
+    ) -> WasmResult<ir::Value> {
         let elem_ty = self.transaction_array_element_type(array_type_index)?;
-        self.translate_transaction_tarray_fixed_record_new_with_builtin(
-            builder,
+        let elem_types = vec![elem_ty; elems.len()];
+        let elements_ptr =
+            self.translate_transaction_object_values_to_stack(builder, &elem_types, elems)?;
+        let persistent_element_size =
+            self.transaction_persistent_array_element_size(array_type_index)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
             BuiltinFunctionIndex::transaction_tarray_static_new_fixed(),
-            array_type_index,
-            array_ref,
-            elem_ty,
-            elems,
-        )
+        );
+        let mut pos = builder.cursor();
+        let vmctx = self.vmctx_val(&mut pos);
+        let array_type = pos
+            .ins()
+            .iconst(I32, i64::try_from(array_type_index.index()).unwrap());
+        let persistent_element_size = pos.ins().iconst(I32, i64::from(persistent_element_size));
+        let element_is_object_ref = pos.ins().iconst(
+            I32,
+            if matches!(elem_ty, WasmStorageType::Val(WasmValType::Ref(_))) {
+                1
+            } else {
+                0
+            },
+        );
+        let element_count = pos.ins().iconst(I32, i64::try_from(elems.len()).unwrap());
+        let call = pos.ins().call(
+            callee,
+            &[
+                vmctx,
+                array_type,
+                persistent_element_size,
+                element_is_object_ref,
+                element_count,
+                elements_ptr,
+            ],
+        );
+        Ok(pos.func.dfg.inst_results(call)[0])
     }
 
     fn translate_transaction_tarray_fixed_record_new_with_builtin(
@@ -4347,10 +4353,10 @@ impl FuncEnvironment<'_> {
         builder: &mut FunctionBuilder,
         builtin: BuiltinFunctionIndex,
         array_type_index: TypeIndex,
-        array_ref: ir::Value,
+        array_ref: Option<ir::Value>,
         elem_ty: WasmStorageType,
         elems: &[ir::Value],
-    ) -> WasmResult<()> {
+    ) -> WasmResult<ir::Value> {
         let elem_types = vec![elem_ty; elems.len()];
         let elements_ptr =
             self.translate_transaction_object_values_to_stack(builder, &elem_types, elems)?;
@@ -4372,15 +4378,23 @@ impl FuncEnvironment<'_> {
             },
         );
         let element_count = pos.ins().iconst(I32, i64::try_from(elems.len()).unwrap());
-        let mut args = vec![vmctx, array_ref, array_type];
-        if builtin == BuiltinFunctionIndex::transaction_tarray_static_new_fixed() {
+        let mut args = vec![vmctx];
+        if let Some(array_ref) = array_ref {
+            args.push(array_ref);
+            args.push(array_type);
             args.push(persistent_element_size);
             args.push(element_is_object_ref);
+        } else {
+            args.push(array_type);
         }
         args.push(element_count);
         args.push(elements_ptr);
-        pos.ins().call(callee, &args);
-        Ok(())
+        let call = pos.ins().call(callee, &args);
+        if let Some(array_ref) = array_ref {
+            Ok(array_ref)
+        } else {
+            Ok(pos.func.dfg.inst_results(call)[0])
+        }
     }
 
     fn translate_transaction_tarray_record_new_with_builtin(
@@ -4388,11 +4402,11 @@ impl FuncEnvironment<'_> {
         builder: &mut FunctionBuilder,
         builtin: BuiltinFunctionIndex,
         array_type_index: TypeIndex,
-        array_ref: ir::Value,
+        array_ref: Option<ir::Value>,
         elem_ty: WasmStorageType,
         elem: ir::Value,
         len: ir::Value,
-    ) -> WasmResult<()> {
+    ) -> WasmResult<ir::Value> {
         let (tag, low, high) =
             self.translate_transaction_object_value_to_abi_values(builder, elem_ty, elem)?;
         let persistent_element_size =
@@ -4412,14 +4426,22 @@ impl FuncEnvironment<'_> {
                 0
             },
         );
-        let mut args = vec![vmctx, array_ref, array_type];
-        if builtin == BuiltinFunctionIndex::transaction_tarray_static_new() {
+        let mut args = vec![vmctx];
+        if let Some(array_ref) = array_ref {
+            args.push(array_ref);
+            args.push(array_type);
             args.push(persistent_element_size);
             args.push(element_is_object_ref);
+        } else {
+            args.push(array_type);
         }
         args.extend([len, tag, low, high]);
-        pos.ins().call(callee, &args);
-        Ok(())
+        let call = pos.ins().call(callee, &args);
+        if let Some(array_ref) = array_ref {
+            Ok(array_ref)
+        } else {
+            Ok(pos.func.dfg.inst_results(call)[0])
+        }
     }
 
     fn transaction_array_element_type(
@@ -4452,7 +4474,96 @@ impl FuncEnvironment<'_> {
         gc_ref: ir::Value,
         gc_ref_ty: WasmRefType,
     ) -> WasmResult<ir::Value> {
+        if let Some(result) =
+            self.translate_transaction_tref_test(builder, test_ty, gc_ref, gc_ref_ty)?
+        {
+            return Ok(result);
+        }
         gc::translate_ref_test(self, builder, test_ty, gc_ref, gc_ref_ty)
+    }
+
+    fn translate_transaction_tref_test(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        test_ty: WasmRefType,
+        gc_ref: ir::Value,
+        gc_ref_ty: WasmRefType,
+    ) -> WasmResult<Option<ir::Value>> {
+        if !self.is_current_tfunc && !self.transaction_may_be_active_on_return {
+            return Ok(None);
+        }
+        if builder.func.dfg.value_type(gc_ref) != I32 {
+            return Ok(None);
+        }
+        let Some((test_kind, expected_interned_ty)) = Self::transaction_tref_test_kind(&test_ty)
+        else {
+            return Ok(None);
+        };
+
+        let callee = self
+            .builtin_functions
+            .load_builtin(builder.func, BuiltinFunctionIndex::transaction_tref_test());
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let test_kind = builder.ins().iconst(I32, i64::from(test_kind));
+        let nullable = builder.ins().iconst(I32, i64::from(test_ty.nullable as u8));
+        let expected_type = match expected_interned_ty {
+            Some(expected_interned_ty) => {
+                self.module_interned_to_shared_ty(&mut builder.cursor(), expected_interned_ty)
+            }
+            None => builder
+                .ins()
+                .iconst(I32, TRANSACTION_TREF_TEST_EXPECTED_TYPE_NONE),
+        };
+        let call = builder
+            .ins()
+            .call(callee, &[vmctx, gc_ref, test_kind, nullable, expected_type]);
+        let helper_result = builder.func.dfg.inst_results(call)[0];
+        let is_not_transaction = builder.ins().icmp_imm_s(
+            IntCC::Equal,
+            helper_result,
+            TRANSACTION_TREF_TEST_NOT_TRANSACTION,
+        );
+
+        let ordinary_block = builder.create_block();
+        let continue_block = builder.create_block();
+        builder.ins().brif(
+            is_not_transaction,
+            ordinary_block,
+            &[],
+            continue_block,
+            &[helper_result.into()],
+        );
+
+        builder.switch_to_block(ordinary_block);
+        let ordinary_result = gc::translate_ref_test(self, builder, test_ty, gc_ref, gc_ref_ty)?;
+        builder
+            .ins()
+            .jump(continue_block, &[ordinary_result.into()]);
+
+        builder.switch_to_block(continue_block);
+        let result = builder.append_block_param(continue_block, I32);
+        builder.seal_block(ordinary_block);
+        builder.seal_block(continue_block);
+        Ok(Some(result))
+    }
+
+    fn transaction_tref_test_kind(
+        test_ty: &WasmRefType,
+    ) -> Option<(u32, Option<ModuleInternedTypeIndex>)> {
+        match test_ty.heap_type {
+            WasmHeapType::Eq => Some((TRANSACTION_TREF_TEST_KIND_EQ, None)),
+            WasmHeapType::Struct => Some((TRANSACTION_TREF_TEST_KIND_STRUCT, None)),
+            WasmHeapType::ConcreteStruct(index) => Some((
+                TRANSACTION_TREF_TEST_KIND_STRUCT,
+                Some(index.unwrap_module_type_index()),
+            )),
+            WasmHeapType::Array => Some((TRANSACTION_TREF_TEST_KIND_ARRAY, None)),
+            WasmHeapType::ConcreteArray(index) => Some((
+                TRANSACTION_TREF_TEST_KIND_ARRAY,
+                Some(index.unwrap_module_type_index()),
+            )),
+            _ => None,
+        }
     }
 
     pub fn translate_ref_null(
@@ -8558,12 +8669,9 @@ impl FuncEnvironment<'_> {
                     let fields = stack
                         .drain(stack.len() - arity..)
                         .collect::<StructFieldsVec>();
-                    let struct_ref =
-                        self.translate_struct_new(builder, *struct_type_index, fields.clone())?;
-                    self.translate_transaction_tstruct_static_record_new(
+                    let struct_ref = self.translate_transaction_tstruct_static_record_new(
                         builder,
                         *struct_type_index,
-                        struct_ref,
                         &fields,
                     )?;
                     stack.push(struct_ref);
@@ -8574,12 +8682,9 @@ impl FuncEnvironment<'_> {
                         .iter()
                         .map(|ty| self.transaction_default_field_value(builder, ty))
                         .collect::<WasmResult<StructFieldsVec>>()?;
-                    let struct_ref =
-                        self.translate_struct_new(builder, *struct_type_index, fields.clone())?;
-                    self.translate_transaction_tstruct_static_record_new(
+                    let struct_ref = self.translate_transaction_tstruct_static_record_new(
                         builder,
                         *struct_type_index,
-                        struct_ref,
                         &fields,
                     )?;
                     stack.push(struct_ref);
@@ -8613,12 +8718,9 @@ impl FuncEnvironment<'_> {
                     let len = stack.pop().unwrap();
                     let elem = stack.pop().unwrap();
                     let elem_ty = self.transaction_array_element_type(*array_type_index)?;
-                    let array_ref =
-                        self.translate_array_new(builder, *array_type_index, elem, len)?;
-                    self.translate_transaction_tarray_static_record_new(
+                    let array_ref = self.translate_transaction_tarray_static_record_new(
                         builder,
                         *array_type_index,
-                        array_ref,
                         elem_ty,
                         elem,
                         len,
@@ -8629,12 +8731,9 @@ impl FuncEnvironment<'_> {
                     let len = stack.pop().unwrap();
                     let elem_ty = self.transaction_array_element_type(*array_type_index)?;
                     let elem = self.transaction_default_field_value(builder, &elem_ty)?;
-                    let array_ref =
-                        self.translate_array_new_default(builder, *array_type_index, len)?;
-                    self.translate_transaction_tarray_static_record_new(
+                    let array_ref = self.translate_transaction_tarray_static_record_new(
                         builder,
                         *array_type_index,
-                        array_ref,
                         elem_ty,
                         elem,
                         len,
@@ -8647,12 +8746,9 @@ impl FuncEnvironment<'_> {
                 } => {
                     let array_size = usize::try_from(*array_size).unwrap();
                     let elems = stack.drain(stack.len() - array_size..).collect::<Vec<_>>();
-                    let array_ref =
-                        self.translate_array_new_fixed(builder, *array_type_index, &elems)?;
-                    self.translate_transaction_tarray_static_fixed_record_new(
+                    let array_ref = self.translate_transaction_tarray_static_fixed_record_new(
                         builder,
                         *array_type_index,
-                        array_ref,
                         &elems,
                     )?;
                     stack.push(array_ref);
