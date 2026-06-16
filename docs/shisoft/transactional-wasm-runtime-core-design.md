@@ -540,12 +540,13 @@ workspace and changes the commit path: durable undo records store old granule
 bytes for crash rollback, then the live persistent linear-memory bytes are
 mutated in place only after the undo record is durable.
 
-Object-backed workspace entries remain keyed by `GranuleId`. `ObjectId` is not a
-standalone `GranuleId` variant; it is the object-table slot and runtime identity
-carried by persistent object-space variants such as `TStruct` and `TArray`.
-Following Wizard, those variants are whole-object granules in the first
-object-table workstream. Ownership, versioning, and conflict checks all use the
-same `GranuleId` key family.
+Object-backed workspace entries remain keyed by `GranuleId::Object(ObjectId)`.
+`ObjectId` is the object-table slot, persistent object runtime identity, and
+object permission/conflict key. Struct and array kind lives in the object
+header and durable object-log domain, not in the runtime permission key.
+Following Wizard, the first object-table workstream uses whole-object granules.
+Ownership, versioning, and conflict checks all use the same `GranuleId` key
+family.
 
 Reads check the private workspace by `GranuleId` first. For `tmemory`, if the
 requested byte range has no staged data, the runtime reads committed bytes.
@@ -597,8 +598,11 @@ on table growth without aliasing element slot ownership.
 
 Object-table phase identities carry `ObjectId` as the stable object-table slot:
 
-- `TStruct { object_id }`
-- `TArray { object_id }`
+- `Object { object_id }`
+
+The runtime permission/conflict key does not distinguish struct and array
+objects. Struct/array kind stays in the object header and in durable object-log
+domains, where the decoder still needs to know how to interpret the payload.
 
 Durable log entries encode granules as a compact `PackedGranuleId` in the
 `logical_id` field. The current encoding reserves the high 4 bits for the
@@ -624,12 +628,18 @@ The object-id payload limit is therefore 60 bits in durable log records. Other
 domains can pack their instance/module/table/memory indices into the same low
 60-bit payload as their durable publication helpers are completed.
 
+Runtime `GranuleId` ordering is explicit rather than derived from enum
+declaration order. `GranuleId::Object(ObjectId)` sorts as the single object
+domain after `TTableSize` and then by `ObjectId`; durable `TStruct`/`TArray`
+domain ordering is limited to packed log records and is not a runtime
+permission distinction.
+
 The first in-memory `ObjectTable` foundation allocates dense stable
 `ObjectId`s, reuses freed slots, stores live-slot versions, and maps persistent
-struct and array slots to `TStruct`/`TArray` granules. It also supports staged
-struct/array payload snapshots so transactions can read staged values, discard
-them on abort, apply them on commit, and validate optimistic object reads
-against current object slot versions.
+struct and array slots to `GranuleId::Object(ObjectId)`. It also supports
+staged struct/array payload snapshots so transactions can read staged values,
+discard them on abort, apply them on commit, and validate optimistic object
+reads against current object slot versions.
 
 This in-memory table is the volatile recovery-time index for Zen-style object
 persistence. It must preserve the final identity split: ordinary volatile
@@ -1109,9 +1119,8 @@ them before commit mutates live storage.
 
 The runtime still uses `GranuleId` internally for concurrency control and
 commit validation. For persistent object references, `tref.cast_read/write`
-maps the reference to the object-space granule (`TStruct` or `TArray`) and
-acquires the read/write state there. Write ownership implies read access in
-the active transaction.
+maps the reference to `GranuleId::Object(ObjectId)` and acquires the read/write
+state there. Write ownership implies read access in the active transaction.
 
 Linear memory, globals, and tables do not gain Wasm-visible `tref`
 permissions. Their transactional operations continue to acquire and validate
@@ -1225,8 +1234,8 @@ Recovery rebuilds the object table as follows:
 
 Object-table-facing constraints:
 
-- All transactional access routes through `GranuleId`; object IDs are carried
-  by object-space variants such as `TStruct` and `TArray`.
+- All transactional access routes through `GranuleId`; persistent object access
+  uses `GranuleId::Object(ObjectId)`.
 - Ownership/version metadata is attached to the transactional object or
   granule, not to ordinary Wasmtime memory.
 - Runtime APIs accept a transaction context and `GranuleId` rather than assuming
@@ -1252,11 +1261,11 @@ latency becomes unacceptable. That mode must be behind an explicit future
 feature/configuration switch and must not add object-table writes to the
 default Zen-style path.
 
-The persistent object workstream wires `TStruct` and `TArray` granules to
-durable object records, function references, persistent object identity,
+The persistent object workstream wires `ObjectId` object granules to durable
+struct/array object records, function references, persistent object identity,
 external object wrappers, commit-time promotion, and backend integration.
-Following Wizard, they start at whole-object granularity. More precise field or
-element granules are a later Wasmtime-specific extension.
+Following Wizard, the runtime starts at whole-object granularity. More precise
+field or element granules are a later Wasmtime-specific extension.
 
 ## Parser, Validation, And Lowering Implications
 

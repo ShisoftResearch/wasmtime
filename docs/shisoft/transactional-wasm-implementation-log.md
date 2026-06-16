@@ -115,8 +115,16 @@ Current bridge classification:
   Classification: commit-time promotion source.
 - `DurableReferenceRegistry` live fallback identity registration.
   Classification: WAST-only compatibility fallback.
-- `GranuleId::TStruct` and `GranuleId::TArray` object permission split.
+- Historical `GranuleId::TStruct` and `GranuleId::TArray` object permission
+  split.
   Classification: object-model debt.
+
+Wave 6 object-permission update:
+
+- Runtime object permission and conflict identity now uses
+  `GranuleId::Object(ObjectId)` for persistent structs and arrays. Struct/array
+  kind remains object header and durable object-log metadata, not a separate
+  permission key.
 
 Concrete object/reference boundary inventory:
 
@@ -259,7 +267,8 @@ Remaining stabilization waves:
 - Wave 3: finish restart-stable function/external reference reintegration.
 - Wave 4: freeze object header, payload, and layout invariants.
 - Wave 5: harden root recovery closure.
-- Wave 6: switch object permissions to `GranuleId::Object(ObjectId)`.
+- Wave 6: object permissions now use `GranuleId::Object(ObjectId)`; remaining
+  Wave 6 work is the broader conflict, abort, trap, and `tfail` hardening gate.
 - Wave 7: document `RefType.transaction_permission` as a temporary
   parser/validator/lowering carrier and defer the full `TRefType` split.
 
@@ -1972,16 +1981,16 @@ Implemented runtime paths:
 - Per-instance `TMemory` sidecars backed by `VMemory` block/chunk regions.
 - Copy-on-write transaction workspace indexed by `GranuleId`.
 - `GranuleId::TMemory`, `TMemorySize`, `TGlobal`, `TTable`, and `TTableSize`.
-  `TStruct` and `TArray` are wired to `ObjectId` through the first in-memory
-  `ObjectTable` foundation.
+  Persistent struct and array objects are wired to `GranuleId::Object(ObjectId)`
+  through the first in-memory `ObjectTable` foundation.
 - Store-local `LockBased` optimistic-read/pessimistic-write ownership with
   selected transaction-id workspaces.
 - Generic runtime read/write permission acquisition over every `GranuleId`
   kind; memory, globals, tables, memory/table sizes, and object granules now
   share one permission path.
 - `ObjectTable` foundation with dense stable `ObjectId` allocation, freed-slot
-  reuse, live-slot version metadata, and kind-aware `TStruct`/`TArray` granule
-  acquisition.
+  reuse, live-slot version metadata, and object-identity granule acquisition
+  for persistent structs and arrays.
 - Object payload copy-on-write foundation for struct/array payloads, including
   staged transaction payloads, abort discard, commit application, and
   optimistic object read-version validation.
@@ -2011,9 +2020,11 @@ Remaining tagged mock boundaries:
   Wasmtime reference values and volatile `ObjectId` maps where the final
   persistent object ABI is not yet installed. Numeric imported `tglobal` is on
   the real runtime path.
-- Durable reference/object permissions and the final persistent object-table
-  backend. The current volatile `ObjectId` bridge is enough for WAST
-  execution, but it is not the final persistent object model.
+- Runtime object permissions now use `GranuleId::Object(ObjectId)` for
+  persistent structs and arrays. Remaining object-model work is the final
+  durable reference ABI and final persistent object-table backend; the current
+  volatile `ObjectId` bridge is enough for WAST execution, but it is not the
+  final persistent object model.
 - Full proposal binary validation beyond the current WAST fixtures, including
   hardened diagnostics for every transactional type/ref encoding.
 - `FileBackedMemory` restart/recovery is implemented for the current tmemory

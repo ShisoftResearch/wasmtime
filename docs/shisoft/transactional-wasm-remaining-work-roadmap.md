@@ -532,7 +532,8 @@ Add runtime helpers for:
 - read array length
 - fill/copy/init array ranges
 - validate object kind on every operation
-- acquire `TStruct` or `TArray` read/write permission before payload access
+- acquire `GranuleId::Object(ObjectId)` read/write permission before payload
+  access
 
 Progress: runtime-level helpers now exist on `TransactionState` for struct
 field reads/writes, array len/element/fill/copy operations, whole-object staged

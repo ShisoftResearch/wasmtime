@@ -5,7 +5,7 @@ use crate::runtime::store::InstanceId;
 use crate::runtime::vm::{PackedGranuleDomain, TMemory, TxDataRecordHeader};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use core::{cell::Cell, mem, ops::Range};
+use core::{cell::Cell, cmp::Ordering, mem, ops::Range};
 use std::path::{Path, PathBuf};
 
 #[path = "transaction/durable_ref.rs"]
@@ -1906,8 +1906,7 @@ impl ObjectTable {
 
     pub(crate) fn granule_id(&self, object_id: ObjectId) -> Result<GranuleId> {
         match self.kind(object_id)? {
-            ObjectKind::Struct => Ok(GranuleId::TStruct { object_id }),
-            ObjectKind::Array => Ok(GranuleId::TArray { object_id }),
+            ObjectKind::Struct | ObjectKind::Array => Ok(GranuleId::Object { object_id }),
             ObjectKind::I31 | ObjectKind::Extern | ObjectKind::Func => {
                 bail!(
                     "object kind is encoded as an inline durable value, not a transactional granule"
@@ -2535,7 +2534,7 @@ fn builtin_type_layouts() -> [PersistentTypeLayout; 5] {
     ]
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum GranuleId {
     TMemory {
         instance: Option<u32>,
@@ -2559,11 +2558,113 @@ pub(crate) enum GranuleId {
         instance: Option<u32>,
         table_index: u32,
     },
-    // Future object-table identities; not wired into runtime paths yet.
-    #[allow(dead_code)]
-    TStruct { object_id: ObjectId },
-    #[allow(dead_code)]
-    TArray { object_id: ObjectId },
+    Object {
+        object_id: ObjectId,
+    },
+}
+
+impl GranuleId {
+    fn domain_order(self) -> u8 {
+        match self {
+            GranuleId::TMemory { .. } => 0,
+            GranuleId::TMemorySize { .. } => 1,
+            GranuleId::TGlobal { .. } => 2,
+            GranuleId::TTable { .. } => 3,
+            GranuleId::TTableSize { .. } => 4,
+            // Runtime object permissions use one object-domain key. Durable log
+            // publication still distinguishes TStruct/TArray record domains.
+            GranuleId::Object { .. } => 5,
+        }
+    }
+}
+
+impl Ord for GranuleId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.domain_order().cmp(&other.domain_order()) {
+            Ordering::Equal => {}
+            order => return order,
+        }
+
+        match (self, other) {
+            (
+                GranuleId::TMemory {
+                    instance: lhs_instance,
+                    memory_index: lhs_memory_index,
+                    granule_index: lhs_granule_index,
+                },
+                GranuleId::TMemory {
+                    instance: rhs_instance,
+                    memory_index: rhs_memory_index,
+                    granule_index: rhs_granule_index,
+                },
+            ) => (lhs_instance, lhs_memory_index, lhs_granule_index).cmp(&(
+                rhs_instance,
+                rhs_memory_index,
+                rhs_granule_index,
+            )),
+            (
+                GranuleId::TMemorySize {
+                    instance: lhs_instance,
+                    memory_index: lhs_memory_index,
+                },
+                GranuleId::TMemorySize {
+                    instance: rhs_instance,
+                    memory_index: rhs_memory_index,
+                },
+            ) => (lhs_instance, lhs_memory_index).cmp(&(rhs_instance, rhs_memory_index)),
+            (
+                GranuleId::TGlobal {
+                    instance: lhs_instance,
+                    global_index: lhs_global_index,
+                },
+                GranuleId::TGlobal {
+                    instance: rhs_instance,
+                    global_index: rhs_global_index,
+                },
+            ) => (lhs_instance, lhs_global_index).cmp(&(rhs_instance, rhs_global_index)),
+            (
+                GranuleId::TTable {
+                    instance: lhs_instance,
+                    table_index: lhs_table_index,
+                    granule_index: lhs_granule_index,
+                },
+                GranuleId::TTable {
+                    instance: rhs_instance,
+                    table_index: rhs_table_index,
+                    granule_index: rhs_granule_index,
+                },
+            ) => (lhs_instance, lhs_table_index, lhs_granule_index).cmp(&(
+                rhs_instance,
+                rhs_table_index,
+                rhs_granule_index,
+            )),
+            (
+                GranuleId::TTableSize {
+                    instance: lhs_instance,
+                    table_index: lhs_table_index,
+                },
+                GranuleId::TTableSize {
+                    instance: rhs_instance,
+                    table_index: rhs_table_index,
+                },
+            ) => (lhs_instance, lhs_table_index).cmp(&(rhs_instance, rhs_table_index)),
+            (
+                GranuleId::Object {
+                    object_id: lhs_object_id,
+                },
+                GranuleId::Object {
+                    object_id: rhs_object_id,
+                },
+            ) => lhs_object_id.cmp(rhs_object_id),
+            _ => unreachable!("granule domain order must be unique for each variant"),
+        }
+    }
+}
+
+impl PartialOrd for GranuleId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -4763,20 +4864,12 @@ impl TransactionState {
         self.owns_granule_write(global_granule_id(owner_instance, global_index))
     }
 
-    pub(crate) fn owns_struct_read(&self, object_id: ObjectId) -> bool {
-        self.owns_granule_read(GranuleId::TStruct { object_id })
+    pub(crate) fn owns_object_read(&self, object_id: ObjectId) -> bool {
+        self.owns_granule_read(GranuleId::Object { object_id })
     }
 
-    pub(crate) fn owns_struct_write(&self, object_id: ObjectId) -> bool {
-        self.owns_granule_write(GranuleId::TStruct { object_id })
-    }
-
-    pub(crate) fn owns_array_read(&self, object_id: ObjectId) -> bool {
-        self.owns_granule_read(GranuleId::TArray { object_id })
-    }
-
-    pub(crate) fn owns_array_write(&self, object_id: ObjectId) -> bool {
-        self.owns_granule_write(GranuleId::TArray { object_id })
+    pub(crate) fn owns_object_write(&self, object_id: ObjectId) -> bool {
+        self.owns_granule_write(GranuleId::Object { object_id })
     }
 
     pub(crate) fn acquire_memory_granule_write(
@@ -5407,7 +5500,7 @@ fn object_slot_index(object_id: ObjectId) -> Result<usize> {
 
 fn object_granule_object_id(granule: GranuleId) -> Option<ObjectId> {
     match granule {
-        GranuleId::TStruct { object_id } | GranuleId::TArray { object_id } => Some(object_id),
+        GranuleId::Object { object_id } => Some(object_id),
         GranuleId::TMemory { .. }
         | GranuleId::TMemorySize { .. }
         | GranuleId::TGlobal { .. }
@@ -7419,10 +7512,10 @@ mod tests {
                 memory_index: 7,
                 granule_index: 1,
             },
-            GranuleId::TArray {
+            GranuleId::Object {
                 object_id: ObjectId { object_index: 2 },
             },
-            GranuleId::TStruct {
+            GranuleId::Object {
                 object_id: ObjectId { object_index: 1 },
             },
             GranuleId::TTableSize {
@@ -7481,10 +7574,10 @@ mod tests {
                     instance: None,
                     table_index: 3,
                 },
-                GranuleId::TStruct {
+                GranuleId::Object {
                     object_id: ObjectId { object_index: 1 },
                 },
-                GranuleId::TArray {
+                GranuleId::Object {
                     object_id: ObjectId { object_index: 2 },
                 },
             ]
@@ -7682,6 +7775,7 @@ mod tests {
         let mut state = TransactionState::default();
         let owner = InstanceId::from_u32(1);
         let object = ObjectId { object_index: 9 };
+        let other_object = ObjectId { object_index: 10 };
         let granules = [
             GranuleId::TMemory {
                 instance: Some(1),
@@ -7705,8 +7799,10 @@ mod tests {
                 instance: Some(1),
                 table_index: 4,
             },
-            GranuleId::TStruct { object_id: object },
-            GranuleId::TArray { object_id: object },
+            GranuleId::Object { object_id: object },
+            GranuleId::Object {
+                object_id: other_object,
+            },
         ];
 
         state.begin().unwrap();
@@ -7761,12 +7857,12 @@ mod tests {
         state.begin().unwrap();
 
         assert!(state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap());
-        assert!(state.owns_struct_read(struct_object));
-        assert!(!state.owns_struct_write(struct_object));
+        assert!(state.owns_object_read(struct_object));
+        assert!(!state.owns_object_write(struct_object));
 
         assert!(state.acquire_tref_write_for_gc_ref(&objects, 0x22).unwrap());
-        assert!(state.owns_array_read(array_object));
-        assert!(state.owns_array_write(array_object));
+        assert!(state.owns_object_read(array_object));
+        assert!(state.owns_object_write(array_object));
     }
 
     #[test]
@@ -7781,8 +7877,8 @@ mod tests {
 
         assert!(!state.acquire_tref_read_for_gc_ref(&objects, 0).unwrap());
         assert!(!state.acquire_tref_write_for_gc_ref(&objects, 0x99).unwrap());
-        assert!(!state.owns_struct_read(object));
-        assert!(!state.owns_struct_write(object));
+        assert!(!state.owns_object_read(object));
+        assert!(!state.owns_object_write(object));
     }
 
     #[test]
@@ -7798,8 +7894,8 @@ mod tests {
         assert!(!objects.is_persistent(object).unwrap());
         assert!(!state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap());
         assert!(!state.acquire_tref_write_for_gc_ref(&objects, 0x11).unwrap());
-        assert!(!state.owns_struct_read(object));
-        assert!(!state.owns_struct_write(object));
+        assert!(!state.owns_object_read(object));
+        assert!(!state.owns_object_write(object));
         assert_eq!(
             state.read_struct_field(&objects, object, 0).unwrap(),
             ObjectValue::I32(7)
@@ -8713,7 +8809,7 @@ mod tests {
     }
 
     #[test]
-    fn object_table_granule_permissions_are_kind_aware() {
+    fn object_table_granule_permissions_use_object_identity() {
         let mut objects = ObjectTable::default();
         let struct_object = objects.allocate(ObjectKind::Struct).unwrap();
         let array_object = objects.allocate(ObjectKind::Array).unwrap();
@@ -8722,27 +8818,57 @@ mod tests {
         state.begin().unwrap();
 
         assert!(state.acquire_object_read(&objects, struct_object).unwrap());
-        assert!(state.owns_granule_read(GranuleId::TStruct {
+        assert!(state.owns_granule_read(GranuleId::Object {
             object_id: struct_object,
         }));
-        assert!(!state.owns_granule_write(GranuleId::TStruct {
+        assert!(!state.owns_granule_write(GranuleId::Object {
             object_id: struct_object,
         }));
 
         assert!(state.acquire_object_write(&objects, array_object).unwrap());
-        assert!(state.owns_granule_read(GranuleId::TArray {
+        assert!(state.owns_granule_read(GranuleId::Object {
             object_id: array_object,
         }));
-        assert!(state.owns_granule_write(GranuleId::TArray {
+        assert!(state.owns_granule_write(GranuleId::Object {
             object_id: array_object,
         }));
 
         state.abort().unwrap();
 
-        assert!(!state.owns_granule_read(GranuleId::TStruct {
+        assert!(!state.owns_granule_read(GranuleId::Object {
             object_id: struct_object,
         }));
-        assert!(!state.owns_granule_write(GranuleId::TArray {
+        assert!(!state.owns_granule_write(GranuleId::Object {
+            object_id: array_object,
+        }));
+    }
+
+    #[test]
+    fn persistent_object_permissions_use_object_granule_identity() {
+        let mut objects = ObjectTable::default();
+        let struct_object = objects
+            .allocate_persistent_struct_for_gc_ref(0x61, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let array_object = objects
+            .allocate_persistent_array_for_gc_ref(0x62, vec![ObjectValue::I32(9)])
+            .unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+
+        assert!(state.acquire_object_read(&objects, struct_object).unwrap());
+        assert!(state.owns_granule_read(GranuleId::Object {
+            object_id: struct_object,
+        }));
+        assert!(!state.owns_granule_write(GranuleId::Object {
+            object_id: struct_object,
+        }));
+
+        assert!(state.acquire_object_write(&objects, array_object).unwrap());
+        assert!(state.owns_granule_read(GranuleId::Object {
+            object_id: array_object,
+        }));
+        assert!(state.owns_granule_write(GranuleId::Object {
             object_id: array_object,
         }));
     }
@@ -12626,7 +12752,7 @@ mod tests {
             state.read_struct_field(&objects, object, 0).unwrap(),
             ObjectValue::I32(9)
         );
-        assert!(state.owns_struct_write(object));
+        assert!(state.owns_object_write(object));
 
         assert!(state.commit_object_payloads(&mut objects).unwrap());
         state.complete_commit().unwrap();
@@ -12635,7 +12761,7 @@ mod tests {
             objects.payload(object).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(9), ObjectValue::I64(2)])
         );
-        assert!(!state.owns_struct_write(object));
+        assert!(!state.owns_object_write(object));
     }
 
     #[test]
@@ -12662,7 +12788,7 @@ mod tests {
             objects.payload(object).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::I32(2)])
         );
-        assert!(!state.owns_struct_write(object));
+        assert!(!state.owns_object_write(object));
     }
 
     #[test]
@@ -12772,7 +12898,7 @@ mod tests {
                 ObjectValue::I32(4),
             ])
         );
-        assert!(state.owns_array_write(object));
+        assert!(state.owns_object_write(object));
 
         assert!(state.commit_object_payloads(&mut objects).unwrap());
         state.complete_commit().unwrap();

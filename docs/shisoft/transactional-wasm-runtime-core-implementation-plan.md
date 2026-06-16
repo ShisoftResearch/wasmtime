@@ -98,10 +98,10 @@ This plan does not implement:
 
 - Table-element COW, table bulk operators, and the full object-model runtime.
   `GranuleId::TTable` and `GranuleId::TTableSize` are used by the first funcref
-  table runtime paths; `GranuleId::TStruct` and `GranuleId::TArray` are backed
-  by the first in-memory `ObjectTable` foundation with payload COW and object
-  read-version validation. `ObjectId` is carried inside the struct/array
-  granule variants, not used as a standalone ownership key.
+  table runtime paths. The current object runtime uses
+  `GranuleId::Object(ObjectId)` as the object permission, ownership, and
+  conflict key for persistent structs and arrays; struct/array kind remains
+  object metadata and durable-log domain metadata.
 - Transactional structs, arrays, refs, GC integration, or reference-control
   permissions.
 - `ttry`/`tfail` structured failure handlers.
@@ -901,9 +901,11 @@ Expected: commit succeeds with no unrelated files staged.
 - Test: `crates/wasmtime/src/runtime/transaction.rs`
 
 This task replaces memory/global-specific workspace keys with the Wizard-style
-identity shape. `GranuleId::TTable` and `GranuleId::TTableSize` are now used by
-the first funcref `ttable` runtime paths; table COW, `GranuleId::TStruct`, and
-`GranuleId::TArray` remain for future table/object-table work.
+identity shape. `GranuleId::TTable` and `GranuleId::TTableSize` are used by the
+first funcref `ttable` runtime paths. Object runtime permission, ownership, and
+conflict identity now uses `GranuleId::Object(ObjectId)` for persistent structs
+and arrays; durable-log object publication still distinguishes struct and array
+record domains.
 
 - [ ] **Step 1: Add failing GranuleId and workspace tests**
 

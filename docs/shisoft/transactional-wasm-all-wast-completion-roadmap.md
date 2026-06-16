@@ -213,8 +213,7 @@ Implement:
 - object kind metadata for `TStruct` and `TArray`, with `ti31`, `tfuncref`,
   and `texternref` encoded as inline durable values inside object payloads.
 - object granule helper methods that map object slots to
-  `GranuleId::TStruct` and `GranuleId::TArray` for permission and conflict
-  acquisition.
+  `GranuleId::Object(ObjectId)` for permission and conflict acquisition.
 - transaction state integration so object reads use optimistic read permission
   and object writes use pessimistic write permission.
 
@@ -222,7 +221,7 @@ Initial tests:
 
 - allocation returns stable dense object ids
 - freeing a slot reuses that id before growing the table
-- struct and array permission helpers acquire the correct granule kind
+- struct and array permission helpers acquire the same object-identity granule
 - abort releases object ownership
 - commit validates object read versions
 

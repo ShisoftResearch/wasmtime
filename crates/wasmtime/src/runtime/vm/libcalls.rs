@@ -3462,7 +3462,7 @@ fn current_granule_version(
                     .context("tmemory granule index does not fit host usize")?,
             )
         }
-        GranuleId::TStruct { object_id } | GranuleId::TArray { object_id } => store
+        GranuleId::Object { object_id } => store
             .store_opaque_mut()
             .transaction_object_table()
             .version(object_id),

@@ -63,8 +63,8 @@ transaction WAST harness, transaction Rust SDK tests.
       records have documented invariants sufficient for tracing and recovery.
 - [ ] `tglobal` and `ttable` roots recover as durable object identities and use
       the same live ABI after reopening file-backed storage.
-- [ ] Transaction permissions for object operations are keyed by
-      `GranuleId::Object(ObjectId)` once the final live object ABI is active.
+- [x] Transaction permissions for object operations are keyed by
+      `GranuleId::Object(ObjectId)`.
 - [ ] `SHISOFT-TWASM-MOCK` paths remain only in explicit WAST compatibility
       fallback seams, not in normal runtime or file-backed persistence paths.
 - [ ] Full transaction verification passes with no ignored transaction WAST
@@ -244,9 +244,9 @@ WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_BUILD_JOBS=2 python3 ./ci/run-tests.py --
 **Purpose:** Ensure object permissions follow the same transaction-state model
 as memory/table/global granules.
 
-- [ ] Route object read/write permission checks through
+- [x] Route object read/write permission checks through
       `GranuleId::Object(ObjectId)`.
-- [ ] Replace the current `GranuleId::TStruct` / `GranuleId::TArray` split with
+- [x] Replace the current `GranuleId::TStruct` / `GranuleId::TArray` split with
       one object granule identity after updating tests to prove permissions no
       longer depend on object kind.
 - [ ] Verify object writes acquire ownership according to the lock-based scheme.
