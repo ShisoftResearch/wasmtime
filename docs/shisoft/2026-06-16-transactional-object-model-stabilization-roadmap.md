@@ -42,8 +42,10 @@ transaction WAST harness, transaction Rust SDK tests.
       bridge paths still convert through process-local Wasmtime GC handles.
 - [ ] Restart-stable `tfuncref` and `texternref` identity is only partially
       integrated.
-- [ ] Durable block/chunk retirement and object storage reuse are not part of
-      the stable object model yet.
+- [ ] Fine-grained GC-driven durable block/chunk retirement and object storage
+      reuse are not part of the stable object model yet. Coarse committed
+      linear-undo chunk retirement and whole-dead object-chunk reuse already
+      exist as pre-GC storage hygiene.
 
 ---
 
@@ -53,14 +55,18 @@ transaction WAST harness, transaction Rust SDK tests.
       boundaries use a final `ObjectId`-carrying ABI, not raw `VMGcRef` or
       `VMFuncRef`.
 - [ ] Raw `VMGcRef` is used only as an ordinary Wasmtime GC handle or as a
-      short-lived commit-time promotion source.
-- [ ] Persistent object payloads store durable values only:
+      short-lived commit-time promotion source. This is true for persistent
+      records, but the live helper ABI still has an explicit temporary bridge.
+- [x] Strict persistent object payload encoding stores durable values only:
       `ObjectId` edges, inline scalar values, inline `ti31` values, and
-      restart-stable function/external reference identities.
+      durable function/external reference identity tuples. Restart-stable
+      reintegration of those identities is still Wave 3 work.
 - [ ] `tfuncref` and `texternref` either encode to restart-stable identities or
       fail the transaction before durable publication.
 - [ ] Object headers, object record payloads, type/layout records, and root
       records have documented invariants sufficient for tracing and recovery.
+      The current docs capture the pre-GC shape, but Wave 4 keeps the final
+      freeze checklist open.
 - [ ] `tglobal` and `ttable` roots recover as durable object identities and use
       the same live ABI after reopening file-backed storage.
 - [x] Transaction permissions for object operations are keyed by
@@ -137,15 +143,15 @@ cargo test -p wasmtime-tests transaction_persistence --test all
 **Purpose:** Make process-local GC identity impossible to accidentally treat as
 persistent identity.
 
-- [ ] Rename or delete APIs that imply a raw `VMGcRef` can identify a
+- [x] Rename or delete APIs that imply a raw `VMGcRef` can identify a
       persistent object after recovery.
-- [ ] Add assertions in file-backed recovery paths that recovered object refs
+- [x] Add assertions in file-backed recovery paths that recovered object refs
       do not require live GC mappings.
-- [ ] Make normal file-backed persistence strict by default: unsupported
+- [x] Make normal file-backed persistence strict by default: unsupported
       durable ref forms fail before publication.
-- [ ] Keep WAST-only fallback behind an explicit harness flag and document the
+- [x] Keep WAST-only fallback behind an explicit harness flag and document the
       flag next to the code.
-- [ ] Add a regression test that reopens storage and accesses recovered object
+- [x] Add a regression test that reopens storage and accesses recovered object
       refs without creating volatile GC mirror objects first.
 
 **Verification:**
@@ -168,10 +174,10 @@ persistent objects.
       identity.
 - [ ] Define the durable external reference identity API. Host code must
       register a stable namespace/key before a `texternref` can be committed.
-- [ ] Encode durable function/external refs inside object payload records,
+- [x] Encode durable function/external refs inside object payload records,
       without allocating standalone object-table entries for them.
 - [ ] Reintegrate durable function/external refs during store reopen.
-- [ ] Fail commit before publication when a function/external ref lacks a
+- [x] Fail commit before publication when a function/external ref lacks a
       stable durable identity.
 - [ ] Keep live-only WAST fallback explicit and separate from file-backed
       persistence.

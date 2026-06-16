@@ -1033,12 +1033,10 @@ struct WasmtimeTypeLayoutKey {
 pub(crate) struct ObjectTable {
     slots: Vec<Option<ObjectTableSlot>>,
     free_list: Vec<ObjectId>,
-    // SHISOFT-TWASM-MOCK: these volatile side maps let live transactional
-    // object libcalls interoperate with Wasmtime GC refs while the final
-    // `ObjectId`-carrying live `tref` ABI is still pending. Durable object
-    // storage and recovered roots use `ObjectId`.
-    gc_ref_to_object: BTreeMap<u32, ObjectId>,
-    object_to_gc_ref: BTreeMap<ObjectId, u32>,
+    // SHISOFT-TWASM-MOCK: live transaction ref bridge; persistent object records
+    // must use ObjectId and must not call this helper.
+    live_bridge_gc_refs_to_objects: BTreeMap<u32, ObjectId>,
+    object_to_live_bridge_gc_ref: BTreeMap<ObjectId, u32>,
     type_layouts: TypeLayoutRegistry,
     wasmtime_type_layout_ids: BTreeMap<WasmtimeTypeLayoutKey, TypeLayoutId>,
     next_dynamic_type_layout_id: Option<u32>,
@@ -1053,8 +1051,8 @@ impl Default for ObjectTable {
         let mut table = Self {
             slots: Vec::new(),
             free_list: Vec::new(),
-            gc_ref_to_object: BTreeMap::new(),
-            object_to_gc_ref: BTreeMap::new(),
+            live_bridge_gc_refs_to_objects: BTreeMap::new(),
+            object_to_live_bridge_gc_ref: BTreeMap::new(),
             type_layouts: TypeLayoutRegistry::default(),
             wasmtime_type_layout_ids: BTreeMap::new(),
             next_dynamic_type_layout_id: Some(TypeLayoutId::BUILTIN_FUNC.get() + 1),
@@ -1283,7 +1281,7 @@ impl ObjectTable {
             "transactional struct object cannot use null GC ref"
         );
         ensure!(
-            !self.gc_ref_to_object.contains_key(&gc_ref),
+            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
             "transactional object GC ref is already associated"
         );
         let object_id = self.allocate_payload_with_type_layout_id(
@@ -1291,7 +1289,7 @@ impl ObjectTable {
             type_layout_id,
             true,
         )?;
-        self.associate_gc_ref(gc_ref, object_id)?;
+        self.associate_live_gc_ref_for_transaction_bridge(gc_ref, object_id)?;
         Ok(object_id)
     }
 
@@ -1305,11 +1303,11 @@ impl ObjectTable {
             "transactional struct object cannot use null GC ref"
         );
         ensure!(
-            !self.gc_ref_to_object.contains_key(&gc_ref),
+            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
             "transactional object GC ref is already associated"
         );
         let object_id = self.allocate_struct(fields)?;
-        self.associate_gc_ref(gc_ref, object_id)?;
+        self.associate_live_gc_ref_for_transaction_bridge(gc_ref, object_id)?;
         Ok(object_id)
     }
 
@@ -1524,7 +1522,7 @@ impl ObjectTable {
             "transactional array object cannot use null GC ref"
         );
         ensure!(
-            !self.gc_ref_to_object.contains_key(&gc_ref),
+            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
             "transactional object GC ref is already associated"
         );
         let object_id = self.allocate_payload_with_type_layout_id(
@@ -1532,7 +1530,7 @@ impl ObjectTable {
             type_layout_id,
             true,
         )?;
-        self.associate_gc_ref(gc_ref, object_id)?;
+        self.associate_live_gc_ref_for_transaction_bridge(gc_ref, object_id)?;
         Ok(object_id)
     }
 
@@ -1546,18 +1544,21 @@ impl ObjectTable {
             "transactional array object cannot use null GC ref"
         );
         ensure!(
-            !self.gc_ref_to_object.contains_key(&gc_ref),
+            !self.live_bridge_gc_refs_to_objects.contains_key(&gc_ref),
             "transactional object GC ref is already associated"
         );
         let object_id = self.allocate_array(elements)?;
-        self.associate_gc_ref(gc_ref, object_id)?;
+        self.associate_live_gc_ref_for_transaction_bridge(gc_ref, object_id)?;
         Ok(object_id)
     }
 
-    pub(crate) fn object_id_for_raw_ref_or_func(&mut self, raw_ref: u64) -> Result<ObjectId> {
+    pub(crate) fn live_bridge_object_id_for_raw_ref_or_func(
+        &mut self,
+        raw_ref: u64,
+    ) -> Result<ObjectId> {
         ensure!(raw_ref != 0, "transactional object cannot use null ref");
         if let Ok(gc_ref) = u32::try_from(raw_ref)
-            && let Some(object_id) = self.gc_ref_to_object.get(&gc_ref).copied()
+            && let Some(object_id) = self.live_bridge_gc_refs_to_objects.get(&gc_ref).copied()
         {
             return Ok(object_id);
         }
@@ -1689,57 +1690,65 @@ impl ObjectTable {
         self.live_count
     }
 
-    pub(crate) fn associate_gc_ref(&mut self, gc_ref: u32, object_id: ObjectId) -> Result<()> {
+    pub(crate) fn associate_live_gc_ref_for_transaction_bridge(
+        &mut self,
+        gc_ref: u32,
+        object_id: ObjectId,
+    ) -> Result<()> {
         ensure!(gc_ref != 0, "transactional object cannot use null GC ref");
         self.live_slot(object_id)?;
-        if let Some(existing) = self.gc_ref_to_object.get(&gc_ref).copied() {
+        if let Some(existing) = self.live_bridge_gc_refs_to_objects.get(&gc_ref).copied() {
             ensure!(
                 existing == object_id,
                 "transactional object GC ref is already associated"
             );
         }
-        if let Some(existing) = self.object_to_gc_ref.get(&object_id).copied() {
+        if let Some(existing) = self.object_to_live_bridge_gc_ref.get(&object_id).copied() {
             ensure!(
                 existing == gc_ref,
                 "transactional object id is already associated with another GC ref"
             );
         }
-        self.gc_ref_to_object.insert(gc_ref, object_id);
-        self.object_to_gc_ref.insert(object_id, gc_ref);
+        self.live_bridge_gc_refs_to_objects
+            .insert(gc_ref, object_id);
+        self.object_to_live_bridge_gc_ref.insert(object_id, gc_ref);
         Ok(())
     }
 
-    pub(crate) fn object_id_for_gc_ref(&self, gc_ref: u32) -> Result<ObjectId> {
+    pub(crate) fn object_id_for_live_gc_ref_bridge(&self, gc_ref: u32) -> Result<ObjectId> {
         ensure!(gc_ref != 0, "transactional object cannot use null GC ref");
-        self.gc_ref_to_object
+        self.live_bridge_gc_refs_to_objects
             .get(&gc_ref)
             .copied()
             .with_context(|| format!("unknown transactional object GC ref: {gc_ref:#x}"))
     }
 
-    pub(crate) fn object_id_for_transaction_ref_raw(&self, raw_ref: u32) -> Result<ObjectId> {
+    pub(crate) fn object_id_for_live_bridge_transaction_ref_raw(
+        &self,
+        raw_ref: u32,
+    ) -> Result<ObjectId> {
         ensure!(raw_ref != 0, "transactional object cannot use null ref");
-        if let Some(object_id) = self.known_object_id_for_gc_ref(raw_ref) {
+        if let Some(object_id) = self.known_object_id_for_live_gc_ref_bridge(raw_ref) {
             return Ok(object_id);
         }
         if let Some(object_id) = self.persistent_object_id_for_raw_ref(u64::from(raw_ref))? {
             return Ok(object_id);
         }
-        self.object_id_for_gc_ref(raw_ref)
+        self.object_id_for_live_gc_ref_bridge(raw_ref)
     }
 
-    pub(crate) fn known_object_id_for_gc_ref(&self, gc_ref: u32) -> Option<ObjectId> {
+    pub(crate) fn known_object_id_for_live_gc_ref_bridge(&self, gc_ref: u32) -> Option<ObjectId> {
         if gc_ref == 0 {
             return None;
         }
-        self.gc_ref_to_object.get(&gc_ref).copied()
+        self.live_bridge_gc_refs_to_objects.get(&gc_ref).copied()
     }
 
-    pub(crate) fn known_persistent_object_id_for_gc_ref(
+    pub(crate) fn known_persistent_object_id_for_live_gc_ref_bridge(
         &self,
         gc_ref: u32,
     ) -> Result<Option<ObjectId>> {
-        let Some(object_id) = self.known_object_id_for_gc_ref(gc_ref) else {
+        let Some(object_id) = self.known_object_id_for_live_gc_ref_bridge(gc_ref) else {
             return Ok(None);
         };
         if self.is_persistent(object_id)? {
@@ -1749,24 +1758,24 @@ impl ObjectTable {
         }
     }
 
-    pub(crate) fn known_persistent_object_id_for_transaction_ref_raw(
+    pub(crate) fn known_persistent_object_id_for_live_bridge_transaction_ref_raw(
         &self,
         raw_ref: u32,
     ) -> Result<Option<ObjectId>> {
-        if let Some(object_id) = self.known_persistent_object_id_for_gc_ref(raw_ref)? {
+        if let Some(object_id) = self.known_persistent_object_id_for_live_gc_ref_bridge(raw_ref)? {
             return Ok(Some(object_id));
         }
         self.persistent_object_id_for_raw_ref(u64::from(raw_ref))
     }
 
-    fn persistent_object_id_for_gc_ref_or_promotion_required(
+    fn persistent_object_id_for_live_bridge_or_promotion_required(
         &self,
         gc_ref: u32,
     ) -> Result<Option<ObjectId>> {
         if gc_ref == 0 {
             return Ok(None);
         }
-        let Some(object_id) = self.known_object_id_for_gc_ref(gc_ref) else {
+        let Some(object_id) = self.known_object_id_for_live_gc_ref_bridge(gc_ref) else {
             bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
         };
         ensure!(
@@ -1776,9 +1785,12 @@ impl ObjectTable {
         Ok(Some(object_id))
     }
 
-    pub(crate) fn gc_ref_for_object_id(&self, object_id: ObjectId) -> Result<u32> {
+    pub(crate) fn live_bridge_gc_ref_lookup_for_object_id(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<u32> {
         self.live_slot(object_id)?;
-        self.object_to_gc_ref
+        self.object_to_live_bridge_gc_ref
             .get(&object_id)
             .copied()
             .with_context(|| {
@@ -1787,27 +1799,46 @@ impl ObjectTable {
     }
 
     pub(crate) fn raw_ref_for_object_id(&self, object_id: ObjectId) -> Result<u64> {
-        Ok(self.live_ref_abi_for_object_id(object_id)?.0)
+        Ok(self.persistent_ref_abi_for_object_id(object_id)?.0)
     }
 
-    pub(crate) fn live_ref_abi_for_object_id(&self, object_id: ObjectId) -> Result<(u64, u64)> {
+    pub(crate) fn persistent_ref_abi_for_object_id(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(u64, u64)> {
         self.live_slot(object_id)?;
-        if let Some(gc_ref) = self.object_to_gc_ref.get(&object_id).copied() {
-            return Ok((u64::from(gc_ref), OBJECT_VALUE_ABI_LIVE_REF_KIND_GC));
-        }
         ensure!(
             self.is_persistent(object_id)?,
-            "transactional object has no GC ref association: {object_id:?}"
+            "persistent ref ABI requires a persistent object: {object_id:?}"
         );
-        // Transactional persistent refs still cross some live helper boundaries
-        // through the temporary 32-bit raw-ref bridge. The final live tref ABI
-        // must remove this narrowing.
+        Ok((
+            PersistentObjectRefRaw::from_optional_object_id(Some(object_id))?.as_raw(),
+            OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
+        ))
+    }
+
+    fn persistent_ref_raw_for_live_bridge(object_id: ObjectId) -> Result<u64> {
         let raw = PersistentObjectRefRaw::from_optional_object_id(Some(object_id))?.as_raw();
         ensure!(
             u32::try_from(raw).is_ok(),
             "persistent object ref does not fit live transaction ref bridge"
         );
-        Ok((raw, OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT))
+        Ok(raw)
+    }
+
+    pub(crate) fn live_bridge_ref_abi_for_object_id(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(u64, u64)> {
+        self.live_slot(object_id)?;
+        if let Some(gc_ref) = self.object_to_live_bridge_gc_ref.get(&object_id).copied() {
+            return Ok((u64::from(gc_ref), OBJECT_VALUE_ABI_LIVE_REF_KIND_GC));
+        }
+        self.persistent_ref_abi_for_object_id(object_id)?;
+        Ok((
+            Self::persistent_ref_raw_for_live_bridge(object_id)?,
+            OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
+        ))
     }
 
     pub(crate) fn persistent_object_id_for_raw_ref(
@@ -1978,8 +2009,8 @@ impl ObjectTable {
             return Ok(false);
         }
         self.slots[index] = None;
-        if let Some(gc_ref) = self.object_to_gc_ref.remove(&object_id) {
-            self.gc_ref_to_object.remove(&gc_ref);
+        if let Some(gc_ref) = self.object_to_live_bridge_gc_ref.remove(&object_id) {
+            self.live_bridge_gc_refs_to_objects.remove(&gc_ref);
         }
         self.live_count = self
             .live_count
@@ -2007,8 +2038,8 @@ impl ObjectTable {
     fn clear_volatile_index(&mut self) {
         self.slots.clear();
         self.free_list.clear();
-        self.gc_ref_to_object.clear();
-        self.object_to_gc_ref.clear();
+        self.live_bridge_gc_refs_to_objects.clear();
+        self.object_to_live_bridge_gc_ref.clear();
         self.next_version = 0;
         self.next_record_version = 0;
         self.live_count = 0;
@@ -4308,7 +4339,7 @@ impl TransactionState {
         raw_ref: u32,
     ) -> Result<bool> {
         let Some(object_id) =
-            object_table.known_persistent_object_id_for_transaction_ref_raw(raw_ref)?
+            object_table.known_persistent_object_id_for_live_bridge_transaction_ref_raw(raw_ref)?
         else {
             return Ok(false);
         };
@@ -4321,7 +4352,7 @@ impl TransactionState {
         raw_ref: u32,
     ) -> Result<bool> {
         let Some(object_id) =
-            object_table.known_persistent_object_id_for_transaction_ref_raw(raw_ref)?
+            object_table.known_persistent_object_id_for_live_bridge_transaction_ref_raw(raw_ref)?
         else {
             return Ok(false);
         };
@@ -4562,7 +4593,7 @@ impl TransactionState {
             let roots = delta.roots.entry(root_key).or_default();
             let root = match value {
                 GlobalSnapshot::GcRef(gc_ref) => self
-                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                    .persistent_object_id_for_live_bridge_after_completed_promotion(
                         object_table,
                         gc_ref,
                     )?,
@@ -4578,7 +4609,7 @@ impl TransactionState {
             let roots = delta.roots.entry(root_key).or_default();
             let root = match value {
                 TableElementSnapshot::GcRef(gc_ref) => self
-                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                    .persistent_object_id_for_live_bridge_after_completed_promotion(
                         object_table,
                         gc_ref,
                     )?,
@@ -4647,7 +4678,7 @@ impl TransactionState {
         for &value in self.staged_globals.values() {
             let root = match value {
                 GlobalSnapshot::GcRef(gc_ref) => self
-                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                    .persistent_object_id_for_live_bridge_after_completed_promotion(
                         object_table,
                         gc_ref,
                     )?,
@@ -4660,7 +4691,7 @@ impl TransactionState {
         for &value in self.staged_table_elements.values() {
             let root = match value {
                 TableElementSnapshot::GcRef(gc_ref) => self
-                    .persistent_object_id_for_gc_ref_after_completed_promotion(
+                    .persistent_object_id_for_live_bridge_after_completed_promotion(
                         object_table,
                         gc_ref,
                     )?,
@@ -5349,7 +5380,7 @@ fn persistent_root_object_id_for_global_snapshot(
 ) -> Result<Option<ObjectId>> {
     match value {
         GlobalSnapshot::GcRef(gc_ref) => {
-            object_table.persistent_object_id_for_gc_ref_or_promotion_required(gc_ref)
+            object_table.persistent_object_id_for_live_bridge_or_promotion_required(gc_ref)
         }
         _ => Ok(None),
     }
@@ -5361,7 +5392,7 @@ fn persistent_root_object_id_for_table_element_snapshot(
 ) -> Result<Option<ObjectId>> {
     match value {
         TableElementSnapshot::GcRef(gc_ref) => {
-            object_table.persistent_object_id_for_gc_ref_or_promotion_required(gc_ref)
+            object_table.persistent_object_id_for_live_bridge_or_promotion_required(gc_ref)
         }
         TableElementSnapshot::FuncRef(_) => Ok(None),
     }
@@ -9315,11 +9346,14 @@ mod tests {
     }
 
     #[test]
-    fn object_id_for_raw_ref_or_func_rejects_unknown_function_ref_without_durable_identity() {
+    fn live_bridge_object_id_for_raw_ref_or_func_rejects_unknown_function_ref_without_durable_identity()
+     {
         let mut objects = ObjectTable::default();
         let raw_ref = u64::from(u32::MAX) + 2;
 
-        let err = objects.object_id_for_raw_ref_or_func(raw_ref).unwrap_err();
+        let err = objects
+            .live_bridge_object_id_for_raw_ref_or_func(raw_ref)
+            .unwrap_err();
 
         assert!(
             err.to_string().contains(
@@ -9518,6 +9552,141 @@ mod tests {
                 0x0f0e_0d0c_0b0a_0908,
             )
         );
+    }
+
+    #[test]
+    fn persistent_object_value_abi_ref_uses_object_id_not_gc_ref_side_map() -> Result<()> {
+        let object_id = ObjectId { object_index: 41 };
+        let abi = ObjectValueAbi::from_object_value(&ObjectValue::Ref(Some(object_id)))?;
+
+        assert_eq!(
+            abi.as_parts(),
+            (
+                OBJECT_VALUE_ABI_TAG_REF,
+                PersistentObjectRefRaw::from_optional_object_id(Some(object_id))?.as_raw(),
+                0
+            )
+        );
+        assert_eq!(abi.to_object_value()?, ObjectValue::Ref(Some(object_id)));
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_ref_abi_ignores_associated_live_gc_ref() -> Result<()> {
+        let mut objects = ObjectTable::default();
+        let object_id =
+            objects.allocate_persistent_struct_for_gc_ref(0x710, vec![ObjectValue::I32(1)])?;
+
+        assert_eq!(
+            objects.known_object_id_for_live_gc_ref_bridge(0x710),
+            Some(object_id)
+        );
+        assert_eq!(
+            objects.persistent_ref_abi_for_object_id(object_id)?,
+            (
+                PersistentObjectRefRaw::from_optional_object_id(Some(object_id))?.as_raw(),
+                OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
+            )
+        );
+        assert_eq!(
+            objects.live_bridge_ref_abi_for_object_id(object_id)?,
+            (0x710, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_ref_abi_live_bridge_rejects_overflow() {
+        let error = ObjectTable::persistent_ref_raw_for_live_bridge(ObjectId {
+            object_index: u64::from(u32::MAX),
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("persistent object ref does not fit live transaction ref bridge")
+        );
+    }
+
+    #[test]
+    fn persistent_ref_abi_live_bridge_rejects_volatile_object_without_live_ref() -> Result<()> {
+        let mut objects = ObjectTable::default();
+        let object_id = objects.allocate_struct(vec![ObjectValue::I32(1)])?;
+
+        let error = objects
+            .live_bridge_ref_abi_for_object_id(object_id)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("persistent ref ABI requires a persistent object")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_object_value_abi_func_and_extern_use_durable_identities() -> Result<()> {
+        let func = DurableFuncIdentity {
+            module_fingerprint: 0x1234,
+            function_index: 7,
+            type_layout_id: TypeLayoutId::BUILTIN_FUNC,
+        };
+        let extern_ = DurableExternIdentity {
+            namespace: 9,
+            handle: 0xabc,
+            type_layout_id: TypeLayoutId::BUILTIN_EXTERN,
+        };
+
+        assert_eq!(
+            ObjectValueAbi::from_object_value(&ObjectValue::FuncRef(func))?.to_object_value()?,
+            ObjectValue::FuncRef(func)
+        );
+        assert_eq!(
+            ObjectValueAbi::from_object_value(&ObjectValue::ExternRef(extern_))?
+                .to_object_value()?,
+            ObjectValue::ExternRef(extern_)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_func_and_extern_values_are_not_object_payloads() {
+        assert!(ObjectPayload::default_for_kind(ObjectKind::Func).is_err());
+        assert!(ObjectPayload::default_for_kind(ObjectKind::Extern).is_err());
+    }
+
+    #[test]
+    fn inline_i31_values_are_not_object_payloads() {
+        assert!(ObjectPayload::default_for_kind(ObjectKind::I31).is_err());
+    }
+
+    #[test]
+    fn object_value_abi_func_extern_does_not_need_live_registry() -> Result<()> {
+        let durable_refs = DurableReferenceRegistry::default();
+        let func = DurableFuncIdentity {
+            module_fingerprint: 0xfeed,
+            function_index: 3,
+            type_layout_id: TypeLayoutId::BUILTIN_FUNC,
+        };
+        let extern_ = DurableExternIdentity {
+            namespace: 4,
+            handle: 0xbeef,
+            type_layout_id: TypeLayoutId::BUILTIN_EXTERN,
+        };
+
+        assert!(durable_refs.resolve_func_identity(func).is_none());
+        assert!(durable_refs.resolve_extern_identity(extern_).is_none());
+        assert_eq!(
+            ObjectValueAbi::from_object_value(&ObjectValue::FuncRef(func))?.to_object_value()?,
+            ObjectValue::FuncRef(func)
+        );
+        assert_eq!(
+            ObjectValueAbi::from_object_value(&ObjectValue::ExternRef(extern_))?
+                .to_object_value()?,
+            ObjectValue::ExternRef(extern_)
+        );
+        Ok(())
     }
 
     #[test]
@@ -10453,8 +10622,8 @@ mod tests {
                 })
                 .unwrap();
 
-            assert!(recovered.rebuilt.gc_ref_to_object.is_empty());
-            assert!(recovered.rebuilt.object_to_gc_ref.is_empty());
+            assert!(recovered.rebuilt.live_bridge_gc_refs_to_objects.is_empty());
+            assert!(recovered.rebuilt.object_to_live_bridge_gc_ref.is_empty());
             assert_eq!(recovered.rebuilt.live_count(), 2);
             assert_eq!(
                 recovered.rebuilt.payload(target).unwrap(),
@@ -13836,6 +14005,27 @@ mod tests {
     }
 
     #[test]
+    fn persistent_publication_traces_object_id_after_live_bridge_maps_are_cleared() -> Result<()> {
+        let mut objects = ObjectTable::default();
+        let child =
+            objects.allocate_persistent_struct_for_gc_ref(0x801, vec![ObjectValue::I32(10)])?;
+        let parent = objects
+            .allocate_persistent_struct_for_gc_ref(0x802, vec![ObjectValue::Ref(Some(child))])?;
+
+        let publication = objects.pending_publication_for_test(parent)?;
+        objects.live_bridge_gc_refs_to_objects.clear();
+        objects.object_to_live_bridge_gc_ref.clear();
+
+        let refs = objects.trace_object_ids(parent)?;
+        assert_eq!(refs, vec![child]);
+        let (domain, object_id) =
+            crate::runtime::vm::unpack_object_granule_id(publication.logical_id)?;
+        assert_eq!(domain, crate::runtime::vm::PackedGranuleDomain::TStruct);
+        assert_eq!(object_id, parent.object_index);
+        Ok(())
+    }
+
+    #[test]
     fn object_table_rebuilds_latest_slots_from_heap_publication_metadata() {
         let mut objects = ObjectTable::default();
         let first = objects
@@ -13859,8 +14049,8 @@ mod tests {
 
         objects.slots.clear();
         objects.free_list.clear();
-        objects.gc_ref_to_object.clear();
-        objects.object_to_gc_ref.clear();
+        objects.live_bridge_gc_refs_to_objects.clear();
+        objects.object_to_live_bridge_gc_ref.clear();
         objects.next_version = 0;
         objects.live_count = 0;
 
@@ -13901,8 +14091,8 @@ mod tests {
                 .type_layouts()
                 .contains(type_layout::TypeLayoutId::new(9).unwrap())
         );
-        assert!(objects.gc_ref_to_object.is_empty());
-        assert!(objects.object_to_gc_ref.is_empty());
+        assert!(objects.live_bridge_gc_refs_to_objects.is_empty());
+        assert!(objects.object_to_live_bridge_gc_ref.is_empty());
         assert_eq!(
             objects.kind(ObjectId { object_index: 41 }).unwrap(),
             ObjectKind::Struct
@@ -14268,6 +14458,25 @@ mod tests {
                 "volatile GC reference promotion into persistent object graph is not implemented yet"
             );
         }
+
+        #[test]
+        fn persistent_payload_rejects_unpromoted_volatile_ref() -> Result<()> {
+            let mut objects = ObjectTable::default();
+            let volatile = objects.allocate_struct_for_gc_ref(0x901, vec![ObjectValue::I32(1)])?;
+            let persistent = objects.allocate_persistent_struct_for_gc_ref(
+                0x902,
+                vec![ObjectValue::Ref(Some(volatile))],
+            )?;
+
+            let err = objects
+                .pending_publication_for_test(persistent)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED)
+            );
+            Ok(())
+        }
     }
 
     mod persistent_promotion_reservation {
@@ -14294,7 +14503,10 @@ mod tests {
                 objects.payload(promoted).unwrap(),
                 ObjectPayload::Struct(Vec::new())
             );
-            assert_eq!(objects.known_object_id_for_gc_ref(0x710), Some(source));
+            assert_eq!(
+                objects.known_object_id_for_live_gc_ref_bridge(0x710),
+                Some(source)
+            );
         }
 
         #[test]
@@ -16179,8 +16391,11 @@ mod tests {
         assert_eq!(report.retained_objects, vec![root]);
         assert_eq!(report.removed_objects, vec![garbage]);
         assert!(objects.live_slot(garbage).is_err());
-        assert_eq!(objects.known_object_id_for_gc_ref(0x553), Some(root));
-        assert_eq!(objects.known_object_id_for_gc_ref(0x554), None);
+        assert_eq!(
+            objects.known_object_id_for_live_gc_ref_bridge(0x553),
+            Some(root)
+        );
+        assert_eq!(objects.known_object_id_for_live_gc_ref_bridge(0x554), None);
     }
 
     #[test]

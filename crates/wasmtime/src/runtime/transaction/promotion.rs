@@ -273,7 +273,7 @@ impl TransactionState {
         if gc_ref == 0 {
             return Ok(None);
         }
-        if let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref) {
+        if let Some(object_id) = object_table.known_object_id_for_live_gc_ref_bridge(gc_ref) {
             if object_table.is_persistent(object_id)? {
                 return Ok(Some(object_id));
             }
@@ -363,20 +363,24 @@ impl TransactionState {
         }
     }
 
-    fn persistent_object_id_for_gc_ref_after_promotion(
+    fn persistent_object_id_for_live_bridge_after_promotion(
         &mut self,
         object_table: &mut ObjectTable,
         gc_ref: u32,
     ) -> Result<Option<ObjectId>> {
         let mut adapter = NoOrdinaryGcPromotionAdapter;
-        self.persistent_object_id_for_gc_ref_after_promotion_with_adapter(
+        self.persistent_object_id_for_live_bridge_after_promotion_with_adapter(
             object_table,
             gc_ref,
             &mut adapter,
         )
     }
 
-    fn persistent_object_id_for_gc_ref_after_promotion_with_adapter<
+    // This is the allowed bridge from an ordinary live Wasmtime GC object into the
+    // persistent object graph. It must copy the source into object storage and
+    // return an ObjectId. Persistent records after this point must not depend on
+    // the original VMGcRef.
+    fn persistent_object_id_for_live_bridge_after_promotion_with_adapter<
         A: OrdinaryGcPromotionAdapter,
     >(
         &mut self,
@@ -389,7 +393,11 @@ impl TransactionState {
         })
     }
 
-    pub(super) fn persistent_object_id_for_gc_ref_after_completed_promotion(
+    // This validates the result of the live-VMGcRef-to-persistent-ObjectId
+    // bridge after promotion has completed. It must return only an already
+    // persistent or already promoted ObjectId; persistent records after this
+    // point must not depend on the original VMGcRef.
+    pub(super) fn persistent_object_id_for_live_bridge_after_completed_promotion(
         &self,
         object_table: &ObjectTable,
         gc_ref: u32,
@@ -397,7 +405,7 @@ impl TransactionState {
         if gc_ref == 0 {
             return Ok(None);
         }
-        if let Some(object_id) = object_table.known_object_id_for_gc_ref(gc_ref) {
+        if let Some(object_id) = object_table.known_object_id_for_live_gc_ref_bridge(gc_ref) {
             if object_table.is_persistent(object_id)? {
                 return Ok(Some(object_id));
             }
@@ -477,7 +485,7 @@ impl TransactionState {
         let staged_globals = self.staged_globals.values().copied().collect::<Vec<_>>();
         for value in staged_globals {
             if let GlobalSnapshot::GcRef(gc_ref) = value {
-                self.persistent_object_id_for_gc_ref_after_promotion_with_adapter(
+                self.persistent_object_id_for_live_bridge_after_promotion_with_adapter(
                     object_table,
                     gc_ref,
                     adapter,
@@ -492,7 +500,7 @@ impl TransactionState {
             .collect::<Vec<_>>();
         for value in staged_table_elements {
             if let TableElementSnapshot::GcRef(gc_ref) = value {
-                self.persistent_object_id_for_gc_ref_after_promotion_with_adapter(
+                self.persistent_object_id_for_live_bridge_after_promotion_with_adapter(
                     object_table,
                     gc_ref,
                     adapter,

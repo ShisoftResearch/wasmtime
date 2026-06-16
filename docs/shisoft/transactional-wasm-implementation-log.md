@@ -36,6 +36,27 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-16 Pre-GC Object Model Freeze
+
+- Split durable persistent object reference encoding from live transaction
+  helper ABI conversion.
+- `ObjectTable::persistent_ref_abi_for_object_id` emits durable
+  `PersistentObjectRefRaw`/`ObjectId` encoding without consulting live
+  Wasmtime refs.
+- `ObjectTable::live_bridge_ref_abi_for_object_id` remains a temporary live
+  helper ABI bridge. It can use a live GC-ref association while executing
+  WAST/runtime helpers, or a checked persistent-object bridge value for
+  persistent objects that fit the current 32-bit lane.
+- Renamed live `VMGcRef` side maps as bridge-only state:
+  `live_bridge_gc_refs_to_objects` and `object_to_live_bridge_gc_ref`.
+- Kept promotion as the only allowed path from live Wasmtime GC objects into
+  persistent `ObjectId` records.
+- Durable `tfuncref`, `texternref`, and inline `ti31` values are scalar
+  leaves, not object-table entries.
+- Confirmed existing coarse block/chunk reclamation remains unchanged:
+  whole-dead object chunks and committed linear-undo chunks can be retired and
+  reused with block generations.
+
 ## 2026-06-16 Wave 8 Stabilization Gate
 
 Wave 8 found and fixed one remaining transaction-table runtime gap before the
@@ -119,8 +140,10 @@ Remaining work before persistent GC reclamation:
   GC handles from persistent object helper boundaries.
 - Restart-stable `tfuncref` and `texternref` identity still need the planned
   durable ABI cleanup.
-- Durable block/chunk retirement and object storage reuse remain excluded until
-  the persistent GC/reclamation roadmap.
+- Fine-grained GC-driven durable block/chunk retirement and object storage
+  reuse remain excluded until the persistent GC/reclamation roadmap. The
+  current pre-GC system already has coarse whole-dead object-chunk retirement
+  and committed linear-undo chunk reuse.
 
 ## 2026-06-16 Wave 7 Type-System Cleanup Boundary
 
@@ -223,10 +246,14 @@ Temporary live ABI debt:
 - `ObjectValueAbi` still carries live values across Cranelift/libcall helper
   boundaries. This is the current tuple carrier for scalars, inline refs, live
   GC refs, durable function/external refs, and persistent object refs.
-- `ObjectTable::gc_ref_to_object` and `ObjectTable::object_to_gc_ref` are
-  volatile side maps. They are needed for ordinary Wasmtime GC promotion and
-  live proposal-WAST execution, but they are not persistent identity.
-- `ObjectTable::live_ref_abi_for_object_id` can return an explicit
+- `ObjectTable::persistent_ref_abi_for_object_id` emits the durable
+  `PersistentObjectRefRaw` encoding directly and does not consult live
+  Wasmtime GC state.
+- `ObjectTable::live_bridge_gc_refs_to_objects` and
+  `ObjectTable::object_to_live_bridge_gc_ref` are volatile side maps. They are
+  needed for ordinary Wasmtime GC promotion and live proposal-WAST execution,
+  but they are not persistent identity.
+- `ObjectTable::live_bridge_ref_abi_for_object_id` can return an explicit
   persistent-object live kind, but some live helper paths still accept a 32-bit
   raw ref. Wave 1 removes that narrowing as an object-model invariant.
 - `GlobalSnapshot::GcRef`, `GlobalSnapshot::FuncRef`, and
@@ -357,12 +384,15 @@ Concrete object/reference boundary inventory:
   publication.
   Classification: commit-time promotion source.
 - `crates/wasmtime/src/runtime/transaction.rs`:
-  `ObjectTable::gc_ref_to_object`, `ObjectTable::object_to_gc_ref`,
-  `associate_gc_ref`, `object_id_for_gc_ref`,
-  `object_id_for_transaction_ref_raw`, `known_object_id_for_gc_ref`,
-  `known_persistent_object_id_for_gc_ref`, and
-  `known_persistent_object_id_for_transaction_ref_raw` are the volatile
-  `VMGcRef` bridge.
+  `ObjectTable::live_bridge_gc_refs_to_objects`,
+  `ObjectTable::object_to_live_bridge_gc_ref`,
+  `associate_live_gc_ref_for_transaction_bridge`,
+  `object_id_for_live_gc_ref_bridge`,
+  `object_id_for_live_bridge_transaction_ref_raw`,
+  `known_object_id_for_live_gc_ref_bridge`,
+  `known_persistent_object_id_for_live_gc_ref_bridge`, and
+  `known_persistent_object_id_for_live_bridge_transaction_ref_raw` are the
+  volatile `VMGcRef` bridge.
   Classification: object-model debt.
 - `crates/wasmtime/src/runtime/transaction.rs`:
   `PersistentObjectRefRaw`, `ObjectValueAbi::from_object_value`, and
@@ -370,9 +400,11 @@ Concrete object/reference boundary inventory:
   record encoding.
   Classification: commit-time promotion source.
 - `crates/wasmtime/src/runtime/transaction.rs`:
-  `ObjectTable::live_ref_abi_for_object_id` returns either a volatile GC ref
-  association or the explicit persistent-object live kind. The persistent
-  branch still checks that the raw object ref fits the current live bridge.
+  `ObjectTable::persistent_ref_abi_for_object_id` is the durable helper, and
+  `ObjectTable::live_bridge_ref_abi_for_object_id` returns either a volatile
+  GC-ref association or the explicit persistent-object live kind. The
+  persistent branch still checks that the raw object ref fits the current live
+  bridge.
   Classification: object-model debt.
 - `crates/wasmtime/src/runtime/transaction/durable_ref.rs`:
   `DurableReferenceRegistry::{register_func_ref, resolve_func_ref,
@@ -588,10 +620,15 @@ The current live helper boundary still uses the existing 24-byte
 process-local `VMGcRef` mapping can now roundtrip through the libcall conversion
 layer:
 
-- `ObjectTable::live_ref_abi_for_object_id` still prefers a live `VMGcRef`
-  mapping when one exists.
-- If no live mapping exists and the object is persistent, it falls back to the
-  durable `PersistentObjectRefRaw` encoding.
+- `ObjectTable::persistent_ref_abi_for_object_id` emits the durable
+  `PersistentObjectRefRaw` encoding directly and never consults live `VMGcRef`
+  state.
+- `ObjectTable::live_bridge_ref_abi_for_object_id` still prefers a live
+  `VMGcRef` mapping when one exists.
+- If no live mapping exists and the object is already persistent or completed
+  promotion proves it should be persistent, the live bridge can fall back to a
+  checked persistent-object bridge value when the current 32-bit raw lane can
+  represent it.
 - Returned live helper values now tag that fallback with an explicit
   persistent-object live ref kind in `ObjectValueAbi.high`; durable object
   records still use `REF` with `high = 0`.
@@ -601,7 +638,8 @@ layer:
 - This temporary bridge still uses the old 32-bit raw ref lane. Its
   `ObjectId + 1` encoding can overlap with raw i31 or process-local
   `VMGcRef` shapes, so the bridge treats persistent objects as authoritative
-  only when the object table proves the raw value is live and persistent.
+  only when the object table proves the raw value is live and persistent, and
+  it rejects persistent object refs that do not fit the bridge lane.
 - This is an intermediate compatibility bridge. The final live transactional
   reference ABI and Cranelift lowering rewrite are still tracked in Workstream
   5.

@@ -131,3 +131,14 @@ The freeze is complete when these checks pass:
 - remaining `SHISOFT-TWASM-MOCK` markers identify only explicit compatibility
   fallbacks or future `TRefType`/GC work.
 
+## Implementation Status
+
+- Persistent object records encode graph edges as `ObjectId`.
+- Live Wasmtime `VMGcRef` mappings are named as transaction live-bridge state.
+- Persistent publication and recovery do not require live GC/function pointer
+  identity.
+- Remaining live fallbacks are explicit WAST compatibility seams or future
+  `TRefType` ABI work.
+- The current live helper ABI still uses a temporary 32-bit bridge and rejects
+  persistent object refs that do not fit that bridge; the durable encoding
+  remains full-width.
