@@ -57,7 +57,7 @@
 //! Ad hoc checking
 //!
 //! - Stack slot loads and stores must be in-bounds.
-//! - Immediate constraints for certain opcodes, like `udiv_imm v3, 0`.
+//! - Immediate constraints for certain opcodes, like `iconst.i8 1234`.
 //! - `Insertlane` and `extractlane` instructions have immediate lane numbers that must be in
 //!   range for their polymorphic type.
 //! - Swizzle and shuffle instructions take a variable number of lane arguments. The number
@@ -617,13 +617,10 @@ impl<'a> Verifier<'a> {
             FuncAddr { func_ref, .. } => {
                 self.verify_func_ref(inst, func_ref, errors)?;
             }
-            StackLoad { stack_slot, .. } | StackStore { stack_slot, .. } => {
+            StackAddr { stack_slot, .. } => {
                 self.verify_stack_slot(inst, stack_slot, errors)?;
             }
-            DynamicStackLoad {
-                dynamic_stack_slot, ..
-            }
-            | DynamicStackStore {
+            DynamicStackAddr {
                 dynamic_stack_slot, ..
             } => {
                 self.verify_dynamic_stack_slot(inst, dynamic_stack_slot, errors)?;
@@ -743,7 +740,6 @@ impl<'a> Verifier<'a> {
             | UnaryIeee64 { .. }
             | Binary { .. }
             | BinaryImm8 { .. }
-            | BinaryImm64 { .. }
             | Ternary { .. }
             | TernaryImm8 { .. }
             | Shuffle { .. }

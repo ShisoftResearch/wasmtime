@@ -499,6 +499,7 @@ information about this check\
             | "is_pic"
             | "bb_padding_log2_minus_one"
             | "log2_min_function_alignment"
+            | "enable_compact_unwind_abi"
             | "machine_code_cfg_info"
             | "tls_model" // wasmtime doesn't use tls right now
             | "opt_level" // opt level doesn't change semantics
@@ -570,6 +571,7 @@ information about this check\
             "has_lse" => "lse",
             "has_pauth" => "paca",
             "has_fp16" => "fp16",
+            "has_dotprod" => "dotprod",
 
             // aarch64 features which don't need detection
             // No effect on its own.

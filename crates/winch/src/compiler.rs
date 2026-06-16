@@ -5,7 +5,6 @@ use std::mem;
 use std::sync::Mutex;
 use wasmparser::FuncValidatorAllocations;
 use wasmtime_cranelift::CompiledFunction;
-#[cfg(feature = "component-model")]
 use wasmtime_environ::component::ComponentTranslation;
 use wasmtime_environ::error::Result;
 use wasmtime_environ::{
@@ -183,7 +182,7 @@ impl wasmtime_environ::Compiler for Compiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, wasmtime_environ::FuncKey) -> usize,
-    ) -> Result<Vec<(SymbolId, FunctionLoc)>> {
+    ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
         self.trampolines.append_code(obj, funcs, resolve_reloc)
     }
 
@@ -203,7 +202,6 @@ impl wasmtime_environ::Compiler for Compiler {
         self.isa.is_branch_protection_enabled()
     }
 
-    #[cfg(feature = "component-model")]
     fn component_compiler(&self) -> &dyn wasmtime_environ::component::ComponentCompiler {
         self.trampolines.component_compiler()
     }
@@ -215,7 +213,7 @@ impl wasmtime_environ::Compiler for Compiler {
         _get_func: &'a dyn Fn(
             StaticModuleIndex,
             DefinedFuncIndex,
-        ) -> (SymbolId, &'a (dyn Any + Send + Sync)),
+        ) -> (Option<SymbolId>, &'a (dyn Any + Send + Sync)),
         _dwarf_package_bytes: Option<&'a [u8]>,
         _tunables: &'a Tunables,
     ) -> Result<()> {
@@ -289,7 +287,7 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, FuncKey) -> usize,
-    ) -> Result<Vec<(SymbolId, FunctionLoc)>> {
+    ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
         self.0.append_code(obj, funcs, resolve_reloc)
     }
 
@@ -309,7 +307,6 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         self.0.is_branch_protection_enabled()
     }
 
-    #[cfg(feature = "component-model")]
     fn component_compiler(&self) -> &dyn wasmtime_environ::component::ComponentCompiler {
         self
     }
@@ -321,7 +318,7 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         get_func: &'a dyn Fn(
             StaticModuleIndex,
             DefinedFuncIndex,
-        ) -> (SymbolId, &'a (dyn Any + Send + Sync)),
+        ) -> (Option<SymbolId>, &'a (dyn Any + Send + Sync)),
         dwarf_package_bytes: Option<&'a [u8]>,
         tunables: &'a Tunables,
     ) -> Result<()> {
@@ -330,7 +327,6 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
     }
 }
 
-#[cfg(feature = "component-model")]
 impl wasmtime_environ::component::ComponentCompiler for NoInlineCompiler {
     fn compile_component_trampoline(
         &self,

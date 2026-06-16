@@ -1517,9 +1517,10 @@ mod tests {
 
         let entries = log.log_entries_for_test(7);
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data_block_generation(), 0);
-        assert_eq!(entries[1].data_block_generation(), 0);
+        assert_eq!(entries[0].tx_meta & 1, 1);
+        assert_eq!(entries[0].role().unwrap(), TxLogEntryRole::TObjectPub);
     }
 
     #[test]

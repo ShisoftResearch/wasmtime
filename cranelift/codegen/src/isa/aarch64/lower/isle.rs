@@ -179,6 +179,14 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         }
     }
 
+    fn use_dotprod(&mut self, _: Inst) -> Option<()> {
+        if self.backend.isa_flags.has_dotprod() {
+            Some(())
+        } else {
+            None
+        }
+    }
+
     fn use_fp16(&mut self) -> bool {
         self.backend.isa_flags.has_fp16()
     }
@@ -743,7 +751,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     fn vec_extract_imm4_from_immediate(&mut self, imm: Immediate) -> Option<u8> {
         let bytes = self.lower_ctx.get_immediate_data(imm).as_slice();
 
-        if bytes.windows(2).all(|a| a[0] + 1 == a[1]) && bytes[0] < 16 {
+        if bytes.array_windows().all(|[a, b]| *a + 1 == *b) && bytes[0] < 16 {
             Some(bytes[0])
         } else {
             None

@@ -6,6 +6,7 @@ use crate::generators::gc_ops::{
 use mutatis;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use std::collections::BTreeSet;
 use wasmparser;
 use wasmprinter;
 
@@ -118,7 +119,6 @@ fn test_ops(num_params: u32, num_globals: u32, table_size: u32) -> GcOps {
 fn assert_valid_wasm(ops: &mut GcOps) {
     let wasm = ops.to_wasm_binary();
     let feats = wasmparser::WasmFeatures::default();
-    eprintln!("wat: {}", wasmprinter::print_bytes(&wasm).unwrap());
     feats.reference_types();
     feats.gc();
     let mut validator = wasmparser::Validator::new_with_features(feats);
@@ -220,7 +220,7 @@ fn every_op_generated() -> mutatis::Result<()> {
     let mut res = empty_test_ops();
     let mut session = mutatis::Session::new().seed(0xC0FFEE);
 
-    'outer: for _ in 0..=1024 {
+    'outer: for _ in 0..=8192 {
         session.mutate(&mut res)?;
         for op in &res.ops {
             unseen_ops.remove(op.name());
@@ -231,6 +231,47 @@ fn every_op_generated() -> mutatis::Result<()> {
     }
 
     assert!(unseen_ops.is_empty(), "Failed to generate {unseen_ops:?}");
+    Ok(())
+}
+
+#[test]
+fn i31_and_eq_upcast_ops_validate() -> mutatis::Result<()> {
+    let _ = env_logger::try_init();
+
+    // Exercise every new i31/eqref op end-to-end through encoding + validation.
+    let mut ops = test_ops(5, 5, 5);
+    ops.ops = vec![
+        // Create i31 values and route them through locals/globals/tables.
+        GcOp::RefI31 { value: 0x4000_0001 },
+        GcOp::I31LocalSet,
+        GcOp::I31LocalGet,
+        GcOp::I31GlobalSet,
+        GcOp::I31GlobalGet,
+        GcOp::I31TableSet { elem_index: 0 },
+        GcOp::I31TableGet { elem_index: 0 },
+        // Inline i31.get_s / i31.get_u (null-guarded).
+        GcOp::I31GetS,
+        GcOp::RefI31 { value: 7 },
+        GcOp::I31GetU,
+        // Null i31, then differential host check.
+        GcOp::NullI31,
+        GcOp::TakeI31Call,
+        GcOp::RefI31 { value: 0x7fff_ffff },
+        GcOp::TakeI31Call,
+        // Upcast i31 -> eqref and hand it to the eqref-taking host function.
+        GcOp::RefI31 { value: 1 },
+        GcOp::I31RefAsEq,
+        GcOp::TakeEqCall,
+        // Upcast abstract and concrete struct refs -> eqref.
+        GcOp::NullStruct,
+        GcOp::StructRefAsEq,
+        GcOp::TakeEqCall,
+        GcOp::StructNew { type_index: 0 },
+        GcOp::TypedStructRefAsEq { type_index: 0 },
+        GcOp::TakeEqCall,
+    ];
+    assert_valid_wasm(&mut ops);
+
     Ok(())
 }
 
@@ -487,7 +528,7 @@ fn sort_rec_groups_topo_orders_dependencies_first() {
 }
 
 #[test]
-fn break_rec_group_cycles() {
+fn merge_rec_group_cycles() {
     let _ = env_logger::try_init();
 
     let mut types = Types::new();
@@ -527,11 +568,15 @@ fn break_rec_group_cycles() {
     //                 -----------| g3 |
     //                            +----+
     //
-    // After: back edges dropped, clean chain
+    // All four groups are mutually reachable (g0->g1->g2->g0 and
+    // g1->g2->g3->g1), so they form a single strongly-connected component.
     //
-    //  +----+       +----+       +----+       +----+
-    //  | g0 |------>| g1 |------>| g2 |------>| g3 |
-    //  +----+       +----+       +----+       +----+
+    // After: the whole SCC is merged into one rec group, with every supertype
+    // edge preserved (nothing is dropped).
+    //
+    //  +-------------------------+
+    //  |   g0 ∪ g1 ∪ g2 ∪ g3     |
+    //  +-------------------------+
 
     types.insert_struct(a0, g0, false, Some(b0), Vec::new()); // g0 -> g1
     types.insert_struct(a1, g0, false, None, Vec::new());
@@ -557,32 +602,28 @@ fn break_rec_group_cycles() {
     assert_eq!(types.rec_groups.len(), 4);
 
     let type_to_group = types.type_to_group_map();
-    types.break_rec_group_cycles(&type_to_group);
+    types.merge_rec_group_cycles(&type_to_group);
 
-    // All four groups preserved.
-    assert_eq!(types.rec_groups.len(), 4);
-    assert!(types.rec_groups.contains_key(&g0));
-    assert!(types.rec_groups.contains_key(&g1));
-    assert!(types.rec_groups.contains_key(&g2));
-    assert!(types.rec_groups.contains_key(&g3));
+    // The whole cycle collapses into a single rec group...
+    assert_eq!(types.rec_groups.len(), 1);
 
-    // Back edge (g2->g0): c1's supertype cleared.
-    assert_eq!(types.type_defs.get(&c1).unwrap().supertype, None);
+    // ...which contains every type from all four original groups.
+    let merged: BTreeSet<TypeId> = types.rec_groups.values().flatten().copied().collect();
+    let expected: BTreeSet<TypeId> = [a0, a1, b0, b1, c0, c1, c2, d0, d1].into_iter().collect();
+    assert_eq!(merged, expected);
 
-    // Back edge (g3->g1): d1's supertype cleared.
-    assert_eq!(types.type_defs.get(&d1).unwrap().supertype, None);
-
-    // All other cross-group supertypes preserved.
+    // Merging drops no edges: every supertype relationship is preserved.
     assert_eq!(types.type_defs.get(&a0).unwrap().supertype, Some(b0));
     assert_eq!(types.type_defs.get(&b1).unwrap().supertype, Some(c0));
+    assert_eq!(types.type_defs.get(&c1).unwrap().supertype, Some(a1));
     assert_eq!(types.type_defs.get(&c2).unwrap().supertype, Some(d0));
+    assert_eq!(types.type_defs.get(&d1).unwrap().supertype, Some(b0));
 
-    // Result is a clean chain: g0 -> g1 -> g2 -> g3
+    // With a single group there are no cross-group ordering constraints left.
     let type_to_group = types.type_to_group_map();
     let mut topo = Vec::new();
     types.sort_rec_groups_topo(&mut topo, &type_to_group);
-    assert_eq!(topo.len(), 4);
-    assert_eq!(topo, vec![g3, g2, g1, g0]);
+    assert_eq!(topo.len(), 1);
 }
 
 #[test]

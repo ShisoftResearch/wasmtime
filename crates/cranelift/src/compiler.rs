@@ -1,10 +1,12 @@
 use crate::TRAP_INTERNAL_ASSERT;
+use crate::alias_region::AliasRegions;
 use crate::debug::DwarfSectionRelocTarget;
 use crate::func_environ::FuncEnvironment;
 use crate::translate::FuncTranslator;
 use crate::{BuiltinFunctionSignatures, builder::LinkOptions, wasm_call_signature};
 use crate::{CompiledFunction, ModuleTextBuilder, array_call_signature};
 use cranelift_codegen::binemit::CodeOffset;
+use cranelift_codegen::cursor::FuncCursor;
 use cranelift_codegen::inline::InlineCommand;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -38,18 +40,16 @@ use wasmtime_environ::obj::{ELF_WASMTIME_EXCEPTIONS, ELF_WASMTIME_FRAMES};
 use wasmtime_environ::{
     Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, CompiledFunctionBody,
     DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape, FrameStateSlotBuilder,
-    FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, HostCall, Inlining,
+    FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, GetPtrSize, HostCall, Inlining,
     InliningCompiler, ModulePC, ModuleStartup, ModuleTranslation, ModuleTypesBuilder, PtrSize,
     StackMapSection, StaticModuleIndex, TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables,
     WasmFuncType, WasmValType, prelude::*,
 };
 use wasmtime_unwinder::ExceptionTableBuilder;
 
-#[cfg(feature = "component-model")]
 pub(crate) mod component;
 
 struct IncrementalCacheContext {
-    #[cfg(feature = "incremental-cache")]
     cache_store: Arc<dyn CacheStore>,
     num_hits: usize,
     num_cached: usize,
@@ -87,7 +87,6 @@ pub struct Compiler {
     linkopts: LinkOptions,
     cache_store: Option<Arc<dyn CacheStore>>,
     clif_dir: Option<path::PathBuf>,
-    #[cfg(feature = "wmemcheck")]
     pub(crate) wmemcheck: bool,
 }
 
@@ -138,7 +137,6 @@ impl Compiler {
             linkopts,
             cache_store,
             clif_dir,
-            #[cfg(feature = "wmemcheck")]
             wmemcheck,
         }
     }
@@ -212,6 +210,7 @@ impl Compiler {
         let pointer_type = isa.pointer_type();
         let wasm_call_sig = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
         let array_call_sig = array_call_signature(isa);
+        let mut alias_regions = AliasRegions::new(isa.pointer_bytes());
 
         let mut compiler = self.function_compiler();
         let func = ir::Function::with_name_signature(key_to_name(key), wasm_call_sig);
@@ -227,16 +226,13 @@ impl Compiler {
         // that's what we are assuming with our offsets below.
         self.debug_assert_vmctx_kind(
             &mut builder,
+            &mut alias_regions,
             caller_vmctx,
             wasmtime_environ::VMCONTEXT_MAGIC,
         );
         let ptr = isa.pointer_bytes();
-        let vm_store_context = builder.ins().load(
-            pointer_type,
-            MemFlagsData::trusted(),
-            caller_vmctx,
-            i32::from(ptr.vmcontext_store_context()),
-        );
+        let vm_store_context =
+            alias_regions.vmctx_store_context(&mut builder.cursor(), caller_vmctx);
         save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &ptr, vm_store_context);
 
         // Spill all wasm arguments to the stack in `ValRaw` slots.
@@ -267,36 +263,27 @@ impl Compiler {
         // Increment the "execution version" on the VMStoreContext if
         // guest debugging is enabled.
         if self.tunables.debug_guest {
-            let vmstore_ctx_ptr = builder.ins().load(
-                pointer_type,
-                MemFlagsData::trusted().with_readonly(),
-                caller_vmctx,
-                i32::from(ptr_size.vmctx_store_context()),
-            );
-            let old_version = builder.ins().load(
-                ir::types::I64,
-                MemFlagsData::trusted(),
+            let vmstore_ctx_ptr =
+                alias_regions.vmctx_store_context(&mut builder.cursor(), caller_vmctx);
+            let old_version = alias_regions
+                .vmstore_context_execution_version(&mut builder.cursor(), vmstore_ctx_ptr);
+            let new_version = builder.ins().iadd_imm_s(old_version, 1);
+            alias_regions.store_vmstore_context_execution_version(
+                &mut builder.cursor(),
                 vmstore_ctx_ptr,
-                i32::from(ptr_size.vmstore_context_execution_version()),
-            );
-            let new_version = builder.ins().iadd_imm(old_version, 1);
-            builder.ins().store(
-                MemFlagsData::trusted(),
                 new_version,
-                vmstore_ctx_ptr,
-                i32::from(ptr_size.vmstore_context_execution_version()),
             );
         }
 
         // Invoke `raise` if the callee (host) returned an error.
         let succeeded = builder.func.dfg.inst_results(call)[0];
-        self.raise_if_host_trapped(&mut builder, caller_vmctx, succeeded);
+        self.raise_if_host_trapped(&mut builder, &mut alias_regions, caller_vmctx, succeeded);
 
         // Return results from the array as native return values.
         let results =
             self.load_values_from_array(wasm_func_ty.results(), &mut builder, args_base, args_len);
         builder.ins().return_(&results);
-        builder.finalize();
+        builder.finalize(self.isa().frontend_config());
 
         Ok(CompiledFunctionBody {
             code: box_dyn_any_compiler_context(Some(compiler.cx)),
@@ -314,6 +301,7 @@ impl Compiler {
         let isa = &*self.isa;
         let ptr_size = isa.pointer_bytes();
         let pointer_type = isa.pointer_type();
+        let mut alias_regions = AliasRegions::new(ptr_size);
         let sigs = BuiltinFunctionSignatures::new(self);
 
         let (builtin_func_index, wasm_sig) = match key {
@@ -338,19 +326,26 @@ impl Compiler {
         // Debug-assert that this is the right kind of vmctx, and then
         // additionally perform the "routine of the exit trampoline" of saving
         // fp/pc/etc.
-        self.debug_assert_vmctx_kind(&mut builder, vmctx, wasmtime_environ::VMCONTEXT_MAGIC);
-        let vm_store_context = builder.ins().load(
-            pointer_type,
-            MemFlagsData::trusted(),
+        self.debug_assert_vmctx_kind(
+            &mut builder,
+            &mut alias_regions,
             vmctx,
-            ptr_size.vmcontext_store_context(),
+            wasmtime_environ::VMCONTEXT_MAGIC,
         );
+        let vm_store_context = alias_regions.vmctx_store_context(&mut builder.cursor(), vmctx);
         save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &ptr_size, vm_store_context);
 
         // Now it's time to delegate to the actual builtin. Forward all our own
         // arguments to the libcall itself.
         let args = builder.block_params(block0).to_vec();
-        let call = self.call_builtin(&mut builder, vmctx, &args, builtin_func_index, host_sig);
+        let call = self.call_builtin(
+            &mut builder,
+            &mut alias_regions,
+            vmctx,
+            &args,
+            builtin_func_index,
+            host_sig,
+        );
         let results = builder.func.dfg.inst_results(call).to_vec();
 
         // Libcalls do not explicitly jump/raise on traps but instead return a
@@ -361,13 +356,13 @@ impl Compiler {
         // process it here.
         match builtin_func_index.trap_sentinel() {
             Some(TrapSentinel::Falsy) => {
-                self.raise_if_host_trapped(&mut builder, vmctx, results[0]);
+                self.raise_if_host_trapped(&mut builder, &mut alias_regions, vmctx, results[0]);
             }
             Some(TrapSentinel::NegativeTwo) => {
                 let ty = builder.func.dfg.value_type(results[0]);
                 let trapped = builder.ins().iconst(ty, -2);
                 let succeeded = builder.ins().icmp(IntCC::NotEqual, results[0], trapped);
-                self.raise_if_host_trapped(&mut builder, vmctx, succeeded);
+                self.raise_if_host_trapped(&mut builder, &mut alias_regions, vmctx, succeeded);
             }
             Some(TrapSentinel::Negative) => {
                 let ty = builder.func.dfg.value_type(results[0]);
@@ -376,13 +371,13 @@ impl Compiler {
                     builder
                         .ins()
                         .icmp(IntCC::SignedGreaterThanOrEqual, results[0], zero);
-                self.raise_if_host_trapped(&mut builder, vmctx, succeeded);
+                self.raise_if_host_trapped(&mut builder, &mut alias_regions, vmctx, succeeded);
             }
             Some(TrapSentinel::NegativeOne) => {
                 let ty = builder.func.dfg.value_type(results[0]);
                 let minus_one = builder.ins().iconst(ty, -1);
                 let succeeded = builder.ins().icmp(IntCC::NotEqual, results[0], minus_one);
-                self.raise_if_host_trapped(&mut builder, vmctx, succeeded);
+                self.raise_if_host_trapped(&mut builder, &mut alias_regions, vmctx, succeeded);
             }
             None => {}
         }
@@ -393,7 +388,7 @@ impl Compiler {
         } else {
             builder.ins().return_(&[]);
         }
-        builder.finalize();
+        builder.finalize(self.isa().frontend_config());
 
         Ok(CompiledFunctionBody {
             code: box_dyn_any_compiler_context(Some(compiler.cx)),
@@ -537,29 +532,44 @@ impl wasmtime_environ::Compiler for Compiler {
             let vmctx = context
                 .func
                 .create_global_value(ir::GlobalValueData::VMContext);
-            let interrupts_flags = context
+
+            let vmctx_store_context_region =
+                func_env.alias_regions.vmctx_region_for_use_in_ir_global(
+                    &mut context.func,
+                    func_env.offsets.ptr.vmctx_store_context().into(),
+                );
+
+            let flags = context
                 .func
                 .dfg
                 .mem_flags
-                .insert(MemFlagsData::trusted().with_readonly())
+                .insert(
+                    MemFlagsData::trusted()
+                        .with_readonly()
+                        .with_can_move()
+                        .with_alias_region(Some(vmctx_store_context_region)),
+                )
                 .unwrap();
-            let interrupts_ptr = context.func.create_global_value(ir::GlobalValueData::Load {
+
+            let vmstore_ctx_ptr = context.func.create_global_value(ir::GlobalValueData::Load {
                 base: vmctx,
                 offset: i32::from(func_env.offsets.ptr.vmctx_store_context()).into(),
                 global_type: isa.pointer_type(),
-                flags: interrupts_flags,
+                flags,
             });
-            let stack_limit_flags = context
+
+            let flags = context
                 .func
                 .dfg
                 .mem_flags
                 .insert(MemFlagsData::trusted())
                 .unwrap();
+
             let stack_limit = context.func.create_global_value(ir::GlobalValueData::Load {
-                base: interrupts_ptr,
+                base: vmstore_ctx_ptr,
                 offset: i32::from(func_env.offsets.ptr.vmstore_context_stack_limit()).into(),
                 global_type: isa.pointer_type(),
-                flags: stack_limit_flags,
+                flags,
             });
             if self.tunables.signals_based_traps {
                 context.func.stack_limit = Some(stack_limit);
@@ -619,8 +629,10 @@ impl wasmtime_environ::Compiler for Compiler {
                     FuncKey::DefinedWasmFunction(module_index, def_func_index),
                     types[sig].unwrap_func(),
                     symbol,
-                    self.isa.pointer_bytes().vmctx_store_context().into(),
                     wasmtime_environ::VMCONTEXT_MAGIC,
+                    |alias_regions, _pointer_type, cursor, vmctx| {
+                        alias_regions.vmctx_store_context(cursor, vmctx)
+                    },
                 )
             }
 
@@ -628,7 +640,6 @@ impl wasmtime_environ::Compiler for Compiler {
                 let ty = types[ty].unwrap_func();
                 self.compile_wasm_to_array_trampoline(ty, key, symbol)
             }
-            #[cfg(feature = "component-model")]
             FuncKey::ResourceDropTrampoline => {
                 let ty = types.find_resource_drop_signature().unwrap();
                 let ty = types[ty].unwrap_func();
@@ -645,7 +656,6 @@ impl wasmtime_environ::Compiler for Compiler {
 
             FuncKey::PulleyHostCall(_) => unreachable!(),
 
-            #[cfg(feature = "component-model")]
             FuncKey::ComponentTrampoline(..) | FuncKey::UnsafeIntrinsic(..) => {
                 unreachable!()
             }
@@ -667,8 +677,10 @@ impl wasmtime_environ::Compiler for Compiler {
                         FuncKey::ModuleStartup(Abi::Wasm, module),
                         ty,
                         symbol,
-                        self.isa.pointer_bytes().vmctx_store_context().into(),
                         wasmtime_environ::VMCONTEXT_MAGIC,
+                        |alias_regions, _pointer_type, cursor, vmctx| {
+                            alias_regions.vmctx_store_context(cursor, vmctx)
+                        },
                     ),
                     // Delegate to a helper to finish compiling this.
                     Abi::Wasm => self.compile_module_startup(translation, types, key, ty),
@@ -683,7 +695,7 @@ impl wasmtime_environ::Compiler for Compiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, FuncKey) -> usize,
-    ) -> Result<Vec<(SymbolId, FunctionLoc)>> {
+    ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
         log::trace!(
             "appending functions to object file: {:#?}",
             funcs.iter().map(|(sym, _, _)| sym).collect::<Vec<_>>()
@@ -856,7 +868,6 @@ impl wasmtime_environ::Compiler for Compiler {
         self.isa.is_branch_protection_enabled()
     }
 
-    #[cfg(feature = "component-model")]
     fn component_compiler(&self) -> &dyn wasmtime_environ::component::ComponentCompiler {
         self
     }
@@ -868,7 +879,7 @@ impl wasmtime_environ::Compiler for Compiler {
         get_func: &'a dyn Fn(
             StaticModuleIndex,
             DefinedFuncIndex,
-        ) -> (SymbolId, &'a (dyn Any + Send + Sync)),
+        ) -> (Option<SymbolId>, &'a (dyn Any + Send + Sync)),
         dwarf_package_bytes: Option<&'a [u8]>,
         tunables: &'a Tunables,
     ) -> Result<()> {
@@ -912,7 +923,7 @@ impl wasmtime_environ::Compiler for Compiler {
             let section_id = *dwarf_sections_ids.get(name).unwrap();
             for reloc in relocs {
                 let target_symbol = match reloc.target {
-                    DwarfSectionRelocTarget::Func(id) => compilation.symbol_id(id),
+                    DwarfSectionRelocTarget::Func(id) => compilation.symbol_id(id).unwrap(),
                     DwarfSectionRelocTarget::Section(name) => {
                         obj.section_symbol(dwarf_sections_ids[name])
                     }
@@ -969,7 +980,6 @@ impl InliningCompiler for Compiler {
                 .map(|name| FuncKey::from_raw_parts(name.namespace, name.index))
                 .filter(|key| match key {
                     FuncKey::DefinedWasmFunction(..) => true,
-                    #[cfg(feature = "component-model")]
                     FuncKey::UnsafeIntrinsic(..) => true,
                     _ => false,
                 }),
@@ -1029,7 +1039,6 @@ impl InliningCompiler for Compiler {
                 let callee = FuncKey::from_raw_parts(callee.namespace, callee.index);
                 match callee {
                     FuncKey::DefinedWasmFunction(..) => {}
-                    #[cfg(feature = "component-model")]
                     FuncKey::UnsafeIntrinsic(..) => {}
                     _ => return InlineCommand::KeepCall,
                 }
@@ -1094,56 +1103,39 @@ impl InliningCompiler for Compiler {
     }
 }
 
-#[cfg(feature = "incremental-cache")]
-mod incremental_cache {
-    use super::*;
+struct CraneliftCacheStore(Arc<dyn CacheStore>);
 
-    struct CraneliftCacheStore(Arc<dyn CacheStore>);
-
-    impl cranelift_codegen::incremental_cache::CacheKvStore for CraneliftCacheStore {
-        fn get(&self, key: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
-            self.0.get(key)
-        }
-        fn insert(&mut self, key: &[u8], val: Vec<u8>) {
-            self.0.insert(key, val);
-        }
+impl cranelift_codegen::incremental_cache::CacheKvStore for CraneliftCacheStore {
+    fn get(&self, key: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        self.0.get(key)
     }
-
-    pub(super) fn compile_maybe_cached<'a>(
-        context: &'a mut Context,
-        isa: &dyn TargetIsa,
-        cache_ctx: Option<&mut IncrementalCacheContext>,
-    ) -> Result<CompiledCode, CompileError> {
-        let cache_ctx = match cache_ctx {
-            Some(ctx) => ctx,
-            None => return compile_uncached(context, isa),
-        };
-
-        let mut cache_store = CraneliftCacheStore(cache_ctx.cache_store.clone());
-        let (_compiled_code, from_cache) = context
-            .compile_with_cache(isa, &mut cache_store, &mut Default::default())
-            .map_err(|error| CompileError::Codegen(pretty_error(&error.func, error.inner)))?;
-
-        if from_cache {
-            cache_ctx.num_hits += 1;
-        } else {
-            cache_ctx.num_cached += 1;
-        }
-
-        Ok(context.take_compiled_code().unwrap())
+    fn insert(&mut self, key: &[u8], val: Vec<u8>) {
+        self.0.insert(key, val);
     }
 }
 
-#[cfg(feature = "incremental-cache")]
-use incremental_cache::*;
-
-#[cfg(not(feature = "incremental-cache"))]
 fn compile_maybe_cached<'a>(
     context: &'a mut Context,
     isa: &dyn TargetIsa,
-    _cache_ctx: Option<&mut IncrementalCacheContext>,
+    cache_ctx: Option<&mut IncrementalCacheContext>,
 ) -> Result<CompiledCode, CompileError> {
-    compile_uncached(context, isa)
+    let cache_ctx = match cache_ctx {
+        Some(ctx) => ctx,
+        None => return compile_uncached(context, isa),
+    };
+
+    let mut cache_store = CraneliftCacheStore(cache_ctx.cache_store.clone());
+    let (_compiled_code, from_cache) = context
+        .compile_with_cache(isa, &mut cache_store, &mut Default::default())
+        .map_err(|error| CompileError::Codegen(pretty_error(&error.func, error.inner)))?;
+
+    if from_cache {
+        cache_ctx.num_hits += 1;
+    } else {
+        cache_ctx.num_cached += 1;
+    }
+
+    Ok(context.take_compiled_code().unwrap())
 }
 
 fn compile_uncached<'a>(
@@ -1285,7 +1277,6 @@ impl Compiler {
                     ctx
                 })
                 .unwrap_or_else(|| CompilerContext {
-                    #[cfg(feature = "incremental-cache")]
                     incremental_cache_ctx: self.cache_store.as_ref().map(|cache_store| {
                         IncrementalCacheContext {
                             cache_store: cache_store.clone(),
@@ -1311,12 +1302,15 @@ impl Compiler {
     /// Additionally in the future for pulley this will emit a special trap
     /// opcode for Pulley itself to cease interpretation and exit the
     /// interpreter.
-    pub fn raise_if_host_trapped(
+    pub fn raise_if_host_trapped<O>(
         &self,
         builder: &mut FunctionBuilder<'_>,
+        alias_regions: &mut AliasRegions<O>,
         vmctx: ir::Value,
         succeeded: ir::Value,
-    ) {
+    ) where
+        O: GetPtrSize,
+    {
         let trapped_block = builder.create_block();
         let continuation_block = builder.create_block();
         builder.set_cold_block(trapped_block);
@@ -1330,7 +1324,14 @@ impl Compiler {
         builder.switch_to_block(trapped_block);
         let sigs = BuiltinFunctionSignatures::new(self);
         let sig = sigs.host_signature(BuiltinFunctionIndex::raise());
-        self.call_builtin(builder, vmctx, &[vmctx], BuiltinFunctionIndex::raise(), sig);
+        self.call_builtin(
+            builder,
+            alias_regions,
+            vmctx,
+            &[vmctx],
+            BuiltinFunctionIndex::raise(),
+            sig,
+        );
         builder.ins().trap(TRAP_INTERNAL_ASSERT);
 
         builder.switch_to_block(continuation_block);
@@ -1338,32 +1339,33 @@ impl Compiler {
 
     /// Helper to load the core `builtin` from `vmctx` and invoke it with
     /// `args`.
-    fn call_builtin(
+    fn call_builtin<O>(
         &self,
         builder: &mut FunctionBuilder<'_>,
+        alias_regions: &mut AliasRegions<O>,
         vmctx: ir::Value,
         args: &[ir::Value],
         builtin: BuiltinFunctionIndex,
         sig: ir::Signature,
-    ) -> ir::Inst {
+    ) -> ir::Inst
+    where
+        O: GetPtrSize,
+    {
         let isa = &*self.isa;
-        let ptr_size = isa.pointer_bytes();
         let pointer_type = isa.pointer_type();
 
         // Builtins are stored in an array in all `VMContext`s. First load the
         // base pointer of the array and then load the entry of the array that
         // corresponds to this builtin.
-        let mem_flags = ir::MemFlagsData::trusted().with_readonly();
-        let array_addr = builder.ins().load(
-            pointer_type,
-            mem_flags,
-            vmctx,
-            i32::from(ptr_size.vmcontext_builtin_functions()),
-        );
+        let array_addr = alias_regions.vmctx_builtin_functions(&mut builder.cursor(), vmctx);
+
         let body_offset = i32::try_from(builtin.index() * pointer_type.bytes()).unwrap();
-        let func_addr = builder
-            .ins()
-            .load(pointer_type, mem_flags, array_addr, body_offset);
+        let func_addr = builder.ins().load(
+            pointer_type,
+            ir::MemFlagsData::trusted().with_readonly().with_can_move(),
+            array_addr,
+            body_offset,
+        );
 
         let sig = builder.func.import_signature(sig);
         self.call_indirect_host(builder, builtin, sig, func_addr, args)
@@ -1386,7 +1388,7 @@ impl Compiler {
         if !self.emit_debug_checks {
             return;
         }
-        let enough_capacity = builder.ins().icmp_imm(
+        let enough_capacity = builder.ins().icmp_imm_s(
             ir::condcodes::IntCC::UnsignedGreaterThanOrEqual,
             capacity,
             ir::immediates::Imm64::new(length.try_into().unwrap()),
@@ -1394,22 +1396,20 @@ impl Compiler {
         builder.ins().trapz(enough_capacity, TRAP_INTERNAL_ASSERT);
     }
 
-    fn debug_assert_vmctx_kind(
+    fn debug_assert_vmctx_kind<O>(
         &self,
         builder: &mut FunctionBuilder,
+        alias_regions: &mut AliasRegions<O>,
         vmctx: ir::Value,
         expected_vmctx_magic: u32,
-    ) {
+    ) where
+        O: GetPtrSize,
+    {
         if !self.emit_debug_checks {
             return;
         }
-        let magic = builder.ins().load(
-            ir::types::I32,
-            MemFlagsData::trusted().with_endianness(self.isa.endianness()),
-            vmctx,
-            0,
-        );
-        let is_expected_vmctx = builder.ins().icmp_imm(
+        let magic = alias_regions.vmctx_magic(&mut builder.cursor(), vmctx);
+        let is_expected_vmctx = builder.ins().icmp_imm_s(
             ir::condcodes::IntCC::Equal,
             magic,
             i64::from(expected_vmctx_magic),
@@ -1423,13 +1423,19 @@ impl Compiler {
         callee_key: FuncKey,
         callee_sig: &WasmFuncType,
         symbol: &str,
-        vm_store_context_offset: u32,
         expected_vmctx_magic: u32,
+        mut load_vm_store_context: impl FnMut(
+            &mut AliasRegions<u8>,
+            ir::Type,
+            &mut FuncCursor<'_>,
+            ir::Value,
+        ) -> ir::Value,
     ) -> Result<CompiledFunctionBody, CompileError> {
         log::trace!("compiling array-to-wasm trampoline: {trampoline_key:?} = {symbol:?}");
 
         let isa = &*self.isa;
         let pointer_type = isa.pointer_type();
+        let mut alias_regions = AliasRegions::new(isa.pointer_bytes());
         let wasm_call_sig = wasm_call_signature(isa, callee_sig, &self.tunables);
         let array_call_sig = array_call_signature(isa);
 
@@ -1460,13 +1466,23 @@ impl Compiler {
         //
         // Assert that we were really given a core Wasm vmctx, since that's
         // what we are assuming with our offsets below.
-        self.debug_assert_vmctx_kind(&mut builder, vmctx, expected_vmctx_magic);
+        self.debug_assert_vmctx_kind(
+            &mut builder,
+            &mut alias_regions,
+            vmctx,
+            expected_vmctx_magic,
+        );
+        let vm_store_ctx = load_vm_store_context(
+            &mut alias_regions,
+            pointer_type,
+            &mut builder.cursor(),
+            vmctx,
+        );
         save_last_wasm_entry_context(
             &mut builder,
             pointer_type,
             &self.isa.pointer_bytes(),
-            vm_store_context_offset,
-            vmctx,
+            vm_store_ctx,
             try_call_block,
         );
 
@@ -1543,7 +1559,7 @@ impl Compiler {
         let false_return = builder.ins().iconst(ir::types::I8, 0);
         builder.ins().return_(&[false_return]);
 
-        builder.finalize();
+        builder.finalize(self.isa().frontend_config());
 
         Ok(CompiledFunctionBody {
             code: box_dyn_any_compiler_context(Some(compiler.cx)),
@@ -1793,18 +1809,9 @@ fn save_last_wasm_entry_context(
     builder: &mut FunctionBuilder,
     pointer_type: ir::Type,
     ptr_size: &dyn PtrSize,
-    vm_store_context_offset: u32,
-    vmctx: Value,
+    vm_store_context: ir::Value,
     block: ir::Block,
 ) {
-    // First we need to get the `VMStoreContext`.
-    let vm_store_context = builder.ins().load(
-        pointer_type,
-        MemFlagsData::trusted(),
-        vmctx,
-        i32::try_from(vm_store_context_offset).unwrap(),
-    );
-
     // Save the current fp/sp of the entry trampoline into the `VMStoreContext`.
     let fp = builder.ins().get_frame_pointer(pointer_type);
     builder.ins().store(

@@ -9,7 +9,9 @@ use crate::component::{
     AsAccessor, ComponentInstanceId, ComponentType, FutureAny, Instance, Lift, Lower, StreamAny,
     Val, WasmList,
 };
+use crate::prelude::*;
 use crate::store::{StoreOpaque, StoreToken};
+use crate::try_mutex::{TryMutex, TryMutexGuard};
 use crate::vm::component::{ComponentInstance, HandleTable, TransmitLocalState};
 use crate::vm::{AlwaysMut, VMStore};
 use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
@@ -17,7 +19,9 @@ use crate::{
     Error, Result, Trap, bail, bail_bug, ensure,
     error::{Context as _, format_err},
 };
+use alloc::sync::Arc;
 use buffers::{Extender, SliceBuffer, UntypedWriteBuffer};
+use core::any::{Any, TypeId};
 use core::fmt;
 use core::future;
 use core::iter;
@@ -28,11 +32,6 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker, ready};
 use futures::channel::oneshot;
 use futures::{FutureExt as _, stream};
-use std::any::{Any, TypeId};
-use std::boxed::Box;
-use std::string::String;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::vec::Vec;
 use wasmtime_environ::component::{
     CanonicalAbiInfo, ComponentTypes, InterfaceType, OptionsIndex, RuntimeComponentInstanceIndex,
     TypeComponentGlobalErrorContextTableIndex, TypeComponentLocalErrorContextTableIndex,
@@ -185,7 +184,7 @@ impl PartialEq<u32> for ItemCount {
 }
 
 impl PartialOrd<u32> for ItemCount {
-    fn partial_cmp(&self, other: &u32) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &u32) -> Option<core::cmp::Ordering> {
         self.raw.partial_cmp(other)
     }
 }
@@ -469,6 +468,7 @@ pub struct DirectDestination<'a, D: 'static> {
     store: StoreContextMut<'a, D>,
 }
 
+#[cfg(feature = "std")]
 impl<D: 'static> std::io::Write for DirectDestination<'_, D> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let rem = self.remaining();
@@ -830,7 +830,7 @@ where
     }
 }
 
-#[cfg(feature = "component-model-async-bytes")]
+#[cfg(feature = "component-model-bytes")]
 impl<D> StreamProducer<D> for bytes::Bytes {
     type Item = u8;
     type Buffer = Self;
@@ -847,7 +847,7 @@ impl<D> StreamProducer<D> for bytes::Bytes {
     }
 }
 
-#[cfg(feature = "component-model-async-bytes")]
+#[cfg(feature = "component-model-bytes")]
 impl<D> StreamProducer<D> for bytes::BytesMut {
     type Item = u8;
     type Buffer = Self;
@@ -982,6 +982,7 @@ pub struct DirectSource<'a, D: 'static> {
     store: StoreContextMut<'a, D>,
 }
 
+#[cfg(feature = "std")]
 impl<D: 'static> std::io::Read for DirectSource<'_, D> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let rem = self.remaining();
@@ -2477,8 +2478,6 @@ impl StoreOpaque {
                 )?;
             }
 
-            WriteState::HostReady { .. } => {}
-
             WriteState::Open => {
                 state.update_event(
                     write_handle.rep(),
@@ -2495,7 +2494,11 @@ impl StoreOpaque {
                 )?;
             }
 
-            WriteState::Dropped => {
+            // If the writer has already been dropped, then this cleans out the
+            // state that the reader is using. If the write is host-owned then
+            // by cleaning this out we run the host's `Drop` implementation
+            // which notifies it of this drop.
+            WriteState::Dropped | WriteState::HostReady { .. } => {
                 log::trace!("host_drop_reader delete {transmit_id:?}");
                 state.delete_transmit(transmit_id)?;
             }
@@ -2576,8 +2579,6 @@ impl StoreOpaque {
                 )?;
             }
 
-            ReadState::HostReady { .. } | ReadState::HostToHost { .. } => {}
-
             // If the read state is open, then there are no registered readers of the stream/future
             ReadState::Open => {
                 self.concurrent_state_mut().update_event(
@@ -2595,9 +2596,13 @@ impl StoreOpaque {
                 )?;
             }
 
-            // If the read state was already dropped, then we can remove the transmit state completely
-            // (both writer and reader have been dropped)
-            ReadState::Dropped => {
+            // If the read state was already dropped, then we can remove the
+            // transmit state completely (both writer and reader have been
+            // dropped). If the read state is host-owned then it's additionally
+            // deleted here as a notification that the read end has gone away.
+            // Running the host's `Drop` implementation is what notifies it of
+            // this event.
+            ReadState::Dropped | ReadState::HostReady { .. } | ReadState::HostToHost { .. } => {
                 log::trace!("host_drop_writer delete {transmit_id:?}");
                 self.concurrent_state_mut().delete_transmit(transmit_id)?;
             }
@@ -3084,14 +3089,17 @@ async fn write<D: 'static, P: Send + 'static, T: func::Lower + 'static, B: Write
                                 },
                             ))))
                     });
-                    rx.await?
+                    match rx.await {
+                        Ok(r) => r,
+                        Err(oneshot::Canceled) => bail_bug!("work cancelled"),
+                    }
                 } else {
                     // Optimize flat payloads (i.e. those which do not
                     // require calling the guest's realloc function) by
                     // lowering directly instead of using a oneshot::channel
                     // and background task.
                     tls::get(|store| accept(token.as_context_mut(store)))?
-                };
+                }
             }
 
             tls::get(|store| {
@@ -3498,7 +3506,7 @@ impl Instance {
         if count > 0 && size > 0 {
             self.options_memory(store, options)
                 .get(address..)
-                .and_then(|b| b.get(..(size * count)))
+                .and_then(|b| b.get(..size.checked_mul(count)?))
                 .map(drop)
                 .ok_or_else(|| crate::format_err!("read pointer out of bounds of memory"))
         } else {
@@ -4899,14 +4907,14 @@ fn allow_intra_component_read_write(ty: Option<&InterfaceType>) -> bool {
 /// contains an
 /// `Option<T>`
 struct LockedState<T> {
-    inner: Mutex<Option<T>>,
+    inner: TryMutex<Option<T>>,
 }
 
 impl<T> LockedState<T> {
     /// Creates a new initial state with `value` stored.
     fn new(value: T) -> Self {
         Self {
-            inner: Mutex::new(Some(value)),
+            inner: TryMutex::new(Some(value)),
         }
     }
 
@@ -4918,10 +4926,10 @@ impl<T> LockedState<T> {
     /// As-used in this file there should never actually be contention on this
     /// lock nor recursive access so failing to acquire the lock is a fatal
     /// error that gets propagated upwards.
-    fn try_lock(&self) -> Result<MutexGuard<'_, Option<T>>> {
+    fn try_lock(&self) -> Result<TryMutexGuard<'_, Option<T>>> {
         match self.inner.try_lock() {
-            Ok(lock) => Ok(lock),
-            Err(_) => bail_bug!("should not have contention on state lock"),
+            Some(lock) => Ok(lock),
+            None => bail_bug!("should not have contention on state lock"),
         }
     }
 

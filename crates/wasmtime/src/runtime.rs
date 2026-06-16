@@ -58,6 +58,8 @@ pub(crate) mod store;
 pub(crate) mod trampoline;
 pub(crate) mod transaction;
 pub(crate) mod trap;
+#[cfg(feature = "component-model-async")]
+pub(crate) mod try_mutex;
 pub(crate) mod type_registry;
 pub(crate) mod types;
 pub(crate) mod v128;

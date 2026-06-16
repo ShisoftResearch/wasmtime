@@ -18,19 +18,19 @@ wit_bindgen::generate!({
     path: "../wasi-http/src/p3/wit",
     world: "wasi:http/middleware",
     with: {
-        "wasi:http/handler@0.3.0-rc-2026-03-15": test_programs::p3::wasi::http::handler,
-        "wasi:http/types@0.3.0-rc-2026-03-15": test_programs::p3::wasi::http::types,
-        "wasi:http/client@0.3.0-rc-2026-03-15": test_programs::p3::wasi::http::client,
-        "wasi:random/random@0.3.0-rc-2026-03-15": test_programs::p3::wasi::random::random,
-        "wasi:random/insecure@0.3.0-rc-2026-03-15": test_programs::p3::wasi::random::insecure,
-        "wasi:random/insecure-seed@0.3.0-rc-2026-03-15": test_programs::p3::wasi::random::insecure_seed,
-        "wasi:cli/stdout@0.3.0-rc-2026-03-15": test_programs::p3::wasi::cli::stdout,
-        "wasi:cli/stderr@0.3.0-rc-2026-03-15": test_programs::p3::wasi::cli::stderr,
-        "wasi:cli/stdin@0.3.0-rc-2026-03-15": test_programs::p3::wasi::cli::stdin,
-        "wasi:cli/types@0.3.0-rc-2026-03-15": test_programs::p3::wasi::cli::types,
-        "wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15": test_programs::p3::wasi::clocks::monotonic_clock,
-        "wasi:clocks/system-clock@0.3.0-rc-2026-03-15": test_programs::p3::wasi::clocks::system_clock,
-        "wasi:clocks/types@0.3.0-rc-2026-03-15": test_programs::p3::wasi::clocks::types,
+        "wasi:http/handler@0.3.0": test_programs::p3::wasi::http::handler,
+        "wasi:http/types@0.3.0": test_programs::p3::wasi::http::types,
+        "wasi:http/client@0.3.0": test_programs::p3::wasi::http::client,
+        "wasi:random/random@0.3.0": test_programs::p3::wasi::random::random,
+        "wasi:random/insecure@0.3.0": test_programs::p3::wasi::random::insecure,
+        "wasi:random/insecure-seed@0.3.0": test_programs::p3::wasi::random::insecure_seed,
+        "wasi:cli/stdout@0.3.0": test_programs::p3::wasi::cli::stdout,
+        "wasi:cli/stderr@0.3.0": test_programs::p3::wasi::cli::stderr,
+        "wasi:cli/stdin@0.3.0": test_programs::p3::wasi::cli::stdin,
+        "wasi:cli/types@0.3.0": test_programs::p3::wasi::cli::types,
+        "wasi:clocks/monotonic-clock@0.3.0": test_programs::p3::wasi::clocks::monotonic_clock,
+        "wasi:clocks/system-clock@0.3.0": test_programs::p3::wasi::clocks::system_clock,
+        "wasi:clocks/types@0.3.0": test_programs::p3::wasi::clocks::types,
     },
 });
 
@@ -76,7 +76,7 @@ impl exports::wasi::http::handler::Guest for Component {
             let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
             let (mut pipe_tx, pipe_rx) = wit_stream::new();
 
-            wit_bindgen::spawn(async move {
+            wit_bindgen::spawn_local(async move {
                 {
                     let mut decoder = DeflateDecoder::new(Vec::new());
                     let mut status = StreamResult::Complete(0);
@@ -140,7 +140,7 @@ impl exports::wasi::http::handler::Guest for Component {
             let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
             let (mut pipe_tx, pipe_rx) = wit_stream::new();
 
-            wit_bindgen::spawn(async move {
+            wit_bindgen::spawn_local(async move {
                 {
                     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
                     let mut status = StreamResult::Complete(0);

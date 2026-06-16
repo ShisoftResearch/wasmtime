@@ -133,14 +133,14 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "wasmtime-transaction-sdk"
-version = "46.0.0"
+version = "47.0.0"
 dependencies = [
  "wasmtime-transaction-sdk-macros",
 ]
 
 [[package]]
 name = "wasmtime-transaction-sdk-macros"
-version = "46.0.0"
+version = "47.0.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

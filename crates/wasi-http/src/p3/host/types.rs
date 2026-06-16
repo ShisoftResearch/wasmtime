@@ -129,6 +129,12 @@ fn parse_header_value(
 ) -> Result<http::HeaderValue, HeaderError> {
     if name == CONTENT_LENGTH {
         let s = str::from_utf8(value.as_ref()).or(Err(HeaderError::InvalidSyntax))?;
+        // RFC 9110 defines `Content-Length` as `1*DIGIT`. `u64`'s `FromStr` is
+        // more lenient and also accepts a leading `+`, so reject anything that
+        // isn't a non-empty run of decimal digits.
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(HeaderError::InvalidSyntax);
+        }
         let v: u64 = s.parse().or(Err(HeaderError::InvalidSyntax))?;
         Ok(v.into())
     } else {
@@ -306,8 +312,8 @@ impl HostFields for WasiHttpCtxView<'_> {
     }
 }
 
-impl HostRequestWithStore for WasiHttp {
-    fn new<T>(
+impl<T> HostRequestWithStore<T> for WasiHttp {
+    fn new(
         mut store: Access<T, Self>,
         headers: Resource<Headers>,
         contents: Option<StreamReader<u8>>,
@@ -354,7 +360,7 @@ impl HostRequestWithStore for WasiHttp {
         ))
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut store: Access<T, Self>,
         req: Resource<Request>,
         fut: FutureReader<Result<(), ErrorCode>>,
@@ -371,7 +377,7 @@ impl HostRequestWithStore for WasiHttp {
         body.consume(store, fut, getter)
     }
 
-    fn drop<T>(mut store: Access<'_, T, Self>, req: Resource<Request>) -> wasmtime::Result<()> {
+    fn drop(mut store: Access<'_, T, Self>, req: Resource<Request>) -> wasmtime::Result<()> {
         let Request { body, .. } = store
             .get()
             .table
@@ -589,8 +595,8 @@ impl HostRequestOptions for WasiHttpCtxView<'_> {
     }
 }
 
-impl HostResponseWithStore for WasiHttp {
-    fn new<T>(
+impl<T> HostResponseWithStore<T> for WasiHttp {
+    fn new(
         mut store: Access<T, Self>,
         headers: Resource<Headers>,
         contents: Option<StreamReader<u8>>,
@@ -631,7 +637,7 @@ impl HostResponseWithStore for WasiHttp {
         ))
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut store: Access<T, Self>,
         res: Resource<Response>,
         fut: FutureReader<Result<(), ErrorCode>>,
@@ -648,7 +654,7 @@ impl HostResponseWithStore for WasiHttp {
         body.consume(store, fut, getter)
     }
 
-    fn drop<T>(mut store: Access<'_, T, Self>, res: Resource<Response>) -> wasmtime::Result<()> {
+    fn drop(mut store: Access<'_, T, Self>, res: Resource<Response>) -> wasmtime::Result<()> {
         let Response { body, .. } = store
             .get()
             .table
@@ -703,5 +709,26 @@ impl Host for WasiHttpCtxView<'_> {
         error: crate::p3::RequestOptionsError,
     ) -> wasmtime::Result<RequestOptionsError> {
         error.downcast()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_header_value;
+    use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+
+    #[test]
+    fn content_length_rejects_non_digits() {
+        assert!(parse_header_value(&CONTENT_LENGTH, "0").is_ok());
+        assert!(parse_header_value(&CONTENT_LENGTH, "1234").is_ok());
+
+        // `u64::from_str` accepts these but they are not `1*DIGIT` per RFC 9110.
+        assert!(parse_header_value(&CONTENT_LENGTH, "+5").is_err());
+        assert!(parse_header_value(&CONTENT_LENGTH, "-5").is_err());
+        assert!(parse_header_value(&CONTENT_LENGTH, " 5").is_err());
+        assert!(parse_header_value(&CONTENT_LENGTH, "").is_err());
+
+        // other header names are unaffected
+        assert!(parse_header_value(&CONTENT_TYPE, "text/plain").is_ok());
     }
 }

@@ -941,7 +941,6 @@ pub fn translate_operator(
             let inst_results = environ.translate_call_indirect(
                 builder,
                 environ.next_srcloc,
-                validator.features(),
                 TableIndex::from_u32(*table_index),
                 type_index,
                 sigref,
@@ -1008,7 +1007,6 @@ pub fn translate_operator(
             environ.translate_return_call_indirect(
                 builder,
                 srcloc,
-                validator.features(),
                 TableIndex::from_u32(*table_index),
                 type_index,
                 sigref,
@@ -1659,7 +1657,7 @@ pub fn translate_operator(
         }
         Operator::I32Eqz | Operator::I64Eqz => {
             let arg = environ.stacks.pop1();
-            let val = builder.ins().icmp_imm(IntCC::Equal, arg, 0);
+            let val = builder.ins().icmp_imm_s(IntCC::Equal, arg, 0);
             environ.stacks.push1(builder.ins().uextend(I32, val));
         }
         Operator::I32Eq | Operator::I64Eq => translate_icmp(IntCC::Equal, builder, environ),
@@ -3718,7 +3716,7 @@ pub fn translate_operator(
 
             if to_ref_type.heap_type == WasmHeapType::I31 {
                 let helper_i31 = environ.translate_transaction_helper_i31_for_ref(builder, r)?;
-                let helper_succeeded = builder.ins().icmp_imm(IntCC::NotEqual, helper_i31, 0);
+                let helper_succeeded = builder.ins().icmp_imm_s(IntCC::NotEqual, helper_i31, 0);
                 let helper_fails_block = builder.create_block();
                 let mut helper_inputs = inputs;
                 if let Some(input) = helper_inputs.last_mut() {
@@ -4379,13 +4377,13 @@ fn align_atomic_addr(
         let effective_addr = if memarg.offset == 0 {
             addr
         } else {
-            builder.ins().iadd_imm(addr, memarg.offset.cast_signed())
+            builder.ins().iadd_imm_s(addr, memarg.offset.cast_signed())
         };
         debug_assert!(loaded_bytes.is_power_of_two());
         let misalignment = builder
             .ins()
-            .band_imm(effective_addr, i64::from(loaded_bytes - 1));
-        let f = builder.ins().icmp_imm(IntCC::NotEqual, misalignment, 0);
+            .band_imm_u(effective_addr, i64::from(loaded_bytes - 1));
+        let f = builder.ins().icmp_imm_s(IntCC::NotEqual, misalignment, 0);
         environ.trapnz(builder, f, crate::TRAP_HEAP_MISALIGNED);
     }
 }
