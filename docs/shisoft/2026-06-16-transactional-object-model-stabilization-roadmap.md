@@ -67,7 +67,7 @@ transaction WAST harness, transaction Rust SDK tests.
       `GranuleId::Object(ObjectId)`.
 - [ ] `SHISOFT-TWASM-MOCK` paths remain only in explicit WAST compatibility
       fallback seams, not in normal runtime or file-backed persistence paths.
-- [ ] Full transaction verification passes with no ignored transaction WAST
+- [x] Full transaction verification passes with no ignored transaction WAST
       cases.
 
 ---
@@ -328,16 +328,16 @@ cargo check -p wasmtime-fuzzing --lib
 **Purpose:** Confirm the object model is stable enough to start persistent GC
 storage reclamation work.
 
-- [ ] Run Wasmtime formatting and whitespace checks.
-- [ ] Run wasm-tools fork formatting and workspace checks needed by the local
+- [x] Run Wasmtime formatting and whitespace checks.
+- [x] Run wasm-tools fork formatting and workspace checks needed by the local
       transaction parser/generator dependencies.
-- [ ] Run transaction unit tests, persistence tests, WAST tests, Rust SDK tests,
+- [x] Run transaction unit tests, persistence tests, WAST tests, Rust SDK tests,
       and fuzzing crate checks.
-- [ ] Build the WASI preview1 component adapter with the local transaction
+- [x] Build the WASI preview1 component adapter with the local transaction
       `wasm-tools` binary on `PATH`.
-- [ ] Update the implementation log with completed waves and remaining GC-only
+- [x] Update the implementation log with completed waves and remaining GC-only
       work.
-- [ ] Commit each completed wave without `Co-authored-by` annotations.
+- [x] Commit this stabilization wave without `Co-authored-by` annotations.
 
 **Verification:**
 
@@ -348,10 +348,11 @@ cargo check -p wasmtime-fuzzing --lib
 
 (cd /home/shisoft/Code/Research/wasm-tools-transaction && cargo fmt --check)
 (cd /home/shisoft/Code/Research/wasm-tools-transaction && git diff --check)
+(cd /home/shisoft/Code/Research/wasm-tools-transaction && cargo check -p wasmparser --lib)
 (cd /home/shisoft/Code/Research/wasm-tools-transaction && cargo check -p wasm-smith --all-features --lib)
 (cd /home/shisoft/Code/Research/wasm-tools-transaction && cargo build --bin wasm-tools)
 
-WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_BUILD_JOBS=2 python3 ./ci/run-tests.py --locked --exclude=wasi-preview1-component-adapter -- --format terse
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_BUILD_JOBS=2 python3 ./ci/run-tests.py --locked --exclude=wasi-preview1-component-adapter -- --format terse
 PATH=/home/shisoft/Code/Research/wasm-tools-transaction/target/debug:$PATH ./ci/build-wasi-preview1-component-adapter.sh
 ```
 

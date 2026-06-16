@@ -758,38 +758,39 @@ git commit -m "Document transaction reference type boundary"
 **Target invariant:** The stabilized object model passes the same verification
 gate used for the branch.
 
-- [ ] **Step 8.1: Run Wasmtime checks**
+- [x] **Step 8.1: Run Wasmtime checks**
 
 ```sh
 cargo fmt --check
 git diff --check
 cargo check -p wasmtime-fuzzing --lib
-WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_BUILD_JOBS=2 python3 ./ci/run-tests.py --locked --exclude=wasi-preview1-component-adapter -- --format terse
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_BUILD_JOBS=2 python3 ./ci/run-tests.py --locked --exclude=wasi-preview1-component-adapter -- --format terse
 ```
 
-- [ ] **Step 8.2: Run wasm-tools fork checks**
+- [x] **Step 8.2: Run wasm-tools fork checks**
 
 ```sh
 cd /home/shisoft/Code/Research/wasm-tools-transaction
 cargo fmt --check
 git diff --check
+cargo check -p wasmparser --lib
 cargo check -p wasm-smith --all-features --lib
 cargo build --bin wasm-tools
 ```
 
-- [ ] **Step 8.3: Build adapter with local wasm-tools**
+- [x] **Step 8.3: Build adapter with local wasm-tools**
 
 ```sh
 cd /home/shisoft/Code/Research/wasmtime
 PATH=/home/shisoft/Code/Research/wasm-tools-transaction/target/debug:$PATH ./ci/build-wasi-preview1-component-adapter.sh
 ```
 
-- [ ] **Step 8.4: Update docs with final status**
+- [x] **Step 8.4: Update docs with final status**
 
 Record exact pass/fail results and remaining GC-only work in
 `docs/shisoft/transactional-wasm-implementation-log.md`.
 
-- [ ] **Step 8.5: Commit**
+- [x] **Step 8.5: Commit**
 
 ```sh
 git add docs/shisoft/transactional-wasm-implementation-log.md \

@@ -36,6 +36,92 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-16 Wave 8 Stabilization Gate
+
+Wave 8 found and fixed one remaining transaction-table runtime gap before the
+full gate could pass:
+
+- `ttable.set` correctly staged table writes privately, but `tcall_indirect`
+  still loaded the callee from the committed table. Two WAST cases trapped with
+  `uninitialized element` after staging a table element and calling it in the
+  same transaction.
+- Cranelift indirect-call lowering now derives the transaction-table overlay
+  decision in `FuncEnvironment` and uses `transaction_ttable_get` for
+  transactional tables. Ordinary tables still use `table_get_funcref`.
+- The existing indirect-call signature and null checks remain shared by both
+  ordinary and transactional table paths.
+
+Focused Wave 8A verification:
+
+```sh
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target WASMTIME_TEST_TRANSACTION_WAST=1 cargo test -p wasmtime-cli --test wast transaction-proposal/simple-transactions/tref_tfunc.wast -- --format terse
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target WASMTIME_TEST_TRANSACTION_WAST=1 cargo test -p wasmtime-cli --test wast transaction-proposal/simple-transactions/tarray_init_elem.wast -- --format terse
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target WASMTIME_TEST_TRANSACTION_WAST=1 cargo test -p wasmtime-cli --test wast transaction-proposal/simple-transactions/tcall_indirect.wast -- --format terse
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target WASMTIME_TEST_TRANSACTION_WAST=1 cargo test -p wasmtime-cli --test wast transaction-proposal/simple-transactions/return_tcall_indirect.wast -- --format terse
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target cargo test -p wasmtime transaction_ttable_set_is_private_until_commit --lib -- --format terse
+cargo fmt --check
+git diff --check
+```
+
+Result: all focused commands passed after the lowering fix.
+
+Wave 8 branch verification:
+
+```sh
+cargo fmt --check
+git diff --check
+cargo test -p wasmtime transaction:: --lib -- --format terse
+cargo test -p wasmtime --test transaction_persistence -- --format terse
+cargo test --test transaction_persistence_wast -- --format terse
+cargo test -p wasmtime-transaction-sdk --tests -- --format terse
+cargo test -p wasmtime-transaction-tools --tests -- --format terse
+cargo test --test transaction_rust_simple_transactions -- --format terse
+cargo test --test transaction_rust_toolset -- --format terse
+cargo check -p wasmtime-fuzzing --lib
+```
+
+Result: all focused Wasmtime transaction commands passed.
+
+Local `wasm-tools-transaction` fork verification:
+
+```sh
+cd /home/shisoft/Code/Research/wasm-tools-transaction
+cargo fmt --check
+git diff --check
+cargo check -p wasmparser --lib
+cargo check -p wasm-smith --all-features --lib
+cargo build --bin wasm-tools
+```
+
+Result: all fork commands passed.
+
+Full transaction-enabled gate:
+
+```sh
+CARGO_TARGET_DIR=/tmp/wasmtime-wave8-target CARGO_INCREMENTAL=0 WASMTIME_TEST_TRANSACTION_WAST=1 CARGO_BUILD_JOBS=2 python3 ./ci/run-tests.py --locked --exclude=wasi-preview1-component-adapter -- --format terse
+```
+
+Result: passed. The transaction-enabled WAST suite reported
+`3641 passed; 0 failed; 0 ignored`.
+
+WASI preview1 adapter gate:
+
+```sh
+PATH=/home/shisoft/Code/Research/wasm-tools-transaction/target/debug:$PATH ./ci/build-wasi-preview1-component-adapter.sh
+```
+
+Result: passed for debug verification and release command/reactor/proxy adapter
+verification using the local transaction-aware `wasm-tools` binary.
+
+Remaining work before persistent GC reclamation:
+
+- Final live persistent reference ABI still needs to eliminate process-local
+  GC handles from persistent object helper boundaries.
+- Restart-stable `tfuncref` and `texternref` identity still need the planned
+  durable ABI cleanup.
+- Durable block/chunk retirement and object storage reuse remain excluded until
+  the persistent GC/reclamation roadmap.
+
 ## 2026-06-16 Wave 7 Type-System Cleanup Boundary
 
 - Added wasmparser regressions that pin constructed and byte-decoded ordinary

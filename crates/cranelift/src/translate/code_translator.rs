@@ -937,6 +937,7 @@ pub fn translate_operator(
             // `table_index` is the index of the table to search the function
             // in.
             let type_index = TypeIndex::from_u32(*type_index);
+            let table_index = TableIndex::from_u32(*table_index);
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
             let callee = environ.stacks.pop1();
@@ -948,7 +949,7 @@ pub fn translate_operator(
             let inst_results = environ.translate_call_indirect(
                 builder,
                 environ.next_srcloc,
-                TableIndex::from_u32(*table_index),
+                table_index,
                 type_index,
                 sigref,
                 callee,
@@ -1003,6 +1004,7 @@ pub fn translate_operator(
             // `table_index` is the index of the table to search the function
             // in.
             let type_index = TypeIndex::from_u32(*type_index);
+            let table_index = TableIndex::from_u32(*table_index);
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
             let callee = environ.stacks.pop1();
@@ -1014,7 +1016,7 @@ pub fn translate_operator(
             environ.translate_return_call_indirect(
                 builder,
                 srcloc,
-                TableIndex::from_u32(*table_index),
+                table_index,
                 type_index,
                 sigref,
                 callee,

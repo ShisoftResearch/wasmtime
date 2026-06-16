@@ -2142,12 +2142,14 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         sig_ref: ir::SigRef,
         callee: ir::Value,
         call_args: &[ir::Value],
+        use_transaction_table_overlay: bool,
     ) -> WasmResult<Option<CallRets>> {
         let (code_ptr, callee_vmctx) = match self.check_and_load_code_and_callee_vmctx(
             table_index,
             ty_index,
             callee,
             false,
+            use_transaction_table_overlay,
         )? {
             Some(pair) => pair,
             None => return Ok(None),
@@ -2163,11 +2165,16 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         ty_index: TypeIndex,
         callee: ir::Value,
         cold_blocks: bool,
+        use_transaction_table_overlay: bool,
     ) -> WasmResult<Option<(ir::Value, ir::Value)>> {
         // Get the funcref pointer from the table.
-        let funcref_ptr =
+        let funcref_ptr = if use_transaction_table_overlay {
             self.env
-                .table_get_funcref(self.builder, table_index, callee, cold_blocks);
+                .translate_transaction_ttable_get(self.builder, table_index, callee)?
+        } else {
+            self.env
+                .table_get_funcref(self.builder, table_index, callee, cold_blocks)
+        };
 
         // If necessary, check the signature.
         let check = self.check_indirect_call_type_signature(table_index, ty_index, funcref_ptr);
@@ -4643,12 +4650,14 @@ impl FuncEnvironment<'_> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<Option<CallRets>> {
+        let use_transaction_table_overlay = self.module.transaction_objects.is_ttable(table_index);
         Call::new(builder, self, srcloc).indirect_call(
             table_index,
             ty_index,
             sig_ref,
             callee,
             call_args,
+            use_transaction_table_overlay,
         )
     }
 
@@ -4696,12 +4705,14 @@ impl FuncEnvironment<'_> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<()> {
+        let use_transaction_table_overlay = self.module.transaction_objects.is_ttable(table_index);
         Call::new_tail(builder, self, srcloc).indirect_call(
             table_index,
             ty_index,
             sig_ref,
             callee,
             call_args,
+            use_transaction_table_overlay,
         )?;
         Ok(())
     }
