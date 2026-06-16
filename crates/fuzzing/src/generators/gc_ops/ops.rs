@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use wasm_encoder::{
     CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function, FunctionSection,
     GlobalSection, ImportSection, Instruction, Module, RefType, TableSection, TableType,
-    TypeSection, ValType,
+    TransactionRefPermission, TypeSection, ValType,
 };
 
 /// The base offsets and indices for various Wasm entities within
@@ -105,6 +105,7 @@ impl GcOps {
                     shared: false,
                     ty: wasm_encoder::AbstractHeapType::Struct,
                 },
+                transaction_permission: TransactionRefPermission::None,
             })],
             vec![],
         );
@@ -117,6 +118,7 @@ impl GcOps {
                     shared: false,
                     ty: wasm_encoder::AbstractHeapType::Eq,
                 },
+                transaction_permission: TransactionRefPermission::None,
             })],
             vec![],
         );
@@ -192,6 +194,7 @@ impl GcOps {
                 vec![ValType::Ref(RefType {
                     nullable: true,
                     heap_type: wasm_encoder::HeapType::Concrete(concrete),
+                    transaction_permission: TransactionRefPermission::None,
                 })],
                 vec![],
             );
@@ -234,6 +237,7 @@ impl GcOps {
                     shared: false,
                     ty: wasm_encoder::AbstractHeapType::Struct,
                 },
+                transaction_permission: TransactionRefPermission::None,
             },
             minimum: u64::from(self.limits.table_size),
             maximum: None,
@@ -266,6 +270,7 @@ impl GcOps {
                 element_type: RefType {
                     nullable: true,
                     heap_type: wasm_encoder::HeapType::Concrete(concrete),
+                    transaction_permission: TransactionRefPermission::None,
                 },
                 minimum: u64::from(self.limits.table_size),
                 maximum: None,
@@ -297,6 +302,7 @@ impl GcOps {
                         shared: false,
                         ty: wasm_encoder::AbstractHeapType::Struct,
                     },
+                    transaction_permission: TransactionRefPermission::None,
                 }),
                 mutable: true,
                 shared: false,
@@ -341,6 +347,7 @@ impl GcOps {
                     val_type: ValType::Ref(RefType {
                         nullable: true,
                         heap_type: wasm_encoder::HeapType::Concrete(concrete),
+                        transaction_permission: TransactionRefPermission::None,
                     }),
                     mutable: true,
                     shared: false,
@@ -372,6 +379,7 @@ impl GcOps {
                     shared: false,
                     ty: wasm_encoder::AbstractHeapType::Struct,
                 },
+                transaction_permission: TransactionRefPermission::None,
             }),
         ));
 
@@ -389,6 +397,7 @@ impl GcOps {
                 ValType::Ref(RefType {
                     nullable: true,
                     heap_type: wasm_encoder::HeapType::Concrete(concrete),
+                    transaction_permission: TransactionRefPermission::None,
                 }),
             ));
         }
@@ -1239,6 +1248,7 @@ impl GcOp {
                     ValType::Ref(RefType {
                         nullable: true,
                         heap_type: sub_heap_type,
+                        transaction_permission: TransactionRefPermission::None,
                     }),
                 )));
 

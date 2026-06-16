@@ -162,6 +162,8 @@ rustix = { workspace = true, features = ["param"] }
 [patch.crates-io]
 wasm-encoder = { path = "../wasm-tools-transaction/crates/wasm-encoder" }
 wasm-metadata = { path = "../wasm-tools-transaction/crates/wasm-metadata" }
+wasm-mutate = { path = "../wasm-tools-transaction/crates/wasm-mutate" }
+wasm-smith = { path = "../wasm-tools-transaction/crates/wasm-smith" }
 wit-component = { path = "../wasm-tools-transaction/crates/wit-component" }
 wit-parser = { path = "../wasm-tools-transaction/crates/wit-parser" }
 wasmparser = { path = "../wasm-tools-transaction/crates/wasmparser" }

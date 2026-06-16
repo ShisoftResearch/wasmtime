@@ -287,6 +287,9 @@ pub struct FuncEnvironment<'module_environment> {
     /// Function-local flag set by dynamically executed `ttry`.
     transaction_began_in_function_var: Variable,
 
+    /// CLIF types for WebAssembly locals in the current function.
+    local_types: Vec<ir::Type>,
+
     /// Structured transaction handlers currently active during translation.
     transaction_try_stack: Vec<TransactionTryFrame>,
 }
@@ -368,6 +371,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             transaction_may_be_active_on_return: false,
             is_current_tfunc,
             transaction_began_in_function_var: Variable::reserved_value(),
+            local_types: Vec::new(),
             transaction_try_stack: Vec::new(),
         }
     }
@@ -395,6 +399,21 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             // The next hint is for a later offset; nothing for this branch.
             return None;
         }
+    }
+
+    pub(crate) fn record_local_type(&mut self, local: Variable, ty: ir::Type) {
+        let index = local.index();
+        if self.local_types.len() <= index {
+            self.local_types.resize(index + 1, types::INVALID);
+        }
+        self.local_types[index] = ty;
+    }
+
+    pub(crate) fn local_type(&self, local: Variable) -> Option<ir::Type> {
+        self.local_types
+            .get(local.index())
+            .copied()
+            .filter(|ty| *ty != types::INVALID)
     }
 
     pub(crate) fn pointer_type(&self) -> ir::Type {
@@ -4795,7 +4814,9 @@ impl FuncEnvironment<'_> {
             BuiltinFunctionIndex::transaction_begin(),
         )?;
         let began = builder.ins().iconst(I8, 1);
-        builder.def_var(self.transaction_began_in_function_var, began);
+        let transaction_began_in_function_var =
+            self.ensure_transaction_began_in_function_var(builder);
+        builder.def_var(transaction_began_in_function_var, began);
         Ok(())
     }
 
@@ -5016,8 +5037,23 @@ impl FuncEnvironment<'_> {
         builder.seal_block(continue_block);
         let began = enter_code;
         let began = builder.ins().ireduce(I8, began);
-        builder.def_var(self.transaction_began_in_function_var, began);
+        let transaction_began_in_function_var =
+            self.ensure_transaction_began_in_function_var(builder);
+        builder.def_var(transaction_began_in_function_var, began);
         Ok(())
+    }
+
+    fn ensure_transaction_began_in_function_var(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> Variable {
+        if self.transaction_began_in_function_var.is_reserved_value() {
+            let var = builder.declare_var(I8);
+            let did_not_begin_transaction = builder.ins().iconst(I8, 0);
+            builder.def_var(var, did_not_begin_transaction);
+            self.transaction_began_in_function_var = var;
+        }
+        self.transaction_began_in_function_var
     }
 
     fn default_wasm_value(
@@ -7481,12 +7517,6 @@ impl FuncEnvironment<'_> {
     }
 
     pub fn before_translate_function(&mut self, builder: &mut FunctionBuilder) -> WasmResult<()> {
-        self.transaction_began_in_function_var = builder.declare_var(I8);
-        let did_not_begin_transaction = builder.ins().iconst(I8, 0);
-        builder.def_var(
-            self.transaction_began_in_function_var,
-            did_not_begin_transaction,
-        );
         if self.is_current_tfunc {
             self.translate_transaction_enter_tfunc(builder)?;
         }
@@ -7680,7 +7710,9 @@ impl FuncEnvironment<'_> {
             return;
         }
 
-        let began = builder.use_var(self.transaction_began_in_function_var);
+        let transaction_began_in_function_var =
+            self.ensure_transaction_began_in_function_var(builder);
+        let began = builder.use_var(transaction_began_in_function_var);
         let should_commit = builder.ins().icmp_imm_s(IntCC::NotEqual, began, 0);
         let commit_block = builder.create_block();
         let continuation_block = builder.create_block();

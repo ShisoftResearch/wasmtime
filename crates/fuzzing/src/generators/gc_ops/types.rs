@@ -103,6 +103,7 @@ macro_rules! define_field_type_enum {
                             shared: false,
                             ty: AbstractHeapType::Struct,
                         },
+                        transaction_permission: wasm_encoder::TransactionRefPermission::None,
                     })),
                     FieldType::Ref { nullable, type_id } => {
                         // Fixup guarantees every concrete reference target is a
@@ -120,6 +121,7 @@ macro_rules! define_field_type_enum {
                         StorageType::Val(ValType::Ref(RefType {
                             nullable,
                             heap_type: HeapType::Concrete(idx),
+                            transaction_permission: wasm_encoder::TransactionRefPermission::None,
                         }))
                     }
                 }

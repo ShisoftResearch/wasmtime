@@ -33,6 +33,7 @@ fn main() {
             contents: _,
             config,
             transaction_proposal: _,
+            transaction_real_text_parser: _,
         } = test;
         println!("cargo:rerun-if-changed={}", path.to_str().unwrap());
         code.push_str(&format!(
@@ -42,6 +43,7 @@ fn main() {
                     contents: include_str!({path:?}).into(),
                     config: wasmtime_test_util::wast::{config:?},
                     transaction_proposal: None,
+                    transaction_real_text_parser: false,
                 }}
             }},"
         ));

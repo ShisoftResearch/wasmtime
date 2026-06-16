@@ -5,99 +5,6 @@ macro_rules! foreach_builtin_function {
         $mac! {
             // Returns an index for wasm's `memory.grow` builtin function.
             memory_grow(vmctx: vmctx, delta: u64, index: u32) -> pointer;
-            // Begins a transactional WebAssembly transaction for `tfunc` entry
-            // if no transaction is already active.
-            transaction_enter_tfunc(vmctx: vmctx) -> u64;
-            // Begins a transactional WebAssembly transaction.
-            transaction_begin(vmctx: vmctx) -> bool;
-            // Ends a structured transactional `ttry` body.
-            transaction_ttry_end(vmctx: vmctx) -> bool;
-            // Commits a transactional WebAssembly transaction.
-            transaction_commit(vmctx: vmctx) -> bool;
-            // Fails and aborts a transactional WebAssembly transaction.
-            transaction_fail(vmctx: vmctx) -> bool;
-            // Fails and aborts a transactional WebAssembly transaction with a structured code.
-            transaction_fail_with_code(vmctx: vmctx, code: u32) -> bool;
-            // Returns whether a structured transactional failure is pending.
-            transaction_failure_pending(vmctx: vmctx) -> u32;
-            // Returns the pending structured transactional failure code.
-            transaction_failure_code(vmctx: vmctx) -> u32;
-            // Compatibility helper for generated transaction fixtures that route scalar payloads through ti31.
-            transaction_helper_i31_for_ref(vmctx: vmctx, gc_ref: u32) -> u32;
-            // Acquires read permission for a known persistent transactional reference.
-            transaction_tref_cast_read(vmctx: vmctx, gc_ref: u32) -> bool;
-            // Acquires write permission for a known persistent transactional reference.
-            transaction_tref_cast_write(vmctx: vmctx, gc_ref: u32) -> bool;
-            // Returns a pointer to a staged transactional global cell.
-            transaction_tglobal_get(vmctx: vmctx, global: u32) -> pointer;
-            // Stages a transactional global write. `tag` identifies the value type.
-            transaction_tglobal_set(vmctx: vmctx, global: u32, tag: u32, value: u64) -> bool;
-            // Stages a transactional v128 global write from a 16-byte value pointer.
-            transaction_tglobal_set_v128(vmctx: vmctx, global: u32, value: pointer) -> bool;
-            // Returns a pointer to readable transactional memory bytes.
-            transaction_tmemory_load(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
-            // Returns a pointer to writable staged transactional memory bytes.
-            transaction_tmemory_store(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
-            // Returns the visible transactional memory size.
-            transaction_tmemory_size(vmctx: vmctx, memory: u32) -> pointer;
-            // Stages a transactional memory grow and returns the previous visible size.
-            transaction_tmemory_grow(vmctx: vmctx, memory: u32, delta: u64) -> pointer;
-            // Stages a transactional memory fill.
-            transaction_tmemory_fill(vmctx: vmctx, memory: u32, dst: u64, val: u32, len: u64) -> bool;
-            // Stages a transactional memory copy.
-            transaction_tmemory_copy(vmctx: vmctx, dst_memory: u32, src_memory: u32, dst: u64, src: u64, len: u64) -> bool;
-            // Stages a transactional memory initialization from runtime data bytes.
-            transaction_tmemory_init(vmctx: vmctx, memory: u32, dst: u64, src: u64, len: u64, data: pointer, data_len: u64) -> bool;
-            // Initializes committed transactional memory from active data during module startup.
-            transaction_tmemory_static_init(vmctx: vmctx, memory: u32, dst: u64, len: u64, data: pointer, data_len: u64) -> bool;
-            // Checks transactional context before lowering applies `tdata.drop`.
-            transaction_tdata_drop(vmctx: vmctx, data: u32) -> bool;
-            // Returns a transactional table element.
-            transaction_ttable_get(vmctx: vmctx, table: u32, index: u64) -> pointer;
-            // Stages a transactional table element write.
-            transaction_ttable_set(vmctx: vmctx, table: u32, index: u64, value: pointer) -> bool;
-            // Acquires a readable transactional table range.
-            transaction_ttable_read_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
-            // Acquires a writable transactional table range.
-            transaction_ttable_write_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
-            // Returns the visible transactional table size.
-            transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
-            // Stages a transactional table grow and returns the previous visible size.
-            transaction_ttable_grow(vmctx: vmctx, table: u32, delta: u64, init: pointer) -> pointer;
-            // Associates a newly allocated Wasmtime GC struct with a transactional object record.
-            transaction_tstruct_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer) -> bool;
-            // Associates a module-initializer Wasmtime GC struct with a committed transactional object record.
-            transaction_tstruct_static_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer, layout_fields: pointer) -> bool;
-            // Stages a transactional struct field write.
-            transaction_tstruct_set(vmctx: vmctx, gc_ref: u32, field: u32, tag: u32, low: u64, high: u64) -> bool;
-            // Reads a transactional struct field as an ObjectValueAbi scratch pointer.
-            transaction_tstruct_get(vmctx: vmctx, gc_ref: u32, field: u32) -> pointer;
-            // Associates a newly allocated Wasmtime GC array with a transactional object record.
-            transaction_tarray_new(vmctx: vmctx, gc_ref: u32, array_type: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
-            // Associates a module-initializer Wasmtime GC array with a committed transactional object record.
-            transaction_tarray_static_new(vmctx: vmctx, gc_ref: u32, array_type: u32, element_size: u32, element_is_object_ref: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
-            // Associates a newly allocated Wasmtime GC array with explicit transactional element records.
-            transaction_tarray_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_count: u32, elements: pointer) -> bool;
-            // Associates a module-initializer Wasmtime GC fixed array with committed transactional element records.
-            transaction_tarray_static_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_size: u32, element_is_object_ref: u32, element_count: u32, elements: pointer) -> bool;
-            // Associates a newly allocated Wasmtime GC numeric array initialized from data bytes.
-            transaction_tarray_new_data(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
-            // Associates a newly allocated Wasmtime GC reference array initialized from an element segment.
-            transaction_tarray_new_elem(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
-            // Stages a transactional array element write.
-            transaction_tarray_set(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64) -> bool;
-            // Stages a transactional array range fill.
-            transaction_tarray_fill(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64, len: u32) -> bool;
-            // Stages a transactional array range copy.
-            transaction_tarray_copy(vmctx: vmctx, dst_gc_ref: u32, dst_index: u32, src_gc_ref: u32, src_index: u32, len: u32) -> bool;
-            // Stages a transactional array range initialized from data bytes.
-            transaction_tarray_init_data(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
-            // Stages a transactional array range initialized from an element segment.
-            transaction_tarray_init_elem(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
-            // Reads a transactional array element as an ObjectValueAbi scratch pointer.
-            transaction_tarray_get(vmctx: vmctx, gc_ref: u32, index: u32) -> pointer;
-            // Reads a transactional array length as an ObjectValueAbi scratch pointer.
-            transaction_tarray_len(vmctx: vmctx, gc_ref: u32) -> pointer;
             // Returns an index for wasm's `memory.copy`
             memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
             // Returns an index for wasm's `memory.fill` instruction.
@@ -263,6 +170,100 @@ macro_rules! foreach_builtin_function {
 
             // Process a debug breakpoint.
             breakpoint(vmctx: vmctx) -> bool;
+
+            // Begins a transactional WebAssembly transaction for `tfunc` entry
+            // if no transaction is already active.
+            transaction_enter_tfunc(vmctx: vmctx) -> u64;
+            // Begins a transactional WebAssembly transaction.
+            transaction_begin(vmctx: vmctx) -> bool;
+            // Ends a structured transactional `ttry` body.
+            transaction_ttry_end(vmctx: vmctx) -> bool;
+            // Commits a transactional WebAssembly transaction.
+            transaction_commit(vmctx: vmctx) -> bool;
+            // Fails and aborts a transactional WebAssembly transaction.
+            transaction_fail(vmctx: vmctx) -> bool;
+            // Fails and aborts a transactional WebAssembly transaction with a structured code.
+            transaction_fail_with_code(vmctx: vmctx, code: u32) -> bool;
+            // Returns whether a structured transactional failure is pending.
+            transaction_failure_pending(vmctx: vmctx) -> u32;
+            // Returns the pending structured transactional failure code.
+            transaction_failure_code(vmctx: vmctx) -> u32;
+            // Compatibility helper for generated transaction fixtures that route scalar payloads through ti31.
+            transaction_helper_i31_for_ref(vmctx: vmctx, gc_ref: u32) -> u32;
+            // Acquires read permission for a known persistent transactional reference.
+            transaction_tref_cast_read(vmctx: vmctx, gc_ref: u32) -> bool;
+            // Acquires write permission for a known persistent transactional reference.
+            transaction_tref_cast_write(vmctx: vmctx, gc_ref: u32) -> bool;
+            // Returns a pointer to a staged transactional global cell.
+            transaction_tglobal_get(vmctx: vmctx, global: u32) -> pointer;
+            // Stages a transactional global write. `tag` identifies the value type.
+            transaction_tglobal_set(vmctx: vmctx, global: u32, tag: u32, value: u64) -> bool;
+            // Stages a transactional v128 global write from a 16-byte value pointer.
+            transaction_tglobal_set_v128(vmctx: vmctx, global: u32, value: pointer) -> bool;
+            // Returns a pointer to readable transactional memory bytes.
+            transaction_tmemory_load(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
+            // Returns a pointer to writable staged transactional memory bytes.
+            transaction_tmemory_store(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
+            // Returns the visible transactional memory size.
+            transaction_tmemory_size(vmctx: vmctx, memory: u32) -> pointer;
+            // Stages a transactional memory grow and returns the previous visible size.
+            transaction_tmemory_grow(vmctx: vmctx, memory: u32, delta: u64) -> pointer;
+            // Stages a transactional memory fill.
+            transaction_tmemory_fill(vmctx: vmctx, memory: u32, dst: u64, val: u32, len: u64) -> bool;
+            // Stages a transactional memory copy.
+            transaction_tmemory_copy(vmctx: vmctx, dst_memory: u32, src_memory: u32, dst: u64, src: u64, len: u64) -> bool;
+            // Stages a transactional memory initialization from runtime data bytes.
+            transaction_tmemory_init(vmctx: vmctx, memory: u32, dst: u64, src: u64, len: u64, data: pointer, data_len: u64) -> bool;
+            // Initializes committed transactional memory from active data during module startup.
+            transaction_tmemory_static_init(vmctx: vmctx, memory: u32, dst: u64, len: u64, data: pointer, data_len: u64) -> bool;
+            // Checks transactional context before lowering applies `tdata.drop`.
+            transaction_tdata_drop(vmctx: vmctx, data: u32) -> bool;
+            // Returns a transactional table element.
+            transaction_ttable_get(vmctx: vmctx, table: u32, index: u64) -> pointer;
+            // Stages a transactional table element write.
+            transaction_ttable_set(vmctx: vmctx, table: u32, index: u64, value: pointer) -> bool;
+            // Acquires a readable transactional table range.
+            transaction_ttable_read_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
+            // Acquires a writable transactional table range.
+            transaction_ttable_write_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
+            // Returns the visible transactional table size.
+            transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
+            // Stages a transactional table grow and returns the previous visible size.
+            transaction_ttable_grow(vmctx: vmctx, table: u32, delta: u64, init: pointer) -> pointer;
+            // Associates a newly allocated Wasmtime GC struct with a transactional object record.
+            transaction_tstruct_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer) -> bool;
+            // Associates a module-initializer Wasmtime GC struct with a committed transactional object record.
+            transaction_tstruct_static_new(vmctx: vmctx, gc_ref: u32, struct_type: u32, field_count: u32, fields: pointer, layout_fields: pointer) -> bool;
+            // Stages a transactional struct field write.
+            transaction_tstruct_set(vmctx: vmctx, gc_ref: u32, field: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Reads a transactional struct field as an ObjectValueAbi scratch pointer.
+            transaction_tstruct_get(vmctx: vmctx, gc_ref: u32, field: u32) -> pointer;
+            // Associates a newly allocated Wasmtime GC array with a transactional object record.
+            transaction_tarray_new(vmctx: vmctx, gc_ref: u32, array_type: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Associates a module-initializer Wasmtime GC array with a committed transactional object record.
+            transaction_tarray_static_new(vmctx: vmctx, gc_ref: u32, array_type: u32, element_size: u32, element_is_object_ref: u32, len: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Associates a newly allocated Wasmtime GC array with explicit transactional element records.
+            transaction_tarray_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_count: u32, elements: pointer) -> bool;
+            // Associates a module-initializer Wasmtime GC fixed array with committed transactional element records.
+            transaction_tarray_static_new_fixed(vmctx: vmctx, gc_ref: u32, array_type: u32, element_size: u32, element_is_object_ref: u32, element_count: u32, elements: pointer) -> bool;
+            // Associates a newly allocated Wasmtime GC numeric array initialized from data bytes.
+            transaction_tarray_new_data(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
+            // Associates a newly allocated Wasmtime GC reference array initialized from an element segment.
+            transaction_tarray_new_elem(vmctx: vmctx, gc_ref: u32, array_type: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
+            // Stages a transactional array element write.
+            transaction_tarray_set(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64) -> bool;
+            // Stages a transactional array range fill.
+            transaction_tarray_fill(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64, len: u32) -> bool;
+            // Stages a transactional array range copy.
+            transaction_tarray_copy(vmctx: vmctx, dst_gc_ref: u32, dst_index: u32, src_gc_ref: u32, src_index: u32, len: u32) -> bool;
+            // Stages a transactional array range initialized from data bytes.
+            transaction_tarray_init_data(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
+            // Stages a transactional array range initialized from an element segment.
+            transaction_tarray_init_elem(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
+            // Reads a transactional array element as an ObjectValueAbi scratch pointer.
+            transaction_tarray_get(vmctx: vmctx, gc_ref: u32, index: u32) -> pointer;
+            // Reads a transactional array length as an ObjectValueAbi scratch pointer.
+            transaction_tarray_len(vmctx: vmctx, gc_ref: u32) -> pointer;
         }
     };
 }

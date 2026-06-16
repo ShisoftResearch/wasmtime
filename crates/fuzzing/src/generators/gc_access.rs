@@ -6,7 +6,8 @@ use std::borrow::Cow;
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ElementSection, Elements, Encode, EntityType, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    Instruction, Module, RefType, StartSection, TableSection, TableType, TypeSection, ValType,
+    Instruction, Module, RefType, StartSection, TableSection, TableType, TransactionRefPermission,
+    TypeSection, ValType,
 };
 
 /// The storage type for a GC object's field or element.
@@ -323,6 +324,7 @@ impl<'a> Emitter<'a> {
         ValType::Ref(RefType {
             nullable: true,
             heap_type: wasm_encoder::HeapType::Concrete(self.obj_type.unwrap()),
+            transaction_permission: TransactionRefPermission::None,
         })
     }
 
@@ -330,6 +332,7 @@ impl<'a> Emitter<'a> {
         ValType::Ref(RefType {
             nullable: false,
             heap_type: wasm_encoder::HeapType::Concrete(self.obj_type.unwrap()),
+            transaction_permission: TransactionRefPermission::None,
         })
     }
 
@@ -411,6 +414,7 @@ impl<'a> Emitter<'a> {
                             element_type: wasm_encoder::StorageType::Val(ValType::Ref(RefType {
                                 nullable: true,
                                 heap_type: wasm_encoder::HeapType::Concrete(fi),
+                                transaction_permission: TransactionRefPermission::None,
                             })),
                             mutable: true,
                         }]),
@@ -503,6 +507,7 @@ impl<'a> Emitter<'a> {
                 element_type: RefType {
                     nullable: false,
                     heap_type: wasm_encoder::HeapType::Concrete(self.obj_type.unwrap()),
+                    transaction_permission: TransactionRefPermission::None,
                 },
                 minimum: 1,
                 maximum: Some(1),
@@ -540,6 +545,7 @@ impl<'a> Emitter<'a> {
                         val_type: ValType::Ref(RefType {
                             nullable: true,
                             heap_type: wasm_encoder::HeapType::Concrete(fi),
+                            transaction_permission: TransactionRefPermission::None,
                         }),
                         mutable: true,
                         shared: false,
@@ -555,6 +561,7 @@ impl<'a> Emitter<'a> {
                         val_type: ValType::Ref(RefType {
                             nullable: true,
                             heap_type: wasm_encoder::HeapType::Concrete(fi),
+                            transaction_permission: TransactionRefPermission::None,
                         }),
                         mutable: true,
                         shared: false,

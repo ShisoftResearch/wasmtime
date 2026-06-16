@@ -137,6 +137,7 @@ fn declare_wasm_parameters(
             let local = builder.declare_var(param_type.value_type);
             debug_assert_eq!(local.index(), next_local);
             next_local += 1;
+            environ.record_local_type(local, param_type.value_type);
 
             if environ.param_needs_stack_map(&builder.func.signature, i) {
                 builder.declare_var_needs_stack_map(local);
@@ -237,6 +238,7 @@ fn declare_locals(
     for _ in 0..count {
         let local = builder.declare_var(ty);
         debug_assert_eq!(local.index(), *next_local);
+        environ.record_local_type(local, ty);
         if needs_stack_map {
             builder.declare_var_needs_stack_map(local);
         }

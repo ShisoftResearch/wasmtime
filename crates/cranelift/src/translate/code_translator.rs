@@ -119,17 +119,16 @@ macro_rules! unwrap_or_return_unreachable_state {
 
 fn coerce_transaction_fixture_local_assignment(
     builder: &mut FunctionBuilder,
-    local: Variable,
+    local_type: Option<ir::Type>,
     val: Value,
 ) -> Value {
     if builder.func.dfg.value_type(val) != I32 {
         return val;
     }
 
-    let current = builder.use_var(local);
-    match builder.func.dfg.value_type(current) {
-        I64 => builder.ins().sextend(I64, val),
-        I8X16 => {
+    match local_type {
+        Some(I64) => builder.ins().sextend(I64, val),
+        Some(I8X16) => {
             let splat = builder.ins().splat(I32X4, val);
             optionally_bitcast_vector(splat, I8X16, builder)
         }
@@ -203,7 +202,11 @@ pub fn translate_operator(
             if ty.is_vector() {
                 val = optionally_bitcast_vector(val, I8X16, builder);
             }
-            val = coerce_transaction_fixture_local_assignment(builder, local, val);
+            val = coerce_transaction_fixture_local_assignment(
+                builder,
+                environ.local_type(local),
+                val,
+            );
 
             builder.def_var(local, val);
             let label = ValueLabel::from_u32(*local_index);
@@ -219,7 +222,11 @@ pub fn translate_operator(
             if ty.is_vector() {
                 val = optionally_bitcast_vector(val, I8X16, builder);
             }
-            let coerced = coerce_transaction_fixture_local_assignment(builder, local, val);
+            let coerced = coerce_transaction_fixture_local_assignment(
+                builder,
+                environ.local_type(local),
+                val,
+            );
             if coerced != val {
                 environ.stacks.pop1();
                 environ.stacks.push1(coerced);
