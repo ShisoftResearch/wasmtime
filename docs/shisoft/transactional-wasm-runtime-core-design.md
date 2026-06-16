@@ -1,7 +1,7 @@
 # Transactional Wasm Runtime Core Design
 
 Date: 2026-06-04
-Last updated: 2026-06-15
+Last updated: 2026-06-16
 
 ## Feature Switch Policy
 
@@ -1088,12 +1088,26 @@ semantics.
 
 ## Runtime Permissions
 
-Wizard permissions follow the meeting model: they are type-state on
-transactional reference types, not fields on reference values, objects, or all
-granules. A `tref` starts with permission `none`. Object operations require
-permissioned `tref` types: reads require `read` or `write`, and writes require
-`write`. Validation rejects object accesses whose operand type does not carry
-the required permission.
+`wasmparser::RefType.transaction_permission` is currently a temporary
+parser/validator/lowering carrier. It threads transaction permission metadata
+through the existing reference-type plumbing, but it is not runtime object
+state and it is not stored on live references or persistent object payloads.
+Ordinary built-in refs, ordinary concrete refs, and other non-transactional
+reference forms remain ordinary `RefType`s with
+`TransactionRefPermission::None`.
+
+Runtime permission enforcement lives in `TransactionState` over `GranuleId`.
+For persistent object references, the runtime permission boundary maps the live
+reference to `GranuleId::Object(ObjectId)` before acquiring read or write
+state. That transaction-state entry is the source of truth for ownership,
+version validation, commit, and abort behavior. The temporary `RefType`
+permission bits only describe validated type-state while the parser, validator,
+and lowering stack still share the existing reference-type interfaces.
+
+A `tref` starts with permission `none`. Object operations require permissioned
+`tref` types: reads require `read` or `write`, and writes require `write`.
+Validation rejects object accesses whose operand type does not carry the
+required permission.
 
 `tref.cast_read` and `tref.cast_write` are the dynamic acquisition boundary.
 The cast does not change the reference identity. It performs the transaction
@@ -1130,6 +1144,13 @@ not part of the current spec or implementation.
 
 Runtime permissions are transaction-scoped. Commit, abort, trap, and `tfail`
 discard the transaction-local access records and release write ownership.
+
+Future cleanup should move this metadata onto a dedicated `TRefType` or
+equivalent transaction-only type boundary. That split remains deferred until
+three prerequisites are stable together: the final live `ObjectId`-carrying
+ABI, restart-stable durable `tfuncref`/`texternref` identity, and complete
+transaction WAST and fuzz coverage across parser, validator, lowering, and
+runtime.
 
 ## LockBased Concurrency
 
@@ -1296,6 +1317,14 @@ unchanged.
 
 SIMD arithmetic uses ordinary Wasmtime SIMD lowering inside `tfunc`. SIMD
 transactional memory operators route through the transaction memory access path.
+
+### Temporary Transaction Reference Carrier
+
+The runtime-permission section defines the temporary
+`wasmparser::RefType.transaction_permission` boundary. Parser, validation, and
+lowering code may use those bits only as type-state metadata while threading
+proposal permissions through existing interfaces. They must not treat the bits
+as runtime object state or as evidence that runtime permission was acquired.
 
 ## Mock Removal Strategy
 

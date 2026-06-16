@@ -293,18 +293,30 @@ cargo test -p wasmtime transaction:: --lib
 **Purpose:** Keep the temporary `RefType.transaction_permission` carrier honest
 without expanding the type-system rewrite before the object ABI is stable.
 
-- [ ] Update design docs to state that `RefType.transaction_permission` is a
+- [x] Update design docs to state that `RefType.transaction_permission` is a
       temporary parser/validator/lowering carrier, not runtime object state.
-- [ ] Add a future `TRefType` migration note with prerequisites:
-      final object ABI, stable durable ref identities, and complete WAST/fuzz
-      coverage.
-- [ ] Add regression checks that ordinary volatile refs have no transaction
-      permission metadata.
-- [ ] Avoid implementing the `TRefType` split in this roadmap.
+      Runtime permissions remain in `TransactionState` keyed by `GranuleId`,
+      with persistent object access using `GranuleId::Object(ObjectId)`.
+- [x] Add a future `TRefType` migration note with prerequisites: final
+      `ObjectId` live ABI, restart-stable durable function/external reference
+      identity, and complete transaction WAST/fuzz coverage across parser,
+      validator, lowering, and runtime.
+- [x] Add regression checks that ordinary built-in and concrete refs keep
+      `TransactionRefPermission::None` through constructors and real byte
+      decoding, that permission subtyping stays `Write >= Read >= None`, and
+      that permission roundtrips do not change ref identity.
+- [x] Avoid implementing the `TRefType` split in this roadmap.
 
 **Verification:**
 
 ```sh
+cd /home/shisoft/Code/Research/wasm-tools-transaction
+cargo fmt --check
+cargo test -p wasmparser ordinary_ref_types_have_no_transaction_permission --lib
+cargo test -p wasmparser transaction_permission_subtyping_is_write_read_none --lib
+cargo test -p wasmparser transaction_permission_round_trips_without_changing_ref_identity --lib
+cargo check -p wasmparser --lib
+cd /home/shisoft/Code/Research/wasmtime
 rg "transaction_permission|TRefType" crates docs
 cargo check -p wasmtime-fuzzing --lib
 ```

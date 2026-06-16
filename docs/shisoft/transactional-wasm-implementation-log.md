@@ -36,6 +36,23 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-16 Wave 7 Type-System Cleanup Boundary
+
+- Added wasmparser regressions that pin constructed and byte-decoded ordinary
+  volatile refs to `TransactionRefPermission::None`.
+- Added permission-ordering coverage for the temporary carrier: `write` can
+  satisfy `read` and `none`, `read` can satisfy `none`, and weaker permissions
+  do not satisfy stronger permissions.
+- Added carrier round-trip coverage proving `with_transaction_permission`
+  changes only parser/validator/lowering type-state and preserves reference
+  nullability and heap type identity.
+- Documented that runtime permissions live in `TransactionState` and
+  lock/version state keyed by `GranuleId`; persistent object access first maps
+  to `GranuleId::Object(ObjectId)`.
+- Kept the full `TRefType` split deferred until the final live `ObjectId` ABI,
+  restart-stable function/external reference identities, and complete
+  parser/validator/lowering/runtime coverage are stable.
+
 ## 2026-06-16 Wave 6 Object Permission Hardening
 
 - Added runtime regressions for object write ownership under the lock-based

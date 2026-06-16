@@ -667,64 +667,83 @@ git commit -m "Harden object transaction permissions"
 **Files:**
 
 - Modify: `docs/shisoft/transactional-wasm-runtime-core-design.md`
-- Modify: `docs/shisoft/transactional-wasm-remaining-work-roadmap.md`
+- Modify:
+  `docs/shisoft/2026-06-16-transactional-object-model-stabilization-roadmap.md`
+- Modify:
+  `docs/shisoft/2026-06-16-transactional-object-model-stabilization-implementation-plan.md`
+- Modify: `docs/shisoft/transactional-wasm-implementation-log.md`
+- Create:
+  `docs/shisoft/2026-06-16-wave7-type-system-cleanup-boundary-plan.md`
 - Modify: `/home/shisoft/Code/Research/wasm-tools-transaction/crates/wasmparser/src/readers/core/types.rs`
-- Modify: `/home/shisoft/Code/Research/wasm-tools-transaction/crates/wasmparser/src/validator/types.rs`
 
 **Target invariant:** Current permission metadata in `RefType` is documented as
 temporary, and ordinary volatile refs stay permission-free.
 
-- [ ] **Step 7.1: Add or tighten wasmparser tests**
+- [x] **Step 7.1: Add or tighten wasmparser tests**
 
-In the wasm-tools transaction fork, add parser/validator tests proving ordinary
-volatile refs have no transaction permission metadata, while transactional refs
-carry permission only for validation/lowering.
+In the wasm-tools transaction fork, add parser tests proving constructed and
+byte-decoded ordinary built-in and concrete refs have no transaction permission
+metadata, permission subtyping stays `Write >= Read >= None`, and
+`with_transaction_permission` changes only the temporary permission carrier.
 
 Run:
 
 ```sh
 cd /home/shisoft/Code/Research/wasm-tools-transaction
-cargo test -p wasmparser transaction_permission_ref_type --lib
+cargo test -p wasmparser ordinary_ref_types_have_no_transaction_permission --lib
+cargo test -p wasmparser transaction_permission_subtyping_is_write_read_none --lib
+cargo test -p wasmparser transaction_permission_round_trips_without_changing_ref_identity --lib
 ```
 
-- [ ] **Step 7.2: Update design docs**
+- [x] **Step 7.2: Update design docs**
 
 Add a section explaining:
 
-- runtime permissions live on transaction state and `GranuleId`
-- `RefType.transaction_permission` is a temporary carrier
+- runtime permissions live on `TransactionState` and `GranuleId`
+- persistent object runtime access maps live refs to
+  `GranuleId::Object(ObjectId)` before acquiring permissions
+- `RefType.transaction_permission` is a temporary parser/validator/lowering
+  carrier, not runtime object state
+- ordinary volatile refs remain ordinary `RefType`s with
+  `TransactionRefPermission::None`
 - a future `TRefType` split can remove permission from ordinary `RefType`
-- prerequisites for `TRefType`: final `ObjectId` live ABI, durable ref
-  identities, and complete WAST/fuzz coverage
+- prerequisites for `TRefType`: final `ObjectId` live ABI, restart-stable
+  durable function/external reference identity, and complete WAST/fuzz
+  coverage across parser, validator, lowering, and runtime
 
-- [ ] **Step 7.3: Verify**
+- [x] **Step 7.3: Verify**
 
 Run:
 
 ```sh
 cd /home/shisoft/Code/Research/wasm-tools-transaction
 cargo fmt --check
+cargo test -p wasmparser ordinary_ref_types_have_no_transaction_permission --lib
+cargo test -p wasmparser transaction_permission_subtyping_is_write_read_none --lib
+cargo test -p wasmparser transaction_permission_round_trips_without_changing_ref_identity --lib
 cargo check -p wasmparser --lib
 cd /home/shisoft/Code/Research/wasmtime
+cargo fmt --check
+git diff --check
 cargo check -p wasmtime-fuzzing --lib
 ```
 
-- [ ] **Step 7.4: Commit**
+- [x] **Step 7.4: Commit**
 
 Commit the wasm-tools fork first, then this repository:
 
 ```sh
 cd /home/shisoft/Code/Research/wasm-tools-transaction
-git add crates/wasmparser/src/readers/core/types.rs \
-  crates/wasmparser/src/validator/types.rs
-git commit -m "Document transaction reference permission carrier"
+git add crates/wasmparser/src/readers/core/types.rs
+git commit -m "Pin transaction reference permission carrier"
 
 cd /home/shisoft/Code/Research/wasmtime
 git add docs/shisoft/transactional-wasm-runtime-core-design.md \
-  docs/shisoft/transactional-wasm-remaining-work-roadmap.md \
   docs/shisoft/transactional-wasm-implementation-log.md \
-  docs/shisoft/2026-06-16-transactional-object-model-stabilization-roadmap.md
-git commit -m "Document transaction reference type cleanup boundary"
+  docs/shisoft/2026-06-16-transactional-object-model-stabilization-roadmap.md \
+  docs/shisoft/2026-06-16-transactional-object-model-stabilization-implementation-plan.md \
+  docs/shisoft/2026-06-16-wave7-type-system-cleanup-boundary-plan.md
+git commit -m "Document transaction reference type boundary"
 ```
 
 ---
