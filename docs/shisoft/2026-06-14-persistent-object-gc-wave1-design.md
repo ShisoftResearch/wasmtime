@@ -4,33 +4,53 @@ Date: 2026-06-14
 
 ## Implementation Status
 
-Implemented on 2026-06-14 in
+Initial mark-only support was implemented on 2026-06-14 in
 `crates/wasmtime/src/runtime/transaction.rs` as `PersistentObjectMarker`.
+The 2026-06-16 follow-up extends that proof point into the first non-moving,
+tombstone-less mark-sweep persistent GC baseline.
 
-The implementation follows the mark-only scope below:
+The implementation now includes:
 
 - explicit `ObjectId` roots only
 - `ObjectTable` plus layout-guided tracing as the graph source
 - reachable, unreachable, dangling-ref, and invalid-root report sets
-- active transaction rejection through the transaction thread-local state
-- no mutation of the object table or durable storage
+- destructive sweep rejection when the mark graph has invalid roots or
+  dangling persistent references
+- active, current-thread, and suspended transaction rejection for runtime GC
+  entry points
+- stop-the-world runtime collection from committed persistent roots
+- explicit maintenance stepping for read-heavy workloads
+- finish-and-sweep for cached commit-coupled mark cycles
+- volatile `ObjectTable` sweep for unreachable persistent objects
+- recovery-time reachable-only object-table rebuild
+- file-backed coverage for whole-dead object-data chunk retirement and reuse
+  by block generation
+- no durable mark bits, tombstones, object movement, line-level reuse, or
+  `ObjectId` reuse
 
 Focused implementation tests use:
 
 ```bash
 cargo test -p wasmtime --lib persistent_object_marker -- --format terse
+cargo test -p wasmtime --lib persistent_mark_sweep -- --format terse
+cargo test -p wasmtime --lib persistent_gc_maintenance_step -- --format terse
+cargo test -p wasmtime --lib persistent_gc_finish_cycle -- --format terse
+cargo test -p wasmtime --lib file_backed_persistent_gc_ -- --format terse
 ```
 
 ## Goal
 
-Add the first persistent-object GC proof point without touching durable
-reclamation. The first collector is a logical `ObjectId` graph marker: it proves
-that recovered roots, volatile object-table rebuild, persistent type-layout
-metadata, and layout-guided object tracing work together.
+Add the first persistent-object GC proof point and grow it into a conservative
+runtime collector. The first collector is a logical `ObjectId` graph marker plus
+volatile sweep: it proves that recovered roots, volatile object-table rebuild,
+persistent type-layout metadata, layout-guided object tracing, and whole-dead
+chunk retirement work together.
 
 This is intentionally not a full storage collector. It does not compact, move,
-delete, tombstone, recycle blocks, update line marks, or persist free-list
-metadata.
+delete, tombstone, reuse `ObjectId`s, update Immix line marks, or persist
+free-list metadata. Whole-dead object-data chunks may be retired and reused via
+block generations; mixed live/dead chunks still require a future copying
+cleaner.
 
 ## Context
 
@@ -176,6 +196,14 @@ Rationale:
 - abort may remove staged references
 - promotion maps are not persistent roots yet
 - write ownership and optimistic reads should not be mixed with graph marking
+
+The persistence rule is reachability through committed durable state. Objects
+created inside a transaction remain transaction-local until commit publishes
+them into a durable root or into a reachable persistent object payload. If the
+transaction aborts, those objects are discarded rather than collected. If an
+older committed object becomes unreachable after later commits, it remains
+durable garbage until a later persistent-GC sweep or recovery-time filtering
+removes it from the live runtime view.
 
 Later collectors can treat active transaction read sets, write sets, staged
 payloads, and promotion maps as temporary roots, but that is explicitly out of

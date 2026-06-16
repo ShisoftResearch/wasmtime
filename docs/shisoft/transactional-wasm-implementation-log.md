@@ -36,6 +36,30 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-16: First Mark-Sweep Persistent GC
+
+- Added a stop-the-world persistent mark-sweep API over committed `ObjectId`
+  roots. The runtime entry point rejects active, current-thread, and suspended
+  transaction workspaces before marking or sweeping.
+- Added `PersistentMarkSweepReport` and centralized sweep validation. Volatile
+  sweep refuses to run when the mark graph has invalid persistent roots or
+  dangling persistent references.
+- Added an explicit maintenance-step API for read-heavy workloads and a
+  finish-and-sweep API that drains cached commit-coupled marker state before
+  applying volatile sweep.
+- Runtime sweep removes unreachable persistent objects from volatile object
+  table indices only. It does not append tombstones, mutate durable object data,
+  move records, or reuse `ObjectId`s.
+- Added file-backed coverage for tombstone-less recovery filtering,
+  whole-dead object-data chunk retirement, generation-based chunk reuse, and
+  mixed live/dead chunk non-retirement.
+- Added reachability semantics coverage: aborted volatile transaction-local
+  reachability does not keep persistent objects live, while committed root
+  removal makes a persistent object collectable.
+- Deferred moving collection, mixed-block copying cleanup, Immix/LXR,
+  line-level reuse, object-id reuse, background collection, and durable
+  collection checkpoints.
+
 ## 2026-06-16 Pre-GC Object Model Freeze
 
 - Split durable persistent object reference encoding from live transaction
@@ -1161,8 +1185,8 @@ storage contains committed object records, roots, type/layout metadata, and
 scan-critical region metadata. Recovery selects live object-data winners, marks
 from persistent roots, rebuilds the volatile object table only for reachable
 objects, and reconstructs auxiliary allocator state. Durable block reuse
-remains deferred until block-generation or checkpoint retirement metadata
-exists.
+now uses the current coarse block-generation scheme for whole-dead object-data
+chunks only.
 
 Implemented status:
 
@@ -1186,10 +1210,15 @@ Implemented status:
   durable record locations.
 - Runtime volatile sweep/reporting for persistent objects is implemented.
 - File-backed end-to-end coverage exercises the tombstone-less recovery path.
+- Stop-the-world runtime mark-sweep, explicit maintenance stepping, and
+  finish-and-sweep are implemented for the non-moving baseline.
+- File-backed coverage verifies whole-dead object-data chunk retirement and
+  generation-based reuse, while mixed live/dead chunks remain active.
 
 Still deferred:
 
-- durable block/chunk retirement, durable block reuse, and Immix line reuse
+- mixed-block copying cleanup, durable compaction checkpoints, and Immix line
+  reuse
 - explicit `ObjectId` reuse
 - commit-time promotion for arbitrary ordinary Wasmtime GC heap graphs beyond
   the transaction-mirrored object graphs implemented in Wave 11

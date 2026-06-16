@@ -1050,17 +1050,25 @@ Implemented status:
   `ObjectId` edges from newly published object payloads.
 - `PersistentGcState::observe_commit_delta` performs bounded post-commit
   marking minibatches.
+- The runtime exposes an explicit maintenance-step API for read-heavy
+  workloads that otherwise would not advance commit-coupled marking.
+- A finish-and-sweep API drains a cached mark cycle and applies volatile sweep
+  after validating the final mark report.
+- Stop-the-world runtime GC entry points reject active, current-thread, and
+  suspended transaction workspaces.
 - New root publications enqueue their root `ObjectId`s directly.
 - When a committed edge `A -> B` is published and `A` is already reachable in
   the current cycle, the commit delta enqueues `B`; otherwise `B` is observed
   when `A` is later scanned.
 - Coverage exists for root enqueue, marked-owner child enqueue, and
-  unmarked-owner no-op cases.
+  unmarked-owner no-op cases, plus explicit maintenance and finish-and-sweep
+  cases.
 
 Still deferred around 9B:
 
-- an explicit maintenance-step API for read-heavy workloads
-- any reclamation path that depends on durable block/chunk retirement metadata
+- background/asynchronous GC scheduling
+- edge-count or payload-byte budgets instead of scanned-object count
+- low-latency integration with future moving/copying cleanup
 
 ## Wave 9C: Tombstone-Less Recovery-Time Persistent GC
 
@@ -1076,8 +1084,15 @@ storage contains committed object records, roots, type/layout metadata, and
 scan-critical region metadata. Recovery selects live object-data winners, marks
 from persistent roots, rebuilds the volatile object table only for reachable
 objects, and reconstructs auxiliary allocator state. Durable block reuse
-remains deferred until block-generation or checkpoint retirement metadata
-exists.
+uses the current coarse block-generation scheme for whole-dead chunks only.
+
+The GC rule is persistence through reachability. Objects produced inside a
+transaction are not persistent just because storage was reserved for them; they
+become persistent only when commit publishes them into the durable root/object
+graph. Aborted transaction-local objects are discarded with the workspace.
+Previously committed objects that are later no longer reachable are persistent
+garbage and are removed from the live runtime view by recovery-time filtering
+or a later sweep/reclamation pass.
 
 Implemented status:
 
@@ -1095,13 +1110,18 @@ Implemented status:
   without persisting dead-object state.
 - File-backed end-to-end coverage exercises tombstone-less recovery and the
   reachable-only rebuild path.
+- File-backed coverage now verifies whole-dead object-data chunk retirement and
+  generation-based reuse, and verifies mixed live/dead chunks are not retired.
+- Commit-time reachability coverage verifies that aborted volatile reachability
+  does not keep persistent objects live and that committed root removal makes a
+  persistent object collectable.
 
 Deferred scope:
 
-- durable block/chunk retirement and Immix line reuse
+- mixed-block copying cleanup and Immix line reuse
 - compacting/copying live records into new persistent blocks
 - block-generation or checkpoint metadata that allows recovery to ignore
-  retired blocks
+  retired mixed blocks after copying cleanup
 - persistent allocator undo/redo repair for future block ownership transitions
 - explicit `ObjectId` reuse
 - commit-time promotion from volatile `VMGcRef` graphs into persistent object

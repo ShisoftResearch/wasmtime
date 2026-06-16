@@ -20,14 +20,16 @@ mod persist;
 mod promotion;
 #[path = "transaction/type_layout.rs"]
 pub(crate) mod type_layout;
+#[cfg(test)]
+use object_gc::PersistentObjectEdge;
 pub(crate) use object_gc::{
     DanglingObjectRef, DanglingObjectRefKind, PersistentGcBudget, PersistentGcCommitDelta,
-    PersistentGcState, PersistentGcStepReport, PersistentRecoveredRecordLocation,
-    PersistentRecoveryGcReport, PersistentRootError, PersistentRootErrorKind,
+    PersistentGcState, PersistentGcStepReport, PersistentObjectMarker,
+    PersistentRecoveredRecordLocation, PersistentRecoveryGcReport, PersistentRootError,
+    PersistentRootErrorKind,
 };
-#[cfg(test)]
-use object_gc::{PersistentObjectEdge, PersistentObjectMarker};
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
+pub(crate) type PersistentMarkSweepReport = object_gc::PersistentMarkSweepReport;
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
 #[cfg(feature = "gc")]
 pub(crate) use durable_ref::DurableExternRefHostData;
@@ -2765,6 +2767,7 @@ impl ObjectTable {
         &mut self,
         mark: &PersistentObjectMarkReport,
     ) -> Result<PersistentVolatileSweepReport> {
+        mark.ensure_sweepable()?;
         let mut report = PersistentVolatileSweepReport::default();
         for object_id in self.persistent_object_ids()? {
             if mark.reachable.contains(&object_id) {
@@ -2776,6 +2779,29 @@ impl ObjectTable {
         }
         self.rebuild_free_list_holes()?;
         Ok(report)
+    }
+
+    pub(crate) fn persistent_mark_sweep_from_roots<I>(
+        &mut self,
+        roots: I,
+    ) -> Result<PersistentMarkSweepReport>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        let mark = PersistentObjectMarker::mark(self, roots)?;
+        let sweep = self.apply_volatile_persistent_sweep(&mark)?;
+        Ok(PersistentMarkSweepReport { mark, sweep })
+    }
+
+    #[cfg(test)]
+    fn persistent_mark_sweep_from_roots_for_test<I>(
+        &mut self,
+        roots: I,
+    ) -> Result<PersistentMarkSweepReport>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        self.persistent_mark_sweep_from_roots(roots)
     }
 }
 
@@ -5140,6 +5166,71 @@ impl TransactionState {
             .collect()
     }
 
+    pub(crate) fn persistent_mark_sweep_collect(
+        &mut self,
+        objects: &mut ObjectTable,
+    ) -> Result<PersistentMarkSweepReport> {
+        ensure!(
+            self.active.is_none()
+                && self.suspended.is_empty()
+                && current_thread_transaction().is_none(),
+            "persistent object marker cannot run while a transaction is active or suspended"
+        );
+        let roots = self.persistent_root_ids();
+        let report = objects.persistent_mark_sweep_from_roots(roots)?;
+        self.persistent_gc_state = None;
+        Ok(report)
+    }
+
+    pub(crate) fn persistent_gc_maintenance_step(
+        &mut self,
+        object_table: &ObjectTable,
+        budget: PersistentGcBudget,
+    ) -> Result<PersistentGcStepReport> {
+        ensure!(
+            self.active.is_none()
+                && self.suspended.is_empty()
+                && current_thread_transaction().is_none(),
+            "persistent object marker cannot run while a transaction is active or suspended"
+        );
+        let roots = if self.persistent_gc_state.is_none() {
+            Some(self.persistent_root_ids())
+        } else {
+            None
+        };
+        let state = match self.persistent_gc_state.as_mut() {
+            Some(state) => state,
+            None => self.persistent_gc_state.insert(PersistentGcState::new(
+                object_table,
+                roots.unwrap_or_default(),
+            )?),
+        };
+        state.mark_step(object_table, budget)
+    }
+
+    pub(crate) fn finish_persistent_gc_cycle_and_sweep(
+        &mut self,
+        objects: &mut ObjectTable,
+    ) -> Result<Option<PersistentMarkSweepReport>> {
+        ensure!(
+            self.active.is_none()
+                && self.suspended.is_empty()
+                && current_thread_transaction().is_none(),
+            "persistent object marker cannot run while a transaction is active or suspended"
+        );
+        let Some(mut state) = self.persistent_gc_state.take() else {
+            return Ok(None);
+        };
+        while !state.is_complete() {
+            let pending = state.pending_object_count();
+            state.mark_step(objects, PersistentGcBudget::objects(pending.max(1)))?;
+        }
+        let mark = state.into_report(objects)?;
+        mark.ensure_sweepable()?;
+        let sweep = objects.apply_volatile_persistent_sweep(&mark)?;
+        Ok(Some(PersistentMarkSweepReport { mark, sweep }))
+    }
+
     pub(crate) fn install_recovered_persistent_roots<I>(&mut self, roots: I) -> Result<()>
     where
         I: IntoIterator<Item = ObjectId>,
@@ -5764,6 +5855,28 @@ impl TransactionState {
 
     fn persistent_root_ids_for_test(&self) -> BTreeSet<ObjectId> {
         self.persistent_root_ids()
+    }
+
+    fn persistent_mark_sweep_collect_for_test(
+        &mut self,
+        objects: &mut ObjectTable,
+    ) -> Result<PersistentMarkSweepReport> {
+        self.persistent_mark_sweep_collect(objects)
+    }
+
+    fn persistent_gc_maintenance_step_for_test(
+        &mut self,
+        object_table: &ObjectTable,
+        budget: PersistentGcBudget,
+    ) -> Result<PersistentGcStepReport> {
+        self.persistent_gc_maintenance_step(object_table, budget)
+    }
+
+    fn finish_persistent_gc_cycle_and_sweep_for_test(
+        &mut self,
+        objects: &mut ObjectTable,
+    ) -> Result<Option<PersistentMarkSweepReport>> {
+        self.finish_persistent_gc_cycle_and_sweep(objects)
     }
 
     fn promote_transaction_object_graph_for_test(
@@ -11274,6 +11387,265 @@ mod tests {
         }
 
         #[test]
+        fn file_backed_persistent_gc_recovery_filters_root_replaced_object() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("persistent-gc-root-replaced.bin");
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(0x812),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let object_a = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8120,
+                    812,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+
+            state.acquire_object_write(&mut objects, object_a).unwrap();
+            state
+                .stage_struct_field(&objects, object_a, 0, ObjectValue::I32(11))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x8120))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(812, 812, &mut objects, &mut state)
+                .unwrap();
+
+            let second_tx = state.begin().unwrap();
+            let object_b = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8121,
+                    813,
+                    2,
+                    vec![ObjectValue::I32(2)],
+                )
+                .unwrap();
+            state.acquire_object_write(&mut objects, object_b).unwrap();
+            state
+                .stage_struct_field(&objects, object_b, 0, ObjectValue::I32(22))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x8121))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(
+                u32::try_from(second_tx.as_raw()).unwrap(),
+                u32::try_from(second_tx.as_raw()).unwrap(),
+                &mut objects,
+                &mut state,
+            )
+            .unwrap();
+            drop(state);
+
+            let (recovered, object_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            assert_eq!(recovered.root_object_ids, vec![object_b.object_index]);
+            assert!(
+                object_winners
+                    .iter()
+                    .any(|winner| winner.object_id == object_a.object_index)
+            );
+            assert!(
+                object_winners
+                    .iter()
+                    .any(|winner| winner.object_id == object_b.object_index)
+            );
+
+            let mut rebuilt = ObjectTable::default();
+            let report = rebuilt
+                .rebuild_reachable_from_recovery_for_test(
+                    &recovered.type_layouts,
+                    &object_winners,
+                    &recovered.root_object_ids,
+                )
+                .unwrap();
+
+            assert_eq!(report.mark.reachable, object_set([object_b]));
+            assert_eq!(report.mark.unreachable_persistent, object_set([object_a]));
+            assert!(rebuilt.payload(object_a).is_err());
+            assert!(rebuilt.payload(object_b).is_ok());
+        }
+
+        #[test]
+        fn file_backed_persistent_gc_retires_whole_dead_object_chunk() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("persistent-gc-retire-whole-dead.bin");
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(0x813),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let object_a = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8130,
+                    813,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+
+            state.acquire_object_write(&mut objects, object_a).unwrap();
+            state
+                .stage_struct_field(&objects, object_a, 0, ObjectValue::I32(11))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x8130))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(813, 813, &mut objects, &mut state)
+                .unwrap();
+
+            let second_tx = state.begin().unwrap();
+            let object_b = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8131,
+                    814,
+                    2,
+                    vec![ObjectValue::I32(2)],
+                )
+                .unwrap();
+            state.acquire_object_write(&mut objects, object_b).unwrap();
+            state
+                .stage_struct_field(&objects, object_b, 0, ObjectValue::I32(22))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x8131))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(
+                u32::try_from(second_tx.as_raw()).unwrap(),
+                u32::try_from(second_tx.as_raw()).unwrap(),
+                &mut objects,
+                &mut state,
+            )
+            .unwrap();
+            drop(state);
+
+            let (recovered, object_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let object_a_winner =
+                recovered_object_winner_by_id_for_test(&object_winners, object_a).clone();
+            let (retired_chunk_start, retired_generation) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, &object_a_winner).unwrap();
+
+            let mut rebuilt = ObjectTable::default();
+            let report = rebuilt
+                .rebuild_reachable_from_recovery_for_test(
+                    &recovered.type_layouts,
+                    &object_winners,
+                    &recovered.root_object_ids,
+                )
+                .unwrap();
+            assert_eq!(report.mark.reachable, object_set([object_b]));
+            assert_eq!(report.mark.unreachable_persistent, object_set([object_a]));
+
+            let retired =
+                retire_unreachable_object_chunks_for_test(&tx_log_path, &[object_a.object_index])
+                    .unwrap();
+            assert_eq!(retired, vec![retired_chunk_start]);
+
+            let object_c = ObjectId { object_index: 91 };
+            crate::runtime::vm::block_region::publish_committed_struct_object(
+                &tx_log_path,
+                91,
+                object_c.object_index,
+                1,
+                12,
+                &[3, 4],
+            )
+            .unwrap();
+
+            let (_, republished_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            assert!(
+                republished_winners
+                    .iter()
+                    .all(|winner| winner.object_id != object_a.object_index)
+            );
+            let object_c_winner =
+                recovered_object_winner_by_id_for_test(&republished_winners, object_c);
+            let (reused_chunk_start, reused_generation) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, object_c_winner).unwrap();
+
+            assert_eq!(reused_chunk_start, retired_chunk_start);
+            assert_eq!(reused_generation, retired_generation + 1);
+        }
+
+        #[test]
+        fn file_backed_persistent_gc_keeps_mixed_live_dead_object_chunk() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("persistent-gc-mixed-chunk.bin");
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(0x814),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let live = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8140,
+                    814,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+            let dead = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x8141,
+                    814,
+                    2,
+                    vec![ObjectValue::I32(2)],
+                )
+                .unwrap();
+
+            state.acquire_object_write(&mut objects, live).unwrap();
+            state
+                .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+                .unwrap();
+            state.acquire_object_write(&mut objects, dead).unwrap();
+            state
+                .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x8140))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(814, 814, &mut objects, &mut state)
+                .unwrap();
+            drop(state);
+
+            let (recovered, object_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let live_winner = recovered_object_winner_by_id_for_test(&object_winners, live);
+            let dead_winner = recovered_object_winner_by_id_for_test(&object_winners, dead);
+            let (live_chunk_start, _) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, live_winner).unwrap();
+            let (dead_chunk_start, _) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, dead_winner).unwrap();
+            assert_eq!(live_chunk_start, dead_chunk_start);
+
+            let mut rebuilt = ObjectTable::default();
+            let report = rebuilt
+                .rebuild_reachable_from_recovery_for_test(
+                    &recovered.type_layouts,
+                    &object_winners,
+                    &recovered.root_object_ids,
+                )
+                .unwrap();
+            assert_eq!(report.mark.reachable, object_set([live]));
+            assert_eq!(report.mark.unreachable_persistent, object_set([dead]));
+
+            let retired =
+                retire_unreachable_object_chunks_for_test(&tx_log_path, &[dead.object_index])
+                    .unwrap();
+            assert!(retired.is_empty());
+        }
+
+        #[test]
         fn pre_gc_object_recovery_closure_file_backed_root_replacement_and_table_roots() {
             let dir = tempfile::tempdir().unwrap();
             let tx_log_path = dir.path().join("pre-gc-root-closure.bin");
@@ -14931,6 +15303,40 @@ mod tests {
         Ok((recovered_region, object_winners))
     }
 
+    fn recovered_object_winner_by_id_for_test<'a>(
+        winners: &'a [crate::runtime::vm::RecoveredObjectWinner],
+        object_id: ObjectId,
+    ) -> &'a crate::runtime::vm::RecoveredObjectWinner {
+        winners
+            .iter()
+            .find(|winner| winner.object_id == object_id.object_index)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing recovered object winner for object id {}; recovered object ids: {:?}",
+                    object_id.object_index,
+                    winners
+                        .iter()
+                        .map(|winner| winner.object_id)
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn file_backed_recovered_chunk_meta_for_test(
+        path: &std::path::Path,
+        winner: &crate::runtime::vm::RecoveredObjectWinner,
+    ) -> Result<(u32, u32)> {
+        let region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
+        let meta = region.block_meta(winner.data_block).with_context(|| {
+            format!(
+                "failed to read chunk metadata for recovered object {} at data block {}",
+                winner.object_id, winner.data_block
+            )
+        })?;
+        Ok((meta.chunk_start, meta.generation))
+    }
+
     fn commit_file_backed_publications_for_test<T, F>(
         txid: u32,
         prepare: F,
@@ -16764,6 +17170,162 @@ mod tests {
     }
 
     #[test]
+    fn transaction_state_persistent_mark_sweep_uses_committed_roots() {
+        let mut objects = ObjectTable::default();
+        let child = objects
+            .allocate_persistent_struct_for_gc_ref(0x660, vec![ObjectValue::I32(3)])
+            .unwrap();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x661, vec![ObjectValue::Ref(Some(child))])
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x662, vec![ObjectValue::I32(4)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(0x660));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x661)).unwrap();
+        let delta = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state
+            .apply_committed_persistent_root_delta_for_test(delta)
+            .unwrap();
+
+        let report = state
+            .persistent_mark_sweep_collect_for_test(&mut objects)
+            .unwrap();
+
+        assert_eq!(report.mark.reachable, object_set([root, child]));
+        assert_eq!(
+            report
+                .sweep
+                .retained_objects
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            object_set([root, child])
+        );
+        assert_eq!(report.sweep.removed_objects, vec![garbage]);
+        assert!(objects.live_slot(root).is_ok());
+        assert!(objects.live_slot(child).is_ok());
+        assert!(objects.live_slot(garbage).is_err());
+    }
+
+    #[test]
+    fn persistent_gc_does_not_consider_aborted_transaction_local_object_persistent() {
+        let mut objects = ObjectTable::default();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(0x680));
+        let persistent_child = objects
+            .allocate_persistent_struct_for_gc_ref(0x680, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let local = objects
+            .allocate_struct(vec![ObjectValue::Ref(Some(persistent_child))])
+            .unwrap();
+
+        state.abort().unwrap();
+
+        let report = objects
+            .persistent_mark_sweep_from_roots_for_test([])
+            .unwrap();
+        assert!(report.mark.reachable.is_empty());
+        assert_eq!(
+            report.mark.unreachable_persistent,
+            object_set([persistent_child])
+        );
+        assert_eq!(report.sweep.removed_objects, vec![persistent_child]);
+        assert!(objects.live_slot(persistent_child).is_err());
+        assert!(objects.live_slot(local).is_ok());
+    }
+
+    #[test]
+    fn persistent_gc_collects_committed_object_only_after_root_is_removed() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x681, vec![ObjectValue::I32(8)])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(0x681));
+        state.stage_global(0, GlobalSnapshot::GcRef(0x681)).unwrap();
+        let install = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state
+            .apply_committed_persistent_root_delta_for_test(install)
+            .unwrap();
+
+        let first = state
+            .persistent_mark_sweep_collect_for_test(&mut objects)
+            .unwrap();
+        assert_eq!(first.sweep.retained_objects, vec![root]);
+
+        state.begin().unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(0)).unwrap();
+        let removal = state
+            .staged_persistent_root_delta_for_test(&objects)
+            .unwrap();
+        state.complete_commit().unwrap();
+        state
+            .apply_committed_persistent_root_delta_for_test(removal)
+            .unwrap();
+
+        let second = state
+            .persistent_mark_sweep_collect_for_test(&mut objects)
+            .unwrap();
+        assert_eq!(second.sweep.removed_objects, vec![root]);
+        assert!(objects.live_slot(root).is_err());
+    }
+
+    #[test]
+    fn transaction_state_persistent_mark_sweep_rejects_active_transaction() {
+        let mut objects = ObjectTable::default();
+        objects
+            .allocate_persistent_struct_for_gc_ref(0x663, vec![ObjectValue::I32(5)])
+            .unwrap();
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(0x663));
+
+        let err = state
+            .persistent_mark_sweep_collect_for_test(&mut objects)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object marker cannot run while a transaction is active"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn transaction_state_persistent_mark_sweep_rejects_suspended_transaction() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let live = objects
+            .allocate_persistent_struct_for_gc_ref(0x664, vec![ObjectValue::I32(6)])
+            .unwrap();
+        let mut state = TransactionState::default();
+        let transaction = TransactionId::from_raw(0x664);
+
+        assert_eq!(state.enter_transaction(transaction).unwrap(), None);
+        state.restore_transaction(None).unwrap();
+        assert!(state.transaction_is_open(transaction));
+
+        let err = state
+            .persistent_mark_sweep_collect_for_test(&mut objects)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object marker cannot run while a transaction is active"),
+            "{err:?}"
+        );
+        assert!(objects.live_slot(live).is_ok());
+    }
+
+    #[test]
     fn persistent_root_recovery_installs_root_index_for_gc() {
         clear_current_thread_transaction_for_test();
         let mut state = TransactionState::default();
@@ -16824,6 +17386,123 @@ mod tests {
                 )
                 .unwrap(),
             PersistentGcStepReport::default()
+        );
+    }
+
+    #[test]
+    fn persistent_gc_maintenance_step_advances_read_heavy_cycle() {
+        let mut objects = ObjectTable::default();
+        let leaf = objects
+            .allocate_persistent_struct_for_gc_ref(0x670, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x671, vec![ObjectValue::Ref(Some(leaf))])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::default();
+        state.install_recovered_persistent_roots([root]).unwrap();
+
+        let first = state
+            .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+            .unwrap();
+        let second = state
+            .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+            .unwrap();
+
+        assert_eq!(
+            first,
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 1,
+            }
+        );
+        assert_eq!(
+            second,
+            PersistentGcStepReport {
+                scanned_objects: 1,
+                enqueued_objects: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn persistent_gc_finish_cycle_sweeps_unreachable_after_incremental_marking() {
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x672, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x673, vec![ObjectValue::I32(2)])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::default();
+        state.install_recovered_persistent_roots([root]).unwrap();
+
+        state
+            .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+            .unwrap();
+
+        let report = state
+            .finish_persistent_gc_cycle_and_sweep_for_test(&mut objects)
+            .unwrap()
+            .expect("maintenance cycle should exist");
+
+        assert_eq!(report.mark.reachable, object_set([root]));
+        assert_eq!(report.sweep.removed_objects, vec![garbage]);
+        assert!(objects.live_slot(garbage).is_err());
+    }
+
+    #[test]
+    fn persistent_gc_maintenance_step_rejects_suspended_transaction() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x674, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let mut state = TransactionState::default();
+        let transaction = TransactionId::from_raw(0x674);
+        state.install_recovered_persistent_roots([root]).unwrap();
+
+        assert_eq!(state.enter_transaction(transaction).unwrap(), None);
+        state.restore_transaction(None).unwrap();
+        assert!(state.transaction_is_open(transaction));
+
+        let err = state
+            .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "persistent object marker cannot run while a transaction is active or suspended"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_gc_finish_cycle_rejects_suspended_transaction() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x675, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let mut state = TransactionState::default();
+        let transaction = TransactionId::from_raw(0x675);
+        state.install_recovered_persistent_roots([root]).unwrap();
+
+        assert_eq!(state.enter_transaction(transaction).unwrap(), None);
+        state.restore_transaction(None).unwrap();
+        assert!(state.transaction_is_open(transaction));
+
+        let err = state
+            .finish_persistent_gc_cycle_and_sweep_for_test(&mut objects)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "persistent object marker cannot run while a transaction is active or suspended"
+            ),
+            "{err:?}"
         );
     }
 
@@ -17197,6 +17876,80 @@ mod tests {
             objects.payload(garbage).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(6)])
         );
+    }
+
+    #[test]
+    fn persistent_gc_volatile_sweep_rejects_invalid_mark_graph_directly() {
+        let mut objects = ObjectTable::default();
+        let live = objects
+            .allocate_persistent_struct_for_gc_ref(0x557, vec![ObjectValue::I32(7)])
+            .unwrap();
+        let mark = PersistentObjectMarkReport {
+            invalid_roots: vec![PersistentRootError {
+                root: ObjectId {
+                    object_index: 77_777,
+                },
+                kind: PersistentRootErrorKind::Missing,
+            }],
+            ..Default::default()
+        };
+
+        let err = objects.apply_volatile_persistent_sweep(&mark).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object sweep requires a valid mark graph"),
+            "{err:?}"
+        );
+        assert!(objects.live_slot(live).is_ok());
+    }
+
+    #[test]
+    fn persistent_mark_sweep_rejects_invalid_root_before_sweep() {
+        let mut objects = ObjectTable::default();
+        let live = objects
+            .allocate_persistent_struct_for_gc_ref(0x650, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let missing = ObjectId {
+            object_index: 99_999,
+        };
+
+        let err = objects
+            .persistent_mark_sweep_from_roots_for_test([missing])
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object sweep requires a valid mark graph"),
+            "{err:?}"
+        );
+        assert!(objects.live_slot(live).is_ok());
+    }
+
+    #[test]
+    fn persistent_mark_sweep_rejects_dangling_ref_before_sweep() {
+        let mut objects = ObjectTable::default();
+        let missing = ObjectId {
+            object_index: 88_888,
+        };
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref(0x651, vec![ObjectValue::Ref(Some(missing))])
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x652, vec![ObjectValue::I32(2)])
+            .unwrap();
+
+        let err = objects
+            .persistent_mark_sweep_from_roots_for_test([root])
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("persistent object sweep requires a valid mark graph"),
+            "{err:?}"
+        );
+        assert!(objects.live_slot(root).is_ok());
+        assert!(objects.live_slot(garbage).is_ok());
     }
 
     #[test]

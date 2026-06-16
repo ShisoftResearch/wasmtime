@@ -834,6 +834,16 @@ After commit, persistent reachability contains persistent roots, `ObjectId`
 heap-object edges, and inline durable scalar/reference leaves. Transaction
 abort discards uncommitted records and the promotion map.
 
+Persistence is defined by reachability. A transaction-local object becomes part
+of persistent state only if commit publishes it into the durable root/object
+graph, either directly as a root or indirectly through a reachable persistent
+object edge. If the transaction aborts before publication, the object is
+discarded with the transaction workspace and must not appear in recovery. If an
+object was committed earlier but is no longer reachable from durable roots, it
+is persistent garbage: the runtime may keep its old object-data record until a
+later GC/reclamation pass, but recovery and the volatile object table must treat
+it as non-live.
+
 ## Persistent Object GC Strategy
 
 Wave 9B/9C now provides the first implemented persistent-object GC baseline for
@@ -908,6 +918,23 @@ under a store-level commit/GC gate that prevents concurrent graph mutation. The
 current full marker keeps the stricter rule and rejects arbitrary active
 transactions.
 
+The first runtime mark-sweep collector is stop-the-world at the transaction
+layer. Collection entry points reject active transactions, the current thread
+transaction, and suspended transaction workspaces. Roots come only from
+committed persistent root state, including `tglobal`, `ttable`, and explicit
+recovered roots. The collector traces committed `ObjectId` edges with
+type-layout metadata, refuses to sweep if the mark report contains invalid
+roots or dangling persistent references, and then removes unreachable
+persistent objects from volatile runtime indices. This sweep does not append
+tombstones or mutate object data records.
+
+Read-heavy workloads can explicitly advance the same marker through a bounded
+maintenance-step API. A separate finish-and-sweep API drains the cached grey
+queue, builds a final mark report, validates it, and applies volatile sweep.
+Failure during maintenance is auxiliary GC failure, not transaction failure;
+the durable recovery pass can always recompute reachability from committed
+state.
+
 This incremental design is conservative. Removing a root or deleting an edge
 during a mark cycle invalidates the cached reachable set in the current
 implementation. Until the runtime has a complete committed-root enumerator, any
@@ -926,9 +953,10 @@ Wave 9C now uses tombstone-less Makalu/Ralloc-style recovery. Persistent
 storage contains committed object records, roots, type/layout metadata, and
 scan-critical region metadata. Recovery selects live object-data winners, marks
 from persistent roots, rebuilds the volatile object table only for reachable
-objects, and reconstructs auxiliary allocator state. Durable block reuse
-remains deferred until block-generation or checkpoint retirement metadata
-exists.
+objects, and reconstructs auxiliary allocator state. Durable block reuse is
+implemented only for coarse whole-dead object-data chunks under block
+generation validation; mixed live/dead chunks still require future copying
+cleanup or checkpoint metadata.
 
 Research basis: Makalu uses lazily persisted non-essential metadata plus
 post-failure recovery-time GC to reduce allocation persistence overhead. Ralloc

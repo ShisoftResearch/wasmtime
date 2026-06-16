@@ -42,6 +42,12 @@ pub(crate) struct PersistentVolatileSweepReport {
     pub(crate) retained_objects: Vec<ObjectId>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistentMarkSweepReport {
+    pub(crate) mark: PersistentObjectMarkReport,
+    pub(crate) sweep: PersistentVolatileSweepReport,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct PersistentRecoveredRecordLocation {
     pub(crate) object_id: ObjectId,
@@ -96,6 +102,22 @@ pub(crate) struct PersistentGcState {
     grey: Vec<ObjectId>,
     dangling_refs: Vec<DanglingObjectRef>,
     invalid_roots: Vec<PersistentRootError>,
+}
+
+impl PersistentObjectMarkReport {
+    pub(crate) fn has_integrity_diagnostics(&self) -> bool {
+        !self.invalid_roots.is_empty() || !self.dangling_refs.is_empty()
+    }
+
+    pub(crate) fn ensure_sweepable(&self) -> Result<()> {
+        ensure!(
+            !self.has_integrity_diagnostics(),
+            "persistent object sweep requires a valid mark graph: {} invalid roots, {} dangling refs",
+            self.invalid_roots.len(),
+            self.dangling_refs.len()
+        );
+        Ok(())
+    }
 }
 
 impl PersistentGcState {
@@ -178,6 +200,10 @@ impl PersistentGcState {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.grey.is_empty()
+    }
+
+    pub(crate) fn pending_object_count(&self) -> usize {
+        self.grey.len()
     }
 
     pub(crate) fn into_report(self, objects: &ObjectTable) -> Result<PersistentObjectMarkReport> {
