@@ -589,7 +589,7 @@ git commit -m "Close persistent object root recovery"
 not reference-type identity. Object read/write permissions use
 `GranuleId::Object(ObjectId)`.
 
-- [ ] **Step 6.1: Add failing object permission tests**
+- [x] **Step 6.1: Add failing object permission tests**
 
 Add tests in `transaction.rs` for:
 
@@ -598,26 +598,52 @@ Add tests in `transaction.rs` for:
 - conflicting write ownership fails for another transaction id
 - abort releases object ownership
 - trap/fail path aborts staged object writes
+- generic transaction terminal paths reject object-cleanup cases unless the
+  object-aware API receives an `ObjectTable`
+- `ttable.set` stays private until commit
+- `ttable.grow` exposes the privately grown region through staged table size
+  and element overlays
+- `ttable.grow` stays private to host-visible table size and element access
+  until commit
+- read/write-range helper bounds use staged table size for privately grown
+  regions; bulk table data COW remains deferred
 
 Run:
 
 ```sh
-cargo test -p wasmtime transaction_permission --lib
+cargo test -p wasmtime lower_transaction_id_aborts_higher_suspended_object_writer --lib
+cargo test -p wasmtime higher_transaction_id_cannot_write_lower_owned_object --lib
+cargo test -p wasmtime transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap --lib
+cargo test -p wasmtime transaction_ttable_set_is_private_until_commit --lib
+cargo test -p wasmtime transaction_ttable_grow_new_region_uses_staged_overlay --lib
+cargo test -p wasmtime transaction_ttable_grow_is_private_until_commit --lib
+cargo test -p wasmtime transaction_table_range_bounds_use_staged_size_for_private_grow --lib
+cargo test -p wasmtime generic_abort_rejects_active_object_allocations_without_object_table --lib
+cargo test -p wasmtime generic_commit_rejects_pending_conflict_aborted_object_allocations --lib
+cargo test -p wasmtime generic_abort_transaction_rejects_suspended_object_allocations_without_object_table --lib
 ```
 
-- [ ] **Step 6.2: Route object helpers through object granules**
+- [x] **Step 6.2: Route object helpers through object granules**
 
 Audit `acquire_tref_read_for_gc_ref`, `acquire_tref_write_for_gc_ref`,
 `stage_struct_field`, `stage_array_element`, and table/global root staging.
 Every persistent object operation should derive the object id first and acquire
 permission on `GranuleId::Object(object_id)`.
 
-- [ ] **Step 6.3: Verify**
+- [x] **Step 6.3: Verify**
 
 Run:
 
 ```sh
-cargo test -p wasmtime transaction_permission --lib
+cargo fmt --check
+git diff --check
+cargo test -p wasmtime transaction_ttable_set_is_private_until_commit --lib
+cargo test -p wasmtime transaction_ttable_grow_new_region_uses_staged_overlay --lib
+cargo test -p wasmtime transaction_ttable_grow_is_private_until_commit --lib
+cargo test -p wasmtime transaction_table_range_bounds_use_staged_size_for_private_grow --lib
+cargo test -p wasmtime generic_abort_rejects_active_object_allocations_without_object_table --lib
+cargo test -p wasmtime generic_commit_rejects_pending_conflict_aborted_object_allocations --lib
+cargo test -p wasmtime generic_abort_transaction_rejects_suspended_object_allocations_without_object_table --lib
 cargo test -p wasmtime transaction:: --lib
 ```
 
@@ -625,9 +651,12 @@ cargo test -p wasmtime transaction:: --lib
 
 ```sh
 git add crates/wasmtime/src/runtime/transaction.rs \
+  crates/wasmtime/src/runtime/func.rs \
   crates/wasmtime/src/runtime/vm/libcalls.rs \
   docs/shisoft/transactional-wasm-implementation-log.md \
-  docs/shisoft/2026-06-16-transactional-object-model-stabilization-roadmap.md
+  docs/shisoft/2026-06-16-transactional-object-model-stabilization-implementation-plan.md \
+  docs/shisoft/2026-06-16-transactional-object-model-stabilization-roadmap.md \
+  docs/shisoft/2026-06-16-wave6-object-permission-hardening-plan.md
 git commit -m "Harden object transaction permissions"
 ```
 

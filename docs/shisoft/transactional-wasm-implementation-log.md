@@ -36,6 +36,58 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-16 Wave 6 Object Permission Hardening
+
+- Added runtime regressions for object write ownership under the lock-based
+  transaction-id scheme.
+- Added two-transaction object conflict coverage for lower-id preemption and
+  higher-id conflict rejection.
+- Added mixed tmemory/object transaction coverage proving object conflicts do
+  not leak aborted staged tmemory or object state, and a surviving transaction
+  can commit both sides.
+- Made the exported-Wasm trap path use object-aware transaction abort so newly
+  allocated persistent object records are freed on ordinary Wasm traps.
+- Added an existing-object staged-write rollback regression covering both
+  `tfail` and ordinary trap paths, followed by a successful write to prove the
+  object lock can be reacquired.
+- Added conflict-aborted allocation cleanup: lower-id conflict preemption now
+  queues allocated objects from discarded suspended workspaces and object-aware
+  boundaries free those records. Regression coverage includes direct object
+  conflicts and tmemory conflicts drained before object commit.
+- Hardened generic transaction terminal paths: generic abort/commit helpers now
+  reject pending object cleanup cases that require an `ObjectTable`, and
+  object-aware abort cleanup clears the active transaction even when cleanup
+  reports an error.
+- Removed the eager live-table write from `ttable.set`. Transactional table
+  writes now stay private in `TransactionState` until commit, matching the
+  existing `ttable.get` staged-overlay behavior and avoiding suspended-conflict
+  rollback holes for live table state.
+- Added staged-size-aware `ttable` bounds checks so a transaction that privately
+  grows a table can use `ttable.get`/`ttable.set` in the newly grown region
+  before commit. Added a direct range-bound regression for read/write-range
+  helper bounds; full transactional bulk data COW remains behind the existing
+  bulk-table mock boundary.
+- Added host-callback coverage proving `ttable.grow` remains host-private until
+  commit: embedder table size and element access still observe committed state
+  during an active transaction.
+- Active-transaction, abort, object trap, and `tfail` tests complete the Wave 6
+  semantic gate.
+
+Verification:
+
+```sh
+cargo fmt --check
+git diff --check
+cargo test -p wasmtime transaction_ttable_set_is_private_until_commit --lib
+cargo test -p wasmtime transaction_ttable_grow_new_region_uses_staged_overlay --lib
+cargo test -p wasmtime transaction_ttable_grow_is_private_until_commit --lib
+cargo test -p wasmtime transaction_table_range_bounds_use_staged_size_for_private_grow --lib
+cargo test -p wasmtime generic_abort_rejects_active_object_allocations_without_object_table --lib
+cargo test -p wasmtime generic_commit_rejects_pending_conflict_aborted_object_allocations --lib
+cargo test -p wasmtime generic_abort_transaction_rejects_suspended_object_allocations_without_object_table --lib
+cargo test -p wasmtime transaction:: --lib
+```
+
 ## Current Status: Object Model Stabilization Baseline
 
 Date: 2026-06-16
@@ -189,8 +241,8 @@ Concrete object/reference boundary inventory:
 - `crates/wasmtime/src/runtime/vm/libcalls.rs`:
   `global_snapshot_from_tag`, `read_global_snapshot`,
   `write_global_snapshot`, `table_element_snapshot_from_raw`,
-  `table_element_snapshot_to_raw`, `read_table_element_snapshot`,
-  `write_table_element_snapshot`, `transaction_ttable_get_impl`, and
+  `table_element_snapshot_to_raw`, `write_table_element_snapshot`,
+  `transaction_ttable_get_impl`, and
   `transaction_ttable_set_impl` move raw global/table `VMGcRef`/`VMFuncRef`
   snapshots across helper boundaries before durable root publication rewrites
   persistent object refs.
@@ -267,8 +319,9 @@ Remaining stabilization waves:
 - Wave 3: finish restart-stable function/external reference reintegration.
 - Wave 4: freeze object header, payload, and layout invariants.
 - Wave 5: harden root recovery closure.
-- Wave 6: object permissions now use `GranuleId::Object(ObjectId)`; remaining
-  Wave 6 work is the broader conflict, abort, trap, and `tfail` hardening gate.
+- Wave 6: completed. Object permissions now use
+  `GranuleId::Object(ObjectId)`, and the broader conflict, abort, trap, and
+  `tfail` semantic gate has runtime coverage.
 - Wave 7: document `RefType.transaction_permission` as a temporary
   parser/validator/lowering carrier and defer the full `TRefType` split.
 

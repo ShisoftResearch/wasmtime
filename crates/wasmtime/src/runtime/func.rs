@@ -1474,9 +1474,9 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
     }
     let result = crate::runtime::vm::catch_traps(store, &mut previous_runtime_state, closure);
     if result.is_err() {
-        let transaction = store.0.transaction_state_mut();
+        let (transaction, object_table) = store.0.transaction_state_and_object_table_mut();
         if transaction.active_transaction().is_some() {
-            let _ = transaction.abort();
+            let _ = transaction.abort_allocated_objects(object_table);
         }
     }
     #[cfg(feature = "component-model")]

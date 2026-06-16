@@ -580,12 +580,12 @@ pub(crate) struct TransactionState {
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
     staged_table_sizes: BTreeMap<GranuleId, u64>,
     staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
-    original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
     promoted_gc_refs: BTreeMap<u32, ObjectId>,
     durable_leaf_gc_refs: BTreeSet<u32>,
     allocated_objects: Vec<ObjectId>,
+    pending_conflict_aborted_allocated_objects: Vec<ObjectId>,
     granule_versions: BTreeMap<GranuleId, u64>,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
@@ -603,7 +603,6 @@ struct TransactionWorkspace {
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
     staged_table_sizes: BTreeMap<GranuleId, u64>,
     staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
-    original_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
     promoted_gc_refs: BTreeMap<u32, ObjectId>,
@@ -634,12 +633,12 @@ impl Default for TransactionState {
             staged_memory_sizes: BTreeMap::new(),
             staged_table_sizes: BTreeMap::new(),
             staged_table_elements: BTreeMap::new(),
-            original_table_elements: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             promoted_objects: BTreeMap::new(),
             promoted_gc_refs: BTreeMap::new(),
             durable_leaf_gc_refs: BTreeSet::new(),
             allocated_objects: Vec::new(),
+            pending_conflict_aborted_allocated_objects: Vec::new(),
             granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
             write_granules: BTreeSet::new(),
@@ -3130,11 +3129,18 @@ impl TransactionState {
     }
 
     pub(crate) fn abort_transaction(&mut self, transaction: TransactionId) -> Result<bool> {
+        self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         if self.active == Some(transaction) {
             self.abort()?;
             return Ok(true);
         }
         self.retry_post_commit_linear_undo_retirement();
+        if let Some(workspace) = self.suspended.get(&transaction) {
+            ensure!(
+                workspace.allocated_objects.is_empty(),
+                "generic transaction abort requires object-aware cleanup for allocated objects"
+            );
+        }
         if let Some(workspace) = self.suspended.remove(&transaction) {
             self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
             self.locks.release_transaction(transaction);
@@ -3148,6 +3154,7 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         transaction: TransactionId,
     ) -> Result<bool> {
+        self.drain_conflict_aborted_allocated_objects(object_table)?;
         if self.active == Some(transaction) {
             self.abort_allocated_objects(object_table)?;
             return Ok(true);
@@ -3404,8 +3411,43 @@ impl TransactionState {
             return Ok(());
         };
         if let Some(workspace) = self.suspended.remove(&transaction) {
+            self.pending_conflict_aborted_allocated_objects
+                .extend(workspace.allocated_objects.iter().rev().copied());
             self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn drain_conflict_aborted_allocated_objects(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<bool> {
+        let pending = mem::take(&mut self.pending_conflict_aborted_allocated_objects);
+        let mut freed = false;
+        for (index, object_id) in pending.iter().copied().enumerate() {
+            if let Err(error) = object_table.free(object_id) {
+                self.pending_conflict_aborted_allocated_objects
+                    .extend(pending[index..].iter().copied());
+                return Err(error);
+            }
+            freed = true;
+        }
+        Ok(freed)
+    }
+
+    fn ensure_no_pending_conflict_aborted_allocated_objects(&self) -> Result<()> {
+        ensure!(
+            self.pending_conflict_aborted_allocated_objects.is_empty(),
+            "generic transaction terminal path requires object-aware cleanup for conflict-aborted allocated objects"
+        );
+        Ok(())
+    }
+
+    fn ensure_no_active_allocated_objects_for_generic_abort(&self) -> Result<()> {
+        ensure!(
+            self.allocated_objects.is_empty(),
+            "generic transaction abort requires object-aware cleanup for allocated objects"
+        );
         Ok(())
     }
 
@@ -3432,6 +3474,7 @@ impl TransactionState {
 
     pub(crate) fn complete_commit(&mut self) -> Result<()> {
         self.ensure_active()?;
+        self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
         self.clear_active();
@@ -3512,6 +3555,8 @@ impl TransactionState {
 
     pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
+        self.ensure_no_pending_conflict_aborted_allocated_objects()?;
+        self.ensure_no_active_allocated_objects_for_generic_abort()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
         self.clear_active();
@@ -3530,12 +3575,32 @@ impl TransactionState {
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
         self.ensure_active()?;
         self.retry_post_commit_linear_undo_retirement();
-        for object_id in self.allocated_objects.iter().rev().copied() {
-            object_table.free(object_id)?;
+        let mut result = self
+            .drain_conflict_aborted_allocated_objects(object_table)
+            .map(|_| ());
+        let allocated = self
+            .allocated_objects
+            .iter()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
+        for (index, object_id) in allocated.iter().copied().enumerate() {
+            if let Err(error) = object_table.free(object_id) {
+                self.pending_conflict_aborted_allocated_objects
+                    .extend(allocated[index..].iter().copied());
+                if result.is_ok() {
+                    result = Err(error);
+                }
+                break;
+            }
         }
-        self.bump_active_versioned_write_granules()?;
+        if let Err(error) = self.bump_active_versioned_write_granules() {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
         self.clear_active();
-        Ok(())
+        result
     }
 
     pub(crate) fn fail_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
@@ -3647,19 +3712,6 @@ impl TransactionState {
             .is_none())
     }
 
-    pub(crate) fn stage_table_element_with_original_owned(
-        &mut self,
-        owner_instance: Option<InstanceId>,
-        table_index: u32,
-        element_index: u64,
-        original: TableElementSnapshot,
-        value: TableElementSnapshot,
-    ) -> Result<bool> {
-        let key = table_element_key(owner_instance, table_index, element_index);
-        self.original_table_elements.entry(key).or_insert(original);
-        self.stage_table_element_owned(owner_instance, table_index, element_index, value)
-    }
-
     pub(crate) fn staged_table_element_owned(
         &self,
         owner_instance: Option<InstanceId>,
@@ -3673,22 +3725,6 @@ impl TransactionState {
                 element_index,
             ))
             .copied()
-    }
-
-    pub(crate) fn original_table_elements(
-        &self,
-    ) -> Vec<(Option<InstanceId>, u32, u64, TableElementSnapshot)> {
-        self.original_table_elements
-            .iter()
-            .map(|(key, &value)| {
-                (
-                    granule_owner_instance(key.instance),
-                    key.table_index,
-                    key.element_index,
-                    value,
-                )
-            })
-            .collect()
     }
 
     pub(crate) fn stage_table_size_owned(
@@ -4242,29 +4278,33 @@ impl TransactionState {
 
     pub(crate) fn acquire_object_read(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<bool> {
-        self.acquire_granule_read(
+        let acquired = self.acquire_granule_read(
             object_table.granule_id(object_id)?,
             object_table.version(object_id)?,
-        )
+        )?;
+        self.drain_conflict_aborted_allocated_objects(object_table)?;
+        Ok(acquired)
     }
 
     pub(crate) fn acquire_object_write(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<bool> {
-        self.acquire_granule_write(
+        let acquired = self.acquire_granule_write(
             object_table.granule_id(object_id)?,
             object_table.version(object_id)?,
-        )
+        )?;
+        self.drain_conflict_aborted_allocated_objects(object_table)?;
+        Ok(acquired)
     }
 
     pub(crate) fn acquire_tref_read_for_gc_ref(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         raw_ref: u32,
     ) -> Result<bool> {
         let Some(object_id) =
@@ -4277,7 +4317,7 @@ impl TransactionState {
 
     pub(crate) fn acquire_tref_write_for_gc_ref(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         raw_ref: u32,
     ) -> Result<bool> {
         let Some(object_id) =
@@ -4793,6 +4833,7 @@ impl TransactionState {
         F: FnMut(persist::PendingPublication) -> Result<()>,
     {
         self.ensure_active()?;
+        self.drain_conflict_aborted_allocated_objects(object_table)?;
         self.validate_active_object_reads(object_table)?;
         if self.staged_objects.is_empty() {
             return Ok(false);
@@ -5237,7 +5278,6 @@ impl TransactionState {
             staged_memory_sizes: mem::take(&mut self.staged_memory_sizes),
             staged_table_sizes: mem::take(&mut self.staged_table_sizes),
             staged_table_elements: mem::take(&mut self.staged_table_elements),
-            original_table_elements: mem::take(&mut self.original_table_elements),
             staged_objects: mem::take(&mut self.staged_objects),
             promoted_objects: mem::take(&mut self.promoted_objects),
             promoted_gc_refs: mem::take(&mut self.promoted_gc_refs),
@@ -5257,7 +5297,6 @@ impl TransactionState {
         self.staged_memory_sizes = workspace.staged_memory_sizes;
         self.staged_table_sizes = workspace.staged_table_sizes;
         self.staged_table_elements = workspace.staged_table_elements;
-        self.original_table_elements = workspace.original_table_elements;
         self.staged_objects = workspace.staged_objects;
         self.promoted_objects = workspace.promoted_objects;
         self.promoted_gc_refs = workspace.promoted_gc_refs;
@@ -6327,6 +6366,162 @@ mod tests {
     }
 
     #[test]
+    fn transaction_ttable_set_is_private_until_commit() {
+        use crate::{Caller, Func, Linker, Ref};
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (import "host" "observe" (func $observe))
+              (ttable $t (export "t") 1 funcref)
+              (elem declare func $target)
+              (func $target)
+              (tfunc (export "set_then_observe")
+                (i32.const 0)
+                (ref.func $target)
+                (ttable.set $t)
+                (call $observe)))
+            "#,
+        );
+        let mut linker = Linker::new(&engine);
+        let mut store = crate::Store::new(&engine, ());
+        let observed_committed_null = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_committed_null);
+        let observe = Func::wrap(&mut store, move |mut caller: Caller<'_, ()>| {
+            let table = caller
+                .get_export("t")
+                .and_then(|export| export.into_table())
+                .expect("exported ttable");
+            let value = table.get(&mut caller, 0).expect("table element");
+            observed.store(matches!(value, Ref::Func(None)), Ordering::SeqCst);
+        });
+        linker
+            .define(&mut store, "host", "observe", observe)
+            .unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let table = instance.get_table(&mut store, "t").unwrap();
+        let set_then_observe = instance
+            .get_typed_func::<(), ()>(&mut store, "set_then_observe")
+            .unwrap();
+
+        assert!(matches!(table.get(&mut store, 0).unwrap(), Ref::Func(None)));
+        set_then_observe.call(&mut store, ()).unwrap();
+        assert!(observed_committed_null.load(Ordering::SeqCst));
+        assert!(matches!(
+            table.get(&mut store, 0).unwrap(),
+            Ref::Func(Some(_))
+        ));
+    }
+
+    #[test]
+    fn transaction_ttable_grow_new_region_uses_staged_overlay() {
+        use crate::Ref;
+
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (ttable $t (export "t") 1 3 funcref)
+              (elem declare func $target)
+              (func $target)
+              (tfunc (export "grow_get_set_new") (result i32)
+                (ref.null func)
+                (i32.const 1)
+                (ttable.grow $t)
+                (drop)
+                (i32.const 1)
+                (ttable.get $t)
+                (ref.is_null)
+                (i32.const 1)
+                (ref.func $target)
+                (ttable.set $t)))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let table = instance.get_table(&mut store, "t").unwrap();
+        let grow_get_set_new = instance
+            .get_typed_func::<(), i32>(&mut store, "grow_get_set_new")
+            .unwrap();
+
+        assert_eq!(table.size(&mut store), 1);
+        assert_eq!(grow_get_set_new.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(table.size(&mut store), 2);
+        assert!(matches!(
+            table.get(&mut store, 1).unwrap(),
+            Ref::Func(Some(_))
+        ));
+    }
+
+    #[test]
+    fn transaction_ttable_grow_is_private_until_commit() {
+        use crate::{Caller, Func, Linker, Ref};
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (import "host" "observe" (func $observe))
+              (ttable $t (export "t") 1 3 funcref)
+              (elem declare func $target)
+              (func $target)
+              (tfunc (export "grow_then_observe")
+                (ref.null func)
+                (i32.const 1)
+                (ttable.grow $t)
+                (drop)
+                (i32.const 1)
+                (ttable.get $t)
+                (drop)
+                (i32.const 1)
+                (ref.func $target)
+                (ttable.set $t)
+                (call $observe)))
+            "#,
+        );
+        let mut linker = Linker::new(&engine);
+        let mut store = crate::Store::new(&engine, ());
+        let observed_size = Arc::new(AtomicU64::new(u64::MAX));
+        let observed_new_slot_absent = Arc::new(AtomicBool::new(false));
+        let observed_size_for_host = Arc::clone(&observed_size);
+        let observed_slot_for_host = Arc::clone(&observed_new_slot_absent);
+        let observe = Func::wrap(&mut store, move |mut caller: Caller<'_, ()>| {
+            let table = caller
+                .get_export("t")
+                .and_then(|export| export.into_table())
+                .expect("exported ttable");
+            observed_size_for_host.store(table.size(&mut caller), Ordering::SeqCst);
+            observed_slot_for_host.store(table.get(&mut caller, 1).is_none(), Ordering::SeqCst);
+        });
+        linker
+            .define(&mut store, "host", "observe", observe)
+            .unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let table = instance.get_table(&mut store, "t").unwrap();
+        let grow_then_observe = instance
+            .get_typed_func::<(), ()>(&mut store, "grow_then_observe")
+            .unwrap();
+
+        assert_eq!(table.size(&mut store), 1);
+        grow_then_observe.call(&mut store, ()).unwrap();
+        assert_eq!(observed_size.load(Ordering::SeqCst), 1);
+        assert!(observed_new_slot_absent.load(Ordering::SeqCst));
+        assert_eq!(table.size(&mut store), 2);
+        assert!(matches!(
+            table.get(&mut store, 1).unwrap(),
+            Ref::Func(Some(_))
+        ));
+    }
+
+    #[test]
     fn mock_transaction_ttable_bulk_funcref_paths_hit_runtime_libcalls() {
         let engine = crate::Engine::default();
         let module = transaction_test_module(
@@ -7235,6 +7430,309 @@ mod tests {
     }
 
     #[test]
+    fn lower_transaction_id_aborts_higher_suspended_object_writer() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x6601, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let mut state = TransactionState::default();
+        let higher = TransactionId::from_raw(100_001);
+        let lower = TransactionId::from_raw(1);
+
+        state.enter_transaction(higher).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+            .unwrap();
+        state.restore_transaction(None).unwrap();
+        assert!(state.transaction_is_open(higher));
+
+        state.enter_transaction(lower).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(7))
+            .unwrap();
+
+        assert!(!state.transaction_is_open(higher));
+        assert!(state.transaction_is_open(lower));
+        assert!(state.owns_object_write(object));
+        assert_eq!(
+            state.read_struct_field(&objects, object, 0).unwrap(),
+            ObjectValue::I32(7)
+        );
+
+        state.abort().unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1)])
+        );
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
+    fn object_conflict_aborted_suspended_transaction_frees_new_object_records() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x6604, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let mut state = TransactionState::default();
+        let higher = TransactionId::from_raw(100_001);
+        let lower = TransactionId::from_raw(1);
+
+        state.enter_transaction(higher).unwrap();
+        let allocated = objects.allocate_struct(vec![ObjectValue::I32(99)]).unwrap();
+        state.record_allocated_object(allocated).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+            .unwrap();
+        state.restore_transaction(None).unwrap();
+        assert_eq!(objects.live_count(), 2);
+
+        state.enter_transaction(lower).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
+
+        assert!(!state.transaction_is_open(higher));
+        assert!(state.transaction_is_open(lower));
+        assert_eq!(objects.live_count(), 1);
+        assert!(objects.kind(allocated).is_err());
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(1)])
+        );
+
+        state.abort().unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
+    fn tmemory_conflict_aborted_allocations_are_reclaimed_before_object_commit() {
+        clear_current_thread_transaction_for_test();
+        let tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
+        let mut objects = ObjectTable::default();
+        let mut state = TransactionState::default();
+        let higher = TransactionId::from_raw(100_001);
+        let lower = TransactionId::from_raw(1);
+
+        state.enter_transaction(higher).unwrap();
+        let allocated = objects.allocate_struct(vec![ObjectValue::I32(99)]).unwrap();
+        state.record_allocated_object(allocated).unwrap();
+        state
+            .stage_tmemory_write_for_test(0, 0, 0, &[1, 2, 3, 4], &tmemory)
+            .unwrap();
+        state.restore_transaction(None).unwrap();
+        assert_eq!(objects.live_count(), 1);
+
+        state.enter_transaction(lower).unwrap();
+        state
+            .stage_tmemory_write_for_test(0, 0, 0, &[5, 6, 7, 8], &tmemory)
+            .unwrap();
+        assert!(!state.transaction_is_open(higher));
+        assert_eq!(objects.live_count(), 1);
+
+        assert!(!state.commit_object_payloads(&mut objects).unwrap());
+        assert_eq!(objects.live_count(), 0);
+        assert!(objects.kind(allocated).is_err());
+
+        state.abort().unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
+    fn generic_abort_rejects_active_object_allocations_without_object_table() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let allocated = objects.allocate_struct(vec![ObjectValue::I32(99)]).unwrap();
+        let mut state = TransactionState::default();
+
+        state.begin().unwrap();
+        state.record_allocated_object(allocated).unwrap();
+        let error = state.abort().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("object-aware cleanup for allocated objects"),
+            "{error:?}"
+        );
+        assert!(state.active_transaction().is_some());
+
+        state.abort_allocated_objects(&mut objects).unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        assert!(objects.kind(allocated).is_err());
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
+    fn generic_commit_rejects_pending_conflict_aborted_object_allocations() {
+        clear_current_thread_transaction_for_test();
+        let tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
+        let mut objects = ObjectTable::default();
+        let mut state = TransactionState::default();
+        let higher = TransactionId::from_raw(100_001);
+        let lower = TransactionId::from_raw(1);
+
+        state.enter_transaction(higher).unwrap();
+        let allocated = objects.allocate_struct(vec![ObjectValue::I32(99)]).unwrap();
+        state.record_allocated_object(allocated).unwrap();
+        state
+            .stage_tmemory_write_for_test(0, 0, 0, &[1, 2, 3, 4], &tmemory)
+            .unwrap();
+        state.restore_transaction(None).unwrap();
+
+        state.enter_transaction(lower).unwrap();
+        state
+            .stage_tmemory_write_for_test(0, 0, 0, &[5, 6, 7, 8], &tmemory)
+            .unwrap();
+        let error = state.complete_commit().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("object-aware cleanup for conflict-aborted allocated objects"),
+            "{error:?}"
+        );
+        assert!(state.active_transaction().is_some());
+
+        assert!(!state.commit_object_payloads(&mut objects).unwrap());
+        assert!(objects.kind(allocated).is_err());
+        state.complete_commit().unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
+    fn generic_abort_transaction_rejects_suspended_object_allocations_without_object_table() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let allocated = objects.allocate_struct(vec![ObjectValue::I32(99)]).unwrap();
+        let mut state = TransactionState::default();
+        let transaction = TransactionId::from_raw(7);
+
+        state.enter_transaction(transaction).unwrap();
+        state.record_allocated_object(allocated).unwrap();
+        state.restore_transaction(None).unwrap();
+
+        let error = state.abort_transaction(transaction).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("object-aware cleanup for allocated objects"),
+            "{error:?}"
+        );
+        assert!(state.transaction_is_open(transaction));
+
+        state
+            .abort_transaction_allocated_objects(&mut objects, transaction)
+            .unwrap();
+        assert!(objects.kind(allocated).is_err());
+        assert!(!state.transaction_is_open(transaction));
+        assert_eq!(current_thread_transaction_for_test(), None);
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
+    fn higher_transaction_id_cannot_write_lower_owned_object() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x6602, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let mut state = TransactionState::default();
+        let lower = TransactionId::from_raw(1);
+        let higher = TransactionId::from_raw(100_001);
+
+        state.enter_transaction(lower).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(11))
+            .unwrap();
+        state.restore_transaction(None).unwrap();
+
+        state.enter_transaction(higher).unwrap();
+        let error = state
+            .acquire_object_write(&mut objects, object)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("transaction write conflict"),
+            "{error:?}"
+        );
+        assert!(state.transaction_is_open(lower));
+        assert!(state.transaction_is_open(higher));
+        assert!(!state.owns_object_write(object));
+
+        state.abort().unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        state.restore_transaction(Some(lower)).unwrap();
+        assert!(state.owns_object_write(object));
+        assert_eq!(
+            state.read_struct_field(&objects, object, 0).unwrap(),
+            ObjectValue::I32(11)
+        );
+
+        state.abort().unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
+    fn mixed_object_and_tmemory_transaction_survives_object_conflict_and_commits_both() {
+        clear_current_thread_transaction_for_test();
+        let mut tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref(0x6603, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let mut state = TransactionState::default();
+        let higher = TransactionId::from_raw(100_001);
+        let lower = TransactionId::from_raw(1);
+        let lower_addr = TMEMORY_GRANULE_SIZE as u64 + 8;
+
+        state.enter_transaction(higher).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+            .unwrap();
+        state
+            .stage_tmemory_write_for_test(0, 0, 4, &[1, 2, 3, 4], &tmemory)
+            .unwrap();
+        state.restore_transaction(None).unwrap();
+
+        state.enter_transaction(lower).unwrap();
+        state
+            .stage_tmemory_write_for_test(0, 0, lower_addr, &[5, 6, 7, 8], &tmemory)
+            .unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
+        state
+            .stage_struct_field(&objects, object, 0, ObjectValue::I32(7))
+            .unwrap();
+
+        assert!(!state.transaction_is_open(higher));
+        assert!(state.owns_object_write(object));
+        assert!(state.owns_memory_granule_write_owned(Some(InstanceId::from_u32(0)), 0, 1));
+
+        assert!(state.commit_tmemory_for_test(&mut tmemory).unwrap());
+        assert!(state.commit_object_payloads(&mut objects).unwrap());
+        state.complete_commit().unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+
+        assert_eq!(tmemory.read_committed(0..4).unwrap(), vec![0, 0, 0, 0]);
+        let lower_range = lower_addr as usize..lower_addr as usize + 4;
+        assert_eq!(
+            tmemory.read_committed(lower_range).unwrap(),
+            vec![5, 6, 7, 8]
+        );
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(7)])
+        );
+        clear_current_thread_transaction_for_test();
+    }
+
+    #[test]
     fn aborting_suspended_transaction_releases_only_its_locks() {
         let mut state = TransactionState::default();
         let first = TransactionId::from_raw(11);
@@ -7856,11 +8354,19 @@ mod tests {
 
         state.begin().unwrap();
 
-        assert!(state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap());
+        assert!(
+            state
+                .acquire_tref_read_for_gc_ref(&mut objects, 0x11)
+                .unwrap()
+        );
         assert!(state.owns_object_read(struct_object));
         assert!(!state.owns_object_write(struct_object));
 
-        assert!(state.acquire_tref_write_for_gc_ref(&objects, 0x22).unwrap());
+        assert!(
+            state
+                .acquire_tref_write_for_gc_ref(&mut objects, 0x22)
+                .unwrap()
+        );
         assert!(state.owns_object_read(array_object));
         assert!(state.owns_object_write(array_object));
     }
@@ -7875,8 +8381,12 @@ mod tests {
 
         state.begin().unwrap();
 
-        assert!(!state.acquire_tref_read_for_gc_ref(&objects, 0).unwrap());
-        assert!(!state.acquire_tref_write_for_gc_ref(&objects, 0x99).unwrap());
+        assert!(!state.acquire_tref_read_for_gc_ref(&mut objects, 0).unwrap());
+        assert!(
+            !state
+                .acquire_tref_write_for_gc_ref(&mut objects, 0x99)
+                .unwrap()
+        );
         assert!(!state.owns_object_read(object));
         assert!(!state.owns_object_write(object));
     }
@@ -7892,8 +8402,16 @@ mod tests {
         state.begin().unwrap();
 
         assert!(!objects.is_persistent(object).unwrap());
-        assert!(!state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap());
-        assert!(!state.acquire_tref_write_for_gc_ref(&objects, 0x11).unwrap());
+        assert!(
+            !state
+                .acquire_tref_read_for_gc_ref(&mut objects, 0x11)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .acquire_tref_write_for_gc_ref(&mut objects, 0x11)
+                .unwrap()
+        );
         assert!(!state.owns_object_read(object));
         assert!(!state.owns_object_write(object));
         assert_eq!(
@@ -7922,7 +8440,9 @@ mod tests {
                 .contains("transactional object read permission was not acquired")
         );
 
-        state.acquire_tref_read_for_gc_ref(&objects, 0x11).unwrap();
+        state
+            .acquire_tref_read_for_gc_ref(&mut objects, 0x11)
+            .unwrap();
         assert_eq!(
             state.read_struct_field(&objects, object, 0).unwrap(),
             ObjectValue::I32(7)
@@ -7937,7 +8457,9 @@ mod tests {
                 .contains("transactional object write permission was not acquired")
         );
 
-        state.acquire_tref_write_for_gc_ref(&objects, 0x11).unwrap();
+        state
+            .acquire_tref_write_for_gc_ref(&mut objects, 0x11)
+            .unwrap();
         state
             .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
             .unwrap();
@@ -8382,7 +8904,7 @@ mod tests {
             vec![first, second]
         );
 
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_struct_field(&objects, object, 0, ObjectValue::I32(7))
             .unwrap();
@@ -8497,7 +9019,7 @@ mod tests {
             vec![first, second]
         );
 
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_array_element(&objects, object, 0, ObjectValue::Ref(Some(first)))
             .unwrap();
@@ -8817,7 +9339,11 @@ mod tests {
 
         state.begin().unwrap();
 
-        assert!(state.acquire_object_read(&objects, struct_object).unwrap());
+        assert!(
+            state
+                .acquire_object_read(&mut objects, struct_object)
+                .unwrap()
+        );
         assert!(state.owns_granule_read(GranuleId::Object {
             object_id: struct_object,
         }));
@@ -8825,7 +9351,11 @@ mod tests {
             object_id: struct_object,
         }));
 
-        assert!(state.acquire_object_write(&objects, array_object).unwrap());
+        assert!(
+            state
+                .acquire_object_write(&mut objects, array_object)
+                .unwrap()
+        );
         assert!(state.owns_granule_read(GranuleId::Object {
             object_id: array_object,
         }));
@@ -8856,7 +9386,11 @@ mod tests {
 
         state.begin().unwrap();
 
-        assert!(state.acquire_object_read(&objects, struct_object).unwrap());
+        assert!(
+            state
+                .acquire_object_read(&mut objects, struct_object)
+                .unwrap()
+        );
         assert!(state.owns_granule_read(GranuleId::Object {
             object_id: struct_object,
         }));
@@ -8864,7 +9398,11 @@ mod tests {
             object_id: struct_object,
         }));
 
-        assert!(state.acquire_object_write(&objects, array_object).unwrap());
+        assert!(
+            state
+                .acquire_object_write(&mut objects, array_object)
+                .unwrap()
+        );
         assert!(state.owns_granule_read(GranuleId::Object {
             object_id: array_object,
         }));
@@ -9022,7 +9560,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         assert_eq!(
             state.read_object_payload(&objects, object).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
@@ -9045,7 +9583,7 @@ mod tests {
         );
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_object_payload(
                 &objects,
@@ -9079,7 +9617,7 @@ mod tests {
             durable_log,
         );
 
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
             .unwrap();
@@ -9468,7 +10006,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
             .unwrap();
@@ -9519,7 +10057,7 @@ mod tests {
             .commit_staged_tmemory_granule(0, &new_granule)
             .unwrap();
 
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
             .unwrap();
@@ -9630,7 +10168,7 @@ mod tests {
             .commit_staged_tmemory_granule(0, &new_granule)
             .unwrap();
 
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
             .unwrap();
@@ -10040,7 +10578,7 @@ mod tests {
                 .commit_staged_tmemory_granule(0, &new_granule)
                 .unwrap();
 
-            state.acquire_object_write(&objects, object).unwrap();
+            state.acquire_object_write(&mut objects, object).unwrap();
             state
                 .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
                 .unwrap();
@@ -10140,7 +10678,7 @@ mod tests {
                 .commit_staged_tmemory_granule(0, &new_granule)
                 .unwrap();
 
-            state.acquire_object_write(&objects, object).unwrap();
+            state.acquire_object_write(&mut objects, object).unwrap();
             state
                 .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
                 .unwrap();
@@ -10457,7 +10995,7 @@ mod tests {
                         )
                         .copied()
                         .context("object model id is outside the prepared object slots")?;
-                    state.acquire_object_write(&objects, handle)?;
+                    state.acquire_object_write(&mut objects, handle)?;
                     state.stage_struct_field(
                         &objects,
                         handle,
@@ -10683,8 +11221,8 @@ mod tests {
             assert_requires_active(state.acquire_table_size_read_owned(None, 0, 0));
             assert_requires_active(state.acquire_table_size_write_owned(None, 0, 0));
 
-            assert_requires_active(state.acquire_object_read(&objects, struct_object));
-            assert_requires_active(state.acquire_object_write(&objects, struct_object));
+            assert_requires_active(state.acquire_object_read(&mut objects, struct_object));
+            assert_requires_active(state.acquire_object_write(&mut objects, struct_object));
             assert!(
                 state.read_struct_field(&objects, struct_object, 0).is_err(),
                 "persistent object read without an active transaction should not succeed"
@@ -12733,7 +13271,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
 
         assert_eq!(
             state.read_struct_field(&objects, object, 0).unwrap(),
@@ -12773,7 +13311,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
         state
             .stage_struct_field(&objects, object, 1, ObjectValue::I32(7))
             .unwrap();
@@ -12852,7 +13390,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
 
         assert_eq!(state.read_array_len(&objects, object).unwrap(), 5);
         assert_eq!(
@@ -12922,7 +13460,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, object).unwrap();
+        state.acquire_object_write(&mut objects, object).unwrap();
 
         let error = state.read_array_element(&objects, object, 1).unwrap_err();
         assert!(error.to_string().contains("out of bounds array access"));
@@ -12977,7 +13515,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_read(&objects, object).unwrap();
+        state.acquire_object_read(&mut objects, object).unwrap();
         state.read_object_payload(&objects, object).unwrap();
         objects
             .update_payload(object, ObjectPayload::Struct(vec![ObjectValue::I32(2)]))
@@ -12999,7 +13537,7 @@ mod tests {
         let mut state = TransactionState::default();
 
         state.begin().unwrap();
-        state.acquire_object_read(&objects, object).unwrap();
+        state.acquire_object_read(&mut objects, object).unwrap();
 
         state.validate_active_object_reads(&objects).unwrap();
 
@@ -14413,7 +14951,7 @@ mod tests {
                 .allocate_persistent_struct_for_gc_ref(0x732, vec![ObjectValue::Ref(None)])
                 .unwrap();
             let mut state = TransactionState::new_for_test(TransactionId::from_raw(731));
-            state.acquire_object_write(&objects, owner).unwrap();
+            state.acquire_object_write(&mut objects, owner).unwrap();
             state
                 .stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
                 .unwrap();
@@ -15351,7 +15889,7 @@ mod tests {
         );
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, owner).unwrap();
+        state.acquire_object_write(&mut objects, owner).unwrap();
         state
             .stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
             .unwrap();
@@ -15474,7 +16012,7 @@ mod tests {
         );
 
         state.begin().unwrap();
-        state.acquire_object_write(&objects, root).unwrap();
+        state.acquire_object_write(&mut objects, root).unwrap();
         state
             .stage_struct_field(&objects, root, 0, ObjectValue::Ref(Some(child)))
             .unwrap();
@@ -15521,7 +16059,7 @@ mod tests {
         let delta = {
             let _cleanup = clear_current_thread_transaction_on_drop_for_test();
             let mut tx = TransactionState::new_for_test(TransactionId::from_raw(541));
-            tx.acquire_object_write(&objects, owner).unwrap();
+            tx.acquire_object_write(&mut objects, owner).unwrap();
             tx.stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
                 .unwrap();
             let mut publications = Vec::new();
@@ -15572,7 +16110,7 @@ mod tests {
         let delta = {
             let _cleanup = clear_current_thread_transaction_on_drop_for_test();
             let mut tx = TransactionState::new_for_test(TransactionId::from_raw(542));
-            tx.acquire_object_write(&objects, owner).unwrap();
+            tx.acquire_object_write(&mut objects, owner).unwrap();
             tx.stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
                 .unwrap();
             let mut publications = Vec::new();
@@ -17100,6 +17638,110 @@ mod tests {
         create_fail.call(&mut store, ()).unwrap();
 
         assert_eq!(store.transaction_object_table().live_count(), 0);
+    }
+
+    #[test]
+    fn transaction_object_tstruct_trap_frees_new_object_record() {
+        clear_current_thread_transaction_for_test();
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $s (struct (field (mut i32))))
+              (tfunc (export "create_trap")
+                (drop (tstruct.new $s (i32.const 41)))
+                (unreachable))
+              (tfunc (export "create_ok") (result i32)
+                (local $s (tref $s))
+                (local.set $s (tstruct.new $s (i32.const 7)))
+                (tstruct.get $s 0 (tref.cast_read (local.get $s)))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let create_trap = instance
+            .get_typed_func::<(), ()>(&mut store, "create_trap")
+            .unwrap();
+        let create_ok = instance
+            .get_typed_func::<(), i32>(&mut store, "create_ok")
+            .unwrap();
+
+        assert!(create_trap.call(&mut store, ()).is_err());
+        assert_eq!(current_thread_transaction_for_test(), None);
+        assert_eq!(store.transaction_object_table().live_count(), 0);
+
+        assert_eq!(create_ok.call(&mut store, ()).unwrap(), 7);
+        assert_eq!(current_thread_transaction_for_test(), None);
+        assert_eq!(store.transaction_object_table().live_count(), 1);
+    }
+
+    #[test]
+    fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
+        clear_current_thread_transaction_for_test();
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+            (module
+              (type $s (struct (field (mut i32))))
+              (tfunc (export "new") (result (ref $s))
+                (tstruct.new $s (i32.const 1)))
+              (tfunc (export "read") (param (ref $s)) (result i32)
+                (tstruct.get $s 0 (tref.cast_read (local.get 0))))
+              (tfunc (export "write_fail") (param (ref $s))
+                (tstruct.set $s 0 (tref.cast_write (local.get 0)) (i32.const 99))
+                (tfail))
+              (tfunc (export "write_trap") (param (ref $s))
+                (tstruct.set $s 0 (tref.cast_write (local.get 0)) (i32.const 77))
+                (unreachable))
+              (tfunc (export "write_ok") (param (ref $s) i32)
+                (tstruct.set $s 0 (tref.cast_write (local.get 0)) (local.get 1))))
+            "#,
+        );
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let new = instance.get_func(&mut store, "new").unwrap();
+        let read = instance.get_func(&mut store, "read").unwrap();
+        let write_fail = instance.get_func(&mut store, "write_fail").unwrap();
+        let write_trap = instance.get_func(&mut store, "write_trap").unwrap();
+        let write_ok = instance.get_func(&mut store, "write_ok").unwrap();
+        let mut object_result = [crate::Val::null_any_ref()];
+        let mut read_result = [crate::Val::I32(0)];
+        let mut no_results: [crate::Val; 0] = [];
+
+        new.call(&mut store, &[], &mut object_result).unwrap();
+        let object = object_result[0];
+        assert_eq!(store.transaction_object_table().live_count(), 1);
+
+        read.call(&mut store, &[object], &mut read_result).unwrap();
+        assert_eq!(read_result[0].unwrap_i32(), 1);
+
+        write_fail
+            .call(&mut store, &[object], &mut no_results)
+            .unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        read.call(&mut store, &[object], &mut read_result).unwrap();
+        assert_eq!(read_result[0].unwrap_i32(), 1);
+
+        write_trap
+            .call(&mut store, &[object], &mut no_results)
+            .unwrap_err();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        read.call(&mut store, &[object], &mut read_result).unwrap();
+        assert_eq!(read_result[0].unwrap_i32(), 1);
+
+        write_ok
+            .call(&mut store, &[object, crate::Val::I32(5)], &mut no_results)
+            .unwrap();
+        assert_eq!(current_thread_transaction_for_test(), None);
+        read.call(&mut store, &[object], &mut read_result).unwrap();
+        assert_eq!(read_result[0].unwrap_i32(), 5);
+        assert_eq!(store.transaction_object_table().live_count(), 1);
     }
 
     #[test]

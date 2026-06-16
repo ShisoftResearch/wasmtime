@@ -249,19 +249,41 @@ as memory/table/global granules.
 - [x] Replace the current `GranuleId::TStruct` / `GranuleId::TArray` split with
       one object granule identity after updating tests to prove permissions no
       longer depend on object kind.
-- [ ] Verify object writes acquire ownership according to the lock-based scheme.
-- [ ] Verify abort, trap, and `tfail` release object ownership and discard
+- [x] Verify object writes acquire ownership according to the lock-based scheme.
+- [x] Verify abort, trap, and `tfail` release object ownership and discard
       staged object changes.
-- [ ] Verify nested object reads and writes require an active transaction.
-- [ ] Add conflict tests for two transaction ids touching the same object.
-- [ ] Add mixed conflict tests where one transaction touches linear memory and
+- [x] Verify nested object reads and writes require an active transaction.
+- [x] Add conflict tests for two transaction ids touching the same object.
+- [x] Add mixed conflict tests where one transaction touches linear memory and
       persistent objects in the same commit.
+- [x] Guard generic transaction terminal paths so object-cleanup cases require
+      object-aware APIs with an `ObjectTable`.
+- [x] Verify transactional table element writes stay private until commit so
+      suspended conflict aborts cannot leak eager live table state.
+- [x] Verify privately grown transactional table regions use the staged size and
+      element overlay before commit.
+- [x] Verify privately grown transactional table regions remain hidden from
+      host-visible table size and element access until commit.
+- [x] Verify transactional table range-bound helpers use staged table size for
+      privately grown regions. Bulk table data COW remains a later mock cleanup
+      workstream.
 
 **Verification:**
 
 ```sh
-cargo test -p wasmtime transaction_permission --lib
-cargo test -p wasmtime-tests transaction_concurrency --test all
+cargo test -p wasmtime transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap --lib
+cargo test -p wasmtime transaction_object_tstruct_trap_frees_new_object_record --lib
+cargo test -p wasmtime object_conflict_aborted_suspended_transaction_frees_new_object_records --lib
+cargo test -p wasmtime tmemory_conflict_aborted_allocations_are_reclaimed_before_object_commit --lib
+cargo test -p wasmtime mixed_object_and_tmemory_transaction_survives_object_conflict_and_commits_both --lib
+cargo test -p wasmtime transaction_ttable_set_is_private_until_commit --lib
+cargo test -p wasmtime transaction_ttable_grow_new_region_uses_staged_overlay --lib
+cargo test -p wasmtime transaction_ttable_grow_is_private_until_commit --lib
+cargo test -p wasmtime transaction_table_range_bounds_use_staged_size_for_private_grow --lib
+cargo test -p wasmtime generic_abort_rejects_active_object_allocations_without_object_table --lib
+cargo test -p wasmtime generic_commit_rejects_pending_conflict_aborted_object_allocations --lib
+cargo test -p wasmtime generic_abort_transaction_rejects_suspended_object_allocations_without_object_table --lib
+cargo test -p wasmtime transaction:: --lib
 ```
 
 ---

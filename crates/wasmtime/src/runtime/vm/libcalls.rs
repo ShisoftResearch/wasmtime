@@ -828,7 +828,6 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
 }
 
 fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
-    restore_original_table_elements(store, _instance)?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     state.fail_allocated_objects(object_table)
@@ -839,7 +838,6 @@ fn transaction_fail_with_code(
     _instance: InstanceId,
     code: u32,
 ) -> Result<()> {
-    restore_original_table_elements(store, _instance)?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     state.fail_allocated_objects_with_code(object_table, code)
@@ -1558,35 +1556,6 @@ fn table_element_snapshot_to_raw(value: TableElementSnapshot) -> *mut u8 {
     }
 }
 
-fn read_table_element_snapshot(
-    store: &mut dyn VMStore,
-    instance: InstanceId,
-    table: u32,
-    index: u64,
-) -> Result<TableElementSnapshot> {
-    ensure_defined_table_index_in_bounds(store, instance, table, index)?;
-    let table_index = DefinedTableIndex::from_u32(table);
-    let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
-    let (_gc_store, registry, instance_ref) =
-        store.optional_gc_store_and_registry_and_instance_mut(instance);
-    let table_ref = instance_ref.get_defined_table_with_lazy_init(
-        registry,
-        table_index,
-        core::iter::once(index),
-    );
-    Ok(match table_ref.element_type() {
-        TableElementType::Func => {
-            let elem = table_ref.get_func(index)?.map_or(0, |ptr| ptr.addr().get());
-            TableElementSnapshot::FuncRef(elem)
-        }
-        TableElementType::GcRef => {
-            let raw = table_ref.get_gc_ref(index)?.map_or(0, VMGcRef::as_raw_u32);
-            TableElementSnapshot::GcRef(raw)
-        }
-        TableElementType::Cont => bail!("transactional contref table is not implemented yet"),
-    })
-}
-
 fn write_table_element_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -1623,7 +1592,7 @@ fn transaction_ttable_get_impl(
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
-    ensure_defined_table_index_in_bounds(store, instance, table, index)?;
+    ensure_transaction_table_index_in_bounds(store, instance, table, index)?;
     {
         let state = store.store_opaque_mut().transaction_state_mut();
         state.acquire_table_granule_read_owned(Some(instance), table, index, 0)?;
@@ -1631,6 +1600,12 @@ fn transaction_ttable_get_impl(
             return Ok(table_element_snapshot_to_raw(value));
         }
     }
+    let committed_size = u64::try_from(defined_table_size(store, instance, table)?)
+        .context("defined table size does not fit u64")?;
+    ensure!(
+        index < committed_size,
+        "transactional table overlay is missing staged element {index} in grown table"
+    );
 
     let table_index = DefinedTableIndex::from_u32(table);
     let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
@@ -1675,9 +1650,8 @@ fn transaction_ttable_set_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
-    ensure_defined_table_index_in_bounds(store, instance, table, index)?;
+    ensure_transaction_table_index_in_bounds(store, instance, table, index)?;
 
-    let original = read_table_element_snapshot(store, instance, table, index)?;
     let snapshot = {
         let table_index = DefinedTableIndex::from_u32(table);
         let mut store_no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
@@ -1690,14 +1664,7 @@ fn transaction_ttable_set_impl(
     store
         .store_opaque_mut()
         .transaction_state_mut()
-        .stage_table_element_with_original_owned(
-            Some(instance),
-            table,
-            index,
-            original,
-            snapshot,
-        )?;
-    write_table_element_snapshot(store, instance, table, index, snapshot)?;
+        .stage_table_element_owned(Some(instance), table, index, snapshot)?;
     Ok(())
 }
 
@@ -1722,7 +1689,7 @@ fn transaction_ttable_read_range_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
-    ensure_defined_table_range_in_bounds(store, instance, table, start, len)?;
+    ensure_transaction_table_range_in_bounds(store, instance, table, start, len)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -1751,7 +1718,7 @@ fn transaction_ttable_write_range_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
-    ensure_defined_table_range_in_bounds(store, instance, table, start, len)?;
+    ensure_transaction_table_range_in_bounds(store, instance, table, start, len)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -3028,7 +2995,6 @@ fn abort_active_transaction_on_error<T>(store: &mut dyn VMStore, result: &Result
         return;
     }
 
-    let _ = restore_original_table_elements(store, InstanceId::from_u32(0));
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     if state.active_transaction().is_some() {
@@ -3065,18 +3031,6 @@ fn finish_transaction_constructor_boundary<T>(
         let (state, object_table) = store.transaction_state_and_object_table_mut();
         state.abort_allocated_objects(object_table)
     }
-}
-
-fn restore_original_table_elements(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
-    let originals = store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .original_table_elements();
-    for (owner_instance, table_index, element_index, value) in originals {
-        let owner = owner_instance.unwrap_or(instance);
-        write_table_element_snapshot(store, owner, table_index, element_index, value)?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3396,15 +3350,43 @@ fn ensure_defined_table_index_in_bounds(
     Ok(())
 }
 
-fn ensure_defined_table_range_in_bounds(
+fn transaction_table_size_for_bounds(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+) -> Result<u64> {
+    if let Some(size) = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .staged_table_size_owned(Some(instance), table)
+    {
+        return Ok(size);
+    }
+    u64::try_from(defined_table_size(store, instance, table)?)
+        .context("defined table size does not fit u64")
+}
+
+fn ensure_transaction_table_index_in_bounds(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+) -> Result<()> {
+    let size = transaction_table_size_for_bounds(store, instance, table)?;
+    if index >= size {
+        bail!(Trap::TableOutOfBounds);
+    }
+    Ok(())
+}
+
+fn ensure_transaction_table_range_in_bounds(
     store: &mut dyn VMStore,
     instance: InstanceId,
     table: u32,
     start: u64,
     len: u64,
 ) -> Result<()> {
-    let size = u64::try_from(defined_table_size(store, instance, table)?)
-        .context("defined table size does not fit u64")?;
+    let size = transaction_table_size_for_bounds(store, instance, table)?;
     let end = start.checked_add(len).ok_or(Trap::TableOutOfBounds)?;
     if start > size || end > size {
         bail!(Trap::TableOutOfBounds);
@@ -4363,6 +4345,7 @@ fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AsContextMut;
     use crate::runtime::transaction::{
         OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, ObjectId, ObjectKind,
         encode_object_record_for_recovery, type_layout::TypeLayoutRegistry,
@@ -4431,6 +4414,42 @@ mod tests {
             object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi).unwrap(),
             ObjectValue::Ref(Some(child))
         );
+    }
+
+    #[test]
+    fn transaction_table_range_bounds_use_staged_size_for_private_grow() {
+        let engine = crate::Engine::default();
+        let module = crate::Module::new(
+            &engine,
+            r#"
+            (module
+              (table $t 1 3 funcref))
+            "#,
+        )
+        .unwrap();
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let instance_id = instance.id();
+        let context = store.as_context_mut();
+        let vm_store = context.0;
+
+        {
+            let state = vm_store.store_opaque_mut().transaction_state_mut();
+            state.begin().unwrap();
+            state
+                .stage_table_size_owned(Some(instance_id), 0, 2)
+                .unwrap();
+        }
+
+        transaction_ttable_read_range_impl(vm_store, instance_id, 0, 1, 1).unwrap();
+        transaction_ttable_write_range_impl(vm_store, instance_id, 0, 1, 1).unwrap();
+        assert!(transaction_ttable_write_range_impl(vm_store, instance_id, 0, 2, 1).is_err());
+
+        vm_store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .complete_commit()
+            .unwrap();
     }
 
     #[test]
