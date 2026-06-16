@@ -30,6 +30,239 @@ for the current persistent-promotion roadmap. It supersedes the older
 plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
 payloads.
 
+Use `docs/shisoft/2026-06-16-transactional-object-model-stabilization-roadmap.md`
+and
+`docs/shisoft/2026-06-16-transactional-object-model-stabilization-implementation-plan.md`
+for the current object-model stabilization work before storage-reclaiming
+persistent GC.
+
+## Current Status: Object Model Stabilization Baseline
+
+Date: 2026-06-16
+
+This baseline classifies the remaining transactional object-model boundaries
+before the final persistent `ObjectId` ABI and GC-facing cleanup waves.
+
+Persistent identity:
+
+- `ObjectId` is the stable identity for persistent transactional heap objects.
+- `PersistentObjectRefRaw` is the durable raw object-reference encoding:
+  `0` is null and non-zero values encode `ObjectId.object_index + 1`.
+- Persistent object records and recovered root records use `ObjectId` identity,
+  not raw `VMGcRef`, raw `VMFuncRef`, process-local pointers, or PMEM
+  addresses.
+
+Durable payload leaves:
+
+- `ObjectValue::Ref(Some(ObjectId))` is the only object graph edge.
+- `ObjectValue::I31`, `ObjectValue::FuncRef(DurableFuncIdentity)`, and
+  `ObjectValue::ExternRef(DurableExternIdentity)` are inline durable leaves.
+  They do not allocate object-table entries and do not contribute `ObjectId`
+  graph edges.
+- Durable function and external reference identities are encoded through
+  `ObjectValueAbi` tags for `FUNCREF` and `EXTERNREF`; object tracing treats
+  them as scalars.
+
+Temporary live ABI debt:
+
+- `ObjectValueAbi` still carries live values across Cranelift/libcall helper
+  boundaries. This is the current tuple carrier for scalars, inline refs, live
+  GC refs, durable function/external refs, and persistent object refs.
+- `ObjectTable::gc_ref_to_object` and `ObjectTable::object_to_gc_ref` are
+  volatile side maps. They are needed for ordinary Wasmtime GC promotion and
+  live proposal-WAST execution, but they are not persistent identity.
+- `ObjectTable::live_ref_abi_for_object_id` can return an explicit
+  persistent-object live kind, but some live helper paths still accept a 32-bit
+  raw ref. Wave 1 removes that narrowing as an object-model invariant.
+- `GlobalSnapshot::GcRef`, `GlobalSnapshot::FuncRef`, and
+  `TableElementSnapshot::{GcRef, FuncRef}` are live snapshot shapes at helper
+  boundaries. Durable root publication rewrites persistent object refs to
+  `ObjectId`.
+
+Strict persistence boundary:
+
+- `DurableReferenceRegistry` defaults to strict behavior. Unregistered
+  `tfuncref` values and external refs without embedded durable host identity
+  are rejected before commit/promotion can publish them.
+- The WAST runner explicitly opts into live fallback identities for proposal
+  compatibility. Those fallbacks remain `SHISOFT-TWASM-MOCK` execution bridges
+  and are not restart-stable durable namespaces.
+- File-backed recovery rebuilds the persistent object table from committed
+  object winners reachable from recovered `TGlobal` and `TTable` roots. It does
+  not recover volatile-only object indices.
+
+Current bridge classification:
+
+- `ObjectValueAbi` durable payload publication.
+  Classification: commit-time promotion source.
+- `ObjectValueAbi` process-local live reference carrier.
+  Classification: object-model debt.
+- `PersistentObjectRefRaw` durable object-ref encoding.
+  Classification: commit-time promotion source.
+- `PersistentObjectRefRaw` use through current live helper paths.
+  Classification: object-model debt.
+- `VMGcRef` side-map lookup while executing ordinary Wasmtime refs.
+  Classification: ordinary volatile GC use.
+- `VMGcRef` side-map lookup while promoting ordinary GC refs before commit.
+  Classification: commit-time promotion source.
+- `VMGcRef` side-map dependency for recovered persistent objects.
+  Classification: object-model debt.
+- `VMFuncRef` raw pointer plumbing for ordinary live function refs.
+  Classification: ordinary volatile GC use.
+- `VMFuncRef` live fallback identity for proposal WAST.
+  Classification: WAST-only compatibility fallback.
+- `DurableReferenceRegistry` strict function/external identity registry.
+  Classification: commit-time promotion source.
+- `DurableReferenceRegistry` live fallback identity registration.
+  Classification: WAST-only compatibility fallback.
+- `GranuleId::TStruct` and `GranuleId::TArray` object permission split.
+  Classification: object-model debt.
+
+Concrete object/reference boundary inventory:
+
+- `crates/cranelift/src/translate/code_translator.rs`:
+  `translate_operator` dispatches transactional object operators to
+  transaction-specific lowering for `tstruct.*` and `tarray.*`. The
+  `SHISOFT-TWASM-MOCK` comment there marks the proposal-operator integration
+  surface, not a durable storage dependency.
+  Classification: object-model debt.
+- `crates/cranelift/src/func_environ.rs`:
+  `translate_transaction_object_value_to_abi_values` and
+  `translate_transaction_object_value_from_abi_pointer` pack and unpack the
+  live `ObjectValueAbi` tuple. Reference values are still lowered as live
+  `low/high` pairs whose `high` word identifies GC, func, extern, i31, or
+  persistent-object refs.
+  Classification: object-model debt.
+- `crates/cranelift/src/func_environ.rs`:
+  `translate_transaction_ttable_fill`,
+  `translate_transaction_ttable_copy`, and
+  `translate_transaction_ttable_init` still carry `SHISOFT-TWASM-MOCK` comments
+  for transactional ownership over Wasmtime table data movement.
+  Classification: object-model debt.
+- `crates/environ/src/builtin.rs`:
+  `foreach_builtin_function!` declares transaction struct/array builtins
+  `transaction_tstruct_new`, `transaction_tstruct_get`,
+  `transaction_tstruct_set`, `transaction_tarray_new`,
+  `transaction_tarray_get`, `transaction_tarray_set`, and bulk variants.
+  Classification: object-model debt.
+- `crates/wasmtime/src/runtime/vm/libcalls.rs`:
+  `transaction_tstruct_new_impl`, `transaction_tstruct_static_new_impl`,
+  `transaction_tstruct_set_impl`, `transaction_tstruct_get_bytes_impl`,
+  `transaction_tarray_new_impl`, `transaction_tarray_static_new_impl`,
+  `transaction_tarray_new_fixed_impl`,
+  `transaction_tarray_static_new_fixed_impl`,
+  `transaction_tarray_new_data_impl`, `transaction_tarray_new_elem_impl`,
+  `transaction_tarray_set_impl`, `transaction_tarray_fill_impl`,
+  `transaction_tarray_copy_impl`, `transaction_tarray_init_data_impl`,
+  `transaction_tarray_init_elem_impl`, `transaction_tarray_get_bytes_impl`,
+  and `transaction_tarray_len_bytes_impl` decode incoming `ObjectValueAbi` with
+  `object_value_from_transaction_abi`, resolve object refs through
+  `ObjectTable`, and return values through `transaction_abi_from_object_value`.
+  Classification: object-model debt.
+- `crates/wasmtime/src/runtime/vm/libcalls.rs`:
+  `live_ref_value_from_raw` resolves live GC, function, and external reference
+  forms through process-local handles.
+  Classification: ordinary volatile GC use.
+- `crates/wasmtime/src/runtime/vm/libcalls.rs`:
+  `live_ref_value_from_raw` uses
+  `DurableReferenceRegistry::resolve_or_register_live_func_ref` and
+  `resolve_or_register_live_extern_ref` only when the WAST fallback flag is
+  enabled.
+  Classification: WAST-only compatibility fallback.
+- `crates/wasmtime/src/runtime/vm/libcalls.rs`:
+  `live_ref_value_from_raw` decodes
+  `OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT` into `ObjectId`.
+  Classification: commit-time promotion source.
+- `crates/wasmtime/src/runtime/transaction.rs`:
+  `GlobalSnapshot::GcRef`, `GlobalSnapshot::FuncRef`, and
+  `TableElementSnapshot::{GcRef, FuncRef}` are live snapshot bridges for
+  global/table helper paths.
+  Classification: ordinary volatile GC use.
+- `crates/wasmtime/src/runtime/vm/libcalls.rs`:
+  `global_snapshot_from_tag`, `read_global_snapshot`,
+  `write_global_snapshot`, `table_element_snapshot_from_raw`,
+  `table_element_snapshot_to_raw`, `read_table_element_snapshot`,
+  `write_table_element_snapshot`, `transaction_ttable_get_impl`, and
+  `transaction_ttable_set_impl` move raw global/table `VMGcRef`/`VMFuncRef`
+  snapshots across helper boundaries before durable root publication rewrites
+  persistent object refs.
+  Classification: ordinary volatile GC use.
+- `crates/wasmtime/src/runtime/transaction.rs`:
+  `persistent_root_object_id_for_global_snapshot` and
+  `persistent_root_object_id_for_table_element_snapshot` convert live
+  global/table snapshots into persistent root `ObjectId`s before durable root
+  publication.
+  Classification: commit-time promotion source.
+- `crates/wasmtime/src/runtime/transaction.rs`:
+  `ObjectTable::gc_ref_to_object`, `ObjectTable::object_to_gc_ref`,
+  `associate_gc_ref`, `object_id_for_gc_ref`,
+  `object_id_for_transaction_ref_raw`, `known_object_id_for_gc_ref`,
+  `known_persistent_object_id_for_gc_ref`, and
+  `known_persistent_object_id_for_transaction_ref_raw` are the volatile
+  `VMGcRef` bridge.
+  Classification: object-model debt.
+- `crates/wasmtime/src/runtime/transaction.rs`:
+  `PersistentObjectRefRaw`, `ObjectValueAbi::from_object_value`, and
+  `ObjectValueAbi::to_object_value` are the durable object payload and root
+  record encoding.
+  Classification: commit-time promotion source.
+- `crates/wasmtime/src/runtime/transaction.rs`:
+  `ObjectTable::live_ref_abi_for_object_id` returns either a volatile GC ref
+  association or the explicit persistent-object live kind. The persistent
+  branch still checks that the raw object ref fits the current live bridge.
+  Classification: object-model debt.
+- `crates/wasmtime/src/runtime/transaction/durable_ref.rs`:
+  `DurableReferenceRegistry::{register_func_ref, resolve_func_ref,
+  resolve_func_identity, register_extern_ref, resolve_extern_ref,
+  resolve_extern_identity}` are the strict durable reference registry.
+  Classification: commit-time promotion source.
+- `crates/wasmtime/src/runtime/transaction/durable_ref.rs`:
+  `resolve_or_register_live_func_ref` and
+  `resolve_or_register_live_extern_ref` are explicit
+  `SHISOFT-TWASM-MOCK` WAST fallbacks behind
+  `enable_live_wast_reference_fallbacks_for_test`.
+  Classification: WAST-only compatibility fallback.
+- `crates/wasmtime/src/runtime/transaction/object_heap.rs`:
+  `append_object_value_bytes`, `decode_payload_bytes`, `trace_object_ids`, and
+  `trace_object_refs_with_layout` encode/decode durable object records and
+  trace only `ObjectValue::Ref(Some(ObjectId))` edges.
+  Classification: commit-time promotion source.
+- `crates/wasmtime/src/runtime/transaction.rs`:
+  `TransactionState::persistent_root_publications` encodes global/table root
+  publications after `persistent_root_object_id_for_global_snapshot` and
+  `persistent_root_object_id_for_table_element_snapshot` have selected
+  persistent `ObjectId` roots.
+  Classification: commit-time promotion source.
+- `crates/wast/src/wast.rs` and `crates/wast/src/spectest.rs`:
+  `configure_transaction_wast_store` enables live proposal compatibility
+  fallbacks for stores it creates, and `link_transaction_spectest_helpers`
+  provides proposal spectest helper imports.
+  Classification: WAST-only compatibility fallback.
+
+Wave 0 verification results:
+
+```text
+rg -n "SHISOFT-TWASM-MOCK|ObjectValueAbi|PersistentObjectRefRaw|VMGcRef|VMFuncRef|DurableReferenceRegistry|transaction_permission" crates/wasmtime crates/cranelift crates/test-util docs/shisoft
+result: completed; output was used for the concrete inventory above.
+
+cargo fmt --check
+result: passed
+
+git diff --check
+result: passed
+```
+
+Remaining stabilization waves:
+
+- Wave 1: final live persistent object-reference ABI.
+- Wave 2: remove long-lived process-local bridge assumptions.
+- Wave 3: finish restart-stable function/external reference reintegration.
+- Wave 4: freeze object header, payload, and layout invariants.
+- Wave 5: harden root recovery closure.
+- Wave 6: switch object permissions to `GranuleId::Object(ObjectId)`.
+- Wave 7: document `RefType.transaction_permission` as a temporary
+  parser/validator/lowering carrier and defer the full `TRefType` split.
+
 ## Current Status: Runtime Design Review Pass
 
 Date: 2026-06-15
