@@ -82,9 +82,10 @@ use crate::error::OutOfMemory;
 use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
+#[cfg(feature = "transaction")]
+use crate::runtime::transaction::{DurableFuncIdentity, ObjectId};
 use crate::runtime::transaction::{
-    DurableFuncIdentity, DurableReferenceRegistry, ObjectId, ObjectTable, TMemoryBackend,
-    TransactionConfig, TransactionState,
+    DurableReferenceRegistry, ObjectTable, TMemoryBackend, TransactionConfig, TransactionState,
 };
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;

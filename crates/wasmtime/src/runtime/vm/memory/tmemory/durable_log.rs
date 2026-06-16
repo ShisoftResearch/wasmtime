@@ -470,9 +470,10 @@ impl TxLogEntry {
 
     fn bytes_without_crc32(&self) -> [u8; 28] {
         let mut bytes = [0u8; 28];
+        let tx_meta_without_lp = self.tx_meta & !1;
         bytes[0..8].copy_from_slice(&self.logical_id.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.version.to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.tx_meta.to_le_bytes());
+        bytes[12..16].copy_from_slice(&tx_meta_without_lp.to_le_bytes());
         bytes[16..20].copy_from_slice(&self.data_block.to_le_bytes());
         bytes[20..24].copy_from_slice(&self.data_offset.to_le_bytes());
         bytes[24..28].copy_from_slice(&self.entry_meta.to_le_bytes());
@@ -698,6 +699,17 @@ mod tests {
         entry.seal_crc32();
 
         assert_eq!(entry.role().unwrap(), TxLogEntryRole::TMemoryUndo);
+        assert!(entry.validate_crc32());
+    }
+
+    #[test]
+    fn tx_log_entry_crc_ignores_lp_bit() {
+        let mut entry = TxLogEntry::new(0x1000_0000_0000_0003, 7, 11 << 1, 4, 32);
+        entry.set_role(TxLogEntryRole::TMemoryUndo);
+        entry.seal_crc32();
+
+        entry.tx_meta |= 1;
+
         assert!(entry.validate_crc32());
     }
 

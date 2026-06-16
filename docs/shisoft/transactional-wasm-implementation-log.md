@@ -30,6 +30,36 @@ for the current persistent-promotion roadmap. It supersedes the older
 plan described `ti31`, `tfuncref`, or `texternref` as standalone object-table
 payloads.
 
+## Current Status: Runtime Design Review Pass
+
+Date: 2026-06-15
+
+This review pass checked the transaction feature gate, durable publication
+ordering, mixed `tmemory`/object commit path, and remaining
+`SHISOFT-TWASM-MOCK` boundaries against
+`docs/shisoft/transactional-wasm-runtime-core-design.md`.
+
+Fixes from the pass:
+
+- Disabled-feature Wasmtime builds no longer compile GC-only ordinary-object
+  promotion code. Struct/array promotion through Wasmtime GC layouts is gated on
+  the `gc` feature, while no-GC builds fail promotion attempts with explicit
+  diagnostics instead of depending on unavailable `VMGcRef` helpers.
+- Removed the stale object-publication helper that put LP directly on the last
+  ordinary `TObjectPub` entry. The runtime now uses the design sequence:
+  append all object/root data records, flush/fence data once, append ordinary
+  `TObjectPub` log entries with LP clear, flush log, then flip LP on the last
+  transaction log entry and flush/fence that log block. CRC validation hashes
+  `tx_meta` with LP cleared, so the LP flip does not require CRC recomputation.
+- Recording durability tests now record each data write, so ordering tests can
+  prove all object data writes precede the first data flush/fence.
+
+The mixed persistent commit path still follows the current design: persistent
+linear-memory undo records are written and fenced before in-place base-image
+updates; object/root redo publications remain loose until the single final LP;
+transactions without LP are recovered as aborted, rolling back `TMemoryUndo`
+records and dropping object/root publications.
+
 ## Current Status: Durable Block Reuse
 
 Date: 2026-06-15
@@ -48,7 +78,7 @@ Implemented reuse paths:
 - Completed linear-memory undo chunks can be retired and later reused without
   letting old committed undo entries roll back recovered memory.
 - Mixed object+tmemory transactions track tmemory undo chunks independently of
-  the final LP marker role, so object-final commits can still retire their
+  the last LP-marked entry role, so object-final commits can still retire their
   committed undo chunks.
 - Post-LP linear-undo retirement is best-effort cleanup: LP durability errors
   still fail commit publication, but cleanup errors after a durable LP do not
@@ -1665,13 +1695,12 @@ Current tagged mock categories:
   use the real transaction parser/runtime path. The remaining harness rewrite
   is diagnostic-only, mapping proposal assertion strings to equivalent
   Wasmtime-style diagnostics.
-- Runtime libcall gaps in `crates/wasmtime/src/runtime/vm/libcalls.rs`.
-  Scalar `tmemory` and numeric/v128 `tglobal` ops run through real compiled
-  helper paths. Numeric imported `tglobal` is supported; object struct/array
-  payload operations now use the volatile `ObjectId` bridge and COW object
-  helpers. Remaining gaps are durable persistent-object identity/storage and
-  replacement of the generated-helper compatibility path with final proposal
-  helper typing.
+- Runtime libcall boundaries in `crates/wasmtime/src/runtime/vm/libcalls.rs`.
+  Scalar `tmemory`, SIMD transactional memory, numeric/v128 `tglobal`, table,
+  object payload, and persistent publication paths run through real compiled
+  helper paths. Remaining tagged boundaries are the live-only reference bridge
+  fallback, generated-helper compatibility shapes that need final proposal
+  typing, and the final `ObjectId`-carrying live `tref` ABI.
 - Transaction state/config scaffold in
   `crates/wasmtime/src/runtime/transaction.rs`. Backend, durability,
   conflict-policy, and concurrency-control selection have the future shape,

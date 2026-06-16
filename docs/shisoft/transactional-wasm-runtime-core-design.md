@@ -358,7 +358,7 @@ record and one publication log entry. The publication commit sequence is:
 3. Fence.
 4. Append ordinary log entries.
 5. Flush log.
-6. Append the final log entry with the LP bit set.
+6. Flip the LP bit on the last log entry of the transaction.
 7. Flush log.
 8. Fence.
 
@@ -397,10 +397,12 @@ entry_meta:
 
 Role zero is a `TObjectPub` entry, and role one is a `TMemoryUndo` entry. Log
 entries carry CRC32 because recovery scans them directly and must reject torn or
-corrupt entries. Data records do not carry a checksum in this design: they are
-not scanned independently, and their completeness is guaranteed by
-data-before-log or undo-before-write ordering, flushes, fences, and LP
-publication. Data corruption detection is left to future storage-layer
+corrupt entries. The CRC32 payload excludes the LP bit by hashing `tx_meta` with
+bit 0 cleared; committing a transaction flips only LP on the already-written
+last entry and does not recompute CRC. Data records do not carry a checksum in
+this design: they are not scanned independently, and their completeness is
+guaranteed by data-before-log or undo-before-write ordering, flushes, fences,
+and LP publication. Data corruption detection is left to future storage-layer
 integrity work.
 
 If 30 generation bits are not enough for a long-running region, the region must
@@ -491,11 +493,10 @@ recovery, undo records in transactions without LP are replayed as rollbacks;
 undo records in transactions with LP are ignored.
 
 If a transaction only mutates persistent `tmemory` and has no object/global/table
-publication entries, commit still needs an LP. The substrate publishes that LP
-as a second final `TMemoryUndo` log entry pointing at the last undo data record;
-it does not append another data record. Recovery treats the transaction as
-committed because LP is present and ignores all undo entries for that
-transaction.
+publication entries, commit still needs an LP. The substrate flips LP on the
+last existing `TMemoryUndo` log entry; it does not append another data record
+or another log entry. Recovery treats the transaction as committed because LP is
+present and ignores all undo entries for that transaction.
 
 Recovery discovers streams by scanning chunk-start blocks and validates
 log-entry CRC32 values. Publication records from LP-marked transactions are
@@ -512,7 +513,7 @@ backend commit path to flush/fence persistent data writes. `TransactionState`
 owns the unified durable-log object. During commit, the transaction layer
 appends all persistent `TMemoryUndo` records into that stream before any
 persistent in-place memory write, applies every touched `tmemory` participant,
-and then publishes one LP marker for the whole transaction.
+and then flips LP on the last log entry for the whole transaction.
 
 This removes the earlier conservative rejection for transactions that touch
 more than one persistent `tmemory` participant. The durable-log owner dispatches

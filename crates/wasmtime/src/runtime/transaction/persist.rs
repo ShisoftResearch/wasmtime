@@ -238,6 +238,7 @@ pub(crate) trait DurableSink {
         is_final: bool,
         role: TxLogEntryRole,
     ) -> Result<()>;
+    fn mark_last_log_entry_committed(&mut self, marker: PendingCommitLogEntry) -> Result<()>;
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
@@ -267,6 +268,11 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
         record: &[u8],
     ) -> Result<DurableDataRecordPointer>;
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()>;
+    fn mark_last_log_entry_committed(
+        &mut self,
+        transaction_stream_id: u32,
+        marker: PendingCommitLogEntry,
+    ) -> Result<()>;
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
@@ -468,6 +474,32 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
         Ok(())
     }
 
+    fn mark_last_log_entry_committed(
+        &mut self,
+        transaction_stream_id: u32,
+        marker: PendingCommitLogEntry,
+    ) -> Result<()> {
+        let state = self
+            .streams
+            .get_mut(&transaction_stream_id)
+            .with_context(|| format!("transaction stream {transaction_stream_id} has no log"))?;
+        let entry = state
+            .log_entries
+            .last_mut()
+            .context("transaction commit LP requires a log entry")?;
+        ensure!(
+            entry.logical_id == marker.logical_id
+                && entry.version == marker.version
+                && entry.data_block == marker.data_block
+                && entry.data_offset == marker.data_offset
+                && entry.data_block_generation() == marker.data_block_generation
+                && entry.role()? == marker.role,
+            "transactional commit LP marker does not match the last log entry"
+        );
+        entry.tx_meta |= 1;
+        Ok(())
+    }
+
     fn flush_data(&mut self) -> Result<()> {
         Ok(())
     }
@@ -538,6 +570,25 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
         let stream = self.stream_cursor(transaction_stream_id)?;
         let log_block = self.region.append_log_entry(stream, entry)?;
+        self.pending_log_blocks.insert(log_block);
+        Ok(())
+    }
+
+    fn mark_last_log_entry_committed(
+        &mut self,
+        transaction_stream_id: u32,
+        marker: PendingCommitLogEntry,
+    ) -> Result<()> {
+        let stream = self.stream_cursor(transaction_stream_id)?;
+        let log_block = self.region.mark_last_log_entry_committed(
+            stream,
+            marker.logical_id,
+            marker.version,
+            marker.data_block,
+            marker.data_offset,
+            marker.data_block_generation,
+            marker.role,
+        )?;
         self.pending_log_blocks.insert(log_block);
         Ok(())
     }
@@ -643,6 +694,12 @@ impl DurableSink for TxDurableLogSink<'_> {
         self.log.storage.append_log_entry(self.stream_id, entry)
     }
 
+    fn mark_last_log_entry_committed(&mut self, marker: PendingCommitLogEntry) -> Result<()> {
+        self.log
+            .storage
+            .mark_last_log_entry_committed(self.stream_id, marker)
+    }
+
     fn flush_data(&mut self) -> Result<()> {
         self.log.storage.flush_data()
     }
@@ -678,55 +735,6 @@ where
             stream_id,
             txid,
         }
-    }
-
-    pub(crate) fn publish_transaction(&mut self, pubs: &[PendingPublication]) -> Result<()> {
-        let _ = self.stream_id;
-
-        let mut ordinary = Vec::new();
-        for pub_ in pubs {
-            let record = encode_data_record(pub_)?;
-            let pointer = self
-                .sink
-                .append_data_record(&record, DurableDataStream::ObjectPublication)?;
-            ordinary.push((pub_.logical_id, pub_.version, self.txid << 1, pointer));
-        }
-
-        self.sink.flush_data()?;
-        self.sink.fence()?;
-
-        for &(logical_id, version, tx_meta, pointer) in
-            ordinary.iter().take(ordinary.len().saturating_sub(1))
-        {
-            self.sink.append_log_entry(
-                logical_id,
-                version,
-                tx_meta,
-                pointer.data_block,
-                pointer.data_offset,
-                pointer.data_block_generation,
-                false,
-                TxLogEntryRole::TObjectPub,
-            )?;
-        }
-        self.sink.flush_log()?;
-
-        if let Some(&(logical_id, version, tx_meta, pointer)) = ordinary.last() {
-            self.sink.append_log_entry(
-                logical_id,
-                version,
-                tx_meta,
-                pointer.data_block,
-                pointer.data_offset,
-                pointer.data_block_generation,
-                true,
-                TxLogEntryRole::TObjectPub,
-            )?;
-            self.sink.flush_log()?;
-            self.sink.fence()?;
-        }
-
-        Ok(())
     }
 
     pub(crate) fn publish_tmemory_undo_before_in_place_write(
@@ -805,17 +813,56 @@ where
         })
     }
 
+    pub(crate) fn publish_object_publications_before_commit(
+        &mut self,
+        publications: &[PendingPublication],
+    ) -> Result<Option<PendingCommitLogEntry>> {
+        let _ = self.stream_id;
+        if publications.is_empty() {
+            return Ok(None);
+        }
+
+        let mut records = Vec::with_capacity(publications.len());
+        for publication in publications {
+            let record = encode_data_record(publication)?;
+            let pointer = self
+                .sink
+                .append_data_record(&record, DurableDataStream::ObjectPublication)?;
+            records.push((publication, pointer));
+        }
+
+        self.sink.flush_data()?;
+        self.sink.fence()?;
+
+        let mut final_marker = None;
+        for (publication, pointer) in records {
+            self.sink.append_log_entry(
+                publication.logical_id,
+                publication.version,
+                self.txid << 1,
+                pointer.data_block,
+                pointer.data_offset,
+                pointer.data_block_generation,
+                false,
+                TxLogEntryRole::TObjectPub,
+            )?;
+            final_marker = Some(PendingCommitLogEntry {
+                logical_id: publication.logical_id,
+                version: publication.version,
+                chunk_start_block: pointer.chunk_start_block,
+                data_block: pointer.data_block,
+                data_offset: pointer.data_offset,
+                data_block_generation: pointer.data_block_generation,
+                role: TxLogEntryRole::TObjectPub,
+            });
+        }
+        self.sink.flush_log()?;
+
+        Ok(final_marker)
+    }
+
     pub(crate) fn publish_commit_lp(&mut self, marker: PendingCommitLogEntry) -> Result<()> {
-        self.sink.append_log_entry(
-            marker.logical_id,
-            marker.version,
-            self.txid << 1,
-            marker.data_block,
-            marker.data_offset,
-            marker.data_block_generation,
-            true,
-            marker.role,
-        )?;
+        self.sink.mark_last_log_entry_committed(marker)?;
         self.sink.flush_log()?;
         self.sink.fence()?;
         if marker.role == TxLogEntryRole::TMemoryUndo {
@@ -839,6 +886,7 @@ pub(crate) enum RecordingBackendEvent {
     EnsureTypeLayout(u32),
     AppendDataRecord(DurableDataStream),
     AppendLogEntry(TxLogEntryRole),
+    MarkLogEntryCommitted(TxLogEntryRole),
     FlushData,
     FlushLog,
     Fence,
@@ -919,6 +967,15 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
 
     fn append_log_entry(&mut self, _transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
         self.push_event(RecordingBackendEvent::AppendLogEntry(entry.role()?));
+        Ok(())
+    }
+
+    fn mark_last_log_entry_committed(
+        &mut self,
+        _transaction_stream_id: u32,
+        marker: PendingCommitLogEntry,
+    ) -> Result<()> {
+        self.push_event(RecordingBackendEvent::MarkLogEntryCommitted(marker.role));
         Ok(())
     }
 
@@ -1052,6 +1109,10 @@ impl DurableSink for RetirementFailingDurability {
         )
     }
 
+    fn mark_last_log_entry_committed(&mut self, marker: PendingCommitLogEntry) -> Result<()> {
+        self.inner.mark_last_log_entry_committed(marker)
+    }
+
     fn flush_data(&mut self) -> Result<()> {
         self.inner.flush_data()
     }
@@ -1077,9 +1138,7 @@ impl DurableSink for RecordingDurability {
         _record: &[u8],
         _data_stream: DurableDataStream,
     ) -> Result<DurableDataRecordPointer> {
-        if self.events.last() != Some(&DurabilityEvent::DataWrite) {
-            self.events.push(DurabilityEvent::DataWrite);
-        }
+        self.events.push(DurabilityEvent::DataWrite);
         let data_block = self.next_data_block;
         self.next_data_block = self
             .next_data_block
@@ -1108,6 +1167,15 @@ impl DurableSink for RecordingDurability {
         let stored_tx_meta = if is_final { tx_meta | 1 } else { tx_meta & !1 };
         self.tx_meta.push(stored_tx_meta);
         self.roles.push(role);
+        Ok(())
+    }
+
+    fn mark_last_log_entry_committed(&mut self, _marker: PendingCommitLogEntry) -> Result<()> {
+        let entry = self
+            .tx_meta
+            .last_mut()
+            .context("recording durability commit LP requires a log entry")?;
+        *entry |= 1;
         Ok(())
     }
 
@@ -1217,14 +1285,25 @@ mod tests {
         }
     }
 
+    fn publish_sample_publications_with_lp<S>(publisher: &mut StreamPublisher<'_, S>) -> Result<()>
+    where
+        S: DurableSink,
+    {
+        let publications = sample_publications();
+        let marker = publisher.publish_object_publications_before_commit(&publications)?;
+        if let Some(marker) = marker {
+            publisher.publish_commit_lp(marker)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn commit_publishes_only_the_last_entry_with_lp() {
         let mut recorder = RecordingDurability::default();
         let mut publisher = StreamPublisher::new_for_test(&mut recorder, 4, 21);
-        publisher
-            .publish_transaction(&sample_publications())
-            .unwrap();
+        publish_sample_publications_with_lp(&mut publisher).unwrap();
 
+        assert_eq!(recorder.tx_meta.len(), sample_publications().len());
         assert_eq!(recorder.final_lp_count(), 1);
         assert!(recorder.non_final_log_entries_before_final_lp());
     }
@@ -1233,15 +1312,18 @@ mod tests {
     fn commit_orders_data_before_final_lp() {
         let mut recorder = RecordingDurability::default();
         let mut publisher = StreamPublisher::new_for_test(&mut recorder, 4, 99);
-        publisher
-            .publish_transaction(&sample_publications())
-            .unwrap();
+        publish_sample_publications_with_lp(&mut publisher).unwrap();
 
-        assert!(recorder.events().starts_with(&[
-            DurabilityEvent::DataWrite,
-            DurabilityEvent::DataFlush,
-            DurabilityEvent::Fence,
-        ]));
+        let data_write_count = sample_publications().len();
+        assert!(
+            recorder.events()[..data_write_count]
+                .iter()
+                .all(|event| *event == DurabilityEvent::DataWrite)
+        );
+        assert_eq!(
+            &recorder.events()[data_write_count..data_write_count + 2],
+            &[DurabilityEvent::DataFlush, DurabilityEvent::Fence]
+        );
         assert_eq!(recorder.events().last(), Some(&DurabilityEvent::Fence));
     }
 
@@ -1298,16 +1380,12 @@ mod tests {
                 DurabilityEvent::LogWrite,
                 DurabilityEvent::LogFlush,
                 DurabilityEvent::Fence,
-                DurabilityEvent::LogWrite,
                 DurabilityEvent::LogFlush,
                 DurabilityEvent::Fence,
             ]
         );
         assert_eq!(recorder.final_lp_count(), 1);
-        assert_eq!(
-            recorder.roles,
-            vec![TxLogEntryRole::TMemoryUndo, TxLogEntryRole::TMemoryUndo]
-        );
+        assert_eq!(recorder.roles, vec![TxLogEntryRole::TMemoryUndo]);
     }
 
     #[test]
@@ -1512,7 +1590,7 @@ mod tests {
         }
 
         let entries = log.log_entries_for_test(12);
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].logical_id, first_marker.logical_id);
         assert_eq!(entries[1].logical_id, second_marker.logical_id);
         assert_eq!(
@@ -1522,6 +1600,7 @@ mod tests {
                 .count(),
             1
         );
+        assert!(entries[1].tx_meta & 1 != 0);
         assert!(entries.iter().all(TxLogEntry::validate_crc32));
     }
 
@@ -1615,10 +1694,14 @@ mod tests {
             publisher.publish_commit_lp(object_marker).unwrap();
         }
         assert_eq!(
-            log.log_entries_for_test(12)
-                .iter()
-                .filter(|entry| entry.tx_meta & 1 != 0)
-                .count(),
+            {
+                let entries = log.log_entries_for_test(12);
+                assert_eq!(entries.len(), 2);
+                entries
+                    .iter()
+                    .filter(|entry| entry.tx_meta & 1 != 0)
+                    .count()
+            },
             1
         );
         drop(log);
@@ -2921,18 +3004,10 @@ mod tests {
                     });
                 }
                 if tx.commit {
-                    let last = tx
-                        .records
-                        .last()
-                        .copied()
-                        .expect("scenario tx must have records");
-                    entries.push(ExpectedLogEntry {
-                        logical_id: last.logical_id(),
-                        version: last.version(),
-                        txid: tx.txid,
-                        role: last.role(),
-                        is_final: true,
-                    });
+                    entries
+                        .last_mut()
+                        .expect("scenario tx must have records")
+                        .is_final = true;
                 }
                 streams.insert(tx.stream_id, entries);
             }
@@ -3158,26 +3233,14 @@ mod tests {
                 for window in actual_entries.windows(2) {
                     let current = &window[0];
                     let next = &window[1];
-                    let next_is_final = (next.tx_meta & 1) != 0;
-                    if next_is_final {
-                        assert_eq!(
-                            (next.data_block, next.data_offset),
-                            (current.data_block, current.data_offset),
-                            "backend {} scenario {} stream {} final lp must reuse previous data pointer",
-                            factory.name(),
-                            scenario.name,
-                            stream_id,
-                        );
-                    } else {
-                        assert_ne!(
-                            (next.data_block, next.data_offset),
-                            (current.data_block, current.data_offset),
-                            "backend {} scenario {} stream {} new records must advance to a new data pointer",
-                            factory.name(),
-                            scenario.name,
-                            stream_id,
-                        );
-                    }
+                    assert_ne!(
+                        (next.data_block, next.data_offset),
+                        (current.data_block, current.data_offset),
+                        "backend {} scenario {} stream {} adjacent records must advance to a new data pointer",
+                        factory.name(),
+                        scenario.name,
+                        stream_id,
+                    );
                 }
             }
 
@@ -3207,7 +3270,9 @@ mod tests {
                     .unwrap();
 
                 for (entry_index, entry) in actual_entries.iter().enumerate() {
-                    if (entry.tx_meta & 1) != 0 {
+                    if (entry.tx_meta & 1) != 0
+                        && entry.role().unwrap() == TxLogEntryRole::TMemoryUndo
+                    {
                         continue;
                     }
 

@@ -1246,6 +1246,53 @@ impl VMemoryBlockRegion {
         Ok(log_block)
     }
 
+    pub(crate) fn mark_last_log_entry_committed(
+        &mut self,
+        stream: StreamCursor,
+        logical_id: u64,
+        version: u32,
+        data_block: u32,
+        data_offset: u32,
+        data_block_generation: u32,
+        role: TxLogEntryRole,
+    ) -> Result<u32> {
+        let state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let log_block = state
+            .current_log_block_start
+            .context("transactional commit LP requires a log entry")?;
+        let header = self.log_block_header(log_block)?;
+        ensure!(
+            header.entry_count > 0,
+            "transactional commit LP requires a log entry"
+        );
+        let entry_index = usize::try_from(header.entry_count - 1)
+            .context("transactional log entry count overflow")?;
+        ensure!(
+            entry_index < self.log_entry_capacity(),
+            "transactional log block entry count exceeds capacity"
+        );
+        let entry_offset = self
+            .block_offset(log_block)?
+            .checked_add(size_of::<LogBlockHeader>())
+            .and_then(|offset| offset.checked_add(entry_index * size_of::<TxLogEntry>()))
+            .context("transactional log entry write offset overflow")?;
+        let mut entry = decode_tx_log_entry(self.read(entry_offset, size_of::<TxLogEntry>())?)?;
+        ensure!(
+            entry.logical_id == logical_id
+                && entry.version == version
+                && entry.data_block == data_block
+                && entry.data_offset == data_offset
+                && entry.data_block_generation() == data_block_generation
+                && entry.role()? == role,
+            "transactional commit LP marker does not match the last log entry"
+        );
+        entry.tx_meta |= 1;
+        self.write(entry_offset, &encode_tx_log_entry(entry))?;
+        Ok(log_block)
+    }
+
     pub(crate) fn flush_data_chunk(&self, chunk_start_block: u32) -> Result<()> {
         let header = self.data_chunk_header(chunk_start_block)?;
         let chunk_blocks = usize::try_from(header.chunk_blocks)
@@ -2295,6 +2342,53 @@ impl FileBackedMemoryBlockRegion {
         self.write_log_block_header(log_block, header)?;
         self.streams.insert(stream.stream_id, state);
 
+        Ok(log_block)
+    }
+
+    pub(crate) fn mark_last_log_entry_committed(
+        &mut self,
+        stream: StreamCursor,
+        logical_id: u64,
+        version: u32,
+        data_block: u32,
+        data_offset: u32,
+        data_block_generation: u32,
+        role: TxLogEntryRole,
+    ) -> Result<u32> {
+        let state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let log_block = state
+            .current_log_block_start
+            .context("transactional commit LP requires a log entry")?;
+        let header = self.log_block_header(log_block)?;
+        ensure!(
+            header.entry_count > 0,
+            "transactional commit LP requires a log entry"
+        );
+        let entry_index = usize::try_from(header.entry_count - 1)
+            .context("transactional log entry count overflow")?;
+        ensure!(
+            entry_index < self.log_entry_capacity(),
+            "transactional log block entry count exceeds capacity"
+        );
+        let entry_offset = self
+            .block_offset(log_block)?
+            .checked_add(size_of::<LogBlockHeader>())
+            .and_then(|offset| offset.checked_add(entry_index * size_of::<TxLogEntry>()))
+            .context("transactional log entry write offset overflow")?;
+        let mut entry = decode_tx_log_entry(self.read(entry_offset, size_of::<TxLogEntry>())?)?;
+        ensure!(
+            entry.logical_id == logical_id
+                && entry.version == version
+                && entry.data_block == data_block
+                && entry.data_offset == data_offset
+                && entry.data_block_generation() == data_block_generation
+                && entry.role()? == role,
+            "transactional commit LP marker does not match the last log entry"
+        );
+        entry.tx_meta |= 1;
+        self.write(entry_offset, &encode_tx_log_entry(entry))?;
         Ok(log_block)
     }
 
@@ -4049,9 +4143,7 @@ mod tests {
     fn file_backed_block_region_grows_existing_mapping_and_preserves_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grow-block-region.tmemory");
-        let mut region =
-            FileBackedMemoryBlockRegion::new_for_test(1, FileBackedRegionMode::Path(path.clone()))
-                .unwrap();
+        let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 5).unwrap();
         let chunk = region.alloc_chunk(1).unwrap();
         let range = chunk.byte_range();
 
@@ -4059,11 +4151,11 @@ mod tests {
         region.flush(range.start + 16, 4).unwrap();
         region.fence().unwrap();
 
-        let grown = region.grow_to_blocks(2).unwrap().unwrap();
+        let grown = region.grow_to_blocks(6).unwrap().unwrap();
 
-        assert_eq!(grown.byte_range(), BLOCK_SIZE..(2 * BLOCK_SIZE));
-        assert_eq!(region.num_blocks(), 2);
-        assert_eq!(region.bytes_len(), 2 * BLOCK_SIZE);
+        assert_eq!(grown.byte_range(), (5 * BLOCK_SIZE)..(6 * BLOCK_SIZE));
+        assert_eq!(region.num_blocks(), 6);
+        assert_eq!(region.bytes_len(), 6 * BLOCK_SIZE);
         assert_eq!(region.read(range.start + 16, 4).unwrap(), vec![1, 2, 3, 4]);
 
         region
@@ -4677,8 +4769,9 @@ mod tests {
         let err = FileBackedMemoryBlockRegion::create_for_test(&path, 2)
             .unwrap_err()
             .to_string();
+        let required = reserved_metadata_blocks(2).unwrap();
         assert!(
-            err.contains("at least 3 blocks") || err.contains("metadata"),
+            err.contains(&format!("at least {required} blocks")) || err.contains("metadata"),
             "{err}"
         );
     }

@@ -29,8 +29,10 @@ pub(crate) use object_gc::{
 use object_gc::{PersistentObjectEdge, PersistentObjectMarker};
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
+#[cfg(feature = "gc")]
+pub(crate) use durable_ref::DurableExternRefHostData;
 pub(crate) use durable_ref::{
-    DurableExternIdentity, DurableExternRefHostData, DurableFuncIdentity, DurableReferenceRegistry,
+    DurableExternIdentity, DurableFuncIdentity, DurableReferenceRegistry,
 };
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
@@ -3130,11 +3132,7 @@ impl TransactionState {
 
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-        let mut final_marker = None;
-        for publication in publications {
-            final_marker = Some(publisher.publish_object_publication_before_commit(publication)?);
-        }
-        Ok(final_marker)
+        publisher.publish_object_publications_before_commit(publications)
     }
 
     pub(crate) fn publish_commit_lp(
@@ -7576,7 +7574,10 @@ mod tests {
             tmemory.read_committed(4..8).expect("read committed"),
             vec![9, 8, 7, 6]
         );
-        assert_eq!(state.durable_log_entries_for_test(12).len(), 2);
+        let entries = state.durable_log_entries_for_test(12);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].tx_meta & 1 != 0);
+        assert!(entries[0].validate_crc32());
     }
 
     #[test]

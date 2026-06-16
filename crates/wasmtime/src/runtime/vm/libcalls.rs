@@ -57,15 +57,16 @@
 use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
+#[cfg(feature = "gc")]
+use crate::runtime::transaction::DurableExternRefHostData;
 use crate::runtime::transaction::{
-    DurableExternRefHostData, DurableReferenceRegistry, GlobalSnapshot, GranuleId,
-    OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN, OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC,
-    OBJECT_VALUE_ABI_LIVE_REF_KIND_GC, OBJECT_VALUE_ABI_LIVE_REF_KIND_I31,
-    OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
-    OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable, ObjectValue, ObjectValueAbi,
-    OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource, OrdinaryGcPromotionValue,
-    PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot,
-    TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
+    DurableReferenceRegistry, GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_I31, OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED, OBJECT_VALUE_ABI_TAG_REF, ObjectPayload, ObjectTable,
+    ObjectValue, ObjectValueAbi, OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource,
+    OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE, PendingCommitLogEntry, StagedRecord,
+    TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot, TransactionId, TransactionState,
     WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
     collect_tmemory_access_snapshot,
 };
@@ -74,17 +75,20 @@ use crate::runtime::vm::{
     self, FuncRefTableId, GcStore, HostResultHasUnwindSentinel, TableElementType, VMStore, f32x4,
     f64x2, i8x16,
 };
-use crate::{ArrayType, Engine, HeapType, StorageType, StructType, ValType};
+#[cfg(feature = "gc")]
+use crate::{ArrayType, StructType};
+use crate::{Engine, HeapType, StorageType, ValType};
 use alloc::collections::BTreeMap;
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
 use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
+#[cfg(feature = "gc")]
+use wasmtime_environ::GcLayout;
 use wasmtime_environ::{
-    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GcLayout, GlobalIndex,
-    MemoryIndex, PassiveElemIndex, TableIndex, Trap, VMGcKind, VMSharedTypeIndex, WasmHeapTopType,
-    WasmValType,
+    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GlobalIndex, MemoryIndex,
+    PassiveElemIndex, TableIndex, Trap, VMGcKind, VMSharedTypeIndex, WasmHeapTopType, WasmValType,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::AccessError::{
@@ -282,8 +286,9 @@ fn memory_grow(
 
 // Transaction libcalls execute compiled transactional operators against
 // store-local transaction state and per-instance `tmemory` sidecars. Remaining
-// `SHISOFT-TWASM-MOCK` tags below mark object-table, reference/object global,
-// imported-v128 global, and table-element COW gaps.
+// `SHISOFT-TWASM-MOCK` tags mark explicit research boundaries such as live-only
+// reference bridge fallbacks; committed object/root and linear-memory paths use
+// the durable transaction machinery.
 fn transaction_enter_tfunc(store: &mut dyn VMStore, _instance: InstanceId) -> Result<u32> {
     let state = store.store_opaque_mut().transaction_state_mut();
     if state.structured_failure_pending() {
@@ -349,12 +354,14 @@ pub(crate) fn transaction_commit_selected_for_host(
     Ok(true)
 }
 
+#[cfg_attr(not(feature = "gc"), allow(dead_code))]
 struct StoreBackedOrdinaryGcPromotionAdapter<'a> {
     engine: &'a Engine,
     gc_store: Option<&'a mut GcStore>,
     durable_refs: &'a mut DurableReferenceRegistry,
 }
 
+#[cfg_attr(not(feature = "gc"), allow(dead_code))]
 impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
     fn new(
         engine: &'a Engine,
@@ -444,6 +451,7 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
         if self.durable_refs.resolve_extern_ref(raw_gc_ref).is_some() {
             return self.read_extern_ref_value(raw_gc_ref);
         }
+        #[cfg(feature = "gc")]
         if let Some(gc_store) = self.gc_store.as_mut()
             && gc_ref.as_externref(&*gc_store.gc_heap).is_some()
         {
@@ -477,6 +485,9 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
         let Some(gc_ref) = VMGcRef::from_raw_u32(raw_gc_ref) else {
             bail!("ordinary GC promotion cannot encode invalid external reference");
         };
+        #[cfg(not(feature = "gc"))]
+        let _ = gc_ref;
+        #[cfg(feature = "gc")]
         let embedded_identity = {
             let gc_store = self.gc_store_mut()?;
             let Some(extern_ref) = gc_ref.as_externref(&*gc_store.gc_heap) else {
@@ -487,6 +498,8 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
                 .downcast_ref::<DurableExternRefHostData>()
                 .map(DurableExternRefHostData::identity)
         };
+        #[cfg(not(feature = "gc"))]
+        let embedded_identity = None;
         let identity = match embedded_identity {
             Some(identity) => {
                 self.durable_refs
@@ -546,44 +559,52 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
         gc_ref: &VMGcRef,
         type_index: VMSharedTypeIndex,
     ) -> Result<OrdinaryGcPromotionSource> {
-        let layout = self
-            .engine
-            .signatures()
-            .layout(type_index)
-            .with_context(|| {
-                format!(
-                    "ordinary GC struct type {} has no registered GC layout",
-                    type_index.bits()
-                )
-            })?;
-        let GcLayout::Struct(layout) = layout else {
-            bail!("ordinary GC struct type layout is not a struct layout");
-        };
-        let field_types = StructType::from_shared_type_index(self.engine, type_index)
-            .fields()
-            .map(|field| field.element_type().clone())
-            .collect::<Vec<_>>();
-        ensure!(
-            field_types.len() == layout.fields.len(),
-            "ordinary GC struct layout field count mismatch"
-        );
-        let mut fields = Vec::with_capacity(field_types.len());
-        for (field_type, field_layout) in field_types.iter().zip(layout.fields.iter()) {
-            fields.push(self.read_storage_value(gc_ref, field_type, field_layout.offset)?);
+        #[cfg(not(feature = "gc"))]
+        {
+            let _ = (object_table, gc_ref, type_index);
+            bail!("ordinary GC struct promotion requires the `gc` cargo feature");
         }
-        let field_layouts = Self::canonical_field_layouts(&field_types)?;
-        let type_layout_id = object_table
-            .ensure_persistent_struct_layout_for_wasmtime_type_layout_namespace(
-                // VMSharedTypeIndex is engine-global, so ordinary Wasmtime GC
-                // promotion uses the stable engine-level namespace.
-                0,
-                type_index.bits(),
-                field_layouts,
-            )?;
-        Ok(OrdinaryGcPromotionSource::Struct {
-            type_layout_id,
-            fields,
-        })
+        #[cfg(feature = "gc")]
+        {
+            let layout = self
+                .engine
+                .signatures()
+                .layout(type_index)
+                .with_context(|| {
+                    format!(
+                        "ordinary GC struct type {} has no registered GC layout",
+                        type_index.bits()
+                    )
+                })?;
+            let GcLayout::Struct(layout) = layout else {
+                bail!("ordinary GC struct type layout is not a struct layout");
+            };
+            let field_types = StructType::from_shared_type_index(self.engine, type_index)
+                .fields()
+                .map(|field| field.element_type().clone())
+                .collect::<Vec<_>>();
+            ensure!(
+                field_types.len() == layout.fields.len(),
+                "ordinary GC struct layout field count mismatch"
+            );
+            let mut fields = Vec::with_capacity(field_types.len());
+            for (field_type, field_layout) in field_types.iter().zip(layout.fields.iter()) {
+                fields.push(self.read_storage_value(gc_ref, field_type, field_layout.offset)?);
+            }
+            let field_layouts = Self::canonical_field_layouts(&field_types)?;
+            let type_layout_id = object_table
+                .ensure_persistent_struct_layout_for_wasmtime_type_layout_namespace(
+                    // VMSharedTypeIndex is engine-global, so ordinary Wasmtime GC
+                    // promotion uses the stable engine-level namespace.
+                    0,
+                    type_index.bits(),
+                    field_layouts,
+                )?;
+            Ok(OrdinaryGcPromotionSource::Struct {
+                type_layout_id,
+                fields,
+            })
+        }
     }
 
     fn promote_array_source(
@@ -592,51 +613,59 @@ impl<'a> StoreBackedOrdinaryGcPromotionAdapter<'a> {
         gc_ref: &VMGcRef,
         type_index: VMSharedTypeIndex,
     ) -> Result<OrdinaryGcPromotionSource> {
-        let layout = self
-            .engine
-            .signatures()
-            .layout(type_index)
-            .with_context(|| {
-                format!(
-                    "ordinary GC array type {} has no registered GC layout",
-                    type_index.bits()
-                )
-            })?;
-        let GcLayout::Array(layout) = layout else {
-            bail!("ordinary GC array type layout is not an array layout");
-        };
-        let element_type =
-            ArrayType::from_shared_type_index(self.engine, type_index).element_type();
-        let len = {
-            let gc_store = self.gc_store_mut()?;
-            let array_ref = gc_ref
-                .as_arrayref(&*gc_store.gc_heap)
-                .context("ordinary GC ref is not an arrayref")?;
-            gc_store.array_len(array_ref)?
-        };
-        let mut elements = Vec::with_capacity(
-            usize::try_from(len).context("ordinary GC array length exceeds usize")?,
-        );
-        for index in 0..len {
-            let offset = layout
-                .elem_offset(index)
-                .context("ordinary GC array element offset overflow")?;
-            elements.push(self.read_storage_value(gc_ref, &element_type, offset)?);
+        #[cfg(not(feature = "gc"))]
+        {
+            let _ = (object_table, gc_ref, type_index);
+            bail!("ordinary GC array promotion requires the `gc` cargo feature");
         }
-        let element_is_object_ref = Self::storage_type_traces_object_refs(&element_type);
-        let type_layout_id = object_table
-            .ensure_persistent_array_layout_for_wasmtime_type_layout_namespace(
-                // VMSharedTypeIndex is engine-global, so ordinary Wasmtime GC
-                // promotion uses the stable engine-level namespace.
-                0,
-                type_index.bits(),
-                PERSISTENT_OBJECT_ABI_SLOT_SIZE,
-                element_is_object_ref,
-            )?;
-        Ok(OrdinaryGcPromotionSource::Array {
-            type_layout_id,
-            elements,
-        })
+        #[cfg(feature = "gc")]
+        {
+            let layout = self
+                .engine
+                .signatures()
+                .layout(type_index)
+                .with_context(|| {
+                    format!(
+                        "ordinary GC array type {} has no registered GC layout",
+                        type_index.bits()
+                    )
+                })?;
+            let GcLayout::Array(layout) = layout else {
+                bail!("ordinary GC array type layout is not an array layout");
+            };
+            let element_type =
+                ArrayType::from_shared_type_index(self.engine, type_index).element_type();
+            let len = {
+                let gc_store = self.gc_store_mut()?;
+                let array_ref = gc_ref
+                    .as_arrayref(&*gc_store.gc_heap)
+                    .context("ordinary GC ref is not an arrayref")?;
+                gc_store.array_len(array_ref)?
+            };
+            let mut elements = Vec::with_capacity(
+                usize::try_from(len).context("ordinary GC array length exceeds usize")?,
+            );
+            for index in 0..len {
+                let offset = layout
+                    .elem_offset(index)
+                    .context("ordinary GC array element offset overflow")?;
+                elements.push(self.read_storage_value(gc_ref, &element_type, offset)?);
+            }
+            let element_is_object_ref = Self::storage_type_traces_object_refs(&element_type);
+            let type_layout_id = object_table
+                .ensure_persistent_array_layout_for_wasmtime_type_layout_namespace(
+                    // VMSharedTypeIndex is engine-global, so ordinary Wasmtime GC
+                    // promotion uses the stable engine-level namespace.
+                    0,
+                    type_index.bits(),
+                    PERSISTENT_OBJECT_ABI_SLOT_SIZE,
+                    element_is_object_ref,
+                )?;
+            Ok(OrdinaryGcPromotionSource::Array {
+                type_layout_id,
+                elements,
+            })
+        }
     }
 }
 
