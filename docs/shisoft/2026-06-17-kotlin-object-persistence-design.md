@@ -148,8 +148,10 @@ Required first-wave rewrites:
 - non-transactional calls into `@TxnFunc` functions become transactional calls.
 - `root<T>("name")` becomes a durable root lookup that returns a persistent
   object reference encoded through the branch's `ObjectId` ABI.
-- persistent `struct.new`/constructor patterns become persistent object
-  allocation.
+- persistent `struct.new`/constructor patterns become promotable object
+  construction. They may remain ordinary Kotlin/WasmGC objects until they are
+  stored into a persistent graph, assigned to a persistent root, or otherwise
+  made persistent by the transaction.
 - persistent `struct.get`/`struct.set` become transactional object reads and
   writes.
 - persistent `array.new`, `array.get`, `array.set`, and `array.len` become
@@ -178,11 +180,37 @@ Persistent Kotlin objects use the existing persistent object model:
 - persistent GC traces durable roots and `ObjectId` edges
 - Kotlin live `VMGcRef` values are not durable identity
 
-Promotion policy for the first wave should be conservative. Creating or
-storing a `@Persistent` object inside a transaction allocates/publishes a
-persistent object record. Storing an ordinary, non-`@Persistent` Kotlin object
-into a persistent field is rejected by the lowerer unless a later promotion
-design explicitly supports that case.
+`@Persistent` declares a durable layout and promotion eligibility; it does not
+mean every instance is immediately allocated in persistent storage. A
+transaction may create ordinary Kotlin/WasmGC instances of `@Persistent`
+classes, use them as temporary objects, and promote them only if they become
+reachable from persistent state before commit.
+
+Promotion happens inside an active transaction. The first wave promotes when a
+volatile `@Persistent` object is:
+
+- stored into a persistent object field,
+- stored into a persistent array element,
+- assigned as a durable root value, or
+- reached through another promoted object's persistent fields or array
+  elements during promotion closure traversal.
+
+The runtime/lowerer maintains a transaction-local volatile-reference-to-
+`ObjectId` map while promoting. This map is not durable object identity and is
+discarded when the transaction ends. It exists only to preserve aliasing and
+cycles during one transaction: two references to the same volatile object must
+publish one persistent `ObjectId`.
+
+Promotion copies the object's current field/array payload into the persistent
+object data path and publishes it through the normal transaction commit log.
+If a promoted object references another volatile object with persistent layout
+metadata, that object is promoted recursively. If it references an ordinary
+Kotlin object without persistent layout metadata, the transaction must fail
+before commit with a clear unsupported-promotion diagnostic.
+
+Objects created inside a transaction but never made reachable from persistent
+state are discarded with the ordinary Kotlin/WasmGC heap and do not produce
+durable records.
 
 ## Validation Requirements
 
@@ -228,6 +256,14 @@ The first wave must include these gates:
    - unreachable Kotlin persistent objects become collectible under the current
      mark-sweep/maintenance transaction implementation.
 
+7. Promotion gate:
+   - a transaction can create an ordinary Kotlin/WasmGC object whose class has
+     persistent layout metadata, store it into a persistent root/object graph,
+     commit, recover, and observe it as a durable `ObjectId`-backed object.
+   - repeated references to the same volatile object in one transaction promote
+     to one `ObjectId`, preserving sharing.
+   - unsupported non-persistable referenced objects are rejected before commit.
+
 The validation suite must not modify upstream or proposal WAST files. Any
 generated fixtures for Kotlin belong in transaction-specific Rust tests or
 tracked Kotlin example test data.
@@ -253,4 +289,5 @@ The first milestone is complete when a tracked Kotlin bank example can:
 3. pass simple-transactions compatibility checks,
 4. run a successful commit and abort scenario,
 5. recover committed object state from file-backed persistent storage, and
-6. survive a persistent GC pass for reachable bank/account objects.
+6. promote a transaction-local Kotlin object into a durable object graph, and
+7. survive a persistent GC pass for reachable bank/account objects.
