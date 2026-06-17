@@ -41,6 +41,36 @@ fn kotlin_bank_example_builds_to_wasm_wasi() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn twasm_kotlin_inspects_tracked_bank_sidecar() -> Result<()> {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "run",
+            "-p",
+            "wasmtime-transaction-tools",
+            "--bin",
+            "twasm-kotlin",
+            "--",
+            "inspect",
+            "--metadata",
+            "examples/transaction-kotlin/bank/twasm.kotlin.json",
+        ])
+        .output()
+        .context("failed to run twasm-kotlin inspect")?;
+    if !output.status.success() {
+        bail!(
+            "twasm-kotlin inspect failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["module"], "transaction-kotlin-bank");
+    assert_eq!(report["persistent_types"], 2);
+    assert_eq!(report["transaction_functions"], 2);
+    assert_eq!(report["roots"], 1);
+    Ok(())
+}
+
 fn find_bank_wasm_artifact(example_dir: &Path) -> Result<std::path::PathBuf> {
     let build_dir = example_dir.join("bank/build");
     let mut wasm_files = Vec::new();

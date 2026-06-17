@@ -13,6 +13,10 @@ workspace = true
 name = "twasm-rust"
 path = "src/main.rs"
 
+[[bin]]
+name = "twasm-kotlin"
+path = "src/kotlin_main.rs"
+
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["derive"] }
