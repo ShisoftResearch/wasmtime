@@ -1,5 +1,5 @@
 use wasmtime_transaction_tools::kotlin_metadata::{
-    KotlinFieldKind, KotlinPersistentKind, parse_kotlin_sidecar,
+    KotlinFieldKind, KotlinGcWasmCapture, KotlinPersistentKind, parse_kotlin_sidecar,
 };
 
 #[test]
@@ -41,6 +41,67 @@ fn parses_bank_sidecar() {
         sidecar.persistent_types[0].fields[0].kind,
         KotlinFieldKind::I64
     );
+}
+
+#[test]
+fn parses_generic_wasmgc_capture_policy() {
+    let json = br#"{
+        "version": 1,
+        "module": "kotlin-collections",
+        "gcWasm": {
+            "capture": "allModuleGcTypes",
+            "denyTypes": ["kotlin.coroutines.*", "kotlin.Throwable"]
+        },
+        "persistentTypes": [],
+        "transactionFunctions": ["main"],
+        "roots": [
+            { "name": "profile", "type": "Profile", "nullable": true }
+        ]
+    }"#;
+
+    let sidecar = parse_kotlin_sidecar(&json[..]).unwrap();
+    assert_eq!(
+        sidecar.gc_wasm.capture,
+        KotlinGcWasmCapture::AllModuleGcTypes
+    );
+    assert_eq!(
+        sidecar.gc_wasm.deny_types,
+        vec!["kotlin.coroutines.*", "kotlin.Throwable"]
+    );
+}
+
+#[test]
+fn old_sidecars_default_to_sidecar_only_capture() {
+    let json = br#"{
+        "version": 1,
+        "module": "old",
+        "persistentTypes": [
+            { "name": "Root", "kind": "struct", "fields": [] }
+        ],
+        "transactionFunctions": [],
+        "roots": [
+            { "name": "root", "type": "Root", "nullable": true }
+        ]
+    }"#;
+
+    let sidecar = parse_kotlin_sidecar(&json[..]).unwrap();
+    assert_eq!(sidecar.gc_wasm.capture, KotlinGcWasmCapture::SidecarTypes);
+    assert!(sidecar.gc_wasm.deny_types.is_empty());
+}
+
+#[test]
+fn kotlin_sidecar_constructor_uses_default_gc_policy() {
+    let sidecar = wasmtime_transaction_tools::kotlin_metadata::KotlinSidecar::new(
+        "constructor-fixture",
+        vec![],
+        vec!["publish".into()],
+        vec![],
+    );
+
+    assert_eq!(sidecar.version, 1);
+    assert_eq!(sidecar.module, "constructor-fixture");
+    assert_eq!(sidecar.gc_wasm.capture, KotlinGcWasmCapture::SidecarTypes);
+    assert!(sidecar.gc_wasm.deny_types.is_empty());
 }
 
 #[test]

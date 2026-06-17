@@ -11,9 +11,61 @@ const KOTLIN_SIDECAR_VERSION: u32 = 1;
 pub struct KotlinSidecar {
     pub version: u32,
     pub module: String,
+    #[serde(default)]
+    pub gc_wasm: KotlinGcWasmPolicy,
     pub persistent_types: Vec<KotlinPersistentType>,
     pub transaction_functions: Vec<String>,
     pub roots: Vec<KotlinRoot>,
+}
+
+impl KotlinSidecar {
+    pub fn new(
+        module: impl Into<String>,
+        persistent_types: Vec<KotlinPersistentType>,
+        transaction_functions: Vec<String>,
+        roots: Vec<KotlinRoot>,
+    ) -> Self {
+        Self {
+            version: KOTLIN_SIDECAR_VERSION,
+            module: module.into(),
+            gc_wasm: KotlinGcWasmPolicy::default(),
+            persistent_types,
+            transaction_functions,
+            roots,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct KotlinGcWasmPolicy {
+    #[serde(default)]
+    pub capture: KotlinGcWasmCapture,
+    #[serde(default)]
+    pub deny_types: Vec<String>,
+}
+
+impl Default for KotlinGcWasmPolicy {
+    fn default() -> Self {
+        Self {
+            capture: KotlinGcWasmCapture::SidecarTypes,
+            deny_types: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KotlinGcWasmCapture {
+    SidecarTypes,
+    AllModuleGcTypes,
+}
+
+impl Default for KotlinGcWasmCapture {
+    fn default() -> Self {
+        Self::SidecarTypes
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -89,6 +141,7 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
     }
 
     let mut type_names = HashSet::with_capacity(sidecar.persistent_types.len());
+    let allow_unknown_gc_types = sidecar.gc_wasm.capture == KotlinGcWasmCapture::AllModuleGcTypes;
     for persistent_type in &sidecar.persistent_types {
         if persistent_type.name.is_empty() {
             bail!("persistent type name must not be empty");
@@ -138,6 +191,7 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
                     validate_field(
                         field,
                         &type_names,
+                        allow_unknown_gc_types,
                         format_args!(
                             "persistent type {} field {}",
                             persistent_type.name, field.name
@@ -169,6 +223,7 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
                 validate_field(
                     element,
                     &type_names,
+                    allow_unknown_gc_types,
                     format_args!("persistent type {} element", persistent_type.name),
                 )?;
             }
@@ -183,7 +238,7 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
         if !root_names.insert(root.name.as_str()) {
             bail!("duplicate root name: {}", root.name);
         }
-        if !type_names.contains(root.r#type.as_str()) {
+        if !allow_unknown_gc_types && !type_names.contains(root.r#type.as_str()) {
             bail!("unknown root type {} for root {}", root.r#type, root.name);
         }
     }
@@ -194,6 +249,7 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
 fn validate_field(
     field: &KotlinField,
     type_names: &HashSet<&str>,
+    allow_unknown_gc_types: bool,
     context: impl std::fmt::Display,
 ) -> Result<()> {
     match field.kind {
@@ -202,7 +258,7 @@ fn validate_field(
                 bail!("{context} is a ref but is missing a target type");
             };
 
-            if !type_names.contains(target) {
+            if !allow_unknown_gc_types && !type_names.contains(target) {
                 bail!("{context} references unknown persistent type: {target}");
             }
         }

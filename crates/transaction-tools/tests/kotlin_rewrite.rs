@@ -21,16 +21,15 @@ fn sidecar(
     transaction_functions: &[&str],
     roots: Vec<KotlinRoot>,
 ) -> KotlinSidecar {
-    KotlinSidecar {
-        version: 1,
-        module: "fixture".into(),
+    KotlinSidecar::new(
+        "fixture",
         persistent_types,
-        transaction_functions: transaction_functions
+        transaction_functions
             .iter()
             .map(|name| (*name).to_string())
             .collect(),
         roots,
-    }
+    )
 }
 
 fn struct_type(name: &str) -> KotlinPersistentType {
