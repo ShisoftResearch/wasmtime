@@ -317,6 +317,45 @@ fn generic_wasmgc_mode_resolves_runtime_gc_field_ref_targets() {
 }
 
 #[test]
+fn generic_wasmgc_rewrites_helpers_reachable_from_transaction_functions() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $String (struct (field (mut i32))))
+          (type $List (array (mut (ref null $String))))
+          (func $push (param $list (ref $List)) (param $value (ref null $String))
+            local.get $list
+            i32.const 0
+            local.get $value
+            array.set $List)
+          (func (export "publish") (param $list (ref $List))
+            local.get $list
+            i32.const 7
+            struct.new $String
+            call $push))
+        "#,
+    )
+    .unwrap();
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "generic-closure",
+          "gcWasm": { "capture": "allModuleGcTypes", "denyTypes": [] },
+          "persistentTypes": [],
+          "transactionFunctions": ["publish"],
+          "roots": []
+        }"#
+        .as_slice(),
+    )
+    .unwrap();
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+    assert!(printed.contains("tarray.set"), "{printed}");
+    assert!(transaction_objects(&output).functions.len() >= 2);
+}
+
+#[test]
 fn rewrite_lowers_inline_root_markers_for_distinct_root_types() {
     let input = wat::parse_str(
         r#"

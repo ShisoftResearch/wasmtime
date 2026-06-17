@@ -283,8 +283,16 @@ pub fn rewrite_kotlin_module(
     validate_kotlin_sidecar(sidecar)?;
 
     let transaction_function_indices = transaction_function_indices(input, sidecar)?;
-    let mut object_rewrite_function_indices = transaction_function_indices.clone();
-    object_rewrite_function_indices.extend(persistent_accessor_function_indices(input, sidecar)?);
+    let imported_function_count = imported_function_count(input)?;
+    let transaction_call_closure_function_indices = transaction_call_closure_function_indices(
+        input,
+        &transaction_function_indices,
+        imported_function_count,
+    )?;
+    let persistent_accessor_function_indices =
+        persistent_accessor_function_indices(input, sidecar)?;
+    let mut object_rewrite_function_indices = transaction_call_closure_function_indices.clone();
+    object_rewrite_function_indices.extend(persistent_accessor_function_indices.iter().copied());
     let mut transaction_objects = transaction_objects(input)?;
     let gc_type_info = gc_type_info(input, sidecar)?;
     let root_lowering = root_lowering(input, sidecar, &gc_type_info)?;
@@ -293,15 +301,15 @@ pub fn rewrite_kotlin_module(
         KotlinIndexRemapper::new(function_index_map(input, &stripped_marker_imports)?);
     remap_transaction_objects(&mut transaction_objects, &index_remapper)?;
     transaction_objects.functions.extend(
-        transaction_function_indices
+        transaction_call_closure_function_indices
             .iter()
+            .filter(|index| !persistent_accessor_function_indices.contains(index))
             .map(|index| index_remapper.remap_function_index(*index))
             .collect::<Result<Vec<_>>>()?,
     );
     transaction_objects
         .globals
         .extend(root_lowering.globals.iter().map(|root| root.global_index));
-    let imported_function_count = imported_function_count(input)?;
     let func_type_params = function_type_params(input)?;
     let defined_function_types = defined_function_type_indices(input)?;
     let root_marker_function_indices = root_marker_function_indices(
@@ -1419,6 +1427,72 @@ fn transaction_function_indices(input: &[u8], sidecar: &KotlinSidecar) -> Result
     }
 
     Ok(indices)
+}
+
+fn transaction_call_closure_function_indices(
+    input: &[u8],
+    transaction_function_indices: &BTreeSet<u32>,
+    imported_function_count: u32,
+) -> Result<BTreeSet<u32>> {
+    let call_edges = direct_local_call_edges(input, imported_function_count)?;
+    let mut closure = transaction_function_indices.clone();
+    let mut worklist = transaction_function_indices
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+
+    while let Some(function_index) = worklist.pop() {
+        let Some(callees) = call_edges.get(&function_index) else {
+            continue;
+        };
+        for callee in callees {
+            if closure.insert(*callee) {
+                worklist.push(*callee);
+            }
+        }
+    }
+
+    Ok(closure)
+}
+
+fn direct_local_call_edges(
+    input: &[u8],
+    imported_function_count: u32,
+) -> Result<BTreeMap<u32, BTreeSet<u32>>> {
+    let mut edges = BTreeMap::<u32, BTreeSet<u32>>::new();
+    let mut next_defined_func = 0u32;
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite call graph payload")? {
+            Payload::CodeSectionStart { range, .. } => {
+                let body_bytes = input
+                    .get(range.start..range.end)
+                    .context("invalid Kotlin rewrite code section range")?;
+                let reader = BinaryReader::new(body_bytes, range.start);
+                let section = CodeSectionReader::new(reader)?;
+
+                for body in section {
+                    let body = body?;
+                    let caller = imported_function_count
+                        .checked_add(next_defined_func)
+                        .context("Kotlin rewrite function index overflow")?;
+                    let mut reader = body.get_operators_reader()?;
+                    while !reader.eof() {
+                        if let Operator::Call { function_index } = reader.read()?
+                            && function_index >= imported_function_count
+                        {
+                            edges.entry(caller).or_default().insert(function_index);
+                        }
+                    }
+                    next_defined_func += 1;
+                }
+            }
+            Payload::CodeSectionEntry(_) => {}
+            _ => {}
+        }
+    }
+
+    Ok(edges)
 }
 
 fn persistent_accessor_function_indices(
