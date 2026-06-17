@@ -243,7 +243,10 @@ fn kotlin_rewritten_bank_executes_and_recovers_file_backed_roots() -> Result<()>
         .context("recovered Bank alice field was null")?;
     let bob_ref = recovered_object_ref_field(&root_winner.record_bytes, 2, 1)?
         .context("recovered Bank bob field was null")?;
-    ensure!(alice_ref != bob_ref, "alice and bob should be distinct accounts");
+    ensure!(
+        alice_ref != bob_ref,
+        "alice and bob should be distinct accounts"
+    );
     let alice = recovered
         .object_winners
         .iter()
