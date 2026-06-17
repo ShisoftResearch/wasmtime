@@ -117,7 +117,7 @@ use core::ptr::NonNull;
 use core::task::Poll;
 #[cfg(feature = "transaction")]
 use std::path::PathBuf;
-use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt};
+use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, FuncIndex, TripleExt};
 
 mod context;
 pub use self::context::*;
@@ -935,6 +935,30 @@ impl<T> Store<T> {
         let func_ref = func.vm_func_ref(&self.inner);
         self.inner
             .transaction_register_durable_func_ref_for_test(func_ref.as_ptr().addr(), identity)
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_register_durable_func_ref_by_index_for_test(
+        &mut self,
+        instance: &crate::Instance,
+        function_index: FuncIndex,
+        identity: DurableFuncIdentity,
+    ) -> Result<()> {
+        let vm_func_ref_addr = {
+            let (mut instance, registry) = instance.id.get_mut_and_module_registry(&mut self.inner);
+            let func_ref = instance
+                .as_mut()
+                .get_func_ref(registry, function_index)
+                .with_context(|| {
+                    format!(
+                        "module function index {} did not resolve to a VMFuncRef",
+                        function_index.as_u32()
+                    )
+                })?;
+            func_ref.as_ptr().addr()
+        };
+        self.inner
+            .transaction_register_durable_func_ref_for_test(vm_func_ref_addr, identity)
     }
 
     #[cfg(feature = "transaction")]

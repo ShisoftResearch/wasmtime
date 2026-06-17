@@ -623,6 +623,12 @@ pub mod _internal {
             pub func: crate::Func,
         }
 
+        #[derive(Debug)]
+        pub struct RegisteredModuleDefinedDurableFuncRefForTest {
+            pub function_index: u32,
+            pub name: Option<String>,
+        }
+
         pub fn register_exported_durable_func_ref_for_test<T>(
             store: &mut crate::Store<T>,
             instance: &crate::Instance,
@@ -701,14 +707,65 @@ pub mod _internal {
             Ok(registered)
         }
 
+        pub fn register_module_defined_durable_func_refs_for_test<T>(
+            store: &mut crate::Store<T>,
+            instance: &crate::Instance,
+        ) -> crate::Result<Vec<RegisteredModuleDefinedDurableFuncRefForTest>> {
+            let module = instance.module(&mut *store).clone();
+            let module_fingerprint = module_fingerprint_for_test(&module)?;
+            register_module_defined_durable_func_refs_with_fingerprint_for_test(
+                store,
+                instance,
+                module_fingerprint,
+            )
+        }
+
+        pub fn register_module_defined_durable_func_refs_with_fingerprint_for_test<T>(
+            store: &mut crate::Store<T>,
+            instance: &crate::Instance,
+            module_fingerprint: u64,
+        ) -> crate::Result<Vec<RegisteredModuleDefinedDurableFuncRefForTest>> {
+            let module = instance.module(&mut *store).clone();
+            let type_layout_id =
+                crate::runtime::transaction::type_layout::TypeLayoutId::BUILTIN_FUNC.get();
+            let env_module = module.env_module();
+            let funcs = module
+                .functions()
+                .filter(|func| env_module.functions[func.index].is_escaping())
+                .map(|func| (func.index, func.name))
+                .collect::<Vec<_>>();
+
+            let mut registered = Vec::with_capacity(funcs.len());
+            for (function_index, name) in funcs {
+                store.transaction_register_durable_func_ref_by_index_for_test(
+                    instance,
+                    function_index,
+                    durable_func_identity_for_test(
+                        module_fingerprint,
+                        function_index.as_u32(),
+                        type_layout_id,
+                    )?,
+                )?;
+                registered.push(RegisteredModuleDefinedDurableFuncRefForTest {
+                    function_index: function_index.as_u32(),
+                    name,
+                });
+            }
+            Ok(registered)
+        }
+
         pub fn module_fingerprint_for_test(module: &crate::Module) -> crate::Result<u64> {
             let bytecode = module.debug_bytecode().context(
                 "durable function module fingerprint requires retained Wasm bytecode; enable Config::guest_debug(true)",
             )?;
+            Ok(module_fingerprint_bytes_for_test(bytecode))
+        }
+
+        pub fn module_fingerprint_bytes_for_test(bytecode: &[u8]) -> u64 {
             let mut fingerprint =
                 stable_fingerprint_bytes(0xcbf2_9ce4_8422_2325, b"shisoft-transaction-module-v1");
             fingerprint = stable_fingerprint_u8(fingerprint, 1);
-            Ok(stable_fingerprint_bytes(fingerprint, bytecode))
+            stable_fingerprint_bytes(fingerprint, bytecode)
         }
 
         fn stable_fingerprint_u8(fingerprint: u64, value: u8) -> u64 {

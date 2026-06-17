@@ -36,6 +36,20 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-17: Kotlin Durable Function Identity Registration
+
+- Added an internal registration path for module-defined functions that have
+  Wasmtime `VMFuncRef` slots. This covers non-exported Kotlin runtime functions
+  that appear in GC object headers through `ref.func`/function-reference
+  payloads.
+- The real Kotlin bank end-to-end test now registers durable function
+  identities from the rewritten module fingerprint, runs without
+  `enable_live_wast_reference_fallbacks_for_test`, and verifies recovered object
+  records contain inline durable funcref payloads.
+- The remaining boundary is productizing the registration contract for language
+  toolchains. The helper is still under `_internal::transaction_persistence`
+  and is intentionally test/tooling-facing for this branch.
+
 ## 2026-06-17: Persistent GC Maintenance Transaction
 
 - Added a physical copying cleaner for mixed live/dead object-data chunks.

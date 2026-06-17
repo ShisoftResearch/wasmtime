@@ -556,6 +556,51 @@ fn durable_funcref_bulk_registration_skips_imported_function_exports() -> Result
 }
 
 #[test]
+fn durable_funcref_module_registration_covers_non_exported_ref_func_targets() -> Result<()> {
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        r#"
+        (module
+          (func $hidden)
+          (func $plain)
+          (elem declare func $hidden)
+          (func $make (export "make") (result funcref)
+            ref.func $hidden))
+        "#,
+    )?;
+    let expected_module_fingerprint =
+        wasmtime::_internal::transaction_persistence::module_fingerprint_for_test(&module)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let registered = wasmtime::_internal::transaction_persistence::register_module_defined_durable_func_refs_for_test(
+        &mut store,
+        &instance,
+    )?;
+    let registered_indices = registered
+        .iter()
+        .map(|entry| entry.function_index)
+        .collect::<Vec<_>>();
+    assert!(registered_indices.contains(&0));
+    assert!(registered_indices.contains(&2));
+
+    for function_index in [0, 2] {
+        assert!(
+            wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+                &mut store,
+                expected_module_fingerprint,
+                function_index,
+                5,
+            )?
+            .is_some()
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn exported_funcref_auto_identity_requires_retained_module_bytecode() -> Result<()> {
     let engine = Engine::default();
     let module = Module::new(&engine, r#"(module (func (export "target")))"#)?;

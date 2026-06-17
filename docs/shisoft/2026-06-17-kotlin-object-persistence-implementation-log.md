@@ -42,7 +42,10 @@
 - The tracked Kotlin bank artifact executes under Wasmtime/WASI, commits to the
   file-backed transaction log, reopens the log, and verifies recovered Bank and
   Account object records with the post-transfer balances.
-- SHISOFT-TWASM-MOCK: the real Kotlin end-to-end test still enables the
-  live-reference fallback because Kotlin runtime object headers carry live
-  funcrefs. User persistent fields are verified through recovered object data;
-  restart-stable symbolic Kotlin funcref rebinding remains the next workstream.
+- The real Kotlin end-to-end test no longer enables the live-reference
+  fallback. It registers durable identities for module-defined functions that
+  have Wasmtime `VMFuncRef` slots, then verifies recovered object records
+  contain inline durable funcref payloads with the rewritten module fingerprint.
+- Remaining object-language work is no longer the Kotlin live-funcref fallback;
+  it is the compiler/tooling contract for exposing this durable registration
+  outside the test-only `_internal::transaction_persistence` namespace.

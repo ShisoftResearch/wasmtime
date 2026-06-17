@@ -7,7 +7,9 @@ use std::sync::{Mutex, OnceLock};
 
 use wasmparser::{BinaryReader, KnownCustom, Name, Operator, Parser, Payload};
 use wasmtime::_internal::transaction_persistence::{
-    create_file_backed_storage_for_test, enable_live_wast_reference_fallbacks_for_test,
+    RegisteredModuleDefinedDurableFuncRefForTest, TransactionPersistenceRecoveredRegion,
+    create_file_backed_storage_for_test, module_fingerprint_bytes_for_test,
+    register_module_defined_durable_func_refs_with_fingerprint_for_test,
     reopen_and_recover_file_backed_region,
 };
 use wasmtime::anyhow::{Context, Result, bail, ensure};
@@ -216,10 +218,16 @@ fn kotlin_rewritten_bank_executes_and_recovers_file_backed_roots() -> Result<()>
     let mut store = Store::new(&engine, wasmtime_wasi::WasiCtxBuilder::new().build_p1());
     create_file_backed_storage_for_test(&mut store, tmemory_path, tx_log_path.clone(), 64)?;
     let instance = linker.instantiate(&mut store, &module)?;
-    // SHISOFT-TWASM-MOCK: Kotlin runtime object headers carry live funcrefs
-    // today. Persisted user fields are validated below; symbolic Kotlin funcref
-    // rebinding remains a separate runtime metadata workstream.
-    enable_live_wast_reference_fallbacks_for_test(&mut store);
+    let module_fingerprint = module_fingerprint_bytes_for_test(&rewritten);
+    let registered_funcs = register_module_defined_durable_func_refs_with_fingerprint_for_test(
+        &mut store,
+        &instance,
+        module_fingerprint,
+    )?;
+    ensure!(
+        !registered_funcs.is_empty(),
+        "expected Kotlin module to register durable identities for defined functions"
+    );
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     start.call(&mut store, ())?;
 
@@ -264,6 +272,11 @@ fn kotlin_rewritten_bank_executes_and_recovers_file_backed_roots() -> Result<()>
     ensure!(
         recovered_object_i64_field(&bob.record_bytes, 1, 0)? == 300,
         "bob balance was not recovered after transfer"
+    );
+    ensure!(
+        recovered_durable_kotlin_funcref_count(&recovered, module_fingerprint, &registered_funcs)?
+            > 0,
+        "expected recovered Kotlin object records to contain durable funcref identities"
     );
     Ok(())
 }
@@ -504,6 +517,70 @@ fn recovered_object_i64_field(
         "expected i64 object field slot, got tag={tag} low={low} high={high}"
     );
     Ok(low as i64)
+}
+
+fn recovered_durable_kotlin_funcref_count(
+    recovered: &TransactionPersistenceRecoveredRegion,
+    module_fingerprint: u64,
+    registered_funcs: &[RegisteredModuleDefinedDurableFuncRefForTest],
+) -> Result<usize> {
+    const OBJECT_KIND_STRUCT: u16 = 0;
+    const OBJECT_KIND_ARRAY: u16 = 1;
+    const OBJECT_VALUE_ABI_TAG_FUNCREF: u32 = 6;
+    const OBJECT_VALUE_RECORD_LEN: usize = 20;
+    const TX_OBJECT_HEADER_LEN: usize = 32;
+    const TX_ARRAY_HEADER_LEN: usize = 40;
+    const BUILTIN_FUNC_TYPE_LAYOUT_ID: u32 = 5;
+
+    let registered_function_indices = registered_funcs
+        .iter()
+        .map(|func| func.function_index)
+        .collect::<BTreeSet<_>>();
+    let mut count = 0;
+    for winner in &recovered.object_winners {
+        let bytes = &winner.record_bytes;
+        if bytes.len() < TX_OBJECT_HEADER_LEN {
+            continue;
+        }
+        let kind = u16::from_le_bytes(bytes[20..22].try_into().unwrap());
+        let payload_start = match kind {
+            OBJECT_KIND_STRUCT => TX_OBJECT_HEADER_LEN,
+            OBJECT_KIND_ARRAY => TX_ARRAY_HEADER_LEN,
+            _ => continue,
+        };
+        if bytes.len() < payload_start {
+            continue;
+        }
+        let payload = &bytes[payload_start..];
+        ensure!(
+            payload.len() % OBJECT_VALUE_RECORD_LEN == 0,
+            "recovered Kotlin object payload has non-canonical ABI slot length"
+        );
+        for slot in payload.chunks_exact(OBJECT_VALUE_RECORD_LEN) {
+            let tag = u32::from_le_bytes(slot[0..4].try_into().unwrap());
+            if tag != OBJECT_VALUE_ABI_TAG_FUNCREF {
+                continue;
+            }
+            let low = u64::from_le_bytes(slot[4..12].try_into().unwrap());
+            let high = u64::from_le_bytes(slot[12..20].try_into().unwrap());
+            let function_index = u32::try_from(high & u64::from(u32::MAX)).unwrap();
+            let type_layout_id = u32::try_from(high >> 32).unwrap();
+            ensure!(
+                low == module_fingerprint,
+                "recovered Kotlin funcref used unexpected module fingerprint"
+            );
+            ensure!(
+                type_layout_id == BUILTIN_FUNC_TYPE_LAYOUT_ID,
+                "recovered Kotlin funcref used unexpected type layout id"
+            );
+            ensure!(
+                registered_function_indices.contains(&function_index),
+                "recovered Kotlin funcref used unregistered function index {function_index}"
+            );
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 #[derive(Debug, Default)]
