@@ -84,10 +84,12 @@ The API is intentionally narrow:
   object.
 
 The first wave supports persistent classes with primitive fields, nullable and
-non-null persistent references, and persistent arrays. Kotlin collections,
-strings, coroutines, exceptions, reflection, virtual dispatch details, and
-unsafe linear memory are out of scope until a later design revision explicitly
-adds them.
+non-null persistent references, persistent arrays, and generic Kotlin/WasmGC
+object graphs. Generic graph mode can persist Kotlin `String` and standard
+collection object graphs by capturing their actual emitted WasmGC
+`struct`/`array` layouts. Coroutines, exceptions, reflection, unsafe linear
+memory, and source-level diagnostics remain out of scope until a later design
+revision explicitly adds them.
 
 ## No Kotlin Compiler Fork
 
@@ -173,6 +175,26 @@ Required first-wave rewrites:
 - nullable persistent references become durable nullable `ObjectId` references.
 - ordinary Kotlin objects outside persistent reachability remain ordinary
   WasmGC objects and are not persisted.
+
+Generic Kotlin/WasmGC graph mode is an opt-in sidecar policy. With
+`gcWasm.capture = "allModuleGcTypes"`, the lowerer treats all concrete module
+GC structs and arrays as persistent-capable except denylisted names. This is
+intentionally module-version-specific: recovery requires the same Kotlin/Wasm
+module layout and durable function/type fingerprint. The runtime does not add
+container-specific encodings for `String`, `MutableList`, `MutableMap`, or
+their backing arrays; they are persisted as their real WasmGC object graph.
+
+Root-publishing functions are allowed to construct ordinary Kotlin/WasmGC
+objects first and then publish the reachable graph through `setRoot`. The
+lowerer removes inline root marker throw-blocks even when Kotlin string literal
+indices shift between modules. Root-publishing functions are not automatically
+object-op rewritten solely because they contain `setRoot`, which keeps ordinary
+Kotlin constructors and standard-library allocation helpers usable before
+promotion. Transactional mutation of already-persistent user objects remains
+covered by `@TxnFunc` functions and transaction call-closure rewriting.
+Arbitrary transactional mutation inside shared Kotlin standard-library helper
+functions is still deferred; it likely needs cloned transaction-specific helper
+paths or a Kotlin compiler plugin.
 
 The lowered module should use the same transactional object operation family as
 the current simple-transactions WAST tranche: `tfunc`, `tcall`, `tstruct`,
@@ -285,7 +307,9 @@ tracked Kotlin example test data.
 ## Non-Goals For The First Wave
 
 - Persistent Kotlin unsafe linear memory.
-- Transparent persistence for arbitrary Kotlin standard-library collections.
+- Container-specific durable formats for Kotlin standard-library collections.
+- Arbitrary transactional mutation inside shared Kotlin standard-library
+  collection helper functions.
 - Kotlin compiler plugin.
 - Full source-level Kotlin diagnostics.
 - Browser/Compose support.

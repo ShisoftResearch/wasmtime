@@ -356,6 +356,47 @@ fn generic_wasmgc_rewrites_helpers_reachable_from_transaction_functions() {
 }
 
 #[test]
+fn transaction_helpers_shared_with_initializers_still_rewrite_on_transaction_path() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $Obj (struct (field (mut i64))))
+          (func $_initializeModule (param $obj (ref null $Obj))
+            local.get $obj
+            i64.const 1
+            call $helper)
+          (func $helper (param $obj (ref null $Obj)) (param $value i64)
+            local.get $obj
+            local.get $value
+            struct.set $Obj 0)
+          (func $transfer (export "transfer") (param $obj (ref null $Obj))
+            local.get $obj
+            i64.const 2
+            call $helper))
+        "#,
+    )
+    .unwrap();
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "shared-helper",
+          "gcWasm": { "capture": "allModuleGcTypes", "denyTypes": [] },
+          "persistentTypes": [],
+          "transactionFunctions": ["transfer"],
+          "roots": []
+        }"#
+        .as_slice(),
+    )
+    .unwrap();
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+    assert_valid_module(&output);
+
+    assert!(printed.contains("tstruct.set"), "{printed}");
+}
+
+#[test]
 fn rewrite_lowers_inline_root_markers_for_distinct_root_types() {
     let input = wat::parse_str(
         r#"
@@ -424,6 +465,88 @@ fn rewrite_lowers_inline_root_markers_for_distinct_root_types() {
     );
     assert!(printed.contains("tglobal.set 0"), "{printed}");
     assert!(printed.contains("tglobal.get 1"), "{printed}");
+}
+
+#[test]
+fn rewrite_does_not_lower_non_marker_throw_blocks_with_shifted_literals() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (type $String (struct))
+              (type $Any (struct))
+              (type $IllegalStateException (struct))
+              (tag $error)
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $_stringLiteralLatin1 (param i32) (result (ref null $String))
+                ref.null $String)
+              (func $kotlin.String.plus
+                    (param (ref null $String) (ref null $Any))
+                    (result (ref null $String))
+                ref.null $String)
+              (func $"kotlin.IllegalStateException.<init>"
+                    (param (ref null $IllegalStateException))
+                    (result (ref null $IllegalStateException))
+                ref.null $IllegalStateException)
+              (func $notSetRoot (param $bank (ref null $Bank)) (result (ref null $Unit))
+                block (result (ref null $Unit))
+                  local.get $bank
+                  local.set $bank
+                  i32.const 696
+                  call $_stringLiteralLatin1
+                  drop
+                  ref.null $String
+                  ref.null $Any
+                  call $kotlin.String.plus
+                  drop
+                  ref.null $IllegalStateException
+                  call $"kotlin.IllegalStateException.<init>"
+                  drop
+                  block
+                    throw $error
+                  end
+                  unreachable
+                end)
+              (func $notGetRoot (result (ref null $Bank))
+                block (result (ref null $Bank))
+                  i32.const 697
+                  call $_stringLiteralLatin1
+                  drop
+                  ref.null $String
+                  ref.null $Any
+                  call $kotlin.String.plus
+                  drop
+                  ref.null $IllegalStateException
+                  call $"kotlin.IllegalStateException.<init>"
+                  drop
+                  block
+                    throw $error
+                  end
+                  unreachable
+                end))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+    assert_valid_module(&output);
+
+    assert!(!printed.contains("tglobal.set"), "{printed}");
+    assert!(!printed.contains("tglobal.get"), "{printed}");
+    assert!(printed.contains("i32.const 696"), "{printed}");
+    assert!(printed.contains("i32.const 697"), "{printed}");
 }
 
 #[test]

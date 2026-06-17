@@ -12,8 +12,8 @@ use wasm_encoder::{
     ValType as EncoderValType,
 };
 use wasmparser::{
-    AbstractHeapType, BinaryReader, BlockType, CodeSectionReader, CompositeInnerType, ExternalKind,
-    HeapType, KnownCustom, Name, Operator, Parser, Payload, StorageType, TypeRef,
+    AbstractHeapType, BinaryReader, BlockType, CodeSectionReader, CompositeInnerType, DataKind,
+    ExternalKind, HeapType, KnownCustom, Name, Operator, Parser, Payload, StorageType, TypeRef,
     ValType as ParserValType,
 };
 
@@ -28,6 +28,8 @@ const KOTLIN_ROOT_GET_IMPORT_MODULE: &str = "twasm.root.get";
 const KOTLIN_ROOT_SET_IMPORT_MODULE: &str = "twasm.root.set";
 const NAME_CUSTOM_SECTION: &str = "name";
 const KOTLIN_RUNTIME_STRUCT_FIELDS: &[&str] = &["vtable", "itable", "rtti", "_hashCode"];
+const KOTLIN_INLINE_ROOT_MARKER: &str = "twasm root marker was not lowered:";
+const KOTLIN_INLINE_SET_ROOT_MARKER: &str = "twasm setRoot marker was not lowered:";
 
 #[derive(Debug, Default, Serialize)]
 pub struct KotlinRewriteReport {
@@ -284,11 +286,20 @@ pub fn rewrite_kotlin_module(
 
     let transaction_function_indices = transaction_function_indices(input, sidecar)?;
     let imported_function_count = imported_function_count(input)?;
+    let marker_literals = KotlinMarkerLiterals::new(input)?;
     let transaction_call_closure_function_indices = transaction_call_closure_function_indices(
         input,
         &transaction_function_indices,
         imported_function_count,
     )?;
+    let ordinary_shared_function_indices = ordinary_shared_function_indices(input)?;
+    let transaction_call_closure_function_indices = transaction_call_closure_function_indices
+        .into_iter()
+        .filter(|index| {
+            transaction_function_indices.contains(index)
+                || !ordinary_shared_function_indices.contains(index)
+        })
+        .collect::<BTreeSet<_>>();
     let persistent_accessor_function_indices =
         persistent_accessor_function_indices(input, sidecar)?;
     let mut object_rewrite_function_indices = transaction_call_closure_function_indices.clone();
@@ -318,14 +329,21 @@ pub fn rewrite_kotlin_module(
         imported_function_count,
         &func_type_params,
         &defined_function_types,
+        &marker_literals,
     )?;
+    let root_publisher_function_indices = root_marker_function_indices
+        .iter()
+        .filter_map(|(index, uses)| (uses.set && !uses.get).then_some(*index))
+        .collect::<BTreeSet<_>>();
+    for index in &root_publisher_function_indices {
+        object_rewrite_function_indices.remove(index);
+    }
     transaction_objects.functions.extend(
         root_marker_function_indices
-            .iter()
+            .keys()
             .map(|index| index_remapper.remap_function_index(*index))
             .collect::<Result<Vec<_>>>()?,
     );
-    object_rewrite_function_indices.extend(root_marker_function_indices.iter().copied());
 
     let mut report = KotlinRewriteReport {
         transaction_functions: sidecar.transaction_functions.clone(),
@@ -467,6 +485,7 @@ pub fn rewrite_kotlin_module(
                         &root_lowering,
                         &mut index_remapper,
                         &params,
+                        &marker_literals,
                         &mut report,
                     )?;
                     code.function(&function);
@@ -514,6 +533,7 @@ fn rewrite_function_body(
     root_lowering: &RootLowering,
     index_remapper: &mut KotlinIndexRemapper,
     params: &[ParserValType],
+    marker_literals: &KotlinMarkerLiterals,
     report: &mut KotlinRewriteReport,
 ) -> Result<Function> {
     let mut type_reencoder = RoundtripReencoder;
@@ -532,7 +552,9 @@ fn rewrite_function_body(
 
     let mut index = 0usize;
     while index < operators.len() {
-        if let Some(marker) = match_inline_set_root_marker(&operators, index, &local_types)? {
+        if let Some(marker) =
+            match_inline_set_root_marker(&operators, index, &local_types, marker_literals)?
+        {
             if let Some(root) = root_for_marker_type(root_lowering, marker.type_index)? {
                 let unit_getter = root_lowering
                     .unit_getter_func
@@ -549,7 +571,7 @@ fn rewrite_function_body(
             }
         }
 
-        if let Some(marker) = match_inline_get_root_marker(&operators, index)?
+        if let Some(marker) = match_inline_get_root_marker(&operators, index, marker_literals)?
             && let Some(root) = root_for_marker_type(root_lowering, marker.type_index)?
         {
             function.instruction(&Instruction::TGlobalGet {
@@ -849,6 +871,75 @@ struct GetRootMarker {
     type_index: u32,
 }
 
+struct KotlinMarkerLiterals {
+    root: BTreeSet<i32>,
+    set_root: BTreeSet<i32>,
+}
+
+impl KotlinMarkerLiterals {
+    fn new(input: &[u8]) -> Result<Self> {
+        let mut root = BTreeSet::from([659]);
+        let mut set_root = BTreeSet::from([658]);
+
+        for (index, literal) in kotlin_latin1_string_pool(input)? {
+            if literal.starts_with(KOTLIN_INLINE_ROOT_MARKER) {
+                root.insert(index);
+            }
+            if literal.starts_with(KOTLIN_INLINE_SET_ROOT_MARKER) {
+                set_root.insert(index);
+            }
+        }
+
+        Ok(Self { root, set_root })
+    }
+}
+
+fn kotlin_latin1_string_pool(input: &[u8]) -> Result<Vec<(i32, String)>> {
+    let mut data_segments = Vec::new();
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin string-pool payload")? {
+            Payload::DataSection(section) => {
+                for data in section {
+                    let data = data.context("failed to parse Kotlin data segment")?;
+                    if matches!(data.kind, DataKind::Passive) {
+                        data_segments.push(data.data.to_vec());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if data_segments.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let strings = &data_segments[0];
+    let address_and_lengths = &data_segments[1];
+    let mut literals = Vec::new();
+    for (index, slot) in address_and_lengths.chunks_exact(8).enumerate() {
+        let encoded = u64::from_le_bytes(slot.try_into().unwrap());
+        let start = (encoded & 0xffff_ffff) as usize;
+        let len = (encoded >> 32) as usize;
+        let Some(end) = start.checked_add(len) else {
+            continue;
+        };
+        let Some(bytes) = strings.get(start..end) else {
+            continue;
+        };
+        let literal = bytes
+            .iter()
+            .map(|byte| char::from(*byte))
+            .collect::<String>();
+        let Ok(index) = i32::try_from(index) else {
+            break;
+        };
+        literals.push((index, literal));
+    }
+
+    Ok(literals)
+}
+
 // SHISOFT-TWASM-MOCK: this recognizes the current Kotlin SDK inline
 // root/setRoot throw-marker shape. Replace it with explicit SDK imports or
 // compiler-emitted intrinsics once the Kotlin frontend contract is stabilized.
@@ -856,6 +947,7 @@ fn match_inline_set_root_marker(
     operators: &[Operator<'_>],
     index: usize,
     local_types: &[ParserValType],
+    marker_literals: &KotlinMarkerLiterals,
 ) -> Result<Option<SetRootMarker>> {
     if !matches!(
         operators.get(index),
@@ -869,7 +961,9 @@ fn match_inline_set_root_marker(
         return Ok(None);
     };
     let body = &operators[index + 1..end];
-    if !body_contains_i32_const(body, 658) || !body_ends_with_throw_unreachable(body) {
+    if !body_contains_i32_const_in(body, &marker_literals.set_root)
+        || !body_ends_with_throw_unreachable(body)
+    {
         return Ok(None);
     }
 
@@ -881,8 +975,11 @@ fn match_inline_set_root_marker(
             Operator::LocalSet {
                 local_index: target,
             },
-            Operator::I32Const { value: 658 },
+            Operator::I32Const { value },
         ] => {
+            if !marker_literals.set_root.contains(value) {
+                return None;
+            }
             let source_type = local_type_index(local_types, *source)?;
             (local_type_index(local_types, *target) == Some(source_type)).then_some(SetRootMarker {
                 next_index: end + 1,
@@ -899,6 +996,7 @@ fn match_inline_set_root_marker(
 fn match_inline_get_root_marker(
     operators: &[Operator<'_>],
     index: usize,
+    marker_literals: &KotlinMarkerLiterals,
 ) -> Result<Option<GetRootMarker>> {
     let type_index = match operators.get(index) {
         Some(Operator::Block {
@@ -913,7 +1011,9 @@ fn match_inline_get_root_marker(
         return Ok(None);
     };
     let body = &operators[index + 1..end];
-    if body_contains_i32_const(body, 659) && body_ends_with_throw_unreachable(body) {
+    if body_contains_i32_const_in(body, &marker_literals.root)
+        && body_ends_with_throw_unreachable(body)
+    {
         Ok(Some(GetRootMarker {
             next_index: end + 1,
             type_index,
@@ -950,10 +1050,10 @@ fn root_for_marker_type<'a>(
     }
 }
 
-fn body_contains_i32_const(operators: &[Operator<'_>], value: i32) -> bool {
+fn body_contains_i32_const_in(operators: &[Operator<'_>], values: &BTreeSet<i32>) -> bool {
     operators
         .iter()
-        .any(|op| matches!(op, Operator::I32Const { value: candidate } if *candidate == value))
+        .any(|op| matches!(op, Operator::I32Const { value } if values.contains(value)))
 }
 
 fn body_ends_with_throw_unreachable(operators: &[Operator<'_>]) -> bool {
@@ -1435,12 +1535,36 @@ fn transaction_call_closure_function_indices(
     imported_function_count: u32,
 ) -> Result<BTreeSet<u32>> {
     let call_edges = direct_local_call_edges(input, imported_function_count)?;
-    let mut closure = transaction_function_indices.clone();
-    let mut worklist = transaction_function_indices
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+    function_call_closure(transaction_function_indices, &call_edges)
+}
 
+fn ordinary_shared_function_indices(input: &[u8]) -> Result<BTreeSet<u32>> {
+    let mut indices = BTreeSet::new();
+    let mut function_entries = exported_function_names(input)?
+        .into_iter()
+        .map(|(name, index)| (name, index))
+        .collect::<Vec<_>>();
+    function_entries.extend(name_section_function_names(input)?);
+
+    for (name, index) in function_entries {
+        if name.starts_with("kotlin.")
+            || name.contains(".<init>")
+            || name == "_initializeModule"
+            || name == "_stringLiteralLatin1"
+        {
+            indices.insert(index);
+        }
+    }
+
+    Ok(indices)
+}
+
+fn function_call_closure(
+    seeds: &BTreeSet<u32>,
+    call_edges: &BTreeMap<u32, BTreeSet<u32>>,
+) -> Result<BTreeSet<u32>> {
+    let mut closure = seeds.clone();
+    let mut worklist = seeds.iter().copied().collect::<Vec<_>>();
     while let Some(function_index) = worklist.pop() {
         let Some(callees) = call_edges.get(&function_index) else {
             continue;
@@ -1622,21 +1746,28 @@ fn defined_global_count(input: &[u8]) -> Result<u32> {
 }
 
 fn function_index_by_exact_name(input: &[u8], expected: &str) -> Result<Option<u32>> {
+    let matches = function_indices_by_name(input, |name| name == expected)?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(*matches.iter().next().unwrap())),
+        _ => bail!("ambiguous Kotlin rewrite function name {expected}: {matches:?}"),
+    }
+}
+
+fn function_indices_by_name(
+    input: &[u8],
+    mut predicate: impl FnMut(&str) -> bool,
+) -> Result<BTreeSet<u32>> {
     let mut function_entries = exported_function_names(input)?
         .into_iter()
         .map(|(name, index)| (name, index))
         .collect::<Vec<_>>();
     function_entries.extend(name_section_function_names(input)?);
 
-    let matches = function_entries
+    Ok(function_entries
         .iter()
-        .filter_map(|(name, index)| (name == expected).then_some(*index))
-        .collect::<BTreeSet<_>>();
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(Some(*matches.iter().next().unwrap())),
-        _ => bail!("ambiguous Kotlin rewrite function name {expected}: {matches:?}"),
-    }
+        .filter_map(|(name, index)| predicate(name).then_some(*index))
+        .collect())
 }
 
 fn root_marker_function_indices(
@@ -1645,8 +1776,9 @@ fn root_marker_function_indices(
     imported_function_count: u32,
     func_type_params: &BTreeMap<u32, Vec<ParserValType>>,
     defined_function_types: &[u32],
-) -> Result<BTreeSet<u32>> {
-    let mut indices = BTreeSet::new();
+    marker_literals: &KotlinMarkerLiterals,
+) -> Result<BTreeMap<u32, RootMarkerUses>> {
+    let mut indices = BTreeMap::new();
     if root_lowering.globals.is_empty() {
         return Ok(indices);
     }
@@ -1671,8 +1803,10 @@ fn root_marker_function_indices(
                         .get(&type_index)
                         .cloned()
                         .context("missing Kotlin rewrite function type parameters")?;
-                    if function_contains_inline_root_marker(&body, &params, root_lowering)? {
-                        indices.insert(function_index);
+                    let uses =
+                        function_root_marker_uses(&body, &params, root_lowering, marker_literals)?;
+                    if uses.any() {
+                        indices.insert(function_index, uses);
                     }
                     next_defined_func += 1;
                 }
@@ -1685,11 +1819,24 @@ fn root_marker_function_indices(
     Ok(indices)
 }
 
-fn function_contains_inline_root_marker(
+#[derive(Clone, Copy, Default)]
+struct RootMarkerUses {
+    get: bool,
+    set: bool,
+}
+
+impl RootMarkerUses {
+    fn any(self) -> bool {
+        self.get || self.set
+    }
+}
+
+fn function_root_marker_uses(
     body: &wasmparser::FunctionBody<'_>,
     params: &[ParserValType],
     root_lowering: &RootLowering,
-) -> Result<bool> {
+    marker_literals: &KotlinMarkerLiterals,
+) -> Result<RootMarkerUses> {
     let local_types = local_types(body, params)?;
     let mut reader = body.get_operators_reader()?;
     let mut operators = Vec::new();
@@ -1697,25 +1844,30 @@ fn function_contains_inline_root_marker(
         operators.push(reader.read()?);
     }
 
+    let mut uses = RootMarkerUses::default();
     for index in 0..operators.len() {
-        if let Some(Operator::Call { function_index }) = operators.get(index)
-            && (root_lowering.get_imports.contains_key(function_index)
-                || root_lowering.set_imports.contains_key(function_index))
-        {
-            return Ok(true);
-        }
-        if let Some(marker) = match_inline_set_root_marker(&operators, index, &local_types)? {
-            if root_for_marker_type(root_lowering, marker.type_index)?.is_some() {
-                return Ok(true);
+        if let Some(Operator::Call { function_index }) = operators.get(index) {
+            if root_lowering.get_imports.contains_key(function_index) {
+                uses.get = true;
+            }
+            if root_lowering.set_imports.contains_key(function_index) {
+                uses.set = true;
             }
         }
-        if let Some(marker) = match_inline_get_root_marker(&operators, index)?
+        if let Some(marker) =
+            match_inline_set_root_marker(&operators, index, &local_types, marker_literals)?
+        {
+            if root_for_marker_type(root_lowering, marker.type_index)?.is_some() {
+                uses.set = true;
+            }
+        }
+        if let Some(marker) = match_inline_get_root_marker(&operators, index, marker_literals)?
             && root_for_marker_type(root_lowering, marker.type_index)?.is_some()
         {
-            return Ok(true);
+            uses.get = true;
         }
     }
-    Ok(false)
+    Ok(uses)
 }
 
 fn function_type_params(input: &[u8]) -> Result<BTreeMap<u32, Vec<ParserValType>>> {

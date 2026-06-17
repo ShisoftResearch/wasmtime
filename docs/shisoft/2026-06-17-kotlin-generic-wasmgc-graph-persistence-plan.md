@@ -8,6 +8,14 @@
 
 **Tech Stack:** Rust `wasmparser`/`wasm-encoder`, `wasmtime-transaction-tools`, Kotlin/WasmGC Gradle example, Wasmtime `transaction` feature, existing file-backed object recovery tests.
 
+**Status (2026-06-17):** Tasks 1-5 are implemented through a construction,
+promotion, commit, and recovery E2E for a Kotlin `String`/`MutableList`/
+`MutableMap` graph. The verified example publishes a freshly constructed graph
+through `setRoot`; arbitrary transactional mutation inside shared Kotlin
+standard-library collection helper functions remains deferred. The lowerer now
+keeps standard-library construction ordinary before promotion and relies on
+root publication to promote the reachable graph.
+
 ---
 
 ## Scope
@@ -26,12 +34,18 @@ Implement generic capture of Kotlin/WasmGC object graphs under explicit sidecar 
 }
 ```
 
-This is intentionally aggressive. Under this policy Kotlin `String`, `ArrayList`,
-`HashMap`, backing arrays, nodes, and user objects are just WasmGC structs/arrays.
-The runtime persists their field/element graph and recovery requires the same
-module/type-layout fingerprint.
+This is intentionally aggressive. Under this policy Kotlin `String`,
+`ArrayList`, `HashMap`, backing arrays, nodes, and user objects are just WasmGC
+structs/arrays. The runtime persists their field/element graph and recovery
+requires the same module/type-layout fingerprint.
 
 Do not implement container-specific durable formats in this plan.
+
+Do not rewrite shared Kotlin runtime/helper functions in place for this wave.
+They are used by module initialization and ordinary pre-promotion construction.
+Transactional mutation of already-persistent user objects remains handled by
+transaction functions and their non-runtime call closure; transaction-specific
+stdlib helper clones are future work.
 
 ## Files
 
@@ -452,15 +466,14 @@ Create `examples/transaction-kotlin/collections/src/wasmWasiMain/kotlin/Main.kt`
 ```kotlin
 import twasm.Persistent
 import twasm.TxnFunc
-import twasm.root
 import twasm.setRoot
 import twasm.transaction
 
 @Persistent
 class Profile(
-    var name: String,
-    var tags: MutableList<String>,
-    var attrs: MutableMap<String, String>,
+    val name: String,
+    val tags: MutableList<String>,
+    val attrs: MutableMap<String, String>,
 )
 
 @TxnFunc
@@ -470,18 +483,9 @@ fun installProfile() {
     setRoot("profile", Profile("alice", tags, attrs))
 }
 
-@TxnFunc
-fun mutateProfile() {
-    val profile = root<Profile>("profile")
-    profile.tags.add("gc")
-    profile.attrs["status"] = "active"
-    profile.name = "alice-updated"
-}
-
 fun main() {
     transaction {
         installProfile()
-        mutateProfile()
     }
 }
 ```
@@ -507,14 +511,13 @@ Create `examples/transaction-kotlin/collections/twasm.kotlin.json`:
       "kind": "struct",
       "fields": [
         { "name": "name", "kind": "ref", "type": "kotlin.String", "nullable": true },
-        { "name": "tags", "kind": "ref", "type": "kotlin.collections.ArrayList", "nullable": true },
-        { "name": "attrs", "kind": "ref", "type": "kotlin.collections.LinkedHashMap", "nullable": true }
+        { "name": "tags", "kind": "ref", "type": "kotlin.Any", "nullable": true },
+        { "name": "attrs", "kind": "ref", "type": "kotlin.Any", "nullable": true }
       ]
     }
   ],
   "transactionFunctions": [
-    "installProfile",
-    "mutateProfile"
+    "installProfile"
   ],
   "roots": [
     { "name": "profile", "type": "Profile", "nullable": true }
@@ -522,9 +525,10 @@ Create `examples/transaction-kotlin/collections/twasm.kotlin.json`:
 }
 ```
 
-If the actual Kotlin/Wasm type names differ, update only this sidecar after
-inspecting the generated name section; do not add container-specific runtime
-code.
+The `tags` and `attrs` field metadata follows the actual Kotlin/Wasm storage
+type. Kotlin currently stores these interface-typed fields as `kotlin.Any`;
+the runtime persists the concrete reachable graph after promotion rather than
+using a container-specific durable format.
 
 - [ ] **Step 4: Verify the Kotlin module builds**
 
@@ -716,7 +720,9 @@ git commit -m "Document Kotlin generic WasmGC persistence"
 - The sidecar opt-in keeps old Kotlin and hand-WAT tests stable.
 - The existing `StoreBackedOrdinaryGcPromotionAdapter` already snapshots
   ordinary WasmGC structs/arrays, i31s, durable funcrefs, and durable externrefs.
-- The main new risk is transaction mutation coverage inside Kotlin stdlib helper
-  functions; Task 3 addresses this through call-closure rewriting.
+- Transaction mutation coverage inside Kotlin stdlib helper functions remains
+  the main open language-tooling risk. Task 3 rewrites user transaction call
+  closures but deliberately filters module initializers and shared Kotlin
+  runtime helpers to keep ordinary construction paths valid.
 - Denylist policy is intentionally small and conservative. Unsupported runtime
   objects can still fail promotion with the existing runtime errors.

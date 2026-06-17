@@ -36,6 +36,29 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-17: Generic Kotlin WasmGC Graph Persistence
+
+- Added sidecar opt-in for generic module-wide Kotlin/WasmGC graph capture.
+  Under this mode the Kotlin lowerer discovers concrete module GC structs and
+  arrays, applies the sidecar denylist, and lets reachable Kotlin runtime
+  objects be promoted through the existing `ObjectId` persistent object path.
+- Added a tracked `examples/transaction-kotlin/collections` example using real
+  Kotlin `String`, `MutableList<String>`, and `MutableMap<String, String>`.
+  The example constructs the collection graph inside a transaction, publishes
+  it through a durable root, commits to file-backed storage, and recovers the
+  root plus runtime object records from the durable log.
+- Hardened Kotlin inline root-marker lowering so it no longer depends on fixed
+  Kotlin string-literal indices. The lowerer now removes the throw-marker shape
+  even when the compiler shifts literal table numbers between modules.
+- Kotlin transaction call-closure rewriting now avoids ordinary module
+  initializer paths and shared Kotlin runtime helpers. This keeps pre-promotion
+  standard-library construction ordinary while still rewriting transactional
+  user/accessor paths.
+- Deferred boundary: arbitrary mutation inside shared Kotlin standard-library
+  collection helpers is not frozen yet. The next stable path should use cloned
+  transaction-specific helper functions or compiler-plugin assistance rather
+  than rewriting global Kotlin runtime helpers in place.
+
 ## 2026-06-17: Kotlin Durable Function Identity Registration
 
 - Added an internal registration path for module-defined functions that have

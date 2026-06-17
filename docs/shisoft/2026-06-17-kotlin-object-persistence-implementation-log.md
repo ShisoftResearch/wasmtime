@@ -1,5 +1,28 @@
 # Kotlin Object Persistence Implementation Log
 
+## 2026-06-17: Generic Kotlin WasmGC Graph Persistence
+
+- Added sidecar opt-in for generic module-wide Kotlin/WasmGC graph capture.
+  The lowerer discovers concrete module GC structs and arrays, applies the
+  sidecar denylist, and lets reachable Kotlin runtime objects promote through
+  the existing `ObjectId` persistent object path.
+- Added `examples/transaction-kotlin/collections`, which constructs real
+  Kotlin `String`, `MutableList<String>`, and `MutableMap<String, String>`
+  objects inside a transaction and publishes the `Profile` graph through a
+  durable root.
+- Added a file-backed end-to-end recovery test for the collections example.
+  The test verifies the recovered root record and non-null `Profile` field
+  references for name/list/map objects, not just the number of recovered
+  records.
+- Hardened inline Kotlin root-marker lowering so it is not tied to fixed
+  string-literal table indices, while adding negative coverage for unrelated
+  throw blocks that should not be treated as root markers.
+- Kotlin runtime helpers such as `_stringLiteralLatin1`, constructors,
+  `_initializeModule`, and `kotlin.*` functions remain ordinary shared helper
+  code for this wave. Arbitrary mutation inside shared Kotlin standard-library
+  collection helpers is deferred to cloned transaction helpers or compiler
+  plugin support.
+
 ## 2026-06-17: Kotlin/WasmGC Shape Discovery
 
 - Built `examples/transaction-kotlin/bank` with Kotlin/Wasm.
