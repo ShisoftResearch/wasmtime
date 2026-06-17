@@ -17440,6 +17440,242 @@ mod tests {
     }
 
     #[test]
+    fn persistent_gc_migrated_linked_list_survives_incremental_collection() {
+        let mut objects = ObjectTable::default();
+        let list = allocate_persistent_linked_list_for_migrated_gc_test(&mut objects, 50, 0x900);
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x950, vec![ObjectValue::I32(950)])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::default();
+        state.install_recovered_persistent_roots([list]).unwrap();
+
+        state
+            .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(7))
+            .unwrap();
+        let report = state
+            .finish_persistent_gc_cycle_and_sweep_for_test(&mut objects)
+            .unwrap()
+            .expect("maintenance cycle should have started");
+
+        assert_eq!(persistent_linked_list_sum_for_test(&objects, list), 1225);
+        assert!(report.mark.reachable.contains(&list));
+        assert_eq!(report.mark.reachable.len(), 50);
+        assert_eq!(report.sweep.removed_objects, vec![garbage]);
+        assert!(objects.live_slot(garbage).is_err());
+    }
+
+    #[test]
+    fn persistent_gc_migrated_deep_struct_chain_survives_maintenance_steps() {
+        let mut objects = ObjectTable::default();
+        let chain = allocate_persistent_linked_list_for_migrated_gc_test(&mut objects, 16, 0x960);
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x980, vec![ObjectValue::I32(980)])
+            .unwrap();
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::default();
+        state.install_recovered_persistent_roots([chain]).unwrap();
+
+        for _ in 0..8 {
+            state
+                .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+                .unwrap();
+        }
+
+        let report = state
+            .finish_persistent_gc_cycle_and_sweep_for_test(&mut objects)
+            .unwrap()
+            .expect("maintenance cycle should have started");
+
+        assert_eq!(persistent_linked_list_sum_for_test(&objects, chain), 120);
+        assert_eq!(report.mark.reachable.len(), 16);
+        assert_eq!(report.sweep.removed_objects, vec![garbage]);
+        assert!(objects.live_slot(garbage).is_err());
+    }
+
+    #[test]
+    fn persistent_gc_migrated_binary_tree_marks_complete_closure() {
+        let mut objects = ObjectTable::default();
+        let mut next_gc_ref = 0x990;
+        let tree = allocate_persistent_binary_tree_for_migrated_gc_test(
+            &mut objects,
+            5,
+            1,
+            &mut next_gc_ref,
+        )
+        .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x9c0, vec![ObjectValue::I32(404)])
+            .unwrap();
+
+        let mark = PersistentObjectMarker::mark(&objects, [tree]).unwrap();
+
+        assert_eq!(
+            persistent_binary_tree_sum_for_test(&objects, Some(tree)),
+            496
+        );
+        assert_eq!(mark.reachable.len(), 31);
+        assert!(mark.reachable.contains(&tree));
+        assert_eq!(mark.unreachable_persistent, object_set([garbage]));
+        assert!(mark.invalid_roots.is_empty());
+        assert!(mark.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_gc_migrated_array_refs_trace_live_elements_only() {
+        let mut objects = ObjectTable::default();
+        let first = objects
+            .allocate_persistent_struct_for_gc_ref(0x9d0, vec![ObjectValue::I32(1)])
+            .unwrap();
+        let second = objects
+            .allocate_persistent_struct_for_gc_ref(0x9d1, vec![ObjectValue::I32(2)])
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref(0x9d2, vec![ObjectValue::I32(3)])
+            .unwrap();
+        let root = objects
+            .allocate_persistent_array_for_gc_ref(
+                0x9d3,
+                vec![
+                    ObjectValue::I32(10),
+                    ObjectValue::Ref(None),
+                    ObjectValue::Ref(Some(first)),
+                    ObjectValue::I64(20),
+                    ObjectValue::Ref(Some(second)),
+                ],
+            )
+            .unwrap();
+
+        let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+
+        assert_eq!(mark.reachable, object_set([root, first, second]));
+        assert_eq!(mark.unreachable_persistent, object_set([garbage]));
+        assert!(mark.invalid_roots.is_empty());
+        assert!(mark.dangling_refs.is_empty());
+    }
+
+    #[test]
+    fn persistent_gc_migrated_pressure_sweeps_unrooted_objects() {
+        let mut objects = ObjectTable::default();
+        let mut roots = Vec::new();
+        let mut garbage = Vec::new();
+        for index in 0..128u32 {
+            let object = objects
+                .allocate_persistent_struct_for_gc_ref(
+                    0xa00 + index,
+                    vec![ObjectValue::I32(i32::try_from(index).unwrap())],
+                )
+                .unwrap();
+            if index % 4 == 0 {
+                roots.push(object);
+            } else {
+                garbage.push(object);
+            }
+        }
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::default();
+        state
+            .install_recovered_persistent_roots(roots.iter().copied())
+            .unwrap();
+
+        let report = state
+            .persistent_mark_sweep_collect_for_test(&mut objects)
+            .unwrap();
+
+        assert_eq!(
+            report
+                .sweep
+                .retained_objects
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            roots.iter().copied().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(report.sweep.removed_objects, garbage);
+        assert_eq!(objects.live_count(), roots.len());
+    }
+
+    #[test]
+    fn file_backed_persistent_gc_migrated_graph_recovers_only_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx_log_path = dir.path().join("persistent-gc-migrated-graph.bin");
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(0xa80),
+            durable_log,
+        );
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut objects = ObjectTable::default();
+        let leaf = objects
+            .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                0xa800,
+                0xa80,
+                1,
+                vec![ObjectValue::I32(7)],
+            )
+            .unwrap();
+        let root = objects
+            .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                0xa801,
+                0xa80,
+                2,
+                vec![ObjectValue::Ref(Some(leaf)), ObjectValue::I32(11)],
+            )
+            .unwrap();
+        let garbage = objects
+            .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                0xa802,
+                0xa80,
+                3,
+                vec![ObjectValue::I32(404)],
+            )
+            .unwrap();
+
+        state.acquire_object_write(&mut objects, leaf).unwrap();
+        state
+            .stage_struct_field(&objects, leaf, 0, ObjectValue::I32(70))
+            .unwrap();
+        state.acquire_object_write(&mut objects, root).unwrap();
+        state
+            .stage_struct_field(&objects, root, 1, ObjectValue::I32(110))
+            .unwrap();
+        state.acquire_object_write(&mut objects, garbage).unwrap();
+        state
+            .stage_struct_field(&objects, garbage, 0, ObjectValue::I32(405))
+            .unwrap();
+        state
+            .stage_global(0, GlobalSnapshot::GcRef(0xa801))
+            .unwrap();
+        commit_active_file_backed_publications_for_test(0xa80, 0xa80, &mut objects, &mut state)
+            .unwrap();
+        drop(state);
+
+        let (recovered, object_winners) =
+            recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+        let mut rebuilt = ObjectTable::default();
+        let report = rebuilt
+            .rebuild_reachable_from_recovery_for_test(
+                &recovered.type_layouts,
+                &object_winners,
+                &recovered.root_object_ids,
+            )
+            .unwrap();
+
+        assert_eq!(report.mark.reachable, object_set([root, leaf]));
+        assert_eq!(report.mark.unreachable_persistent, object_set([garbage]));
+        assert_eq!(
+            rebuilt.payload(root).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::Ref(Some(leaf)), ObjectValue::I32(110)])
+        );
+        assert_eq!(
+            rebuilt.payload(leaf).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(70)])
+        );
+        assert!(rebuilt.payload(garbage).is_err());
+    }
+
+    #[test]
     fn persistent_object_marker_budgeted_state_tracks_partial_progress() {
         let mut objects = ObjectTable::default();
         let leaf = objects
@@ -19458,6 +19694,105 @@ mod tests {
             bytes.extend_from_slice(&raw.to_le_bytes());
         }
         bytes
+    }
+
+    fn allocate_persistent_linked_list_for_migrated_gc_test(
+        objects: &mut ObjectTable,
+        len: usize,
+        gc_ref_base: u32,
+    ) -> ObjectId {
+        let mut head = None;
+        for index in 0..len {
+            let gc_ref = gc_ref_base
+                .checked_add(u32::try_from(index).unwrap())
+                .unwrap();
+            let node = objects
+                .allocate_persistent_struct_for_gc_ref(
+                    gc_ref,
+                    vec![
+                        ObjectValue::Ref(head),
+                        ObjectValue::I32(i32::try_from(index).unwrap()),
+                    ],
+                )
+                .unwrap();
+            head = Some(node);
+        }
+        head.expect("linked-list test needs at least one node")
+    }
+
+    fn persistent_linked_list_sum_for_test(objects: &ObjectTable, head: ObjectId) -> i32 {
+        let mut sum = 0;
+        let mut current = Some(head);
+        while let Some(object_id) = current {
+            let payload = objects.payload(object_id).unwrap();
+            let ObjectPayload::Struct(fields) = payload else {
+                panic!("linked-list node must be a struct");
+            };
+            let [ObjectValue::Ref(next), ObjectValue::I32(value)] = fields.as_slice() else {
+                panic!("linked-list node must have next and value fields");
+            };
+            sum += *value;
+            current = *next;
+        }
+        sum
+    }
+
+    fn allocate_persistent_binary_tree_for_migrated_gc_test(
+        objects: &mut ObjectTable,
+        depth: u32,
+        value: i32,
+        next_gc_ref: &mut u32,
+    ) -> Option<ObjectId> {
+        if depth == 0 {
+            return None;
+        }
+        let left = allocate_persistent_binary_tree_for_migrated_gc_test(
+            objects,
+            depth - 1,
+            value * 2,
+            next_gc_ref,
+        );
+        let right = allocate_persistent_binary_tree_for_migrated_gc_test(
+            objects,
+            depth - 1,
+            value * 2 + 1,
+            next_gc_ref,
+        );
+        let gc_ref = *next_gc_ref;
+        *next_gc_ref = gc_ref.checked_add(1).unwrap();
+        Some(
+            objects
+                .allocate_persistent_struct_for_gc_ref(
+                    gc_ref,
+                    vec![
+                        ObjectValue::Ref(left),
+                        ObjectValue::Ref(right),
+                        ObjectValue::I32(value),
+                    ],
+                )
+                .unwrap(),
+        )
+    }
+
+    fn persistent_binary_tree_sum_for_test(objects: &ObjectTable, root: Option<ObjectId>) -> i32 {
+        let Some(object_id) = root else {
+            return 0;
+        };
+        let payload = objects.payload(object_id).unwrap();
+        let ObjectPayload::Struct(fields) = payload else {
+            panic!("binary-tree node must be a struct");
+        };
+        let [
+            ObjectValue::Ref(left),
+            ObjectValue::Ref(right),
+            ObjectValue::I32(value),
+        ] = fields.as_slice()
+        else {
+            panic!("binary-tree node must have left, right, and value fields");
+        };
+        value
+            + persistent_binary_tree_sum_for_test(objects, *left)
+            + persistent_binary_tree_sum_for_test(objects, *right)
     }
 
     fn object_set<const N: usize>(objects: [ObjectId; N]) -> BTreeSet<ObjectId> {

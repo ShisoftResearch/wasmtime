@@ -52,6 +52,18 @@ persistent GC.
   chunks, broader cleaning heuristics, background scheduling, and explicit
   `ObjectId` reuse policy.
 
+## 2026-06-17: Persistent GC Migrated Wasmtime Test Coverage
+
+- Migrated applicable Wasmtime GC graph/liveness cases into persistent
+  `ObjectId` tests: linked lists, deep struct chains, binary trees, arrays with
+  reference/scalar/null elements, and allocation-pressure sweeping.
+- Added file-backed recovery coverage for a persistent object graph where the
+  recovered object table keeps the rooted object and reachable child while
+  filtering the unreachable winner.
+- Deliberately did not migrate volatile Wasmtime GC tests whose correctness
+  depends on `VMGcRef` rooting, cross-store checks, stack maps, or host
+  `ExternRef` finalization rather than persistent reachability.
+
 ## 2026-06-16: First Mark-Sweep Persistent GC
 
 - Added a stop-the-world persistent mark-sweep API over committed `ObjectId`
