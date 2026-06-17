@@ -79,14 +79,12 @@ Modify:
   - Add `twasm-kotlin` binary. Existing dependencies cover the planned tests.
 - `crates/transaction-tools/src/lib.rs`
   - Export Kotlin metadata/inspect/rewrite modules.
-- `crates/wasmtime/src/runtime/transaction/promotion.rs`
-  - Make the existing `OrdinaryGcPromotionAdapter` path usable by a real Wasmtime GC adapter.
-- `crates/wasmtime/src/runtime/vm/libcalls.rs`
-  - Add narrow runtime hooks for promoting live Kotlin/WasmGC refs when they cross into persistent state.
-- `crates/wasmtime/src/runtime/transaction.rs`
-  - Add focused unit tests for alias/cycle-preserving ordinary-GC promotion if the helper surface belongs there.
-- `crates/wasmtime/tests/transaction_persistence.rs`
-  - Add file-backed recovery tests for promoted ordinary objects.
+- Existing Wasmtime runtime promotion code is reused as-is.
+  - `StoreBackedOrdinaryGcPromotionAdapter` in `crates/wasmtime/src/runtime/vm/libcalls.rs`
+    already snapshots ordinary WasmGC structs/arrays into persistent `ObjectId`
+    records before commit.
+  - Kotlin work must only generate/lower Wasm into that existing transaction
+    boundary and verify it with Kotlin-shaped modules.
 
 ---
 
@@ -1371,146 +1369,86 @@ git commit -m "Lower Kotlin WasmGC object ops to transactions"
 
 ---
 
-## Task 7: Wire Real Wasmtime Promotion For Ordinary WasmGC Objects
+## Task 7: Verify Kotlin Uses Existing Ordinary WasmGC Promotion
 
 **Files:**
 
-- Modify: `crates/wasmtime/src/runtime/transaction/promotion.rs`
-- Modify: `crates/wasmtime/src/runtime/vm/libcalls.rs`
-- Modify: `crates/wasmtime/src/runtime/transaction.rs`
-- Modify: `crates/wasmtime/tests/transaction_persistence.rs`
+- Modify: `crates/transaction-tools/src/kotlin_rewrite.rs`
+- Modify: `crates/transaction-tools/tests/kotlin_rewrite.rs`
+- Modify: `tests/transaction_kotlin_toolset.rs`
 
-- [ ] **Step 1: Add failing promotion unit tests**
+- [ ] **Step 1: Assert the runtime boundary is existing Wasmtime promotion**
 
-Add focused tests in `crates/wasmtime/src/runtime/transaction.rs` under the existing transaction tests:
+Do not add a second ordinary-WasmGC promotion adapter for Kotlin. The runtime
+already has the generic path:
 
-```rust
-#[test]
-fn ordinary_gc_promotion_preserves_aliases() {
-    // Build two persistent fields from the same ordinary source ref through a
-    // fake OrdinaryGcPromotionAdapter. Both fields must end up with the same
-    // promoted ObjectId.
-}
-
-#[test]
-fn ordinary_gc_promotion_rolls_back_on_unsupported_child() {
-    // Fake adapter returns Struct -> Unsupported child. Promotion must fail and
-    // leave no allocated persistent ObjectId behind.
-}
+```bash
+rg -n "StoreBackedOrdinaryGcPromotionAdapter|impl OrdinaryGcPromotionAdapter" \
+  crates/wasmtime/src/runtime/vm/libcalls.rs
+rg -n "real_tfunc_promotes_ordinary" crates/wasmtime/tests/transaction_persistence.rs
 ```
 
-Use the existing `OrdinaryGcPromotionAdapter` trait with a test adapter that returns:
+Expected: the store-backed adapter and ordinary promotion recovery tests exist.
 
-```rust
-OrdinaryGcPromotionSource::Struct {
-    type_layout_id,
-    fields: vec![
-        OrdinaryGcPromotionValue::GcRef(Some(0x100)),
-        OrdinaryGcPromotionValue::GcRef(Some(0x100)),
-    ],
-}
-```
+- [ ] **Step 2: Keep Kotlin allocation ordinary until persistence is required**
 
-- [ ] **Step 2: Run failing promotion tests**
+In `crates/transaction-tools/tests/kotlin_rewrite.rs`, add shape tests proving
+the Kotlin lowerer does not eagerly allocate persistent objects for every
+`struct.new`/`array.new`.
+
+Expected lowering shape:
+
+- ordinary Kotlin constructors remain ordinary WasmGC allocation sites,
+- assignments to persistent roots/fields/arrays cross the existing transaction
+  persistence boundary,
+- unsupported referenced ordinary objects still fail before commit rather than
+  being written as durable `VMGcRef`s.
+
+- [ ] **Step 3: Register Kotlin persistent type layouts**
+
+Use the Kotlin sidecar metadata to connect Kotlin persistent classes/arrays to
+the existing Wasmtime persistent type-layout registry. This is the Kotlin-specific
+part: the runtime promotion adapter can only snapshot an ordinary WasmGC object
+when its runtime type maps to a persistent layout id.
+
+Add tests that reject:
+
+- missing layout metadata for an `@Persistent` class,
+- field count/type mismatches between sidecar metadata and discovered WasmGC
+  type shape,
+- persistent references to ordinary Kotlin runtime classes that are not
+  `@Persistent`.
+
+- [ ] **Step 4: Add Kotlin-shaped promotion/recovery test**
+
+In `tests/transaction_kotlin_toolset.rs`, add an end-to-end test that builds a
+small Kotlin module, lowers it, runs it against file-backed storage, reopens the
+storage, and verifies promoted objects are recovered through `ObjectId` records.
+
+The module should cover:
+
+- ordinary `struct.new`/`array.new` inside a transaction,
+- promotion through persistent root assignment,
+- at least one nested persistent object reference,
+- alias preservation when two fields reference the same ordinary object,
+- recovery after reopening the file-backed backend.
+
+- [ ] **Step 5: Run Kotlin promotion integration tests**
 
 Run:
 
 ```bash
-cargo test -p wasmtime --lib ordinary_gc_promotion_ -- --format terse
-```
-
-Expected: FAIL if helpers are private or alias rollback behavior is incomplete.
-
-- [ ] **Step 3: Expose the narrow promotion helper for runtime use**
-
-In `crates/wasmtime/src/runtime/transaction/promotion.rs`, add a public crate-visible helper:
-
-```rust
-pub(crate) fn promote_ordinary_gc_ref_for_persistence_with_adapter<A: OrdinaryGcPromotionAdapter>(
-    &mut self,
-    object_table: &mut ObjectTable,
-    gc_ref: u32,
-    adapter: &mut A,
-) -> Result<Option<ObjectId>> {
-    self.persistent_object_id_for_live_bridge_after_promotion_with_adapter(
-        object_table,
-        gc_ref,
-        adapter,
-    )
-}
-```
-
-Keep the existing rollback semantics through `run_promotion_attempt`.
-
-- [ ] **Step 4: Implement the real Wasmtime GC adapter**
-
-In `crates/wasmtime/src/runtime/vm/libcalls.rs`, add a local adapter type used only by transaction persistence helpers:
-
-```rust
-struct WasmtimeOrdinaryGcPromotionAdapter<'a> {
-    store: &'a mut dyn VMStore,
-    instance: InstanceId,
-}
-```
-
-It implements `OrdinaryGcPromotionAdapter` by reading a live Wasmtime GC ref and returning `OrdinaryGcPromotionSource::Struct` or `OrdinaryGcPromotionSource::Array` only when:
-
-- the runtime type maps to a persistent layout id registered from Kotlin sidecar/type metadata,
-- every field/element can be converted to `OrdinaryGcPromotionValue`,
-- unsupported Kotlin runtime objects return `OrdinaryGcPromotionSource::Unsupported("...")`.
-
-The adapter must not store `VMGcRef` in durable records. It only extracts a snapshot and lets `TransactionState` allocate durable `ObjectId`s.
-
-- [ ] **Step 5: Add runtime libcall for promotion boundary**
-
-Add a narrow libcall invoked by lowered Kotlin when assigning a volatile object to a persistent root/field:
-
-```rust
-fn transaction_promote_gc_ref_for_persistence(
-    store: &mut dyn VMStore,
-    instance: InstanceId,
-    gc_ref: u32,
-) -> Result<u64>
-```
-
-Return the persistent nullable-ref ABI raw value for the promoted `ObjectId`.
-
-- [ ] **Step 6: Add file-backed recovery test for promoted ordinary object**
-
-In `crates/wasmtime/tests/transaction_persistence.rs`, add:
-
-```rust
-#[test]
-fn real_tfunc_promotes_ordinary_struct_root_and_recovers() -> Result<()> {
-    // Use a small WAT/Kotlin-lowered-style module that creates an ordinary
-    // struct, promotes it through the new promotion libcall/root assignment,
-    // commits, reopens file-backed storage, and verifies one root object winner.
-    Ok(())
-}
-```
-
-Expected assertions:
-
-- recovered root count is `1`
-- recovered object winners include the promoted struct
-- recovered field bytes contain the committed value
-
-- [ ] **Step 7: Run promotion and persistence tests**
-
-Run:
-
-```bash
-cargo test -p wasmtime --lib ordinary_gc_promotion_ -- --format terse
-cargo test -p wasmtime --test transaction_persistence real_tfunc_promotes_ordinary_struct_root_and_recovers -- --format terse
+cargo test -p wasmtime-transaction-tools --test kotlin_rewrite -- --format terse
+cargo test --test transaction_kotlin_toolset kotlin_promotes_ordinary_wasmgc_objects -- --format terse
 ```
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/wasmtime/src/runtime/transaction.rs crates/wasmtime/src/runtime/transaction/promotion.rs crates/wasmtime/src/runtime/vm/libcalls.rs crates/wasmtime/tests/transaction_persistence.rs
-git commit -m "Promote ordinary WasmGC objects into persistent records"
+git add crates/transaction-tools/src/kotlin_rewrite.rs crates/transaction-tools/tests/kotlin_rewrite.rs tests/transaction_kotlin_toolset.rs
+git commit -m "Verify Kotlin WasmGC promotion integration"
 ```
 
 ---
@@ -1731,14 +1669,16 @@ Spec coverage:
 - Sidecar metadata: Task 2.
 - Lowerer/tooling: Tasks 3, 5, and 6.
 - Real simple-transactions compatibility: Tasks 5 and 8.
-- Transaction-time promotion: Task 7.
+- Transaction-time promotion: Task 7 verifies Kotlin-shaped modules use the
+  existing Wasmtime ordinary-WasmGC-to-`ObjectId` promotion path.
 - File-backed recovery and persistent GC: Task 8.
 - Final verification: Task 9.
 
 Plan hygiene:
 
 - The plan uses exact file paths and avoids open-ended implementation slots.
-- Task 7 includes the real hard part, but it is bounded to concrete files, tests, helper names, and expected semantics.
+- Runtime promotion is not duplicated in the Kotlin toolchain plan; only
+  Kotlin metadata, lowering shape, and integration tests remain here.
 
 Execution notes:
 
