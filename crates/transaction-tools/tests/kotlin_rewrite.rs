@@ -274,6 +274,8 @@ fn rewrite_lowers_same_type_root_marker_imports() {
                 (func $set_primary (param (ref null $Bank)) (result (ref null $Unit))))
               (import "twasm.root.get" "secondary"
                 (func $get_secondary (result (ref null $Bank))))
+              (import "env" "observe"
+                (func $observe (param (ref null $Bank))))
               (tag $error)
               (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
                 ref.null $Unit)
@@ -281,7 +283,10 @@ fn rewrite_lowers_same_type_root_marker_imports() {
                 local.get $bank
                 call $set_primary)
               (func $readSecondary (result (ref null $Bank))
-                call $get_secondary))
+                call $get_secondary)
+              (func $passToEnv (param $bank (ref null $Bank))
+                local.get $bank
+                call $observe))
             "#,
     )
     .unwrap();
@@ -305,13 +310,14 @@ fn rewrite_lowers_same_type_root_marker_imports() {
     let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
     assert_valid_module(&output);
+    assert_eq!(marker_import_count(&output), 0);
 
     assert_eq!(
         transaction_objects(&output),
         TransactionObjects {
             memories: vec![],
             globals: vec![0, 1],
-            functions: vec![3, 4],
+            functions: vec![2, 3],
             tables: vec![],
         }
     );
@@ -371,13 +377,14 @@ fn rewrite_lowers_inline_and_explicit_root_markers_together() {
     let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
     assert_valid_module(&output);
+    assert_eq!(marker_import_count(&output), 0);
 
     assert_eq!(
         transaction_objects(&output),
         TransactionObjects {
             memories: vec![],
             globals: vec![0, 1],
-            functions: vec![2, 3],
+            functions: vec![1, 2],
             tables: vec![],
         }
     );
@@ -1332,6 +1339,23 @@ fn assert_valid_module(bytes: &[u8]) {
     Validator::new()
         .validate_all(bytes)
         .expect("rewritten module should validate");
+}
+
+fn marker_import_count(bytes: &[u8]) -> usize {
+    let mut count = 0;
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.expect("payload");
+        let Payload::ImportSection(section) = payload else {
+            continue;
+        };
+        for import in section.into_imports() {
+            let import = import.expect("import");
+            if matches!(import.module, "twasm.root.get" | "twasm.root.set") {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 fn read_index_vec(reader: &mut BinaryReader<'_>) -> Vec<u32> {

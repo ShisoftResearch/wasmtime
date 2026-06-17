@@ -50,6 +50,7 @@
 - Remaining object-language work is no longer the Kotlin live-funcref fallback;
   it is the compiler/tooling contract for exposing this durable registration
   outside the test-only `_internal::transaction_persistence` namespace.
-- Explicit root marker import calls are lowered, but the import declarations
-  are still an intermediate toolchain contract. Final Kotlin packaging should
-  strip them or replace them with an equivalent self-contained metadata carrier.
+- Explicit root marker import calls are lowered and their import declarations
+  are stripped from the rewritten module. Function indices in code, exports,
+  elements, starts, and transaction-object metadata are remapped so the lowered
+  module is self-contained.

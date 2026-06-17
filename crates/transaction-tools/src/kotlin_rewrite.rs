@@ -2,11 +2,14 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
+use std::error::Error as StdError;
+use std::fmt;
+use wasm_encoder::reencode::{Error as ReencodeError, Reencode, RoundtripReencoder};
 use wasm_encoder::{
     CodeSection, ConstExpr, Encode, Function, GlobalType as EncoderGlobalType,
-    HeapType as EncoderHeapType, Instruction, Module, RawSection, RefType as EncoderRefType,
-    TransactionRefPermission as EncoderTransactionRefPermission, ValType as EncoderValType,
+    HeapType as EncoderHeapType, ImportSection, Instruction, Module, RawSection,
+    RefType as EncoderRefType, TransactionRefPermission as EncoderTransactionRefPermission,
+    ValType as EncoderValType,
 };
 use wasmparser::{
     AbstractHeapType, BinaryReader, BlockType, CodeSectionReader, CompositeInnerType, ExternalKind,
@@ -23,6 +26,7 @@ const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 const TRANSACTION_OBJECTS_VERSION: u8 = 1;
 const KOTLIN_ROOT_GET_IMPORT_MODULE: &str = "twasm.root.get";
 const KOTLIN_ROOT_SET_IMPORT_MODULE: &str = "twasm.root.set";
+const NAME_CUSTOM_SECTION: &str = "name";
 const KOTLIN_RUNTIME_STRUCT_FIELDS: &[&str] = &["vtable", "itable", "rtti", "_hashCode"];
 
 #[derive(Debug, Default, Serialize)]
@@ -92,12 +96,83 @@ struct FunctionSignature {
     results: Vec<ParserValType>,
 }
 
+struct KotlinIndexRemapper {
+    function_index_map: Vec<Option<u32>>,
+}
+
+#[derive(Debug)]
+struct KotlinRemapError(String);
+
+impl fmt::Display for KotlinRemapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl StdError for KotlinRemapError {}
+
+impl KotlinIndexRemapper {
+    fn new(function_index_map: Vec<Option<u32>>) -> Self {
+        Self { function_index_map }
+    }
+
+    fn remap_function_index(&self, function_index: u32) -> Result<u32> {
+        self.function_index_map
+            .get(function_index as usize)
+            .copied()
+            .flatten()
+            .with_context(|| format!("function index {function_index} was removed during rewrite"))
+    }
+
+    fn remap_function_index_for_reencode(
+        &self,
+        function_index: u32,
+    ) -> std::result::Result<u32, ReencodeError<KotlinRemapError>> {
+        self.function_index_map
+            .get(function_index as usize)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                ReencodeError::UserError(KotlinRemapError(format!(
+                    "function index {function_index} was removed during rewrite"
+                )))
+            })
+    }
+
+    fn function_index_removed(&self, function_index: u32) -> bool {
+        self.function_index_map
+            .get(function_index as usize)
+            .is_some_and(Option::is_none)
+    }
+}
+
+impl Reencode for KotlinIndexRemapper {
+    type Error = KotlinRemapError;
+
+    fn function_index(
+        &mut self,
+        function_index: u32,
+    ) -> std::result::Result<u32, ReencodeError<Self::Error>> {
+        self.remap_function_index_for_reencode(function_index)
+    }
+}
+
 impl TransactionObjects {
     fn is_empty(&self) -> bool {
         self.memories.is_empty()
             && self.globals.is_empty()
             && self.functions.is_empty()
             && self.tables.is_empty()
+    }
+}
+
+impl RootLowering {
+    fn marker_import_indices(&self) -> BTreeSet<u32> {
+        self.get_imports
+            .keys()
+            .chain(self.set_imports.keys())
+            .copied()
+            .collect()
     }
 }
 
@@ -209,11 +284,18 @@ pub fn rewrite_kotlin_module(
     let mut object_rewrite_function_indices = transaction_function_indices.clone();
     object_rewrite_function_indices.extend(persistent_accessor_function_indices(input, sidecar)?);
     let mut transaction_objects = transaction_objects(input)?;
-    transaction_objects
-        .functions
-        .extend(transaction_function_indices.iter().copied());
     let gc_type_info = gc_type_info(input, sidecar)?;
     let root_lowering = root_lowering(input, sidecar, &gc_type_info)?;
+    let stripped_marker_imports = root_lowering.marker_import_indices();
+    let mut index_remapper =
+        KotlinIndexRemapper::new(function_index_map(input, &stripped_marker_imports)?);
+    remap_transaction_objects(&mut transaction_objects, &index_remapper)?;
+    transaction_objects.functions.extend(
+        transaction_function_indices
+            .iter()
+            .map(|index| index_remapper.remap_function_index(*index))
+            .collect::<Result<Vec<_>>>()?,
+    );
     transaction_objects
         .globals
         .extend(root_lowering.globals.iter().map(|root| root.global_index));
@@ -227,9 +309,12 @@ pub fn rewrite_kotlin_module(
         &func_type_params,
         &defined_function_types,
     )?;
-    transaction_objects
-        .functions
-        .extend(root_marker_function_indices.iter().copied());
+    transaction_objects.functions.extend(
+        root_marker_function_indices
+            .iter()
+            .map(|index| index_remapper.remap_function_index(*index))
+            .collect::<Result<Vec<_>>>()?,
+    );
     object_rewrite_function_indices.extend(root_marker_function_indices.iter().copied());
 
     let mut report = KotlinRewriteReport {
@@ -240,7 +325,6 @@ pub fn rewrite_kotlin_module(
         rewritten_object_ops: 0,
     };
 
-    let mut reencoder = RoundtripReencoder;
     let mut module = Module::new();
     let mut next_defined_func = 0u32;
     let mut emitted_global_section = false;
@@ -255,37 +339,39 @@ pub fn rewrite_kotlin_module(
             Payload::Version { .. } => bail!("unsupported non-core wasm module"),
             Payload::TypeSection(section) => {
                 let mut types = wasm_encoder::TypeSection::new();
-                reencoder.parse_type_section(&mut types, section)?;
+                index_remapper.parse_type_section(&mut types, section)?;
                 module.section(&types);
             }
             Payload::ImportSection(section) => {
-                let mut imports = wasm_encoder::ImportSection::new();
-                reencoder.parse_import_section(&mut imports, section)?;
-                module.section(&imports);
+                let mut imports = ImportSection::new();
+                rewrite_kotlin_import_section(&mut index_remapper, &mut imports, section)?;
+                if !imports.is_empty() {
+                    module.section(&imports);
+                }
             }
             Payload::FunctionSection(section) => {
                 let mut functions = wasm_encoder::FunctionSection::new();
-                reencoder.parse_function_section(&mut functions, section)?;
+                index_remapper.parse_function_section(&mut functions, section)?;
                 module.section(&functions);
             }
             Payload::TableSection(section) => {
                 let mut tables = wasm_encoder::TableSection::new();
-                reencoder.parse_table_section(&mut tables, section)?;
+                index_remapper.parse_table_section(&mut tables, section)?;
                 module.section(&tables);
             }
             Payload::MemorySection(section) => {
                 let mut memories = wasm_encoder::MemorySection::new();
-                reencoder.parse_memory_section(&mut memories, section)?;
+                index_remapper.parse_memory_section(&mut memories, section)?;
                 module.section(&memories);
             }
             Payload::TagSection(section) => {
                 let mut tags = wasm_encoder::TagSection::new();
-                reencoder.parse_tag_section(&mut tags, section)?;
+                index_remapper.parse_tag_section(&mut tags, section)?;
                 module.section(&tags);
             }
             Payload::GlobalSection(section) => {
                 let mut globals = wasm_encoder::GlobalSection::new();
-                reencoder.parse_global_section(&mut globals, section)?;
+                index_remapper.parse_global_section(&mut globals, section)?;
                 append_root_globals(&mut globals, &root_lowering);
                 module.section(&globals);
                 emitted_global_section = true;
@@ -297,7 +383,7 @@ pub fn rewrite_kotlin_module(
                     &mut emitted_global_section,
                 );
                 let mut exports = wasm_encoder::ExportSection::new();
-                reencoder.parse_export_section(&mut exports, section)?;
+                index_remapper.parse_export_section(&mut exports, section)?;
                 module.section(&exports);
             }
             Payload::StartSection { func, .. } => {
@@ -307,7 +393,7 @@ pub fn rewrite_kotlin_module(
                     &mut emitted_global_section,
                 );
                 module.section(&wasm_encoder::StartSection {
-                    function_index: reencoder.start_section(func)?,
+                    function_index: index_remapper.start_section(func)?,
                 });
             }
             Payload::ElementSection(section) => {
@@ -317,7 +403,7 @@ pub fn rewrite_kotlin_module(
                     &mut emitted_global_section,
                 );
                 let mut elements = wasm_encoder::ElementSection::new();
-                reencoder.parse_element_section(&mut elements, section)?;
+                index_remapper.parse_element_section(&mut elements, section)?;
                 module.section(&elements);
             }
             Payload::DataCountSection { count, .. } => {
@@ -327,7 +413,7 @@ pub fn rewrite_kotlin_module(
                     &mut emitted_global_section,
                 );
                 module.section(&wasm_encoder::DataCountSection {
-                    count: reencoder.data_count(count)?,
+                    count: index_remapper.data_count(count)?,
                 });
             }
             Payload::DataSection(section) => {
@@ -337,7 +423,7 @@ pub fn rewrite_kotlin_module(
                     &mut emitted_global_section,
                 );
                 let mut data = wasm_encoder::DataSection::new();
-                reencoder.parse_data_section(&mut data, section)?;
+                index_remapper.parse_data_section(&mut data, section)?;
                 module.section(&data);
             }
             Payload::CodeSectionStart { range, .. } => {
@@ -368,6 +454,7 @@ pub fn rewrite_kotlin_module(
                         object_rewrite_function_indices.contains(&function_index),
                         &gc_type_info,
                         &root_lowering,
+                        &mut index_remapper,
                         &params,
                         &mut report,
                     )?;
@@ -379,7 +466,10 @@ pub fn rewrite_kotlin_module(
             }
             Payload::CodeSectionEntry(_) => {}
             Payload::CustomSection(section) => {
-                if section.name() != TRANSACTION_OBJECTS_CUSTOM_SECTION {
+                if section.name() != TRANSACTION_OBJECTS_CUSTOM_SECTION
+                    && !(section.name() == NAME_CUSTOM_SECTION
+                        && !stripped_marker_imports.is_empty())
+                {
                     module.section(&wasm_encoder::CustomSection::from(section));
                 }
             }
@@ -411,14 +501,15 @@ fn rewrite_function_body(
     rewrite_object_ops: bool,
     gc_type_info: &GcTypeInfo,
     root_lowering: &RootLowering,
+    index_remapper: &mut KotlinIndexRemapper,
     params: &[ParserValType],
     report: &mut KotlinRewriteReport,
 ) -> Result<Function> {
-    let mut reencoder = RoundtripReencoder;
+    let mut type_reencoder = RoundtripReencoder;
     let local_types = local_types(body, params)?;
     let required_temps = required_temps(body, rewrite_object_ops, gc_type_info)?;
     let (local_decls, temp_locals) =
-        local_decls_with_temps(&mut reencoder, body, &local_types, required_temps)?;
+        local_decls_with_temps(&mut type_reencoder, body, &local_types, required_temps)?;
     let mut function = Function::new(local_decls);
     let mut type_stack = Vec::new();
     let mut reader = body.get_operators_reader()?;
@@ -435,6 +526,7 @@ fn rewrite_function_body(
                 let unit_getter = root_lowering
                     .unit_getter_func
                     .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
+                let unit_getter = index_remapper.remap_function_index(unit_getter)?;
                 function.instruction(&Instruction::LocalGet(marker.value_local));
                 function.instruction(&Instruction::TGlobalSet {
                     global_index: root.global_index,
@@ -480,6 +572,7 @@ fn rewrite_function_body(
                 let unit_getter = root_lowering
                     .unit_getter_func
                     .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
+                let unit_getter = index_remapper.remap_function_index(unit_getter)?;
                 function.instruction(&Instruction::TGlobalSet {
                     global_index: root.global_index,
                 });
@@ -619,7 +712,7 @@ fn rewrite_function_body(
                 type_stack.push(None);
             }
             _ => {
-                function.instruction(&reencoder.instruction(op)?);
+                function.instruction(&index_remapper.instruction(op)?);
                 if is_array_len {
                     type_stack.push(None);
                 }
@@ -1020,6 +1113,98 @@ fn transaction_objects(input: &[u8]) -> Result<TransactionObjects> {
     }
 
     Ok(objects)
+}
+
+fn function_index_map(
+    input: &[u8],
+    stripped_function_imports: &BTreeSet<u32>,
+) -> Result<Vec<Option<u32>>> {
+    let mut function_index_map = Vec::new();
+    let mut stripped_seen = BTreeSet::new();
+    let mut next_new_function_index = 0u32;
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite function-index payload")? {
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import =
+                        import.context("failed to parse Kotlin rewrite function import")?;
+                    if !matches!(import.ty, TypeRef::Func(_) | TypeRef::FuncExact(_)) {
+                        continue;
+                    }
+
+                    let old_function_index = u32::try_from(function_index_map.len())
+                        .context("Kotlin rewrite function index overflow")?;
+                    if stripped_function_imports.contains(&old_function_index) {
+                        stripped_seen.insert(old_function_index);
+                        function_index_map.push(None);
+                    } else {
+                        function_index_map.push(Some(next_new_function_index));
+                        next_new_function_index = next_new_function_index
+                            .checked_add(1)
+                            .context("Kotlin rewrite function index overflow")?;
+                    }
+                }
+            }
+            Payload::FunctionSection(section) => {
+                for type_index in section {
+                    type_index.context("failed to parse Kotlin rewrite function type index")?;
+                    function_index_map.push(Some(next_new_function_index));
+                    next_new_function_index = next_new_function_index
+                        .checked_add(1)
+                        .context("Kotlin rewrite function index overflow")?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ensure!(
+        stripped_seen == *stripped_function_imports,
+        "Kotlin marker import index set contained non-import function indices"
+    );
+    Ok(function_index_map)
+}
+
+fn remap_transaction_objects(
+    transaction_objects: &mut TransactionObjects,
+    index_remapper: &KotlinIndexRemapper,
+) -> Result<()> {
+    transaction_objects.functions = transaction_objects
+        .functions
+        .iter()
+        .map(|index| index_remapper.remap_function_index(*index))
+        .collect::<Result<BTreeSet<_>>>()?;
+    Ok(())
+}
+
+fn rewrite_kotlin_import_section(
+    index_remapper: &mut KotlinIndexRemapper,
+    imports: &mut ImportSection,
+    section: wasmparser::ImportSectionReader<'_>,
+) -> Result<()> {
+    let mut next_function_index = 0u32;
+
+    for import in section.into_imports() {
+        let import = import.context("failed to parse Kotlin rewrite import")?;
+        if matches!(import.ty, TypeRef::Func(_) | TypeRef::FuncExact(_)) {
+            let old_function_index = next_function_index;
+            next_function_index = next_function_index
+                .checked_add(1)
+                .context("Kotlin rewrite function index overflow")?;
+            if index_remapper.function_index_removed(old_function_index) {
+                continue;
+            }
+        }
+
+        imports.import(
+            import.module,
+            import.name,
+            index_remapper.entity_type(import.ty)?,
+        );
+    }
+
+    Ok(())
 }
 
 fn explicit_root_marker_imports(

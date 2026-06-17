@@ -157,10 +157,11 @@ Required first-wave rewrites:
 - `root<T>("name")` becomes a durable root lookup that returns a persistent
   object reference encoded through the branch's `ObjectId` ABI.
 - Explicit root marker imports may encode stable root names when the inline
-  Kotlin helper body does not expose the string operand. The supported
-  intermediate ABI is `twasm.root.get`/`twasm.root.set` with the import field
-  equal to the sidecar root name. This lets same-type roots lower without
-  relying on type-only disambiguation.
+  Kotlin helper body does not expose the string operand. The supported ABI is
+  `twasm.root.get`/`twasm.root.set` with the import field equal to the sidecar
+  root name. The lowerer consumes those calls, strips the marker import
+  declarations, and remaps function indices so the rewritten module is
+  self-contained.
 - persistent `struct.new`/constructor patterns become promotable object
   construction. They may remain ordinary Kotlin/WasmGC objects until they are
   stored into a persistent graph, assigned to a persistent root, or otherwise
@@ -177,10 +178,8 @@ The lowered module should use the same transactional object operation family as
 the current simple-transactions WAST tranche: `tfunc`, `tcall`, `tstruct`,
 `tarray`, transactional reference/cast operations where needed, and the
 existing persistent object runtime paths. SDK marker calls must be removed from
-executed code. Explicit marker import declarations are currently an
-intermediate root-name carrier for toolchain tests; a production packaging pass
-should either strip them with full index rewriting or provide an equivalent
-self-contained metadata carrier.
+executed code. Explicit marker import declarations are root-name carriers for
+the lowerer only; they must not remain in the executed module after rewriting.
 
 ## Runtime Semantics
 

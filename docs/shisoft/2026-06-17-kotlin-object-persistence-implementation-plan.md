@@ -8,6 +8,14 @@
 
 **Tech Stack:** Kotlin/Wasm Gradle plugin `2.4.0`, WasmGC/WASI, Rust `wasmparser`/`wasm-encoder`/`wasmprinter`, existing `wasmtime-transaction-tools`, Wasmtime `transaction` feature, file-backed transaction persistence tests.
 
+**Current status, 2026-06-17:** Tasks 1 through 8 are implemented for the first
+tracked Kotlin object-memory path. The lowerer now consumes both inline root
+markers and explicit `twasm.root.get`/`twasm.root.set` marker imports, strips
+those marker imports, remaps function indices, and verifies the resulting module
+against the existing transaction Wasmtime runtime. Remaining Kotlin-language
+work is SDK/compiler polish and broader language examples, not a second runtime
+promotion path.
+
 ---
 
 ## Scope
