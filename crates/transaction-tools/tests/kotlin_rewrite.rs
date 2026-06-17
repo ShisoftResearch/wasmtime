@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use wasmparser::{BinaryReader, ElementItems, ExternalKind, Parser, Payload, Validator};
 use wasmtime_transaction_tools::kotlin_metadata::{
     KotlinField, KotlinFieldKind, KotlinPersistentKind, KotlinPersistentType, KotlinRoot,
-    KotlinSidecar,
+    KotlinSidecar, parse_kotlin_sidecar,
 };
 use wasmtime_transaction_tools::kotlin_rewrite::rewrite_kotlin_module;
 
@@ -144,6 +144,176 @@ fn rewrite_report_records_transaction_function_name_section_matches() {
     assert_eq!(report.transaction_functions, vec!["transfer"]);
     assert_eq!(report.rewritten_tfuncs, 1);
     assert_eq!(transaction_objects(&output).functions, vec![0]);
+}
+
+#[test]
+fn generic_wasmgc_mode_allows_roots_and_refs_to_runtime_gc_types() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $String (struct (field (mut i32))))
+          (type $Profile (struct (field (mut (ref null $String)))))
+          (global $source (ref $Profile)
+            (struct.new $Profile
+              (struct.new $String (i32.const 5))))
+          (func (export "publish")
+            global.get $source
+            drop))
+        "#,
+    )
+    .unwrap();
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "generic",
+          "gcWasm": { "capture": "allModuleGcTypes", "denyTypes": [] },
+          "persistentTypes": [],
+          "transactionFunctions": ["publish"],
+          "roots": [
+            { "name": "profile", "type": "Profile", "nullable": true }
+          ]
+        }"#
+        .as_slice(),
+    )
+    .unwrap();
+
+    let (_output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_eq!(report.persistent_types, 2);
+}
+
+#[test]
+fn generic_wasmgc_mode_marks_unnamed_module_gc_types_persistent() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $Named (struct))
+          (type (array (mut i32)))
+          (func (export "publish")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "generic",
+          "gcWasm": { "capture": "allModuleGcTypes", "denyTypes": [] },
+          "persistentTypes": [],
+          "transactionFunctions": ["publish"],
+          "roots": []
+        }"#
+        .as_slice(),
+    )
+    .unwrap();
+
+    let (_output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_eq!(report.persistent_types, 2);
+}
+
+#[test]
+fn generic_wasmgc_mode_rejects_denied_runtime_gc_root_types() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $Hidden (struct))
+          (global $source (ref null $Hidden)
+            ref.null $Hidden)
+          (func (export "publish")
+            global.get $source
+            drop))
+        "#,
+    )
+    .unwrap();
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "generic",
+          "gcWasm": { "capture": "allModuleGcTypes", "denyTypes": ["Hidden"] },
+          "persistentTypes": [],
+          "transactionFunctions": ["publish"],
+          "roots": [
+            { "name": "hidden", "type": "Hidden", "nullable": true }
+          ]
+        }"#
+        .as_slice(),
+    )
+    .unwrap();
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("denied") || err.contains("unmapped"), "{err}");
+}
+
+#[test]
+fn generic_wasmgc_mode_rejects_denied_explicit_persistent_types() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $Hidden (struct))
+          (func (export "publish")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "generic",
+          "gcWasm": { "capture": "allModuleGcTypes", "denyTypes": ["Hidden"] },
+          "persistentTypes": [
+            { "name": "Hidden", "kind": "struct", "fields": [] }
+          ],
+          "transactionFunctions": ["publish"],
+          "roots": []
+        }"#
+        .as_slice(),
+    )
+    .unwrap();
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("denied"), "{err}");
+}
+
+#[test]
+fn generic_wasmgc_mode_resolves_runtime_gc_field_ref_targets() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $String (struct (field (mut i32))))
+          (type $Profile (struct (field (mut (ref null $String)))))
+          (func (export "publish")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "generic",
+          "gcWasm": { "capture": "allModuleGcTypes", "denyTypes": [] },
+          "persistentTypes": [
+            {
+              "name": "Profile",
+              "kind": "struct",
+              "fields": [
+                { "name": "name", "kind": "ref", "type": "String", "nullable": true }
+              ]
+            }
+          ],
+          "transactionFunctions": ["publish"],
+          "roots": []
+        }"#
+        .as_slice(),
+    )
+    .unwrap();
+
+    let (_output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_eq!(report.persistent_types, 2);
 }
 
 #[test]

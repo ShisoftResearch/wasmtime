@@ -18,8 +18,8 @@ use wasmparser::{
 };
 
 use super::metadata::{
-    KotlinField, KotlinFieldKind, KotlinPersistentKind, KotlinPersistentType, KotlinSidecar,
-    validate_kotlin_sidecar,
+    KotlinField, KotlinFieldKind, KotlinGcWasmCapture, KotlinPersistentKind, KotlinPersistentType,
+    KotlinSidecar, validate_kotlin_sidecar,
 };
 
 const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
@@ -47,6 +47,8 @@ struct PersistentTypeIndices {
 #[derive(Default)]
 struct GcTypeInfo {
     persistent: PersistentTypeIndices,
+    module_type_indices: BTreeMap<String, u32>,
+    denied_type_indices: BTreeSet<u32>,
     sidecar_type_indices: BTreeMap<String, u32>,
     struct_field_counts: BTreeMap<u32, usize>,
     struct_field_names: BTreeMap<(u32, String), BTreeSet<u32>>,
@@ -319,7 +321,8 @@ pub fn rewrite_kotlin_module(
 
     let mut report = KotlinRewriteReport {
         transaction_functions: sidecar.transaction_functions.clone(),
-        persistent_types: sidecar.persistent_types.len(),
+        persistent_types: gc_type_info.persistent.structs.len()
+            + gc_type_info.persistent.arrays.len(),
         roots: sidecar.roots.len(),
         rewritten_tfuncs: transaction_function_indices.len(),
         rewritten_object_ops: 0,
@@ -1745,31 +1748,97 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
         }
     }
 
+    if sidecar.gc_wasm.capture == KotlinGcWasmCapture::AllModuleGcTypes {
+        for (name, indices) in &type_names {
+            let denied = kotlin_type_denied(name, &sidecar.gc_wasm.deny_types);
+            let gc_indices = indices
+                .iter()
+                .copied()
+                .filter(|type_index| gc_type_kind(&info, *type_index).is_some())
+                .collect::<Vec<_>>();
+            if gc_indices.len() == 1 {
+                info.module_type_indices.insert(name.clone(), gc_indices[0]);
+            }
+            for type_index in gc_indices {
+                if denied {
+                    info.denied_type_indices.insert(type_index);
+                    continue;
+                }
+                match gc_type_kind(&info, type_index).context("missing Kotlin rewrite GC kind")? {
+                    KotlinPersistentKind::Struct => {
+                        info.persistent.structs.insert(type_index);
+                    }
+                    KotlinPersistentKind::Array => {
+                        info.persistent.arrays.insert(type_index);
+                    }
+                }
+            }
+        }
+
+        for (type_index, kind) in &gc_type_indices {
+            if info.denied_type_indices.contains(type_index) {
+                continue;
+            }
+            match kind {
+                KotlinPersistentKind::Struct => {
+                    info.persistent.structs.insert(*type_index);
+                }
+                KotlinPersistentKind::Array => {
+                    info.persistent.arrays.insert(*type_index);
+                }
+            }
+        }
+    }
+
     let mut mapped_type_indices = BTreeSet::new();
     let mut fallback_ordinal = 0usize;
     for persistent_type in &sidecar.persistent_types {
-        let (type_index, actual_kind) = if let Some(type_indices) =
-            type_names.get(&persistent_type.name)
+        let (type_index, actual_kind) = if let Some(type_index) =
+            info.module_type_indices.get(&persistent_type.name).copied()
         {
-            if type_indices.len() != 1 {
+            ensure_type_not_denied(
+                &info,
+                &sidecar.gc_wasm.deny_types,
+                &persistent_type.name,
+                type_index,
+                &format!("persistent type {}", persistent_type.name),
+            )?;
+            let actual_kind = gc_type_kind(&info, type_index)
+                .context("named persistent type did not map to a GC type")?;
+            let gc_position = gc_type_indices
+                .iter()
+                .position(|(candidate, _)| *candidate == type_index)
+                .context("named persistent type did not map to a GC type")?;
+            fallback_ordinal = fallback_ordinal.max(gc_position + 1);
+            (type_index, actual_kind)
+        } else if let Some(type_indices) = type_names.get(&persistent_type.name) {
+            let gc_indices = type_indices
+                .iter()
+                .copied()
+                .filter(|type_index| gc_type_kind(&info, *type_index).is_some())
+                .collect::<BTreeSet<_>>();
+            if gc_indices.len() > 1 {
                 bail!(
                     "ambiguous Kotlin rewrite type name {}: {:?}",
                     persistent_type.name,
-                    type_indices
+                    gc_indices
                 );
             }
-            let type_index = *type_indices.iter().next().unwrap();
-            let actual_kind = if info.struct_field_counts.contains_key(&type_index) {
-                KotlinPersistentKind::Struct
-            } else if info.array_element_storage.contains_key(&type_index) {
-                KotlinPersistentKind::Array
-            } else {
+            let Some(type_index) = gc_indices.iter().next().copied() else {
                 bail!(
-                    "persistent type {} maps to non-GC type index {}",
-                    persistent_type.name,
-                    type_index
+                    "persistent type {} maps to non-GC type",
+                    persistent_type.name
                 );
             };
+            ensure_type_not_denied(
+                &info,
+                &sidecar.gc_wasm.deny_types,
+                &persistent_type.name,
+                type_index,
+                &format!("persistent type {}", persistent_type.name),
+            )?;
+            let actual_kind = gc_type_kind(&info, type_index)
+                .context("named persistent type did not map to a GC type")?;
             let gc_position = gc_type_indices
                 .iter()
                 .position(|(candidate, _)| *candidate == type_index)
@@ -1779,7 +1848,10 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
         } else {
             while gc_type_indices
                 .get(fallback_ordinal)
-                .is_some_and(|(candidate, _)| mapped_type_indices.contains(candidate))
+                .is_some_and(|(candidate, _)| {
+                    mapped_type_indices.contains(candidate)
+                        || info.denied_type_indices.contains(candidate)
+                })
             {
                 fallback_ordinal += 1;
             }
@@ -1825,12 +1897,119 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
         }
     }
 
+    for root in &sidecar.roots {
+        ensure_runtime_type_mapping(
+            &mut info,
+            &type_names,
+            &sidecar.gc_wasm.deny_types,
+            &root.r#type,
+            &format!("Kotlin root {}", root.name),
+        )?;
+    }
+    for persistent_type in &sidecar.persistent_types {
+        for field in persistent_type
+            .fields
+            .iter()
+            .chain(persistent_type.element.iter())
+        {
+            let Some(target_name) = field.r#type.as_deref() else {
+                continue;
+            };
+            ensure_runtime_type_mapping(
+                &mut info,
+                &type_names,
+                &sidecar.gc_wasm.deny_types,
+                target_name,
+                &format!(
+                    "persistent type {} field {}",
+                    persistent_type.name, field.name
+                ),
+            )?;
+        }
+    }
+
     for persistent_type in &sidecar.persistent_types {
         let type_index = info.sidecar_type_indices[&persistent_type.name];
         validate_persistent_type_shape(type_index, persistent_type, &info)?;
     }
 
     Ok(info)
+}
+
+fn gc_type_kind(info: &GcTypeInfo, type_index: u32) -> Option<KotlinPersistentKind> {
+    if info.struct_field_counts.contains_key(&type_index) {
+        Some(KotlinPersistentKind::Struct)
+    } else if info.array_element_storage.contains_key(&type_index) {
+        Some(KotlinPersistentKind::Array)
+    } else {
+        None
+    }
+}
+
+fn ensure_runtime_type_mapping(
+    info: &mut GcTypeInfo,
+    type_names: &BTreeMap<String, BTreeSet<u32>>,
+    deny_types: &[String],
+    type_name: &str,
+    context: &str,
+) -> Result<()> {
+    if let Some(type_index) = info.sidecar_type_indices.get(type_name).copied() {
+        ensure_type_not_denied(info, deny_types, type_name, type_index, context)?;
+        return Ok(());
+    }
+
+    let gc_indices = type_names
+        .get(type_name)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|type_index| gc_type_kind(info, *type_index).is_some())
+        .collect::<BTreeSet<_>>();
+
+    if gc_indices.is_empty() {
+        bail!("{context} has unmapped type {type_name}");
+    }
+    if kotlin_type_denied(type_name, deny_types)
+        || gc_indices
+            .iter()
+            .any(|type_index| info.denied_type_indices.contains(type_index))
+    {
+        bail!("{context} uses denied Kotlin GC type {type_name}");
+    }
+    if gc_indices.len() != 1 {
+        bail!(
+            "{context} has ambiguous runtime GC type {type_name}: {:?}",
+            gc_indices
+        );
+    }
+
+    info.sidecar_type_indices
+        .insert(type_name.to_string(), *gc_indices.iter().next().unwrap());
+    Ok(())
+}
+
+fn ensure_type_not_denied(
+    info: &GcTypeInfo,
+    deny_types: &[String],
+    type_name: &str,
+    type_index: u32,
+    context: &str,
+) -> Result<()> {
+    if kotlin_type_denied(type_name, deny_types) || info.denied_type_indices.contains(&type_index) {
+        bail!("{context} uses denied Kotlin GC type {type_name}");
+    }
+    Ok(())
+}
+
+fn kotlin_type_denied(name: &str, deny_types: &[String]) -> bool {
+    deny_types.iter().any(|pattern| {
+        pattern.strip_suffix(".*").is_some_and(|prefix| {
+            name == prefix
+                || name
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        }) || pattern == name
+    })
 }
 
 fn name_section_function_names(input: &[u8]) -> Result<Vec<(String, u32)>> {
