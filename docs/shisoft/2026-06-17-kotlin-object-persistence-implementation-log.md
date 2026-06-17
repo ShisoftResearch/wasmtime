@@ -34,8 +34,9 @@
   functions, so the generated Kotlin `_start`/`main` path can start a real
   transaction without changing Kotlin source.
 - Root marker lowering supports multiple roots when their persistent types are
-  distinct. Same-type inline root markers fail loudly until the SDK exposes a
-  stable root-name intrinsic.
+  distinct through the current inline helper shape. Same-type roots can now use
+  explicit `twasm.root.get`/`twasm.root.set` marker imports whose import field
+  names the sidecar root.
 - Same-transaction `tglobal.get` of an ordinary Wasmtime GC ref now promotes
   the object graph into persistent `ObjectId` storage and returns a
   transaction-handle-compatible ref for transactional object reads.
@@ -49,3 +50,6 @@
 - Remaining object-language work is no longer the Kotlin live-funcref fallback;
   it is the compiler/tooling contract for exposing this durable registration
   outside the test-only `_internal::transaction_persistence` namespace.
+- Explicit root marker import calls are lowered, but the import declarations
+  are still an intermediate toolchain contract. Final Kotlin packaging should
+  strip them or replace them with an equivalent self-contained metadata carrier.

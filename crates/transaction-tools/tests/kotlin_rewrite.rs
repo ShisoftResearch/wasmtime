@@ -202,6 +202,7 @@ fn rewrite_lowers_inline_root_markers_for_distinct_root_types() {
 
     let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
+    assert_valid_module(&output);
 
     assert_eq!(
         transaction_objects(&output),
@@ -260,6 +261,335 @@ fn rewrite_rejects_ambiguous_inline_root_marker_type() {
         .to_string();
 
     assert!(err.contains("ambiguous Kotlin root marker"), "{err}");
+}
+
+#[test]
+fn rewrite_lowers_same_type_root_marker_imports() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (import "twasm.root.set" "primary"
+                (func $set_primary (param (ref null $Bank)) (result (ref null $Unit))))
+              (import "twasm.root.get" "secondary"
+                (func $get_secondary (result (ref null $Bank))))
+              (tag $error)
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $installPrimary (param $bank (ref null $Bank)) (result (ref null $Unit))
+                local.get $bank
+                call $set_primary)
+              (func $readSecondary (result (ref null $Bank))
+                call $get_secondary))
+            "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![
+            KotlinRoot {
+                name: "primary".into(),
+                r#type: "Bank".into(),
+                nullable: true,
+            },
+            KotlinRoot {
+                name: "secondary".into(),
+                r#type: "Bank".into(),
+                nullable: true,
+            },
+        ],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+    assert_valid_module(&output);
+
+    assert_eq!(
+        transaction_objects(&output),
+        TransactionObjects {
+            memories: vec![],
+            globals: vec![0, 1],
+            functions: vec![3, 4],
+            tables: vec![],
+        }
+    );
+    assert!(printed.contains("tglobal.set 0"), "{printed}");
+    assert!(printed.contains("tglobal.get 1"), "{printed}");
+}
+
+#[test]
+fn rewrite_lowers_inline_and_explicit_root_markers_together() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (type $Vault (struct))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref null $Bank))))
+              (tag $error)
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $installVault (param $vault (ref null $Vault)) (result (ref null $Unit))
+                block (result (ref null $Unit))
+                  local.get $vault
+                  local.set $vault
+                  i32.const 658
+                  drop
+                  block
+                    throw $error
+                  end
+                  unreachable
+                end)
+              (func $readBank (result (ref null $Bank))
+                call $get_bank))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![
+            struct_type_with_fields("Bank", vec![]),
+            struct_type_with_fields("Vault", vec![]),
+        ],
+        &[],
+        vec![
+            KotlinRoot {
+                name: "bank".into(),
+                r#type: "Bank".into(),
+                nullable: true,
+            },
+            KotlinRoot {
+                name: "vault".into(),
+                r#type: "Vault".into(),
+                nullable: true,
+            },
+        ],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+    assert_valid_module(&output);
+
+    assert_eq!(
+        transaction_objects(&output),
+        TransactionObjects {
+            memories: vec![],
+            globals: vec![0, 1],
+            functions: vec![2, 3],
+            tables: vec![],
+        }
+    );
+    assert!(printed.contains("tglobal.get 0"), "{printed}");
+    assert!(printed.contains("tglobal.set 1"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_unknown_root_marker_import_name() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Bank (struct))
+              (import "twasm.root.get" "missing"
+                (func $get_missing (result (ref null $Bank)))))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("names unknown root"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_root_marker_import_type_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Bank (struct))
+              (type $Vault (struct))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref null $Vault)))))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("has type index"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_root_marker_import_nullability_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Bank (struct))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref $Bank)))))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("must use nullable concrete root ref"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_root_marker_import_exact_ref() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Bank (struct))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref (exact $Bank))))))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("must use nullable concrete root ref"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_root_marker_import_abstract_ref() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Bank (struct))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref null struct)))))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("must use nullable concrete root ref"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_root_set_marker_param_type_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (type $Vault (struct))
+              (import "twasm.root.set" "bank"
+                (func $set_bank (param (ref null $Vault)) (result (ref null $Unit))))
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("has type index"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_root_set_marker_wrong_result_type() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (import "twasm.root.set" "bank"
+                (func $set_bank (param (ref null $Bank)) (result (ref null $Bank))))
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("must return kotlin.Unit_getInstance type"),
+        "{err}"
+    );
 }
 
 #[test]

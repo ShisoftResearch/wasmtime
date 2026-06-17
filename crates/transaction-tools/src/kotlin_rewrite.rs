@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +21,8 @@ use crate::kotlin_metadata::{
 
 const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 const TRANSACTION_OBJECTS_VERSION: u8 = 1;
+const KOTLIN_ROOT_GET_IMPORT_MODULE: &str = "twasm.root.get";
+const KOTLIN_ROOT_SET_IMPORT_MODULE: &str = "twasm.root.set";
 const KOTLIN_RUNTIME_STRUCT_FIELDS: &[&str] = &["vtable", "itable", "rtti", "_hashCode"];
 
 #[derive(Debug, Default, Serialize)]
@@ -80,6 +82,14 @@ struct RootGlobal {
 struct RootLowering {
     globals: Vec<RootGlobal>,
     unit_getter_func: Option<u32>,
+    get_imports: BTreeMap<u32, RootGlobal>,
+    set_imports: BTreeMap<u32, RootGlobal>,
+}
+
+#[derive(Clone)]
+struct FunctionSignature {
+    params: Vec<ParserValType>,
+    results: Vec<ParserValType>,
 }
 
 impl TransactionObjects {
@@ -128,10 +138,32 @@ fn root_lowering(
     // Unit through this exact frontend helper name. Replace this with an
     // explicit SDK intrinsic once the Kotlin transaction frontend is stable.
     let unit_getter_func = function_index_by_exact_name(input, "kotlin.Unit_getInstance")?;
+    let unit_getter_result = unit_getter_func
+        .map(|function_index| {
+            function_signature(input, function_index).and_then(|signature| {
+                let signature = signature.with_context(|| {
+                    format!("missing Kotlin Unit getter function index {function_index}")
+                })?;
+                ensure!(
+                    signature.params.is_empty(),
+                    "kotlin.Unit_getInstance must not have parameters"
+                );
+                ensure!(
+                    signature.results.len() == 1,
+                    "kotlin.Unit_getInstance must return one value"
+                );
+                Ok(signature.results[0])
+            })
+        })
+        .transpose()?;
+    let (get_imports, set_imports) =
+        explicit_root_marker_imports(input, &globals, unit_getter_result)?;
 
     Ok(RootLowering {
         globals,
         unit_getter_func,
+        get_imports,
+        set_imports,
     })
 }
 
@@ -426,6 +458,37 @@ fn rewrite_function_body(
         }
 
         let op = operators[index].clone();
+        if let Operator::Call { function_index } = op {
+            if let Some(root) = root_lowering.get_imports.get(&function_index) {
+                function.instruction(&Instruction::TGlobalGet {
+                    global_index: root.global_index,
+                });
+                type_stack.push(Some(root.type_index));
+                index += 1;
+                continue;
+            }
+            if let Some(root) = root_lowering.set_imports.get(&function_index) {
+                if let Some(Some(type_index)) = type_stack.pop()
+                    && type_index != root.type_index
+                {
+                    bail!(
+                        "Kotlin setRoot marker for root {} consumed type index {type_index}, expected {}",
+                        root.name,
+                        root.type_index
+                    );
+                }
+                let unit_getter = root_lowering
+                    .unit_getter_func
+                    .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
+                function.instruction(&Instruction::TGlobalSet {
+                    global_index: root.global_index,
+                });
+                function.instruction(&Instruction::Call(unit_getter));
+                type_stack.push(None);
+                index += 1;
+                continue;
+            }
+        }
         let is_array_len = matches!(op, Operator::ArrayLen);
         let array_len_operand = if is_array_len {
             type_stack.pop().flatten()
@@ -959,6 +1022,152 @@ fn transaction_objects(input: &[u8]) -> Result<TransactionObjects> {
     Ok(objects)
 }
 
+fn explicit_root_marker_imports(
+    input: &[u8],
+    roots: &[RootGlobal],
+    unit_getter_result: Option<ParserValType>,
+) -> Result<(BTreeMap<u32, RootGlobal>, BTreeMap<u32, RootGlobal>)> {
+    let signatures = function_type_signatures(input)?;
+    let roots_by_name = roots
+        .iter()
+        .map(|root| (root.name.as_str(), root))
+        .collect::<BTreeMap<_, _>>();
+    let mut get_imports = BTreeMap::new();
+    let mut set_imports = BTreeMap::new();
+    let mut next_function_index = 0u32;
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin root marker import payload")? {
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import.context("failed to parse Kotlin root marker import")?;
+                    let type_index = match import.ty {
+                        TypeRef::Func(type_index) | TypeRef::FuncExact(type_index) => type_index,
+                        _ => {
+                            continue;
+                        }
+                    };
+                    let function_index = next_function_index;
+                    next_function_index = next_function_index
+                        .checked_add(1)
+                        .context("Kotlin root marker function index overflow")?;
+
+                    let marker_kind = match import.module {
+                        KOTLIN_ROOT_GET_IMPORT_MODULE => Some("get"),
+                        KOTLIN_ROOT_SET_IMPORT_MODULE => Some("set"),
+                        _ => None,
+                    };
+                    let Some(marker_kind) = marker_kind else {
+                        continue;
+                    };
+                    let root = roots_by_name.get(import.name).with_context(|| {
+                        format!(
+                            "Kotlin root marker import {}.{} names unknown root",
+                            import.module, import.name
+                        )
+                    })?;
+                    let signature = signatures.get(&type_index).with_context(|| {
+                        format!(
+                            "Kotlin root marker import {}.{} uses unknown function type {type_index}",
+                            import.module, import.name
+                        )
+                    })?;
+                    match marker_kind {
+                        "get" => {
+                            ensure!(
+                                signature.params.is_empty(),
+                                "Kotlin root get marker {} must not have parameters",
+                                import.name
+                            );
+                            ensure!(
+                                signature.results.len() == 1,
+                                "Kotlin root get marker {} must return one value",
+                                import.name
+                            );
+                            ensure_marker_ref_type(
+                                signature.results[0],
+                                root,
+                                "Kotlin root get marker",
+                            )?;
+                            if get_imports
+                                .insert(function_index, (*root).clone())
+                                .is_some()
+                            {
+                                bail!(
+                                    "duplicate Kotlin root get marker function index {function_index}"
+                                );
+                            }
+                        }
+                        "set" => {
+                            ensure!(
+                                signature.params.len() == 1,
+                                "Kotlin root set marker {} must have one parameter",
+                                import.name
+                            );
+                            ensure!(
+                                signature.results.len() == 1,
+                                "Kotlin root set marker {} must return Kotlin Unit",
+                                import.name
+                            );
+                            let unit_getter_result = unit_getter_result.with_context(|| {
+                                format!(
+                                    "Kotlin root set marker {} requires kotlin.Unit_getInstance",
+                                    import.name
+                                )
+                            })?;
+                            ensure!(
+                                signature.results[0] == unit_getter_result,
+                                "Kotlin root set marker {} must return kotlin.Unit_getInstance type",
+                                import.name
+                            );
+                            ensure_marker_ref_type(
+                                signature.params[0],
+                                root,
+                                "Kotlin root set marker",
+                            )?;
+                            if set_imports
+                                .insert(function_index, (*root).clone())
+                                .is_some()
+                            {
+                                bail!(
+                                    "duplicate Kotlin root set marker function index {function_index}"
+                                );
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((get_imports, set_imports))
+}
+
+fn ensure_marker_ref_type(value_type: ParserValType, root: &RootGlobal, label: &str) -> Result<()> {
+    let Some(type_index) = nullable_concrete_module_ref_type_index(value_type) else {
+        bail!("{label} {} must use nullable concrete root ref", root.name);
+    };
+    ensure!(
+        type_index == root.type_index,
+        "{label} {} has type index {type_index}, expected {}",
+        root.name,
+        root.type_index
+    );
+    Ok(())
+}
+
+fn nullable_concrete_module_ref_type_index(ty: ParserValType) -> Option<u32> {
+    let ParserValType::Ref(ref_type) = ty else {
+        return None;
+    };
+    if !ref_type.is_nullable() || ref_type.is_exact_type_ref() {
+        return None;
+    }
+    ref_type.type_index()?.unpack().as_module_index()
+}
+
 fn extend_index_set(
     indices: &mut BTreeSet<u32>,
     reader: &mut BinaryReader<'_>,
@@ -1064,15 +1273,23 @@ fn persistent_accessor_function_indices(
 }
 
 fn imported_function_count(input: &[u8]) -> Result<u32> {
-    let mut count = 0u32;
+    let len = imported_function_type_indices(input)?.len();
+    u32::try_from(len).context("Kotlin rewrite imported function count overflow")
+}
+
+fn imported_function_type_indices(input: &[u8]) -> Result<Vec<u32>> {
+    let mut type_indices = Vec::new();
 
     for payload in Parser::new(0).parse_all(input) {
         match payload.context("failed to parse Kotlin rewrite import payload")? {
             Payload::ImportSection(section) => {
                 for import in section.into_imports() {
                     let import = import.context("failed to parse Kotlin rewrite import")?;
-                    if matches!(import.ty, TypeRef::Func(_) | TypeRef::FuncExact(_)) {
-                        count += 1;
+                    match import.ty {
+                        TypeRef::Func(type_index) | TypeRef::FuncExact(type_index) => {
+                            type_indices.push(type_index);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1080,7 +1297,29 @@ fn imported_function_count(input: &[u8]) -> Result<u32> {
         }
     }
 
-    Ok(count)
+    Ok(type_indices)
+}
+
+fn function_signature(input: &[u8], function_index: u32) -> Result<Option<FunctionSignature>> {
+    let signatures = function_type_signatures(input)?;
+    let imported_function_types = imported_function_type_indices(input)?;
+    let imported_function_count = u32::try_from(imported_function_types.len())
+        .context("Kotlin rewrite imported function count overflow")?;
+    let type_index = if let Some(type_index) = imported_function_types.get(function_index as usize)
+    {
+        *type_index
+    } else {
+        let defined_index = function_index
+            .checked_sub(imported_function_count)
+            .context("Kotlin rewrite function index underflow")?;
+        let defined_function_types = defined_function_type_indices(input)?;
+        let Some(type_index) = defined_function_types.get(defined_index as usize) else {
+            return Ok(None);
+        };
+        *type_index
+    };
+
+    Ok(signatures.get(&type_index).cloned())
 }
 
 fn imported_global_count(input: &[u8]) -> Result<u32> {
@@ -1197,6 +1436,12 @@ fn function_contains_inline_root_marker(
     }
 
     for index in 0..operators.len() {
+        if let Some(Operator::Call { function_index }) = operators.get(index)
+            && (root_lowering.get_imports.contains_key(function_index)
+                || root_lowering.set_imports.contains_key(function_index))
+        {
+            return Ok(true);
+        }
         if let Some(marker) = match_inline_set_root_marker(&operators, index, &local_types)? {
             if root_for_marker_type(root_lowering, marker.type_index)?.is_some() {
                 return Ok(true);
@@ -1212,7 +1457,14 @@ fn function_contains_inline_root_marker(
 }
 
 fn function_type_params(input: &[u8]) -> Result<BTreeMap<u32, Vec<ParserValType>>> {
-    let mut params = BTreeMap::new();
+    Ok(function_type_signatures(input)?
+        .into_iter()
+        .map(|(type_index, signature)| (type_index, signature.params))
+        .collect())
+}
+
+fn function_type_signatures(input: &[u8]) -> Result<BTreeMap<u32, FunctionSignature>> {
+    let mut signatures = BTreeMap::new();
     let mut next_type_index = 0u32;
 
     for payload in Parser::new(0).parse_all(input) {
@@ -1222,7 +1474,13 @@ fn function_type_params(input: &[u8]) -> Result<BTreeMap<u32, Vec<ParserValType>
                     let group = group.context("failed to parse Kotlin rewrite type group")?;
                     for ty in group.into_types() {
                         if let CompositeInnerType::Func(func) = ty.composite_type.inner {
-                            params.insert(next_type_index, func.params().to_vec());
+                            signatures.insert(
+                                next_type_index,
+                                FunctionSignature {
+                                    params: func.params().to_vec(),
+                                    results: func.results().to_vec(),
+                                },
+                            );
                         }
                         next_type_index += 1;
                     }
@@ -1232,7 +1490,7 @@ fn function_type_params(input: &[u8]) -> Result<BTreeMap<u32, Vec<ParserValType>
         }
     }
 
-    Ok(params)
+    Ok(signatures)
 }
 
 fn defined_function_type_indices(input: &[u8]) -> Result<Vec<u32>> {
