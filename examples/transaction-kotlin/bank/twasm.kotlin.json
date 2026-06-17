@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "module": "transaction-kotlin-bank",
+  "persistentTypes": [
+    {
+      "name": "Account",
+      "kind": "struct",
+      "fields": [
+        { "name": "balance", "kind": "i64", "nullable": false }
+      ]
+    },
+    {
+      "name": "Bank",
+      "kind": "struct",
+      "fields": [
+        { "name": "alice", "kind": "ref", "type": "Account", "nullable": false },
+        { "name": "bob", "kind": "ref", "type": "Account", "nullable": false }
+      ]
+    }
+  ],
+  "transactionFunctions": [
+    "transfer",
+    "installFreshBank"
+  ],
+  "roots": [
+    { "name": "bank", "type": "Bank", "nullable": false }
+  ]
+}
