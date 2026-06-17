@@ -129,6 +129,14 @@ The lowerer cross-checks sidecar metadata against the Wasm module:
 - field counts and field kinds must match the WasmGC type shape
 - unresolved or ambiguous names fail the build
 
+`nullable` in the sidecar describes the emitted WasmGC storage type observed by
+the lowerer, not Kotlin source-level nullability. Kotlin may emit nullable
+storage for fields whose source types are non-null because runtime
+initialization and object-layout details are represented below the source type
+system. Source-level non-null guarantees can be reintroduced later as an
+additional validation layer, but the first lowerer must match the actual WasmGC
+layout it rewrites.
+
 Later, a Gradle task or compiler plugin can generate this sidecar from Kotlin
 source annotations. The initial checked-in sidecar is acceptable for proving the
 runtime and lowering model, but it must be treated as scaffold, not the final

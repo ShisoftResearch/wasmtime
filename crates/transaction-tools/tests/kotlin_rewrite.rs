@@ -129,6 +129,24 @@ fn rewrite_report_records_transaction_function_names() {
 }
 
 #[test]
+fn rewrite_report_records_transaction_function_name_section_matches() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (func $transfer))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![], &["transfer"], vec![]);
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_eq!(report.transaction_functions, vec!["transfer"]);
+    assert_eq!(report.rewritten_tfuncs, 1);
+    assert_eq!(transaction_objects(&output).functions, vec![0]);
+}
+
+#[test]
 fn rewrite_merges_existing_transaction_object_metadata() {
     let input = wat::parse_str(
         r#"
@@ -287,6 +305,242 @@ fn rewrite_keeps_persistent_constructors_ordinary_until_promotion_boundary() {
 }
 
 #[test]
+fn rewrite_maps_persistent_gc_types_by_name_section_before_ordinal() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Runtime (struct (field (mut i32))))
+              (type $Account (struct (field (mut i64))))
+              (func $transfer (export "transfer") (param $account (ref $Account)) (result i64)
+                local.get $account
+                struct.get $Account 0))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![struct_type("Account")], &["transfer"], vec![]);
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_eq!(report.rewritten_tfuncs, 1);
+    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
+    assert_valid_module(&output);
+    assert!(printed.contains("tstruct.get"), "{printed}");
+}
+
+#[test]
+fn rewrite_validates_named_persistent_fields_after_runtime_prefix() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Account
+                (struct
+                  (field $vtable (mut i32))
+                  (field $itable (mut i32))
+                  (field $rtti (mut i32))
+                  (field $_hashCode (mut i32))
+                  (field $balance (mut i64))))
+              (func $transfer (export "transfer") (param $account (ref $Account)) (result i64)
+                local.get $account
+                struct.get $Account 4))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![struct_type("Account")], &["transfer"], vec![]);
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_eq!(report.rewritten_tfuncs, 1);
+    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
+    assert_valid_module(&output);
+    assert!(printed.contains("tstruct.get"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_named_struct_sidecar_missing_persistent_field() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Account
+                (struct
+                  (field $vtable (mut i32))
+                  (field $itable (mut i32))
+                  (field $rtti (mut i32))
+                  (field $_hashCode (mut i32))
+                  (field $balance (mut i64))
+                  (field $status (mut i32))))
+              (func $transfer (export "transfer") (param $account (ref $Account)) (result i64)
+                local.get $account
+                struct.get $Account 4))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![struct_type("Account")], &["transfer"], vec![]);
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("missing persistent field status"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rewrite_rejects_partial_named_struct_fields_with_unnamed_persistent_field() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Account
+                (struct
+                  (field $vtable (mut i32))
+                  (field $itable (mut i32))
+                  (field $rtti (mut i32))
+                  (field $_hashCode (mut i32))
+                  (field $balance (mut i64))
+                  (field (mut i32))))
+              (func $transfer (export "transfer") (param $account (ref $Account)) (result i64)
+                local.get $account
+                struct.get $Account 4))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![struct_type("Account")], &["transfer"], vec![]);
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("has unnamed non-runtime WasmGC fields"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rewrite_lowers_persistent_accessor_bodies_without_marking_tfuncs() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Account (struct (field $balance (mut i64))))
+              (func $get (param $account (ref $Account)) (result i64)
+                local.get $account
+                struct.get $Account 0)
+              (export "Account.<get-balance>" (func $get))
+              (func $transfer (export "transfer") (param $account (ref $Account)) (result i64)
+                local.get $account
+                call $get))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![struct_type("Account")], &["transfer"], vec![]);
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+    let objects = transaction_objects(&output);
+
+    assert_eq!(report.rewritten_tfuncs, 1);
+    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
+    assert_eq!(objects.functions, vec![1]);
+    assert_valid_module(&output);
+    assert!(printed.contains("tstruct.get"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_ambiguous_persistent_accessor_name_matches() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Account (struct (field $balance (mut i64))))
+              (func $Account.<get-balance> (param $account (ref $Account)) (result i64)
+                local.get $account
+                struct.get $Account 0)
+              (func $other_get (param $account (ref $Account)) (result i64)
+                local.get $account
+                struct.get $Account 0)
+              (export "Account.<get-balance>" (func $other_get))
+              (func $transfer (export "transfer") (param $account (ref $Account)) (result i64)
+                local.get $account
+                call $Account.<get-balance>))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![struct_type("Account")], &["transfer"], vec![]);
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("ambiguous Kotlin rewrite persistent accessor Account.<get-balance>"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rewrite_falls_back_to_next_unmatched_gc_type_after_named_type_mapping() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Runtime (struct (field (mut i32))))
+              (type $Account (struct (field (mut i64))))
+              (type (struct (field (mut (ref null $Account)))))
+              (func $transfer (export "transfer") (param $bank (ref 2)) (result i64)
+                local.get $bank
+                struct.get 2 0
+                ref.as_non_null
+                struct.get $Account 0))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![
+            struct_type("Account"),
+            struct_type_with_fields("Bank", vec![ref_field("account", "Account", true)]),
+        ],
+        &["transfer"],
+        vec![],
+    );
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_eq!(report.rewritten_tfuncs, 1);
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
+    assert_valid_module(&output);
+    assert!(printed.contains("tstruct.get $Account 0"), "{printed}");
+    assert!(printed.contains("tstruct.get 2 0"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_duplicate_sidecar_type_index_mapping() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Account (struct (field (mut i64))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type("Account"), struct_type("Bank")],
+        &["transfer"],
+        vec![],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("persistent type Bank could not be mapped"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn rewrite_rejects_sidecar_struct_field_count_mismatch() {
     let input = wat::parse_str(
         r#"
@@ -381,7 +635,7 @@ fn rewrite_rejects_missing_sidecar_layout_metadata() {
         .to_string();
 
     assert!(
-        err.contains("could not be mapped to GC type ordinal"),
+        err.contains("persistent type Missing could not be mapped"),
         "{err}"
     );
 }

@@ -8,7 +8,7 @@ use wasm_encoder::{
 };
 use wasmparser::{
     AbstractHeapType, BinaryReader, CodeSectionReader, CompositeInnerType, ExternalKind, HeapType,
-    Operator, Parser, Payload, StorageType, TypeRef, ValType as ParserValType,
+    KnownCustom, Name, Operator, Parser, Payload, StorageType, TypeRef, ValType as ParserValType,
 };
 
 use crate::kotlin_metadata::{
@@ -18,6 +18,7 @@ use crate::kotlin_metadata::{
 
 const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 const TRANSACTION_OBJECTS_VERSION: u8 = 1;
+const KOTLIN_RUNTIME_STRUCT_FIELDS: &[&str] = &["vtable", "itable", "rtti", "_hashCode"];
 
 #[derive(Debug, Default, Serialize)]
 pub struct KotlinRewriteReport {
@@ -39,6 +40,7 @@ struct GcTypeInfo {
     persistent: PersistentTypeIndices,
     sidecar_type_indices: BTreeMap<String, u32>,
     struct_field_counts: BTreeMap<u32, usize>,
+    struct_field_names: BTreeMap<(u32, String), BTreeSet<u32>>,
     struct_field_storage: BTreeMap<(u32, u32), StorageType>,
     array_element_storage: BTreeMap<u32, StorageType>,
     struct_fields: BTreeMap<(u32, u32), ParserValType>,
@@ -80,8 +82,9 @@ pub fn rewrite_kotlin_module(
 ) -> Result<(Vec<u8>, KotlinRewriteReport)> {
     validate_kotlin_sidecar(sidecar)?;
 
-    let exported_functions = exported_function_names(input)?;
-    let transaction_function_indices = transaction_function_indices(&exported_functions, sidecar)?;
+    let transaction_function_indices = transaction_function_indices(input, sidecar)?;
+    let mut object_rewrite_function_indices = transaction_function_indices.clone();
+    object_rewrite_function_indices.extend(persistent_accessor_function_indices(input, sidecar)?);
     let mut transaction_objects = transaction_objects(input)?;
     transaction_objects
         .functions
@@ -191,7 +194,7 @@ pub fn rewrite_kotlin_module(
                         .context("missing Kotlin rewrite function type parameters")?;
                     let function = rewrite_function_body(
                         &body,
-                        transaction_function_indices.contains(&function_index),
+                        object_rewrite_function_indices.contains(&function_index),
                         &gc_type_info,
                         &params,
                         &mut report,
@@ -664,17 +667,67 @@ fn exported_function_names(input: &[u8]) -> Result<BTreeMap<String, u32>> {
     Ok(exports)
 }
 
-fn transaction_function_indices(
-    exported_functions: &BTreeMap<String, u32>,
-    sidecar: &KotlinSidecar,
-) -> Result<BTreeSet<u32>> {
+fn transaction_function_indices(input: &[u8], sidecar: &KotlinSidecar) -> Result<BTreeSet<u32>> {
     let mut indices = BTreeSet::new();
+    let exported_functions = exported_function_names(input)?;
+    let function_name_entries = name_section_function_names(input)?;
 
     for name in &sidecar.transaction_functions {
-        let Some(index) = exported_functions.get(name) else {
-            bail!("transaction function {name} was not found");
+        if let Some(index) = exported_functions.get(name) {
+            indices.insert(*index);
+            continue;
+        }
+
+        let matches = function_name_entries
+            .iter()
+            .filter_map(|(candidate, index)| (candidate == name).then_some(*index))
+            .collect::<BTreeSet<_>>();
+        match matches.len() {
+            0 => bail!("transaction function {name} was not found"),
+            1 => {
+                indices.insert(*matches.iter().next().unwrap());
+            }
+            _ => bail!("ambiguous Kotlin rewrite function name {name}: {matches:?}"),
         };
-        indices.insert(*index);
+    }
+
+    Ok(indices)
+}
+
+fn persistent_accessor_function_indices(
+    input: &[u8],
+    sidecar: &KotlinSidecar,
+) -> Result<BTreeSet<u32>> {
+    let mut accessor_names = BTreeSet::new();
+    for persistent_type in &sidecar.persistent_types {
+        if persistent_type.kind != KotlinPersistentKind::Struct {
+            continue;
+        }
+        for field in &persistent_type.fields {
+            accessor_names.insert(format!("{}.<get-{}>", persistent_type.name, field.name));
+            accessor_names.insert(format!("{}.<set-{}>", persistent_type.name, field.name));
+        }
+    }
+
+    let mut function_entries = exported_function_names(input)?
+        .into_iter()
+        .map(|(name, index)| (name, index))
+        .collect::<Vec<_>>();
+    function_entries.extend(name_section_function_names(input)?);
+
+    let mut indices = BTreeSet::new();
+    for accessor_name in accessor_names {
+        let matches = function_entries
+            .iter()
+            .filter_map(|(name, index)| (name == &accessor_name).then_some(*index))
+            .collect::<BTreeSet<_>>();
+        match matches.len() {
+            0 => {}
+            1 => {
+                indices.insert(*matches.iter().next().unwrap());
+            }
+            _ => bail!("ambiguous Kotlin rewrite persistent accessor {accessor_name}: {matches:?}"),
+        }
     }
 
     Ok(indices)
@@ -747,6 +800,8 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
     let mut gc_type_indices = Vec::new();
     let mut info = GcTypeInfo::default();
     let mut next_type_index = 0u32;
+    let type_names = name_section_type_names(input)?;
+    info.struct_field_names = name_section_field_names(input)?;
 
     for payload in Parser::new(0).parse_all(input) {
         match payload.context("failed to parse Kotlin rewrite type payload")? {
@@ -789,21 +844,69 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
         }
     }
 
-    for (ordinal, persistent_type) in sidecar.persistent_types.iter().enumerate() {
-        let Some((type_index, actual_kind)) = gc_type_indices.get(ordinal).copied() else {
-            bail!(
-                "persistent type {} could not be mapped to GC type ordinal {}",
-                persistent_type.name,
-                ordinal
-            );
+    let mut mapped_type_indices = BTreeSet::new();
+    let mut fallback_ordinal = 0usize;
+    for persistent_type in &sidecar.persistent_types {
+        let (type_index, actual_kind) = if let Some(type_indices) =
+            type_names.get(&persistent_type.name)
+        {
+            if type_indices.len() != 1 {
+                bail!(
+                    "ambiguous Kotlin rewrite type name {}: {:?}",
+                    persistent_type.name,
+                    type_indices
+                );
+            }
+            let type_index = *type_indices.iter().next().unwrap();
+            let actual_kind = if info.struct_field_counts.contains_key(&type_index) {
+                KotlinPersistentKind::Struct
+            } else if info.array_element_storage.contains_key(&type_index) {
+                KotlinPersistentKind::Array
+            } else {
+                bail!(
+                    "persistent type {} maps to non-GC type index {}",
+                    persistent_type.name,
+                    type_index
+                );
+            };
+            let gc_position = gc_type_indices
+                .iter()
+                .position(|(candidate, _)| *candidate == type_index)
+                .context("named persistent type did not map to a GC type")?;
+            fallback_ordinal = fallback_ordinal.max(gc_position + 1);
+            (type_index, actual_kind)
+        } else {
+            while gc_type_indices
+                .get(fallback_ordinal)
+                .is_some_and(|(candidate, _)| mapped_type_indices.contains(candidate))
+            {
+                fallback_ordinal += 1;
+            }
+            let Some((type_index, actual_kind)) = gc_type_indices.get(fallback_ordinal).copied()
+            else {
+                bail!(
+                    "persistent type {} could not be mapped",
+                    persistent_type.name
+                );
+            };
+            fallback_ordinal += 1;
+            (type_index, actual_kind)
         };
+
+        if !mapped_type_indices.insert(type_index) {
+            bail!(
+                "persistent type {} maps to duplicate GC type index {}",
+                persistent_type.name,
+                type_index
+            );
+        }
 
         if actual_kind != persistent_type.kind {
             bail!(
-                "persistent type {} expected {:?} at GC type ordinal {}, found {:?}",
+                "persistent type {} expected {:?} at GC type index {}, found {:?}",
                 persistent_type.name,
                 persistent_type.kind,
-                ordinal,
+                type_index,
                 actual_kind
             );
         }
@@ -821,12 +924,102 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
         }
     }
 
-    for (ordinal, persistent_type) in sidecar.persistent_types.iter().enumerate() {
-        let (type_index, _) = gc_type_indices[ordinal];
+    for persistent_type in &sidecar.persistent_types {
+        let type_index = info.sidecar_type_indices[&persistent_type.name];
         validate_persistent_type_shape(type_index, persistent_type, &info)?;
     }
 
     Ok(info)
+}
+
+fn name_section_function_names(input: &[u8]) -> Result<Vec<(String, u32)>> {
+    name_section_index_names(input, NameSectionIndexKind::Function)
+}
+
+fn name_section_type_names(input: &[u8]) -> Result<BTreeMap<String, BTreeSet<u32>>> {
+    let mut names = BTreeMap::<String, BTreeSet<u32>>::new();
+    for (name, index) in name_section_index_names(input, NameSectionIndexKind::Type)? {
+        names.entry(name).or_default().insert(index);
+    }
+    Ok(names)
+}
+
+fn name_section_field_names(input: &[u8]) -> Result<BTreeMap<(u32, String), BTreeSet<u32>>> {
+    let mut names = BTreeMap::<(u32, String), BTreeSet<u32>>::new();
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite field-name payload")? {
+            Payload::CustomSection(section) => {
+                let KnownCustom::Name(name_section) = section.as_known() else {
+                    continue;
+                };
+                for subsection in name_section {
+                    let subsection = subsection
+                        .context("failed to parse Kotlin rewrite field-name subsection")?;
+                    let Name::Field(indirect_map) = subsection else {
+                        continue;
+                    };
+                    for indirect in indirect_map {
+                        let indirect = indirect
+                            .context("failed to parse Kotlin rewrite field-name type entry")?;
+                        for naming in indirect.names {
+                            let naming = naming
+                                .context("failed to parse Kotlin rewrite field-name entry")?;
+                            names
+                                .entry((indirect.index, naming.name.to_string()))
+                                .or_default()
+                                .insert(naming.index);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(names)
+}
+
+#[derive(Clone, Copy)]
+enum NameSectionIndexKind {
+    Function,
+    Type,
+}
+
+fn name_section_index_names(
+    input: &[u8],
+    kind: NameSectionIndexKind,
+) -> Result<Vec<(String, u32)>> {
+    let mut names = Vec::new();
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite name payload")? {
+            Payload::CustomSection(section) => {
+                let KnownCustom::Name(name_section) = section.as_known() else {
+                    continue;
+                };
+                for subsection in name_section {
+                    let subsection =
+                        subsection.context("failed to parse Kotlin rewrite name subsection")?;
+                    match (kind, subsection) {
+                        (NameSectionIndexKind::Function, Name::Function(map))
+                        | (NameSectionIndexKind::Type, Name::Type(map)) => {
+                            for naming in map {
+                                let naming = naming.context(
+                                    "failed to parse Kotlin rewrite name subsection entry",
+                                )?;
+                                names.push((naming.name.to_string(), naming.index));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(names)
 }
 
 fn validate_persistent_type_shape(
@@ -836,23 +1029,88 @@ fn validate_persistent_type_shape(
 ) -> Result<()> {
     match persistent_type.kind {
         KotlinPersistentKind::Struct => {
-            let actual_count = *info
-                .struct_field_counts
-                .get(&type_index)
-                .context("missing Kotlin rewrite struct field count")?;
-            if actual_count != persistent_type.fields.len() {
-                bail!(
-                    "persistent type {} field count mismatch: sidecar has {}, WasmGC type has {}",
-                    persistent_type.name,
-                    persistent_type.fields.len(),
-                    actual_count
-                );
+            let has_named_fields = info
+                .struct_field_names
+                .keys()
+                .any(|(named_type_index, _)| *named_type_index == type_index);
+            if !has_named_fields {
+                let actual_count = *info
+                    .struct_field_counts
+                    .get(&type_index)
+                    .context("missing Kotlin rewrite struct field count")?;
+                if actual_count != persistent_type.fields.len() {
+                    bail!(
+                        "persistent type {} field count mismatch: sidecar has {}, WasmGC type has {}",
+                        persistent_type.name,
+                        persistent_type.fields.len(),
+                        actual_count
+                    );
+                }
+            } else {
+                let actual_count = *info
+                    .struct_field_counts
+                    .get(&type_index)
+                    .context("missing Kotlin rewrite struct field count")?;
+                let named_count = info
+                    .struct_field_names
+                    .keys()
+                    .filter(|(named_type_index, _)| *named_type_index == type_index)
+                    .count();
+                if named_count != actual_count {
+                    bail!(
+                        "persistent type {} has unnamed non-runtime WasmGC fields",
+                        persistent_type.name
+                    );
+                }
+                let sidecar_fields = persistent_type
+                    .fields
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<BTreeSet<_>>();
+                for ((_, field_name), _) in info
+                    .struct_field_names
+                    .iter()
+                    .filter(|((named_type_index, _), _)| *named_type_index == type_index)
+                {
+                    if KOTLIN_RUNTIME_STRUCT_FIELDS.contains(&field_name.as_str()) {
+                        continue;
+                    }
+                    if !sidecar_fields.contains(field_name.as_str()) {
+                        bail!(
+                            "persistent type {} missing persistent field {} in sidecar",
+                            persistent_type.name,
+                            field_name
+                        );
+                    }
+                }
             }
 
-            for (field_index, field) in persistent_type.fields.iter().enumerate() {
+            for (ordinal, field) in persistent_type.fields.iter().enumerate() {
+                let field_index = if has_named_fields {
+                    let field_indices = info
+                        .struct_field_names
+                        .get(&(type_index, field.name.clone()))
+                        .with_context(|| {
+                            format!(
+                                "persistent type {} field {} was not found in WasmGC field names",
+                                persistent_type.name, field.name
+                            )
+                        })?;
+                    if field_indices.len() != 1 {
+                        bail!(
+                            "ambiguous Kotlin rewrite field name {} on persistent type {}: {:?}",
+                            field.name,
+                            persistent_type.name,
+                            field_indices
+                        );
+                    }
+                    *field_indices.iter().next().unwrap()
+                } else {
+                    u32::try_from(ordinal).context("Kotlin sidecar field ordinal overflow")?
+                };
                 let actual = *info
                     .struct_field_storage
-                    .get(&(type_index, field_index as u32))
+                    .get(&(type_index, field_index))
                     .context("missing Kotlin rewrite struct field type")?;
                 validate_sidecar_field_type(
                     actual,

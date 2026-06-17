@@ -1,9 +1,11 @@
 #![cfg(all(feature = "transaction", unix))]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+use wasmparser::{BinaryReader, KnownCustom, Name, Operator, Parser, Payload};
 use wasmtime::_internal::transaction_persistence::{
     create_file_backed_storage_for_test, reopen_and_recover_file_backed_region,
 };
@@ -13,6 +15,7 @@ use wasmtime_transaction_tools::kotlin_metadata::parse_kotlin_sidecar;
 use wasmtime_transaction_tools::kotlin_rewrite::rewrite_kotlin_module;
 
 static KOTLIN_BANK_BUILD: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 
 fn gradle_available() -> bool {
     Command::new("gradle")
@@ -108,7 +111,6 @@ fn twasm_kotlin_inspects_tracked_bank_shape() -> Result<()> {
 }
 
 #[test]
-#[ignore = "Kotlin object lowering not implemented yet"]
 fn kotlin_rewrite_output_must_contain_real_transaction_object_ops() -> Result<()> {
     let Some(wasm_path) = build_kotlin_bank_example()? else {
         println!("skipping kotlin bank rewrite test: gradle is unavailable");
@@ -147,15 +149,39 @@ fn kotlin_rewrite_output_must_contain_real_transaction_object_ops() -> Result<()
     }
 
     let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
-    let printed = wasmprinter::print_bytes(std::fs::read(&rewritten)?)?;
+    let rewritten_bytes = std::fs::read(&rewritten)?;
+    let shape = kotlin_transaction_shape(&rewritten_bytes)?;
     assert!(report["rewritten_object_ops"].as_u64().unwrap_or(0) > 0);
-    assert!(
-        printed.contains("tstruct.get")
-            || printed.contains("tstruct.set")
-            || printed.contains("tarray.get")
-            || printed.contains("tarray.set")
-            || printed.contains("tarray.len")
+    ensure!(
+        shape.marker_imports == 0,
+        "Kotlin marker imports must be lowered before execution: {shape:?}"
     );
+    ensure!(
+        shape.tfuncs >= 2,
+        "expected transfer and installFreshBank to be transaction functions: {shape:?}"
+    );
+    ensure!(
+        shape.tfunc_names.contains("transfer"),
+        "expected transfer to be recorded as a transaction function: {shape:?}"
+    );
+    ensure!(
+        shape.tfunc_names.contains("installFreshBank"),
+        "expected installFreshBank to be recorded as a transaction function: {shape:?}"
+    );
+    ensure!(
+        shape.tstruct_gets + shape.tstruct_sets > 0,
+        "expected real transactional struct operations: {shape:?}"
+    );
+
+    let mut config = Config::new();
+    config
+        .wasm_bulk_memory(true)
+        .wasm_gc(true)
+        .wasm_reference_types(true)
+        .wasm_function_references(true)
+        .wasm_tail_call(true);
+    let engine = Engine::new(&config)?;
+    Module::new(&engine, &rewritten_bytes)?;
     Ok(())
 }
 
@@ -355,6 +381,136 @@ fn recovered_object_ref_field(
         "expected persistent object ref slot, got tag={tag} low={low} high={high}"
     );
     Ok(low.checked_sub(1))
+}
+
+#[derive(Debug, Default)]
+struct KotlinTransactionShape {
+    tfuncs: usize,
+    tfunc_names: BTreeSet<String>,
+    tstruct_gets: usize,
+    tstruct_sets: usize,
+    tarray_gets: usize,
+    tarray_sets: usize,
+    marker_imports: usize,
+}
+
+fn kotlin_transaction_shape(bytes: &[u8]) -> Result<KotlinTransactionShape> {
+    let mut shape = KotlinTransactionShape::default();
+    let mut tfunc_indices = Vec::new();
+    let mut function_names = BTreeMap::<u32, BTreeSet<String>>::new();
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.context("failed to parse rewritten Kotlin wasm payload")? {
+            Payload::CustomSection(section)
+                if section.name() == TRANSACTION_OBJECTS_CUSTOM_SECTION =>
+            {
+                let mut reader = BinaryReader::new(section.data(), 0);
+                let version = reader
+                    .read_u8()
+                    .context("failed to parse transaction object metadata version")?;
+                ensure!(
+                    version == 1,
+                    "unexpected transaction object metadata version {version}"
+                );
+                skip_index_set(&mut reader, "memories")?;
+                skip_index_set(&mut reader, "globals")?;
+                tfunc_indices = read_index_set(&mut reader, "functions")?;
+                if !reader.eof() {
+                    skip_index_set(&mut reader, "tables")?;
+                }
+                ensure!(
+                    reader.eof(),
+                    "transaction object metadata has trailing bytes"
+                );
+            }
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import.context("failed to parse rewritten Kotlin import")?;
+                    if import.module.starts_with("twasm") {
+                        shape.marker_imports += 1;
+                    }
+                }
+            }
+            Payload::CustomSection(section) => {
+                let KnownCustom::Name(name_section) = section.as_known() else {
+                    continue;
+                };
+                for subsection in name_section {
+                    let subsection =
+                        subsection.context("failed to parse rewritten Kotlin name subsection")?;
+                    let Name::Function(map) = subsection else {
+                        continue;
+                    };
+                    for naming in map {
+                        let naming =
+                            naming.context("failed to parse rewritten Kotlin function name")?;
+                        function_names
+                            .entry(naming.index)
+                            .or_default()
+                            .insert(naming.name.to_string());
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let mut reader = body
+                    .get_operators_reader()
+                    .context("failed to read rewritten Kotlin operators")?;
+                while !reader.eof() {
+                    match reader
+                        .read()
+                        .context("failed to parse rewritten Kotlin operator")?
+                    {
+                        Operator::TStructGet { .. }
+                        | Operator::TStructGetS { .. }
+                        | Operator::TStructGetU { .. } => {
+                            shape.tstruct_gets += 1;
+                        }
+                        Operator::TStructSet { .. } => {
+                            shape.tstruct_sets += 1;
+                        }
+                        Operator::TArrayGet { .. }
+                        | Operator::TArrayGetS { .. }
+                        | Operator::TArrayGetU { .. }
+                        | Operator::TArrayLen => {
+                            shape.tarray_gets += 1;
+                        }
+                        Operator::TArraySet { .. } => {
+                            shape.tarray_sets += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    shape.tfuncs = tfunc_indices.len();
+    for index in tfunc_indices {
+        if let Some(names) = function_names.get(&index) {
+            shape.tfunc_names.extend(names.iter().cloned());
+        }
+    }
+
+    Ok(shape)
+}
+
+fn skip_index_set(reader: &mut BinaryReader<'_>, label: &str) -> Result<()> {
+    read_index_set(reader, label)?;
+    Ok(())
+}
+
+fn read_index_set(reader: &mut BinaryReader<'_>, label: &str) -> Result<Vec<u32>> {
+    let len = reader
+        .read_var_u32()
+        .with_context(|| format!("failed to parse transaction object {label} length"))?;
+    (0..len)
+        .map(|_| {
+            reader
+                .read_var_u32()
+                .with_context(|| format!("failed to parse transaction object {label} index"))
+        })
+        .collect::<Result<Vec<_>>>()
 }
 
 fn build_kotlin_bank_example() -> Result<Option<std::path::PathBuf>> {

@@ -13,8 +13,8 @@
       "name": "Bank",
       "kind": "struct",
       "fields": [
-        { "name": "alice", "kind": "ref", "type": "Account", "nullable": false },
-        { "name": "bob", "kind": "ref", "type": "Account", "nullable": false }
+        { "name": "alice", "kind": "ref", "type": "Account", "nullable": true },
+        { "name": "bob", "kind": "ref", "type": "Account", "nullable": true }
       ]
     }
   ],

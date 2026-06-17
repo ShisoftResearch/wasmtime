@@ -262,8 +262,8 @@ Create `examples/transaction-kotlin/bank/twasm.kotlin.json`:
       "name": "Bank",
       "kind": "struct",
       "fields": [
-        { "name": "alice", "kind": "ref", "type": "Account", "nullable": false },
-        { "name": "bob", "kind": "ref", "type": "Account", "nullable": false }
+        { "name": "alice", "kind": "ref", "type": "Account", "nullable": true },
+        { "name": "bob", "kind": "ref", "type": "Account", "nullable": true }
       ]
     }
   ],
@@ -276,6 +276,10 @@ Create `examples/transaction-kotlin/bank/twasm.kotlin.json`:
   ]
 }
 ```
+
+For this first sidecar, `nullable` means the emitted WasmGC storage
+nullability that the lowerer validates. It does not yet encode Kotlin
+source-level non-null guarantees.
 
 - [ ] **Step 5: Add a failing Gradle build test**
 
