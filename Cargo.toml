@@ -107,6 +107,7 @@ async-trait = { workspace = true }
 wat = { workspace = true }
 rayon = "1.5.0"
 wasmtime-wast = { workspace = true, features = ['component-model'] }
+wasmtime-transaction-tools = { workspace = true }
 wasmtime-component-util = { workspace = true }
 wasmtime-test-util = { workspace = true, features = ['wasmtime-wast', 'component'] }
 bstr = "1.6.0"

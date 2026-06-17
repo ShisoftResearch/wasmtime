@@ -7,11 +7,14 @@ use wasm_encoder::{
     CodeSection, Encode, Function, Instruction, Module, RawSection, ValType as EncoderValType,
 };
 use wasmparser::{
-    BinaryReader, CodeSectionReader, CompositeInnerType, ExternalKind, Operator, Parser, Payload,
-    TypeRef, ValType as ParserValType,
+    AbstractHeapType, BinaryReader, CodeSectionReader, CompositeInnerType, ExternalKind, HeapType,
+    Operator, Parser, Payload, StorageType, TypeRef, ValType as ParserValType,
 };
 
-use crate::kotlin_metadata::{KotlinPersistentKind, KotlinSidecar, validate_kotlin_sidecar};
+use crate::kotlin_metadata::{
+    KotlinField, KotlinFieldKind, KotlinPersistentKind, KotlinPersistentType, KotlinSidecar,
+    validate_kotlin_sidecar,
+};
 
 const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 const TRANSACTION_OBJECTS_VERSION: u8 = 1;
@@ -34,6 +37,10 @@ struct PersistentTypeIndices {
 #[derive(Default)]
 struct GcTypeInfo {
     persistent: PersistentTypeIndices,
+    sidecar_type_indices: BTreeMap<String, u32>,
+    struct_field_counts: BTreeMap<u32, usize>,
+    struct_field_storage: BTreeMap<(u32, u32), StorageType>,
+    array_element_storage: BTreeMap<u32, StorageType>,
     struct_fields: BTreeMap<(u32, u32), ParserValType>,
     array_elements: BTreeMap<u32, ParserValType>,
 }
@@ -50,6 +57,23 @@ struct TempLocals {
     values: BTreeMap<ParserValType, u32>,
 }
 
+#[derive(Default)]
+struct TransactionObjects {
+    memories: BTreeSet<u32>,
+    globals: BTreeSet<u32>,
+    functions: BTreeSet<u32>,
+    tables: BTreeSet<u32>,
+}
+
+impl TransactionObjects {
+    fn is_empty(&self) -> bool {
+        self.memories.is_empty()
+            && self.globals.is_empty()
+            && self.functions.is_empty()
+            && self.tables.is_empty()
+    }
+}
+
 pub fn rewrite_kotlin_module(
     input: &[u8],
     sidecar: &KotlinSidecar,
@@ -58,6 +82,10 @@ pub fn rewrite_kotlin_module(
 
     let exported_functions = exported_function_names(input)?;
     let transaction_function_indices = transaction_function_indices(&exported_functions, sidecar)?;
+    let mut transaction_objects = transaction_objects(input)?;
+    transaction_objects
+        .functions
+        .extend(transaction_function_indices.iter().copied());
     let gc_type_info = gc_type_info(input, sidecar)?;
     let imported_function_count = imported_function_count(input)?;
     let func_type_params = function_type_params(input)?;
@@ -193,10 +221,10 @@ pub fn rewrite_kotlin_module(
         }
     }
 
-    if !transaction_function_indices.is_empty() {
+    if !transaction_objects.is_empty() {
         module.section(&wasm_encoder::CustomSection {
             name: Cow::Borrowed(TRANSACTION_OBJECTS_CUSTOM_SECTION),
-            data: Cow::Owned(encode_transaction_objects(&transaction_function_indices)),
+            data: Cow::Owned(encode_transaction_objects(&transaction_objects)),
         });
     }
 
@@ -544,17 +572,76 @@ fn heap_type_index(heap_type: wasmparser::HeapType) -> Option<u32> {
     }
 }
 
-fn encode_transaction_objects(transaction_functions: &BTreeSet<u32>) -> Vec<u8> {
+fn encode_transaction_objects(transaction_objects: &TransactionObjects) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.push(TRANSACTION_OBJECTS_VERSION);
-    0u32.encode(&mut bytes);
-    0u32.encode(&mut bytes);
-    (transaction_functions.len() as u32).encode(&mut bytes);
-    for function in transaction_functions {
-        function.encode(&mut bytes);
-    }
-    0u32.encode(&mut bytes);
+    encode_index_set(&transaction_objects.memories, &mut bytes);
+    encode_index_set(&transaction_objects.globals, &mut bytes);
+    encode_index_set(&transaction_objects.functions, &mut bytes);
+    encode_index_set(&transaction_objects.tables, &mut bytes);
     bytes
+}
+
+fn encode_index_set(indices: &BTreeSet<u32>, bytes: &mut Vec<u8>) {
+    (indices.len() as u32).encode(bytes);
+    for index in indices {
+        index.encode(bytes);
+    }
+}
+
+fn transaction_objects(input: &[u8]) -> Result<TransactionObjects> {
+    let mut objects = TransactionObjects::default();
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite transaction metadata payload")? {
+            Payload::CustomSection(section)
+                if section.name() == TRANSACTION_OBJECTS_CUSTOM_SECTION =>
+            {
+                let mut reader = BinaryReader::new(section.data(), 0);
+                let version = reader
+                    .read_u8()
+                    .context("failed to parse transaction object metadata version")?;
+                if version != TRANSACTION_OBJECTS_VERSION {
+                    bail!(
+                        "unsupported transaction object metadata version: expected {}, found {}",
+                        TRANSACTION_OBJECTS_VERSION,
+                        version
+                    );
+                }
+
+                extend_index_set(&mut objects.memories, &mut reader, "memories")?;
+                extend_index_set(&mut objects.globals, &mut reader, "globals")?;
+                extend_index_set(&mut objects.functions, &mut reader, "functions")?;
+                if !reader.eof() {
+                    extend_index_set(&mut objects.tables, &mut reader, "tables")?;
+                }
+                if !reader.eof() {
+                    bail!("transaction object metadata has trailing bytes");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(objects)
+}
+
+fn extend_index_set(
+    indices: &mut BTreeSet<u32>,
+    reader: &mut BinaryReader<'_>,
+    label: &str,
+) -> Result<()> {
+    let len = reader
+        .read_var_u32()
+        .with_context(|| format!("failed to parse transaction object {label} length"))?;
+    for _ in 0..len {
+        indices.insert(
+            reader
+                .read_var_u32()
+                .with_context(|| format!("failed to parse transaction object {label} index"))?,
+        );
+    }
+    Ok(())
 }
 
 fn exported_function_names(input: &[u8]) -> Result<BTreeMap<String, u32>> {
@@ -669,7 +756,13 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
                     for ty in group.into_types() {
                         match ty.composite_type.inner {
                             CompositeInnerType::Struct(struct_ty) => {
+                                info.struct_field_counts
+                                    .insert(next_type_index, struct_ty.fields.len());
                                 for (field_index, field) in struct_ty.fields.iter().enumerate() {
+                                    info.struct_field_storage.insert(
+                                        (next_type_index, field_index as u32),
+                                        field.element_type,
+                                    );
                                     info.struct_fields.insert(
                                         (next_type_index, field_index as u32),
                                         field.element_type.unpack(),
@@ -679,6 +772,8 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
                                     .push((next_type_index, KotlinPersistentKind::Struct));
                             }
                             CompositeInnerType::Array(array_ty) => {
+                                info.array_element_storage
+                                    .insert(next_type_index, array_ty.0.element_type);
                                 info.array_elements
                                     .insert(next_type_index, array_ty.0.element_type.unpack());
                                 gc_type_indices
@@ -713,6 +808,9 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
             );
         }
 
+        info.sidecar_type_indices
+            .insert(persistent_type.name.clone(), type_index);
+
         match persistent_type.kind {
             KotlinPersistentKind::Struct => {
                 info.persistent.structs.insert(type_index);
@@ -723,5 +821,161 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
         }
     }
 
+    for (ordinal, persistent_type) in sidecar.persistent_types.iter().enumerate() {
+        let (type_index, _) = gc_type_indices[ordinal];
+        validate_persistent_type_shape(type_index, persistent_type, &info)?;
+    }
+
     Ok(info)
+}
+
+fn validate_persistent_type_shape(
+    type_index: u32,
+    persistent_type: &KotlinPersistentType,
+    info: &GcTypeInfo,
+) -> Result<()> {
+    match persistent_type.kind {
+        KotlinPersistentKind::Struct => {
+            let actual_count = *info
+                .struct_field_counts
+                .get(&type_index)
+                .context("missing Kotlin rewrite struct field count")?;
+            if actual_count != persistent_type.fields.len() {
+                bail!(
+                    "persistent type {} field count mismatch: sidecar has {}, WasmGC type has {}",
+                    persistent_type.name,
+                    persistent_type.fields.len(),
+                    actual_count
+                );
+            }
+
+            for (field_index, field) in persistent_type.fields.iter().enumerate() {
+                let actual = *info
+                    .struct_field_storage
+                    .get(&(type_index, field_index as u32))
+                    .context("missing Kotlin rewrite struct field type")?;
+                validate_sidecar_field_type(
+                    actual,
+                    field,
+                    &format!(
+                        "persistent type {} field {}",
+                        persistent_type.name, field.name
+                    ),
+                    info,
+                )?;
+            }
+        }
+        KotlinPersistentKind::Array => {
+            let actual = *info
+                .array_element_storage
+                .get(&type_index)
+                .context("missing Kotlin rewrite array element type")?;
+            let element = persistent_type
+                .element
+                .as_ref()
+                .context("array sidecar element was not validated")?;
+            validate_sidecar_field_type(
+                actual,
+                element,
+                &format!("persistent type {} element", persistent_type.name),
+                info,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_sidecar_field_type(
+    actual: StorageType,
+    field: &KotlinField,
+    context: &str,
+    info: &GcTypeInfo,
+) -> Result<()> {
+    match field.kind {
+        KotlinFieldKind::I31 => match actual {
+            StorageType::Val(ParserValType::Ref(ref_type))
+                if matches!(
+                    ref_type.heap_type(),
+                    HeapType::Abstract {
+                        ty: AbstractHeapType::I31,
+                        ..
+                    }
+                ) && ref_type.is_nullable() == field.nullable =>
+            {
+                Ok(())
+            }
+            _ => bail!("{context} type mismatch: expected i31, found {actual}"),
+        },
+        KotlinFieldKind::I32 => validate_scalar_field(actual, ParserValType::I32, context, "i32"),
+        KotlinFieldKind::I64 => validate_scalar_field(actual, ParserValType::I64, context, "i64"),
+        KotlinFieldKind::F32 => validate_scalar_field(actual, ParserValType::F32, context, "f32"),
+        KotlinFieldKind::F64 => validate_scalar_field(actual, ParserValType::F64, context, "f64"),
+        KotlinFieldKind::V128 => {
+            validate_scalar_field(actual, ParserValType::V128, context, "v128")
+        }
+        KotlinFieldKind::Ref => validate_ref_field(actual, field, context, info),
+    }
+}
+
+fn validate_scalar_field(
+    actual: StorageType,
+    expected: ParserValType,
+    context: &str,
+    expected_name: &str,
+) -> Result<()> {
+    if actual == StorageType::Val(expected) {
+        Ok(())
+    } else {
+        bail!("{context} type mismatch: expected {expected_name}, found {actual}")
+    }
+}
+
+fn validate_ref_field(
+    actual: StorageType,
+    field: &KotlinField,
+    context: &str,
+    info: &GcTypeInfo,
+) -> Result<()> {
+    let StorageType::Val(ParserValType::Ref(ref_type)) = actual else {
+        bail!("{context} type mismatch: expected ref, found {actual}");
+    };
+
+    if ref_type.is_nullable() != field.nullable {
+        bail!(
+            "{context} nullability mismatch: sidecar has nullable={}, WasmGC type has nullable={}",
+            field.nullable,
+            ref_type.is_nullable()
+        );
+    }
+
+    let actual_type_index = ref_type
+        .type_index()
+        .and_then(|index| index.unpack().as_module_index())
+        .with_context(|| format!("{context} type mismatch: expected concrete persistent ref"))?;
+    let Some(target_name) = field.r#type.as_deref() else {
+        bail!("{context} is missing ref target type");
+    };
+    let Some(expected_type_index) = info.sidecar_type_indices.get(target_name).copied() else {
+        bail!("{context} references unknown persistent type: {target_name}");
+    };
+
+    if !info.persistent.structs.contains(&actual_type_index)
+        && !info.persistent.arrays.contains(&actual_type_index)
+    {
+        bail!(
+            "{context} points at non-persistent GC type index {}",
+            actual_type_index
+        );
+    }
+
+    if actual_type_index != expected_type_index {
+        bail!(
+            "{context} type mismatch: expected ref to {}, found persistent GC type index {}",
+            target_name,
+            actual_type_index
+        );
+    }
+
+    Ok(())
 }

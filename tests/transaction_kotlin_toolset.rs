@@ -4,7 +4,13 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+use wasmtime::_internal::transaction_persistence::{
+    create_file_backed_storage_for_test, reopen_and_recover_file_backed_region,
+};
 use wasmtime::anyhow::{Context, Result, bail, ensure};
+use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime_transaction_tools::kotlin_metadata::parse_kotlin_sidecar;
+use wasmtime_transaction_tools::kotlin_rewrite::rewrite_kotlin_module;
 
 static KOTLIN_BANK_BUILD: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
 
@@ -151,6 +157,204 @@ fn kotlin_rewrite_output_must_contain_real_transaction_object_ops() -> Result<()
             || printed.contains("tarray.len")
     );
     Ok(())
+}
+
+#[test]
+fn kotlin_promotes_ordinary_wasmgc_objects() -> Result<()> {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $account (struct (field (mut i64))))
+          (type $accounts (array (mut (ref null $account))))
+          (type $bank
+            (struct
+              (field (mut (ref null $account)))
+              (field (mut (ref null $account)))
+              (field (mut (ref null $accounts)))))
+          (tglobal $root (mut (ref null $bank)) (ref.null $bank))
+          (func (export "publish") (local $alice (ref $account))
+            i64.const 100
+            struct.new $account
+            local.tee $alice
+            local.get $alice
+            local.get $alice
+            i32.const 2
+            array.new $accounts
+            struct.new $bank
+            tglobal.set $root))
+        "#,
+    )?;
+    let sidecar = parse_kotlin_sidecar(
+        br#"{
+          "version": 1,
+          "module": "kotlin-shaped-promotion",
+          "persistentTypes": [
+            {
+              "name": "Account",
+              "kind": "struct",
+              "fields": [
+                { "name": "balance", "kind": "i64", "nullable": false }
+              ]
+            },
+            {
+              "name": "Accounts",
+              "kind": "array",
+              "element": {
+                "name": "element",
+                "kind": "ref",
+                "type": "Account",
+                "nullable": true
+              }
+            },
+            {
+              "name": "Bank",
+              "kind": "struct",
+              "fields": [
+                { "name": "alice", "kind": "ref", "type": "Account", "nullable": true },
+                { "name": "mirror", "kind": "ref", "type": "Account", "nullable": true },
+                { "name": "accounts", "kind": "ref", "type": "Accounts", "nullable": true }
+              ]
+            }
+          ],
+          "transactionFunctions": ["publish"],
+          "roots": [
+            { "name": "bank", "type": "Bank", "nullable": true }
+          ]
+        }"#
+        .as_slice(),
+    )?;
+
+    let (rewritten, report) = rewrite_kotlin_module(&input, &sidecar)?;
+    ensure!(
+        report.rewritten_tfuncs == 1,
+        "expected publish to be marked"
+    );
+    ensure!(
+        report.rewritten_object_ops == 0,
+        "ordinary constructors should remain ordinary until promotion: {report:?}"
+    );
+    let printed = wasmprinter::print_bytes(&rewritten)?;
+    ensure!(
+        printed.contains("struct.new"),
+        "missing ordinary struct.new"
+    );
+    ensure!(printed.contains("array.new"), "missing ordinary array.new");
+    ensure!(
+        !printed.contains("tstruct.new"),
+        "constructor was eagerly transactional"
+    );
+    ensure!(
+        !printed.contains("tarray.new"),
+        "constructor was eagerly transactional"
+    );
+
+    let temp = tempfile::tempdir()?;
+    let tmemory_path = temp.path().join("kotlin-shaped.tmemory");
+    let tx_log_path = temp.path().join("kotlin-shaped.txlog");
+    let mut config = Config::new();
+    config
+        .wasm_bulk_memory(true)
+        .wasm_gc(true)
+        .wasm_reference_types(true)
+        .wasm_function_references(true)
+        .wasm_tail_call(true);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, &rewritten)?;
+    let mut store = Store::new(&engine, ());
+    create_file_backed_storage_for_test(&mut store, tmemory_path, tx_log_path.clone(), 64)?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let publish = instance.get_typed_func::<(), ()>(&mut store, "publish")?;
+    publish.call(&mut store, ())?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    ensure!(
+        recovered.root_object_ids.len() == 1,
+        "expected one recovered Kotlin root, got {:?}",
+        recovered.root_object_ids
+    );
+    ensure!(
+        recovered.object_winners.len() >= 3,
+        "expected recovered Bank, Account, and Accounts records, got {}",
+        recovered.object_winners.len()
+    );
+    ensure!(
+        recovered
+            .object_winners
+            .iter()
+            .any(|winner| winner.object_id == recovered.root_object_ids[0]),
+        "root ObjectId was not recovered as an object record"
+    );
+    let root_winner = recovered
+        .object_winners
+        .iter()
+        .find(|winner| winner.object_id == recovered.root_object_ids[0])
+        .expect("root ObjectId should have a recovered object record");
+    let alice_ref = recovered_object_ref_field(&root_winner.record_bytes, 3, 0)?;
+    let mirror_ref = recovered_object_ref_field(&root_winner.record_bytes, 3, 1)?;
+    ensure!(
+        alice_ref == mirror_ref,
+        "promotion did not preserve repeated GC-ref aliasing: {alice_ref:?} != {mirror_ref:?}"
+    );
+    let alice_object_id =
+        alice_ref.context("promoted repeated GC-ref alias resolved to null ObjectId")?;
+    ensure!(
+        recovered
+            .object_winners
+            .iter()
+            .any(|winner| winner.object_id == alice_object_id),
+        "aliased Account ObjectId did not have a recovered object record"
+    );
+    let accounts_ref = recovered_object_ref_field(&root_winner.record_bytes, 3, 2)?;
+    let accounts_object_id =
+        accounts_ref.context("Bank accounts field resolved to null ObjectId")?;
+    ensure!(
+        recovered
+            .object_winners
+            .iter()
+            .any(|winner| winner.object_id == accounts_object_id),
+        "Bank accounts field did not point at a recovered persistent array record"
+    );
+    Ok(())
+}
+
+fn recovered_object_ref_field(
+    record_bytes: &[u8],
+    field_count: usize,
+    field_index: usize,
+) -> Result<Option<u64>> {
+    const OBJECT_VALUE_ABI_TAG_REF: u32 = 5;
+    const OBJECT_VALUE_RECORD_LEN: usize = 20;
+
+    ensure!(field_index < field_count, "field index out of range");
+    let payload_len = field_count
+        .checked_mul(OBJECT_VALUE_RECORD_LEN)
+        .context("object payload length overflow")?;
+    ensure!(
+        record_bytes.len() >= payload_len,
+        "recovered object record is shorter than its payload"
+    );
+    let payload_start = record_bytes.len() - payload_len;
+    let field_offset = payload_start + field_index * OBJECT_VALUE_RECORD_LEN;
+    let tag = u32::from_le_bytes(
+        record_bytes[field_offset..field_offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let low = u64::from_le_bytes(
+        record_bytes[field_offset + 4..field_offset + 12]
+            .try_into()
+            .unwrap(),
+    );
+    let high = u64::from_le_bytes(
+        record_bytes[field_offset + 12..field_offset + 20]
+            .try_into()
+            .unwrap(),
+    );
+    ensure!(
+        tag == OBJECT_VALUE_ABI_TAG_REF && high == 0,
+        "expected persistent object ref slot, got tag={tag} low={low} high={high}"
+    );
+    Ok(low.checked_sub(1))
 }
 
 fn build_kotlin_bank_example() -> Result<Option<std::path::PathBuf>> {

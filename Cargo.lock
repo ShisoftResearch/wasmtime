@@ -4681,6 +4681,7 @@ dependencies = [
  "wasmtime-internal-unwinder",
  "wasmtime-test-macros",
  "wasmtime-test-util",
+ "wasmtime-transaction-tools",
  "wasmtime-wasi",
  "wasmtime-wasi-config",
  "wasmtime-wasi-http",

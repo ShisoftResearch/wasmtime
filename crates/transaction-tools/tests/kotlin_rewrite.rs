@@ -7,6 +7,14 @@ use wasmtime_transaction_tools::kotlin_rewrite::rewrite_kotlin_module;
 
 const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 
+#[derive(Default, Debug, Eq, PartialEq)]
+struct TransactionObjects {
+    memories: Vec<u32>,
+    globals: Vec<u32>,
+    functions: Vec<u32>,
+    tables: Vec<u32>,
+}
+
 fn sidecar(
     persistent_types: Vec<KotlinPersistentType>,
     transaction_functions: &[&str],
@@ -25,30 +33,62 @@ fn sidecar(
 }
 
 fn struct_type(name: &str) -> KotlinPersistentType {
-    KotlinPersistentType {
-        name: name.into(),
-        kind: KotlinPersistentKind::Struct,
-        fields: vec![KotlinField {
+    struct_type_with_fields(
+        name,
+        vec![KotlinField {
             name: "balance".into(),
             kind: KotlinFieldKind::I64,
             r#type: None,
             nullable: false,
         }],
+    )
+}
+
+fn struct_type_with_fields(name: &str, fields: Vec<KotlinField>) -> KotlinPersistentType {
+    KotlinPersistentType {
+        name: name.into(),
+        kind: KotlinPersistentKind::Struct,
+        fields,
         element: None,
     }
 }
 
 fn array_type(name: &str) -> KotlinPersistentType {
-    KotlinPersistentType {
-        name: name.into(),
-        kind: KotlinPersistentKind::Array,
-        fields: vec![],
-        element: Some(KotlinField {
+    array_type_with_element(
+        name,
+        KotlinField {
             name: "element".into(),
             kind: KotlinFieldKind::I32,
             r#type: None,
             nullable: false,
-        }),
+        },
+    )
+}
+
+fn array_type_with_element(name: &str, element: KotlinField) -> KotlinPersistentType {
+    KotlinPersistentType {
+        name: name.into(),
+        kind: KotlinPersistentKind::Array,
+        fields: vec![],
+        element: Some(element),
+    }
+}
+
+fn scalar_field(name: &str, kind: KotlinFieldKind) -> KotlinField {
+    KotlinField {
+        name: name.into(),
+        kind,
+        r#type: None,
+        nullable: false,
+    }
+}
+
+fn ref_field(name: &str, target: &str, nullable: bool) -> KotlinField {
+    KotlinField {
+        name: name.into(),
+        kind: KotlinFieldKind::Ref,
+        r#type: Some(target.into()),
+        nullable,
     }
 }
 
@@ -85,7 +125,63 @@ fn rewrite_report_records_transaction_function_names() {
 
     assert_eq!(report.transaction_functions, vec!["transfer"]);
     assert_eq!(report.rewritten_tfuncs, 1);
-    assert_eq!(transaction_function_metadata(&output), vec![0]);
+    assert_eq!(transaction_objects(&output).functions, vec![0]);
+}
+
+#[test]
+fn rewrite_merges_existing_transaction_object_metadata() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (tglobal $root (mut i32) (i32.const 0))
+              (func (export "publish")
+                i32.const 1
+                tglobal.set $root))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![], &["publish"], vec![]);
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_eq!(report.rewritten_tfuncs, 1);
+    assert_eq!(
+        transaction_objects(&output),
+        TransactionObjects {
+            memories: vec![],
+            globals: vec![0],
+            functions: vec![0],
+            tables: vec![],
+        }
+    );
+}
+
+#[test]
+fn rewrite_merges_existing_transaction_table_metadata() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (ttable $root 1 funcref)
+              (func (export "publish")
+                ttable.size $root
+                drop))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![], &["publish"], vec![]);
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_eq!(report.rewritten_tfuncs, 1);
+    assert_eq!(
+        transaction_objects(&output),
+        TransactionObjects {
+            memories: vec![],
+            globals: vec![],
+            functions: vec![0],
+            tables: vec![0],
+        }
+    );
 }
 
 #[test]
@@ -153,6 +249,246 @@ fn rewrite_lowers_array_object_ops_in_marked_transaction_function() {
     assert!(printed.contains("tarray.get"), "{printed}");
     assert!(printed.contains("tarray.set"), "{printed}");
     assert!(printed.contains("tarray.len"), "{printed}");
+}
+
+#[test]
+fn rewrite_keeps_persistent_constructors_ordinary_until_promotion_boundary() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $account (struct (field (mut i64))))
+              (type $accounts (array (mut i32)))
+              (func (export "transfer")
+                i64.const 10
+                struct.new $account
+                drop
+                i32.const 7
+                i32.const 2
+                array.new $accounts
+                drop))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type("Account"), array_type("Accounts")],
+        &["transfer"],
+        vec![],
+    );
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
+    assert_valid_module(&output);
+    assert!(printed.contains("struct.new"), "{printed}");
+    assert!(printed.contains("array.new"), "{printed}");
+    assert!(!printed.contains("tstruct.new"), "{printed}");
+    assert!(!printed.contains("tarray.new"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_sidecar_struct_field_count_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $account (struct (field (mut i64))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Account",
+            vec![
+                scalar_field("balance", KotlinFieldKind::I64),
+                scalar_field("status", KotlinFieldKind::I32),
+            ],
+        )],
+        &["transfer"],
+        vec![],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("field count mismatch"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_sidecar_struct_field_type_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $account (struct (field (mut i32))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![struct_type("Account")], &["transfer"], vec![]);
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("field balance type mismatch"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_sidecar_packed_struct_field_as_i32() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $account (struct (field (mut i8))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Account",
+            vec![scalar_field("balance", KotlinFieldKind::I32)],
+        )],
+        &["transfer"],
+        vec![],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("expected i32, found i8"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_missing_sidecar_layout_metadata() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $account (struct (field (mut i64))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type("Account"), struct_type("Missing")],
+        &["transfer"],
+        vec![],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("could not be mapped to GC type ordinal"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rewrite_rejects_persistent_ref_to_non_persistent_gc_type() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $holder (struct (field (mut (ref null $ordinary)))))
+              (type $ordinary (struct (field (mut i64))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Holder",
+            vec![ref_field("child", "Holder", true)],
+        )],
+        &["transfer"],
+        vec![],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("points at non-persistent GC type"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_sidecar_array_element_type_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $accounts (array (mut i64)))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(vec![array_type("Accounts")], &["transfer"], vec![]);
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("persistent type Accounts element type mismatch"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rewrite_rejects_sidecar_ref_nullability_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $account (struct (field (mut i64))))
+              (type $holder (struct (field (mut (ref null $account)))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![
+            struct_type("Account"),
+            struct_type_with_fields("Holder", vec![ref_field("child", "Account", false)]),
+        ],
+        &["transfer"],
+        vec![],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("nullability mismatch"), "{err}");
+}
+
+#[test]
+fn rewrite_rejects_sidecar_ref_target_mismatch() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $account (struct (field (mut i64))))
+              (type $profile (struct (field (mut i64))))
+              (type $holder (struct (field (mut (ref null $profile)))))
+              (func (export "transfer")))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![
+            struct_type("Account"),
+            struct_type_with_fields("Profile", vec![scalar_field("id", KotlinFieldKind::I64)]),
+            struct_type_with_fields("Holder", vec![ref_field("child", "Account", true)]),
+        ],
+        &["transfer"],
+        vec![],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("expected ref to Account"), "{err}");
 }
 
 #[test]
@@ -264,7 +600,7 @@ fn rewrite_preserves_array_len_result_on_type_stack() {
     assert!(printed.contains("tarray.len"), "{printed}");
 }
 
-fn transaction_function_metadata(bytes: &[u8]) -> Vec<u32> {
+fn transaction_objects(bytes: &[u8]) -> TransactionObjects {
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.expect("payload");
         let Payload::CustomSection(section) = payload else {
@@ -276,15 +612,20 @@ fn transaction_function_metadata(bytes: &[u8]) -> Vec<u32> {
 
         let mut reader = BinaryReader::new(section.data(), 0);
         assert_eq!(reader.read_u8().expect("version"), 1);
-        assert!(read_index_vec(&mut reader).is_empty(), "memories");
-        assert!(read_index_vec(&mut reader).is_empty(), "globals");
+        let memories = read_index_vec(&mut reader);
+        let globals = read_index_vec(&mut reader);
         let functions = read_index_vec(&mut reader);
-        assert!(read_index_vec(&mut reader).is_empty(), "tables");
+        let tables = read_index_vec(&mut reader);
         assert!(reader.eof(), "metadata trailing bytes");
-        return functions;
+        return TransactionObjects {
+            memories,
+            globals,
+            functions,
+            tables,
+        };
     }
 
-    Vec::new()
+    TransactionObjects::default()
 }
 
 fn assert_valid_module(bytes: &[u8]) {
