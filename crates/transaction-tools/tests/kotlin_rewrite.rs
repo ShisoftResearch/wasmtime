@@ -1,4 +1,5 @@
-use wasmparser::{BinaryReader, Parser, Payload, Validator};
+use std::collections::BTreeMap;
+use wasmparser::{BinaryReader, ElementItems, ExternalKind, Parser, Payload, Validator};
 use wasmtime_transaction_tools::kotlin_metadata::{
     KotlinField, KotlinFieldKind, KotlinPersistentKind, KotlinPersistentType, KotlinRoot,
     KotlinSidecar,
@@ -390,6 +391,138 @@ fn rewrite_lowers_inline_and_explicit_root_markers_together() {
     );
     assert!(printed.contains("tglobal.get 0"), "{printed}");
     assert!(printed.contains("tglobal.set 1"), "{printed}");
+}
+
+#[test]
+fn rewrite_remaps_exports_after_stripping_root_marker_imports() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (import "env" "keep" (func $keep))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref null $Bank))))
+              (import "twasm.root.set" "bank"
+                (func $set_bank (param (ref null $Bank)) (result (ref null $Unit))))
+              (func $unit_getter (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $publish (export "publish")
+                call $keep)
+              (func $read_bank (export "readBank") (result (ref null $Bank))
+                call $get_bank)
+              (func $install_bank (export "installBank")
+                    (param $bank (ref null $Bank))
+                    (result (ref null $Unit))
+                local.get $bank
+                call $set_bank))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_valid_module(&output);
+    assert_eq!(marker_import_count(&output), 0);
+    assert_eq!(
+        function_exports(&output),
+        BTreeMap::from([
+            ("installBank".into(), 4),
+            ("kotlin.Unit_getInstance".into(), 1),
+            ("publish".into(), 2),
+            ("readBank".into(), 3),
+        ])
+    );
+}
+
+#[test]
+fn rewrite_remaps_start_function_after_stripping_root_marker_imports() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (import "env" "observe" (func $observe (param (ref null $Bank))))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref null $Bank))))
+              (import "twasm.root.set" "bank"
+                (func $set_bank (param (ref null $Bank)) (result (ref null $Unit))))
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $initialize
+                call $get_bank
+                call $observe
+                ref.null $Bank
+                call $set_bank
+                drop)
+              (start $initialize))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_valid_module(&output);
+    assert_eq!(marker_import_count(&output), 0);
+    assert_eq!(start_function(&output), Some(2));
+}
+
+#[test]
+fn rewrite_remaps_element_function_refs_after_stripping_root_marker_imports() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (import "env" "keep" (func $keep))
+              (import "twasm.root.get" "bank"
+                (func $get_bank (result (ref null $Bank))))
+              (import "twasm.root.set" "bank"
+                (func $set_bank (param (ref null $Bank)) (result (ref null $Unit))))
+              (table 4 funcref)
+              (func $unit_getter (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $publish
+                call $keep)
+              (func $read_bank (result (ref null $Bank))
+                call $get_bank)
+              (elem (i32.const 0) func $keep $unit_getter $publish $read_bank))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+
+    assert_valid_module(&output);
+    assert_eq!(marker_import_count(&output), 0);
+    assert_eq!(element_function_indices(&output), vec![vec![0, 1, 2, 3]]);
 }
 
 #[test]
@@ -1356,6 +1489,56 @@ fn marker_import_count(bytes: &[u8]) -> usize {
         }
     }
     count
+}
+
+fn function_exports(bytes: &[u8]) -> BTreeMap<String, u32> {
+    let mut exports = BTreeMap::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.expect("payload");
+        let Payload::ExportSection(section) = payload else {
+            continue;
+        };
+        for export in section {
+            let export = export.expect("export");
+            if matches!(export.kind, ExternalKind::Func | ExternalKind::FuncExact) {
+                exports.insert(export.name.to_string(), export.index);
+            }
+        }
+    }
+    exports
+}
+
+fn start_function(bytes: &[u8]) -> Option<u32> {
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.expect("payload");
+        if let Payload::StartSection { func, .. } = payload {
+            return Some(func);
+        }
+    }
+    None
+}
+
+fn element_function_indices(bytes: &[u8]) -> Vec<Vec<u32>> {
+    let mut segments = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.expect("payload");
+        let Payload::ElementSection(section) = payload else {
+            continue;
+        };
+        for segment in section {
+            let segment = segment.expect("element segment");
+            let funcs = match segment.items {
+                ElementItems::Functions(funcs) => funcs,
+                ElementItems::Expressions(_, _) => panic!("expected function element items"),
+            };
+            let mut indices = Vec::new();
+            for func in funcs {
+                indices.push(func.expect("function index"));
+            }
+            segments.push(indices);
+        }
+    }
+    segments
 }
 
 fn read_index_vec(reader: &mut BinaryReader<'_>) -> Vec<u32> {
