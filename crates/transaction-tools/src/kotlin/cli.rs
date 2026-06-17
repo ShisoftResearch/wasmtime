@@ -1,9 +1,10 @@
-use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+
+use crate::common::{read_bytes, write_bytes, write_json};
 
 #[derive(Parser)]
 #[command(name = "twasm-kotlin")]
@@ -40,15 +41,13 @@ pub fn main() -> Result<()> {
 pub fn run(cli: KotlinCli, stdout: &mut impl Write) -> Result<()> {
     match cli.command {
         KotlinCommand::Inspect { metadata, wasm } => {
-            let bytes = fs::read(&metadata)
-                .with_context(|| format!("failed to read {}", metadata.display()))?;
-            let sidecar = crate::kotlin_metadata::parse_kotlin_sidecar(&bytes[..])
+            let bytes = read_bytes(&metadata)?;
+            let sidecar = super::metadata::parse_kotlin_sidecar(&bytes[..])
                 .with_context(|| format!("failed to parse {}", metadata.display()))?;
-            let report = crate::kotlin_inspect::inspect_sidecar(&sidecar);
+            let report = super::inspect::inspect_sidecar(&sidecar);
             if let Some(wasm) = wasm {
-                let wasm_bytes = fs::read(&wasm)
-                    .with_context(|| format!("failed to read {}", wasm.display()))?;
-                let wasm_shape = crate::kotlin_inspect::inspect_wasm_shape(&wasm_bytes)
+                let wasm_bytes = read_bytes(&wasm)?;
+                let wasm_shape = super::inspect::inspect_wasm_shape(&wasm_bytes)
                     .with_context(|| format!("failed to inspect {}", wasm.display()))?;
                 let mut value = serde_json::to_value(&report)?;
                 value["wasm_shape"] = serde_json::to_value(&wasm_shape)?;
@@ -63,20 +62,16 @@ pub fn run(cli: KotlinCli, stdout: &mut impl Write) -> Result<()> {
             output,
             report,
         } => {
-            let input_bytes =
-                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let metadata_bytes = fs::read(&metadata)
-                .with_context(|| format!("failed to read {}", metadata.display()))?;
-            let sidecar = crate::kotlin_metadata::parse_kotlin_sidecar(&metadata_bytes[..])
+            let input_bytes = read_bytes(&input)?;
+            let metadata_bytes = read_bytes(&metadata)?;
+            let sidecar = super::metadata::parse_kotlin_sidecar(&metadata_bytes[..])
                 .with_context(|| format!("failed to parse {}", metadata.display()))?;
             let (rewritten, rewrite_report) =
-                crate::kotlin_rewrite::rewrite_kotlin_module(&input_bytes, &sidecar)
+                super::rewrite::rewrite_kotlin_module(&input_bytes, &sidecar)
                     .with_context(|| format!("failed to rewrite {}", input.display()))?;
-            fs::write(&output, rewritten)
-                .with_context(|| format!("failed to write {}", output.display()))?;
+            write_bytes(&output, rewritten)?;
             if let Some(report_path) = report {
-                fs::write(&report_path, serde_json::to_vec_pretty(&rewrite_report)?)
-                    .with_context(|| format!("failed to write {}", report_path.display()))?;
+                write_json(&report_path, &rewrite_report)?;
             }
         }
     }

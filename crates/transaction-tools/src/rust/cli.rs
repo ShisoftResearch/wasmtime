@@ -1,10 +1,11 @@
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+
+use crate::common::{create_parent_dir, read_bytes, write_bytes, write_json};
 
 #[derive(Parser)]
 #[command(name = "twasm-rust")]
@@ -46,9 +47,8 @@ pub fn main() -> Result<()> {
 pub fn run(cli: Cli, stdout: &mut impl Write) -> Result<()> {
     match cli.command {
         Command::Inspect { input } => {
-            let bytes =
-                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let report = crate::metadata::inspect_module(&bytes)?;
+            let bytes = read_bytes(&input)?;
+            let report = super::metadata::inspect_module(&bytes)?;
             writeln!(stdout, "{}", serde_json::to_string_pretty(&report)?)?;
         }
         Command::Rewrite {
@@ -56,15 +56,12 @@ pub fn run(cli: Cli, stdout: &mut impl Write) -> Result<()> {
             output,
             report,
         } => {
-            let bytes =
-                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let (rewritten, rewrite_report) = crate::rewrite::rewrite_module(&bytes)?;
-            fs::write(&output, rewritten)
-                .with_context(|| format!("failed to write {}", output.display()))?;
+            let bytes = read_bytes(&input)?;
+            let (rewritten, rewrite_report) = super::rewrite::rewrite_module(&bytes)?;
+            write_bytes(&output, rewritten)?;
 
             if let Some(report_path) = report {
-                fs::write(&report_path, serde_json::to_vec_pretty(&rewrite_report)?)
-                    .with_context(|| format!("failed to write {}", report_path.display()))?;
+                write_json(&report_path, &rewrite_report)?;
             }
         }
         Command::Build {
@@ -112,25 +109,22 @@ fn build_and_rewrite(
         .join("wasm32-unknown-unknown")
         .join(profile)
         .join(format!("{}.wasm", wasm_artifact_stem(&package_name)));
-    let bytes = fs::read(&wasm_path)
-        .with_context(|| format!("failed to read built wasm {}", wasm_path.display()))?;
-    let (rewritten, rewrite_report) = crate::rewrite::rewrite_module(&bytes)?;
+    let bytes = read_built_wasm(&wasm_path)?;
+    let (rewritten, rewrite_report) = super::rewrite::rewrite_module(&bytes)?;
 
     create_parent_dir(&output)?;
-    fs::write(&output, rewritten)
-        .with_context(|| format!("failed to write {}", output.display()))?;
+    write_bytes(&output, rewritten)?;
 
     if let Some(report_path) = report {
         create_parent_dir(&report_path)?;
-        fs::write(&report_path, serde_json::to_vec_pretty(&rewrite_report)?)
-            .with_context(|| format!("failed to write {}", report_path.display()))?;
+        write_json(&report_path, &rewrite_report)?;
     }
 
     Ok(())
 }
 
 fn package_name_from_manifest(manifest_path: &Path) -> Result<String> {
-    let manifest = fs::read_to_string(manifest_path)
+    let manifest = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     let manifest: toml::Value = toml::from_str(&manifest)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
@@ -146,14 +140,8 @@ fn wasm_artifact_stem(package_name: &str) -> String {
     package_name.replace('-', "_")
 }
 
-fn create_parent_dir(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))
+fn read_built_wasm(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("failed to read built wasm {}", path.display()))
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ use wasmparser::{
     ValType as ParserValType,
 };
 
-use crate::kotlin_metadata::{
+use super::metadata::{
     KotlinField, KotlinFieldKind, KotlinPersistentKind, KotlinPersistentType, KotlinSidecar,
     validate_kotlin_sidecar,
 };

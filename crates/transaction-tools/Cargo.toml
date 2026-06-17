@@ -11,11 +11,11 @@ workspace = true
 
 [[bin]]
 name = "twasm-rust"
-path = "src/main.rs"
+path = "src/rust/main.rs"
 
 [[bin]]
 name = "twasm-kotlin"
-path = "src/kotlin_main.rs"
+path = "src/kotlin/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }

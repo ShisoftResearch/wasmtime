@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use wasmparser::{CompositeInnerType, Operator, Parser, Payload};
 
-use crate::kotlin_metadata::KotlinSidecar;
+use super::metadata::KotlinSidecar;
 
 #[derive(Debug, Serialize)]
 pub struct KotlinInspectReport {

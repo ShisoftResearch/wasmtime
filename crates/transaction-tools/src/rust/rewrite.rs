@@ -2433,7 +2433,7 @@ fn encode_transaction_objects(transaction_functions: &BTreeSet<u32>) -> Vec<u8> 
 }
 
 pub fn main() -> anyhow::Result<()> {
-    crate::cli::main()
+    crate::rust::cli::main()
 }
 
 #[cfg(test)]
