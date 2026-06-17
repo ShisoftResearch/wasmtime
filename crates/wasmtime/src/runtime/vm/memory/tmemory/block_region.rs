@@ -3130,6 +3130,14 @@ impl FileBackedMemoryBlockRegion {
         Ok(self.block_meta(block)?.generation)
     }
 
+    pub(crate) fn object_data_chunk_start_for_block(&self, block: u32) -> Result<Option<u32>> {
+        let meta = self.block_meta(block)?;
+        if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+            return Ok(None);
+        }
+        Ok(Some(meta.chunk_start))
+    }
+
     fn write_log_block_header(&mut self, start_block: u32, header: LogBlockHeader) -> Result<()> {
         self.write(self.block_offset(start_block)?, &header.as_bytes())
     }
@@ -3756,6 +3764,12 @@ pub(crate) fn reopen_and_recover_file_backed_region_for_runtime(
     path: &Path,
 ) -> Result<super::recovery::RecoveredRegion> {
     let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+    recover_file_backed_region_snapshot(&region)
+}
+
+pub(crate) fn recover_file_backed_region_snapshot(
+    region: &FileBackedMemoryBlockRegion,
+) -> Result<super::recovery::RecoveredRegion> {
     super::recovery::recover_region(&region.view(), region.load_type_layout_metadata()?)
 }
 

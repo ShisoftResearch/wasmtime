@@ -36,6 +36,22 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-17: Persistent GC Maintenance Transaction
+
+- Added a physical copying cleaner for mixed live/dead object-data chunks.
+- The cleaner runs as a GC maintenance transaction: it republishes reachable
+  current records as higher-version `TObjectPub` entries, flips LP on the final
+  copied record, then retires the old mixed chunk through block-generation
+  metadata.
+- `ObjectId` remains stable across the move. Persistent references do not need
+  rewriting because they store `ObjectId`, not physical record addresses.
+- Added crash-ordering coverage: copied records before LP are ignored by
+  recovery, while copied records after LP win by version even if retirement has
+  not happened yet.
+- Remaining GC efficiency work is line-level/Immix-style reuse inside active
+  chunks, broader cleaning heuristics, background scheduling, and explicit
+  `ObjectId` reuse policy.
+
 ## 2026-06-16: First Mark-Sweep Persistent GC
 
 - Added a stop-the-world persistent mark-sweep API over committed `ObjectId`
@@ -52,13 +68,14 @@ persistent GC.
   move records, or reuse `ObjectId`s.
 - Added file-backed coverage for tombstone-less recovery filtering,
   whole-dead object-data chunk retirement, generation-based chunk reuse, and
-  mixed live/dead chunk non-retirement.
+  mixed live/dead chunk non-retirement in the initial non-moving baseline.
 - Added reachability semantics coverage: aborted volatile transaction-local
   reachability does not keep persistent objects live, while committed root
   removal makes a persistent object collectable.
-- Deferred moving collection, mixed-block copying cleanup, Immix/LXR,
+- At this point moving collection, mixed-block copying cleanup, Immix/LXR,
   line-level reuse, object-id reuse, background collection, and durable
-  collection checkpoints.
+  collection checkpoints were still deferred. The 2026-06-17 maintenance
+  transaction entry supersedes the mixed-block copying part.
 
 ## 2026-06-16 Pre-GC Object Model Freeze
 
@@ -1212,13 +1229,14 @@ Implemented status:
 - File-backed end-to-end coverage exercises the tombstone-less recovery path.
 - Stop-the-world runtime mark-sweep, explicit maintenance stepping, and
   finish-and-sweep are implemented for the non-moving baseline.
-- File-backed coverage verifies whole-dead object-data chunk retirement and
-  generation-based reuse, while mixed live/dead chunks remain active.
+- File-backed coverage verifies whole-dead object-data chunk retirement,
+  generation-based reuse, and mixed live/dead chunk evacuation through a GC
+  maintenance transaction.
 
 Still deferred:
 
-- mixed-block copying cleanup, durable compaction checkpoints, and Immix line
-  reuse
+- durable compaction checkpoints for broader cleaning policies and Immix line
+  reuse inside active chunks
 - explicit `ObjectId` reuse
 - commit-time promotion for arbitrary ordinary Wasmtime GC heap graphs beyond
   the transaction-mirrored object graphs implemented in Wave 11

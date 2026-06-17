@@ -1035,12 +1035,13 @@ reachability computation and reaches the same logical object table.
 Durable storage reuse is a block/chunk-cleaning problem, not a per-object
 tombstone problem. Old unreachable object data remains in object-data blocks
 until a cleaner copies live records into new blocks and publishes durable
-block-generation or checkpoint metadata that lets recovery ignore retired
-blocks. The current milestone implements only coarse whole-chunk reuse:
-whole-dead object-data chunks and completed linear-undo chunks can be retired
-and reused after their durable block generations make old log entries stale.
-`ObjectId`s remain non-reused until generation/reuse rules are explicitly
-designed for identity reuse.
+block-generation metadata that lets recovery ignore retired blocks. The current
+implementation has two object-data reuse layers: coarse whole-dead chunk
+retirement, and a GC maintenance transaction that evacuates live current
+records out of selected mixed live/dead chunks before retiring the old chunks.
+Completed linear-undo chunks can also be retired and reused after their durable
+block generations make old log entries stale. `ObjectId`s remain non-reused
+until generation/reuse rules are explicitly designed for identity reuse.
 
 The first block-reuse design is coarse block/chunk reuse with generations, not
 line-level Immix reuse. Line marks remain volatile allocator/collector metadata
@@ -1062,14 +1063,15 @@ Stage 1 reclaims whole-dead blocks only:
 5. When reusing the block, increment its generation, mark it active for
    object-data use, flush/fence the metadata, then allocate new records there.
 
-Stage 2 adds a copying cleaner for mixed blocks:
+Stage 2 adds the implemented GC maintenance transaction for mixed blocks:
 
-1. Select an object-data block whose live-byte ratio is low enough to clean.
-2. Copy each live current record to a new object-data block.
+1. Select an object-data chunk that contains both reachable and unreachable
+   current object records.
+2. Copy each reachable current record to a new object-data chunk.
 3. Publish each copied record as a normal `TObjectPub` entry with a higher
    per-`ObjectId` version.
 4. Commit the copy transaction with LP.
-5. After the copy transaction is durable, retire the old block.
+5. After the copy transaction is durable, retire the old chunk.
 6. Recovery before the retirement sees both old and copied records and chooses
    the higher committed version. Recovery after the retirement ignores old
    entries by block-generation mismatch.
@@ -1105,7 +1107,9 @@ The staged rollout is:
    until the durable free pool catches up.
 6. Add durable clean-abort rollback completion so non-LP undo chunks can be
    reclaimed after abort without weakening crash recovery.
-7. Add the copying cleaner for mixed object-data blocks.
+7. Add the copying cleaner for mixed object-data blocks. This is implemented as
+   a GC maintenance transaction that republishes live records and flips LP
+   before retiring the old chunk.
 8. Add line-level reuse inside active object chunks only after block-level
    generation reuse is proven correct.
 

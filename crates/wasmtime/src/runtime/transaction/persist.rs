@@ -1,6 +1,7 @@
 use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::transaction::PersistentObjectRefRaw;
+use crate::runtime::transaction::PersistentRecoveredRecordLocation;
 use crate::runtime::transaction::type_layout::{
     PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
 };
@@ -279,6 +280,19 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
     fn retire_committed_linear_undo_chunk(&mut self, _chunk_start_block: u32) -> Result<()> {
         Ok(())
     }
+    fn recover_region_snapshot(&self) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
+        Ok(None)
+    }
+    fn object_data_chunk_start_for_block(&self, _data_block: u32) -> Result<Option<u32>> {
+        Ok(None)
+    }
+    fn retire_whole_dead_object_chunks(
+        &mut self,
+        _reachable: &[PersistentRecoveredRecordLocation],
+        _unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
 
     #[cfg(test)]
     fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry>;
@@ -345,6 +359,25 @@ impl TxDurableLog {
                 .retire_committed_linear_undo_chunk(chunk_start_block)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn recover_region_snapshot(
+        &self,
+    ) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
+        self.storage.recover_region_snapshot()
+    }
+
+    pub(crate) fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
+        self.storage.object_data_chunk_start_for_block(data_block)
+    }
+
+    pub(crate) fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        self.storage
+            .retire_whole_dead_object_chunks(reachable, unreachable)
     }
 
     pub(crate) fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
@@ -615,6 +648,25 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         self.region
             .retire_linear_undo_chunks(core::iter::once(chunk_start_block))?;
         Ok(())
+    }
+
+    fn recover_region_snapshot(&self) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
+        Ok(Some(
+            crate::runtime::vm::block_region::recover_file_backed_region_snapshot(&self.region)?,
+        ))
+    }
+
+    fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
+        self.region.object_data_chunk_start_for_block(data_block)
+    }
+
+    fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        self.region
+            .retire_whole_dead_object_chunks(reachable, unreachable)
     }
 
     #[cfg(test)]

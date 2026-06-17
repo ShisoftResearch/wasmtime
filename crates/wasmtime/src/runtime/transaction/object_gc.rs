@@ -48,6 +48,13 @@ pub(crate) struct PersistentMarkSweepReport {
     pub(crate) sweep: PersistentVolatileSweepReport,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistentObjectCompactionReport {
+    pub(crate) copied_objects: Vec<ObjectId>,
+    pub(crate) retired_chunks: Vec<u32>,
+    pub(crate) skipped_chunks: Vec<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct PersistentRecoveredRecordLocation {
     pub(crate) object_id: ObjectId,

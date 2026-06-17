@@ -29,6 +29,7 @@ pub(crate) use object_gc::{
     PersistentRootErrorKind,
 };
 pub(crate) type PersistentObjectMarkReport = object_gc::PersistentObjectMarkReport;
+pub(crate) type PersistentObjectCompactionReport = object_gc::PersistentObjectCompactionReport;
 pub(crate) type PersistentMarkSweepReport = object_gc::PersistentMarkSweepReport;
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
 #[cfg(feature = "gc")]
@@ -2284,6 +2285,124 @@ impl ObjectTable {
             header.type_layout_id,
             payload,
         )
+    }
+
+    fn persistent_gc_copy_publication(
+        &mut self,
+        object_id: ObjectId,
+    ) -> Result<persist::PendingPublication> {
+        let slot = self.live_slot(object_id)?.clone();
+        ensure!(
+            slot.persistent,
+            "persistent GC copy requires a persistent object: {object_id:?}"
+        );
+        let payload = self.heap.payload(slot.current_record)?.clone();
+        self.validate_persistent_payload_refs(&payload)?;
+        let record_version = self.bump_record_version()?;
+        let record = object_heap::encode_object_record(
+            object_id.object_index,
+            record_version,
+            slot.kind as u16,
+            slot.type_layout_id,
+            &payload,
+        )?;
+        let domain = match slot.kind {
+            ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
+            ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
+            other => bail!("object kind {other:?} is not a persistent object granule"),
+        };
+        persist::PendingPublication::persistent_object(
+            domain,
+            object_id.object_index,
+            record_version,
+            slot.type_layout_id,
+            record,
+        )
+    }
+
+    fn install_persistent_gc_copied_publication(
+        &mut self,
+        publication: &persist::PendingPublication,
+    ) -> Result<ObjectId> {
+        let (domain, object_index) =
+            crate::runtime::vm::unpack_object_granule_id(publication.logical_id)
+                .context("persistent GC copy publication logical id is not an object granule")?;
+        ensure!(
+            matches!(
+                domain,
+                crate::runtime::vm::PackedGranuleDomain::TStruct
+                    | crate::runtime::vm::PackedGranuleDomain::TArray
+            ),
+            "persistent GC copy publication domain must be a durable object domain"
+        );
+        let object_id = ObjectId { object_index };
+        let index = object_slot_index(object_id)?;
+        let slot = self.live_slot(object_id)?.clone();
+        ensure!(
+            slot.persistent,
+            "persistent GC copy install requires a persistent object: {object_id:?}"
+        );
+
+        let record = self.heap.install_record_bytes(&publication.payload)?;
+        let header = self.heap.header(record)?;
+        let kind = object_kind_from_u16(header.kind)?;
+        let expected_kind = match domain {
+            crate::runtime::vm::PackedGranuleDomain::TStruct => ObjectKind::Struct,
+            crate::runtime::vm::PackedGranuleDomain::TArray => ObjectKind::Array,
+            _ => unreachable!("domain was checked above"),
+        };
+        ensure!(
+            header.object_id == object_id.object_index,
+            "persistent GC copied record id does not match publication"
+        );
+        ensure!(
+            header.version == publication.version,
+            "persistent GC copied record version does not match publication"
+        );
+        ensure!(
+            kind == expected_kind,
+            "persistent GC copied record kind does not match publication domain"
+        );
+        ensure!(
+            header.type_layout_id == publication.type_layout_id,
+            "persistent GC copied record type layout id does not match publication"
+        );
+        ensure!(
+            slot.kind == kind,
+            "persistent GC copied record kind does not match object slot kind"
+        );
+        self.validate_type_layout_for_object_kind(
+            kind,
+            TypeLayoutId::new(header.type_layout_id)
+                .context("persistent GC copied record type layout id cannot be zero")?,
+        )?;
+        self.next_record_version = self.next_record_version.max(header.version);
+        let version = self.bump_object_version()?;
+        self.slots[index] = Some(ObjectTableSlot {
+            kind,
+            version,
+            type_layout_id: header.type_layout_id,
+            runtime_type_index: slot.runtime_type_index,
+            persistent: true,
+            current_record: record,
+        });
+        Ok(object_id)
+    }
+
+    #[cfg(test)]
+    fn persistent_gc_copy_publication_for_test(
+        &mut self,
+        object_id: ObjectId,
+    ) -> Result<persist::PendingPublication> {
+        self.persistent_gc_copy_publication(object_id)
+    }
+
+    #[cfg(test)]
+    fn install_persistent_gc_copied_publication_for_test(
+        &mut self,
+        publication: &persist::PendingPublication,
+    ) -> Result<ObjectId> {
+        self.install_persistent_gc_copied_publication(publication)
     }
 
     fn validate_persistent_payload_refs(&self, payload: &ObjectPayload) -> Result<()> {
@@ -5231,6 +5350,137 @@ impl TransactionState {
         Ok(Some(PersistentMarkSweepReport { mark, sweep }))
     }
 
+    pub(crate) fn compact_persistent_object_chunks(
+        &mut self,
+        objects: &mut ObjectTable,
+        recovery_report: &PersistentRecoveryGcReport,
+    ) -> Result<PersistentObjectCompactionReport> {
+        ensure!(
+            self.active.is_none()
+                && self.suspended.is_empty()
+                && current_thread_transaction().is_none(),
+            "persistent object compaction cannot run while a transaction is active or suspended"
+        );
+        recovery_report.mark.ensure_sweepable()?;
+
+        #[derive(Default)]
+        struct ChunkCandidate {
+            reachable_objects: BTreeSet<ObjectId>,
+            old_locations: Vec<PersistentRecoveredRecordLocation>,
+            has_unreachable: bool,
+        }
+
+        let recovered = self
+            .durable_log
+            .recover_region_snapshot()?
+            .context("persistent object compaction requires a durable block region backend")?;
+        let winners = recovered.committed_object_winners()?;
+        let mut chunks = BTreeMap::<u32, ChunkCandidate>::new();
+        for winner in &winners {
+            let object_id = ObjectId {
+                object_index: winner.object_id,
+            };
+            let Some(chunk_start) = self
+                .durable_log
+                .object_data_chunk_start_for_block(winner.data_block)?
+            else {
+                continue;
+            };
+            let location = recovered_record_location_from_winner(winner);
+            let chunk = chunks.entry(chunk_start).or_default();
+            if recovery_report.mark.reachable.contains(&object_id) {
+                chunk.reachable_objects.insert(object_id);
+                chunk.old_locations.push(location);
+            } else if recovery_report
+                .mark
+                .unreachable_persistent
+                .contains(&object_id)
+            {
+                chunk.has_unreachable = true;
+                chunk.old_locations.push(location);
+            }
+        }
+
+        let mut selected_chunks = Vec::new();
+        let mut copied_objects = BTreeSet::new();
+        let mut old_locations = Vec::new();
+        let mut skipped_chunks = Vec::new();
+        for (chunk_start, chunk) in chunks {
+            if chunk.reachable_objects.is_empty() || !chunk.has_unreachable {
+                skipped_chunks.push(chunk_start);
+                continue;
+            }
+            selected_chunks.push(chunk_start);
+            copied_objects.extend(chunk.reachable_objects);
+            old_locations.extend(chunk.old_locations);
+        }
+
+        if copied_objects.is_empty() {
+            return Ok(PersistentObjectCompactionReport {
+                skipped_chunks,
+                ..PersistentObjectCompactionReport::default()
+            });
+        }
+
+        let mut publications = Vec::new();
+        for object_id in &copied_objects {
+            publications.push(objects.persistent_gc_copy_publication(*object_id)?);
+        }
+
+        let stream_id =
+            u32::try_from(self.next_id).context("GC maintenance transaction id overflow")?;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .context("transaction id overflow")?;
+        let marker = self
+            .publish_object_publications_before_commit(
+                stream_id,
+                stream_id,
+                objects,
+                &publications,
+            )?
+            .context("GC maintenance transaction did not publish copied object records")?;
+        self.publish_commit_lp(stream_id, stream_id, marker)?;
+        for publication in &publications {
+            objects.install_persistent_gc_copied_publication(publication)?;
+        }
+
+        let recovered_after = self
+            .durable_log
+            .recover_region_snapshot()?
+            .context("persistent object compaction requires a durable block region backend")?;
+        let winners_after = recovered_after.committed_object_winners()?;
+        let reachable_after = winners_after
+            .iter()
+            .filter_map(|winner| {
+                let object_id = ObjectId {
+                    object_index: winner.object_id,
+                };
+                recovery_report
+                    .mark
+                    .reachable
+                    .contains(&object_id)
+                    .then(|| recovered_record_location_from_winner(winner))
+            })
+            .collect::<Vec<_>>();
+        let retired_chunks = self
+            .durable_log
+            .retire_whole_dead_object_chunks(&reachable_after, &old_locations)?;
+        let retired_set = retired_chunks.iter().copied().collect::<BTreeSet<_>>();
+        skipped_chunks.extend(
+            selected_chunks
+                .into_iter()
+                .filter(|chunk| !retired_set.contains(chunk)),
+        );
+
+        Ok(PersistentObjectCompactionReport {
+            copied_objects: copied_objects.into_iter().collect(),
+            retired_chunks,
+            skipped_chunks,
+        })
+    }
+
     pub(crate) fn install_recovered_persistent_roots<I>(&mut self, roots: I) -> Result<()>
     where
         I: IntoIterator<Item = ObjectId>,
@@ -5877,6 +6127,14 @@ impl TransactionState {
         objects: &mut ObjectTable,
     ) -> Result<Option<PersistentMarkSweepReport>> {
         self.finish_persistent_gc_cycle_and_sweep(objects)
+    }
+
+    fn compact_persistent_object_chunks_for_test(
+        &mut self,
+        objects: &mut ObjectTable,
+        recovery_report: &PersistentRecoveryGcReport,
+    ) -> Result<PersistentObjectCompactionReport> {
+        self.compact_persistent_object_chunks(objects, recovery_report)
     }
 
     fn promote_transaction_object_graph_for_test(
@@ -11646,6 +11904,252 @@ mod tests {
         }
 
         #[test]
+        fn file_backed_persistent_gc_evacuates_mixed_chunk_and_retires_old_chunk() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("persistent-gc-evacuate-mixed.bin");
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(0x900),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let live = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x9000,
+                    900,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+            let dead = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x9001,
+                    900,
+                    2,
+                    vec![ObjectValue::I32(2)],
+                )
+                .unwrap();
+
+            state.acquire_object_write(&mut objects, live).unwrap();
+            state
+                .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+                .unwrap();
+            state.acquire_object_write(&mut objects, dead).unwrap();
+            state
+                .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x9000))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(0x900, 0x900, &mut objects, &mut state)
+                .unwrap();
+
+            let (before_recovered, before_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let live_before = recovered_object_winner_by_id_for_test(&before_winners, live).clone();
+            let dead_before = recovered_object_winner_by_id_for_test(&before_winners, dead).clone();
+            let (old_chunk, old_generation) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, &live_before).unwrap();
+            assert_eq!(
+                old_chunk,
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, &dead_before)
+                    .unwrap()
+                    .0
+            );
+
+            let mut rebuilt = ObjectTable::default();
+            let report = rebuilt
+                .rebuild_reachable_from_recovery_for_test(
+                    &before_recovered.type_layouts,
+                    &before_winners,
+                    &before_recovered.root_object_ids,
+                )
+                .unwrap();
+            assert_eq!(report.mark.reachable, object_set([live]));
+            assert_eq!(report.mark.unreachable_persistent, object_set([dead]));
+
+            let compact = state
+                .compact_persistent_object_chunks_for_test(&mut objects, &report)
+                .unwrap();
+            assert_eq!(compact.copied_objects, vec![live]);
+            assert_eq!(compact.retired_chunks, vec![old_chunk]);
+
+            let (_, after_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let live_after = recovered_object_winner_by_id_for_test(&after_winners, live);
+            assert!(
+                after_winners
+                    .iter()
+                    .all(|winner| winner.object_id != dead.object_index)
+            );
+            assert!(live_after.version > live_before.version);
+            let (new_chunk, new_generation) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, live_after).unwrap();
+            assert_ne!(new_chunk, old_chunk);
+            assert_eq!(new_generation, old_generation);
+
+            let object_c = ObjectId { object_index: 901 };
+            crate::runtime::vm::block_region::publish_committed_struct_object(
+                &tx_log_path,
+                901,
+                object_c.object_index,
+                1,
+                12,
+                &[3, 4],
+            )
+            .unwrap();
+            let (_, reused_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let object_c_winner = recovered_object_winner_by_id_for_test(&reused_winners, object_c);
+            let (reused_chunk, reused_generation) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, object_c_winner).unwrap();
+            assert_eq!(reused_chunk, old_chunk);
+            assert_eq!(reused_generation, old_generation + 1);
+        }
+
+        #[test]
+        fn persistent_gc_compaction_crash_before_lp_keeps_old_winner() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("persistent-gc-crash-before-lp.bin");
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(0x920),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let live = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x9200,
+                    920,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+            let dead = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x9201,
+                    920,
+                    2,
+                    vec![ObjectValue::I32(2)],
+                )
+                .unwrap();
+
+            state.acquire_object_write(&mut objects, live).unwrap();
+            state
+                .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+                .unwrap();
+            state.acquire_object_write(&mut objects, dead).unwrap();
+            state
+                .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x9200))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(0x920, 0x920, &mut objects, &mut state)
+                .unwrap();
+
+            let (_, before_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let live_before = recovered_object_winner_by_id_for_test(&before_winners, live).clone();
+            let (old_chunk, _) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, &live_before).unwrap();
+
+            let publication = objects
+                .persistent_gc_copy_publication_for_test(live)
+                .unwrap();
+            let marker = state
+                .publish_object_publications_before_commit(0x921, 0x921, &objects, &[publication])
+                .unwrap()
+                .unwrap();
+            let _ = marker;
+            drop(state);
+
+            let (_, after_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let live_after = recovered_object_winner_by_id_for_test(&after_winners, live);
+            let (after_chunk, _) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, live_after).unwrap();
+            assert_eq!(live_after.version, live_before.version);
+            assert_eq!(after_chunk, old_chunk);
+        }
+
+        #[test]
+        fn persistent_gc_compaction_crash_after_lp_before_retirement_uses_copy() {
+            let dir = tempfile::tempdir().unwrap();
+            let tx_log_path = dir.path().join("persistent-gc-crash-after-lp.bin");
+            let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64).unwrap();
+            let mut state = TransactionState::new_for_test_with_durable_log(
+                TransactionId::from_raw(0x930),
+                durable_log,
+            );
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut objects = ObjectTable::default();
+            let live = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x9300,
+                    930,
+                    1,
+                    vec![ObjectValue::I32(1)],
+                )
+                .unwrap();
+            let dead = objects
+                .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                    0x9301,
+                    930,
+                    2,
+                    vec![ObjectValue::I32(2)],
+                )
+                .unwrap();
+
+            state.acquire_object_write(&mut objects, live).unwrap();
+            state
+                .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+                .unwrap();
+            state.acquire_object_write(&mut objects, dead).unwrap();
+            state
+                .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+                .unwrap();
+            state
+                .stage_global(0, GlobalSnapshot::GcRef(0x9300))
+                .unwrap();
+            commit_active_file_backed_publications_for_test(0x930, 0x930, &mut objects, &mut state)
+                .unwrap();
+
+            let (_, before_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let live_before = recovered_object_winner_by_id_for_test(&before_winners, live).clone();
+            let (old_chunk, old_generation) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, &live_before).unwrap();
+
+            let publication = objects
+                .persistent_gc_copy_publication_for_test(live)
+                .unwrap();
+            let marker = state
+                .publish_object_publications_before_commit(0x931, 0x931, &objects, &[publication])
+                .unwrap()
+                .unwrap();
+            state.publish_commit_lp(0x931, 0x931, marker).unwrap();
+            drop(state);
+
+            let (_, after_winners) =
+                recover_file_backed_recovery_inputs_for_test(&tx_log_path).unwrap();
+            let live_after = recovered_object_winner_by_id_for_test(&after_winners, live);
+            let (new_chunk, _) =
+                file_backed_recovered_chunk_meta_for_test(&tx_log_path, live_after).unwrap();
+            let region =
+                crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(
+                    &tx_log_path,
+                )
+                .unwrap();
+
+            assert!(live_after.version > live_before.version);
+            assert_ne!(new_chunk, old_chunk);
+            assert_eq!(region.block_generation(old_chunk).unwrap(), old_generation);
+        }
+
+        #[test]
         fn pre_gc_object_recovery_closure_file_backed_root_replacement_and_table_roots() {
             let dir = tempfile::tempdir().unwrap();
             let tx_log_path = dir.path().join("pre-gc-root-closure.bin");
@@ -15000,6 +15504,50 @@ mod tests {
         assert_eq!(object, ObjectId { object_index: 0 });
         assert_ne!(first_handle, second_handle);
         assert!(second_version > first_version);
+    }
+
+    #[test]
+    fn persistent_gc_copy_refreshes_record_version_without_changing_object_id() {
+        let mut objects = ObjectTable::default();
+        let object = objects
+            .allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+                0x9100,
+                910,
+                1,
+                vec![ObjectValue::I32(7)],
+            )
+            .unwrap();
+        let before = objects.pending_publication_for_test(object).unwrap();
+        let copied = objects
+            .persistent_gc_copy_publication_for_test(object)
+            .unwrap();
+
+        assert_eq!(before.logical_id, copied.logical_id);
+        assert!(copied.version > before.version);
+        assert_eq!(
+            objects
+                .pending_publication_for_test(object)
+                .unwrap()
+                .version,
+            before.version
+        );
+        assert_eq!(
+            objects
+                .install_persistent_gc_copied_publication_for_test(&copied)
+                .unwrap(),
+            object
+        );
+        assert_eq!(
+            objects
+                .pending_publication_for_test(object)
+                .unwrap()
+                .version,
+            copied.version
+        );
+        assert_eq!(
+            objects.payload(object).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(7)])
+        );
     }
 
     #[test]

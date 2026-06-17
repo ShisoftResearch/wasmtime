@@ -1110,18 +1110,18 @@ Implemented status:
   without persisting dead-object state.
 - File-backed end-to-end coverage exercises tombstone-less recovery and the
   reachable-only rebuild path.
-- File-backed coverage now verifies whole-dead object-data chunk retirement and
-  generation-based reuse, and verifies mixed live/dead chunks are not retired.
+- File-backed coverage now verifies whole-dead object-data chunk retirement,
+  generation-based reuse, mixed live/dead chunk evacuation through a GC
+  maintenance transaction, and crash ordering before LP and after LP before
+  retirement.
 - Commit-time reachability coverage verifies that aborted volatile reachability
   does not keep persistent objects live and that committed root removal makes a
   persistent object collectable.
 
 Deferred scope:
 
-- mixed-block copying cleanup and Immix line reuse
-- compacting/copying live records into new persistent blocks
-- block-generation or checkpoint metadata that allows recovery to ignore
-  retired mixed blocks after copying cleanup
+- Immix line reuse inside active object-data chunks
+- broader compaction heuristics based on measured live-byte ratios
 - persistent allocator undo/redo repair for future block ownership transitions
 - explicit `ObjectId` reuse
 - commit-time promotion from volatile `VMGcRef` graphs into persistent object
