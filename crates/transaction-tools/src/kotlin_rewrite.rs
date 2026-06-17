@@ -4,11 +4,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
 use wasm_encoder::{
-    CodeSection, Encode, Function, Instruction, Module, RawSection, ValType as EncoderValType,
+    CodeSection, ConstExpr, Encode, Function, GlobalType as EncoderGlobalType,
+    HeapType as EncoderHeapType, Instruction, Module, RawSection, RefType as EncoderRefType,
+    TransactionRefPermission as EncoderTransactionRefPermission, ValType as EncoderValType,
 };
 use wasmparser::{
-    AbstractHeapType, BinaryReader, CodeSectionReader, CompositeInnerType, ExternalKind, HeapType,
-    KnownCustom, Name, Operator, Parser, Payload, StorageType, TypeRef, ValType as ParserValType,
+    AbstractHeapType, BinaryReader, BlockType, CodeSectionReader, CompositeInnerType, ExternalKind,
+    HeapType, KnownCustom, Name, Operator, Parser, Payload, StorageType, TypeRef,
+    ValType as ParserValType,
 };
 
 use crate::kotlin_metadata::{
@@ -67,6 +70,18 @@ struct TransactionObjects {
     tables: BTreeSet<u32>,
 }
 
+#[derive(Clone)]
+struct RootGlobal {
+    name: String,
+    type_index: u32,
+    global_index: u32,
+}
+
+struct RootLowering {
+    globals: Vec<RootGlobal>,
+    unit_getter_func: Option<u32>,
+}
+
 impl TransactionObjects {
     fn is_empty(&self) -> bool {
         self.memories.is_empty()
@@ -74,6 +89,82 @@ impl TransactionObjects {
             && self.functions.is_empty()
             && self.tables.is_empty()
     }
+}
+
+fn root_lowering(
+    input: &[u8],
+    sidecar: &KotlinSidecar,
+    gc_type_info: &GcTypeInfo,
+) -> Result<RootLowering> {
+    let imported_globals = imported_global_count(input)?;
+    let defined_globals = defined_global_count(input)?;
+    let first_root_global = imported_globals
+        .checked_add(defined_globals)
+        .context("Kotlin root global index overflow")?;
+    let mut globals = Vec::new();
+
+    for (ordinal, root) in sidecar.roots.iter().enumerate() {
+        let type_index = *gc_type_info
+            .sidecar_type_indices
+            .get(&root.r#type)
+            .with_context(|| {
+                format!(
+                    "Kotlin root {} has unmapped type {}",
+                    root.name, root.r#type
+                )
+            })?;
+        let ordinal = u32::try_from(ordinal).context("Kotlin root ordinal overflow")?;
+        let global_index = first_root_global
+            .checked_add(ordinal)
+            .context("Kotlin root global index overflow")?;
+        globals.push(RootGlobal {
+            name: root.name.clone(),
+            type_index,
+            global_index,
+        });
+    }
+
+    // SHISOFT-TWASM-MOCK: current inline setRoot lowering reconstructs Kotlin
+    // Unit through this exact frontend helper name. Replace this with an
+    // explicit SDK intrinsic once the Kotlin transaction frontend is stable.
+    let unit_getter_func = function_index_by_exact_name(input, "kotlin.Unit_getInstance")?;
+
+    Ok(RootLowering {
+        globals,
+        unit_getter_func,
+    })
+}
+
+fn append_root_globals(globals: &mut wasm_encoder::GlobalSection, root_lowering: &RootLowering) {
+    for root in &root_lowering.globals {
+        globals.global(
+            EncoderGlobalType {
+                val_type: EncoderValType::Ref(EncoderRefType {
+                    nullable: true,
+                    heap_type: EncoderHeapType::Concrete(root.type_index),
+                    transaction_permission: EncoderTransactionRefPermission::None,
+                }),
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::ref_null(EncoderHeapType::Concrete(root.type_index)),
+        );
+    }
+}
+
+fn emit_root_global_section_if_needed(
+    module: &mut Module,
+    root_lowering: &RootLowering,
+    emitted_global_section: &mut bool,
+) {
+    if *emitted_global_section || root_lowering.globals.is_empty() {
+        return;
+    }
+
+    let mut globals = wasm_encoder::GlobalSection::new();
+    append_root_globals(&mut globals, root_lowering);
+    module.section(&globals);
+    *emitted_global_section = true;
 }
 
 pub fn rewrite_kotlin_module(
@@ -90,9 +181,24 @@ pub fn rewrite_kotlin_module(
         .functions
         .extend(transaction_function_indices.iter().copied());
     let gc_type_info = gc_type_info(input, sidecar)?;
+    let root_lowering = root_lowering(input, sidecar, &gc_type_info)?;
+    transaction_objects
+        .globals
+        .extend(root_lowering.globals.iter().map(|root| root.global_index));
     let imported_function_count = imported_function_count(input)?;
     let func_type_params = function_type_params(input)?;
     let defined_function_types = defined_function_type_indices(input)?;
+    let root_marker_function_indices = root_marker_function_indices(
+        input,
+        &root_lowering,
+        imported_function_count,
+        &func_type_params,
+        &defined_function_types,
+    )?;
+    transaction_objects
+        .functions
+        .extend(root_marker_function_indices.iter().copied());
+    object_rewrite_function_indices.extend(root_marker_function_indices.iter().copied());
 
     let mut report = KotlinRewriteReport {
         transaction_functions: sidecar.transaction_functions.clone(),
@@ -105,6 +211,7 @@ pub fn rewrite_kotlin_module(
     let mut reencoder = RoundtripReencoder;
     let mut module = Module::new();
     let mut next_defined_func = 0u32;
+    let mut emitted_global_section = false;
 
     for payload in Parser::new(0).parse_all(input) {
         let payload = payload.context("failed to parse Kotlin rewrite wasm payload")?;
@@ -147,34 +254,66 @@ pub fn rewrite_kotlin_module(
             Payload::GlobalSection(section) => {
                 let mut globals = wasm_encoder::GlobalSection::new();
                 reencoder.parse_global_section(&mut globals, section)?;
+                append_root_globals(&mut globals, &root_lowering);
                 module.section(&globals);
+                emitted_global_section = true;
             }
             Payload::ExportSection(section) => {
+                emit_root_global_section_if_needed(
+                    &mut module,
+                    &root_lowering,
+                    &mut emitted_global_section,
+                );
                 let mut exports = wasm_encoder::ExportSection::new();
                 reencoder.parse_export_section(&mut exports, section)?;
                 module.section(&exports);
             }
             Payload::StartSection { func, .. } => {
+                emit_root_global_section_if_needed(
+                    &mut module,
+                    &root_lowering,
+                    &mut emitted_global_section,
+                );
                 module.section(&wasm_encoder::StartSection {
                     function_index: reencoder.start_section(func)?,
                 });
             }
             Payload::ElementSection(section) => {
+                emit_root_global_section_if_needed(
+                    &mut module,
+                    &root_lowering,
+                    &mut emitted_global_section,
+                );
                 let mut elements = wasm_encoder::ElementSection::new();
                 reencoder.parse_element_section(&mut elements, section)?;
                 module.section(&elements);
             }
             Payload::DataCountSection { count, .. } => {
+                emit_root_global_section_if_needed(
+                    &mut module,
+                    &root_lowering,
+                    &mut emitted_global_section,
+                );
                 module.section(&wasm_encoder::DataCountSection {
                     count: reencoder.data_count(count)?,
                 });
             }
             Payload::DataSection(section) => {
+                emit_root_global_section_if_needed(
+                    &mut module,
+                    &root_lowering,
+                    &mut emitted_global_section,
+                );
                 let mut data = wasm_encoder::DataSection::new();
                 reencoder.parse_data_section(&mut data, section)?;
                 module.section(&data);
             }
             Payload::CodeSectionStart { range, .. } => {
+                emit_root_global_section_if_needed(
+                    &mut module,
+                    &root_lowering,
+                    &mut emitted_global_section,
+                );
                 let body_bytes = input
                     .get(range.start..range.end)
                     .context("invalid Kotlin rewrite code section range")?;
@@ -196,6 +335,7 @@ pub fn rewrite_kotlin_module(
                         &body,
                         object_rewrite_function_indices.contains(&function_index),
                         &gc_type_info,
+                        &root_lowering,
                         &params,
                         &mut report,
                     )?;
@@ -238,6 +378,7 @@ fn rewrite_function_body(
     body: &wasmparser::FunctionBody<'_>,
     rewrite_object_ops: bool,
     gc_type_info: &GcTypeInfo,
+    root_lowering: &RootLowering,
     params: &[ParserValType],
     report: &mut KotlinRewriteReport,
 ) -> Result<Function> {
@@ -249,9 +390,42 @@ fn rewrite_function_body(
     let mut function = Function::new(local_decls);
     let mut type_stack = Vec::new();
     let mut reader = body.get_operators_reader()?;
+    let mut operators = Vec::new();
 
     while !reader.eof() {
-        let op = reader.read()?;
+        operators.push(reader.read()?);
+    }
+
+    let mut index = 0usize;
+    while index < operators.len() {
+        if let Some(marker) = match_inline_set_root_marker(&operators, index, &local_types)? {
+            if let Some(root) = root_for_marker_type(root_lowering, marker.type_index)? {
+                let unit_getter = root_lowering
+                    .unit_getter_func
+                    .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
+                function.instruction(&Instruction::LocalGet(marker.value_local));
+                function.instruction(&Instruction::TGlobalSet {
+                    global_index: root.global_index,
+                });
+                function.instruction(&Instruction::Call(unit_getter));
+                type_stack.push(None);
+                index = marker.next_index;
+                continue;
+            }
+        }
+
+        if let Some(marker) = match_inline_get_root_marker(&operators, index)?
+            && let Some(root) = root_for_marker_type(root_lowering, marker.type_index)?
+        {
+            function.instruction(&Instruction::TGlobalGet {
+                global_index: root.global_index,
+            });
+            type_stack.push(Some(root.type_index));
+            index = marker.next_index;
+            continue;
+        }
+
+        let op = operators[index].clone();
         let is_array_len = matches!(op, Operator::ArrayLen);
         let array_len_operand = if is_array_len {
             type_stack.pop().flatten()
@@ -388,6 +562,7 @@ fn rewrite_function_body(
                 }
             }
         }
+        index += 1;
     }
 
     Ok(function)
@@ -496,6 +671,154 @@ fn emit_array_read_prefix(function: &mut Function, temp_locals: &TempLocals) -> 
     Ok(())
 }
 
+struct SetRootMarker {
+    next_index: usize,
+    type_index: u32,
+    value_local: u32,
+}
+
+struct GetRootMarker {
+    next_index: usize,
+    type_index: u32,
+}
+
+// SHISOFT-TWASM-MOCK: this recognizes the current Kotlin SDK inline
+// root/setRoot throw-marker shape. Replace it with explicit SDK imports or
+// compiler-emitted intrinsics once the Kotlin frontend contract is stabilized.
+fn match_inline_set_root_marker(
+    operators: &[Operator<'_>],
+    index: usize,
+    local_types: &[ParserValType],
+) -> Result<Option<SetRootMarker>> {
+    if !matches!(
+        operators.get(index),
+        Some(Operator::Block {
+            blockty: BlockType::Type(_)
+        })
+    ) {
+        return Ok(None);
+    }
+    let Some(end) = matching_block_end(operators, index) else {
+        return Ok(None);
+    };
+    let body = &operators[index + 1..end];
+    if !body_contains_i32_const(body, 658) || !body_ends_with_throw_unreachable(body) {
+        return Ok(None);
+    }
+
+    let marker = body.windows(3).find_map(|window| match window {
+        [
+            Operator::LocalGet {
+                local_index: source,
+            },
+            Operator::LocalSet {
+                local_index: target,
+            },
+            Operator::I32Const { value: 658 },
+        ] => {
+            let source_type = local_type_index(local_types, *source)?;
+            (local_type_index(local_types, *target) == Some(source_type)).then_some(SetRootMarker {
+                next_index: end + 1,
+                type_index: source_type,
+                value_local: *source,
+            })
+        }
+        _ => None,
+    });
+
+    Ok(marker)
+}
+
+fn match_inline_get_root_marker(
+    operators: &[Operator<'_>],
+    index: usize,
+) -> Result<Option<GetRootMarker>> {
+    let type_index = match operators.get(index) {
+        Some(Operator::Block {
+            blockty: BlockType::Type(ty),
+        }) => module_ref_type_index(*ty),
+        _ => None,
+    };
+    let Some(type_index) = type_index else {
+        return Ok(None);
+    };
+    let Some(end) = matching_block_end(operators, index) else {
+        return Ok(None);
+    };
+    let body = &operators[index + 1..end];
+    if body_contains_i32_const(body, 659) && body_ends_with_throw_unreachable(body) {
+        Ok(Some(GetRootMarker {
+            next_index: end + 1,
+            type_index,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn root_for_marker_type<'a>(
+    root_lowering: &'a RootLowering,
+    type_index: u32,
+) -> Result<Option<&'a RootGlobal>> {
+    // SHISOFT-TWASM-MOCK: inline Kotlin root markers currently expose the root
+    // result/value type but not a stable decoded root-name operand. Distinct
+    // root types can be resolved; same-type roots fail loudly below.
+    let matches = root_lowering
+        .globals
+        .iter()
+        .filter(|root| root.type_index == type_index)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [root] => Ok(Some(*root)),
+        _ => {
+            let names = matches
+                .iter()
+                .map(|root| root.name.as_str())
+                .collect::<Vec<_>>();
+            bail!(
+                "ambiguous Kotlin root marker for type index {type_index}: roots {names:?}; use distinct root types or add explicit root marker imports"
+            )
+        }
+    }
+}
+
+fn body_contains_i32_const(operators: &[Operator<'_>], value: i32) -> bool {
+    operators
+        .iter()
+        .any(|op| matches!(op, Operator::I32Const { value: candidate } if *candidate == value))
+}
+
+fn body_ends_with_throw_unreachable(operators: &[Operator<'_>]) -> bool {
+    operators.windows(3).any(|window| {
+        matches!(
+            window,
+            [Operator::Throw { .. }, Operator::End, Operator::Unreachable]
+        )
+    })
+}
+
+fn matching_block_end(operators: &[Operator<'_>], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, op) in operators.iter().enumerate().skip(start + 1) {
+        match op {
+            Operator::Block { .. }
+            | Operator::Loop { .. }
+            | Operator::If { .. }
+            | Operator::TryTable { .. }
+            | Operator::Try { .. } => depth += 1,
+            Operator::End => {
+                if depth == 0 {
+                    return Some(offset);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn update_type_stack_for_operator(
     op: &Operator<'_>,
     local_types: &[ParserValType],
@@ -564,6 +887,13 @@ fn module_ref_type_index(ty: ParserValType) -> Option<u32> {
         ParserValType::Ref(ref_type) => ref_type.type_index()?.unpack().as_module_index(),
         _ => None,
     }
+}
+
+fn local_type_index(local_types: &[ParserValType], local_index: u32) -> Option<u32> {
+    local_types
+        .get(local_index as usize)
+        .copied()
+        .and_then(module_ref_type_index)
 }
 
 fn heap_type_index(heap_type: wasmparser::HeapType) -> Option<u32> {
@@ -751,6 +1081,134 @@ fn imported_function_count(input: &[u8]) -> Result<u32> {
     }
 
     Ok(count)
+}
+
+fn imported_global_count(input: &[u8]) -> Result<u32> {
+    let mut count = 0u32;
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite import payload")? {
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import.context("failed to parse Kotlin rewrite import")?;
+                    if matches!(import.ty, TypeRef::Global(_)) {
+                        count += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(count)
+}
+
+fn defined_global_count(input: &[u8]) -> Result<u32> {
+    let mut count = 0u32;
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite global payload")? {
+            Payload::GlobalSection(section) => {
+                count = count
+                    .checked_add(section.count())
+                    .context("Kotlin rewrite global count overflow")?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(count)
+}
+
+fn function_index_by_exact_name(input: &[u8], expected: &str) -> Result<Option<u32>> {
+    let mut function_entries = exported_function_names(input)?
+        .into_iter()
+        .map(|(name, index)| (name, index))
+        .collect::<Vec<_>>();
+    function_entries.extend(name_section_function_names(input)?);
+
+    let matches = function_entries
+        .iter()
+        .filter_map(|(name, index)| (name == expected).then_some(*index))
+        .collect::<BTreeSet<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(*matches.iter().next().unwrap())),
+        _ => bail!("ambiguous Kotlin rewrite function name {expected}: {matches:?}"),
+    }
+}
+
+fn root_marker_function_indices(
+    input: &[u8],
+    root_lowering: &RootLowering,
+    imported_function_count: u32,
+    func_type_params: &BTreeMap<u32, Vec<ParserValType>>,
+    defined_function_types: &[u32],
+) -> Result<BTreeSet<u32>> {
+    let mut indices = BTreeSet::new();
+    if root_lowering.globals.is_empty() {
+        return Ok(indices);
+    }
+    let mut next_defined_func = 0u32;
+
+    for payload in Parser::new(0).parse_all(input) {
+        match payload.context("failed to parse Kotlin rewrite root marker payload")? {
+            Payload::CodeSectionStart { range, .. } => {
+                let body_bytes = input
+                    .get(range.start..range.end)
+                    .context("invalid Kotlin rewrite code section range")?;
+                let reader = BinaryReader::new(body_bytes, range.start);
+                let section = CodeSectionReader::new(reader)?;
+
+                for body in section {
+                    let body = body?;
+                    let function_index = imported_function_count + next_defined_func;
+                    let type_index = *defined_function_types
+                        .get(next_defined_func as usize)
+                        .context("missing Kotlin rewrite function type index")?;
+                    let params = func_type_params
+                        .get(&type_index)
+                        .cloned()
+                        .context("missing Kotlin rewrite function type parameters")?;
+                    if function_contains_inline_root_marker(&body, &params, root_lowering)? {
+                        indices.insert(function_index);
+                    }
+                    next_defined_func += 1;
+                }
+            }
+            Payload::CodeSectionEntry(_) => {}
+            _ => {}
+        }
+    }
+
+    Ok(indices)
+}
+
+fn function_contains_inline_root_marker(
+    body: &wasmparser::FunctionBody<'_>,
+    params: &[ParserValType],
+    root_lowering: &RootLowering,
+) -> Result<bool> {
+    let local_types = local_types(body, params)?;
+    let mut reader = body.get_operators_reader()?;
+    let mut operators = Vec::new();
+    while !reader.eof() {
+        operators.push(reader.read()?);
+    }
+
+    for index in 0..operators.len() {
+        if let Some(marker) = match_inline_set_root_marker(&operators, index, &local_types)? {
+            if root_for_marker_type(root_lowering, marker.type_index)?.is_some() {
+                return Ok(true);
+            }
+        }
+        if let Some(marker) = match_inline_get_root_marker(&operators, index)?
+            && root_for_marker_type(root_lowering, marker.type_index)?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn function_type_params(input: &[u8]) -> Result<BTreeMap<u32, Vec<ParserValType>>> {

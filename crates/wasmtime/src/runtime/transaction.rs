@@ -16691,6 +16691,46 @@ mod tests {
         }
 
         #[test]
+        fn live_transaction_ref_promotion_returns_tref_lockable_object() {
+            clear_current_thread_transaction_for_test();
+            let mut objects = ObjectTable::default();
+            let mut adapter = FakeOrdinaryGcPromotionAdapter::default().with_source(
+                0x902,
+                OrdinaryGcPromotionSource::Struct {
+                    type_layout_id: type_layout::TypeLayoutId::DEFAULT_STRUCT,
+                    fields: vec![OrdinaryGcPromotionValue::I64(901)],
+                },
+            );
+            let mut state = TransactionState::new_for_test(TransactionId::from_raw(901));
+
+            let promoted = state
+                .promote_gc_ref_for_live_transaction_ref_with_adapter(
+                    &mut objects,
+                    0x902,
+                    &mut adapter,
+                )
+                .unwrap()
+                .unwrap();
+            let handle = objects
+                .transaction_ref_handle_for_object_id(promoted)
+                .unwrap();
+
+            assert_eq!(state.promoted_gc_ref_for_test(0x902), Some(promoted));
+            assert!(objects.is_persistent(promoted).unwrap());
+            assert_eq!(
+                state.staged_object_payload_for_test(promoted).unwrap(),
+                &ObjectPayload::Struct(vec![ObjectValue::I64(901)])
+            );
+            assert!(
+                state
+                    .acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)
+                    .unwrap()
+            );
+            assert!(state.owns_object_read(promoted));
+            assert!(!state.owns_object_write(promoted));
+        }
+
+        #[test]
         fn adapter_promotion_rewrites_nested_refs_and_inline_i31_leaves() {
             clear_current_thread_transaction_for_test();
             let mut objects = ObjectTable::default();

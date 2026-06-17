@@ -147,6 +147,122 @@ fn rewrite_report_records_transaction_function_name_section_matches() {
 }
 
 #[test]
+fn rewrite_lowers_inline_root_markers_for_distinct_root_types() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (type $Vault (struct))
+              (tag $error)
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $installBank (param $bank (ref null $Bank)) (result (ref null $Unit))
+                block (result (ref null $Unit))
+                  local.get $bank
+                  local.set $bank
+                  i32.const 658
+                  drop
+                  block
+                    throw $error
+                  end
+                  unreachable
+                end)
+              (func $readVault (result (ref null $Vault))
+                block (result (ref null $Vault))
+                  i32.const 659
+                  drop
+                  block
+                    throw $error
+                  end
+                  unreachable
+                end))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![
+            struct_type_with_fields("Bank", vec![]),
+            struct_type_with_fields("Vault", vec![]),
+        ],
+        &[],
+        vec![
+            KotlinRoot {
+                name: "bank".into(),
+                r#type: "Bank".into(),
+                nullable: true,
+            },
+            KotlinRoot {
+                name: "vault".into(),
+                r#type: "Vault".into(),
+                nullable: true,
+            },
+        ],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_eq!(
+        transaction_objects(&output),
+        TransactionObjects {
+            memories: vec![],
+            globals: vec![0, 1],
+            functions: vec![1, 2],
+            tables: vec![],
+        }
+    );
+    assert!(printed.contains("tglobal.set 0"), "{printed}");
+    assert!(printed.contains("tglobal.get 1"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_ambiguous_inline_root_marker_type() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (tag $error)
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $readBank (result (ref null $Bank))
+                block (result (ref null $Bank))
+                  i32.const 659
+                  drop
+                  block
+                    throw $error
+                  end
+                  unreachable
+                end))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &[],
+        vec![
+            KotlinRoot {
+                name: "primary".into(),
+                r#type: "Bank".into(),
+                nullable: true,
+            },
+            KotlinRoot {
+                name: "secondary".into(),
+                r#type: "Bank".into(),
+                nullable: true,
+            },
+        ],
+    );
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("ambiguous Kotlin root marker"), "{err}");
+}
+
+#[test]
 fn rewrite_merges_existing_transaction_object_metadata() {
     let input = wat::parse_str(
         r#"

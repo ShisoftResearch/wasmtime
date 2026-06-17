@@ -401,6 +401,22 @@ impl TransactionState {
         })
     }
 
+    pub(crate) fn promote_gc_ref_for_live_transaction_ref_with_adapter<
+        A: OrdinaryGcPromotionAdapter,
+    >(
+        &mut self,
+        object_table: &mut ObjectTable,
+        gc_ref: u32,
+        adapter: &mut A,
+    ) -> Result<Option<ObjectId>> {
+        self.ensure_active()?;
+        self.persistent_object_id_for_live_bridge_after_promotion_with_adapter(
+            object_table,
+            gc_ref,
+            adapter,
+        )
+    }
+
     // This validates the result of the live-VMGcRef-to-persistent-ObjectId
     // bridge after promotion has completed. It must return only an already
     // persistent or already promoted ObjectId; persistent records after this

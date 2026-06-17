@@ -7,10 +7,11 @@ use std::sync::{Mutex, OnceLock};
 
 use wasmparser::{BinaryReader, KnownCustom, Name, Operator, Parser, Payload};
 use wasmtime::_internal::transaction_persistence::{
-    create_file_backed_storage_for_test, reopen_and_recover_file_backed_region,
+    create_file_backed_storage_for_test, enable_live_wast_reference_fallbacks_for_test,
+    reopen_and_recover_file_backed_region,
 };
 use wasmtime::anyhow::{Context, Result, bail, ensure};
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Instance, Linker, Module, Store};
 use wasmtime_transaction_tools::kotlin_metadata::parse_kotlin_sidecar;
 use wasmtime_transaction_tools::kotlin_rewrite::rewrite_kotlin_module;
 
@@ -182,6 +183,85 @@ fn kotlin_rewrite_output_must_contain_real_transaction_object_ops() -> Result<()
         .wasm_tail_call(true);
     let engine = Engine::new(&config)?;
     Module::new(&engine, &rewritten_bytes)?;
+    Ok(())
+}
+
+#[test]
+fn kotlin_rewritten_bank_executes_and_recovers_file_backed_roots() -> Result<()> {
+    let Some(wasm_path) = build_kotlin_bank_example()? else {
+        println!("skipping kotlin bank execution test: gradle is unavailable");
+        return Ok(());
+    };
+
+    let sidecar = parse_kotlin_sidecar(
+        std::fs::read("examples/transaction-kotlin/bank/twasm.kotlin.json")?.as_slice(),
+    )?;
+    let input = std::fs::read(&wasm_path)?;
+    let (rewritten, _) = rewrite_kotlin_module(&input, &sidecar)?;
+
+    let temp = tempfile::tempdir()?;
+    let tmemory_path = temp.path().join("kotlin-bank.tmemory");
+    let tx_log_path = temp.path().join("kotlin-bank.txlog");
+    let mut config = Config::new();
+    config
+        .wasm_bulk_memory(true)
+        .wasm_gc(true)
+        .wasm_reference_types(true)
+        .wasm_function_references(true)
+        .wasm_tail_call(true);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, &rewritten)?;
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx)?;
+    let mut store = Store::new(&engine, wasmtime_wasi::WasiCtxBuilder::new().build_p1());
+    create_file_backed_storage_for_test(&mut store, tmemory_path, tx_log_path.clone(), 64)?;
+    let instance = linker.instantiate(&mut store, &module)?;
+    // SHISOFT-TWASM-MOCK: Kotlin runtime object headers carry live funcrefs
+    // today. Persisted user fields are validated below; symbolic Kotlin funcref
+    // rebinding remains a separate runtime metadata workstream.
+    enable_live_wast_reference_fallbacks_for_test(&mut store);
+    let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+    start.call(&mut store, ())?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    ensure!(
+        recovered.root_object_ids.len() == 1,
+        "expected one recovered Kotlin root, got {:?}",
+        recovered.root_object_ids
+    );
+    ensure!(
+        recovered.object_winners.len() >= 3,
+        "expected recovered Bank and Account records, got {}",
+        recovered.object_winners.len()
+    );
+    let root_winner = recovered
+        .object_winners
+        .iter()
+        .find(|winner| winner.object_id == recovered.root_object_ids[0])
+        .context("root ObjectId did not have a recovered object record")?;
+    let alice_ref = recovered_object_ref_field(&root_winner.record_bytes, 2, 0)?
+        .context("recovered Bank alice field was null")?;
+    let bob_ref = recovered_object_ref_field(&root_winner.record_bytes, 2, 1)?
+        .context("recovered Bank bob field was null")?;
+    ensure!(alice_ref != bob_ref, "alice and bob should be distinct accounts");
+    let alice = recovered
+        .object_winners
+        .iter()
+        .find(|winner| winner.object_id == alice_ref)
+        .context("recovered alice ObjectId did not have an Account record")?;
+    let bob = recovered
+        .object_winners
+        .iter()
+        .find(|winner| winner.object_id == bob_ref)
+        .context("recovered bob ObjectId did not have an Account record")?;
+    ensure!(
+        recovered_object_i64_field(&alice.record_bytes, 1, 0)? == 900,
+        "alice balance was not recovered after transfer"
+    );
+    ensure!(
+        recovered_object_i64_field(&bob.record_bytes, 1, 0)? == 300,
+        "bob balance was not recovered after transfer"
+    );
     Ok(())
 }
 
@@ -381,6 +461,46 @@ fn recovered_object_ref_field(
         "expected persistent object ref slot, got tag={tag} low={low} high={high}"
     );
     Ok(low.checked_sub(1))
+}
+
+fn recovered_object_i64_field(
+    record_bytes: &[u8],
+    field_count: usize,
+    field_index: usize,
+) -> Result<i64> {
+    const OBJECT_VALUE_ABI_TAG_I64: u32 = 1;
+    const OBJECT_VALUE_RECORD_LEN: usize = 20;
+
+    ensure!(field_index < field_count, "field index out of range");
+    let payload_len = field_count
+        .checked_mul(OBJECT_VALUE_RECORD_LEN)
+        .context("object payload length overflow")?;
+    ensure!(
+        record_bytes.len() >= payload_len,
+        "recovered object record is shorter than its payload"
+    );
+    let payload_start = record_bytes.len() - payload_len;
+    let field_offset = payload_start + field_index * OBJECT_VALUE_RECORD_LEN;
+    let tag = u32::from_le_bytes(
+        record_bytes[field_offset..field_offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let low = u64::from_le_bytes(
+        record_bytes[field_offset + 4..field_offset + 12]
+            .try_into()
+            .unwrap(),
+    );
+    let high = u64::from_le_bytes(
+        record_bytes[field_offset + 12..field_offset + 20]
+            .try_into()
+            .unwrap(),
+    );
+    ensure!(
+        tag == OBJECT_VALUE_ABI_TAG_I64 && high == 0,
+        "expected i64 object field slot, got tag={tag} low={low} high={high}"
+    );
+    Ok(low as i64)
 }
 
 #[derive(Debug, Default)]

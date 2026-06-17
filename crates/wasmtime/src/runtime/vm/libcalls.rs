@@ -1063,6 +1063,7 @@ fn transaction_tglobal_get_impl(
     };
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
 
+    let snapshot = live_transaction_global_snapshot_for_read(store, snapshot)?;
     let bytes = global_snapshot_bytes(snapshot);
     Ok(store
         .store_opaque_mut()
@@ -1133,6 +1134,38 @@ fn global_snapshot_from_tag(tag: u32, value: u64) -> Result<GlobalSnapshot> {
         5 => Ok(GlobalSnapshot::FuncRef(usize::try_from(value)?)),
         _ => bail!("unknown transactional global value tag: {tag}"),
     }
+}
+
+fn live_transaction_global_snapshot_for_read(
+    store: &mut dyn VMStore,
+    snapshot: GlobalSnapshot,
+) -> Result<GlobalSnapshot> {
+    let GlobalSnapshot::GcRef(gc_ref) = snapshot else {
+        return Ok(snapshot);
+    };
+    if gc_ref == 0 || ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
+        return Ok(snapshot);
+    }
+
+    let store = store.store_opaque_mut();
+    let (engine, gc_store, durable_refs, state, object_table) =
+        store.transaction_promotion_context_mut();
+    let promoted = {
+        let mut adapter =
+            StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
+        state.promote_gc_ref_for_live_transaction_ref_with_adapter(
+            object_table,
+            gc_ref,
+            &mut adapter,
+        )?
+    };
+    let Some(object_id) = promoted else {
+        return Ok(snapshot);
+    };
+    let handle = object_table.transaction_ref_handle_for_object_id_avoiding(object_id, |raw| {
+        live_ref_raw_is_registered(&*durable_refs, raw)
+    })?;
+    Ok(GlobalSnapshot::GcRef(handle))
 }
 
 fn read_global_snapshot(
