@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "module": "transaction-kotlin-collections",
+  "gcWasm": {
+    "capture": "allModuleGcTypes",
+    "denyTypes": [
+      "kotlin.coroutines.*",
+      "kotlin.Throwable"
+    ]
+  },
+  "persistentTypes": [
+    {
+      "name": "Profile",
+      "kind": "struct",
+      "fields": [
+        { "name": "name", "kind": "ref", "type": "kotlin.String", "nullable": true },
+        { "name": "tags", "kind": "ref", "type": "kotlin.Any", "nullable": true },
+        { "name": "attrs", "kind": "ref", "type": "kotlin.Any", "nullable": true }
+      ]
+    }
+  ],
+  "transactionFunctions": [
+    "installProfile",
+    "mutateProfile"
+  ],
+  "roots": [
+    { "name": "profile", "type": "Profile", "nullable": true }
+  ]
+}
