@@ -101,6 +101,58 @@ fn twasm_kotlin_inspects_tracked_bank_shape() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "Kotlin object lowering not implemented yet"]
+fn kotlin_rewrite_output_must_contain_real_transaction_object_ops() -> Result<()> {
+    let Some(wasm_path) = build_kotlin_bank_example()? else {
+        println!("skipping kotlin bank rewrite test: gradle is unavailable");
+        return Ok(());
+    };
+
+    let temp = tempfile::tempdir()?;
+    let rewritten = temp.path().join("bank.rewritten.wasm");
+    let report_path = temp.path().join("bank.rewrite-report.json");
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "run",
+            "-p",
+            "wasmtime-transaction-tools",
+            "--bin",
+            "twasm-kotlin",
+            "--",
+            "rewrite",
+        ])
+        .arg(&wasm_path)
+        .args([
+            "--metadata",
+            "examples/transaction-kotlin/bank/twasm.kotlin.json",
+            "--output",
+        ])
+        .arg(&rewritten)
+        .args(["--report"])
+        .arg(&report_path)
+        .output()
+        .context("failed to run twasm-kotlin rewrite")?;
+    if !output.status.success() {
+        bail!(
+            "twasm-kotlin rewrite failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    let printed = wasmprinter::print_bytes(std::fs::read(&rewritten)?)?;
+    assert!(report["rewritten_object_ops"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        printed.contains("tstruct.get")
+            || printed.contains("tstruct.set")
+            || printed.contains("tarray.get")
+            || printed.contains("tarray.set")
+            || printed.contains("tarray.len")
+    );
+    Ok(())
+}
+
 fn build_kotlin_bank_example() -> Result<Option<std::path::PathBuf>> {
     let build = KOTLIN_BANK_BUILD.get_or_init(|| Mutex::new(None));
     let mut cached = build.lock().expect("Kotlin bank build mutex poisoned");

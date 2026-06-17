@@ -21,6 +21,15 @@ enum KotlinCommand {
         #[arg(long = "wasm")]
         wasm: Option<PathBuf>,
     },
+    Rewrite {
+        input: PathBuf,
+        #[arg(long = "metadata")]
+        metadata: PathBuf,
+        #[arg(long = "output")]
+        output: PathBuf,
+        #[arg(long = "report")]
+        report: Option<PathBuf>,
+    },
 }
 
 pub fn main() -> Result<()> {
@@ -46,6 +55,28 @@ pub fn run(cli: KotlinCli, stdout: &mut impl Write) -> Result<()> {
                 writeln!(stdout, "{}", serde_json::to_string_pretty(&value)?)?;
             } else {
                 writeln!(stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+            }
+        }
+        KotlinCommand::Rewrite {
+            input,
+            metadata,
+            output,
+            report,
+        } => {
+            let input_bytes =
+                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
+            let metadata_bytes = fs::read(&metadata)
+                .with_context(|| format!("failed to read {}", metadata.display()))?;
+            let sidecar = crate::kotlin_metadata::parse_kotlin_sidecar(&metadata_bytes[..])
+                .with_context(|| format!("failed to parse {}", metadata.display()))?;
+            let (rewritten, rewrite_report) =
+                crate::kotlin_rewrite::rewrite_kotlin_module(&input_bytes, &sidecar)
+                    .with_context(|| format!("failed to rewrite {}", input.display()))?;
+            fs::write(&output, rewritten)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            if let Some(report_path) = report {
+                fs::write(&report_path, serde_json::to_vec_pretty(&rewrite_report)?)
+                    .with_context(|| format!("failed to write {}", report_path.display()))?;
             }
         }
     }
