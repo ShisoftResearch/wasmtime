@@ -2,6 +2,7 @@ use crate::prelude::*;
 use alloc::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::concurrency::LockBasedConflictKind;
 use super::{
     GranuleId, LockBased, TransactionId, TxDurableLog, granule_uses_transaction_state_version,
 };
@@ -14,6 +15,7 @@ pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) next_transaction_id: u64,
     pub(crate) locks: LockBased,
     pub(crate) conflict_aborted_transactions: BTreeSet<TransactionId>,
+    pub(crate) terminal_commits: BTreeSet<TransactionId>,
     pub(crate) granule_versions: BTreeMap<GranuleId, u64>,
     pub(crate) durable_log: TxDurableLog,
 }
@@ -24,6 +26,7 @@ impl Default for TransactionRegionRuntimeInner {
             next_transaction_id: 10_001,
             locks: LockBased::default(),
             conflict_aborted_transactions: BTreeSet::new(),
+            terminal_commits: BTreeSet::new(),
             granule_versions: BTreeMap::new(),
             durable_log: TxDurableLog::default(),
         }
@@ -62,6 +65,7 @@ impl TransactionRegionRuntime {
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
         let mut runtime = self.lock()?;
+        Self::check_terminal_owner_conflict(&runtime, transaction, granule, false)?;
         let aborted = runtime
             .locks
             .record_read(transaction, granule, current_version)?;
@@ -79,6 +83,7 @@ impl TransactionRegionRuntime {
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
         let mut runtime = self.lock()?;
+        Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
         let aborted = runtime
             .locks
             .acquire_write(transaction, granule, current_version)?;
@@ -116,6 +121,7 @@ impl TransactionRegionRuntime {
         let mut runtime = self.lock()?;
         runtime.locks.release_transaction(transaction);
         runtime.conflict_aborted_transactions.remove(&transaction);
+        runtime.terminal_commits.remove(&transaction);
         Ok(())
     }
 
@@ -127,6 +133,21 @@ impl TransactionRegionRuntime {
             .lock()?
             .conflict_aborted_transactions
             .remove(&transaction))
+    }
+
+    pub(crate) fn begin_terminal_commit(&self, transaction: TransactionId) -> Result<()> {
+        let mut runtime = self.lock()?;
+        ensure!(
+            !runtime.conflict_aborted_transactions.remove(&transaction),
+            "transaction was conflict-aborted by another transaction"
+        );
+        runtime.terminal_commits.insert(transaction);
+        Ok(())
+    }
+
+    pub(crate) fn end_terminal_commit(&self, transaction: TransactionId) -> Result<()> {
+        self.lock()?.terminal_commits.remove(&transaction);
+        Ok(())
     }
 
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> Result<u64> {
@@ -153,6 +174,27 @@ impl TransactionRegionRuntime {
                 .context("transaction granule version overflow")?;
         }
         Ok(())
+    }
+
+    fn check_terminal_owner_conflict(
+        runtime: &TransactionRegionRuntimeInner,
+        transaction: TransactionId,
+        granule: GranuleId,
+        is_write: bool,
+    ) -> Result<()> {
+        let Some(owner) = runtime.locks.owner_for_granule(granule) else {
+            return Ok(());
+        };
+        if owner == transaction || transaction > owner || !runtime.terminal_commits.contains(&owner)
+        {
+            return Ok(());
+        }
+        let kind = if is_write {
+            LockBasedConflictKind::WriteOwnedByOther
+        } else {
+            LockBasedConflictKind::ReadOwnedByOther
+        };
+        bail!(kind.message())
     }
 
     #[cfg(test)]
@@ -188,6 +230,32 @@ impl TransactionRegionRuntime {
     #[cfg(test)]
     pub(crate) fn release_transaction_for_test(&self, transaction: TransactionId) -> Result<()> {
         self.release_transaction(transaction)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_terminal_commit_for_test(&self, transaction: TransactionId) -> Result<()> {
+        self.begin_terminal_commit(transaction)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn end_terminal_commit_for_test(&self, transaction: TransactionId) -> Result<()> {
+        self.end_terminal_commit(transaction)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_conflict_aborted_transaction_for_test(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<bool> {
+        self.take_conflict_aborted_transaction(transaction)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transaction_is_terminal_commit_for_test(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<bool> {
+        Ok(self.lock()?.terminal_commits.contains(&transaction))
     }
 
     #[cfg(test)]

@@ -39,7 +39,7 @@ pub(crate) enum LockBasedConflictKind {
 }
 
 impl LockBasedConflictKind {
-    fn message(self) -> &'static str {
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::ReadOwnedByOther => {
                 "transaction read conflict: granule is owned by another transaction"
@@ -127,6 +127,10 @@ impl LockBased {
     pub(crate) fn release_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
         self.release_transaction(transaction);
         Ok(())
+    }
+
+    pub(crate) fn owner_for_granule(&self, granule: GranuleId) -> Option<TransactionId> {
+        self.owners.get(&granule).copied()
     }
 
     fn map_conflict_result<T>(result: core::result::Result<T, LockBasedConflictKind>) -> Result<T> {

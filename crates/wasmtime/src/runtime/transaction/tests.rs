@@ -189,50 +189,6 @@ fn shared_transaction_states_detect_cross_thread_write_conflict() {
 }
 
 #[test]
-fn shared_region_runtime_conflict_abort_prevents_younger_state_commit() {
-    use std::sync::mpsc;
-    use std::thread;
-
-    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
-    let granule = global_granule_id(None, 0);
-    let (owned_tx, owned_rx) = mpsc::channel();
-    let (preempted_tx, preempted_rx) = mpsc::channel();
-
-    let younger_runtime = runtime.clone();
-    let younger = thread::spawn(move || {
-        let mut state = TransactionState::default();
-        state.shared_region_runtime = Some(younger_runtime);
-        state
-            .enter_transaction(TransactionId::from_raw(100_001))
-            .unwrap();
-        state.stage_global(0, GlobalSnapshot::I32(1)).unwrap();
-        owned_tx.send(()).unwrap();
-        preempted_rx.recv().unwrap();
-
-        let error = state.commit().unwrap_err();
-        assert!(error.to_string().contains("conflict-aborted"), "{error:?}");
-        assert_eq!(state.active_transaction(), None);
-        assert!(!state.owns_granule_read(granule));
-        assert!(!state.owns_granule_write(granule));
-        assert_eq!(state.staged_global_owned(None, 0), None);
-    });
-
-    owned_rx.recv().unwrap();
-    let older_runtime = runtime.clone();
-    let older = thread::spawn(move || {
-        let mut state = TransactionState::default();
-        state.shared_region_runtime = Some(older_runtime);
-        state.enter_transaction(TransactionId::from_raw(1)).unwrap();
-        state.stage_global(0, GlobalSnapshot::I32(2)).unwrap();
-        preempted_tx.send(()).unwrap();
-        state.abort().unwrap();
-    });
-
-    younger.join().unwrap();
-    older.join().unwrap();
-}
-
-#[test]
 fn versioned_granule_version_ignores_poisoned_shared_runtime() {
     use std::thread;
 
@@ -252,6 +208,96 @@ fn versioned_granule_version_ignores_poisoned_shared_runtime() {
     assert_eq!(
         state.versioned_granule_version(global_granule_id(None, 0)),
         0
+    );
+}
+
+#[test]
+fn shared_region_runtime_conflict_abort_before_terminal_commit_frees_active_allocations() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let (owned_tx, owned_rx) = mpsc::channel();
+    let (preempted_tx, preempted_rx) = mpsc::channel();
+
+    let younger_runtime = runtime.clone();
+    let younger = thread::spawn(move || {
+        let mut objects = ObjectTable::default();
+        let allocated = objects.allocate_struct(vec![ObjectValue::I32(99)]).unwrap();
+        let mut state = TransactionState::default();
+        state.shared_region_runtime = Some(younger_runtime);
+        state
+            .enter_transaction(TransactionId::from_raw(100_001))
+            .unwrap();
+        state.record_allocated_object(allocated).unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(100)).unwrap();
+        owned_tx.send(()).unwrap();
+        preempted_rx.recv().unwrap();
+
+        let error = state
+            .begin_terminal_commit_with_cleanup_for_test(&mut objects)
+            .unwrap_err();
+        assert!(error.to_string().contains("conflict-aborted"), "{error:?}");
+        assert_eq!(state.active_transaction(), None);
+        assert!(objects.kind(allocated).is_err());
+    });
+
+    owned_rx.recv().unwrap();
+    let older_runtime = runtime.clone();
+    let older = thread::spawn(move || {
+        let mut state = TransactionState::default();
+        state.shared_region_runtime = Some(older_runtime);
+        state.enter_transaction(TransactionId::from_raw(1)).unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(200)).unwrap();
+        preempted_tx.send(()).unwrap();
+        state.abort().unwrap();
+    });
+
+    younger.join().unwrap();
+    older.join().unwrap();
+}
+
+#[test]
+fn shared_region_runtime_terminal_owner_cannot_be_preempted() {
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let owner = TransactionId::from_raw(100_001);
+    let older = TransactionId::from_raw(1);
+    let granule = global_granule_id(None, 0);
+
+    runtime
+        .acquire_granule_write_for_test(owner, granule, 0)
+        .unwrap();
+    runtime.begin_terminal_commit_for_test(owner).unwrap();
+
+    let error = runtime
+        .acquire_granule_write_for_test(older, granule, 0)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("transaction write conflict"),
+        "{error:?}"
+    );
+    assert!(
+        !runtime
+            .take_conflict_aborted_transaction_for_test(owner)
+            .unwrap()
+    );
+}
+
+#[test]
+fn shared_region_runtime_release_clears_terminal_marker() {
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let mut state = TransactionState::default();
+    let transaction = state.begin_with_region_runtime(&runtime).unwrap();
+    state
+        .acquire_granule_write(global_granule_id(None, 0), 0)
+        .unwrap();
+    runtime.begin_terminal_commit_for_test(transaction).unwrap();
+    state.abort().unwrap();
+
+    assert!(
+        !runtime
+            .transaction_is_terminal_commit_for_test(transaction)
+            .unwrap()
     );
 }
 

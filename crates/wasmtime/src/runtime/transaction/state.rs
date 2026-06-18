@@ -11,6 +11,8 @@ pub(crate) struct TransactionState {
     pub(super) persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     pub(super) next_id: u64,
     pub(super) shared_region_runtime: Option<TransactionRegionRuntime>,
+    pub(super) terminal_commit_active: bool,
+    pub(super) active_conflict_aborted: bool,
     pub(super) locks: LockBased,
     pub(super) suspended: BTreeMap<TransactionId, TransactionWorkspace>,
     pub(super) staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
@@ -46,6 +48,7 @@ pub(super) struct TransactionWorkspace {
     promoted_gc_refs: BTreeMap<u32, ObjectId>,
     durable_leaf_gc_refs: BTreeSet<u32>,
     allocated_objects: Vec<ObjectId>,
+    conflict_aborted: bool,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
     pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
@@ -65,6 +68,8 @@ impl Default for TransactionState {
             persistent_root_versions: BTreeMap::new(),
             next_id: 10_001,
             shared_region_runtime: None,
+            terminal_commit_active: false,
+            active_conflict_aborted: false,
             locks: LockBased::default(),
             suspended: BTreeMap::new(),
             staged_globals: BTreeMap::new(),
@@ -479,9 +484,11 @@ impl TransactionState {
         V: FnMut(GranuleId) -> Result<u64>,
         F: FnMut(&StagedRecord) -> Result<()>,
     {
-        self.prepare_active_commit()?;
+        self.ensure_active()?;
         self.validate_active_reads_with(current_version_fn)?;
-        for record in self.staged_records()? {
+        let records = self.staged_records()?;
+        self.begin_terminal_commit()?;
+        for record in records {
             apply(&record)?;
         }
         self.complete_commit()
@@ -613,30 +620,91 @@ impl TransactionState {
         Ok(())
     }
 
-    pub(crate) fn prepare_active_commit(&mut self) -> Result<()> {
-        self.ensure_active()?;
-        self.fail_if_active_transaction_conflict_aborted()
-    }
-
-    fn fail_if_active_transaction_conflict_aborted(&mut self) -> Result<()> {
-        let transaction = self.active_transaction_required()?;
-        if !self.take_shared_conflict_aborted_transaction(transaction)? {
-            return Ok(());
-        }
-
-        self.pending_conflict_aborted_allocated_objects
-            .extend(self.allocated_objects.iter().rev().copied());
-        let version_result = self.bump_active_versioned_write_granules();
-        self.clear_active();
-        version_result?;
-        bail!("transaction was conflict-aborted by another transaction");
-    }
-
     fn take_shared_conflict_aborted_transaction(&self, transaction: TransactionId) -> Result<bool> {
         let Some(runtime) = &self.shared_region_runtime else {
             return Ok(false);
         };
         runtime.take_conflict_aborted_transaction(transaction)
+    }
+
+    pub(crate) fn begin_terminal_commit(&mut self) -> Result<()> {
+        self.ensure_active()?;
+        if self.terminal_commit_active {
+            return Ok(());
+        }
+        match self.try_begin_terminal_commit() {
+            Ok(()) => Ok(()),
+            Err(error) if Self::is_conflict_aborted_error(&error) => {
+                self.active_conflict_aborted = true;
+                self.fail_active_conflict_aborted_without_object_cleanup()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn begin_terminal_commit_with_object_cleanup(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<()> {
+        self.ensure_active()?;
+        if self.terminal_commit_active {
+            return Ok(());
+        }
+        match self.try_begin_terminal_commit() {
+            Ok(()) => Ok(()),
+            Err(error) if Self::is_conflict_aborted_error(&error) => {
+                self.active_conflict_aborted = true;
+                self.fail_active_conflict_aborted_with_object_cleanup(object_table)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_begin_terminal_commit(&mut self) -> Result<()> {
+        let transaction = self.active_transaction_required()?;
+        if self.active_conflict_aborted {
+            bail!("transaction was conflict-aborted by another transaction");
+        }
+        let Some(runtime) = &self.shared_region_runtime else {
+            self.terminal_commit_active = true;
+            return Ok(());
+        };
+        runtime.begin_terminal_commit(transaction)?;
+        self.terminal_commit_active = true;
+        Ok(())
+    }
+
+    fn fail_active_conflict_aborted_without_object_cleanup(&mut self) -> Result<()> {
+        if self.allocated_objects.is_empty()
+            && self.pending_conflict_aborted_allocated_objects.is_empty()
+        {
+            self.finish_active_conflict_aborted_without_object_cleanup()?;
+            bail!("transaction was conflict-aborted by another transaction");
+        }
+        bail!(
+            "transaction was conflict-aborted by another transaction and requires object-aware cleanup for allocated objects"
+        )
+    }
+
+    fn fail_active_conflict_aborted_with_object_cleanup(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<()> {
+        self.abort_allocated_objects(object_table)?;
+        bail!("transaction was conflict-aborted by another transaction");
+    }
+
+    fn finish_active_conflict_aborted_without_object_cleanup(&mut self) -> Result<()> {
+        self.retry_post_commit_linear_undo_retirement();
+        self.bump_active_versioned_write_granules()?;
+        self.clear_active();
+        Ok(())
+    }
+
+    fn is_conflict_aborted_error(error: &impl core::fmt::Display) -> bool {
+        error
+            .to_string()
+            .contains("transaction was conflict-aborted by another transaction")
     }
 
     pub(super) fn discard_conflict_aborted_transaction(
@@ -713,7 +781,7 @@ impl TransactionState {
     }
 
     pub(crate) fn complete_commit(&mut self) -> Result<()> {
-        self.prepare_active_commit()?;
+        self.begin_terminal_commit()?;
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
@@ -795,6 +863,7 @@ impl TransactionState {
 
     pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
+        self.active_conflict_aborted = false;
         let _ =
             self.take_shared_conflict_aborted_transaction(self.active_transaction_required()?)?;
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
@@ -816,6 +885,7 @@ impl TransactionState {
 
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
         self.ensure_active()?;
+        self.active_conflict_aborted = false;
         let _ =
             self.take_shared_conflict_aborted_transaction(self.active_transaction_required()?)?;
         self.retry_post_commit_linear_undo_retirement();
@@ -2723,6 +2793,7 @@ impl TransactionState {
             promoted_gc_refs: mem::take(&mut self.promoted_gc_refs),
             durable_leaf_gc_refs: mem::take(&mut self.durable_leaf_gc_refs),
             allocated_objects: mem::take(&mut self.allocated_objects),
+            conflict_aborted: mem::take(&mut self.active_conflict_aborted),
             read_granules: mem::take(&mut self.read_granules),
             write_granules: mem::take(&mut self.write_granules),
             pending_linear_undo_chunks: mem::take(&mut self.pending_linear_undo_chunks),
@@ -2742,6 +2813,7 @@ impl TransactionState {
         self.promoted_gc_refs = workspace.promoted_gc_refs;
         self.durable_leaf_gc_refs = workspace.durable_leaf_gc_refs;
         self.allocated_objects = workspace.allocated_objects;
+        self.active_conflict_aborted = workspace.conflict_aborted;
         self.read_granules = workspace.read_granules;
         self.write_granules = workspace.write_granules;
         self.pending_linear_undo_chunks = workspace.pending_linear_undo_chunks;
@@ -2751,9 +2823,18 @@ impl TransactionState {
 
     pub(super) fn clear_active(&mut self) {
         if let Some(transaction) = self.active.take() {
+            if self.terminal_commit_active {
+                if let Some(runtime) = &self.shared_region_runtime {
+                    runtime
+                        .end_terminal_commit(transaction)
+                        .expect("terminal commit release should not fail during cleanup");
+                }
+                self.terminal_commit_active = false;
+            }
             self.release_transaction_authority(transaction)
                 .expect("transaction release should not fail during cleanup");
         }
+        self.terminal_commit_active = false;
         replace_current_thread_transaction(None);
         self.install_workspace(TransactionWorkspace::default());
     }
@@ -2945,5 +3026,12 @@ impl TransactionState {
 
     pub(super) fn commit_tmemory_for_test(&mut self, tmemory: &mut TMemory) -> Result<bool> {
         self.commit_tmemory_owned(Some(InstanceId::from_u32(0)), 0, tmemory)
+    }
+
+    pub(super) fn begin_terminal_commit_with_cleanup_for_test(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<()> {
+        self.begin_terminal_commit_with_object_cleanup(object_table)
     }
 }

@@ -740,7 +740,6 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         if state.active_transaction().is_none() {
             return Ok(());
         }
-        state.prepare_active_commit()?;
         (state.staged_records()?, state.active_read_granules()?)
     };
 
@@ -769,6 +768,12 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
     };
     let stream_id = u32::try_from(transaction_id)
         .context("transaction id does not fit durable transaction stream id")?;
+
+    {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.begin_terminal_commit_with_object_cleanup(object_table)?;
+    }
 
     let mut final_marker = commit_staged_tmemory_records(store, instance, &records, stream_id)?;
 
@@ -3220,10 +3225,10 @@ fn finish_transaction_constructor_boundary<T>(
     }
 
     if result.is_ok() {
-        store
-            .store_opaque_mut()
-            .transaction_state_mut()
-            .complete_commit()
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.begin_terminal_commit_with_object_cleanup(object_table)?;
+        state.complete_commit()
     } else {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
