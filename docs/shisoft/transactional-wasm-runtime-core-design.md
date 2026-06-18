@@ -178,11 +178,15 @@ range. A chunk list records the logical order in which chunks make up a
 higher-level region.
 
 Blocks are allocated from a global block allocator. Transaction log and data
-streams are thread-local at execution time, but they do not own fixed lanes:
-threads request log/data blocks from the global allocator, and blocks from
-ended threads can return to a global free list. Recovery recomputes allocator
-tail/free knowledge from chunk-start scans and committed log records instead of
-persisting allocator counters just to reduce recovery work.
+publication uses per-thread log segments: each execution thread owns its
+current stream segment and publishes into that segment without serializing
+unrelated threads' append/flush/fence/LP work through one global publication
+lock. These segments are not fixed lanes baked into the region layout. Threads
+request log/data blocks from the global allocator when a segment needs more
+space, and blocks from ended threads can return to a global free list. Recovery
+recomputes allocator tail/free knowledge from chunk-start scans and committed
+log records instead of persisting allocator counters just to reduce recovery
+work.
 
 Chunks are contiguous runs of one or more blocks. The first block of a chunk is
 the chunk-start block and carries the chunk header. Continuation blocks in the

@@ -32,7 +32,7 @@ Raw live `VMGcRef`, `VMFuncRef`, or host `ExternRef` values must not be stored i
 - Modify: `crates/wasmtime/src/runtime/transaction/concurrency.rs`
   - Keeps `LockBased` as the algorithm, but makes it owned by the shared runtime rather than by each store-local `TransactionState`.
 - Modify: `crates/wasmtime/src/runtime/transaction/persist.rs`
-  - Adds shared-runtime-safe durable publication entry points so append and LP flip are serialized by region state.
+  - Adds shared-runtime-safe durable log segment registration and recovery helpers while preserving independent per-thread/per-stream publication.
 - Modify: `crates/wasmtime/src/runtime/transaction/object_table.rs`
   - Separates live store-local bridge data from shared persistent object metadata.
 - Modify: `crates/wasmtime/src/runtime/transaction/object_gc.rs`
@@ -53,7 +53,7 @@ Raw live `VMGcRef`, `VMFuncRef`, or host `ExternRef` values must not be stored i
 1. Add a shared runtime shell with a coarse mutex.
 2. Move transaction id allocation and current-thread bookkeeping to the new boundary.
 3. Move lock/version authority into shared region state.
-4. Serialize durable log append, flush, fence, and LP flip through shared runtime methods.
+4. Make durable publication thread-safe through per-thread/per-stream log segments, not a global publication lock.
 5. Make persistent object roots and object index shared, while leaving live Wasmtime bridges store-local.
 6. Route `tmemory` commit and recovery through the shared runtime.
 7. Add a persistent GC coordinator with an exclusive region maintenance lock.
@@ -501,7 +501,7 @@ git commit -m "Share transaction lock state across stores"
 
 ---
 
-### Task 4: Serialize Durable Publication Through Shared Runtime
+### Task 4: Add Per-Thread Durable Log Segments
 
 **Files:**
 - Modify: `crates/wasmtime/src/runtime/transaction/region_runtime.rs`
@@ -510,12 +510,11 @@ git commit -m "Share transaction lock state across stores"
 - Test: `crates/wasmtime/src/runtime/transaction/tests.rs`
 - Test: `tests/transaction_persistence.rs`
 
-- [ ] **Step 1: Add failing concurrent durable-log append test**
+- [ ] **Step 1: Add failing per-thread segment registration test**
 
 ```rust
 #[test]
-fn shared_region_runtime_serializes_concurrent_durable_publication() {
-    use crate::runtime::transaction::{PendingGranuleUndo, TransactionId};
+fn shared_region_runtime_assigns_distinct_log_segments_to_threads() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -526,25 +525,20 @@ fn shared_region_runtime_serializes_concurrent_durable_publication() {
     let first_barrier = barrier.clone();
     let first = thread::spawn(move || {
         first_barrier.wait();
-        first_runtime
-            .publish_tmemory_undo_for_test(TransactionId::from_raw(1), PendingGranuleUndo::for_test(1, 1, &[1, 2, 3, 4]))
-            .unwrap();
+        first_runtime.current_thread_log_segment_for_test().unwrap()
     });
 
     let second_runtime = runtime.clone();
     let second_barrier = barrier.clone();
     let second = thread::spawn(move || {
         second_barrier.wait();
-        second_runtime
-            .publish_tmemory_undo_for_test(TransactionId::from_raw(2), PendingGranuleUndo::for_test(2, 1, &[5, 6, 7, 8]))
-            .unwrap();
+        second_runtime.current_thread_log_segment_for_test().unwrap()
     });
 
-    first.join().unwrap();
-    second.join().unwrap();
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
 
-    assert_eq!(runtime.durable_log_entry_count_for_test(1), 1);
-    assert_eq!(runtime.durable_log_entry_count_for_test(2), 1);
+    assert_ne!(first.stream_id(), second.stream_id());
 }
 ```
 
@@ -553,52 +547,69 @@ fn shared_region_runtime_serializes_concurrent_durable_publication() {
 Run:
 
 ```sh
-cargo test -p wasmtime shared_region_runtime_serializes_concurrent_durable_publication --lib -- --format terse
+cargo test -p wasmtime shared_region_runtime_assigns_distinct_log_segments_to_threads --lib -- --format terse
 ```
 
-Expected: compile failure because shared publication helpers do not exist.
+Expected: compile failure because shared log segment assignment does not exist.
 
-- [ ] **Step 3: Add runtime publication methods**
+- [ ] **Step 3: Add log segment identity and assignment**
 
-Add methods that hold the region mutex for the full durable publication sequence:
+Add a small durable segment identity:
 
 ```rust
-pub(crate) fn publish_tmemory_undo_before_in_place_write(
-    &self,
-    transaction: TransactionId,
-    undo: &PendingGranuleUndo,
-) -> Result<Option<PendingCommitLogEntry>> {
-    let mut inner = self.lock()?;
-    let stream_id = transaction
-        .as_u32()
-        .context("transaction id does not fit durable stream id")?;
-    let txid = stream_id;
-    let mut sink = inner.durable_log.stream_sink(stream_id);
-    let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-    publisher
-        .publish_tmemory_undo_before_in_place_write(undo)
-        .map(Some)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DurableLogSegment {
+    stream_id: u32,
 }
 
-pub(crate) fn publish_commit_lp(
-    &self,
-    transaction: TransactionId,
-    marker: PendingCommitLogEntry,
-) -> Result<()> {
-    let mut inner = self.lock()?;
-    let stream_id = transaction
-        .as_u32()
-        .context("transaction id does not fit durable stream id")?;
-    let txid = stream_id;
-    let mut sink = inner.durable_log.stream_sink(stream_id);
-    let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-    publisher.publish_commit_lp(marker)
+impl DurableLogSegment {
+    pub(crate) fn stream_id(self) -> u32 {
+        self.stream_id
+    }
 }
 ```
 
-- [ ] **Step 4: Move state commit code to shared publication**
+Add to `TransactionRegionRuntimeInner`:
 
-In `TransactionState` commit paths, replace direct `self.durable_log.stream_sink(...)` usage with `region.publish_*` calls. Keep staged workspace collection local; publish only durable records and LP through the region runtime.
+```rust
+next_log_segment_stream_id: u32,
+thread_log_segments: BTreeMap<std::thread::ThreadId, DurableLogSegment>,
+```
+
+Add to `TransactionRegionRuntime`:
+
+```rust
+pub(crate) fn current_thread_log_segment(&self) -> Result<DurableLogSegment> {
+    let thread_id = std::thread::current().id();
+    let mut inner = self.lock()?;
+    if let Some(segment) = inner.thread_log_segments.get(&thread_id).copied() {
+        return Ok(segment);
+    }
+    let stream_id = inner.next_log_segment_stream_id;
+    inner.next_log_segment_stream_id = inner
+        .next_log_segment_stream_id
+        .checked_add(1)
+        .context("transaction log segment stream id overflow")?;
+    let segment = DurableLogSegment { stream_id };
+    inner.thread_log_segments.insert(thread_id, segment);
+    Ok(segment)
+}
+```
+
+- [ ] **Step 4: Route durable stream selection through the segment**
+
+Production commit paths should derive the durable `stream_id` from the current thread's log segment when a shared runtime is attached:
+
+```rust
+let stream_id = if let Some(region) = state.shared_region_runtime() {
+    region.current_thread_log_segment()?.stream_id()
+} else {
+    u32::try_from(transaction_id).context("transaction id does not fit durable transaction stream id")?
+};
+let txid = u32::try_from(transaction_id).context("transaction id does not fit durable transaction id")?;
+```
+
+Keep actual publication in the thread-local/store-local durable log segment for now. Do not route publication through a global runtime mutex. The durable backend may still briefly lock global allocation/free-list state when it needs a fresh block/chunk.
 
 - [ ] **Step 5: Preserve ordering**
 
@@ -618,23 +629,31 @@ fence
 
 Do not recalculate CRC after LP flip. CRC validation must keep checking with the LP bit cleared.
 
-- [ ] **Step 6: Run durable-log tests**
+- [ ] **Step 6: Add a non-serialization publication test**
+
+Add a test that publishes one committed tmemory undo from each of two thread-local durable logs using distinct stream ids assigned by the shared runtime. The test should assert:
+
+- the two assigned stream ids differ
+- each local log has exactly one committed entry for its assigned stream
+- no global shared-runtime publication API is used
+
+- [ ] **Step 7: Run durable-log tests**
 
 Run:
 
 ```sh
+cargo test -p wasmtime shared_region_runtime_assigns_distinct_log_segments_to_threads --lib -- --format terse
 cargo test -p wasmtime transaction::persist --lib -- --format terse
-cargo test -p wasmtime shared_region_runtime_serializes_concurrent_durable_publication --lib -- --format terse
 cargo test -p wasmtime --test transaction_persistence -- --format terse
 ```
 
 Expected: all durable publication tests pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```sh
 git add crates/wasmtime/src/runtime/transaction/region_runtime.rs crates/wasmtime/src/runtime/transaction/persist.rs crates/wasmtime/src/runtime/transaction/state.rs crates/wasmtime/src/runtime/transaction/tests.rs tests/transaction_persistence.rs
-git commit -m "Serialize durable transaction publication through shared runtime"
+git commit -m "Add per-thread transaction log segments"
 ```
 
 ---
