@@ -106,6 +106,89 @@ fn shared_region_runtime_allocates_unique_transaction_ids_across_threads() {
 }
 
 #[test]
+fn shared_region_runtime_detects_cross_thread_write_conflict() {
+    use crate::runtime::transaction::{GranuleId, TransactionId};
+    use std::sync::mpsc;
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let granule = GranuleId::TMemory {
+        instance: None,
+        memory_index: 0,
+        granule_index: 7,
+    };
+    let (owned_tx, owned_rx) = mpsc::channel();
+    let (attempted_tx, attempted_rx) = mpsc::channel();
+
+    let first_runtime = runtime.clone();
+    let first = thread::spawn(move || {
+        first_runtime
+            .acquire_granule_write_for_test(TransactionId::from_raw(1), granule, 0)
+            .unwrap();
+        owned_tx.send(()).unwrap();
+        attempted_rx.recv().unwrap();
+        first_runtime
+            .release_transaction_for_test(TransactionId::from_raw(1))
+            .unwrap();
+    });
+
+    owned_rx.recv().unwrap();
+    let second_runtime = runtime.clone();
+    let second = thread::spawn(move || {
+        let result =
+            second_runtime.acquire_granule_write_for_test(TransactionId::from_raw(2), granule, 0);
+        attempted_tx.send(()).unwrap();
+        result.is_err()
+    });
+
+    assert!(second.join().unwrap());
+    first.join().unwrap();
+}
+
+#[test]
+fn shared_transaction_states_detect_cross_thread_write_conflict() {
+    use crate::runtime::transaction::{GranuleId, TransactionState};
+    use std::sync::mpsc;
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let granule = GranuleId::TGlobal {
+        instance: Some(1),
+        global_index: 7,
+    };
+    let (owned_tx, owned_rx) = mpsc::channel();
+    let (attempted_tx, attempted_rx) = mpsc::channel();
+
+    let first_runtime = runtime.clone();
+    let first = thread::spawn(move || {
+        let mut state = TransactionState::default();
+        state.begin_with_region_runtime(&first_runtime).unwrap();
+        state.acquire_granule_write(granule, 0).unwrap();
+        owned_tx.send(()).unwrap();
+        attempted_rx.recv().unwrap();
+        state.abort().unwrap();
+    });
+
+    owned_rx.recv().unwrap();
+    let second_runtime = runtime.clone();
+    let second = thread::spawn(move || {
+        let mut state = TransactionState::default();
+        state.begin_with_region_runtime(&second_runtime).unwrap();
+        let result = state.acquire_granule_write(granule, 0);
+        attempted_tx.send(()).unwrap();
+        if result.is_err() {
+            state.abort().unwrap();
+            return true;
+        }
+        state.abort().unwrap();
+        false
+    });
+
+    assert!(second.join().unwrap());
+    first.join().unwrap();
+}
+
+#[test]
 fn mock_transaction_store_commits_to_tmemory() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(

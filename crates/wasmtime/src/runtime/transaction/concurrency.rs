@@ -124,6 +124,11 @@ impl LockBased {
             .retain(|(reader, _), _| *reader != transaction);
     }
 
+    pub(crate) fn release_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
+        self.release_transaction(transaction);
+        Ok(())
+    }
+
     fn map_conflict_result<T>(result: core::result::Result<T, LockBasedConflictKind>) -> Result<T> {
         match result {
             Ok(value) => Ok(value),

@@ -10,6 +10,7 @@ pub(crate) struct TransactionState {
     pub(super) persistent_roots: BTreeMap<PersistentRootKey, BTreeSet<ObjectId>>,
     pub(super) persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     pub(super) next_id: u64,
+    pub(super) shared_region_runtime: Option<TransactionRegionRuntime>,
     pub(super) locks: LockBased,
     pub(super) suspended: BTreeMap<TransactionId, TransactionWorkspace>,
     pub(super) staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
@@ -63,6 +64,7 @@ impl Default for TransactionState {
             persistent_roots: BTreeMap::new(),
             persistent_root_versions: BTreeMap::new(),
             next_id: 10_001,
+            shared_region_runtime: None,
             locks: LockBased::default(),
             suspended: BTreeMap::new(),
             staged_globals: BTreeMap::new(),
@@ -178,6 +180,7 @@ impl TransactionState {
     ) -> Result<TransactionId> {
         self.prepare_to_begin_transaction()?;
         let id = region.allocate_transaction_id()?;
+        self.shared_region_runtime = Some(region.clone());
         self.activate_transaction(id);
         Ok(id)
     }
@@ -270,7 +273,7 @@ impl TransactionState {
         }
         if let Some(workspace) = self.suspended.remove(&transaction) {
             self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
-            self.locks.release_transaction(transaction);
+            self.release_transaction_authority(transaction)?;
             return Ok(true);
         }
         Ok(false)
@@ -294,7 +297,7 @@ impl TransactionState {
             object_table.free(object_id)?;
         }
         self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
-        self.locks.release_transaction(transaction);
+        self.release_transaction_authority(transaction)?;
         Ok(true)
     }
 
@@ -419,15 +422,12 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         let transaction = self.active_transaction_required()?;
-        let current_version = self.current_version_for_granule(granule, current_version);
-        let aborted = self
-            .locks
-            .acquire_granule_read(transaction, granule, current_version)?;
+        let current_version = self.current_version_for_granule(granule, current_version)?;
+        let aborted = self.acquire_granule_read_authority(transaction, granule, current_version)?;
         if aborted.is_some() {
             self.discard_conflict_aborted_transaction(aborted)?;
-            let current_version = self.current_version_for_granule(granule, current_version);
-            self.locks
-                .refresh_read_version(transaction, granule, current_version);
+            let current_version = self.current_version_for_granule(granule, current_version)?;
+            self.refresh_read_version_authority(transaction, granule, current_version)?;
         }
         Ok(self.read_granules.insert(granule))
     }
@@ -439,15 +439,13 @@ impl TransactionState {
     ) -> Result<bool> {
         self.ensure_active()?;
         let transaction = self.active_transaction_required()?;
-        let current_version = self.current_version_for_granule(granule, current_version);
-        let aborted = self
-            .locks
-            .acquire_granule_write(transaction, granule, current_version)?;
+        let current_version = self.current_version_for_granule(granule, current_version)?;
+        let aborted =
+            self.acquire_granule_write_authority(transaction, granule, current_version)?;
         if aborted.is_some() {
             self.discard_conflict_aborted_transaction(aborted)?;
-            let current_version = self.current_version_for_granule(granule, current_version);
-            self.locks
-                .refresh_read_version(transaction, granule, current_version);
+            let current_version = self.current_version_for_granule(granule, current_version)?;
+            self.refresh_read_version_authority(transaction, granule, current_version)?;
         }
         self.read_granules.insert(granule);
         Ok(self.write_granules.insert(granule))
@@ -493,13 +491,14 @@ impl TransactionState {
     where
         F: FnMut(GranuleId) -> Result<u64>,
     {
-        let transaction = self.active_transaction_required()?;
-        self.locks
-            .validate_transaction_reads(transaction, current_version_fn)
+        self.validate_active_read_granules_with(current_version_fn)
     }
 
     pub(crate) fn active_read_granules(&self) -> Result<Vec<GranuleId>> {
         let transaction = self.active_transaction_required()?;
+        if self.shared_region_runtime.is_some() {
+            return Ok(self.read_granules.iter().copied().collect());
+        }
         Ok(self
             .locks
             .read_versions
@@ -514,24 +513,116 @@ impl TransactionState {
         current_version: u64,
     ) -> Result<()> {
         let transaction = self.active_transaction_required()?;
-        self.locks
-            .validate_read(transaction, granule, current_version)
+        let current_version = self.current_version_for_granule(granule, current_version)?;
+        self.validate_granule_read_authority(transaction, granule, current_version)
     }
 
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> u64 {
-        self.granule_versions.get(&granule).copied().unwrap_or(0)
+        self.granule_versions
+            .get(&granule)
+            .copied()
+            .unwrap_or_else(|| {
+                self.shared_region_runtime
+                    .as_ref()
+                    .map(|runtime| {
+                        runtime
+                            .versioned_granule_version(granule)
+                            .expect("shared transaction version lookup should not fail")
+                    })
+                    .unwrap_or(0)
+            })
     }
 
     pub(super) fn current_version_for_granule(
         &self,
         granule: GranuleId,
         backend_version: u64,
-    ) -> u64 {
+    ) -> Result<u64> {
         if granule_uses_transaction_state_version(granule) {
-            self.versioned_granule_version(granule)
+            if let Some(runtime) = &self.shared_region_runtime {
+                runtime.versioned_granule_version(granule)
+            } else {
+                Ok(self.versioned_granule_version(granule))
+            }
         } else {
-            backend_version
+            Ok(backend_version)
         }
+    }
+
+    fn acquire_granule_read_authority(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<Option<TransactionId>> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.acquire_granule_read(transaction, granule, current_version)
+        } else {
+            self.locks
+                .acquire_granule_read(transaction, granule, current_version)
+        }
+    }
+
+    fn acquire_granule_write_authority(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<Option<TransactionId>> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.acquire_granule_write(transaction, granule, current_version)
+        } else {
+            self.locks
+                .acquire_granule_write(transaction, granule, current_version)
+        }
+    }
+
+    fn refresh_read_version_authority(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.refresh_read_version(transaction, granule, current_version)
+        } else {
+            self.locks
+                .refresh_read_version(transaction, granule, current_version);
+            Ok(())
+        }
+    }
+
+    fn validate_granule_read_authority(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.validate_granule_read(transaction, granule, current_version)
+        } else {
+            self.locks
+                .validate_read(transaction, granule, current_version)
+        }
+    }
+
+    fn release_transaction_authority(&mut self, transaction: TransactionId) -> Result<()> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.release_transaction(transaction)
+        } else {
+            self.locks.release_transaction_result(transaction)
+        }
+    }
+
+    fn validate_active_read_granules_with<F>(&self, mut current_version_fn: F) -> Result<()>
+    where
+        F: FnMut(GranuleId) -> Result<u64>,
+    {
+        for granule in self.active_read_granules()? {
+            let current_version = current_version_fn(granule)?;
+            self.validate_active_read(granule, current_version)?;
+        }
+        Ok(())
     }
 
     pub(super) fn discard_conflict_aborted_transaction(
@@ -591,6 +682,9 @@ impl TransactionState {
     where
         I: IntoIterator<Item = GranuleId>,
     {
+        if let Some(runtime) = &self.shared_region_runtime {
+            return runtime.bump_versioned_granules(granules);
+        }
         for granule in granules {
             if !granule_uses_transaction_state_version(granule) {
                 continue;
@@ -2638,7 +2732,8 @@ impl TransactionState {
 
     pub(super) fn clear_active(&mut self) {
         if let Some(transaction) = self.active.take() {
-            self.locks.release_transaction(transaction);
+            self.release_transaction_authority(transaction)
+                .expect("transaction release should not fail during cleanup");
         }
         replace_current_thread_transaction(None);
         self.install_workspace(TransactionWorkspace::default());
