@@ -55,6 +55,29 @@ fn count_retire_committed_linear_undo_failures(
 }
 
 #[test]
+fn transaction_region_runtime_can_be_shared_between_stores_for_test() {
+    let engine = crate::Engine::default();
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+
+    let mut first = crate::Store::new(&engine, ());
+    let mut second = crate::Store::new(&engine, ());
+
+    first.set_transaction_region_runtime_for_test(runtime.clone());
+    second.set_transaction_region_runtime_for_test(runtime);
+
+    assert!(first.transaction_region_runtime_is_same_for_test(&second));
+}
+
+#[test]
+fn stores_have_distinct_transaction_region_runtimes_by_default() {
+    let engine = crate::Engine::default();
+    let first = crate::Store::new(&engine, ());
+    let second = crate::Store::new(&engine, ());
+
+    assert!(!first.transaction_region_runtime_is_same_for_test(&second));
+}
+
+#[test]
 fn mock_transaction_store_commits_to_tmemory() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(

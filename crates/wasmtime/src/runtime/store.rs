@@ -85,7 +85,8 @@ use crate::prelude::*;
 #[cfg(feature = "transaction")]
 use crate::runtime::transaction::{DurableFuncIdentity, ObjectId};
 use crate::runtime::transaction::{
-    DurableReferenceRegistry, ObjectTable, TMemoryBackend, TransactionConfig, TransactionState,
+    DurableReferenceRegistry, ObjectTable, TMemoryBackend, TransactionConfig,
+    TransactionRegionRuntime, TransactionState,
 };
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
@@ -488,6 +489,7 @@ pub struct StoreOpaque {
     file_backed_tmemory_count: usize,
     #[allow(dead_code)]
     transaction_object_table: ObjectTable,
+    transaction_region_runtime: TransactionRegionRuntime,
     transaction_durable_refs: DurableReferenceRegistry,
     // GC-related fields.
     gc_store: Option<GcStore>,
@@ -791,6 +793,7 @@ impl<T> Store<T> {
             transaction_config: TransactionConfig::default(),
             file_backed_tmemory_count: 0,
             transaction_object_table: ObjectTable::default(),
+            transaction_region_runtime: TransactionRegionRuntime::default(),
             transaction_durable_refs: DurableReferenceRegistry::default(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
@@ -924,6 +927,21 @@ impl<T> Store<T> {
     ) -> Result<()> {
         self.inner
             .transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_transaction_region_runtime_for_test(
+        &mut self,
+        runtime: TransactionRegionRuntime,
+    ) {
+        *self.inner.transaction_region_runtime_mut() = runtime;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transaction_region_runtime_is_same_for_test<U>(&self, other: &Store<U>) -> bool {
+        self.inner
+            .transaction_region_runtime()
+            .ptr_eq_for_test(other.inner.transaction_region_runtime())
     }
 
     #[cfg(feature = "transaction")]
@@ -1740,6 +1758,16 @@ impl StoreOpaque {
 
     pub(crate) fn transaction_config(&self) -> &TransactionConfig {
         &self.transaction_config
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_region_runtime(&self) -> &TransactionRegionRuntime {
+        &self.transaction_region_runtime
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transaction_region_runtime_mut(&mut self) -> &mut TransactionRegionRuntime {
+        &mut self.transaction_region_runtime
     }
 
     #[allow(dead_code)]

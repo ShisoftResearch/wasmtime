@@ -21,6 +21,7 @@ mod object_table;
 mod object_value;
 mod persist;
 mod promotion;
+mod region_runtime;
 mod state;
 pub(crate) mod type_layout;
 mod wasmtime_layout;
@@ -96,6 +97,7 @@ pub(crate) use persist::{
 pub(crate) use promotion::{
     OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource, OrdinaryGcPromotionValue,
 };
+pub(crate) use region_runtime::TransactionRegionRuntime;
 use type_layout::TypeLayoutId;
 #[cfg(test)]
 use type_layout::{PersistentTypeKind, PersistentTypeLayout, TraceSlotKind, TypeLayoutRegistry};
