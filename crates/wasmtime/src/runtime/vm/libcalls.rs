@@ -782,7 +782,8 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         state.begin_terminal_commit_with_object_cleanup(object_table)?;
     }
 
-    let mut final_marker = commit_staged_tmemory_records(store, instance, &records, stream_id)?;
+    let mut final_marker =
+        commit_staged_tmemory_records(store, instance, &records, stream_id, txid)?;
 
     for record in &records {
         apply_staged_transaction_record(store, instance, record)?;
@@ -3306,6 +3307,7 @@ fn commit_staged_tmemory_records(
     instance: InstanceId,
     records: &[StagedRecord],
     stream_id: u32,
+    txid: u32,
 ) -> Result<Option<PendingCommitLogEntry>> {
     let participants = collect_tmemory_participants(instance, records);
     if participants.is_empty() {
@@ -3348,7 +3350,7 @@ fn commit_staged_tmemory_records(
     for undo in &persistent_undos {
         let marker = {
             let state = store.store_opaque_mut().transaction_state_mut();
-            state.publish_tmemory_undo_before_in_place_write(stream_id, stream_id, undo)?
+            state.publish_tmemory_undo_before_in_place_write(stream_id, txid, undo)?
         };
         final_marker = Some(marker);
     }

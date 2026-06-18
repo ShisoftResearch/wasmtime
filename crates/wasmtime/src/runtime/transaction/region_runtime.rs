@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use alloc::collections::{BTreeMap, BTreeSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
@@ -22,24 +23,6 @@ impl DurableLogSegment {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct DurableLogThreadId(u64);
-
-impl DurableLogThreadId {
-    // This toolchain does not expose an ordered or numeric `ThreadId`, so the
-    // runtime derives a stable per-process key from the debug form.
-    fn from_thread_id(thread_id: ThreadId) -> Result<Self> {
-        let debug = format!("{thread_id:?}");
-        let raw = debug
-            .strip_prefix("ThreadId(")
-            .and_then(|suffix| suffix.strip_suffix(')'))
-            .context("unsupported std::thread::ThreadId debug format")?
-            .parse::<u64>()
-            .context("failed to parse std::thread::ThreadId debug value")?;
-        Ok(Self(raw))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct TransactionRegionRuntime(Arc<Mutex<TransactionRegionRuntimeInner>>);
 
@@ -47,7 +30,7 @@ pub(crate) struct TransactionRegionRuntime(Arc<Mutex<TransactionRegionRuntimeInn
 pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) next_transaction_id: u64,
     pub(crate) next_log_segment_stream_id: u32,
-    pub(crate) thread_log_segments: BTreeMap<DurableLogThreadId, DurableLogSegment>,
+    pub(crate) thread_log_segments: HashMap<ThreadId, DurableLogSegment>,
     pub(crate) locks: LockBased,
     pub(crate) conflict_aborted_transactions: BTreeSet<TransactionId>,
     pub(crate) terminal_commits: BTreeSet<TransactionId>,
@@ -60,7 +43,7 @@ impl Default for TransactionRegionRuntimeInner {
         Self {
             next_transaction_id: 10_001,
             next_log_segment_stream_id: FIRST_DURABLE_LOG_SEGMENT_STREAM_ID,
-            thread_log_segments: BTreeMap::new(),
+            thread_log_segments: HashMap::new(),
             locks: LockBased::default(),
             conflict_aborted_transactions: BTreeSet::new(),
             terminal_commits: BTreeSet::new(),
@@ -96,7 +79,7 @@ impl TransactionRegionRuntime {
     }
 
     pub(crate) fn current_thread_log_segment(&self) -> Result<DurableLogSegment> {
-        let thread_id = DurableLogThreadId::from_thread_id(std::thread::current().id())?;
+        let thread_id = std::thread::current().id();
         let mut runtime = self.lock()?;
         if let Some(segment) = runtime.thread_log_segments.get(&thread_id).copied() {
             return Ok(segment);

@@ -204,14 +204,68 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
     assert_ne!(first_txid, second_txid);
     assert_eq!(first_entries.len(), 1);
     assert_eq!(first_entries[0].tx_meta & 1, 1);
+    assert_eq!(first_entries[0].tx_meta >> 1, first_txid);
     assert_eq!(
         first_entries[0].role().unwrap(),
         crate::vm::TxLogEntryRole::TMemoryUndo
     );
     assert_eq!(second_entries.len(), 1);
     assert_eq!(second_entries[0].tx_meta & 1, 1);
+    assert_eq!(second_entries[0].tx_meta >> 1, second_txid);
     assert_eq!(
         second_entries[0].role().unwrap(),
+        crate::vm::TxLogEntryRole::TMemoryUndo
+    );
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn shared_region_runtime_commit_path_uses_transaction_id_in_tmemory_undo_tx_meta() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 42))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    store
+        .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 64)
+        .unwrap();
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+
+    write.call(&mut store, ()).unwrap();
+
+    let stream_id = runtime
+        .current_thread_log_segment_for_test()
+        .unwrap()
+        .stream_id();
+    let next_txid = runtime.allocate_transaction_id_for_test().unwrap();
+    let txid = u32::try_from(next_txid.as_raw() - 1).unwrap();
+    let entries = store
+        .transaction_state()
+        .durable_log_entries_for_test(stream_id);
+
+    assert_eq!(entries.len(), 1);
+    assert_ne!(stream_id, txid);
+    assert_eq!(entries[0].tx_meta & 1, 1);
+    assert_eq!(entries[0].tx_meta >> 1, txid);
+    assert_eq!(
+        entries[0].role().unwrap(),
         crate::vm::TxLogEntryRole::TMemoryUndo
     );
 
