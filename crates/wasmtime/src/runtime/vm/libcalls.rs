@@ -740,6 +740,7 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         if state.active_transaction().is_none() {
             return Ok(());
         }
+        state.prepare_active_commit()?;
         (state.staged_records()?, state.active_read_granules()?)
     };
 

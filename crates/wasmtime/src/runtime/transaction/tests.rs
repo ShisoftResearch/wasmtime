@@ -189,6 +189,73 @@ fn shared_transaction_states_detect_cross_thread_write_conflict() {
 }
 
 #[test]
+fn shared_region_runtime_conflict_abort_prevents_younger_state_commit() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let granule = global_granule_id(None, 0);
+    let (owned_tx, owned_rx) = mpsc::channel();
+    let (preempted_tx, preempted_rx) = mpsc::channel();
+
+    let younger_runtime = runtime.clone();
+    let younger = thread::spawn(move || {
+        let mut state = TransactionState::default();
+        state.shared_region_runtime = Some(younger_runtime);
+        state
+            .enter_transaction(TransactionId::from_raw(100_001))
+            .unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(1)).unwrap();
+        owned_tx.send(()).unwrap();
+        preempted_rx.recv().unwrap();
+
+        let error = state.commit().unwrap_err();
+        assert!(error.to_string().contains("conflict-aborted"), "{error:?}");
+        assert_eq!(state.active_transaction(), None);
+        assert!(!state.owns_granule_read(granule));
+        assert!(!state.owns_granule_write(granule));
+        assert_eq!(state.staged_global_owned(None, 0), None);
+    });
+
+    owned_rx.recv().unwrap();
+    let older_runtime = runtime.clone();
+    let older = thread::spawn(move || {
+        let mut state = TransactionState::default();
+        state.shared_region_runtime = Some(older_runtime);
+        state.enter_transaction(TransactionId::from_raw(1)).unwrap();
+        state.stage_global(0, GlobalSnapshot::I32(2)).unwrap();
+        preempted_tx.send(()).unwrap();
+        state.abort().unwrap();
+    });
+
+    younger.join().unwrap();
+    older.join().unwrap();
+}
+
+#[test]
+fn versioned_granule_version_ignores_poisoned_shared_runtime() {
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let poisoned_runtime = runtime.clone();
+    let _ = thread::spawn(move || {
+        let _guard = poisoned_runtime.lock().unwrap();
+        panic!("poison shared runtime");
+    })
+    .join();
+
+    let state = TransactionState {
+        shared_region_runtime: Some(runtime),
+        ..TransactionState::default()
+    };
+
+    assert_eq!(
+        state.versioned_granule_version(global_granule_id(None, 0)),
+        0
+    );
+}
+
+#[test]
 fn mock_transaction_store_commits_to_tmemory() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(

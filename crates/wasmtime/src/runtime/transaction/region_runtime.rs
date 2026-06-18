@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
@@ -13,6 +13,7 @@ pub(crate) struct TransactionRegionRuntime(Arc<Mutex<TransactionRegionRuntimeInn
 pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) next_transaction_id: u64,
     pub(crate) locks: LockBased,
+    pub(crate) conflict_aborted_transactions: BTreeSet<TransactionId>,
     pub(crate) granule_versions: BTreeMap<GranuleId, u64>,
     pub(crate) durable_log: TxDurableLog,
 }
@@ -22,6 +23,7 @@ impl Default for TransactionRegionRuntimeInner {
         Self {
             next_transaction_id: 10_001,
             locks: LockBased::default(),
+            conflict_aborted_transactions: BTreeSet::new(),
             granule_versions: BTreeMap::new(),
             durable_log: TxDurableLog::default(),
         }
@@ -59,9 +61,15 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
-        self.lock()?
+        let mut runtime = self.lock()?;
+        let aborted = runtime
             .locks
-            .record_read(transaction, granule, current_version)
+            .record_read(transaction, granule, current_version)?;
+        if let Some(aborted) = aborted {
+            runtime.conflict_aborted_transactions.insert(aborted);
+            return Ok(Some(aborted));
+        }
+        Ok(None)
     }
 
     pub(crate) fn acquire_granule_write(
@@ -70,9 +78,15 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
-        self.lock()?
+        let mut runtime = self.lock()?;
+        let aborted = runtime
             .locks
-            .acquire_write(transaction, granule, current_version)
+            .acquire_write(transaction, granule, current_version)?;
+        if let Some(aborted) = aborted {
+            runtime.conflict_aborted_transactions.insert(aborted);
+            return Ok(Some(aborted));
+        }
+        Ok(None)
     }
 
     pub(crate) fn validate_granule_read(
@@ -99,8 +113,20 @@ impl TransactionRegionRuntime {
     }
 
     pub(crate) fn release_transaction(&self, transaction: TransactionId) -> Result<()> {
-        self.lock()?.locks.release_transaction(transaction);
+        let mut runtime = self.lock()?;
+        runtime.locks.release_transaction(transaction);
+        runtime.conflict_aborted_transactions.remove(&transaction);
         Ok(())
+    }
+
+    pub(crate) fn take_conflict_aborted_transaction(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<bool> {
+        Ok(self
+            .lock()?
+            .conflict_aborted_transactions
+            .remove(&transaction))
     }
 
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> Result<u64> {

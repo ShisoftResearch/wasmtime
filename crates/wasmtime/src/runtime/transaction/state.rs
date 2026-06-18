@@ -479,7 +479,7 @@ impl TransactionState {
         V: FnMut(GranuleId) -> Result<u64>,
         F: FnMut(&StagedRecord) -> Result<()>,
     {
-        self.ensure_active()?;
+        self.prepare_active_commit()?;
         self.validate_active_reads_with(current_version_fn)?;
         for record in self.staged_records()? {
             apply(&record)?;
@@ -518,19 +518,7 @@ impl TransactionState {
     }
 
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> u64 {
-        self.granule_versions
-            .get(&granule)
-            .copied()
-            .unwrap_or_else(|| {
-                self.shared_region_runtime
-                    .as_ref()
-                    .map(|runtime| {
-                        runtime
-                            .versioned_granule_version(granule)
-                            .expect("shared transaction version lookup should not fail")
-                    })
-                    .unwrap_or(0)
-            })
+        self.granule_versions.get(&granule).copied().unwrap_or(0)
     }
 
     pub(super) fn current_version_for_granule(
@@ -625,6 +613,32 @@ impl TransactionState {
         Ok(())
     }
 
+    pub(crate) fn prepare_active_commit(&mut self) -> Result<()> {
+        self.ensure_active()?;
+        self.fail_if_active_transaction_conflict_aborted()
+    }
+
+    fn fail_if_active_transaction_conflict_aborted(&mut self) -> Result<()> {
+        let transaction = self.active_transaction_required()?;
+        if !self.take_shared_conflict_aborted_transaction(transaction)? {
+            return Ok(());
+        }
+
+        self.pending_conflict_aborted_allocated_objects
+            .extend(self.allocated_objects.iter().rev().copied());
+        let version_result = self.bump_active_versioned_write_granules();
+        self.clear_active();
+        version_result?;
+        bail!("transaction was conflict-aborted by another transaction");
+    }
+
+    fn take_shared_conflict_aborted_transaction(&self, transaction: TransactionId) -> Result<bool> {
+        let Some(runtime) = &self.shared_region_runtime else {
+            return Ok(false);
+        };
+        runtime.take_conflict_aborted_transaction(transaction)
+    }
+
     pub(super) fn discard_conflict_aborted_transaction(
         &mut self,
         transaction: Option<TransactionId>,
@@ -633,6 +647,7 @@ impl TransactionState {
             return Ok(());
         };
         if let Some(workspace) = self.suspended.remove(&transaction) {
+            let _ = self.take_shared_conflict_aborted_transaction(transaction)?;
             self.pending_conflict_aborted_allocated_objects
                 .extend(workspace.allocated_objects.iter().rev().copied());
             self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
@@ -698,7 +713,7 @@ impl TransactionState {
     }
 
     pub(crate) fn complete_commit(&mut self) -> Result<()> {
-        self.ensure_active()?;
+        self.prepare_active_commit()?;
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
@@ -780,6 +795,8 @@ impl TransactionState {
 
     pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
+        let _ =
+            self.take_shared_conflict_aborted_transaction(self.active_transaction_required()?)?;
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.ensure_no_active_allocated_objects_for_generic_abort()?;
         self.retry_post_commit_linear_undo_retirement();
@@ -799,6 +816,8 @@ impl TransactionState {
 
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
         self.ensure_active()?;
+        let _ =
+            self.take_shared_conflict_aborted_transaction(self.active_transaction_required()?)?;
         self.retry_post_commit_linear_undo_retirement();
         let mut result = self
             .drain_conflict_aborted_allocated_objects(object_table)
