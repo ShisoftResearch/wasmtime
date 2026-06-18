@@ -697,7 +697,7 @@ impl TransactionState {
     fn finish_active_conflict_aborted_without_object_cleanup(&mut self) -> Result<()> {
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
-        self.clear_active();
+        self.clear_active()?;
         Ok(())
     }
 
@@ -785,7 +785,7 @@ impl TransactionState {
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
-        self.clear_active();
+        self.clear_active()?;
         Ok(())
     }
 
@@ -870,7 +870,7 @@ impl TransactionState {
         self.ensure_no_active_allocated_objects_for_generic_abort()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
-        self.clear_active();
+        self.clear_active()?;
         Ok(())
     }
 
@@ -913,7 +913,11 @@ impl TransactionState {
                 result = Err(error);
             }
         }
-        self.clear_active();
+        if let Err(error) = self.clear_active() {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
         result
     }
 
@@ -2821,22 +2825,20 @@ impl TransactionState {
         self.pending_memory_store = workspace.pending_memory_store;
     }
 
-    pub(super) fn clear_active(&mut self) {
+    pub(super) fn clear_active(&mut self) -> Result<()> {
         if let Some(transaction) = self.active.take() {
             if self.terminal_commit_active {
                 if let Some(runtime) = &self.shared_region_runtime {
-                    runtime
-                        .end_terminal_commit(transaction)
-                        .expect("terminal commit release should not fail during cleanup");
+                    runtime.end_terminal_commit(transaction)?;
                 }
                 self.terminal_commit_active = false;
             }
-            self.release_transaction_authority(transaction)
-                .expect("transaction release should not fail during cleanup");
+            self.release_transaction_authority(transaction)?;
         }
         self.terminal_commit_active = false;
         replace_current_thread_transaction(None);
         self.install_workspace(TransactionWorkspace::default());
+        Ok(())
     }
 
     pub(super) fn retry_post_commit_linear_undo_retirement(&mut self) {

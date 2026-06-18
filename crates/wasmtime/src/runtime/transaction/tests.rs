@@ -302,6 +302,30 @@ fn shared_region_runtime_release_clears_terminal_marker() {
 }
 
 #[test]
+fn shared_region_runtime_poisoned_clear_active_returns_error_without_panic() {
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let poisoned_runtime = runtime.clone();
+    let _ = thread::spawn(move || {
+        let _guard = poisoned_runtime.lock().unwrap();
+        panic!("poison shared runtime");
+    })
+    .join();
+
+    let transaction = TransactionId::from_raw(7);
+    let mut state = TransactionState {
+        active: Some(transaction),
+        shared_region_runtime: Some(runtime),
+        terminal_commit_active: true,
+        ..TransactionState::default()
+    };
+
+    let error = state.clear_active().unwrap_err();
+    assert!(error.to_string().contains("lock poisoned"), "{error:?}");
+}
+
+#[test]
 fn mock_transaction_store_commits_to_tmemory() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
