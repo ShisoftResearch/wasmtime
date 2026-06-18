@@ -291,23 +291,27 @@ fn memory_grow(
 // reference bridge fallbacks; committed object/root and linear-memory paths use
 // the durable transaction machinery.
 fn transaction_enter_tfunc(store: &mut dyn VMStore, _instance: InstanceId) -> Result<u32> {
-    let state = store.store_opaque_mut().transaction_state_mut();
+    let store = store.store_opaque_mut();
+    let region = store.transaction_region_runtime().clone();
+    let state = store.transaction_state_mut();
     if state.structured_failure_pending() {
         return Ok(2);
     }
     if state.active_transaction().is_some() {
         return Ok(0);
     }
-    state.begin()?;
+    state.begin_with_region_runtime(&region)?;
     Ok(1)
 }
 
 fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
-    let state = store.store_opaque_mut().transaction_state_mut();
+    let store = store.store_opaque_mut();
+    let region = store.transaction_region_runtime().clone();
+    let state = store.transaction_state_mut();
     if state.structured_failure_pending() {
         return Ok(());
     }
-    state.begin()?;
+    state.begin_with_region_runtime(&region)?;
     Ok(())
 }
 
@@ -3194,11 +3198,13 @@ fn abort_active_transaction_on_error<T>(store: &mut dyn VMStore, result: &Result
 }
 
 fn begin_transaction_constructor_boundary(store: &mut dyn VMStore) -> Result<bool> {
-    let state = store.store_opaque_mut().transaction_state_mut();
+    let store = store.store_opaque_mut();
+    let region = store.transaction_region_runtime().clone();
+    let state = store.transaction_state_mut();
     if state.active_transaction().is_some() {
         return Ok(false);
     }
-    state.begin()?;
+    state.begin_with_region_runtime(&region)?;
     Ok(true)
 }
 

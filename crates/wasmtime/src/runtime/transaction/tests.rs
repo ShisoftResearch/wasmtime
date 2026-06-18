@@ -78,6 +78,34 @@ fn stores_have_distinct_transaction_region_runtimes_by_default() {
 }
 
 #[test]
+fn shared_region_runtime_allocates_unique_transaction_ids_across_threads() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_runtime = runtime.clone();
+    let first_barrier = barrier.clone();
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        first_runtime.allocate_transaction_id_for_test().unwrap()
+    });
+
+    let second_runtime = runtime.clone();
+    let second_barrier = barrier.clone();
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        second_runtime.allocate_transaction_id_for_test().unwrap()
+    });
+
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+
+    assert_ne!(first, second);
+}
+
+#[test]
 fn mock_transaction_store_commits_to_tmemory() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(

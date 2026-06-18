@@ -166,6 +166,23 @@ impl PersistentRootDelta {
 
 impl TransactionState {
     pub(crate) fn begin(&mut self) -> Result<TransactionId> {
+        self.prepare_to_begin_transaction()?;
+        let id = self.allocate_local_transaction_id()?;
+        self.activate_transaction(id);
+        Ok(id)
+    }
+
+    pub(crate) fn begin_with_region_runtime(
+        &mut self,
+        region: &TransactionRegionRuntime,
+    ) -> Result<TransactionId> {
+        self.prepare_to_begin_transaction()?;
+        let id = region.allocate_transaction_id()?;
+        self.activate_transaction(id);
+        Ok(id)
+    }
+
+    fn prepare_to_begin_transaction(&mut self) -> Result<()> {
         self.retry_post_commit_linear_undo_retirement();
         ensure!(
             !self.failed,
@@ -175,14 +192,21 @@ impl TransactionState {
             self.active.is_none(),
             "transaction is already active in this store"
         );
+        Ok(())
+    }
+
+    fn allocate_local_transaction_id(&mut self) -> Result<TransactionId> {
         let id = TransactionId::from_raw(self.next_id);
         self.next_id = self
             .next_id
             .checked_add(1)
             .context("transaction id overflow")?;
+        Ok(id)
+    }
+
+    fn activate_transaction(&mut self, id: TransactionId) {
         self.active = Some(id);
         replace_current_thread_transaction(Some(id));
-        Ok(id)
     }
 
     pub(crate) fn enter_transaction(
