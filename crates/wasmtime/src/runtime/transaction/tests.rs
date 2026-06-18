@@ -106,6 +106,119 @@ fn shared_region_runtime_allocates_unique_transaction_ids_across_threads() {
 }
 
 #[test]
+fn shared_region_runtime_assigns_distinct_log_segments_to_threads() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_runtime = runtime.clone();
+    let first_barrier = barrier.clone();
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        first_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id()
+    });
+
+    let second_runtime = runtime.clone();
+    let second_barrier = barrier.clone();
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        second_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id()
+    });
+
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    clear_current_thread_transaction_for_test();
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let spawn_commit = |runtime: TransactionRegionRuntime,
+                        barrier: Arc<Barrier>,
+                        addr: u64,
+                        new_bytes: [u8; 4]|
+     -> thread::JoinHandle<(u32, u32, Vec<crate::vm::TxLogEntry>)> {
+        thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let tmemory_path = dir.path().join("tmemory.bin");
+            let mut tmemory = crate::runtime::vm::TMemory::new(
+                TransactionConfig::with_file_backed_tmemory_path(tmemory_path).unwrap(),
+                1,
+                Some(1),
+            )
+            .unwrap();
+            tmemory
+                .commit_staged_tmemory_granule(0, &vec![0x11; TMEMORY_GRANULE_SIZE])
+                .unwrap();
+
+            let mut state = TransactionState::default();
+            let transaction = state.begin_with_region_runtime(&runtime).unwrap();
+            state
+                .stage_tmemory_write_for_test(0, 0, addr, &new_bytes, &tmemory)
+                .unwrap();
+
+            barrier.wait();
+
+            let stream_id = runtime
+                .current_thread_log_segment_for_test()
+                .unwrap()
+                .stream_id();
+            let txid = u32::try_from(transaction.as_raw()).unwrap();
+            assert_ne!(stream_id, txid);
+            assert!(state.commit_tmemory_for_test(&mut tmemory).unwrap());
+            let entries = state.durable_log_entries_for_test(stream_id);
+            state.clear_active().unwrap();
+
+            (stream_id, txid, entries)
+        })
+    };
+
+    let first = spawn_commit(runtime.clone(), barrier.clone(), 0, [1, 2, 3, 4]);
+    let second = spawn_commit(
+        runtime.clone(),
+        barrier,
+        u64::try_from(TMEMORY_GRANULE_SIZE).unwrap(),
+        [5, 6, 7, 8],
+    );
+
+    let (first_stream_id, first_txid, first_entries) = first.join().unwrap();
+    let (second_stream_id, second_txid, second_entries) = second.join().unwrap();
+
+    assert_ne!(first_stream_id, second_stream_id);
+    assert_ne!(first_txid, second_txid);
+    assert_eq!(first_entries.len(), 1);
+    assert_eq!(first_entries[0].tx_meta & 1, 1);
+    assert_eq!(
+        first_entries[0].role().unwrap(),
+        crate::vm::TxLogEntryRole::TMemoryUndo
+    );
+    assert_eq!(second_entries.len(), 1);
+    assert_eq!(second_entries[0].tx_meta & 1, 1);
+    assert_eq!(
+        second_entries[0].role().unwrap(),
+        crate::vm::TxLogEntryRole::TMemoryUndo
+    );
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
 fn shared_region_runtime_detects_cross_thread_write_conflict() {
     use crate::runtime::transaction::{GranuleId, TransactionId};
     use std::sync::mpsc;

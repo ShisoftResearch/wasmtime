@@ -762,12 +762,19 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         state.validate_active_object_reads(&*object_table)?;
     }
 
-    let transaction_id = {
+    let (stream_id, txid) = {
         let state = store.store_opaque_mut().transaction_state_mut();
-        state.active_transaction_required_raw()?
+        let transaction_id = state.active_transaction_required_raw()?;
+        let stream_id = if let Some(region) = state.shared_region_runtime_for_publication() {
+            region.current_thread_log_segment()?.stream_id()
+        } else {
+            u32::try_from(transaction_id)
+                .context("transaction id does not fit durable transaction stream id")?
+        };
+        let txid = u32::try_from(transaction_id)
+            .context("transaction id does not fit durable transaction id")?;
+        (stream_id, txid)
     };
-    let stream_id = u32::try_from(transaction_id)
-        .context("transaction id does not fit durable transaction stream id")?;
 
     {
         let store = store.store_opaque_mut();
@@ -799,7 +806,7 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
             let (state, object_table) = store.transaction_state_and_object_table_mut();
             state.publish_object_publications_before_commit(
                 stream_id,
-                stream_id,
+                txid,
                 &*object_table,
                 &object_publications,
             )?
@@ -817,7 +824,7 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         store
             .store_opaque_mut()
             .transaction_state_mut()
-            .publish_commit_lp(stream_id, stream_id, marker)?;
+            .publish_commit_lp(stream_id, txid, marker)?;
     }
 
     store

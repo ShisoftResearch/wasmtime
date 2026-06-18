@@ -322,6 +322,12 @@ impl TransactionState {
         Ok(self.active_transaction_required()?.as_raw())
     }
 
+    pub(crate) fn shared_region_runtime_for_publication(
+        &self,
+    ) -> Option<&TransactionRegionRuntime> {
+        self.shared_region_runtime.as_ref()
+    }
+
     pub(crate) fn create_file_backed_durable_log(
         &mut self,
         path: &Path,
@@ -1475,8 +1481,15 @@ impl TransactionState {
             return Ok(false);
         }
 
-        let stream_id = u32::try_from(self.active_transaction_required_raw()?)
-            .context("transaction id does not fit durable tmemory stream id")?;
+        let transaction_id = self.active_transaction_required_raw()?;
+        let stream_id = if let Some(region) = self.shared_region_runtime_for_publication() {
+            region.current_thread_log_segment()?.stream_id()
+        } else {
+            u32::try_from(transaction_id)
+                .context("transaction id does not fit durable tmemory stream id")?
+        };
+        let txid = u32::try_from(transaction_id)
+            .context("transaction id does not fit durable transaction id")?;
         let staged = staged
             .iter()
             .map(|(_, granule_index, bytes)| {
@@ -1498,15 +1511,14 @@ impl TransactionState {
                     *granule_index,
                     bytes,
                 )?;
-                final_marker = Some(
-                    self.publish_tmemory_undo_before_in_place_write(stream_id, stream_id, &undo)?,
-                );
+                final_marker =
+                    Some(self.publish_tmemory_undo_before_in_place_write(stream_id, txid, &undo)?);
             }
             for (granule_index, bytes) in &staged {
                 tmemory.commit_staged_tmemory_granule(*granule_index, bytes)?;
             }
             if let Some(marker) = final_marker {
-                self.publish_commit_lp(stream_id, stream_id, marker)?;
+                self.publish_commit_lp(stream_id, txid, marker)?;
             }
         }
 
