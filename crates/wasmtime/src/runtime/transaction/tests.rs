@@ -2856,6 +2856,30 @@ fn abort_does_not_call_policy_commit_success_hook() {
 }
 
 #[test]
+fn commit_success_policy_hook_error_clears_active_transaction() {
+    let mut state = TransactionState::default();
+    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased);
+    let transaction = state.begin().unwrap();
+
+    state.stage_global(0, GlobalSnapshot::I32(7)).unwrap();
+    state.concurrency.fail_commit_transaction_once_for_test();
+
+    let error = state.complete_commit().unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected commit transaction failure"),
+        "{error:?}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        state.concurrency.committed_transactions_for_test().unwrap(),
+        BTreeSet::from([transaction])
+    );
+}
+
+#[test]
 fn commit_applies_only_latest_staged_records() {
     let mut state = TransactionState::default();
     state.begin().unwrap();

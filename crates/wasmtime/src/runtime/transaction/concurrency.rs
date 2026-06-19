@@ -278,6 +278,13 @@ impl ConcurrencyControlState {
             | Self::OptimisticValidation(_) => None,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn fail_commit_transaction_once_for_test(&mut self) {
+        if let Self::LockBased(policy) = self {
+            policy.fail_commit_transaction_once_for_test = true;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -289,6 +296,8 @@ pub(crate) struct LockBased {
     pub(crate) read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
     #[cfg(test)]
     pub(crate) committed_transactions_for_test: BTreeSet<TransactionId>,
+    #[cfg(test)]
+    pub(crate) fail_commit_transaction_once_for_test: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -524,6 +533,7 @@ impl LockBased {
             owners: self.owners.clone(),
             read_versions: self.read_versions.clone(),
             committed_transactions_for_test: self.committed_transactions_for_test.clone(),
+            fail_commit_transaction_once_for_test: self.fail_commit_transaction_once_for_test,
         }
     }
 
@@ -719,6 +729,9 @@ impl TransactionConcurrencyControl for LockBased {
         #[cfg(test)]
         {
             self.committed_transactions_for_test.insert(transaction);
+            if core::mem::take(&mut self.fail_commit_transaction_once_for_test) {
+                bail!("injected commit transaction failure");
+            }
         }
         Ok(())
     }

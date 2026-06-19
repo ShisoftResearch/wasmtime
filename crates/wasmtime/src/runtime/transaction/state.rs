@@ -884,9 +884,7 @@ impl TransactionState {
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
-        self.commit_transaction_authority(transaction)?;
-        self.clear_active()?;
-        Ok(())
+        self.finish_commit_after_policy_hook(transaction)
     }
 
     pub(crate) fn complete_commit_with_persistent_root_delta(
@@ -900,15 +898,23 @@ impl TransactionState {
         if self.shared_region_runtime.is_some() {
             self.commit_shared_persistent_root_delta_before_complete_commit(delta)?;
             self.bump_active_versioned_write_granules()?;
-            self.commit_transaction_authority(transaction)?;
-            self.clear_active()?;
+            self.finish_commit_after_policy_hook(transaction)?;
             return Ok(());
         }
         self.bump_active_versioned_write_granules()?;
-        self.commit_transaction_authority(transaction)?;
-        self.clear_active()?;
+        self.finish_commit_after_policy_hook(transaction)?;
         self.apply_committed_persistent_root_delta(delta)?;
         Ok(())
+    }
+
+    fn finish_commit_after_policy_hook(&mut self, transaction: TransactionId) -> Result<()> {
+        let mut result = self.commit_transaction_authority(transaction);
+        if let Err(error) = self.clear_active()
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        result
     }
 
     pub(crate) fn staged_records(&self) -> Result<Vec<StagedRecord>> {
