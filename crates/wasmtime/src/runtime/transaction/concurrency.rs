@@ -3,6 +3,37 @@ use alloc::collections::BTreeMap;
 
 use super::{ConcurrencyControl, GranuleId, TransactionId};
 
+type TransactionTimestamp = TransactionId;
+
+fn timestamp_for_transaction(transaction: TransactionId) -> TransactionTimestamp {
+    transaction
+}
+
+fn is_older(requester: TransactionId, owner: TransactionId) -> bool {
+    timestamp_for_transaction(requester) < timestamp_for_transaction(owner)
+}
+
+fn is_younger(requester: TransactionId, owner: TransactionId) -> bool {
+    timestamp_for_transaction(requester) > timestamp_for_transaction(owner)
+}
+
+#[cfg(test)]
+pub(crate) fn timestamp_for_transaction_for_test(
+    transaction: TransactionId,
+) -> TransactionTimestamp {
+    timestamp_for_transaction(transaction)
+}
+
+#[cfg(test)]
+pub(crate) fn is_older_for_test(requester: TransactionId, owner: TransactionId) -> bool {
+    is_older(requester, owner)
+}
+
+#[cfg(test)]
+pub(crate) fn is_younger_for_test(requester: TransactionId, owner: TransactionId) -> bool {
+    is_younger(requester, owner)
+}
+
 pub(crate) trait TransactionConcurrencyControl {
     fn acquire_granule_read(
         &mut self,

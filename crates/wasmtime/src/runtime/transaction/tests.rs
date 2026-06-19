@@ -15513,6 +15513,21 @@ fn no_wait_abort_abort_releases_owned_granules() {
 }
 
 #[test]
+fn transaction_timestamp_helpers_use_transaction_id_order() {
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+
+    assert_eq!(
+        super::concurrency::timestamp_for_transaction_for_test(older),
+        older
+    );
+    assert!(super::concurrency::is_older_for_test(older, younger));
+    assert!(super::concurrency::is_younger_for_test(younger, older));
+    assert!(!super::concurrency::is_older_for_test(younger, older));
+    assert!(!super::concurrency::is_younger_for_test(older, younger));
+}
+
+#[test]
 fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
     fn granule(granule_index: u64) -> GranuleId {
         GranuleId::TMemory {
