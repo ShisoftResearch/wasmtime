@@ -225,8 +225,20 @@ fn replay_tmemory_size_winners(
             winner.data_offset,
         )?;
         ensure!(
+            data_header.logical_id == winner.logical_id,
+            "recovered tmemory size logical id does not match log winner"
+        );
+        ensure!(
+            data_header.version == winner.version,
+            "recovered tmemory size version does not match log winner"
+        );
+        ensure!(
             data_header.role()? == TxDataRecordRole::TObjectPub,
             "recovered tmemory size data record has non-publication role"
+        );
+        ensure!(
+            data_header.kind == PackedGranuleDomain::TMemorySize as u16,
+            "recovered tmemory size kind does not match log winner"
         );
         ensure!(
             payload.len() == size_of::<u64>(),
@@ -851,7 +863,9 @@ mod tests {
     use crate::runtime::vm::memory::tmemory::metadata::{
         TYPE_LAYOUT_METADATA_HEADER_LEN, TYPE_LAYOUT_METADATA_START_BLOCK,
     };
-    use crate::runtime::vm::{PackedGranuleDomain, pack_object_granule_id};
+    use crate::runtime::vm::{
+        PackedGranuleDomain, pack_object_granule_id, pack_tmemory_size_logical_id,
+    };
 
     #[test]
     fn recovery_discovers_streams_from_chunk_starts() {
@@ -1080,6 +1094,57 @@ mod tests {
         let err = recover_region_for_test(&region).unwrap_err();
 
         assert!(err.to_string().contains("non-publication role"));
+    }
+
+    #[test]
+    fn model_recovery_rejects_tmemory_size_publication_logical_id_mismatch() {
+        let (region, winner) =
+            sample_region_with_tmemory_size_publication_header_mismatch(|header| {
+                header.logical_id = pack_tmemory_size_logical_id(Some(8), 5).unwrap();
+            });
+        let discovered = discover_region(&region.view()).unwrap();
+        let err =
+            replay_tmemory_size_winners(&region.view(), &discovered.data_chunk_index, &[winner])
+                .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("recovered tmemory size logical id does not match log winner")
+        );
+    }
+
+    #[test]
+    fn model_recovery_rejects_tmemory_size_publication_version_mismatch() {
+        let (region, winner) =
+            sample_region_with_tmemory_size_publication_header_mismatch(|header| {
+                header.version += 1;
+            });
+        let discovered = discover_region(&region.view()).unwrap();
+        let err =
+            replay_tmemory_size_winners(&region.view(), &discovered.data_chunk_index, &[winner])
+                .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("recovered tmemory size version does not match log winner")
+        );
+    }
+
+    #[test]
+    fn model_recovery_rejects_tmemory_size_publication_kind_mismatch() {
+        let (region, winner) =
+            sample_region_with_tmemory_size_publication_header_mismatch(|header| {
+                header.kind = PackedGranuleDomain::TMemory as u16;
+            });
+        let discovered = discover_region(&region.view()).unwrap();
+        let err =
+            replay_tmemory_size_winners(&region.view(), &discovered.data_chunk_index, &[winner])
+                .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("recovered tmemory size kind does not match log winner")
+        );
     }
 
     #[test]
@@ -1555,6 +1620,46 @@ mod tests {
             header.set_role(TxDataRecordRole::TMemoryUndo);
         });
         region
+    }
+
+    fn sample_region_with_tmemory_size_publication_header_mismatch(
+        update: impl FnOnce(&mut TxDataRecordHeader),
+    ) -> (VMemoryBlockRegion, RecoveryWinner) {
+        let mut region = VMemoryBlockRegion::new_for_test(32).unwrap();
+        let stream = region.alloc_stream(1).unwrap();
+        let logical_id = pack_tmemory_size_logical_id(Some(7), 4).unwrap();
+        let payload = 2u64.to_le_bytes();
+        let record = TMemory::encode_publication_data_record(
+            logical_id,
+            9,
+            PackedGranuleDomain::TMemorySize as u16,
+            0,
+            &payload,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let log_block = region.alloc_log_block(1, 0).unwrap();
+        let entry = TMemory::publication_log_entry(
+            logical_id,
+            9,
+            1 << 1,
+            location.data_block,
+            location.data_offset,
+            0,
+            true,
+        )
+        .unwrap();
+        write_log_entries(&mut region, log_block, &[entry]);
+        rewrite_data_record_header(&mut region, location, update);
+        (
+            region,
+            RecoveryWinner {
+                logical_id,
+                version: 9,
+                data_block: location.data_block,
+                data_offset: location.data_offset,
+            },
+        )
     }
 
     fn sample_region_with_publication_pointer_outside_data_chunk() -> VMemoryBlockRegion {
