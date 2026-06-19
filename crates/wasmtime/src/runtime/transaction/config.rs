@@ -13,14 +13,27 @@ use std::path::PathBuf;
             feature = "transaction-cc-wound-wait"
         ),
         all(
+            feature = "transaction-cc-lockbased",
+            feature = "transaction-cc-wait-die"
+        ),
+        all(
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-wound-wait"
+        ),
+        all(
+            feature = "transaction-cc-nowait-abort",
+            feature = "transaction-cc-wait-die"
+        ),
+        all(
+            feature = "transaction-cc-wound-wait",
+            feature = "transaction-cc-wait-die"
         )
     )
 ))]
 compile_error!(
     "select exactly one transaction concurrency-control feature: \
-     transaction-cc-lockbased, transaction-cc-nowait-abort, or transaction-cc-wound-wait"
+     transaction-cc-lockbased, transaction-cc-nowait-abort, \
+     transaction-cc-wound-wait, or transaction-cc-wait-die"
 );
 
 #[cfg(all(
@@ -28,12 +41,14 @@ compile_error!(
     not(any(
         feature = "transaction-cc-lockbased",
         feature = "transaction-cc-nowait-abort",
-        feature = "transaction-cc-wound-wait"
+        feature = "transaction-cc-wound-wait",
+        feature = "transaction-cc-wait-die"
     ))
 ))]
 compile_error!(
     "transaction requires one transaction concurrency-control feature: \
-     transaction-cc-lockbased, transaction-cc-nowait-abort, or transaction-cc-wound-wait"
+     transaction-cc-lockbased, transaction-cc-nowait-abort, \
+     transaction-cc-wound-wait, or transaction-cc-wait-die"
 );
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -83,10 +98,16 @@ pub(crate) enum ConcurrencyControl {
     LockBased,
     NoWaitAbort,
     WoundWait,
+    WaitDie,
 }
 
 impl ConcurrencyControl {
     pub(crate) const fn default_for_build() -> Self {
+        #[cfg(feature = "transaction-cc-wait-die")]
+        {
+            return Self::WaitDie;
+        }
+
         #[cfg(feature = "transaction-cc-wound-wait")]
         {
             return Self::WoundWait;
@@ -103,6 +124,7 @@ impl ConcurrencyControl {
         }
 
         #[cfg(not(any(
+            feature = "transaction-cc-wait-die",
             feature = "transaction-cc-wound-wait",
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-lockbased"

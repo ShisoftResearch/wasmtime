@@ -29,8 +29,8 @@ use concurrency::ConcurrencyControlState;
 #[cfg(test)]
 use concurrency::{
     LockBased, LockBasedConflictKindForTest, LockBasedSnapshotForTest, NoWaitAbort,
-    NoWaitAbortConflictKindForTest, TransactionConcurrencyControl, WoundWait,
-    WoundWaitConflictKindForTest,
+    NoWaitAbortConflictKindForTest, TransactionConcurrencyControl, WaitDie,
+    WaitDieConflictKindForTest, WoundWait, WoundWaitConflictKindForTest,
 };
 use config::ConcurrencyControl;
 #[cfg(test)]

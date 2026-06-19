@@ -1488,6 +1488,36 @@ fn shared_region_runtime_nowait_conflict_does_not_abort_existing_owner() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wait-die")]
+fn shared_runtime_wait_die_would_wait_does_not_conflict_abort_owner() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    runtime
+        .acquire_granule_write_for_test(younger, granule, 0)
+        .unwrap();
+    let action = runtime
+        .acquire_granule_write_for_test(older, granule, 0)
+        .unwrap();
+
+    assert_eq!(
+        action,
+        super::concurrency::TransactionConflictAction::WouldWait(younger)
+    );
+    assert!(
+        !runtime
+            .take_conflict_aborted_transaction_for_test(younger)
+            .unwrap()
+    );
+}
+
+#[test]
 fn shared_region_runtime_terminal_owner_cannot_be_preempted() {
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
     let owner = TransactionId::from_raw(100_001);
@@ -15634,6 +15664,88 @@ fn wound_wait_refreshes_read_version_after_wounding_owner() {
 }
 
 #[test]
+fn wait_die_older_requester_would_wait_for_younger_owner() {
+    let mut policy = WaitDie::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write_for_test(younger, granule, 3).unwrap();
+    let action = policy.acquire_write(older, granule, 3).unwrap();
+
+    assert_eq!(
+        action,
+        super::concurrency::TransactionConflictAction::WouldWait(younger)
+    );
+    assert_eq!(policy.owner_for_test(granule), Some(younger));
+}
+
+#[test]
+fn wait_die_younger_requester_dies_against_older_owner() {
+    let mut policy = WaitDie::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write_for_test(older, granule, 3).unwrap();
+
+    let error = policy
+        .acquire_write_result_for_test(younger, granule, 3)
+        .unwrap_err();
+    assert_eq!(error, WaitDieConflictKindForTest::WriteOwnedByOther);
+    assert_eq!(policy.owner_for_test(granule), Some(older));
+}
+
+#[test]
+fn wait_die_validates_optimistic_reads_at_commit() {
+    let mut policy = WaitDie::default();
+    let reader = TransactionId::from_raw(1);
+    let writer = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    policy.record_read_for_test(reader, granule, 7).unwrap();
+    policy.acquire_write_for_test(writer, granule, 7).unwrap();
+    policy.abort_for_test(writer);
+
+    let error = policy
+        .validate_read_result_for_test(reader, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, WaitDieConflictKindForTest::ReadVersionMismatch);
+}
+
+#[test]
+fn wait_die_rejects_write_after_stale_read_version() {
+    let mut policy = WaitDie::default();
+    let transaction = TransactionId::from_raw(1);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    policy
+        .record_read_for_test(transaction, granule, 7)
+        .unwrap();
+
+    let error = policy
+        .acquire_write_result_for_test(transaction, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, WaitDieConflictKindForTest::WriteVersionMismatch);
+}
+
+#[test]
 fn transaction_timestamp_helpers_use_transaction_id_order() {
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
@@ -15746,6 +15858,7 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
 
     assert_contract(&mut LockBased::default());
     assert_contract(&mut NoWaitAbort::default());
+    assert_contract(&mut WaitDie::default());
     assert_contract(&mut WoundWait::default());
 }
 
@@ -15787,6 +15900,28 @@ fn selected_concurrency_control_uses_wound_wait_semantics() {
 
     assert_eq!(action.aborted_transaction(), Some(younger));
     assert_eq!(policy.owner_for_granule(granule), Some(older));
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-wait-die")]
+fn selected_concurrency_control_uses_wait_die_would_wait_semantics() {
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::WaitDie);
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_granule_write(younger, granule, 0).unwrap();
+    let action = policy.acquire_granule_write(older, granule, 0).unwrap();
+
+    assert_eq!(
+        action,
+        super::concurrency::TransactionConflictAction::WouldWait(younger)
+    );
+    assert_eq!(policy.owner_for_granule(granule), Some(younger));
 }
 
 #[test]

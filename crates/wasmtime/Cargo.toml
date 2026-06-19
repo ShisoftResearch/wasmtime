@@ -177,6 +177,7 @@ transaction = [
 ]
 transaction-cc-lockbased = ["transaction"]
 transaction-cc-nowait-abort = ["transaction"]
+transaction-cc-wait-die = ["transaction"]
 transaction-cc-wound-wait = ["transaction"]
 
 # Enables backtrace capturing in `wasmtime::Error`.
