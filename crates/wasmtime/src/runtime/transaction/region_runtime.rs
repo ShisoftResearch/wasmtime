@@ -110,13 +110,23 @@ impl TransactionRegionRuntime {
         Ok(segment)
     }
 
-    pub(crate) fn release_current_thread_log_segment(&self) -> Result<()> {
+    pub(crate) fn release_current_thread_log_segment_reusable(&self) -> Result<()> {
+        self.release_current_thread_log_segment(true)
+    }
+
+    pub(crate) fn retire_current_thread_log_segment(&self) -> Result<()> {
+        self.release_current_thread_log_segment(false)
+    }
+
+    fn release_current_thread_log_segment(&self, reusable: bool) -> Result<()> {
         let thread_id = std::thread::current().id();
         let mut runtime = self.lock()?;
         if let Some(segment) = runtime.thread_log_segments.remove(&thread_id) {
-            runtime
-                .free_log_segment_stream_ids
-                .push(segment.stream_id());
+            if reusable {
+                runtime
+                    .free_log_segment_stream_ids
+                    .push(segment.stream_id());
+            }
         }
         Ok(())
     }
@@ -337,7 +347,7 @@ impl TransactionRegionRuntime {
 
     #[cfg(test)]
     pub(crate) fn release_current_thread_log_segment_for_test(&self) -> Result<()> {
-        self.release_current_thread_log_segment()
+        self.release_current_thread_log_segment_reusable()
     }
 
     #[cfg(test)]

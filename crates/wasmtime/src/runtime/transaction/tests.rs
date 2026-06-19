@@ -261,6 +261,66 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
 }
 
 #[test]
+fn shared_region_runtime_pre_lp_failure_retires_log_segment() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 42))))
+        "#,
+    );
+    let initial_stream_id = runtime
+        .current_thread_log_segment_for_test()
+        .unwrap()
+        .stream_id();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    store
+        .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 64)
+        .unwrap();
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .fail_next_commit_before_lp_for_test();
+    assert!(write.call(&mut store, ()).is_err());
+    assert_eq!(current_thread_transaction_for_test(), None);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 0);
+
+    let next_runtime = runtime.clone();
+    let next = std::thread::spawn(move || {
+        let stream_id = next_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        next_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        stream_id
+    });
+    let next_stream_id = next.join().unwrap();
+
+    assert_ne!(next_stream_id, initial_stream_id);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 1);
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
 fn shared_region_runtime_commit_path_uses_transaction_id_in_tmemory_undo_tx_meta() {
     clear_current_thread_transaction_for_test();
 

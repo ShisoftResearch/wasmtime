@@ -29,6 +29,7 @@ pub(crate) struct TransactionState {
     pub(super) granule_versions: BTreeMap<GranuleId, u64>,
     pub(super) read_granules: BTreeSet<GranuleId>,
     pub(super) write_granules: BTreeSet<GranuleId>,
+    pub(super) uncommitted_publication_streams: BTreeSet<u32>,
     pub(super) pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
     pub(super) post_commit_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
     pub(super) scratch: Vec<u8>,
@@ -51,6 +52,7 @@ pub(super) struct TransactionWorkspace {
     conflict_aborted: bool,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
+    uncommitted_publication_streams: BTreeSet<u32>,
     pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
@@ -86,6 +88,7 @@ impl Default for TransactionState {
             granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
             write_granules: BTreeSet::new(),
+            uncommitted_publication_streams: BTreeSet::new(),
             pending_linear_undo_chunks: BTreeMap::new(),
             post_commit_linear_undo_chunks: BTreeMap::new(),
             scratch: Vec::new(),
@@ -351,6 +354,7 @@ impl TransactionState {
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
         let marker = publisher.publish_tmemory_undo_before_in_place_write(undo)?;
+        self.uncommitted_publication_streams.insert(stream_id);
         self.pending_linear_undo_chunks
             .entry(stream_id)
             .or_default()
@@ -381,7 +385,11 @@ impl TransactionState {
 
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-        publisher.publish_object_publications_before_commit(publications)
+        let marker = publisher.publish_object_publications_before_commit(publications)?;
+        if marker.is_some() {
+            self.uncommitted_publication_streams.insert(stream_id);
+        }
+        Ok(marker)
     }
 
     pub(crate) fn publish_commit_lp(
@@ -395,6 +403,7 @@ impl TransactionState {
             let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
             publisher.publish_commit_lp(marker)?;
         }
+        self.uncommitted_publication_streams.remove(&stream_id);
         if let Some(chunk_starts) = self.pending_linear_undo_chunks.remove(&stream_id) {
             self.post_commit_linear_undo_chunks
                 .entry(stream_id)
@@ -2812,6 +2821,7 @@ impl TransactionState {
             conflict_aborted: mem::take(&mut self.active_conflict_aborted),
             read_granules: mem::take(&mut self.read_granules),
             write_granules: mem::take(&mut self.write_granules),
+            uncommitted_publication_streams: mem::take(&mut self.uncommitted_publication_streams),
             pending_linear_undo_chunks: mem::take(&mut self.pending_linear_undo_chunks),
             scratch: mem::take(&mut self.scratch),
             pending_memory_store: self.pending_memory_store.take(),
@@ -2832,6 +2842,7 @@ impl TransactionState {
         self.active_conflict_aborted = workspace.conflict_aborted;
         self.read_granules = workspace.read_granules;
         self.write_granules = workspace.write_granules;
+        self.uncommitted_publication_streams = workspace.uncommitted_publication_streams;
         self.pending_linear_undo_chunks = workspace.pending_linear_undo_chunks;
         self.scratch = workspace.scratch;
         self.pending_memory_store = workspace.pending_memory_store;
@@ -2855,7 +2866,12 @@ impl TransactionState {
                 }
             }
             if let Some(runtime) = &self.shared_region_runtime {
-                if let Err(err) = runtime.release_current_thread_log_segment() {
+                let release_result = if self.uncommitted_publication_streams.is_empty() {
+                    runtime.release_current_thread_log_segment_reusable()
+                } else {
+                    runtime.retire_current_thread_log_segment()
+                };
+                if let Err(err) = release_result {
                     if error.is_none() {
                         error = Some(err);
                     }
