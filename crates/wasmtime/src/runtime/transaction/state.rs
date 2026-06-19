@@ -879,10 +879,12 @@ impl TransactionState {
     }
 
     pub(crate) fn complete_commit(&mut self) -> Result<()> {
+        let transaction = self.active_transaction_required()?;
         self.begin_terminal_commit()?;
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
+        self.commit_transaction_authority(transaction)?;
         self.clear_active()?;
         Ok(())
     }
@@ -891,16 +893,19 @@ impl TransactionState {
         &mut self,
         delta: PersistentRootDelta,
     ) -> Result<()> {
+        let transaction = self.active_transaction_required()?;
         self.begin_terminal_commit()?;
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
         if self.shared_region_runtime.is_some() {
             self.commit_shared_persistent_root_delta_before_complete_commit(delta)?;
             self.bump_active_versioned_write_granules()?;
+            self.commit_transaction_authority(transaction)?;
             self.clear_active()?;
             return Ok(());
         }
         self.bump_active_versioned_write_granules()?;
+        self.commit_transaction_authority(transaction)?;
         self.clear_active()?;
         self.apply_committed_persistent_root_delta(delta)?;
         Ok(())

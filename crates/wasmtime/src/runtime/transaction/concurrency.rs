@@ -266,6 +266,18 @@ impl ConcurrencyControlState {
             Self::OptimisticValidation(_) => None,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn committed_transactions_for_test(&self) -> Option<BTreeSet<TransactionId>> {
+        match self {
+            Self::LockBased(policy) => Some(policy.committed_transactions_for_test()),
+            Self::NoWaitAbort(_)
+            | Self::StrictTwoPhaseLocking(_)
+            | Self::WoundWait(_)
+            | Self::WaitDie(_)
+            | Self::OptimisticValidation(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -275,6 +287,8 @@ pub(crate) struct LockBased {
     // manager.
     pub(crate) owners: BTreeMap<GranuleId, TransactionId>,
     pub(crate) read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
+    #[cfg(test)]
+    pub(crate) committed_transactions_for_test: BTreeSet<TransactionId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -509,6 +523,7 @@ impl LockBased {
         Self {
             owners: self.owners.clone(),
             read_versions: self.read_versions.clone(),
+            committed_transactions_for_test: self.committed_transactions_for_test.clone(),
         }
     }
 
@@ -620,6 +635,10 @@ impl LockBased {
     pub(crate) fn owner_for_test(&self, granule: GranuleId) -> Option<TransactionId> {
         self.owners.get(&granule).copied()
     }
+
+    pub(crate) fn committed_transactions_for_test(&self) -> BTreeSet<TransactionId> {
+        self.committed_transactions_for_test.clone()
+    }
 }
 
 impl TransactionConcurrencyControl for LockBased {
@@ -694,6 +713,14 @@ impl TransactionConcurrencyControl for LockBased {
             .iter()
             .filter_map(|(granule, owner)| (*owner == transaction).then_some(*granule))
             .collect()
+    }
+
+    fn commit_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.committed_transactions_for_test.insert(transaction);
+        }
+        Ok(())
     }
 }
 

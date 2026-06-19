@@ -2809,6 +2809,53 @@ fn begin_commit_and_abort_clear_active_transaction() {
 }
 
 #[test]
+fn commit_success_policy_hook_preserves_default_commit_behavior() {
+    let mut state = TransactionState::default();
+    let transaction = state.begin().unwrap();
+
+    state.stage_global(0, GlobalSnapshot::I32(7)).unwrap();
+    state.complete_commit().unwrap();
+
+    assert_eq!(state.active_transaction(), None);
+    assert_ne!(transaction.as_raw(), 0);
+}
+
+#[test]
+fn complete_commit_calls_policy_commit_success_hook() {
+    let mut state = TransactionState::default();
+    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased);
+    let transaction = state.begin().unwrap();
+
+    state.stage_global(0, GlobalSnapshot::I32(7)).unwrap();
+    state.complete_commit().unwrap();
+
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        state.concurrency.committed_transactions_for_test().unwrap(),
+        BTreeSet::from([transaction])
+    );
+}
+
+#[test]
+fn abort_does_not_call_policy_commit_success_hook() {
+    let mut state = TransactionState::default();
+    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased);
+    state.begin().unwrap();
+
+    state.stage_global(0, GlobalSnapshot::I32(7)).unwrap();
+    state.abort().unwrap();
+
+    assert_eq!(state.active_transaction(), None);
+    assert!(
+        state
+            .concurrency
+            .committed_transactions_for_test()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn commit_applies_only_latest_staged_records() {
     let mut state = TransactionState::default();
     state.begin().unwrap();
