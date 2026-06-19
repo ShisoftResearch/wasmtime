@@ -3,24 +3,37 @@ use std::path::PathBuf;
 
 #[cfg(all(
     feature = "transaction",
-    feature = "transaction-cc-lockbased",
-    feature = "transaction-cc-nowait-abort"
+    any(
+        all(
+            feature = "transaction-cc-lockbased",
+            feature = "transaction-cc-nowait-abort"
+        ),
+        all(
+            feature = "transaction-cc-lockbased",
+            feature = "transaction-cc-wound-wait"
+        ),
+        all(
+            feature = "transaction-cc-nowait-abort",
+            feature = "transaction-cc-wound-wait"
+        )
+    )
 ))]
 compile_error!(
     "select exactly one transaction concurrency-control feature: \
-     transaction-cc-lockbased or transaction-cc-nowait-abort"
+     transaction-cc-lockbased, transaction-cc-nowait-abort, or transaction-cc-wound-wait"
 );
 
 #[cfg(all(
     feature = "transaction",
     not(any(
         feature = "transaction-cc-lockbased",
-        feature = "transaction-cc-nowait-abort"
+        feature = "transaction-cc-nowait-abort",
+        feature = "transaction-cc-wound-wait"
     ))
 ))]
 compile_error!(
     "transaction requires one transaction concurrency-control feature: \
-     transaction-cc-lockbased or transaction-cc-nowait-abort"
+     transaction-cc-lockbased, transaction-cc-nowait-abort, or transaction-cc-wound-wait"
 );
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -69,10 +82,16 @@ pub(crate) enum TMemoryFileBacking {
 pub(crate) enum ConcurrencyControl {
     LockBased,
     NoWaitAbort,
+    WoundWait,
 }
 
 impl ConcurrencyControl {
     pub(crate) const fn default_for_build() -> Self {
+        #[cfg(feature = "transaction-cc-wound-wait")]
+        {
+            return Self::WoundWait;
+        }
+
         #[cfg(feature = "transaction-cc-nowait-abort")]
         {
             return Self::NoWaitAbort;
@@ -84,6 +103,7 @@ impl ConcurrencyControl {
         }
 
         #[cfg(not(any(
+            feature = "transaction-cc-wound-wait",
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-lockbased"
         )))]

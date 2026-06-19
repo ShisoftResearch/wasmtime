@@ -15513,6 +15513,67 @@ fn no_wait_abort_abort_releases_owned_granules() {
 }
 
 #[test]
+fn wound_wait_older_writer_wounds_younger_owner() {
+    let mut policy = WoundWait::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write_for_test(younger, granule, 3).unwrap();
+    let wounded = policy.acquire_write(older, granule, 3).unwrap();
+
+    assert_eq!(wounded, Some(younger));
+    assert_eq!(policy.owner_for_test(granule), Some(older));
+}
+
+#[test]
+fn wound_wait_older_reader_wounds_younger_writer() {
+    let mut policy = WoundWait::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write_for_test(younger, granule, 3).unwrap();
+    let wounded = policy.record_read(older, granule, 3).unwrap();
+
+    assert_eq!(wounded, Some(younger));
+    assert_eq!(policy.owner_for_test(granule), None);
+    assert_eq!(policy.read_granules_for_transaction(older), vec![granule]);
+}
+
+#[test]
+fn wound_wait_younger_requester_conflicts_with_older_owner() {
+    let mut policy = WoundWait::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write_for_test(older, granule, 3).unwrap();
+
+    let read_error = policy
+        .record_read_result_for_test(younger, granule, 3)
+        .unwrap_err();
+    assert_eq!(read_error, WoundWaitConflictKindForTest::ReadOwnedByOther);
+
+    let write_error = policy
+        .acquire_write_result_for_test(younger, granule, 3)
+        .unwrap_err();
+    assert_eq!(write_error, WoundWaitConflictKindForTest::WriteOwnedByOther);
+}
+
+#[test]
 fn transaction_timestamp_helpers_use_transaction_id_order() {
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
@@ -15603,6 +15664,7 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
 
     assert_contract(&mut LockBased::default());
     assert_contract(&mut NoWaitAbort::default());
+    assert_contract(&mut WoundWait::default());
 }
 
 #[test]
@@ -15624,6 +15686,25 @@ fn selected_concurrency_control_uses_nowait_abort_semantics() {
         "{err:?}"
     );
     assert_eq!(policy.owner_for_granule(granule), Some(younger));
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
+fn selected_concurrency_control_uses_wound_wait_semantics() {
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::WoundWait);
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_granule_write(younger, granule, 0).unwrap();
+    let wounded = policy.acquire_granule_write(older, granule, 0).unwrap();
+
+    assert_eq!(wounded, Some(younger));
+    assert_eq!(policy.owner_for_granule(granule), Some(older));
 }
 
 #[test]

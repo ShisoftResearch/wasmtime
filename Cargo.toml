@@ -619,6 +619,7 @@ transaction = [
 ]
 transaction-cc-lockbased = ["wasmtime/transaction-cc-lockbased"]
 transaction-cc-nowait-abort = ["wasmtime/transaction-cc-nowait-abort"]
+transaction-cc-wound-wait = ["wasmtime/transaction-cc-wound-wait"]
 
 # CLI subcommands for the `wasmtime` executable. See `wasmtime $cmd --help`
 # for more information on each subcommand.
