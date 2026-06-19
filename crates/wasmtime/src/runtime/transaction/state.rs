@@ -2055,6 +2055,32 @@ impl TransactionState {
         Ok(publications)
     }
 
+    pub(crate) fn tmemory_size_publications(&self) -> Result<Vec<persist::PendingPublication>> {
+        self.ensure_active()?;
+        let mut publications = Vec::new();
+        for (&granule, &new_pages) in &self.staged_memory_sizes {
+            let GranuleId::TMemorySize {
+                instance,
+                memory_index,
+            } = granule
+            else {
+                bail!("staged memory size map contains non-size key");
+            };
+            let version = self
+                .current_version_for_granule(granule, 0)?
+                .checked_add(1)
+                .context("tmemory size publication version overflow")?;
+            publications.push(persist::PendingPublication::tmemory_size(
+                granule_owner_instance(instance).map(InstanceId::as_u32),
+                memory_index,
+                u32::try_from(version)
+                    .context("tmemory size publication version does not fit durable log")?,
+                new_pages,
+            )?);
+        }
+        Ok(publications)
+    }
+
     pub(crate) fn persistent_gc_commit_delta(
         &self,
         object_table: &ObjectTable,

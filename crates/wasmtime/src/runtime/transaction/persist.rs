@@ -9,6 +9,7 @@ use crate::runtime::transaction::type_layout::{
 use crate::runtime::vm::unpack_object_granule_id;
 use crate::runtime::vm::{
     PackedGranuleDomain, TMemory, TxLogEntry, TxLogEntryRole, pack_object_granule_id,
+    pack_tmemory_size_logical_id,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -89,6 +90,21 @@ impl DurableDataStream {
 }
 
 impl PendingPublication {
+    pub(crate) fn tmemory_size(
+        owner_instance: Option<u32>,
+        memory_index: u32,
+        version: u32,
+        new_pages: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            logical_id: pack_tmemory_size_logical_id(owner_instance, memory_index)?,
+            version,
+            kind: PackedGranuleDomain::TMemorySize as u16,
+            type_layout_id: 0,
+            payload: new_pages.to_le_bytes().to_vec(),
+        })
+    }
+
     fn persistent_root(
         domain: PackedGranuleDomain,
         root_index: u64,

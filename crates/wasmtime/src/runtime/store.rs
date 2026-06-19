@@ -944,16 +944,21 @@ impl<T> Store<T> {
         &mut self,
         runtime: TransactionRegionRuntime,
     ) {
-        if let Ok(Some(shared)) = runtime.shared_file_backed_storage_for_store_adoption() {
-            self.inner.transaction_config = shared.transaction_config().unwrap();
-            self.inner
-                .transaction_state
-                .open_shared_file_backed_durable_log(&shared)
-                .unwrap();
-            self.inner
-                .transaction_state
-                .set_shared_region_runtime(Some(runtime.clone()));
-        }
+        runtime
+            .with_shared_file_backed_tmemory_commit_read_lock(|| {
+                if let Some(shared) = runtime.shared_file_backed_storage_for_store_adoption()? {
+                    self.inner.transaction_config = shared.transaction_config().unwrap();
+                    self.inner
+                        .transaction_state
+                        .open_shared_file_backed_durable_log(&shared)
+                        .unwrap();
+                    self.inner
+                        .transaction_state
+                        .set_shared_region_runtime(Some(runtime.clone()));
+                }
+                Ok(())
+            })
+            .unwrap();
         *self.inner.transaction_region_runtime_mut() = runtime;
     }
 
@@ -1858,6 +1863,10 @@ impl StoreOpaque {
         .context("transaction log block count overflow")?;
         self.transaction_region_runtime
             .record_opened_file_backed_storage(&tmemory_path, &tx_log_path, tx_log_blocks)?;
+        if let Some(tmemory_pages) = recovered.committed_file_backed_tmemory_pages()? {
+            self.transaction_region_runtime
+                .record_file_backed_tmemory_pages(tmemory_pages)?;
+        }
         let shared = self
             .transaction_region_runtime
             .shared_file_backed_storage()?

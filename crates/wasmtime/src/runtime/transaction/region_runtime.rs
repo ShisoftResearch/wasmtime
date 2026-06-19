@@ -15,7 +15,6 @@ use super::{
 
 const FIRST_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x2000_0000;
 const MAX_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x3fff_ffff;
-const TMEMORY_WASM_PAGE_SIZE: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DurableLogSegment {
@@ -272,13 +271,12 @@ impl TransactionRegionRuntime {
     ) -> Result<()> {
         let mut runtime = self.lock()?;
         let existing = runtime.file_backed_storage.clone();
-        let mut shared = SharedFileBackedStorageConfig::new(
+        let shared = SharedFileBackedStorageConfig::new(
             TMemoryFileBacking::ExistingPath(tmemory_path.to_path_buf()),
             tx_log_path.to_path_buf(),
             tx_log_blocks,
         )
         .with_reused_locks_from(existing.as_ref());
-        shared.tmemory_pages = Some(file_backed_tmemory_pages_from_path(tmemory_path)?);
         runtime.file_backed_storage = Some(shared);
         Ok(())
     }
@@ -639,6 +637,10 @@ impl TransactionRegionRuntime {
     ) -> Result<Self> {
         let runtime = Self::default();
         TxDurableLog::open_file_backed(tx_log_path)?;
+        let recovered =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(
+                tx_log_path,
+            )?;
         let tx_log_blocks = u32::try_from(
             std::fs::metadata(tx_log_path)
                 .with_context(|| {
@@ -649,6 +651,9 @@ impl TransactionRegionRuntime {
         )
         .context("transaction log block count overflow")?;
         runtime.record_opened_file_backed_storage(tmemory_path, tx_log_path, tx_log_blocks)?;
+        if let Some(tmemory_pages) = recovered.committed_file_backed_tmemory_pages()? {
+            runtime.record_file_backed_tmemory_pages(tmemory_pages)?;
+        }
         Ok(runtime)
     }
 
@@ -773,16 +778,4 @@ impl TransactionRegionRuntime {
             .unwrap()
             .fail_apply_persistent_root_delta_once_for_test = true;
     }
-}
-
-fn file_backed_tmemory_pages_from_path(path: &Path) -> Result<u64> {
-    let len = std::fs::metadata(path)
-        .with_context(|| format!("failed to stat file-backed tmemory {}", path.display()))?
-        .len();
-    ensure!(
-        len % TMEMORY_WASM_PAGE_SIZE == 0,
-        "file-backed tmemory length {} is not wasm-page aligned",
-        path.display()
-    );
-    Ok(len / TMEMORY_WASM_PAGE_SIZE)
 }

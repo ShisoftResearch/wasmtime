@@ -789,19 +789,21 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         apply_staged_transaction_record(store, instance, record)?;
     }
 
-    let (object_publications, root_delta, persistent_gc_delta) = {
+    let (durable_publications, root_delta, persistent_gc_delta) = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
         let mut object_publications = Vec::new();
         state.commit_object_payloads_into(object_table, &mut object_publications)?;
         let root_delta = state.staged_persistent_root_delta(&*object_table)?;
         let root_publications = state.persistent_root_publications(&root_delta)?;
+        let tmemory_size_publications = state.tmemory_size_publications()?;
         let persistent_gc_delta =
             state.persistent_gc_commit_delta(&*object_table, &object_publications)?;
         object_publications.extend(root_publications);
+        object_publications.extend(tmemory_size_publications);
         (object_publications, root_delta, persistent_gc_delta)
     };
-    if !object_publications.is_empty() {
+    if !durable_publications.is_empty() {
         let object_marker = {
             let store = store.store_opaque_mut();
             let (state, object_table) = store.transaction_state_and_object_table_mut();
@@ -809,7 +811,7 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
                 stream_id,
                 txid,
                 &*object_table,
-                &object_publications,
+                &durable_publications,
             )?
         };
         final_marker = object_marker.or(final_marker);

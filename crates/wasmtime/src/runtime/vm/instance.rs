@@ -249,6 +249,20 @@ impl Instance {
         module: &wasmtime_environ::Module,
         store: &StoreOpaque,
     ) -> Result<TMemorySidecar> {
+        if store.transaction_config().tmemory_backend() == TMemoryBackend::FileBackedMemory {
+            let runtime = store.transaction_region_runtime().clone();
+            return runtime.with_shared_file_backed_tmemory_commit_read_lock(|| {
+                Self::build_tmemory_sidecar_locked(module, store)
+            });
+        }
+        Self::build_tmemory_sidecar_locked(module, store)
+    }
+
+    #[cfg(has_virtual_memory)]
+    fn build_tmemory_sidecar_locked(
+        module: &wasmtime_environ::Module,
+        store: &StoreOpaque,
+    ) -> Result<TMemorySidecar> {
         let transaction_config = store.transaction_config();
         let mut sidecar = TMemorySidecar::default();
         let defined_tmemories = module

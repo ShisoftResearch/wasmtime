@@ -121,6 +121,8 @@ pub(crate) use crate::runtime::vm::memory::tmemory::TxLogEntryRole;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::block_region;
 #[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::pack_tmemory_size_logical_id;
+#[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredObjectWinner;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredRegion;

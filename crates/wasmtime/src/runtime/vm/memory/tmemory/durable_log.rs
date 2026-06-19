@@ -548,6 +548,29 @@ pub(crate) fn pack_tmemory_granule_id(
     Ok(((PackedGranuleDomain::TMemory as u64) << 60) | payload)
 }
 
+pub(crate) fn pack_tmemory_size_logical_id(
+    instance: Option<u32>,
+    memory_index: u32,
+) -> Result<u64> {
+    let instance_code = match instance {
+        Some(instance) => u64::from(instance)
+            .checked_add(1)
+            .context("tmemory instance id overflow")?,
+        None => 0,
+    };
+    ensure!(
+        instance_code < (1u64 << 20),
+        "tmemory instance id does not fit in packed granule id payload"
+    );
+    ensure!(
+        memory_index < (1u32 << 12),
+        "tmemory memory index does not fit in packed granule id payload"
+    );
+
+    let payload = (instance_code << 40) | (u64::from(memory_index) << 28);
+    Ok(((PackedGranuleDomain::TMemorySize as u64) << 60) | payload)
+}
+
 pub(crate) fn unpack_tmemory_granule_id(logical_id: u64) -> Result<(Option<u32>, u32, u64)> {
     let domain = packed_granule_domain(logical_id)?;
     ensure!(
@@ -564,6 +587,27 @@ pub(crate) fn unpack_tmemory_granule_id(logical_id: u64) -> Result<(Option<u32>,
         Some(u32::try_from(instance_code - 1).unwrap())
     };
     Ok((instance, memory_index, granule_index))
+}
+
+pub(crate) fn unpack_tmemory_size_logical_id(logical_id: u64) -> Result<(Option<u32>, u32)> {
+    let domain = packed_granule_domain(logical_id)?;
+    ensure!(
+        domain == PackedGranuleDomain::TMemorySize,
+        "logical id {logical_id:#x} is not a tmemory size granule"
+    );
+    let payload = logical_id & ((1u64 << 60) - 1);
+    let instance_code = (payload >> 40) & ((1u64 << 20) - 1);
+    let memory_index = u32::try_from((payload >> 28) & ((1u64 << 12) - 1)).unwrap();
+    ensure!(
+        payload & ((1u64 << 28) - 1) == 0,
+        "tmemory size logical id reserves low payload bits"
+    );
+    let instance = if instance_code == 0 {
+        None
+    } else {
+        Some(u32::try_from(instance_code - 1).unwrap())
+    };
+    Ok((instance, memory_index))
 }
 
 pub(crate) fn unpack_object_granule_id(logical_id: u64) -> Result<(PackedGranuleDomain, u64)> {

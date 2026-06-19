@@ -415,6 +415,250 @@ fn shared_region_runtime_late_store_adopts_existing_file_backed_tmemory_after_gr
 
 #[cfg(all(unix, has_virtual_memory))]
 #[test]
+fn shared_region_runtime_store_adoption_waits_for_file_backed_tmemory_write_lock() {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::thread;
+    use std::time::Duration;
+
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(&engine, "(module (tmemory 1))");
+
+    let mut first_store = crate::Store::new(&engine, ());
+    first_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let _instance = crate::Instance::new(&mut first_store, &module, &[]).unwrap();
+    drop(first_store);
+
+    let (ready_tx, ready_rx) = channel();
+    let (done_tx, done_rx) = channel();
+    let runtime_for_thread = runtime.clone();
+
+    let mut handle = None;
+
+    runtime
+        .with_shared_file_backed_tmemory_commit_write_lock(|| {
+            handle = Some(thread::spawn(move || {
+                clear_current_thread_transaction_for_test();
+
+                let engine = crate::Engine::default();
+                let mut store = crate::Store::new(&engine, ());
+                ready_tx.send(()).unwrap();
+                store.set_transaction_region_runtime_for_test(runtime_for_thread);
+                done_tx.send(()).unwrap();
+
+                clear_current_thread_transaction_for_test();
+            }));
+            ready_rx.recv().unwrap();
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(RecvTimeoutError::Timeout)
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    done_rx.recv().unwrap();
+    handle.take().unwrap().join().unwrap();
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
+fn shared_region_runtime_restart_keeps_file_backed_tmemory_min_size_when_max_is_larger() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1 10)
+              (tfunc (export "size") (result i32)
+                (tmemory.size)))
+        "#,
+    );
+
+    let mut first_store = crate::Store::new(&engine, ());
+    first_store.set_transaction_region_runtime_for_test(runtime);
+    let first_instance = crate::Instance::new(&mut first_store, &module, &[]).unwrap();
+    let size = first_instance
+        .get_typed_func::<(), i32>(&mut first_store, "size")
+        .unwrap();
+    assert_eq!(size.call(&mut first_store, ()).unwrap(), 1);
+    drop(first_store);
+
+    let reopened_runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+        )
+        .unwrap();
+    let mut reopened_store = crate::Store::new(&engine, ());
+    reopened_store.set_transaction_region_runtime_for_test(reopened_runtime);
+    let reopened_instance = crate::Instance::new(&mut reopened_store, &module, &[]).unwrap();
+    let reopened_size = reopened_instance
+        .get_typed_func::<(), i32>(&mut reopened_store, "size")
+        .unwrap();
+
+    assert_eq!(reopened_size.call(&mut reopened_store, ()).unwrap(), 1);
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
+fn shared_region_runtime_restart_recovers_grown_file_backed_tmemory_size_with_max_limit() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1 10)
+              (tfunc (export "size") (result i32)
+                (tmemory.size))
+              (tfunc (export "grow") (param i32) (result i32)
+                (tmemory.grow (local.get 0)))
+              (tfunc (export "write") (param i32 i32)
+                (i32.tstore (local.get 0) (local.get 1)))
+              (tfunc (export "read") (param i32) (result i32)
+                (i32.tload (local.get 0))))
+        "#,
+    );
+
+    let grown_addr = 64 * 1024;
+    let expected = 0x5566_7788;
+
+    let mut first_store = crate::Store::new(&engine, ());
+    first_store.set_transaction_region_runtime_for_test(runtime);
+    let first_instance = crate::Instance::new(&mut first_store, &module, &[]).unwrap();
+    let grow = first_instance
+        .get_typed_func::<i32, i32>(&mut first_store, "grow")
+        .unwrap();
+    let write = first_instance
+        .get_typed_func::<(i32, i32), ()>(&mut first_store, "write")
+        .unwrap();
+    assert_eq!(grow.call(&mut first_store, 1).unwrap(), 1);
+    write
+        .call(&mut first_store, (grown_addr, expected))
+        .unwrap();
+    drop(first_store);
+
+    let reopened_runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+        )
+        .unwrap();
+    let mut reopened_store = crate::Store::new(&engine, ());
+    reopened_store.set_transaction_region_runtime_for_test(reopened_runtime);
+    let reopened_instance = crate::Instance::new(&mut reopened_store, &module, &[]).unwrap();
+    let size = reopened_instance
+        .get_typed_func::<(), i32>(&mut reopened_store, "size")
+        .unwrap();
+    let read = reopened_instance
+        .get_typed_func::<i32, i32>(&mut reopened_store, "read")
+        .unwrap();
+
+    assert_eq!(size.call(&mut reopened_store, ()).unwrap(), 2);
+    assert_eq!(
+        read.call(&mut reopened_store, grown_addr).unwrap(),
+        expected
+    );
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
+fn shared_region_runtime_restart_recovers_grow_only_file_backed_tmemory_size_with_max_limit() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1 10)
+              (tfunc (export "size") (result i32)
+                (tmemory.size))
+              (tfunc (export "grow") (param i32) (result i32)
+                (tmemory.grow (local.get 0))))
+        "#,
+    );
+
+    let mut first_store = crate::Store::new(&engine, ());
+    first_store.set_transaction_region_runtime_for_test(runtime);
+    let first_instance = crate::Instance::new(&mut first_store, &module, &[]).unwrap();
+    let grow = first_instance
+        .get_typed_func::<i32, i32>(&mut first_store, "grow")
+        .unwrap();
+    assert_eq!(grow.call(&mut first_store, 1).unwrap(), 1);
+    drop(first_store);
+
+    let reopened_runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+        )
+        .unwrap();
+    let mut reopened_store = crate::Store::new(&engine, ());
+    reopened_store.set_transaction_region_runtime_for_test(reopened_runtime);
+    let reopened_instance = crate::Instance::new(&mut reopened_store, &module, &[]).unwrap();
+    let size = reopened_instance
+        .get_typed_func::<(), i32>(&mut reopened_store, "size")
+        .unwrap();
+
+    assert_eq!(size.call(&mut reopened_store, ()).unwrap(), 2);
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
 fn shared_region_runtime_restart_recovers_grown_file_backed_tmemory_size() {
     clear_current_thread_transaction_for_test();
 

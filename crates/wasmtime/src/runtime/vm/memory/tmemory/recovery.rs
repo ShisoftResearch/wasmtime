@@ -3,6 +3,7 @@ use super::durable_log::BlockKind;
 use super::{
     DATA_CHUNK_MAGIC, DataChunkHeader, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader,
     TxDataRecordRole, TxLogEntry, TxLogEntryRole, packed_granule_domain, unpack_object_granule_id,
+    unpack_tmemory_size_logical_id,
 };
 use crate::prelude::*;
 #[cfg(test)]
@@ -40,6 +41,7 @@ pub(crate) struct RecoveredRegion {
     pub(crate) streams: Vec<RecoveredStream>,
     pub(crate) winners: Vec<RecoveryWinner>,
     pub(crate) object_winners: Vec<RecoveredObjectWinner>,
+    pub(crate) tmemory_size_winners: Vec<RecoveredTMemorySizeWinner>,
     pub(crate) type_layouts: TypeLayoutRegistry,
     pub(crate) root_object_ids: Vec<u64>,
     pub(crate) tmemory_undo_rollbacks: Vec<RecoveredTMemoryUndoRollback>,
@@ -65,6 +67,14 @@ pub(crate) struct RecoveredTMemoryUndoRollback {
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
     pub(crate) old_granule_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveredTMemorySizeWinner {
+    pub(crate) owner_instance: Option<u32>,
+    pub(crate) memory_index: u32,
+    pub(crate) version: u32,
+    pub(crate) new_pages: u64,
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +157,8 @@ pub(crate) fn recover_region(
 
     let winners = winners.into_values().collect::<Vec<_>>();
     let object_winners = replay_object_winners(region, &discovered.data_chunk_index, &winners)?;
+    let tmemory_size_winners =
+        replay_tmemory_size_winners(region, &discovered.data_chunk_index, &winners)?;
     let root_object_ids = replay_root_object_ids(region, &discovered.data_chunk_index, &winners)?;
 
     Ok(RecoveredRegion {
@@ -160,6 +172,7 @@ pub(crate) fn recover_region(
         streams: discovered.streams,
         winners,
         object_winners,
+        tmemory_size_winners,
         type_layouts,
         root_object_ids,
         tmemory_undo_rollbacks,
@@ -170,6 +183,65 @@ impl RecoveredRegion {
     pub(crate) fn committed_object_winners(&self) -> Result<Vec<RecoveredObjectWinner>> {
         Ok(self.object_winners.clone())
     }
+
+    pub(crate) fn committed_file_backed_tmemory_pages(&self) -> Result<Option<u64>> {
+        let mut pages = None;
+        let mut key = None;
+        for winner in &self.tmemory_size_winners {
+            let winner_key = (winner.owner_instance, winner.memory_index);
+            if let Some(current_key) = key {
+                ensure!(
+                    current_key == winner_key,
+                    "file-backed tmemory recovery found multiple tmemory size winners"
+                );
+            } else {
+                key = Some(winner_key);
+            }
+            pages = Some(winner.new_pages);
+        }
+        Ok(pages)
+    }
+}
+
+fn replay_tmemory_size_winners(
+    region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
+    winners: &[RecoveryWinner],
+) -> Result<Vec<RecoveredTMemorySizeWinner>> {
+    let mut tmemory_sizes = Vec::new();
+
+    for winner in winners {
+        let Ok(domain) = packed_granule_domain(winner.logical_id) else {
+            continue;
+        };
+        if domain != PackedGranuleDomain::TMemorySize {
+            continue;
+        }
+
+        let (data_header, payload) = load_publication_payload(
+            region,
+            data_chunk_index,
+            winner.data_block,
+            winner.data_offset,
+        )?;
+        ensure!(
+            data_header.role()? == TxDataRecordRole::TObjectPub,
+            "recovered tmemory size data record has non-publication role"
+        );
+        ensure!(
+            payload.len() == size_of::<u64>(),
+            "recovered tmemory size payload must be exactly 8 bytes"
+        );
+        let (owner_instance, memory_index) = unpack_tmemory_size_logical_id(winner.logical_id)?;
+        tmemory_sizes.push(RecoveredTMemorySizeWinner {
+            owner_instance,
+            memory_index,
+            version: winner.version,
+            new_pages: u64::from_le_bytes(payload.try_into().unwrap()),
+        });
+    }
+
+    Ok(tmemory_sizes)
 }
 
 fn replay_root_object_ids(
