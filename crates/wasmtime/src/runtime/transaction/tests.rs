@@ -321,23 +321,17 @@ fn shared_region_runtime_file_backed_tmemory_recovers_commits_from_two_stores() 
     first.join().unwrap();
     second.join().unwrap();
 
-    let _reopened_runtime =
+    let reopened_runtime =
         crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
             &tmemory_path,
             &tx_log_path,
         )
         .unwrap();
-    let recovered = TxDurableLog::recover_file_backed_for_test(&tx_log_path).unwrap();
-    let mut reopened = crate::runtime::vm::TMemory::new(
-        TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path).unwrap(),
-        1,
-        Some(1),
-    )
-    .unwrap();
-    reopened
-        .apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
-            recovered.tmemory_undo_rollbacks,
-        )
+    let engine = crate::Engine::default();
+    let mut reopened_store = crate::Store::new(&engine, ());
+    reopened_store.set_transaction_region_runtime_for_test(reopened_runtime);
+    let reopened = reopened_store
+        .transaction_recover_file_backed_tmemory_for_test(1, Some(1))
         .unwrap();
 
     assert_eq!(
@@ -350,6 +344,71 @@ fn shared_region_runtime_file_backed_tmemory_recovers_commits_from_two_stores() 
             .unwrap(),
         vec![0x55, 0x66, 0x77, 0x08]
     );
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
+fn shared_region_runtime_late_store_adopts_existing_file_backed_tmemory_after_grow() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "size") (result i32)
+                (tmemory.size))
+              (tfunc (export "grow") (param i32) (result i32)
+                (tmemory.grow (local.get 0)))
+              (tfunc (export "write") (param i32 i32)
+                (i32.tstore (local.get 0) (local.get 1)))
+              (tfunc (export "read") (param i32) (result i32)
+                (i32.tload (local.get 0))))
+        "#,
+    );
+
+    let grown_addr = 64 * 1024;
+    let expected = 0x4433_2211;
+
+    let mut first_store = crate::Store::new(&engine, ());
+    first_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let first_instance = crate::Instance::new(&mut first_store, &module, &[]).unwrap();
+    let grow = first_instance
+        .get_typed_func::<i32, i32>(&mut first_store, "grow")
+        .unwrap();
+    let write = first_instance
+        .get_typed_func::<(i32, i32), ()>(&mut first_store, "write")
+        .unwrap();
+    assert_eq!(grow.call(&mut first_store, 1).unwrap(), 1);
+    write
+        .call(&mut first_store, (grown_addr, expected))
+        .unwrap();
+
+    let mut second_store = crate::Store::new(&engine, ());
+    second_store.set_transaction_region_runtime_for_test(runtime);
+    let second_instance = crate::Instance::new(&mut second_store, &module, &[]).unwrap();
+    let size = second_instance
+        .get_typed_func::<(), i32>(&mut second_store, "size")
+        .unwrap();
+    let read = second_instance
+        .get_typed_func::<i32, i32>(&mut second_store, "read")
+        .unwrap();
+
+    assert_eq!(size.call(&mut second_store, ()).unwrap(), 2);
+    assert_eq!(read.call(&mut second_store, grown_addr).unwrap(), expected);
 
     clear_current_thread_transaction_for_test();
 }

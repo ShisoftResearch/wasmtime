@@ -3528,7 +3528,9 @@ fn grow_tmemory_to_pages(
         }
         tmemory
             .grow_to_pages(new_pages)
-            .context("transactional memory grow failed during commit")
+            .context("transactional memory grow failed during commit")?;
+        runtime.record_file_backed_tmemory_pages(new_pages)?;
+        Ok(())
     })
 }
 

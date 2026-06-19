@@ -6,7 +6,7 @@ use crate::code::ModuleWithCode;
 use crate::module::ModuleRegistry;
 use crate::prelude::*;
 #[cfg(has_virtual_memory)]
-use crate::runtime::transaction::{TMemoryBackend, TransactionConfig};
+use crate::runtime::transaction::TMemoryBackend;
 use crate::runtime::vm::export::{Export, ExportMemory};
 #[cfg(has_virtual_memory)]
 use crate::runtime::vm::memory::tmemory::{
@@ -183,7 +183,7 @@ impl Instance {
         let module = req.runtime_info.env_module();
         let memory_tys = &module.memories;
         #[cfg(has_virtual_memory)]
-        let tmemory_sidecar = Self::build_tmemory_sidecar(module, req.store.transaction_config())
+        let tmemory_sidecar = Self::build_tmemory_sidecar(module, req.store)
             .map_err(|_| OutOfMemory::new(usize::MAX))?;
         let mut passive_elements = TryVec::with_capacity(module.passive_elements.len())?;
 
@@ -247,8 +247,9 @@ impl Instance {
     #[cfg(has_virtual_memory)]
     fn build_tmemory_sidecar(
         module: &wasmtime_environ::Module,
-        transaction_config: &TransactionConfig,
+        store: &StoreOpaque,
     ) -> Result<TMemorySidecar> {
+        let transaction_config = store.transaction_config();
         let mut sidecar = TMemorySidecar::default();
         let defined_tmemories = module
             .transaction_objects
@@ -283,7 +284,17 @@ impl Instance {
                 )),
                 None => None,
             };
-            let tmemory = TMemory::new(transaction_config.clone(), min_pages, max_pages)?;
+            let mut tmemory = TMemory::new(transaction_config.clone(), min_pages, max_pages)?;
+            if transaction_config.tmemory_backend() == TMemoryBackend::FileBackedMemory {
+                if let Some(shared_pages) = store
+                    .transaction_region_runtime()
+                    .shared_file_backed_tmemory_pages()?
+                {
+                    if shared_pages > min_pages {
+                        tmemory.grow_to_pages(shared_pages)?;
+                    }
+                }
+            }
             sidecar.insert(memory_index, tmemory)?;
         }
 

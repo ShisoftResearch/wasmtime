@@ -218,21 +218,14 @@ fn new_file_backed_mapping(
     len: usize,
     unlink_on_drop: bool,
 ) -> Result<FileBackedMapping> {
-    let existing_len = std::fs::metadata(&path)
-        .ok()
-        .and_then(|meta| usize::try_from(meta.len()).ok());
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&path)
         .with_context(|| format!("failed to open file-backed tmemory file {}", path.display()))?;
-    finish_file_backed_mapping(
-        file,
-        path,
-        existing_len.unwrap_or(0).max(len),
-        unlink_on_drop,
-    )
+    finish_file_backed_mapping(file, path, len, unlink_on_drop)
 }
 
 #[cfg(unix)]

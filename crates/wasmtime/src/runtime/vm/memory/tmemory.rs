@@ -962,7 +962,7 @@ impl FileBackedMemory {
             None => byte_len,
         };
         let byte_capacity =
-            existing_file_backed_capacity(&file_backing)?.unwrap_or(requested_byte_capacity);
+            existing_file_backed_len(&file_backing)?.unwrap_or(requested_byte_capacity);
         let byte_capacity = byte_capacity.max(requested_byte_capacity);
         let existing_pages = byte_capacity.div_ceil(WASM_PAGE_SIZE) as u64;
         let max_pages = max_pages.max(existing_pages);
@@ -1079,7 +1079,7 @@ impl FileBackedMemory {
     }
 }
 
-fn existing_file_backed_capacity(file_backing: &TMemoryFileBacking) -> Result<Option<usize>> {
+fn existing_file_backed_len(file_backing: &TMemoryFileBacking) -> Result<Option<usize>> {
     let TMemoryFileBacking::ExistingPath(path) = file_backing else {
         return Ok(None);
     };

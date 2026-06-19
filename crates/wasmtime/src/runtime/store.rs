@@ -929,12 +929,22 @@ impl<T> Store<T> {
             .transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
     }
 
+    #[cfg(all(feature = "transaction", test, unix))]
+    pub(crate) fn transaction_recover_file_backed_tmemory_for_test(
+        &self,
+        min_pages: u64,
+        max_pages: Option<u64>,
+    ) -> Result<crate::runtime::vm::TMemory> {
+        self.inner
+            .transaction_recover_file_backed_tmemory_for_test(min_pages, max_pages)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_transaction_region_runtime_for_test(
         &mut self,
         runtime: TransactionRegionRuntime,
     ) {
-        if let Ok(Some(shared)) = runtime.shared_file_backed_storage() {
+        if let Ok(Some(shared)) = runtime.shared_file_backed_storage_for_store_adoption() {
             self.inner.transaction_config = shared.transaction_config().unwrap();
             self.inner
                 .transaction_state
@@ -1859,6 +1869,29 @@ impl StoreOpaque {
         self.transaction_object_table = recovered_object_table;
         self.transaction_config = config;
         Ok(())
+    }
+
+    #[cfg(all(feature = "transaction", test, unix))]
+    pub(crate) fn transaction_recover_file_backed_tmemory_for_test(
+        &self,
+        min_pages: u64,
+        max_pages: Option<u64>,
+    ) -> Result<crate::runtime::vm::TMemory> {
+        let shared = self
+            .transaction_region_runtime
+            .shared_file_backed_storage_for_store_adoption()?
+            .context("shared file-backed storage config was not recorded")?;
+        let recovered =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(
+                shared.tx_log_path(),
+            )?;
+        let mut tmemory = crate::runtime::vm::TMemory::new(
+            self.transaction_config.clone(),
+            min_pages,
+            max_pages,
+        )?;
+        tmemory.apply_recovered_tmemory_undo_rollbacks(recovered.tmemory_undo_rollbacks)?;
+        Ok(tmemory)
     }
 
     #[allow(dead_code)]
@@ -3353,37 +3386,37 @@ mod tests {
     #[cfg(all(feature = "transaction", unix))]
     #[test]
     fn store_transaction_file_backed_config_selects_existing_tmemory_path() {
+        use crate::runtime::transaction::{TMemoryFileBacking, TransactionRegionRuntime};
         use crate::runtime::vm::TMemory;
 
         let dir = tempfile::tempdir().unwrap();
         let tmemory_path = dir.path().join("phase.tmemory");
         let tx_log_path = dir.path().join("tx-log.bin");
         let engine = Engine::default();
-        let mut store = Store::new(&engine, ());
+        let runtime =
+            TransactionRegionRuntime::create_file_backed_for_test(&tmemory_path, &tx_log_path, 32)
+                .unwrap();
 
-        store
-            .transaction_create_file_backed_storage_for_test(
-                tmemory_path.clone(),
-                tx_log_path.clone(),
-                32,
-            )
-            .unwrap();
-        let create_config = store.as_store_opaque().transaction_config().clone();
-        let mut created = TMemory::new(create_config, 1, Some(1)).unwrap();
+        let mut first_store = Store::new(&engine, ());
+        first_store.set_transaction_region_runtime_for_test(runtime.clone());
+        let create_config = first_store.as_store_opaque().transaction_config().clone();
+        let mut created = TMemory::new(create_config, 1, None).unwrap();
+        created.grow_to_pages(2).unwrap();
         created.commit_range(64, &[1, 2, 3, 4]).unwrap();
         drop(created);
-        assert_eq!(
-            std::fs::metadata(&tmemory_path).unwrap().len(),
-            crate::vm::block_region::BLOCK_SIZE as u64
-        );
+        assert!(std::fs::metadata(&tmemory_path).unwrap().len() >= (2 * 64 * 1024) as u64);
 
-        store
-            .transaction_open_file_backed_storage_for_test(tmemory_path.clone(), tx_log_path)
-            .unwrap();
-        let open_config = store.as_store_opaque().transaction_config().clone();
+        let mut second_store = Store::new(&engine, ());
+        second_store.set_transaction_region_runtime_for_test(runtime);
+        let open_config = second_store.as_store_opaque().transaction_config().clone();
+        assert_eq!(
+            open_config.tmemory_file_backing(),
+            Some(TMemoryFileBacking::ExistingPath(tmemory_path.clone()))
+        );
         let reopened = TMemory::new(open_config, 1, Some(1)).unwrap();
 
         assert_eq!(reopened.read_committed(64..68).unwrap(), vec![1, 2, 3, 4]);
+        assert!(reopened.byte_capacity() >= 2 * 64 * 1024);
     }
 
     #[cfg(all(feature = "transaction", unix))]

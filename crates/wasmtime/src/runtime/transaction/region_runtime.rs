@@ -35,6 +35,7 @@ pub(crate) struct SharedFileBackedStorageConfig {
     tmemory_file_backing: TMemoryFileBacking,
     tx_log_path: PathBuf,
     tx_log_blocks: u32,
+    tmemory_pages: Option<u64>,
     // Coordinates file-backed durable-log region allocator metadata across
     // independent mappings. Per-stream publication still runs store-local.
     durable_log_allocator_lock: Arc<Mutex<()>>,
@@ -51,6 +52,7 @@ impl SharedFileBackedStorageConfig {
             tmemory_file_backing,
             tx_log_path,
             tx_log_blocks,
+            tmemory_pages: None,
             durable_log_allocator_lock: Arc::new(Mutex::new(())),
             tmemory_commit_lock: Arc::new(RwLock::new(())),
         }
@@ -76,6 +78,10 @@ impl SharedFileBackedStorageConfig {
         self.tx_log_blocks
     }
 
+    pub(crate) fn tmemory_pages(&self) -> Option<u64> {
+        self.tmemory_pages
+    }
+
     pub(crate) fn durable_log_allocator_lock(&self) -> Arc<Mutex<()>> {
         self.durable_log_allocator_lock.clone()
     }
@@ -90,6 +96,19 @@ impl SharedFileBackedStorageConfig {
             self.tmemory_commit_lock = existing.tmemory_commit_lock();
         }
         self
+    }
+
+    fn reopen_tmemory_for_store_adoption(&mut self) {
+        let TMemoryFileBacking::Path(path) = &self.tmemory_file_backing else {
+            return;
+        };
+        if path.exists() {
+            self.tmemory_file_backing = TMemoryFileBacking::ExistingPath(path.clone());
+        }
+    }
+
+    fn record_tmemory_pages(&mut self, tmemory_pages: u64) {
+        self.tmemory_pages = Some(self.tmemory_pages.unwrap_or(0).max(tmemory_pages));
     }
 }
 
@@ -169,12 +188,34 @@ impl TransactionRegionRuntime {
         Ok(self.lock()?.file_backed_storage.clone())
     }
 
+    pub(crate) fn shared_file_backed_storage_for_store_adoption(
+        &self,
+    ) -> Result<Option<SharedFileBackedStorageConfig>> {
+        let mut runtime = self.lock()?;
+        if let Some(shared) = runtime.file_backed_storage.as_mut() {
+            // Fresh-create runtimes hand the first store a create/truncate path
+            // until tmemory is materialized. Once the backing file exists, later
+            // stores must reopen it as existing storage so size/capacity come
+            // from disk rather than reusing fresh-create semantics.
+            shared.reopen_tmemory_for_store_adoption();
+        }
+        Ok(runtime.file_backed_storage.clone())
+    }
+
     pub(crate) fn shared_file_backed_tmemory_commit_lock(&self) -> Result<Option<Arc<RwLock<()>>>> {
         Ok(self
             .lock()?
             .file_backed_storage
             .as_ref()
             .map(SharedFileBackedStorageConfig::tmemory_commit_lock))
+    }
+
+    pub(crate) fn shared_file_backed_tmemory_pages(&self) -> Result<Option<u64>> {
+        Ok(self
+            .lock()?
+            .file_backed_storage
+            .as_ref()
+            .and_then(SharedFileBackedStorageConfig::tmemory_pages))
     }
 
     pub(crate) fn with_shared_file_backed_tmemory_commit_read_lock<T>(
@@ -238,6 +279,14 @@ impl TransactionRegionRuntime {
             )
             .with_reused_locks_from(existing.as_ref()),
         );
+        Ok(())
+    }
+
+    pub(crate) fn record_file_backed_tmemory_pages(&self, tmemory_pages: u64) -> Result<()> {
+        let mut runtime = self.lock()?;
+        if let Some(shared) = runtime.file_backed_storage.as_mut() {
+            shared.record_tmemory_pages(tmemory_pages);
+        }
         Ok(())
     }
 
@@ -589,7 +638,16 @@ impl TransactionRegionRuntime {
     ) -> Result<Self> {
         let runtime = Self::default();
         TxDurableLog::open_file_backed(tx_log_path)?;
-        runtime.record_opened_file_backed_storage(tmemory_path, tx_log_path, 0)?;
+        let tx_log_blocks = u32::try_from(
+            std::fs::metadata(tx_log_path)
+                .with_context(|| {
+                    format!("failed to stat transaction log {}", tx_log_path.display())
+                })?
+                .len()
+                / u64::try_from(crate::runtime::vm::block_region::BLOCK_SIZE).unwrap(),
+        )
+        .context("transaction log block count overflow")?;
+        runtime.record_opened_file_backed_storage(tmemory_path, tx_log_path, tx_log_blocks)?;
         Ok(runtime)
     }
 
