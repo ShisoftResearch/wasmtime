@@ -1,3 +1,5 @@
+use crate::runtime::transaction::concurrency::TransactionConflictAction;
+
 use super::*;
 
 #[derive(Debug)]
@@ -473,9 +475,10 @@ impl TransactionState {
         self.ensure_active()?;
         let transaction = self.active_transaction_required()?;
         let current_version = self.current_version_for_granule(granule, current_version)?;
-        let aborted = self.acquire_granule_read_authority(transaction, granule, current_version)?;
-        if aborted.is_some() {
-            self.discard_conflict_aborted_transaction(aborted)?;
+        let action = self.acquire_granule_read_authority(transaction, granule, current_version)?;
+        let refresh_after_abort = action.aborted_transaction().is_some();
+        self.handle_conflict_action(action)?;
+        if refresh_after_abort {
             let current_version = self.current_version_for_granule(granule, current_version)?;
             self.refresh_read_version_authority(transaction, granule, current_version)?;
         }
@@ -490,10 +493,10 @@ impl TransactionState {
         self.ensure_active()?;
         let transaction = self.active_transaction_required()?;
         let current_version = self.current_version_for_granule(granule, current_version)?;
-        let aborted =
-            self.acquire_granule_write_authority(transaction, granule, current_version)?;
-        if aborted.is_some() {
-            self.discard_conflict_aborted_transaction(aborted)?;
+        let action = self.acquire_granule_write_authority(transaction, granule, current_version)?;
+        let refresh_after_abort = action.aborted_transaction().is_some();
+        self.handle_conflict_action(action)?;
+        if refresh_after_abort {
             let current_version = self.current_version_for_granule(granule, current_version)?;
             self.refresh_read_version_authority(transaction, granule, current_version)?;
         }
@@ -589,7 +592,7 @@ impl TransactionState {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.acquire_granule_read(transaction, granule, current_version)
         } else {
@@ -603,7 +606,7 @@ impl TransactionState {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.acquire_granule_write(transaction, granule, current_version)
         } else {
@@ -745,6 +748,16 @@ impl TransactionState {
         error
             .to_string()
             .contains("transaction was conflict-aborted by another transaction")
+    }
+
+    fn handle_conflict_action(&mut self, action: TransactionConflictAction) -> Result<()> {
+        if let Some(owner) = action.would_wait_owner() {
+            bail!(
+                "transaction conflict would wait for transaction {}",
+                owner.as_raw()
+            );
+        }
+        self.discard_conflict_aborted_transaction(action.aborted_transaction())
     }
 
     pub(super) fn discard_conflict_aborted_transaction(

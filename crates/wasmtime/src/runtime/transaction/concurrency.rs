@@ -34,20 +34,50 @@ pub(crate) fn is_younger_for_test(requester: TransactionId, owner: TransactionId
     is_younger(requester, owner)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransactionConflictAction {
+    Continue,
+    AbortOther(TransactionId),
+    WouldWait(TransactionId),
+}
+
+impl TransactionConflictAction {
+    pub(crate) fn aborted_transaction(self) -> Option<TransactionId> {
+        match self {
+            Self::AbortOther(transaction) => Some(transaction),
+            Self::Continue | Self::WouldWait(_) => None,
+        }
+    }
+
+    pub(crate) fn would_wait_owner(self) -> Option<TransactionId> {
+        match self {
+            Self::WouldWait(owner) => Some(owner),
+            Self::Continue | Self::AbortOther(_) => None,
+        }
+    }
+}
+
+fn action_from_aborted_transaction(aborted: Option<TransactionId>) -> TransactionConflictAction {
+    match aborted {
+        Some(transaction) => TransactionConflictAction::AbortOther(transaction),
+        None => TransactionConflictAction::Continue,
+    }
+}
+
 pub(crate) trait TransactionConcurrencyControl {
     fn acquire_granule_read(
         &mut self,
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>>;
+    ) -> Result<TransactionConflictAction>;
 
     fn acquire_granule_write(
         &mut self,
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>>;
+    ) -> Result<TransactionConflictAction>;
 
     fn validate_read(
         &self,
@@ -118,7 +148,7 @@ impl ConcurrencyControlState {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.policy_mut()
             .acquire_granule_read(transaction, granule, current_version)
     }
@@ -128,7 +158,7 @@ impl ConcurrencyControlState {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.policy_mut()
             .acquire_granule_write(transaction, granule, current_version)
     }
@@ -525,8 +555,9 @@ impl TransactionConcurrencyControl for LockBased {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.record_read(transaction, granule, current_version)
+            .map(action_from_aborted_transaction)
     }
 
     fn acquire_granule_write(
@@ -534,8 +565,9 @@ impl TransactionConcurrencyControl for LockBased {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.acquire_write(transaction, granule, current_version)
+            .map(action_from_aborted_transaction)
     }
 
     fn validate_read(
@@ -827,8 +859,9 @@ impl TransactionConcurrencyControl for NoWaitAbort {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.record_read(transaction, granule, current_version)
+            .map(action_from_aborted_transaction)
     }
 
     fn acquire_granule_write(
@@ -836,8 +869,9 @@ impl TransactionConcurrencyControl for NoWaitAbort {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.acquire_write(transaction, granule, current_version)
+            .map(action_from_aborted_transaction)
     }
 
     fn validate_read(
@@ -1139,8 +1173,9 @@ impl TransactionConcurrencyControl for WoundWait {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.record_read(transaction, granule, current_version)
+            .map(action_from_aborted_transaction)
     }
 
     fn acquire_granule_write(
@@ -1148,8 +1183,9 @@ impl TransactionConcurrencyControl for WoundWait {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.acquire_write(transaction, granule, current_version)
+            .map(action_from_aborted_transaction)
     }
 
     fn validate_read(

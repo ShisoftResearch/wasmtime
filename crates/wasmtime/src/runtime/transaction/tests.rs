@@ -1181,12 +1181,10 @@ fn shared_region_runtime_disjoint_lock_acquisition_can_overlap_before_terminal_p
         second_progress.store(3, Ordering::SeqCst);
 
         let transaction = state.active_transaction_required().unwrap();
-        assert!(
-            second_runtime
-                .try_acquire_granule_write_for_test(transaction, global_granule_id(None, 1), 0)
-                .unwrap()
-                .is_none()
-        );
+        let action = second_runtime
+            .try_acquire_granule_write_for_test(transaction, global_granule_id(None, 1), 0)
+            .unwrap();
+        assert_eq!(action.aborted_transaction(), None);
         second_progress.store(4, Ordering::SeqCst);
 
         second_disjoint_attempted.wait();
@@ -15651,6 +15649,28 @@ fn transaction_timestamp_helpers_use_transaction_id_order() {
 }
 
 #[test]
+fn transaction_conflict_action_reports_abort_and_wait_targets() {
+    let other = TransactionId::from_raw(2);
+
+    assert_eq!(
+        super::concurrency::TransactionConflictAction::Continue.aborted_transaction(),
+        None
+    );
+    assert_eq!(
+        super::concurrency::TransactionConflictAction::AbortOther(other).aborted_transaction(),
+        Some(other)
+    );
+    assert_eq!(
+        super::concurrency::TransactionConflictAction::WouldWait(other).aborted_transaction(),
+        None
+    );
+    assert_eq!(
+        super::concurrency::TransactionConflictAction::WouldWait(other).would_wait_owner(),
+        Some(other)
+    );
+}
+
+#[test]
 fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
     fn granule(granule_index: u64) -> GranuleId {
         GranuleId::TMemory {
@@ -15763,9 +15783,9 @@ fn selected_concurrency_control_uses_wound_wait_semantics() {
     };
 
     policy.acquire_granule_write(younger, granule, 0).unwrap();
-    let wounded = policy.acquire_granule_write(older, granule, 0).unwrap();
+    let action = policy.acquire_granule_write(older, granule, 0).unwrap();
 
-    assert_eq!(wounded, Some(younger));
+    assert_eq!(action.aborted_transaction(), Some(younger));
     assert_eq!(policy.owner_for_granule(granule), Some(older));
 }
 

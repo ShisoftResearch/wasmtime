@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
-use super::concurrency::LockBasedConflictKind;
+use super::concurrency::{LockBasedConflictKind, TransactionConflictAction};
 use super::state::PersistentRootDelta;
 use super::{
     ConcurrencyControlState, GranuleId, ObjectId, PersistentRootKey, TMemoryFileBacking,
@@ -442,18 +442,17 @@ impl TransactionRegionRuntime {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         let mut runtime = self.lock_authority()?;
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, false)?;
-        let aborted =
+        let action =
             runtime
                 .concurrency
                 .acquire_granule_read(transaction, granule, current_version)?;
-        if let Some(aborted) = aborted {
+        if let Some(aborted) = action.aborted_transaction() {
             runtime.conflict_aborted_transactions.insert(aborted);
-            return Ok(Some(aborted));
         }
-        Ok(None)
+        Ok(action)
     }
 
     pub(crate) fn acquire_granule_write(
@@ -461,18 +460,17 @@ impl TransactionRegionRuntime {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         let mut runtime = self.lock_authority()?;
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
-        let aborted =
+        let action =
             runtime
                 .concurrency
                 .acquire_granule_write(transaction, granule, current_version)?;
-        if let Some(aborted) = aborted {
+        if let Some(aborted) = action.aborted_transaction() {
             runtime.conflict_aborted_transactions.insert(aborted);
-            return Ok(Some(aborted));
         }
-        Ok(None)
+        Ok(action)
     }
 
     pub(crate) fn validate_granule_read(
@@ -811,7 +809,7 @@ impl TransactionRegionRuntime {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.acquire_granule_read(transaction, granule, current_version)
     }
 
@@ -821,7 +819,7 @@ impl TransactionRegionRuntime {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         self.acquire_granule_write(transaction, granule, current_version)
     }
 
@@ -942,7 +940,7 @@ impl TransactionRegionRuntime {
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
-    ) -> Result<Option<TransactionId>> {
+    ) -> Result<TransactionConflictAction> {
         let mut runtime = match self.0.lock_authority.try_lock() {
             Ok(runtime) => runtime,
             Err(TryLockError::WouldBlock) => {
@@ -953,15 +951,14 @@ impl TransactionRegionRuntime {
             }
         };
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
-        let aborted =
+        let action =
             runtime
                 .concurrency
                 .acquire_granule_write(transaction, granule, current_version)?;
-        if let Some(aborted) = aborted {
+        if let Some(aborted) = action.aborted_transaction() {
             runtime.conflict_aborted_transactions.insert(aborted);
-            return Ok(Some(aborted));
         }
-        Ok(None)
+        Ok(action)
     }
 
     #[cfg(test)]
