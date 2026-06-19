@@ -1775,7 +1775,7 @@ mod tests {
 
         let config = TransactionConfig::with_file_backed_tmemory_existing_path(path).unwrap();
         let mut reopened = TMemory::new(config, 1, Some(1)).unwrap();
-        assert!(reopened.byte_capacity() >= block_region::BLOCK_SIZE * 2);
+        assert_eq!(reopened.byte_capacity(), 9 * WASM_PAGE_SIZE);
 
         reopened.grow_to_pages(9).unwrap();
         assert_eq!(

@@ -680,6 +680,9 @@ pub(crate) trait BlockRegionBackend {
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
     fn flush(&self, offset: usize, len: usize) -> Result<()>;
     fn fence(&self) -> Result<()>;
+    fn resize_bytes(&mut self, _new_len: usize) -> Result<()> {
+        bail!("transactional block region backend cannot resize bytes")
+    }
     fn grow_to_blocks(&mut self, _new_block_count: usize) -> Result<Option<RegionChunk>> {
         bail!("transactional block region backend cannot grow")
     }

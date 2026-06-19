@@ -55,7 +55,7 @@ impl TMemoryRegion {
         mode: FileBackedRegionMode,
     ) -> Result<Self> {
         let block_count = byte_capacity.div_ceil(BLOCK_SIZE);
-        let mut backend = FileBackedLinearRegion::new(block_count, mode)?;
+        let mut backend = FileBackedLinearRegion::new(block_count, byte_capacity, mode)?;
         let chunks = if block_count == 0 {
             Vec::new()
         } else {
@@ -115,16 +115,15 @@ impl TMemoryRegion {
 #[derive(Debug)]
 struct FileBackedLinearRegion {
     mapping: FileBackedMapping,
+    block_count: usize,
     next_free_block: usize,
 }
 
 impl FileBackedLinearRegion {
-    fn new(block_count: usize, mode: FileBackedRegionMode) -> Result<Self> {
-        let bytes_len = block_count
-            .checked_mul(BLOCK_SIZE)
-            .context("transactional linear file-backed region size overflow")?;
+    fn new(block_count: usize, bytes_len: usize, mode: FileBackedRegionMode) -> Result<Self> {
         Ok(Self {
             mapping: FileBackedMapping::new(mode, bytes_len)?,
+            block_count,
             next_free_block: 0,
         })
     }
@@ -136,7 +135,7 @@ impl BlockRegionBackend for FileBackedLinearRegion {
     }
 
     fn num_blocks(&self) -> usize {
-        self.mapping.len() / BLOCK_SIZE
+        self.block_count
     }
 
     fn bytes_len(&self) -> usize {
@@ -144,7 +143,7 @@ impl BlockRegionBackend for FileBackedLinearRegion {
     }
 
     fn line_mark_count(&self) -> usize {
-        self.mapping.len() / IMMIX_LINE_SIZE
+        self.block_count * (BLOCK_SIZE / IMMIX_LINE_SIZE)
     }
 
     fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
@@ -180,8 +179,19 @@ impl BlockRegionBackend for FileBackedLinearRegion {
         self.mapping.fence_data()
     }
 
+    fn resize_bytes(&mut self, new_len: usize) -> Result<()> {
+        ensure!(
+            new_len >= self.mapping.len(),
+            "transactional linear file-backed region cannot shrink"
+        );
+        if new_len == self.mapping.len() {
+            return Ok(());
+        }
+        self.mapping.remap_len(new_len)
+    }
+
     fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
-        let old_block_count = self.num_blocks();
+        let old_block_count = self.block_count;
         ensure!(
             new_block_count >= old_block_count,
             "transactional linear file-backed region cannot shrink"
@@ -190,16 +200,12 @@ impl BlockRegionBackend for FileBackedLinearRegion {
             return Ok(None);
         }
 
-        let bytes_len = new_block_count
-            .checked_mul(BLOCK_SIZE)
-            .context("transactional linear file-backed region size overflow")?;
-        self.mapping.remap_len(bytes_len)?;
-
         let additional_blocks = new_block_count - old_block_count;
         ensure!(
             self.next_free_block == old_block_count,
             "transactional linear file-backed region has unallocated gap before grow"
         );
+        self.block_count = new_block_count;
         self.next_free_block = new_block_count;
         Ok(Some(RegionChunk::new(old_block_count, additional_blocks)))
     }
@@ -289,6 +295,7 @@ impl MappedLinearRegion {
             new_block_count >= self.backend.num_blocks(),
             "transactional linear file-backed reserve cannot shrink"
         );
+        self.backend.resize_bytes(byte_capacity)?;
         if new_block_count == self.backend.num_blocks() {
             return Ok(());
         }
