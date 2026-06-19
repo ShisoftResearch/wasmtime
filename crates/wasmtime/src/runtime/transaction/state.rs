@@ -2307,6 +2307,11 @@ impl TransactionState {
                 && current_thread_transaction().is_none(),
             "persistent object marker cannot run while a transaction is active or suspended"
         );
+        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
+            Some(runtime.begin_persistent_gc()?)
+        } else {
+            None
+        };
         let roots = self.persistent_root_ids()?;
         let report = objects.persistent_mark_sweep_from_roots(roots)?;
         self.persistent_gc_state = None;
@@ -2324,6 +2329,11 @@ impl TransactionState {
                 && current_thread_transaction().is_none(),
             "persistent object marker cannot run while a transaction is active or suspended"
         );
+        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
+            Some(runtime.begin_persistent_gc()?)
+        } else {
+            None
+        };
         let roots = if self.persistent_gc_state.is_none() {
             Some(self.persistent_root_ids()?)
         } else {
@@ -2349,6 +2359,11 @@ impl TransactionState {
                 && current_thread_transaction().is_none(),
             "persistent object marker cannot run while a transaction is active or suspended"
         );
+        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
+            Some(runtime.begin_persistent_gc()?)
+        } else {
+            None
+        };
         let Some(mut state) = self.persistent_gc_state.take() else {
             return Ok(None);
         };
@@ -2373,6 +2388,11 @@ impl TransactionState {
                 && current_thread_transaction().is_none(),
             "persistent object compaction cannot run while a transaction is active or suspended"
         );
+        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
+            Some(runtime.begin_persistent_gc()?)
+        } else {
+            None
+        };
         recovery_report.mark.ensure_sweepable()?;
 
         #[derive(Default)]

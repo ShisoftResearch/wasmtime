@@ -30,6 +30,16 @@ impl DurableLogSegment {
 #[derive(Clone, Debug)]
 pub(crate) struct TransactionRegionRuntime(Arc<Mutex<TransactionRegionRuntimeInner>>);
 
+#[derive(Debug)]
+pub(crate) struct UserTransactionRegionPermit {
+    runtime: TransactionRegionRuntime,
+}
+
+#[derive(Debug)]
+pub(crate) struct PersistentGcRegionPermit {
+    runtime: TransactionRegionRuntime,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SharedFileBackedStorageConfig {
     tmemory_file_backing: TMemoryFileBacking,
@@ -127,6 +137,8 @@ pub(crate) struct TransactionRegionRuntimeInner {
     object_versions: BTreeMap<ObjectId, u32>,
     pub(crate) durable_log: TxDurableLog,
     pub(crate) file_backed_storage: Option<SharedFileBackedStorageConfig>,
+    pub(crate) active_user_commits: u32,
+    pub(crate) gc_active: bool,
     #[cfg(test)]
     pub(crate) fail_release_transaction_once_for_test: bool,
     #[cfg(test)]
@@ -149,6 +161,8 @@ impl Default for TransactionRegionRuntimeInner {
             object_versions: BTreeMap::new(),
             durable_log: TxDurableLog::default(),
             file_backed_storage: None,
+            active_user_commits: 0,
+            gc_active: false,
             #[cfg(test)]
             fail_release_transaction_once_for_test: false,
             #[cfg(test)]
@@ -180,6 +194,31 @@ impl TransactionRegionRuntime {
             .checked_add(1)
             .context("transaction id overflow")?;
         Ok(id)
+    }
+
+    pub(crate) fn begin_user_transaction_region(&self) -> Result<UserTransactionRegionPermit> {
+        let mut inner = self.lock()?;
+        ensure!(!inner.gc_active, "persistent GC is active");
+        inner.active_user_commits = inner
+            .active_user_commits
+            .checked_add(1)
+            .context("active transaction commit count overflow")?;
+        Ok(UserTransactionRegionPermit {
+            runtime: self.clone(),
+        })
+    }
+
+    pub(crate) fn begin_persistent_gc(&self) -> Result<PersistentGcRegionPermit> {
+        let mut inner = self.lock()?;
+        ensure!(!inner.gc_active, "persistent GC is already active");
+        ensure!(
+            inner.active_user_commits == 0,
+            "user transaction commit is active"
+        );
+        inner.gc_active = true;
+        Ok(PersistentGcRegionPermit {
+            runtime: self.clone(),
+        })
     }
 
     pub(crate) fn shared_file_backed_storage(
@@ -663,6 +702,18 @@ impl TransactionRegionRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn begin_user_transaction_region_for_test(
+        &self,
+    ) -> Result<UserTransactionRegionPermit> {
+        self.begin_user_transaction_region()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_persistent_gc_for_test(&self) -> Result<PersistentGcRegionPermit> {
+        self.begin_persistent_gc()
+    }
+
+    #[cfg(test)]
     pub(crate) fn acquire_granule_read_for_test(
         &self,
         transaction: TransactionId,
@@ -777,5 +828,25 @@ impl TransactionRegionRuntime {
         self.lock()
             .unwrap()
             .fail_apply_persistent_root_delta_once_for_test = true;
+    }
+}
+
+impl Drop for UserTransactionRegionPermit {
+    fn drop(&mut self) {
+        let Ok(mut inner) = self.runtime.0.lock() else {
+            return;
+        };
+        if inner.active_user_commits > 0 {
+            inner.active_user_commits -= 1;
+        }
+    }
+}
+
+impl Drop for PersistentGcRegionPermit {
+    fn drop(&mut self) {
+        let Ok(mut inner) = self.runtime.0.lock() else {
+            return;
+        };
+        inner.gc_active = false;
     }
 }

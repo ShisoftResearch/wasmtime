@@ -762,6 +762,15 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         state.validate_active_object_reads(&*object_table)?;
     }
 
+    let _user_transaction_region_permit = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        if let Some(runtime) = state.shared_region_runtime_for_publication() {
+            Some(runtime.begin_user_transaction_region()?)
+        } else {
+            None
+        }
+    };
+
     let (stream_id, txid) = {
         let state = store.store_opaque_mut().transaction_state_mut();
         let transaction_id = state.active_transaction_required_raw()?;

@@ -78,6 +78,45 @@ fn stores_have_distinct_transaction_region_runtimes_by_default() {
 }
 
 #[test]
+fn persistent_gc_excludes_user_transaction_commits() {
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let permit = runtime.begin_user_transaction_region_for_test().unwrap();
+
+    let gc_result = runtime.begin_persistent_gc_for_test();
+    assert!(gc_result.is_err());
+
+    drop(permit);
+    assert!(runtime.begin_persistent_gc_for_test().is_ok());
+}
+
+#[test]
+fn user_transaction_region_permits_can_overlap() {
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let first = runtime.begin_user_transaction_region_for_test().unwrap();
+    let second = runtime.begin_user_transaction_region_for_test().unwrap();
+
+    assert!(runtime.begin_persistent_gc_for_test().is_err());
+
+    drop(first);
+    assert!(runtime.begin_persistent_gc_for_test().is_err());
+
+    drop(second);
+    assert!(runtime.begin_persistent_gc_for_test().is_ok());
+}
+
+#[test]
+fn persistent_gc_region_permit_is_exclusive() {
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let permit = runtime.begin_persistent_gc_for_test().unwrap();
+
+    assert!(runtime.begin_persistent_gc_for_test().is_err());
+    assert!(runtime.begin_user_transaction_region_for_test().is_err());
+
+    drop(permit);
+    assert!(runtime.begin_persistent_gc_for_test().is_ok());
+}
+
+#[test]
 fn shared_region_runtime_allocates_unique_transaction_ids_across_threads() {
     use std::sync::{Arc, Barrier};
     use std::thread;
