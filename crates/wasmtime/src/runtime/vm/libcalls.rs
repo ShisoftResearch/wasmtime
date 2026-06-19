@@ -1331,10 +1331,11 @@ fn transaction_tmemory_load_impl(
     flush_pending_tmemory_store(store, instance)?;
     let (memory_index, snapshot) =
         collect_defined_tmemory_snapshot(store, instance, memory, effective, len)?;
+    let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
 
     let state = store.store_opaque_mut().transaction_state_mut();
     let bytes = state.read_tmemory_owned_from_snapshot(
-        Some(instance),
+        owner_instance_key,
         memory_index.as_u32(),
         effective,
         len,
@@ -1369,16 +1370,23 @@ fn transaction_tmemory_store_impl(
     flush_pending_tmemory_store(store, instance)?;
     let (memory_index, snapshot) =
         collect_defined_tmemory_snapshot(store, instance, memory, effective, len)?;
+    let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
 
     let state = store.store_opaque_mut().transaction_state_mut();
     let bytes = state.read_tmemory_owned_from_snapshot(
-        Some(instance),
+        owner_instance_key,
         memory_index.as_u32(),
         effective,
         len,
         &snapshot,
     )?;
-    state.set_tmemory_store_scratch(instance, memory_index.as_u32(), effective, bytes)
+    state.set_tmemory_store_scratch(
+        instance,
+        owner_instance_key,
+        memory_index.as_u32(),
+        effective,
+        bytes,
+    )
 }
 
 fn transaction_tmemory_size(
@@ -1399,10 +1407,13 @@ fn transaction_tmemory_size_impl(
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
+    let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     {
         let state = store.store_opaque_mut().transaction_state_mut();
-        state.acquire_memory_size_read_owned(Some(instance), memory_index.as_u32())?;
-        if let Some(pages) = state.staged_memory_size_owned(Some(instance), memory_index.as_u32()) {
+        state.acquire_memory_size_read_owned(owner_instance_key, memory_index.as_u32())?;
+        if let Some(pages) =
+            state.staged_memory_size_owned(owner_instance_key, memory_index.as_u32())
+        {
             return Ok(
                 usize::try_from(pages).context("transactional memory size overflow")? as *mut u8,
             );
@@ -1439,6 +1450,7 @@ fn transaction_tmemory_grow_impl(
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
+    let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     let committed_pages = {
         let instance_ref = store.instance_mut(instance);
         let instance_ref = instance_ref.as_ref();
@@ -1451,7 +1463,7 @@ fn transaction_tmemory_grow_impl(
     let previous_pages = store
         .store_opaque_mut()
         .transaction_state_mut()
-        .staged_memory_size_owned(Some(instance), memory_index.as_u32())
+        .staged_memory_size_owned(owner_instance_key, memory_index.as_u32())
         .unwrap_or(committed_pages);
     let Some(new_pages) = previous_pages.checked_add(delta) else {
         return Ok(None);
@@ -1470,7 +1482,7 @@ fn transaction_tmemory_grow_impl(
     store
         .store_opaque_mut()
         .transaction_state_mut()
-        .stage_memory_size_owned(Some(instance), memory_index.as_u32(), new_pages)?;
+        .stage_memory_size_owned(owner_instance_key, memory_index.as_u32(), new_pages)?;
     Ok(Some(AllocationSize(
         usize::try_from(previous_pages).context("tmemory previous size overflow")?,
     )))
@@ -1502,12 +1514,13 @@ fn transaction_tmemory_fill_impl(
     let len = usize::try_from(len).context("tmemory fill length overflow")?;
     let (memory_index, snapshot) =
         collect_defined_tmemory_snapshot(store, instance, memory, dst, len)?;
+    let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     let bytes = alloc::vec![val as u8; len];
     store
         .store_opaque_mut()
         .transaction_state_mut()
         .stage_tmemory_write_owned_from_snapshot(
-            Some(instance),
+            owner_instance_key,
             memory_index.as_u32(),
             dst,
             &bytes,
@@ -1544,11 +1557,12 @@ fn transaction_tmemory_copy_impl(
     let len = usize::try_from(len).context("tmemory copy length overflow")?;
     let (src_memory_index, src_snapshot) =
         collect_defined_tmemory_snapshot(store, instance, src_memory, src, len)?;
+    let src_owner_instance_key = tmemory_transaction_owner_key(store, instance, src_memory_index)?;
     let bytes = store
         .store_opaque_mut()
         .transaction_state_mut()
         .read_tmemory_owned_from_snapshot(
-            Some(instance),
+            src_owner_instance_key,
             src_memory_index.as_u32(),
             src,
             len,
@@ -1556,11 +1570,12 @@ fn transaction_tmemory_copy_impl(
         )?;
     let (dst_memory_index, dst_snapshot) =
         collect_defined_tmemory_snapshot(store, instance, dst_memory, dst, len)?;
+    let dst_owner_instance_key = tmemory_transaction_owner_key(store, instance, dst_memory_index)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
         .stage_tmemory_write_owned_from_snapshot(
-            Some(instance),
+            dst_owner_instance_key,
             dst_memory_index.as_u32(),
             dst,
             &bytes,
@@ -1608,13 +1623,14 @@ fn transaction_tmemory_init_impl(
     );
     let (memory_index, snapshot) =
         collect_defined_tmemory_snapshot(store, instance, memory, dst, len)?;
+    let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     let data = unsafe { data.add(src) };
     let bytes = unsafe { core::slice::from_raw_parts(data.cast_const(), len) };
     store
         .store_opaque_mut()
         .transaction_state_mut()
         .stage_tmemory_write_owned_from_snapshot(
-            Some(instance),
+            owner_instance_key,
             memory_index.as_u32(),
             dst,
             bytes,
@@ -3355,7 +3371,7 @@ fn commit_staged_tmemory_records(
         };
         for (granule_index, bytes) in staged {
             let undo = tmemory.prepare_tmemory_undo_record(
-                Some(participant.owner.as_u32()),
+                participant.owner_instance_key.map(InstanceId::as_u32),
                 participant.memory_index,
                 *granule_index,
                 bytes,
@@ -3507,6 +3523,22 @@ fn resolve_defined_tmemory_index(
         "transactional memory operation targeted non-transactional memory"
     );
     Ok(memory_index)
+}
+
+fn tmemory_transaction_owner_key(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: MemoryIndex,
+) -> Result<Option<InstanceId>> {
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let tmemory = instance_ref
+        .get_tmemory(memory_index)
+        .context("transactional memory operation targeted non-transactional memory")?;
+    Ok(match tmemory.backend() {
+        TMemoryBackend::FileBackedMemory => None,
+        TMemoryBackend::VMemory | TMemoryBackend::NVMemory => Some(instance),
+    })
 }
 
 fn grow_tmemory_to_pages(

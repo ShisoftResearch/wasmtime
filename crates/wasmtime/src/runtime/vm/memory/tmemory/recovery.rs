@@ -185,19 +185,12 @@ impl RecoveredRegion {
     }
 
     pub(crate) fn committed_file_backed_tmemory_pages(&self) -> Result<Option<u64>> {
-        let mut pages = None;
-        let mut key = None;
+        let mut pages: Option<u64> = None;
         for winner in &self.tmemory_size_winners {
-            let winner_key = (winner.owner_instance, winner.memory_index);
-            if let Some(current_key) = key {
-                ensure!(
-                    current_key == winner_key,
-                    "file-backed tmemory recovery found multiple tmemory size winners"
-                );
-            } else {
-                key = Some(winner_key);
-            }
-            pages = Some(winner.new_pages);
+            pages = Some(match pages {
+                Some(current_pages) => current_pages.max(winner.new_pages),
+                None => winner.new_pages,
+            });
         }
         Ok(pages)
     }
@@ -909,6 +902,38 @@ mod tests {
         assert_eq!(
             objects[0].kind,
             crate::runtime::transaction::ObjectKind::Struct as u16
+        );
+    }
+
+    #[test]
+    fn recovery_file_backed_tmemory_pages_uses_max_across_legacy_owner_keys() {
+        let recovered = RecoveredRegion {
+            streams: Vec::new(),
+            winners: Vec::new(),
+            object_winners: Vec::new(),
+            tmemory_size_winners: vec![
+                RecoveredTMemorySizeWinner {
+                    owner_instance: Some(7),
+                    memory_index: 0,
+                    version: 1,
+                    new_pages: 2,
+                },
+                RecoveredTMemorySizeWinner {
+                    owner_instance: Some(3),
+                    memory_index: 0,
+                    version: 2,
+                    new_pages: 3,
+                },
+            ],
+            type_layouts: TypeLayoutRegistry::default(),
+            root_object_ids: Vec::new(),
+            tmemory_undo_rollbacks: Vec::new(),
+            next_stream_id: 1,
+        };
+
+        assert_eq!(
+            recovered.committed_file_backed_tmemory_pages().unwrap(),
+            Some(3)
         );
     }
 

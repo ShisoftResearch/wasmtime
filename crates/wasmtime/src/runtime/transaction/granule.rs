@@ -147,6 +147,7 @@ pub(super) struct TableElementKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PendingMemoryStore {
     pub(super) instance: InstanceId,
+    pub(super) owner_instance_key: Option<InstanceId>,
     pub(super) memory_index: u32,
     pub(super) addr: u64,
     pub(super) len: usize,

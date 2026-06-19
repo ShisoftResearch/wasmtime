@@ -1436,6 +1436,7 @@ impl TransactionState {
         self.scratch = bytes;
         self.pending_memory_store = Some(PendingMemoryStore {
             instance,
+            owner_instance_key: Some(instance),
             memory_index,
             addr,
             len,
@@ -1446,6 +1447,7 @@ impl TransactionState {
     pub(crate) fn set_tmemory_store_scratch(
         &mut self,
         instance: InstanceId,
+        owner_instance_key: Option<InstanceId>,
         memory_index: u32,
         addr: u64,
         bytes: Vec<u8>,
@@ -1455,6 +1457,7 @@ impl TransactionState {
         self.scratch = bytes;
         self.pending_memory_store = Some(PendingMemoryStore {
             instance,
+            owner_instance_key,
             memory_index,
             addr,
             len: self.scratch.len(),
@@ -1493,7 +1496,7 @@ impl TransactionState {
         );
         let bytes = self.scratch[..pending.len].to_vec();
         self.stage_memory_write_owned_from_backing(
-            Some(pending.instance),
+            pending.owner_instance_key,
             pending.memory_index,
             pending.addr,
             &bytes,
@@ -1518,7 +1521,7 @@ impl TransactionState {
         );
         let bytes = self.scratch[..pending.len].to_vec();
         self.stage_tmemory_write_owned_from_snapshot(
-            Some(pending.instance),
+            pending.owner_instance_key,
             pending.memory_index,
             pending.addr,
             &bytes,
