@@ -11862,9 +11862,9 @@ fn committed_persistent_root_is_visible_to_another_store_using_same_region_runti
     let delta = publisher
         .staged_persistent_root_delta_for_test(&objects)
         .unwrap();
-    publisher.complete_commit().unwrap();
+    publisher.persistent_root_publications(&delta).unwrap();
     publisher
-        .apply_committed_persistent_root_delta_for_test(delta)
+        .complete_commit_with_persistent_root_delta_for_test(delta)
         .unwrap();
 
     let observer = TransactionState {
@@ -11903,9 +11903,8 @@ fn persistent_root_publication_versions_are_shared_across_states_using_same_regi
         .unwrap();
     let first_publications = first.persistent_root_publications(&first_delta).unwrap();
     assert_eq!(first_publications[0].version, 1);
-    first.complete_commit().unwrap();
     first
-        .apply_committed_persistent_root_delta_for_test(first_delta)
+        .complete_commit_with_persistent_root_delta_for_test(first_delta)
         .unwrap();
 
     let mut second = TransactionState::new_for_test(TransactionId::from_raw(599));
@@ -11920,8 +11919,82 @@ fn persistent_root_publication_versions_are_shared_across_states_using_same_regi
     assert_eq!(second_publications[0].version, 2);
     assert_eq!(
         runtime.persistent_root_version_for_test(root_key).unwrap(),
-        Some(1)
+        Some(2)
     );
+}
+
+#[test]
+fn shared_region_runtime_reserves_distinct_root_versions_before_either_state_applies() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let root_key = PersistentRootKey::Global {
+        instance: None,
+        global_index: 0,
+    };
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+    let first_delta = state::PersistentRootDelta {
+        roots: BTreeMap::from([(root_key, object_set([ObjectId { object_index: 91 }]))]),
+    };
+    let second_delta = state::PersistentRootDelta {
+        roots: BTreeMap::from([(root_key, object_set([ObjectId { object_index: 92 }]))]),
+    };
+
+    let mut first = TransactionState::new_for_test(TransactionId::from_raw(602));
+    first.shared_region_runtime = Some(runtime.clone());
+    let first_publications = first.persistent_root_publications(&first_delta).unwrap();
+
+    let mut second = TransactionState::new_for_test(TransactionId::from_raw(603));
+    second.shared_region_runtime = Some(runtime.clone());
+    let second_publications = second.persistent_root_publications(&second_delta).unwrap();
+
+    assert_eq!(first_publications[0].version, 1);
+    assert_eq!(second_publications[0].version, 2);
+    assert_ne!(
+        first_publications[0].version,
+        second_publications[0].version
+    );
+    assert_eq!(
+        runtime.persistent_root_version_for_test(root_key).unwrap(),
+        Some(2)
+    );
+}
+
+#[test]
+fn shared_region_runtime_applies_committed_roots_before_transaction_authority_is_released() {
+    let mut objects = ObjectTable::default();
+    let root = objects
+        .allocate_persistent_struct_for_gc_ref(0x59d, vec![ObjectValue::I32(22)])
+        .unwrap();
+
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(604);
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut state = TransactionState::new_for_test(transaction);
+    state.shared_region_runtime = Some(runtime.clone());
+    state.stage_global(0, GlobalSnapshot::GcRef(0x59d)).unwrap();
+    let delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    state.persistent_root_publications(&delta).unwrap();
+    state.begin_terminal_commit().unwrap();
+    state
+        .commit_shared_persistent_root_delta_before_complete_commit(delta)
+        .unwrap();
+
+    let observer = TransactionState {
+        shared_region_runtime: Some(runtime.clone()),
+        ..TransactionState::default()
+    };
+    assert_eq!(observer.persistent_root_ids_for_test(), object_set([root]));
+    assert_eq!(state.active, Some(transaction));
+    assert!(state.terminal_commit_active);
+    assert!(
+        runtime
+            .transaction_is_terminal_commit_for_test(transaction)
+            .unwrap()
+    );
+
+    state.clear_active().unwrap();
 }
 
 #[test]
@@ -11942,9 +12015,11 @@ fn shared_region_runtime_root_ids_change_when_roots_are_removed() {
     let install_delta = installer
         .staged_persistent_root_delta_for_test(&objects)
         .unwrap();
-    installer.complete_commit().unwrap();
     installer
-        .apply_committed_persistent_root_delta_for_test(install_delta)
+        .persistent_root_publications(&install_delta)
+        .unwrap();
+    installer
+        .complete_commit_with_persistent_root_delta_for_test(install_delta)
         .unwrap();
     assert_eq!(
         runtime.persistent_root_ids_for_test().unwrap(),
@@ -11957,9 +12032,11 @@ fn shared_region_runtime_root_ids_change_when_roots_are_removed() {
     let removal_delta = remover
         .staged_persistent_root_delta_for_test(&objects)
         .unwrap();
-    remover.complete_commit().unwrap();
     remover
-        .apply_committed_persistent_root_delta_for_test(removal_delta)
+        .persistent_root_publications(&removal_delta)
+        .unwrap();
+    remover
+        .complete_commit_with_persistent_root_delta_for_test(removal_delta)
         .unwrap();
 
     let observer = TransactionState {

@@ -261,50 +261,54 @@ impl TransactionRegionRuntime {
         Ok(())
     }
 
-    pub(super) fn next_persistent_root_version(&self, key: PersistentRootKey) -> Result<u32> {
-        self.lock()?
-            .persistent_root_versions
-            .get(&key)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .context("persistent root publication version overflow")
+    pub(super) fn reserve_persistent_root_versions<I>(
+        &self,
+        keys: I,
+    ) -> Result<BTreeMap<PersistentRootKey, u32>>
+    where
+        I: IntoIterator<Item = PersistentRootKey>,
+    {
+        let mut runtime = self.lock()?;
+        let mut reserved = BTreeMap::new();
+        for key in keys.into_iter().collect::<BTreeSet<_>>() {
+            let version = runtime.persistent_root_versions.entry(key).or_insert(0);
+            *version = (*version)
+                .checked_add(1)
+                .context("persistent root publication version overflow")?;
+            reserved.insert(key, *version);
+        }
+        Ok(reserved)
     }
 
     pub(super) fn apply_committed_persistent_root_delta(
         &self,
         delta: PersistentRootDelta,
+        reserved_versions: BTreeMap<PersistentRootKey, u32>,
     ) -> Result<()> {
         if delta.is_empty() {
             return Ok(());
         }
 
         let mut runtime = self.lock()?;
-        let next_versions = delta
-            .roots
-            .keys()
-            .copied()
-            .map(|key| {
-                let next_version = runtime
-                    .persistent_root_versions
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .context("persistent root version overflow")?;
-                Ok((key, next_version))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         for (key, roots) in delta.roots {
+            let version = reserved_versions
+                .get(&key)
+                .copied()
+                .context("shared persistent root publication version was not reserved")?;
+            match runtime.persistent_root_versions.get(&key).copied() {
+                Some(current) => ensure!(
+                    current >= version,
+                    "shared persistent root publication version regressed"
+                ),
+                None => {
+                    runtime.persistent_root_versions.insert(key, version);
+                }
+            }
             if roots.is_empty() {
                 runtime.persistent_roots.remove(&key);
             } else {
                 runtime.persistent_roots.insert(key, roots);
             }
-        }
-        for (key, version) in next_versions {
-            runtime.persistent_root_versions.insert(key, version);
         }
         Ok(())
     }

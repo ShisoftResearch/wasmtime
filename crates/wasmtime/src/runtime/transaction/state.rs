@@ -21,6 +21,7 @@ pub(crate) struct TransactionState {
     pub(super) staged_table_sizes: BTreeMap<GranuleId, u64>,
     pub(super) staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     pub(super) staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    pub(super) pending_persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     pub(super) promoted_objects: BTreeMap<ObjectId, ObjectId>,
     pub(super) promoted_gc_refs: BTreeMap<u32, ObjectId>,
     pub(super) durable_leaf_gc_refs: BTreeSet<u32>,
@@ -45,6 +46,7 @@ pub(super) struct TransactionWorkspace {
     staged_table_sizes: BTreeMap<GranuleId, u64>,
     staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
     staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    pending_persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
     promoted_gc_refs: BTreeMap<u32, ObjectId>,
     durable_leaf_gc_refs: BTreeSet<u32>,
@@ -80,6 +82,7 @@ impl Default for TransactionState {
             staged_table_sizes: BTreeMap::new(),
             staged_table_elements: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
+            pending_persistent_root_versions: BTreeMap::new(),
             promoted_objects: BTreeMap::new(),
             promoted_gc_refs: BTreeMap::new(),
             durable_leaf_gc_refs: BTreeSet::new(),
@@ -801,6 +804,25 @@ impl TransactionState {
         self.retry_post_commit_linear_undo_retirement();
         self.bump_active_versioned_write_granules()?;
         self.clear_active()?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_commit_with_persistent_root_delta(
+        &mut self,
+        delta: PersistentRootDelta,
+    ) -> Result<()> {
+        self.begin_terminal_commit()?;
+        self.ensure_no_pending_conflict_aborted_allocated_objects()?;
+        self.retry_post_commit_linear_undo_retirement();
+        if self.shared_region_runtime.is_some() {
+            self.commit_shared_persistent_root_delta_before_complete_commit(delta)?;
+            self.bump_active_versioned_write_granules()?;
+            self.clear_active()?;
+            return Ok(());
+        }
+        self.bump_active_versioned_write_granules()?;
+        self.clear_active()?;
+        self.apply_committed_persistent_root_delta(delta)?;
         Ok(())
     }
 
@@ -1932,14 +1954,29 @@ impl TransactionState {
     }
 
     pub(crate) fn persistent_root_publications(
-        &self,
+        &mut self,
         delta: &PersistentRootDelta,
     ) -> Result<Vec<persist::PendingPublication>> {
         self.ensure_active()?;
+        if let Some(runtime) = &self.shared_region_runtime {
+            let newly_reserved = runtime.reserve_persistent_root_versions(
+                delta
+                    .roots
+                    .keys()
+                    .filter(|key| !self.pending_persistent_root_versions.contains_key(key))
+                    .copied(),
+            )?;
+            for (key, version) in newly_reserved {
+                self.pending_persistent_root_versions.insert(key, version);
+            }
+        }
         let mut publications = Vec::new();
         for (&key, roots) in &delta.roots {
-            let version = if let Some(runtime) = &self.shared_region_runtime {
-                runtime.next_persistent_root_version(key)?
+            let version = if self.shared_region_runtime.is_some() {
+                self.pending_persistent_root_versions
+                    .get(&key)
+                    .copied()
+                    .context("shared persistent root publication version was not reserved")?
             } else {
                 self.persistent_root_versions
                     .get(&key)
@@ -2081,8 +2118,13 @@ impl TransactionState {
         &mut self,
         delta: PersistentRootDelta,
     ) -> Result<()> {
+        let applying_during_shared_terminal_commit = self.shared_region_runtime.is_some()
+            && self.active.is_some()
+            && current_thread_transaction() == self.active
+            && self.terminal_commit_active;
         ensure!(
-            self.active.is_none() && current_thread_transaction().is_none(),
+            applying_during_shared_terminal_commit
+                || (self.active.is_none() && current_thread_transaction().is_none()),
             "committed persistent root delta can only be applied after complete_commit"
         );
         if delta.is_empty() {
@@ -2090,7 +2132,19 @@ impl TransactionState {
         }
 
         if let Some(runtime) = &self.shared_region_runtime {
-            return runtime.apply_committed_persistent_root_delta(delta);
+            let reserved_versions = delta
+                .roots
+                .keys()
+                .copied()
+                .map(|key| {
+                    let version = self
+                        .pending_persistent_root_versions
+                        .remove(&key)
+                        .context("shared persistent root publication version was not reserved")?;
+                    Ok((key, version))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            return runtime.apply_committed_persistent_root_delta(delta, reserved_versions);
         }
 
         let next_versions = delta
@@ -2120,6 +2174,22 @@ impl TransactionState {
             self.persistent_root_versions.insert(key, version);
         }
         Ok(())
+    }
+
+    pub(crate) fn commit_shared_persistent_root_delta_before_complete_commit(
+        &mut self,
+        delta: PersistentRootDelta,
+    ) -> Result<()> {
+        self.ensure_active()?;
+        ensure!(
+            self.shared_region_runtime.is_some(),
+            "shared persistent root commit requires a shared region runtime"
+        );
+        ensure!(
+            self.terminal_commit_active,
+            "shared persistent root commit requires an active terminal commit"
+        );
+        self.apply_committed_persistent_root_delta(delta)
     }
 
     pub(crate) fn persistent_root_ids(&self) -> Result<BTreeSet<ObjectId>> {
@@ -2839,6 +2909,7 @@ impl TransactionState {
             staged_table_sizes: mem::take(&mut self.staged_table_sizes),
             staged_table_elements: mem::take(&mut self.staged_table_elements),
             staged_objects: mem::take(&mut self.staged_objects),
+            pending_persistent_root_versions: mem::take(&mut self.pending_persistent_root_versions),
             promoted_objects: mem::take(&mut self.promoted_objects),
             promoted_gc_refs: mem::take(&mut self.promoted_gc_refs),
             durable_leaf_gc_refs: mem::take(&mut self.durable_leaf_gc_refs),
@@ -2860,6 +2931,7 @@ impl TransactionState {
         self.staged_table_sizes = workspace.staged_table_sizes;
         self.staged_table_elements = workspace.staged_table_elements;
         self.staged_objects = workspace.staged_objects;
+        self.pending_persistent_root_versions = workspace.pending_persistent_root_versions;
         self.promoted_objects = workspace.promoted_objects;
         self.promoted_gc_refs = workspace.promoted_gc_refs;
         self.durable_leaf_gc_refs = workspace.durable_leaf_gc_refs;
@@ -2999,6 +3071,13 @@ impl TransactionState {
         delta: PersistentRootDelta,
     ) -> Result<()> {
         self.apply_committed_persistent_root_delta(delta)
+    }
+
+    pub(super) fn complete_commit_with_persistent_root_delta_for_test(
+        &mut self,
+        delta: PersistentRootDelta,
+    ) -> Result<()> {
+        self.complete_commit_with_persistent_root_delta(delta)
     }
 
     pub(super) fn persistent_root_ids_for_test(&self) -> BTreeSet<ObjectId> {
