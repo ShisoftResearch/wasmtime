@@ -321,6 +321,69 @@ fn shared_region_runtime_pre_lp_failure_retires_log_segment() {
 }
 
 #[test]
+fn shared_region_runtime_publication_failure_retires_log_segment() {
+    use crate::runtime::transaction::persist::RecordingBackendEvent;
+
+    clear_current_thread_transaction_for_test();
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let (durable_log, events) = TxDurableLog::recording_backend_with_flush_log_failure_for_test();
+
+    let first_stream_id = {
+        let mut state = TransactionState::default();
+        let transaction = state.begin_with_region_runtime(&runtime).unwrap();
+        let stream_id = runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        let txid = u32::try_from(transaction.as_raw()).unwrap();
+        state.durable_log = durable_log;
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0042, 1, vec![1, 2, 3, 4]);
+
+        let error = state
+            .publish_tmemory_undo_before_in_place_write(stream_id, txid, &undo)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("recording backend flush log failure"),
+            "{error:?}"
+        );
+        state.clear_active().unwrap();
+        stream_id
+    };
+
+    let events = events.lock().unwrap().clone();
+    assert!(events.contains(&RecordingBackendEvent::AppendDataRecord(
+        persist::DurableDataStream::TMemoryUndo
+    )));
+    assert!(events.contains(&RecordingBackendEvent::AppendLogEntry(
+        crate::runtime::vm::TxLogEntryRole::TMemoryUndo
+    )));
+    assert!(events.contains(&RecordingBackendEvent::FlushLog));
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 0);
+
+    let next_runtime = runtime.clone();
+    let next = std::thread::spawn(move || {
+        let stream_id = next_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        next_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        stream_id
+    });
+    let next_stream_id = next.join().unwrap();
+
+    assert_ne!(next_stream_id, first_stream_id);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 1);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
 fn shared_region_runtime_commit_path_uses_transaction_id_in_tmemory_undo_tx_meta() {
     clear_current_thread_transaction_for_test();
 

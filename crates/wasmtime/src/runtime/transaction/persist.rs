@@ -469,6 +469,18 @@ impl TxDurableLog {
             events,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn recording_backend_with_flush_log_failure_for_test()
+    -> (Self, Arc<Mutex<Vec<RecordingBackendEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self::with_backend(RecordingTxDurableLogBackend::new_with_flush_log_failure(
+                events.clone(),
+            )),
+            events,
+        )
+    }
 }
 
 impl TxDurableLogBackend for InMemoryTxDurableLog {
@@ -953,6 +965,7 @@ struct RecordingTxDurableLogBackend {
     next_data_block: u32,
     type_layouts: TypeLayoutRegistry,
     retire_committed_linear_undo_failures_remaining: u32,
+    fail_flush_log_once: bool,
 }
 
 #[cfg(test)]
@@ -963,6 +976,7 @@ impl RecordingTxDurableLogBackend {
             next_data_block: 0,
             type_layouts: TypeLayoutRegistry::default(),
             retire_committed_linear_undo_failures_remaining: 0,
+            fail_flush_log_once: false,
         }
     }
 
@@ -976,6 +990,13 @@ impl RecordingTxDurableLogBackend {
     ) -> Self {
         Self {
             retire_committed_linear_undo_failures_remaining: failures_remaining,
+            ..Self::new(events)
+        }
+    }
+
+    fn new_with_flush_log_failure(events: Arc<Mutex<Vec<RecordingBackendEvent>>>) -> Self {
+        Self {
+            fail_flush_log_once: true,
             ..Self::new(events)
         }
     }
@@ -1038,6 +1059,9 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
 
     fn flush_log(&mut self) -> Result<()> {
         self.push_event(RecordingBackendEvent::FlushLog);
+        if core::mem::take(&mut self.fail_flush_log_once) {
+            bail!("recording backend flush log failure");
+        }
         Ok(())
     }
 

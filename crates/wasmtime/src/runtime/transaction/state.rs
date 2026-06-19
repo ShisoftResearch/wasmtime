@@ -351,10 +351,10 @@ impl TransactionState {
         txid: u32,
         undo: &PendingGranuleUndo,
     ) -> Result<PendingCommitLogEntry> {
+        self.uncommitted_publication_streams.insert(stream_id);
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
         let marker = publisher.publish_tmemory_undo_before_in_place_write(undo)?;
-        self.uncommitted_publication_streams.insert(stream_id);
         self.pending_linear_undo_chunks
             .entry(stream_id)
             .or_default()
@@ -369,6 +369,10 @@ impl TransactionState {
         object_table: &ObjectTable,
         publications: &[persist::PendingPublication],
     ) -> Result<Option<PendingCommitLogEntry>> {
+        if publications.is_empty() {
+            return Ok(None);
+        }
+        self.uncommitted_publication_streams.insert(stream_id);
         let mut required_layout_ids = BTreeSet::new();
         let mut required_layouts = Vec::new();
         for publication in publications {
@@ -385,11 +389,7 @@ impl TransactionState {
 
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-        let marker = publisher.publish_object_publications_before_commit(publications)?;
-        if marker.is_some() {
-            self.uncommitted_publication_streams.insert(stream_id);
-        }
-        Ok(marker)
+        publisher.publish_object_publications_before_commit(publications)
     }
 
     pub(crate) fn publish_commit_lp(
