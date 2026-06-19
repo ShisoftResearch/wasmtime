@@ -11998,6 +11998,127 @@ fn shared_region_runtime_applies_committed_roots_before_transaction_authority_is
 }
 
 #[test]
+fn shared_root_apply_failure_after_lp_keeps_committed_allocated_object_and_clears_state() {
+    clear_current_thread_transaction_for_test();
+
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut objects = ObjectTable::default();
+    let object = objects
+        .allocate_persistent_struct_for_gc_ref(0x59e, vec![ObjectValue::I32(22)])
+        .unwrap();
+
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+    let transaction = TransactionId::from_raw(605);
+    let mut state = TransactionState::new_for_test(transaction);
+    state.shared_region_runtime = Some(runtime.clone());
+    state.record_allocated_object(object).unwrap();
+    state.acquire_object_write(&mut objects, object).unwrap();
+    state
+        .stage_struct_field(&objects, object, 0, ObjectValue::I32(23))
+        .unwrap();
+    state.stage_global(0, GlobalSnapshot::GcRef(0x59e)).unwrap();
+
+    let mut publications = Vec::new();
+    state
+        .commit_object_payloads_into(&mut objects, &mut publications)
+        .unwrap();
+    let delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    publications.extend(state.persistent_root_publications(&delta).unwrap());
+
+    let stream_id = runtime
+        .current_thread_log_segment_for_test()
+        .unwrap()
+        .stream_id();
+    let txid = u32::try_from(state.active_transaction_required_raw().unwrap()).unwrap();
+    let marker = state
+        .publish_object_publications_before_commit(stream_id, txid, &objects, &publications)
+        .unwrap()
+        .unwrap();
+    state.publish_commit_lp(stream_id, txid, marker).unwrap();
+    state.begin_terminal_commit().unwrap();
+
+    runtime.fail_apply_persistent_root_delta_once_for_test();
+    let error = state
+        .complete_commit_with_persistent_root_delta_for_test(delta)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected shared persistent root apply failure"),
+        "{error:?}"
+    );
+
+    state
+        .finish_committed_cleanup_after_durable_commit_error_for_test()
+        .unwrap();
+    assert_eq!(state.active_transaction(), None);
+    assert!(!state.terminal_commit_active);
+    assert_eq!(current_thread_transaction_for_test(), None);
+    assert_eq!(state.allocated_object_count_for_test(), 0);
+    assert_eq!(
+        objects.payload(object).unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::I32(23)])
+    );
+    assert_eq!(
+        runtime.persistent_root_ids_for_test().unwrap(),
+        object_set([])
+    );
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn shared_root_apply_failure_can_retry_with_original_reserved_version() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let root_key = PersistentRootKey::Global {
+        instance: None,
+        global_index: 0,
+    };
+    let mut objects = ObjectTable::default();
+    let root = objects
+        .allocate_persistent_struct_for_gc_ref(0x59f, vec![ObjectValue::I32(24)])
+        .unwrap();
+
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+    let mut state = TransactionState::new_for_test(TransactionId::from_raw(606));
+    state.shared_region_runtime = Some(runtime.clone());
+    state.stage_global(0, GlobalSnapshot::GcRef(0x59f)).unwrap();
+    let delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    let publications = state.persistent_root_publications(&delta).unwrap();
+    assert_eq!(publications[0].version, 1);
+
+    state.begin_terminal_commit().unwrap();
+    runtime.fail_apply_persistent_root_delta_once_for_test();
+    let error = state
+        .commit_shared_persistent_root_delta_before_complete_commit(delta.clone())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected shared persistent root apply failure"),
+        "{error:?}"
+    );
+
+    state
+        .commit_shared_persistent_root_delta_before_complete_commit(delta)
+        .unwrap();
+    assert_eq!(
+        runtime.persistent_root_ids_for_test().unwrap(),
+        object_set([root])
+    );
+    assert_eq!(
+        runtime.persistent_root_version_for_test(root_key).unwrap(),
+        Some(1)
+    );
+
+    state.complete_commit().unwrap();
+}
+
+#[test]
 fn shared_region_runtime_root_ids_change_when_roots_are_removed() {
     let mut objects = ObjectTable::default();
     let root = objects

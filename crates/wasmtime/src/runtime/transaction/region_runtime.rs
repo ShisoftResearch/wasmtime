@@ -44,6 +44,8 @@ pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) durable_log: TxDurableLog,
     #[cfg(test)]
     pub(crate) fail_release_transaction_once_for_test: bool,
+    #[cfg(test)]
+    pub(crate) fail_apply_persistent_root_delta_once_for_test: bool,
 }
 
 impl Default for TransactionRegionRuntimeInner {
@@ -63,6 +65,8 @@ impl Default for TransactionRegionRuntimeInner {
             durable_log: TxDurableLog::default(),
             #[cfg(test)]
             fail_release_transaction_once_for_test: false,
+            #[cfg(test)]
+            fail_apply_persistent_root_delta_once_for_test: false,
         }
     }
 }
@@ -290,6 +294,10 @@ impl TransactionRegionRuntime {
         }
 
         let mut runtime = self.lock()?;
+        #[cfg(test)]
+        if core::mem::take(&mut runtime.fail_apply_persistent_root_delta_once_for_test) {
+            bail!("injected shared persistent root apply failure");
+        }
         for (key, roots) in delta.roots {
             let version = reserved_versions
                 .get(&key)
@@ -527,5 +535,12 @@ impl TransactionRegionRuntime {
     #[cfg(test)]
     pub(crate) fn fail_release_transaction_once_for_test(&self) {
         self.lock().unwrap().fail_release_transaction_once_for_test = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_apply_persistent_root_delta_once_for_test(&self) {
+        self.lock()
+            .unwrap()
+            .fail_apply_persistent_root_delta_once_for_test = true;
     }
 }

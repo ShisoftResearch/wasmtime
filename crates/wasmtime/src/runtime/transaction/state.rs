@@ -2132,6 +2132,7 @@ impl TransactionState {
         }
 
         if let Some(runtime) = &self.shared_region_runtime {
+            let root_keys = delta.roots.keys().copied().collect::<Vec<_>>();
             let reserved_versions = delta
                 .roots
                 .keys()
@@ -2139,12 +2140,17 @@ impl TransactionState {
                 .map(|key| {
                     let version = self
                         .pending_persistent_root_versions
-                        .remove(&key)
+                        .get(&key)
+                        .copied()
                         .context("shared persistent root publication version was not reserved")?;
                     Ok((key, version))
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?;
-            return runtime.apply_committed_persistent_root_delta(delta, reserved_versions);
+            runtime.apply_committed_persistent_root_delta(delta, reserved_versions)?;
+            for key in root_keys {
+                self.pending_persistent_root_versions.remove(&key);
+            }
+            return Ok(());
         }
 
         let next_versions = delta
@@ -2190,6 +2196,23 @@ impl TransactionState {
             "shared persistent root commit requires an active terminal commit"
         );
         self.apply_committed_persistent_root_delta(delta)
+    }
+
+    pub(crate) fn finish_committed_cleanup_after_durable_commit_error(&mut self) -> Result<()> {
+        self.ensure_active()?;
+        ensure!(
+            self.terminal_commit_active,
+            "durable commit cleanup requires an active terminal commit"
+        );
+        self.ensure_no_pending_conflict_aborted_allocated_objects()?;
+        self.retry_post_commit_linear_undo_retirement();
+        let mut result = self.bump_active_versioned_write_granules();
+        if let Err(error) = self.clear_active()
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        result
     }
 
     pub(crate) fn persistent_root_ids(&self) -> Result<BTreeSet<ObjectId>> {
@@ -3078,6 +3101,12 @@ impl TransactionState {
         delta: PersistentRootDelta,
     ) -> Result<()> {
         self.complete_commit_with_persistent_root_delta(delta)
+    }
+
+    pub(super) fn finish_committed_cleanup_after_durable_commit_error_for_test(
+        &mut self,
+    ) -> Result<()> {
+        self.finish_committed_cleanup_after_durable_commit_error()
     }
 
     pub(super) fn persistent_root_ids_for_test(&self) -> BTreeSet<ObjectId> {

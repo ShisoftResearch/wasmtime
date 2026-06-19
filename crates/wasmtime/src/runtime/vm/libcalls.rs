@@ -814,6 +814,7 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         };
         final_marker = object_marker.or(final_marker);
     }
+    let mut lp_published = false;
     if let Some(marker) = final_marker {
         if store
             .store_opaque_mut()
@@ -826,12 +827,28 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
             .store_opaque_mut()
             .transaction_state_mut()
             .publish_commit_lp(stream_id, txid, marker)?;
+        lp_published = true;
     }
 
-    store
+    let commit_result = store
         .store_opaque_mut()
         .transaction_state_mut()
-        .complete_commit_with_persistent_root_delta(root_delta)?;
+        .complete_commit_with_persistent_root_delta(root_delta);
+    if let Err(error) = commit_result {
+        if lp_published {
+            let cleanup_result = store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .finish_committed_cleanup_after_durable_commit_error();
+            return match cleanup_result {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error.context(format!(
+                    "transaction committed durably but cleanup after commit failure also failed: {error}"
+                ))),
+            };
+        }
+        return Err(error);
+    }
 
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
