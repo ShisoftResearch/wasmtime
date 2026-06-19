@@ -484,6 +484,17 @@ impl TransactionRegionRuntime {
             .validate_read(transaction, granule, current_version)
     }
 
+    pub(crate) fn validate_granule_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        self.lock_authority()?
+            .concurrency
+            .validate_write(transaction, granule, current_version)
+    }
+
     pub(crate) fn refresh_read_version(
         &self,
         transaction: TransactionId,
@@ -508,6 +519,12 @@ impl TransactionRegionRuntime {
             bail!("injected release transaction failure");
         }
         Ok(())
+    }
+
+    pub(crate) fn commit_transaction_result(&self, transaction: TransactionId) -> Result<()> {
+        self.lock_authority()?
+            .concurrency
+            .commit_transaction_result(transaction)
     }
 
     pub(crate) fn take_conflict_aborted_transaction(

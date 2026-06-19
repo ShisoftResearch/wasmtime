@@ -3113,6 +3113,39 @@ fn commit_validates_reads_before_apply_callback() {
 }
 
 #[test]
+fn commit_validates_writes_before_apply_callback() {
+    let transaction = TransactionId::from_raw(77);
+    let mut state = TransactionState::new_for_test(transaction);
+    let granule = GranuleId::TGlobal {
+        instance: None,
+        global_index: 3,
+    };
+
+    state.stage_global(3, GlobalSnapshot::I32(7)).unwrap();
+    assert_eq!(state.active_write_granules().unwrap(), vec![granule]);
+    assert_eq!(
+        state.concurrency.remove_owner_for_granule_for_test(granule),
+        Some(transaction)
+    );
+    state.commit_transaction_authority(transaction).unwrap();
+
+    let mut applied = false;
+    let error = state
+        .commit_with_read_validation(
+            |_| Ok(0),
+            |_| {
+                applied = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("transaction write conflict"));
+    assert!(!applied);
+    assert_eq!(state.active_transaction(), Some(transaction));
+}
+
+#[test]
 fn abort_releases_lock_based_ownership_for_next_transaction() {
     let mut state = TransactionState::default();
     state.begin().unwrap();
@@ -15902,15 +15935,26 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
         policy
             .validate_read(result_release_transaction, result_release_read_granule, 2)
             .unwrap();
+        policy
+            .validate_write(result_release_transaction, result_release_write_granule, 1)
+            .unwrap();
         assert!(
             policy
                 .read_granules_for_transaction(result_release_transaction)
                 .contains(&result_release_read_granule)
         );
+        assert!(
+            policy
+                .write_granules_for_transaction(result_release_transaction)
+                .contains(&result_release_write_granule)
+        );
         assert_eq!(
             policy.owner_for_granule(result_release_write_granule),
             Some(result_release_transaction)
         );
+        policy
+            .commit_transaction_result(result_release_transaction)
+            .unwrap();
 
         policy
             .release_transaction_result(result_release_transaction)

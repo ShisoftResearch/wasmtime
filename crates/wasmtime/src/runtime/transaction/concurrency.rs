@@ -86,6 +86,13 @@ pub(crate) trait TransactionConcurrencyControl {
         current_version: u64,
     ) -> Result<()>;
 
+    fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()>;
+
     fn refresh_read_version(
         &mut self,
         transaction: TransactionId,
@@ -103,6 +110,12 @@ pub(crate) trait TransactionConcurrencyControl {
     fn owner_for_granule(&self, granule: GranuleId) -> Option<TransactionId>;
 
     fn read_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId>;
+
+    fn write_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId>;
+
+    fn commit_transaction_result(&mut self, _transaction: TransactionId) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -183,6 +196,16 @@ impl ConcurrencyControlState {
             .validate_read(transaction, granule, current_version)
     }
 
+    pub(crate) fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        self.policy()
+            .validate_write(transaction, granule, current_version)
+    }
+
     pub(crate) fn refresh_read_version(
         &mut self,
         transaction: TransactionId,
@@ -210,6 +233,17 @@ impl ConcurrencyControlState {
         transaction: TransactionId,
     ) -> Vec<GranuleId> {
         self.policy().read_granules_for_transaction(transaction)
+    }
+
+    pub(crate) fn write_granules_for_transaction(
+        &self,
+        transaction: TransactionId,
+    ) -> Vec<GranuleId> {
+        self.policy().write_granules_for_transaction(transaction)
+    }
+
+    pub(crate) fn commit_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
+        self.policy_mut().commit_transaction_result(transaction)
     }
 
     #[cfg(test)]
@@ -292,6 +326,15 @@ impl LockBased {
         current_version: u64,
     ) -> Result<()> {
         Self::map_conflict_result(self.validate_read_typed(transaction, granule, current_version))
+    }
+
+    pub(crate) fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        _current_version: u64,
+    ) -> Result<()> {
+        Self::map_conflict_result(self.validate_write_typed(transaction, granule))
     }
 
     pub(crate) fn validate_transaction_reads<F>(
@@ -408,6 +451,17 @@ impl LockBased {
             return Err(LockBasedConflictKind::ReadVersionMismatch);
         }
 
+        Ok(())
+    }
+
+    fn validate_write_typed(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+    ) -> core::result::Result<(), LockBasedConflictKind> {
+        if self.owners.get(&granule).copied() != Some(transaction) {
+            return Err(LockBasedConflictKind::WriteOwnedByOther);
+        }
         Ok(())
     }
 
@@ -591,6 +645,15 @@ impl TransactionConcurrencyControl for LockBased {
         LockBased::validate_read(self, transaction, granule, current_version)
     }
 
+    fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        LockBased::validate_write(self, transaction, granule, current_version)
+    }
+
     fn refresh_read_version(
         &mut self,
         transaction: TransactionId,
@@ -616,6 +679,13 @@ impl TransactionConcurrencyControl for LockBased {
         self.read_versions
             .keys()
             .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect()
+    }
+
+    fn write_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId> {
+        self.owners
+            .iter()
+            .filter_map(|(granule, owner)| (*owner == transaction).then_some(*granule))
             .collect()
     }
 }
@@ -682,6 +752,15 @@ impl NoWaitAbort {
         current_version: u64,
     ) -> Result<()> {
         Self::map_conflict_result(self.validate_read_typed(transaction, granule, current_version))
+    }
+
+    pub(crate) fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        _current_version: u64,
+    ) -> Result<()> {
+        Self::map_conflict_result(self.validate_write_typed(transaction, granule))
     }
 
     pub(crate) fn refresh_read_version(
@@ -781,6 +860,17 @@ impl NoWaitAbort {
             return Err(NoWaitAbortConflictKind::ReadVersionMismatch);
         }
 
+        Ok(())
+    }
+
+    fn validate_write_typed(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+    ) -> core::result::Result<(), NoWaitAbortConflictKind> {
+        if self.owners.get(&granule).copied() != Some(transaction) {
+            return Err(NoWaitAbortConflictKind::WriteOwnedByOther);
+        }
         Ok(())
     }
 
@@ -895,6 +985,15 @@ impl TransactionConcurrencyControl for NoWaitAbort {
         NoWaitAbort::validate_read(self, transaction, granule, current_version)
     }
 
+    fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        NoWaitAbort::validate_write(self, transaction, granule, current_version)
+    }
+
     fn refresh_read_version(
         &mut self,
         transaction: TransactionId,
@@ -920,6 +1019,13 @@ impl TransactionConcurrencyControl for NoWaitAbort {
         self.read_versions
             .keys()
             .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect()
+    }
+
+    fn write_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId> {
+        self.owners
+            .iter()
+            .filter_map(|(granule, owner)| (*owner == transaction).then_some(*granule))
             .collect()
     }
 }
@@ -991,6 +1097,15 @@ impl StrictTwoPhaseLocking {
         current_version: u64,
     ) -> Result<()> {
         Self::map_conflict_result(self.validate_read_typed(transaction, granule, current_version))
+    }
+
+    pub(crate) fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        _current_version: u64,
+    ) -> Result<()> {
+        Self::map_conflict_result(self.validate_write_typed(transaction, granule))
     }
 
     pub(crate) fn refresh_read_version(
@@ -1120,6 +1235,17 @@ impl StrictTwoPhaseLocking {
 
         Ok(())
     }
+
+    fn validate_write_typed(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+    ) -> core::result::Result<(), StrictTwoPhaseLockingConflictKind> {
+        if self.writers.get(&granule).copied() != Some(transaction) {
+            return Err(StrictTwoPhaseLockingConflictKind::WriteOwnedByOther);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1230,6 +1356,15 @@ impl TransactionConcurrencyControl for StrictTwoPhaseLocking {
         StrictTwoPhaseLocking::validate_read(self, transaction, granule, current_version)
     }
 
+    fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        StrictTwoPhaseLocking::validate_write(self, transaction, granule, current_version)
+    }
+
     fn refresh_read_version(
         &mut self,
         transaction: TransactionId,
@@ -1255,6 +1390,13 @@ impl TransactionConcurrencyControl for StrictTwoPhaseLocking {
         self.read_versions
             .keys()
             .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect()
+    }
+
+    fn write_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId> {
+        self.writers
+            .iter()
+            .filter_map(|(granule, owner)| (*owner == transaction).then_some(*granule))
             .collect()
     }
 }
@@ -1321,6 +1463,15 @@ impl WoundWait {
         current_version: u64,
     ) -> Result<()> {
         Self::map_conflict_result(self.validate_read_typed(transaction, granule, current_version))
+    }
+
+    pub(crate) fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        _current_version: u64,
+    ) -> Result<()> {
+        Self::map_conflict_result(self.validate_write_typed(transaction, granule))
     }
 
     pub(crate) fn refresh_read_version(
@@ -1418,6 +1569,17 @@ impl WoundWait {
             return Err(WoundWaitConflictKind::ReadVersionMismatch);
         }
 
+        Ok(())
+    }
+
+    fn validate_write_typed(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+    ) -> core::result::Result<(), WoundWaitConflictKind> {
+        if self.owners.get(&granule).copied() != Some(transaction) {
+            return Err(WoundWaitConflictKind::WriteOwnedByOther);
+        }
         Ok(())
     }
 
@@ -1544,6 +1706,15 @@ impl TransactionConcurrencyControl for WoundWait {
         WoundWait::validate_read(self, transaction, granule, current_version)
     }
 
+    fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        WoundWait::validate_write(self, transaction, granule, current_version)
+    }
+
     fn refresh_read_version(
         &mut self,
         transaction: TransactionId,
@@ -1569,6 +1740,13 @@ impl TransactionConcurrencyControl for WoundWait {
         self.read_versions
             .keys()
             .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect()
+    }
+
+    fn write_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId> {
+        self.owners
+            .iter()
+            .filter_map(|(granule, owner)| (*owner == transaction).then_some(*granule))
             .collect()
     }
 }
@@ -1635,6 +1813,15 @@ impl WaitDie {
         current_version: u64,
     ) -> Result<()> {
         Self::map_conflict_result(self.validate_read_typed(transaction, granule, current_version))
+    }
+
+    pub(crate) fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        _current_version: u64,
+    ) -> Result<()> {
+        Self::map_conflict_result(self.validate_write_typed(transaction, granule))
     }
 
     pub(crate) fn refresh_read_version(
@@ -1738,6 +1925,17 @@ impl WaitDie {
             return Err(WaitDieConflictKind::ReadVersionMismatch);
         }
 
+        Ok(())
+    }
+
+    fn validate_write_typed(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+    ) -> core::result::Result<(), WaitDieConflictKind> {
+        if self.owners.get(&granule).copied() != Some(transaction) {
+            return Err(WaitDieConflictKind::WriteOwnedByOther);
+        }
         Ok(())
     }
 
@@ -1864,6 +2062,15 @@ impl TransactionConcurrencyControl for WaitDie {
         WaitDie::validate_read(self, transaction, granule, current_version)
     }
 
+    fn validate_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        WaitDie::validate_write(self, transaction, granule, current_version)
+    }
+
     fn refresh_read_version(
         &mut self,
         transaction: TransactionId,
@@ -1889,6 +2096,13 @@ impl TransactionConcurrencyControl for WaitDie {
         self.read_versions
             .keys()
             .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect()
+    }
+
+    fn write_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId> {
+        self.owners
+            .iter()
+            .filter_map(|(granule, owner)| (*owner == transaction).then_some(*granule))
             .collect()
     }
 }

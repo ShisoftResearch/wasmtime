@@ -533,7 +533,9 @@ impl TransactionState {
         F: FnMut(&StagedRecord) -> Result<()>,
     {
         self.ensure_active()?;
-        self.validate_active_reads_with(current_version_fn)?;
+        let mut current_version_fn = current_version_fn;
+        self.validate_active_read_granules_with(&mut current_version_fn)?;
+        self.validate_active_writes_with(&mut current_version_fn)?;
         let records = self.staged_records()?;
         self.begin_terminal_commit()?;
         for record in records {
@@ -546,7 +548,8 @@ impl TransactionState {
     where
         F: FnMut(GranuleId) -> Result<u64>,
     {
-        self.validate_active_read_granules_with(current_version_fn)
+        let mut current_version_fn = current_version_fn;
+        self.validate_active_read_granules_with(&mut current_version_fn)
     }
 
     pub(crate) fn active_read_granules(&self) -> Result<Vec<GranuleId>> {
@@ -555,6 +558,11 @@ impl TransactionState {
             return Ok(self.read_granules.iter().copied().collect());
         }
         Ok(self.concurrency.read_granules_for_transaction(transaction))
+    }
+
+    pub(crate) fn active_write_granules(&self) -> Result<Vec<GranuleId>> {
+        self.active_transaction_required()?;
+        Ok(self.write_granules.iter().copied().collect())
     }
 
     pub(crate) fn validate_active_read(
@@ -644,6 +652,20 @@ impl TransactionState {
         }
     }
 
+    fn validate_granule_write_authority(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.validate_granule_write(transaction, granule, current_version)
+        } else {
+            self.concurrency
+                .validate_write(transaction, granule, current_version)
+        }
+    }
+
     fn release_transaction_authority(&mut self, transaction: TransactionId) -> Result<()> {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.release_transaction(transaction)
@@ -652,13 +674,36 @@ impl TransactionState {
         }
     }
 
-    fn validate_active_read_granules_with<F>(&self, mut current_version_fn: F) -> Result<()>
+    pub(crate) fn commit_transaction_authority(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.commit_transaction_result(transaction)
+        } else {
+            self.concurrency.commit_transaction_result(transaction)
+        }
+    }
+
+    fn validate_active_read_granules_with<F>(&self, current_version_fn: &mut F) -> Result<()>
     where
         F: FnMut(GranuleId) -> Result<u64>,
     {
         for granule in self.active_read_granules()? {
             let current_version = current_version_fn(granule)?;
             self.validate_active_read(granule, current_version)?;
+        }
+        Ok(())
+    }
+
+    fn validate_active_writes_with<F>(&self, current_version_fn: &mut F) -> Result<()>
+    where
+        F: FnMut(GranuleId) -> Result<u64>,
+    {
+        let transaction = self.active_transaction_required()?;
+        for granule in self.active_write_granules()? {
+            let current_version = current_version_fn(granule)?;
+            self.validate_granule_write_authority(transaction, granule, current_version)?;
         }
         Ok(())
     }
