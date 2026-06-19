@@ -15574,6 +15574,68 @@ fn wound_wait_younger_requester_conflicts_with_older_owner() {
 }
 
 #[test]
+fn wound_wait_validates_optimistic_reads_at_commit() {
+    let mut policy = WoundWait::default();
+    let reader = TransactionId::from_raw(1);
+    let writer = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    policy.record_read_for_test(reader, granule, 7).unwrap();
+    policy.acquire_write_for_test(writer, granule, 7).unwrap();
+    policy.abort_for_test(writer);
+
+    let error = policy
+        .validate_read_result_for_test(reader, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, WoundWaitConflictKindForTest::ReadVersionMismatch);
+}
+
+#[test]
+fn wound_wait_rejects_write_after_stale_read_version() {
+    let mut policy = WoundWait::default();
+    let transaction = TransactionId::from_raw(1);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    policy
+        .record_read_for_test(transaction, granule, 7)
+        .unwrap();
+
+    let error = policy
+        .acquire_write_result_for_test(transaction, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, WoundWaitConflictKindForTest::WriteVersionMismatch);
+}
+
+#[test]
+fn wound_wait_refreshes_read_version_after_wounding_owner() {
+    let mut policy = WoundWait::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    policy.record_read_for_test(older, granule, 7).unwrap();
+    policy.acquire_write_for_test(younger, granule, 7).unwrap();
+
+    let wounded = policy.record_read(older, granule, 7).unwrap();
+    assert_eq!(wounded, Some(younger));
+
+    policy.refresh_read_version(older, granule, 8);
+    policy.validate_read_for_test(older, granule, 8).unwrap();
+}
+
+#[test]
 fn transaction_timestamp_helpers_use_transaction_id_order() {
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);

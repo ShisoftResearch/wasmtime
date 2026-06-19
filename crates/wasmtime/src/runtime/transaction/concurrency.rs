@@ -1106,6 +1106,24 @@ impl WoundWait {
             .map(|_| ())
     }
 
+    pub(crate) fn validate_read_for_test(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        self.validate_read(transaction, granule, current_version)
+    }
+
+    pub(crate) fn validate_read_result_for_test(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> core::result::Result<(), WoundWaitConflictKindForTest> {
+        self.validate_read_typed(transaction, granule, current_version)
+    }
+
     pub(crate) fn abort_for_test(&mut self, transaction: TransactionId) {
         self.release_transaction(transaction);
     }
