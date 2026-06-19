@@ -140,6 +140,46 @@ fn shared_region_runtime_assigns_distinct_log_segments_to_threads() {
 }
 
 #[test]
+fn shared_region_runtime_reuses_released_log_segments() {
+    use std::thread;
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+
+    let first_runtime = runtime.clone();
+    let first = thread::spawn(move || {
+        let segment = first_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        first_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        segment
+    });
+    let first = first.join().unwrap();
+
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 1);
+
+    let second_runtime = runtime.clone();
+    let second = thread::spawn(move || {
+        let segment = second_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        second_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        segment
+    });
+    let second = second.join().unwrap();
+
+    assert_eq!(second, first);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 1);
+}
+
+#[test]
 fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -490,6 +530,37 @@ fn shared_region_runtime_poisoned_clear_active_returns_error_without_panic() {
 
     let error = state.clear_active().unwrap_err();
     assert!(error.to_string().contains("lock poisoned"), "{error:?}");
+}
+
+#[test]
+fn shared_region_runtime_cleanup_failure_still_clears_local_state() {
+    clear_current_thread_transaction_for_test();
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let mut state = TransactionState::default();
+
+    let first = state.begin_with_region_runtime(&runtime).unwrap();
+    state.stage_global(0, GlobalSnapshot::I32(1)).unwrap();
+    runtime.fail_release_transaction_once_for_test();
+
+    let error = state.clear_active().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected release transaction failure"),
+        "{error:?}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(current_thread_transaction_for_test(), None);
+
+    let second = state.begin_with_region_runtime(&runtime).unwrap();
+    assert_ne!(second, first);
+    assert_eq!(current_thread_transaction_for_test(), Some(second));
+    assert!(state.staged_records().unwrap().is_empty());
+
+    state.abort().unwrap();
+    assert_eq!(current_thread_transaction_for_test(), None);
+    clear_current_thread_transaction_for_test();
 }
 
 #[test]

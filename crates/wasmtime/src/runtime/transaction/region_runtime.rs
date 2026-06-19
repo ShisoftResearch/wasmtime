@@ -31,11 +31,14 @@ pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) next_transaction_id: u64,
     pub(crate) next_log_segment_stream_id: u32,
     pub(crate) thread_log_segments: HashMap<ThreadId, DurableLogSegment>,
+    pub(crate) free_log_segment_stream_ids: Vec<u32>,
     pub(crate) locks: LockBased,
     pub(crate) conflict_aborted_transactions: BTreeSet<TransactionId>,
     pub(crate) terminal_commits: BTreeSet<TransactionId>,
     pub(crate) granule_versions: BTreeMap<GranuleId, u64>,
     pub(crate) durable_log: TxDurableLog,
+    #[cfg(test)]
+    pub(crate) fail_release_transaction_once_for_test: bool,
 }
 
 impl Default for TransactionRegionRuntimeInner {
@@ -44,11 +47,14 @@ impl Default for TransactionRegionRuntimeInner {
             next_transaction_id: 10_001,
             next_log_segment_stream_id: FIRST_DURABLE_LOG_SEGMENT_STREAM_ID,
             thread_log_segments: HashMap::new(),
+            free_log_segment_stream_ids: Vec::new(),
             locks: LockBased::default(),
             conflict_aborted_transactions: BTreeSet::new(),
             terminal_commits: BTreeSet::new(),
             granule_versions: BTreeMap::new(),
             durable_log: TxDurableLog::default(),
+            #[cfg(test)]
+            fail_release_transaction_once_for_test: false,
         }
     }
 }
@@ -85,19 +91,34 @@ impl TransactionRegionRuntime {
             return Ok(segment);
         }
 
-        ensure!(
-            runtime.next_log_segment_stream_id <= MAX_DURABLE_LOG_SEGMENT_STREAM_ID,
-            "durable log segment stream id overflow"
-        );
-        let segment = DurableLogSegment {
-            stream_id: runtime.next_log_segment_stream_id,
+        let stream_id = if let Some(stream_id) = runtime.free_log_segment_stream_ids.pop() {
+            stream_id
+        } else {
+            ensure!(
+                runtime.next_log_segment_stream_id <= MAX_DURABLE_LOG_SEGMENT_STREAM_ID,
+                "durable log segment stream id overflow"
+            );
+            let stream_id = runtime.next_log_segment_stream_id;
+            runtime.next_log_segment_stream_id = runtime
+                .next_log_segment_stream_id
+                .checked_add(1)
+                .context("durable log segment stream id overflow")?;
+            stream_id
         };
-        runtime.next_log_segment_stream_id = runtime
-            .next_log_segment_stream_id
-            .checked_add(1)
-            .context("durable log segment stream id overflow")?;
+        let segment = DurableLogSegment { stream_id };
         runtime.thread_log_segments.insert(thread_id, segment);
         Ok(segment)
+    }
+
+    pub(crate) fn release_current_thread_log_segment(&self) -> Result<()> {
+        let thread_id = std::thread::current().id();
+        let mut runtime = self.lock()?;
+        if let Some(segment) = runtime.thread_log_segments.remove(&thread_id) {
+            runtime
+                .free_log_segment_stream_ids
+                .push(segment.stream_id());
+        }
+        Ok(())
     }
 
     pub(crate) fn acquire_granule_read(
@@ -164,6 +185,10 @@ impl TransactionRegionRuntime {
         runtime.locks.release_transaction(transaction);
         runtime.conflict_aborted_transactions.remove(&transaction);
         runtime.terminal_commits.remove(&transaction);
+        #[cfg(test)]
+        if core::mem::take(&mut runtime.fail_release_transaction_once_for_test) {
+            bail!("injected release transaction failure");
+        }
         Ok(())
     }
 
@@ -308,5 +333,25 @@ impl TransactionRegionRuntime {
     #[cfg(test)]
     pub(crate) fn current_thread_log_segment_for_test(&self) -> Result<DurableLogSegment> {
         self.current_thread_log_segment()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_current_thread_log_segment_for_test(&self) -> Result<()> {
+        self.release_current_thread_log_segment()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread_log_segment_count_for_test(&self) -> Result<usize> {
+        Ok(self.lock()?.thread_log_segments.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn free_log_segment_count_for_test(&self) -> Result<usize> {
+        Ok(self.lock()?.free_log_segment_stream_ids.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_release_transaction_once_for_test(&self) {
+        self.lock().unwrap().fail_release_transaction_once_for_test = true;
     }
 }

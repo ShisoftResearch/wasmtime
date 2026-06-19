@@ -2838,19 +2838,38 @@ impl TransactionState {
     }
 
     pub(super) fn clear_active(&mut self) -> Result<()> {
-        if let Some(transaction) = self.active.take() {
+        let mut error = None;
+        if let Some(transaction) = self.active {
             if self.terminal_commit_active {
                 if let Some(runtime) = &self.shared_region_runtime {
-                    runtime.end_terminal_commit(transaction)?;
+                    if let Err(err) = runtime.end_terminal_commit(transaction) {
+                        if error.is_none() {
+                            error = Some(err);
+                        }
+                    }
                 }
-                self.terminal_commit_active = false;
             }
-            self.release_transaction_authority(transaction)?;
+            if let Err(err) = self.release_transaction_authority(transaction) {
+                if error.is_none() {
+                    error = Some(err);
+                }
+            }
+            if let Some(runtime) = &self.shared_region_runtime {
+                if let Err(err) = runtime.release_current_thread_log_segment() {
+                    if error.is_none() {
+                        error = Some(err);
+                    }
+                }
+            }
         }
+        self.active = None;
         self.terminal_commit_active = false;
         replace_current_thread_transaction(None);
         self.install_workspace(TransactionWorkspace::default());
-        Ok(())
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn retry_post_commit_linear_undo_retirement(&mut self) {
