@@ -1076,7 +1076,11 @@ fn shared_region_runtime_detects_cross_thread_write_conflict() {
         let result =
             second_runtime.acquire_granule_write_for_test(TransactionId::from_raw(2), granule, 0);
         attempted_tx.send(()).unwrap();
-        result.is_err()
+        if cfg!(feature = "transaction-cc-optimistic-validation") {
+            result.is_ok()
+        } else {
+            result.is_err()
+        }
     });
 
     assert!(second.join().unwrap());
@@ -1114,6 +1118,14 @@ fn shared_transaction_states_detect_cross_thread_write_conflict() {
         state.begin_with_region_runtime(&second_runtime).unwrap();
         let result = state.acquire_granule_write(granule, 0);
         attempted_tx.send(()).unwrap();
+        if cfg!(feature = "transaction-cc-optimistic-validation") {
+            if result.is_ok() {
+                state.abort().unwrap();
+                return true;
+            }
+            state.abort().unwrap();
+            return false;
+        }
         if result.is_err() {
             state.abort().unwrap();
             return true;
@@ -1529,13 +1541,23 @@ fn shared_region_runtime_terminal_owner_cannot_be_preempted() {
         .unwrap();
     runtime.begin_terminal_commit_for_test(owner).unwrap();
 
-    let error = runtime
-        .acquire_granule_write_for_test(older, granule, 0)
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("transaction write conflict"),
-        "{error:?}"
-    );
+    if cfg!(feature = "transaction-cc-optimistic-validation") {
+        let action = runtime
+            .acquire_granule_write_for_test(older, granule, 0)
+            .unwrap();
+        assert_eq!(
+            action,
+            super::concurrency::TransactionConflictAction::Continue
+        );
+    } else {
+        let error = runtime
+            .acquire_granule_write_for_test(older, granule, 0)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("transaction write conflict"),
+            "{error:?}"
+        );
+    }
     assert!(
         !runtime
             .take_conflict_aborted_transaction_for_test(owner)
@@ -3123,16 +3145,20 @@ fn commit_validates_writes_before_apply_callback() {
 
     state.stage_global(3, GlobalSnapshot::I32(7)).unwrap();
     assert_eq!(state.active_write_granules().unwrap(), vec![granule]);
-    assert_eq!(
-        state.concurrency.remove_owner_for_granule_for_test(granule),
-        Some(transaction)
-    );
+    let removed_owner = state.concurrency.remove_owner_for_granule_for_test(granule);
+    let current_version = if cfg!(feature = "transaction-cc-optimistic-validation") {
+        assert_eq!(removed_owner, None);
+        1
+    } else {
+        assert_eq!(removed_owner, Some(transaction));
+        0
+    };
     state.commit_transaction_authority(transaction).unwrap();
 
     let mut applied = false;
     let error = state
         .commit_with_read_validation(
-            |_| Ok(0),
+            |_| Ok(current_version),
             |_| {
                 applied = true;
                 Ok(())
@@ -3557,16 +3583,21 @@ fn higher_transaction_id_cannot_write_lower_owned_object() {
     state.restore_transaction(None).unwrap();
 
     state.enter_transaction(higher).unwrap();
-    let error = state
-        .acquire_object_write(&mut objects, object)
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("transaction write conflict"),
-        "{error:?}"
-    );
     assert!(state.transaction_is_open(lower));
     assert!(state.transaction_is_open(higher));
-    assert!(!state.owns_object_write(object));
+    if cfg!(feature = "transaction-cc-optimistic-validation") {
+        state.acquire_object_write(&mut objects, object).unwrap();
+        assert!(state.owns_object_write(object));
+    } else {
+        let error = state
+            .acquire_object_write(&mut objects, object)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("transaction write conflict"),
+            "{error:?}"
+        );
+        assert!(!state.owns_object_write(object));
+    }
 
     state.abort().unwrap();
     assert_eq!(current_thread_transaction_for_test(), None);
@@ -3652,8 +3683,12 @@ fn aborting_suspended_transaction_releases_only_its_locks() {
         .acquire_memory_granule_write(0, 1, vec![0xbb; TMEMORY_GRANULE_SIZE])
         .unwrap();
 
-    let conflict = state.acquire_memory_granule_read(0, 0).unwrap_err();
-    assert!(conflict.to_string().contains("transaction read conflict"));
+    if cfg!(feature = "transaction-cc-optimistic-validation") {
+        state.acquire_memory_granule_read(0, 0).unwrap();
+    } else {
+        let conflict = state.acquire_memory_granule_read(0, 0).unwrap_err();
+        assert!(conflict.to_string().contains("transaction read conflict"));
+    }
 
     assert!(state.abort_transaction(first).unwrap());
     state.acquire_memory_granule_read(0, 0).unwrap();
@@ -9534,10 +9569,20 @@ mod model_permissions {
                 state.read_granules.contains(&granule),
                 "permission downgrade should preserve read permission for {granule:?}"
             );
-            ensure!(
-                state.concurrency.remove_owner_for_granule_for_test(granule) == Some(transaction),
-                "permission downgrade expected tx {transaction:?} to own {granule:?}"
-            );
+            if cfg!(feature = "transaction-cc-optimistic-validation") {
+                match &mut state.concurrency {
+                    ConcurrencyControlState::OptimisticValidation(policy) => {
+                        policy.write_versions.remove(&(transaction, granule));
+                    }
+                    _ => unreachable!("optimistic-validation feature should select that policy"),
+                }
+            } else {
+                ensure!(
+                    state.concurrency.remove_owner_for_granule_for_test(granule)
+                        == Some(transaction),
+                    "permission downgrade expected tx {transaction:?} to own {granule:?}"
+                );
+            }
         }
         Ok(removed)
     }
@@ -15845,6 +15890,47 @@ fn strict_2pl_reader_conflicts_with_active_writer() {
 }
 
 #[test]
+fn optimistic_validation_records_writes_without_ownership() {
+    let mut policy = OptimisticValidation::default();
+    let transaction = TransactionId::from_raw(1);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write(transaction, granule, 5).unwrap();
+
+    assert_eq!(policy.owner_for_granule(granule), None);
+    assert_eq!(
+        policy.write_granules_for_transaction(transaction),
+        vec![granule]
+    );
+    policy.validate_write(transaction, granule, 5).unwrap();
+}
+
+#[test]
+fn optimistic_validation_rejects_changed_write_version() {
+    let mut policy = OptimisticValidation::default();
+    let transaction = TransactionId::from_raw(1);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write(transaction, granule, 5).unwrap();
+
+    let error = policy
+        .validate_write_result_for_test(transaction, granule, 6)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        OptimisticValidationConflictKindForTest::WriteVersionMismatch
+    );
+}
+
+#[test]
 fn transaction_timestamp_helpers_use_transaction_id_order() {
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
@@ -15883,6 +15969,13 @@ fn transaction_conflict_action_reports_abort_and_wait_targets() {
 
 #[test]
 fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
+    fn expected_write_owner(
+        expects_owner: bool,
+        transaction: TransactionId,
+    ) -> Option<TransactionId> {
+        expects_owner.then_some(transaction)
+    }
+
     fn granule(granule_index: u64) -> GranuleId {
         GranuleId::TMemory {
             instance: Some(1),
@@ -15891,7 +15984,10 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
         }
     }
 
-    fn assert_contract<T: super::concurrency::TransactionConcurrencyControl>(policy: &mut T) {
+    fn assert_contract<T: super::concurrency::TransactionConcurrencyControl>(
+        policy: &mut T,
+        expects_write_owner: bool,
+    ) {
         let direct_release_transaction = TransactionId::from_raw(1);
         let direct_release_read_granule = granule(0);
         let direct_release_write_granule = granule(1);
@@ -15907,9 +16003,14 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
                 .read_granules_for_transaction(direct_release_transaction)
                 .contains(&direct_release_read_granule)
         );
+        assert!(
+            policy
+                .write_granules_for_transaction(direct_release_transaction)
+                .contains(&direct_release_write_granule)
+        );
         assert_eq!(
             policy.owner_for_granule(direct_release_write_granule),
-            Some(direct_release_transaction)
+            expected_write_owner(expects_write_owner, direct_release_transaction)
         );
 
         policy.release_transaction(direct_release_transaction);
@@ -15950,7 +16051,7 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
         );
         assert_eq!(
             policy.owner_for_granule(result_release_write_granule),
-            Some(result_release_transaction)
+            expected_write_owner(expects_write_owner, result_release_transaction)
         );
         policy
             .commit_transaction_result(result_release_transaction)
@@ -15968,11 +16069,12 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
         assert_eq!(policy.owner_for_granule(result_release_write_granule), None);
     }
 
-    assert_contract(&mut LockBased::default());
-    assert_contract(&mut NoWaitAbort::default());
-    assert_contract(&mut StrictTwoPhaseLocking::default());
-    assert_contract(&mut WaitDie::default());
-    assert_contract(&mut WoundWait::default());
+    assert_contract(&mut LockBased::default(), true);
+    assert_contract(&mut NoWaitAbort::default(), true);
+    assert_contract(&mut StrictTwoPhaseLocking::default(), true);
+    assert_contract(&mut WaitDie::default(), true);
+    assert_contract(&mut WoundWait::default(), true);
+    assert_contract(&mut OptimisticValidation::default(), false);
 }
 
 #[test]
@@ -16056,6 +16158,26 @@ fn selected_concurrency_control_uses_strict_2pl_semantics() {
 
     assert!(err.to_string().contains("read-locked"), "{err:?}");
     assert_eq!(policy.owner_for_granule(granule), None);
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-optimistic-validation")]
+fn selected_concurrency_control_uses_optimistic_validation_semantics() {
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::OptimisticValidation);
+    let first = TransactionId::from_raw(1);
+    let second = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_granule_write(first, granule, 5).unwrap();
+    policy.acquire_granule_write(second, granule, 5).unwrap();
+
+    assert_eq!(policy.owner_for_granule(granule), None);
+    policy.validate_write(first, granule, 5).unwrap();
+    policy.validate_write(second, granule, 5).unwrap();
 }
 
 #[test]

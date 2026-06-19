@@ -21,6 +21,10 @@ use std::path::PathBuf;
             feature = "transaction-cc-strict-2pl"
         ),
         all(
+            feature = "transaction-cc-lockbased",
+            feature = "transaction-cc-optimistic-validation"
+        ),
+        all(
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-wound-wait"
         ),
@@ -33,6 +37,10 @@ use std::path::PathBuf;
             feature = "transaction-cc-strict-2pl"
         ),
         all(
+            feature = "transaction-cc-nowait-abort",
+            feature = "transaction-cc-optimistic-validation"
+        ),
+        all(
             feature = "transaction-cc-wound-wait",
             feature = "transaction-cc-wait-die"
         ),
@@ -41,8 +49,20 @@ use std::path::PathBuf;
             feature = "transaction-cc-strict-2pl"
         ),
         all(
+            feature = "transaction-cc-wound-wait",
+            feature = "transaction-cc-optimistic-validation"
+        ),
+        all(
             feature = "transaction-cc-wait-die",
             feature = "transaction-cc-strict-2pl"
+        ),
+        all(
+            feature = "transaction-cc-wait-die",
+            feature = "transaction-cc-optimistic-validation"
+        ),
+        all(
+            feature = "transaction-cc-strict-2pl",
+            feature = "transaction-cc-optimistic-validation"
         )
     )
 ))]
@@ -50,7 +70,8 @@ compile_error!(
     "select exactly one transaction concurrency-control feature: \
      transaction-cc-lockbased, transaction-cc-nowait-abort, \
      transaction-cc-wound-wait, transaction-cc-wait-die, \
-     or transaction-cc-strict-2pl"
+     transaction-cc-strict-2pl, or \
+     transaction-cc-optimistic-validation"
 );
 
 #[cfg(all(
@@ -60,14 +81,16 @@ compile_error!(
         feature = "transaction-cc-nowait-abort",
         feature = "transaction-cc-wound-wait",
         feature = "transaction-cc-wait-die",
-        feature = "transaction-cc-strict-2pl"
+        feature = "transaction-cc-strict-2pl",
+        feature = "transaction-cc-optimistic-validation"
     ))
 ))]
 compile_error!(
     "transaction requires one transaction concurrency-control feature: \
      transaction-cc-lockbased, transaction-cc-nowait-abort, \
      transaction-cc-wound-wait, transaction-cc-wait-die, \
-     or transaction-cc-strict-2pl"
+     transaction-cc-strict-2pl, or \
+     transaction-cc-optimistic-validation"
 );
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -119,10 +142,16 @@ pub(crate) enum ConcurrencyControl {
     StrictTwoPhaseLocking,
     WoundWait,
     WaitDie,
+    OptimisticValidation,
 }
 
 impl ConcurrencyControl {
     pub(crate) const fn default_for_build() -> Self {
+        #[cfg(feature = "transaction-cc-optimistic-validation")]
+        {
+            return Self::OptimisticValidation;
+        }
+
         #[cfg(feature = "transaction-cc-wait-die")]
         {
             return Self::WaitDie;
@@ -153,7 +182,8 @@ impl ConcurrencyControl {
             feature = "transaction-cc-wound-wait",
             feature = "transaction-cc-strict-2pl",
             feature = "transaction-cc-nowait-abort",
-            feature = "transaction-cc-lockbased"
+            feature = "transaction-cc-lockbased",
+            feature = "transaction-cc-optimistic-validation"
         )))]
         {
             return Self::LockBased;

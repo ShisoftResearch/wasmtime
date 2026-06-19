@@ -177,6 +177,7 @@ transaction = [
 ]
 transaction-cc-lockbased = ["transaction"]
 transaction-cc-nowait-abort = ["transaction"]
+transaction-cc-optimistic-validation = ["transaction"]
 transaction-cc-strict-2pl = ["transaction"]
 transaction-cc-wait-die = ["transaction"]
 transaction-cc-wound-wait = ["transaction"]

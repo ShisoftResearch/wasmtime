@@ -619,6 +619,7 @@ transaction = [
 ]
 transaction-cc-lockbased = ["wasmtime/transaction-cc-lockbased"]
 transaction-cc-nowait-abort = ["wasmtime/transaction-cc-nowait-abort"]
+transaction-cc-optimistic-validation = ["wasmtime/transaction-cc-optimistic-validation"]
 transaction-cc-strict-2pl = ["wasmtime/transaction-cc-strict-2pl"]
 transaction-cc-wait-die = ["wasmtime/transaction-cc-wait-die"]
 transaction-cc-wound-wait = ["wasmtime/transaction-cc-wound-wait"]
