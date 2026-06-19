@@ -1,7 +1,7 @@
 # Transactional Wasm Runtime Core Design
 
 Date: 2026-06-04
-Last updated: 2026-06-16
+Last updated: 2026-06-19
 
 ## Feature Switch Policy
 
@@ -1227,6 +1227,27 @@ Abort path:
 There is no automatic retry in this phase. Conflict policy can be represented
 in configuration, but the implemented default is deterministic id-priority
 locking with no retry.
+
+### Compile-Time Concurrency-Control Selection
+
+The transaction branch keeps concurrency control behind the default-on
+`transaction` feature and selects the concrete policy with one
+`transaction-cc-*` feature.
+
+The default policy is `transaction-cc-lockbased`, which preserves the current
+Wizard-aligned lock-based behavior: optimistic reads, pessimistic writes, and
+transaction-id priority where an older transaction can abort a younger owner.
+
+The first alternate policy is `transaction-cc-nowait-abort`. It uses the same
+`GranuleId` ownership and version validation state, but a transaction never
+preempts an existing owner. If another transaction owns the granule, the
+contender receives a transaction conflict and aborts. This policy is useful as
+the smallest meaningful feature-selected alternative because it does not change
+durable log format, object identity, tmemory undo records, or recovery.
+
+Only one `transaction-cc-*` feature may be selected at a time. Shared
+host-thread transaction runtimes and store-local transaction runtimes must use
+the same selected policy.
 
 ## Future Loom Workstream
 

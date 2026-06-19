@@ -1,6 +1,28 @@
 use crate::prelude::*;
 use std::path::PathBuf;
 
+#[cfg(all(
+    feature = "transaction",
+    feature = "transaction-cc-lockbased",
+    feature = "transaction-cc-nowait-abort"
+))]
+compile_error!(
+    "select exactly one transaction concurrency-control feature: \
+     transaction-cc-lockbased or transaction-cc-nowait-abort"
+);
+
+#[cfg(all(
+    feature = "transaction",
+    not(any(
+        feature = "transaction-cc-lockbased",
+        feature = "transaction-cc-nowait-abort"
+    ))
+))]
+compile_error!(
+    "transaction requires one transaction concurrency-control feature: \
+     transaction-cc-lockbased or transaction-cc-nowait-abort"
+);
+
 // Milestone runtime core for proposal WAST progress. The current runtime uses
 // store-local transaction state, `VMemory` and configurable `NVMemory`
 // transactional memory storage, and real `tmemory` sidecars. Remaining
@@ -41,11 +63,34 @@ pub(crate) enum TMemoryFileBacking {
     ExistingPath(PathBuf),
 }
 
-/// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. `LockBased` is the
-/// only implemented policy today and remains store-local.
+/// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. Policy selection is
+/// currently compile-time for branch experiments rather than public API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcurrencyControl {
     LockBased,
+    NoWaitAbort,
+}
+
+impl ConcurrencyControl {
+    pub(crate) const fn default_for_build() -> Self {
+        #[cfg(feature = "transaction-cc-nowait-abort")]
+        {
+            return Self::NoWaitAbort;
+        }
+
+        #[cfg(feature = "transaction-cc-lockbased")]
+        {
+            return Self::LockBased;
+        }
+
+        #[cfg(not(any(
+            feature = "transaction-cc-nowait-abort",
+            feature = "transaction-cc-lockbased"
+        )))]
+        {
+            return Self::LockBased;
+        }
+    }
 }
 
 /// SHISOFT-TWASM-MOCK: durability policy selection is not yet public API.
@@ -87,7 +132,7 @@ impl Default for TransactionConfig {
             tmemory_backend: TMemoryBackend::VMemory,
             tmemory_persistence_mode: TMemoryPersistenceMode::ResearchPretendPmem,
             tmemory_file_backing: None,
-            concurrency_control: ConcurrencyControl::LockBased,
+            concurrency_control: ConcurrencyControl::default_for_build(),
             durability_policy: DurabilityPolicy::VolatileRollbackOnly,
             conflict_policy: ConflictPolicy::AbortOrWizardDefault,
             object_index_persistence_policy: ObjectIndexPersistencePolicy::RebuildOnRecovery,
@@ -141,6 +186,14 @@ impl TransactionConfig {
     ) -> Result<Self> {
         let mut config = Self::default();
         config.set_object_index_persistence_policy(object_index_persistence_policy)?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_concurrency_control(
+        concurrency_control: ConcurrencyControl,
+    ) -> Result<Self> {
+        let mut config = Self::default();
+        config.set_concurrency_control(concurrency_control)?;
         Ok(config)
     }
 
@@ -202,6 +255,11 @@ impl TransactionConfig {
     fn set_file_backed_tmemory(&mut self, file_backing: TMemoryFileBacking) -> Result<()> {
         self.tmemory_backend = TMemoryBackend::FileBackedMemory;
         self.tmemory_file_backing = Some(file_backing);
+        Ok(())
+    }
+
+    fn set_concurrency_control(&mut self, concurrency_control: ConcurrencyControl) -> Result<()> {
+        self.concurrency_control = concurrency_control;
         Ok(())
     }
 

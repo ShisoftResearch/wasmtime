@@ -11,8 +11,8 @@ use std::thread::ThreadId;
 use super::concurrency::LockBasedConflictKind;
 use super::state::PersistentRootDelta;
 use super::{
-    GranuleId, LockBased, ObjectId, PersistentRootKey, TMemoryFileBacking, TransactionConfig,
-    TransactionId, TxDurableLog, granule_uses_transaction_state_version,
+    ConcurrencyControlState, GranuleId, ObjectId, PersistentRootKey, TMemoryFileBacking,
+    TransactionConfig, TransactionId, TxDurableLog, granule_uses_transaction_state_version,
     persistent_root_key_from_logical_id,
 };
 
@@ -144,7 +144,7 @@ struct DurableLogSegmentRegistry {
 
 #[derive(Debug, Default)]
 struct LockAuthorityState {
-    locks: LockBased,
+    concurrency: ConcurrencyControlState,
     conflict_aborted_transactions: BTreeSet<TransactionId>,
     terminal_commits: BTreeSet<TransactionId>,
     granule_versions: BTreeMap<GranuleId, u64>,
@@ -445,9 +445,10 @@ impl TransactionRegionRuntime {
     ) -> Result<Option<TransactionId>> {
         let mut runtime = self.lock_authority()?;
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, false)?;
-        let aborted = runtime
-            .locks
-            .record_read(transaction, granule, current_version)?;
+        let aborted =
+            runtime
+                .concurrency
+                .acquire_granule_read(transaction, granule, current_version)?;
         if let Some(aborted) = aborted {
             runtime.conflict_aborted_transactions.insert(aborted);
             return Ok(Some(aborted));
@@ -463,9 +464,10 @@ impl TransactionRegionRuntime {
     ) -> Result<Option<TransactionId>> {
         let mut runtime = self.lock_authority()?;
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
-        let aborted = runtime
-            .locks
-            .acquire_write(transaction, granule, current_version)?;
+        let aborted =
+            runtime
+                .concurrency
+                .acquire_granule_write(transaction, granule, current_version)?;
         if let Some(aborted) = aborted {
             runtime.conflict_aborted_transactions.insert(aborted);
             return Ok(Some(aborted));
@@ -480,7 +482,7 @@ impl TransactionRegionRuntime {
         current_version: u64,
     ) -> Result<()> {
         self.lock_authority()?
-            .locks
+            .concurrency
             .validate_read(transaction, granule, current_version)
     }
 
@@ -490,15 +492,17 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        self.lock_authority()?
-            .locks
-            .refresh_read_version(transaction, granule, current_version);
+        self.lock_authority()?.concurrency.refresh_read_version(
+            transaction,
+            granule,
+            current_version,
+        );
         Ok(())
     }
 
     pub(crate) fn release_transaction(&self, transaction: TransactionId) -> Result<()> {
         let mut runtime = self.lock_authority()?;
-        runtime.locks.release_transaction(transaction);
+        runtime.concurrency.release_transaction(transaction);
         runtime.conflict_aborted_transactions.remove(&transaction);
         runtime.terminal_commits.remove(&transaction);
         #[cfg(test)]
@@ -726,7 +730,7 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         is_write: bool,
     ) -> Result<()> {
-        let Some(owner) = runtime.locks.owner_for_granule(granule) else {
+        let Some(owner) = runtime.concurrency.owner_for_granule(granule) else {
             return Ok(());
         };
         if owner == transaction || transaction > owner || !runtime.terminal_commits.contains(&owner)
@@ -949,9 +953,10 @@ impl TransactionRegionRuntime {
             }
         };
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
-        let aborted = runtime
-            .locks
-            .acquire_write(transaction, granule, current_version)?;
+        let aborted =
+            runtime
+                .concurrency
+                .acquire_granule_write(transaction, granule, current_version)?;
         if let Some(aborted) = aborted {
             runtime.conflict_aborted_transactions.insert(aborted);
             return Ok(Some(aborted));

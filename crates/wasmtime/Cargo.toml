@@ -158,7 +158,7 @@ default = [
   'debug',
   'compile-time-builtins',
   'wit-parser',
-  'transaction',
+  'transaction-cc-lockbased',
 ]
 
 # Enables conversion helpers between `anyhow::Error` and `wasmtime::Error`.
@@ -175,6 +175,8 @@ transaction = [
   "wasmtime-environ/transaction",
   "wasmtime-cranelift?/transaction",
 ]
+transaction-cc-lockbased = ["transaction"]
+transaction-cc-nowait-abort = ["transaction"]
 
 # Enables backtrace capturing in `wasmtime::Error`.
 backtrace = ["std", "wasmtime-environ/backtrace"]

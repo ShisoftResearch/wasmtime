@@ -36,6 +36,37 @@ and
 for the current object-model stabilization work before storage-reclaiming
 persistent GC.
 
+## 2026-06-19: Transaction Concurrency-Control Feature Switch
+
+Added a compile-time policy switch for transaction concurrency control:
+
+- `transaction-cc-lockbased`: default branch behavior.
+- `transaction-cc-nowait-abort`: no-wait ownership conflicts, with no
+  transaction-id preemption.
+
+Both policies operate over `GranuleId`, share optimistic read-version
+validation, and release all owned/read granules on commit or abort. The switch
+is intentionally compile-time for now so experiments can compare policy behavior
+without adding public embedding API.
+
+Verification commands:
+
+```bash
+cargo test -p wasmtime --lib transaction:: -- --format terse
+cargo test -p wasmtime --test transaction_persistence shared_runtime_threaded -- --format terse
+cargo check -p wasmtime --no-default-features \
+  --features "runtime,std,gc,cranelift,transaction-cc-nowait-abort" \
+```
+
+The no-default alternate policy `cargo test --lib` path also needs the ordinary
+default support features because unrelated lib unit-test modules assume them:
+
+```bash
+cargo test -p wasmtime --no-default-features \
+  --features "anyhow,async,backtrace,cache,gc,gc-copying,gc-drc,gc-null,wat,profiling,parallel-compilation,cranelift,pooling-allocator,demangle,addr2line,coredump,debug-builtins,runtime,component-model,component-model-async,threads,stack-switching,std,debug,compile-time-builtins,wit-parser,transaction-cc-nowait-abort" \
+  --lib transaction:: -- --format terse
+```
+
 ## 2026-06-17: Generic Kotlin WasmGC Graph Persistence
 
 - Added sidecar opt-in for generic module-wide Kotlin/WasmGC graph capture.

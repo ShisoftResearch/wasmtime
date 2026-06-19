@@ -1402,6 +1402,7 @@ fn current_version_for_granule_reports_poisoned_shared_lock_authority() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn shared_region_runtime_conflict_abort_before_terminal_commit_frees_active_allocations() {
     use std::sync::mpsc;
     use std::thread;
@@ -1445,6 +1446,47 @@ fn shared_region_runtime_conflict_abort_before_terminal_commit_frees_active_allo
 
     younger.join().unwrap();
     older.join().unwrap();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
+fn shared_region_runtime_nowait_conflict_does_not_abort_existing_owner() {
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let owner = TransactionId::from_raw(100_001);
+    let contender = TransactionId::from_raw(1);
+
+    let mut owning_state = TransactionState::default();
+    owning_state.shared_region_runtime = Some(runtime.clone());
+    owning_state.enter_transaction(owner).unwrap();
+    owning_state
+        .stage_global(0, GlobalSnapshot::I32(100))
+        .unwrap();
+    owning_state.restore_transaction(None).unwrap();
+
+    let mut contender_state = TransactionState::default();
+    contender_state.shared_region_runtime = Some(runtime.clone());
+    contender_state.enter_transaction(contender).unwrap();
+    let error = contender_state
+        .stage_global(0, GlobalSnapshot::I32(200))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("transaction write conflict"),
+        "{error:?}"
+    );
+
+    assert!(
+        !runtime
+            .take_conflict_aborted_transaction_for_test(owner)
+            .unwrap()
+    );
+    contender_state.abort().unwrap();
+    owning_state.restore_transaction(Some(owner)).unwrap();
+    assert_eq!(
+        owning_state.staged_global_owned(None, 0),
+        Some(GlobalSnapshot::I32(100))
+    );
+    owning_state.abort().unwrap();
+    assert_eq!(current_thread_transaction_for_test(), None);
 }
 
 #[test]
@@ -2570,7 +2612,10 @@ fn default_transaction_config_uses_minimal_vmemory_runtime() {
         config.tmemory_persistence_mode(),
         TMemoryPersistenceMode::ResearchPretendPmem
     );
-    assert_eq!(config.concurrency_control(), ConcurrencyControl::LockBased);
+    assert_eq!(
+        config.concurrency_control(),
+        ConcurrencyControl::default_for_build()
+    );
     assert_eq!(
         config.durability_policy(),
         DurabilityPolicy::VolatileRollbackOnly
@@ -2582,6 +2627,24 @@ fn default_transaction_config_uses_minimal_vmemory_runtime() {
     assert_eq!(
         config.object_index_persistence_policy(),
         ObjectIndexPersistencePolicy::RebuildOnRecovery
+    );
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transaction_config_default_concurrency_is_lock_based_under_feature() {
+    assert_eq!(
+        TransactionConfig::default().concurrency_control(),
+        ConcurrencyControl::LockBased
+    );
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
+fn transaction_config_default_concurrency_is_nowait_abort_under_feature() {
+    assert_eq!(
+        TransactionConfig::default().concurrency_control(),
+        ConcurrencyControl::NoWaitAbort
     );
 }
 
@@ -2958,8 +3021,8 @@ fn commit_rejects_changed_optimistic_read_version() {
         granule_index: 0,
     };
     state
-        .locks
-        .record_read_for_test(transaction, granule, 1)
+        .concurrency
+        .acquire_granule_read(transaction, granule, 1)
         .unwrap();
 
     let error = state.commit().unwrap_err();
@@ -2978,8 +3041,8 @@ fn commit_validates_optimistic_read_versions_before_clearing() {
         granule_index: 0,
     };
     state
-        .locks
-        .record_read_for_test(transaction, granule, 1)
+        .concurrency
+        .acquire_granule_read(transaction, granule, 1)
         .unwrap();
 
     let error = state
@@ -3001,8 +3064,8 @@ fn commit_validates_reads_before_apply_callback() {
     };
     state.stage_global(3, GlobalSnapshot::I32(7)).unwrap();
     state
-        .locks
-        .record_read_for_test(transaction, granule, 1)
+        .concurrency
+        .acquire_granule_read(transaction, granule, 1)
         .unwrap();
     let mut applied = false;
 
@@ -3085,6 +3148,7 @@ fn lock_based_transaction_ids_keep_separate_workspaces() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lower_transaction_id_aborts_higher_suspended_writer() {
     clear_current_thread_transaction_for_test();
     let mut state = TransactionState::default();
@@ -3104,6 +3168,40 @@ fn lower_transaction_id_aborts_higher_suspended_writer() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
+fn lower_transaction_id_cannot_preempt_higher_suspended_writer_under_nowait_abort() {
+    clear_current_thread_transaction_for_test();
+    let mut state = TransactionState::default();
+    let higher = TransactionId::from_raw(100_001);
+    let lower = TransactionId::from_raw(1);
+
+    state.enter_transaction(higher).unwrap();
+    state.stage_global(0, GlobalSnapshot::I32(100)).unwrap();
+    state.restore_transaction(None).unwrap();
+    assert!(state.transaction_is_open(higher));
+
+    state.enter_transaction(lower).unwrap();
+    let error = state.stage_global(0, GlobalSnapshot::I32(200)).unwrap_err();
+    assert!(
+        error.to_string().contains("transaction write conflict"),
+        "{error:?}"
+    );
+
+    assert!(state.transaction_is_open(higher));
+    assert!(state.transaction_is_open(lower));
+
+    state.abort().unwrap();
+    state.restore_transaction(Some(higher)).unwrap();
+    assert_eq!(
+        state.staged_global_owned(None, 0),
+        Some(GlobalSnapshot::I32(100))
+    );
+    state.abort().unwrap();
+    assert_eq!(current_thread_transaction_for_test(), None);
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lower_transaction_id_reader_records_version_after_aborting_writer() {
     clear_current_thread_transaction_for_test();
     let mut state = TransactionState::default();
@@ -3126,6 +3224,7 @@ fn lower_transaction_id_reader_records_version_after_aborting_writer() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lower_transaction_id_aborts_higher_suspended_object_writer() {
     clear_current_thread_transaction_for_test();
     let mut objects = ObjectTable::default();
@@ -3168,6 +3267,52 @@ fn lower_transaction_id_aborts_higher_suspended_object_writer() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
+fn lower_transaction_id_cannot_preempt_higher_suspended_object_writer_under_nowait_abort() {
+    clear_current_thread_transaction_for_test();
+    let mut objects = ObjectTable::default();
+    let object = objects
+        .allocate_persistent_struct_for_gc_ref(0x6601, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let mut state = TransactionState::default();
+    let higher = TransactionId::from_raw(100_001);
+    let lower = TransactionId::from_raw(1);
+
+    state.enter_transaction(higher).unwrap();
+    state.acquire_object_write(&mut objects, object).unwrap();
+    state
+        .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+        .unwrap();
+    state.restore_transaction(None).unwrap();
+    assert!(state.transaction_is_open(higher));
+
+    state.enter_transaction(lower).unwrap();
+    let error = state
+        .acquire_object_write(&mut objects, object)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("transaction write conflict"),
+        "{error:?}"
+    );
+
+    assert!(state.transaction_is_open(higher));
+    assert!(state.transaction_is_open(lower));
+    assert!(!state.owns_object_write(object));
+
+    state.abort().unwrap();
+    state.restore_transaction(Some(higher)).unwrap();
+    assert!(state.owns_object_write(object));
+    assert_eq!(
+        state.read_struct_field(&objects, object, 0).unwrap(),
+        ObjectValue::I32(100)
+    );
+    state.abort().unwrap();
+    assert_eq!(current_thread_transaction_for_test(), None);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn object_conflict_aborted_suspended_transaction_frees_new_object_records() {
     clear_current_thread_transaction_for_test();
     let mut objects = ObjectTable::default();
@@ -3206,6 +3351,7 @@ fn object_conflict_aborted_suspended_transaction_frees_new_object_records() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn tmemory_conflict_aborted_allocations_are_reclaimed_before_object_commit() {
     clear_current_thread_transaction_for_test();
     let tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
@@ -3264,6 +3410,7 @@ fn generic_abort_rejects_active_object_allocations_without_object_table() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn generic_commit_rejects_pending_conflict_aborted_object_allocations() {
     clear_current_thread_transaction_for_test();
     let tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
@@ -3375,6 +3522,7 @@ fn higher_transaction_id_cannot_write_lower_owned_object() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn mixed_object_and_tmemory_transaction_survives_object_conflict_and_commits_both() {
     clear_current_thread_transaction_for_test();
     let mut tmemory = crate::runtime::vm::TMemory::new_vmemory(1).expect("tmemory");
@@ -9326,7 +9474,7 @@ mod model_permissions {
                 "permission downgrade should preserve read permission for {granule:?}"
             );
             ensure!(
-                state.locks.owners.remove(&granule) == Some(transaction),
+                state.concurrency.remove_owner_for_granule_for_test(granule) == Some(transaction),
                 "permission downgrade expected tx {transaction:?} to own {granule:?}"
             );
         }
@@ -15277,6 +15425,112 @@ fn lock_based_abort_releases_owned_granules() {
     locks.abort_for_test(transaction);
 
     assert_eq!(locks.owner_for_test(granule), None);
+}
+
+#[test]
+fn no_wait_abort_allows_shared_reads_and_writer_upgrade() {
+    let mut locks = NoWaitAbort::default();
+    let first = TransactionId::from_raw(1);
+    let second = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    locks.record_read_for_test(first, granule, 5).unwrap();
+    locks.record_read_for_test(second, granule, 5).unwrap();
+    locks.acquire_write_for_test(second, granule, 5).unwrap();
+}
+
+#[test]
+fn no_wait_abort_writer_excludes_other_transactions_without_preemption() {
+    let mut locks = NoWaitAbort::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    locks.acquire_write_for_test(younger, granule, 3).unwrap();
+
+    let read_error = locks
+        .record_read_result_for_test(older, granule, 3)
+        .unwrap_err();
+    assert_eq!(read_error, NoWaitAbortConflictKindForTest::ReadOwnedByOther);
+
+    let write_error = locks
+        .acquire_write_result_for_test(older, granule, 3)
+        .unwrap_err();
+    assert_eq!(
+        write_error,
+        NoWaitAbortConflictKindForTest::WriteOwnedByOther
+    );
+    assert_eq!(locks.owner_for_test(granule), Some(younger));
+}
+
+#[test]
+fn no_wait_abort_validates_optimistic_reads_at_commit() {
+    let mut locks = NoWaitAbort::default();
+    let reader = TransactionId::from_raw(1);
+    let writer = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    locks.record_read_for_test(reader, granule, 7).unwrap();
+    locks.acquire_write_for_test(writer, granule, 7).unwrap();
+    locks.abort_for_test(writer);
+
+    let error = locks
+        .validate_read_result_for_test(reader, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, NoWaitAbortConflictKindForTest::ReadVersionMismatch);
+}
+
+#[test]
+fn no_wait_abort_abort_releases_owned_granules() {
+    let mut locks = NoWaitAbort::default();
+    let transaction = TransactionId::from_raw(1);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    locks
+        .acquire_write_for_test(transaction, granule, 4)
+        .unwrap();
+    assert_eq!(locks.owner_for_test(granule), Some(transaction));
+
+    locks.abort_for_test(transaction);
+
+    assert_eq!(locks.owner_for_test(granule), None);
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
+fn selected_concurrency_control_uses_nowait_abort_semantics() {
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::NoWaitAbort);
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_granule_write(younger, granule, 0).unwrap();
+    let err = policy.acquire_granule_write(older, granule, 0).unwrap_err();
+    assert!(
+        err.to_string().contains("transaction write conflict"),
+        "{err:?}"
+    );
+    assert_eq!(policy.owner_for_granule(granule), Some(younger));
 }
 
 #[test]

@@ -25,11 +25,15 @@ mod region_runtime;
 mod state;
 pub(crate) mod type_layout;
 mod wasmtime_layout;
-use concurrency::{LockBased, TransactionConcurrencyControl};
+use concurrency::ConcurrencyControlState;
 #[cfg(test)]
-use concurrency::{LockBasedConflictKindForTest, LockBasedSnapshotForTest};
+use concurrency::{
+    LockBased, LockBasedConflictKindForTest, LockBasedSnapshotForTest, NoWaitAbort,
+    NoWaitAbortConflictKindForTest,
+};
+use config::ConcurrencyControl;
 #[cfg(test)]
-use config::{ConcurrencyControl, ConflictPolicy, DurabilityPolicy, ObjectIndexPersistencePolicy};
+use config::{ConflictPolicy, DurabilityPolicy, ObjectIndexPersistencePolicy};
 pub(crate) use config::{
     TMemoryBackend, TMemoryFileBacking, TMemoryPersistenceMode, TransactionConfig,
 };

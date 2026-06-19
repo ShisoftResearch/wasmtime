@@ -13,7 +13,7 @@ pub(crate) struct TransactionState {
     pub(super) shared_region_runtime: Option<TransactionRegionRuntime>,
     pub(super) terminal_commit_active: bool,
     pub(super) active_conflict_aborted: bool,
-    pub(super) locks: LockBased,
+    pub(super) concurrency: ConcurrencyControlState,
     pub(super) suspended: BTreeMap<TransactionId, TransactionWorkspace>,
     pub(super) staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
     pub(super) staged_granules: BTreeMap<GranuleId, Vec<u8>>,
@@ -74,7 +74,7 @@ impl Default for TransactionState {
             shared_region_runtime: None,
             terminal_commit_active: false,
             active_conflict_aborted: false,
-            locks: LockBased::default(),
+            concurrency: ConcurrencyControlState::default(),
             suspended: BTreeMap::new(),
             staged_globals: BTreeMap::new(),
             staged_granules: BTreeMap::new(),
@@ -551,12 +551,7 @@ impl TransactionState {
         if self.shared_region_runtime.is_some() {
             return Ok(self.read_granules.iter().copied().collect());
         }
-        Ok(self
-            .locks
-            .read_versions
-            .keys()
-            .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
-            .collect())
+        Ok(self.concurrency.read_granules_for_transaction(transaction))
     }
 
     pub(crate) fn validate_active_read(
@@ -598,7 +593,7 @@ impl TransactionState {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.acquire_granule_read(transaction, granule, current_version)
         } else {
-            self.locks
+            self.concurrency
                 .acquire_granule_read(transaction, granule, current_version)
         }
     }
@@ -612,7 +607,7 @@ impl TransactionState {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.acquire_granule_write(transaction, granule, current_version)
         } else {
-            self.locks
+            self.concurrency
                 .acquire_granule_write(transaction, granule, current_version)
         }
     }
@@ -626,7 +621,7 @@ impl TransactionState {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.refresh_read_version(transaction, granule, current_version)
         } else {
-            self.locks
+            self.concurrency
                 .refresh_read_version(transaction, granule, current_version);
             Ok(())
         }
@@ -641,7 +636,7 @@ impl TransactionState {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.validate_granule_read(transaction, granule, current_version)
         } else {
-            self.locks
+            self.concurrency
                 .validate_read(transaction, granule, current_version)
         }
     }
@@ -650,7 +645,7 @@ impl TransactionState {
         if let Some(runtime) = &self.shared_region_runtime {
             runtime.release_transaction(transaction)
         } else {
-            self.locks.release_transaction_result(transaction)
+            self.concurrency.release_transaction_result(transaction)
         }
     }
 

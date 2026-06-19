@@ -535,7 +535,7 @@ default = [
   "winch",
   "pulley",
   "debug",
-  "transaction",
+  "transaction-cc-lockbased",
 
   # Enable some nice features of clap by default, but they come at a binary size
   # cost, so allow disabling this through disabling of our own `default`
@@ -617,6 +617,8 @@ transaction = [
   "wasmtime-cranelift?/transaction",
   "wasmtime-wast?/transaction",
 ]
+transaction-cc-lockbased = ["wasmtime/transaction-cc-lockbased"]
+transaction-cc-nowait-abort = ["wasmtime/transaction-cc-nowait-abort"]
 
 # CLI subcommands for the `wasmtime` executable. See `wasmtime $cmd --help`
 # for more information on each subcommand.

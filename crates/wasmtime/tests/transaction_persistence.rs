@@ -1205,6 +1205,80 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
+fn shared_runtime_nowait_abort_does_not_preempt_existing_owner() -> Result<()> {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
+
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("threaded-nowait-owner.tmemory");
+    let tx_log_path = dir.path().join("threaded-nowait-owner.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = blocking_tmemory_module(&engine)?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+
+    warm_shared_module(&engine, &module, &runtime, 1)?;
+
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let first = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        let gate = gate.clone();
+        thread::spawn(move || -> Result<()> {
+            let mut store = shared_store(&engine, &runtime)?;
+            let gate = gate.clone();
+            let pause = Func::wrap(&mut store, move || {
+                let (lock, ready) = &*gate;
+                let mut released = lock.lock().unwrap();
+                *released = true;
+                ready.notify_one();
+                while *released {
+                    released = ready.wait(released).unwrap();
+                }
+            });
+            let instance = Instance::new(&mut store, &module, &[pause.into()])?;
+            instance
+                .get_typed_func::<i32, ()>(&mut store, "write")?
+                .call(&mut store, 0x1122_3344)?;
+            Ok(())
+        })
+    };
+
+    let (lock, ready) = &*gate;
+    let mut released = lock.lock().unwrap();
+    while !*released {
+        released = ready.wait(released).unwrap();
+    }
+
+    let mut second_store = shared_store(&engine, &runtime)?;
+    let second_pause = Func::wrap(&mut second_store, || {});
+    let second_instance = Instance::new(&mut second_store, &module, &[second_pause.into()])?;
+    let err = second_instance
+        .get_typed_func::<i32, ()>(&mut second_store, "write")?
+        .call(&mut second_store, 0x5566_7788)
+        .unwrap_err();
+    let err = format!("{err:?}");
+    assert_transaction_conflict(&err);
+
+    *released = false;
+    ready.notify_one();
+    drop(released);
+    first.join().unwrap()?;
+
+    wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        1,
+        Some(1),
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 0, &0x1122_3344u32.to_le_bytes())?;
+
+    Ok(())
+}
+
+#[test]
 fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> Result<()> {
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
