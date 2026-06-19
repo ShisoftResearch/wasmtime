@@ -319,7 +319,9 @@ struct FileBackedTxDurableLog {
     streams: BTreeMap<u32, crate::runtime::vm::block_region::StreamCursor>,
     pending_data_chunks: BTreeSet<u32>,
     pending_log_blocks: BTreeSet<u32>,
-    shared_append_lock: Option<Arc<Mutex<()>>>,
+    // Protects shared free-block allocation and region-metadata refresh across
+    // independent file mappings. It is not a per-stream publication lock.
+    shared_allocator_lock: Option<Arc<Mutex<()>>>,
 }
 
 pub(crate) struct TxDurableLogSink<'a> {
@@ -403,69 +405,73 @@ impl TxDurableLog {
     }
 
     pub(crate) fn create_file_backed(path: &Path, num_blocks: u32) -> Result<Self> {
-        Self::create_file_backed_with_shared_append_lock(path, num_blocks, None)
+        Self::create_file_backed_with_shared_allocator_lock(path, num_blocks, None)
     }
 
-    pub(crate) fn create_file_backed_with_append_lock(
+    pub(crate) fn create_file_backed_with_allocator_lock(
         path: &Path,
         num_blocks: u32,
-        shared_append_lock: Arc<Mutex<()>>,
+        shared_allocator_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
-        Self::create_file_backed_with_shared_append_lock(path, num_blocks, Some(shared_append_lock))
+        Self::create_file_backed_with_shared_allocator_lock(
+            path,
+            num_blocks,
+            Some(shared_allocator_lock),
+        )
     }
 
-    fn create_file_backed_with_shared_append_lock(
+    fn create_file_backed_with_shared_allocator_lock(
         path: &Path,
         num_blocks: u32,
-        shared_append_lock: Option<Arc<Mutex<()>>>,
+        shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Result<Self> {
         let region =
             crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(
                 path, num_blocks,
             )?;
-        Ok(Self::from_file_backed_region(region, shared_append_lock))
+        Ok(Self::from_file_backed_region(region, shared_allocator_lock))
     }
 
     pub(crate) fn open_file_backed(path: &Path) -> Result<Self> {
-        Self::open_file_backed_with_shared_append_lock(path, None)
+        Self::open_file_backed_with_shared_allocator_lock(path, None)
     }
 
-    pub(crate) fn open_file_backed_with_append_lock(
+    pub(crate) fn open_file_backed_with_allocator_lock(
         path: &Path,
-        shared_append_lock: Arc<Mutex<()>>,
+        shared_allocator_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
-        Self::open_file_backed_with_shared_append_lock(path, Some(shared_append_lock))
+        Self::open_file_backed_with_shared_allocator_lock(path, Some(shared_allocator_lock))
     }
 
-    fn open_file_backed_with_shared_append_lock(
+    fn open_file_backed_with_shared_allocator_lock(
         path: &Path,
-        shared_append_lock: Option<Arc<Mutex<()>>>,
+        shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Result<Self> {
-        if let Some(lock) = shared_append_lock.clone() {
+        if let Some(lock) = shared_allocator_lock.clone() {
             let _guard = lock
                 .lock()
-                .map_err(|_| crate::format_err!("shared durable log append lock poisoned"))?;
+                .map_err(|_| crate::format_err!("shared durable log allocator lock poisoned"))?;
             let mut region =
                 crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
             crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
-            return Ok(Self::from_file_backed_region(region, shared_append_lock));
+            return Ok(Self::from_file_backed_region(region, shared_allocator_lock));
         }
         let mut region =
             crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
         crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
-        Ok(Self::from_file_backed_region(region, shared_append_lock))
+        Ok(Self::from_file_backed_region(region, shared_allocator_lock))
     }
 
     fn from_file_backed_region(
         region: crate::runtime::vm::block_region::FileBackedMemoryBlockRegion,
-        shared_append_lock: Option<Arc<Mutex<()>>>,
+        shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Self {
         Self::with_backend(FileBackedTxDurableLog {
             region,
             streams: BTreeMap::new(),
             pending_data_chunks: BTreeSet::new(),
             pending_log_blocks: BTreeSet::new(),
-            shared_append_lock,
+            shared_allocator_lock,
         })
     }
 
@@ -617,20 +623,20 @@ impl FileBackedTxDurableLog {
         &mut self,
         stream_id: u32,
     ) -> Result<crate::runtime::vm::block_region::StreamCursor> {
-        if let Some(stream) = self.streams.get(&stream_id).copied() {
-            return Ok(stream);
-        }
         let stream = self.region.stream_cursor(stream_id);
         self.streams.insert(stream_id, stream);
         Ok(stream)
     }
 
-    fn with_shared_append_lock<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let shared_append_lock = self.shared_append_lock.clone();
-        if let Some(lock) = shared_append_lock {
+    fn with_shared_allocator_lock<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let shared_allocator_lock = self.shared_allocator_lock.clone();
+        if let Some(lock) = shared_allocator_lock {
             let _guard = lock
                 .lock()
-                .map_err(|_| crate::format_err!("shared durable log append lock poisoned"))?;
+                .map_err(|_| crate::format_err!("shared durable log allocator lock poisoned"))?;
             self.region.refresh_from_image()?;
             return f(self);
         }
@@ -640,7 +646,7 @@ impl FileBackedTxDurableLog {
 
 impl TxDurableLogBackend for FileBackedTxDurableLog {
     fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
-        self.with_shared_append_lock(|this| this.region.append_type_layout_metadata(layout))
+        self.with_shared_allocator_lock(|this| this.region.append_type_layout_metadata(layout))
     }
 
     fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool> {
@@ -653,8 +659,9 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         data_stream: DurableDataStream,
         record: &[u8],
     ) -> Result<DurableDataRecordPointer> {
-        self.with_shared_append_lock(|this| {
-            let data_stream_id = data_stream.file_backed_stream_id(transaction_stream_id)?;
+        let data_stream_id = data_stream.file_backed_stream_id(transaction_stream_id)?;
+        let stream = self.stream_cursor(data_stream_id)?;
+        let append = |this: &mut Self| {
             let stream = this.stream_cursor(data_stream_id)?;
             let location = this.region.append_data_record(stream, record)?;
             this.pending_data_chunks.insert(location.chunk_start_block);
@@ -664,16 +671,28 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
                 data_offset: location.data_offset,
                 data_block_generation: this.region.block_generation(location.data_block)?,
             })
-        })
+        };
+        if self
+            .region
+            .append_data_record_requires_allocation(stream, record)?
+        {
+            return self.with_shared_allocator_lock(append);
+        }
+        append(self)
     }
 
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
-        self.with_shared_append_lock(|this| {
+        let stream = self.stream_cursor(transaction_stream_id)?;
+        let append = |this: &mut Self| {
             let stream = this.stream_cursor(transaction_stream_id)?;
             let log_block = this.region.append_log_entry(stream, entry)?;
             this.pending_log_blocks.insert(log_block);
             Ok(())
-        })
+        };
+        if self.region.append_log_entry_requires_allocation(stream)? {
+            return self.with_shared_allocator_lock(append);
+        }
+        append(self)
     }
 
     fn mark_last_log_entry_committed(
@@ -1926,6 +1945,50 @@ mod tests {
             recovered.tmemory_undo_rollbacks[0].old_granule_bytes,
             vec![1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn file_backed_logs_sharing_allocator_lock_allocate_distinct_undo_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let allocator_lock = Arc::new(Mutex::new(()));
+
+        let first = PendingGranuleUndo::tmemory(0x1000_0000_0000_002a, 13, vec![1, 2, 3, 4]);
+        {
+            let mut log = TxDurableLog::create_file_backed_with_allocator_lock(
+                &path,
+                64,
+                allocator_lock.clone(),
+            )
+            .unwrap();
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&first)
+                .unwrap();
+        }
+
+        let second = PendingGranuleUndo::tmemory(0x1000_0000_1000_002a, 8, vec![5, 6, 7, 8]);
+        {
+            let mut log =
+                TxDurableLog::open_file_backed_with_allocator_lock(&path, allocator_lock).unwrap();
+            let mut sink = log.stream_sink(13);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&second)
+                .unwrap();
+        }
+
+        let reopened = TxDurableLog::open_file_backed(&path).unwrap();
+        let first_entries = reopened.log_entries_for_test(12);
+        let second_entries = reopened.log_entries_for_test(13);
+
+        assert_eq!(first_entries.len(), 1);
+        assert_eq!(second_entries.len(), 1);
+        assert_ne!(first_entries[0].data_block, second_entries[0].data_block);
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 2);
     }
 
     #[test]

@@ -1108,6 +1108,41 @@ impl VMemoryBlockRegion {
         StreamCursor { stream_id }
     }
 
+    pub(crate) fn append_data_record_requires_allocation(
+        &self,
+        stream: StreamCursor,
+        bytes: &[u8],
+    ) -> Result<bool> {
+        let kind = block_kind_for_data_record(bytes)?;
+        let state = self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let Some(start_block) = state.current_data_chunk_start else {
+            return Ok(true);
+        };
+        let header = self.data_chunk_header(start_block)?;
+        let current_kind = self.block_meta(start_block)?.kind()?;
+        Ok(!(current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len()))
+    }
+
+    pub(crate) fn append_log_entry_requires_allocation(
+        &self,
+        stream: StreamCursor,
+    ) -> Result<bool> {
+        let state = self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let Some(start_block) = state.current_log_block_start else {
+            return Ok(true);
+        };
+        let header = self.log_block_header(start_block)?;
+        Ok(
+            usize::try_from(header.entry_count)
+                .context("transactional log entry count overflow")?
+                >= self.log_entry_capacity(),
+        )
+    }
+
     pub(crate) fn append_data_record(
         &mut self,
         stream: StreamCursor,
@@ -2212,6 +2247,41 @@ impl FileBackedMemoryBlockRegion {
     pub(crate) fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
         self.streams.entry(stream_id).or_default();
         StreamCursor { stream_id }
+    }
+
+    pub(crate) fn append_data_record_requires_allocation(
+        &self,
+        stream: StreamCursor,
+        bytes: &[u8],
+    ) -> Result<bool> {
+        let kind = block_kind_for_data_record(bytes)?;
+        let state = self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let Some(start_block) = state.current_data_chunk_start else {
+            return Ok(true);
+        };
+        let header = self.data_chunk_header(start_block)?;
+        let current_kind = self.block_meta(start_block)?.kind()?;
+        Ok(!(current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len()))
+    }
+
+    pub(crate) fn append_log_entry_requires_allocation(
+        &self,
+        stream: StreamCursor,
+    ) -> Result<bool> {
+        let state = self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let Some(start_block) = state.current_log_block_start else {
+            return Ok(true);
+        };
+        let header = self.log_block_header(start_block)?;
+        Ok(
+            usize::try_from(header.entry_count)
+                .context("transactional log entry count overflow")?
+                >= self.log_entry_capacity(),
+        )
     }
 
     pub(crate) fn append_data_record(

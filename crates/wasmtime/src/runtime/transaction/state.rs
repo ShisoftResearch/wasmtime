@@ -351,10 +351,10 @@ impl TransactionState {
         &mut self,
         shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
     ) -> Result<()> {
-        self.durable_log = TxDurableLog::create_file_backed_with_append_lock(
+        self.durable_log = TxDurableLog::create_file_backed_with_allocator_lock(
             shared.tx_log_path(),
             shared.tx_log_blocks(),
-            shared.durable_log_append_lock(),
+            shared.durable_log_allocator_lock(),
         )?;
         Ok(())
     }
@@ -368,9 +368,9 @@ impl TransactionState {
         &mut self,
         shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
     ) -> Result<()> {
-        self.durable_log = TxDurableLog::open_file_backed_with_append_lock(
+        self.durable_log = TxDurableLog::open_file_backed_with_allocator_lock(
             shared.tx_log_path(),
-            shared.durable_log_append_lock(),
+            shared.durable_log_allocator_lock(),
         )?;
         Ok(())
     }

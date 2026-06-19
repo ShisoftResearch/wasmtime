@@ -35,7 +35,9 @@ pub(crate) struct SharedFileBackedStorageConfig {
     tmemory_file_backing: TMemoryFileBacking,
     tx_log_path: PathBuf,
     tx_log_blocks: u32,
-    durable_log_append_lock: Arc<Mutex<()>>,
+    // Coordinates file-backed durable-log region allocator metadata across
+    // independent mappings. Per-stream publication still runs store-local.
+    durable_log_allocator_lock: Arc<Mutex<()>>,
     tmemory_commit_lock: Arc<RwLock<()>>,
 }
 
@@ -49,7 +51,7 @@ impl SharedFileBackedStorageConfig {
             tmemory_file_backing,
             tx_log_path,
             tx_log_blocks,
-            durable_log_append_lock: Arc::new(Mutex::new(())),
+            durable_log_allocator_lock: Arc::new(Mutex::new(())),
             tmemory_commit_lock: Arc::new(RwLock::new(())),
         }
     }
@@ -74,8 +76,8 @@ impl SharedFileBackedStorageConfig {
         self.tx_log_blocks
     }
 
-    pub(crate) fn durable_log_append_lock(&self) -> Arc<Mutex<()>> {
-        self.durable_log_append_lock.clone()
+    pub(crate) fn durable_log_allocator_lock(&self) -> Arc<Mutex<()>> {
+        self.durable_log_allocator_lock.clone()
     }
 
     pub(crate) fn tmemory_commit_lock(&self) -> Arc<RwLock<()>> {
@@ -84,7 +86,7 @@ impl SharedFileBackedStorageConfig {
 
     fn with_reused_locks_from(mut self, existing: Option<&SharedFileBackedStorageConfig>) -> Self {
         if let Some(existing) = existing {
-            self.durable_log_append_lock = existing.durable_log_append_lock();
+            self.durable_log_allocator_lock = existing.durable_log_allocator_lock();
             self.tmemory_commit_lock = existing.tmemory_commit_lock();
         }
         self
