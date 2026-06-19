@@ -260,6 +260,100 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
     clear_current_thread_transaction_for_test();
 }
 
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
+fn shared_region_runtime_file_backed_tmemory_recovers_commits_from_two_stores() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let spawn_commit = |runtime: TransactionRegionRuntime,
+                        barrier: Arc<Barrier>,
+                        addr: i32,
+                        value: i32|
+     -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            clear_current_thread_transaction_for_test();
+
+            let engine = crate::Engine::default();
+            let module = transaction_test_module(
+                &engine,
+                r#"
+                    (module
+                      (tmemory 1)
+                      (tfunc (export "write") (param i32 i32)
+                        (i32.tstore (local.get 0) (local.get 1))))
+                "#,
+            );
+            let mut store = crate::Store::new(&engine, ());
+            store.set_transaction_region_runtime_for_test(runtime);
+            let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+            let write = instance
+                .get_typed_func::<(i32, i32), ()>(&mut store, "write")
+                .unwrap();
+
+            barrier.wait();
+            write.call(&mut store, (addr, value)).unwrap();
+            clear_current_thread_transaction_for_test();
+        })
+    };
+
+    let first = spawn_commit(runtime.clone(), barrier.clone(), 0, 0x4433_2211);
+    let second = spawn_commit(
+        runtime.clone(),
+        barrier,
+        i32::try_from(TMEMORY_GRANULE_SIZE).unwrap(),
+        i32::from_le_bytes([0x55, 0x66, 0x77, 0x08]),
+    );
+    first.join().unwrap();
+    second.join().unwrap();
+
+    let _reopened_runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+        )
+        .unwrap();
+    let recovered = TxDurableLog::recover_file_backed_for_test(&tx_log_path).unwrap();
+    let mut reopened = crate::runtime::vm::TMemory::new(
+        TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path).unwrap(),
+        1,
+        Some(1),
+    )
+    .unwrap();
+    reopened
+        .apply_file_backed_recovered_tmemory_undo_rollbacks_for_test(
+            recovered.tmemory_undo_rollbacks,
+        )
+        .unwrap();
+
+    assert_eq!(
+        reopened.read_committed(0..4).unwrap(),
+        vec![0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(
+        reopened
+            .read_committed(TMEMORY_GRANULE_SIZE..TMEMORY_GRANULE_SIZE + 4)
+            .unwrap(),
+        vec![0x55, 0x66, 0x77, 0x08]
+    );
+
+    clear_current_thread_transaction_for_test();
+}
+
 #[test]
 fn shared_region_runtime_pre_lp_failure_retires_log_segment() {
     clear_current_thread_transaction_for_test();

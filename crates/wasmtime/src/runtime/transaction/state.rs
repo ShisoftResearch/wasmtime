@@ -334,6 +334,10 @@ impl TransactionState {
         self.shared_region_runtime.as_ref()
     }
 
+    pub(crate) fn set_shared_region_runtime(&mut self, runtime: Option<TransactionRegionRuntime>) {
+        self.shared_region_runtime = runtime;
+    }
+
     pub(crate) fn create_file_backed_durable_log(
         &mut self,
         path: &Path,
@@ -343,8 +347,31 @@ impl TransactionState {
         Ok(())
     }
 
+    pub(crate) fn create_shared_file_backed_durable_log(
+        &mut self,
+        shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
+    ) -> Result<()> {
+        self.durable_log = TxDurableLog::create_file_backed_with_append_lock(
+            shared.tx_log_path(),
+            shared.tx_log_blocks(),
+            shared.durable_log_append_lock(),
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn open_file_backed_durable_log(&mut self, path: &Path) -> Result<()> {
         self.durable_log = TxDurableLog::open_file_backed(path)?;
+        Ok(())
+    }
+
+    pub(crate) fn open_shared_file_backed_durable_log(
+        &mut self,
+        shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
+    ) -> Result<()> {
+        self.durable_log = TxDurableLog::open_file_backed_with_append_lock(
+            shared.tx_log_path(),
+            shared.durable_log_append_lock(),
+        )?;
         Ok(())
     }
 
@@ -1501,6 +1528,21 @@ impl TransactionState {
     }
 
     pub(crate) fn commit_tmemory_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        tmemory: &mut TMemory,
+    ) -> Result<bool> {
+        let region = self.shared_region_runtime_for_publication().cloned();
+        if let Some(region) = region {
+            return region.with_shared_file_backed_tmemory_commit_read_lock(|| {
+                self.commit_tmemory_owned_inner(owner_instance, memory_index, tmemory)
+            });
+        }
+        self.commit_tmemory_owned_inner(owner_instance, memory_index, tmemory)
+    }
+
+    fn commit_tmemory_owned_inner(
         &mut self,
         owner_instance: Option<InstanceId>,
         memory_index: u32,

@@ -3513,20 +3513,23 @@ fn grow_tmemory_to_pages(
     memory: u32,
     new_pages: u64,
 ) -> Result<()> {
-    let memory = MemoryIndex::from_u32(memory);
-    let mut instance_ref = store.instance_mut(instance);
-    let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory) else {
-        bail!("transactional memory operation targeted non-transactional memory");
-    };
-    let current_pages =
-        u64::try_from(tmemory.byte_len() / crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE)
-            .context("tmemory current size overflow")?;
-    if new_pages <= current_pages {
-        return Ok(());
-    }
-    tmemory
-        .grow_to_pages(new_pages)
-        .context("transactional memory grow failed during commit")
+    let runtime = store.store_opaque().transaction_region_runtime().clone();
+    runtime.with_shared_file_backed_tmemory_commit_write_lock(|| {
+        let memory = MemoryIndex::from_u32(memory);
+        let mut instance_ref = store.instance_mut(instance);
+        let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory) else {
+            bail!("transactional memory operation targeted non-transactional memory");
+        };
+        let current_pages =
+            u64::try_from(tmemory.byte_len() / crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE)
+                .context("tmemory current size overflow")?;
+        if new_pages <= current_pages {
+            return Ok(());
+        }
+        tmemory
+            .grow_to_pages(new_pages)
+            .context("transactional memory grow failed during commit")
+    })
 }
 
 fn defined_table_size(store: &mut dyn VMStore, instance: InstanceId, table: u32) -> Result<usize> {

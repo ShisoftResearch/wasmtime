@@ -1,14 +1,16 @@
 use crate::prelude::*;
 use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
 use super::concurrency::LockBasedConflictKind;
 use super::state::PersistentRootDelta;
 use super::{
-    GranuleId, LockBased, ObjectId, PersistentRootKey, TransactionId, TxDurableLog,
-    granule_uses_transaction_state_version, persistent_root_key_from_logical_id,
+    GranuleId, LockBased, ObjectId, PersistentRootKey, TMemoryFileBacking, TransactionConfig,
+    TransactionId, TxDurableLog, granule_uses_transaction_state_version,
+    persistent_root_key_from_logical_id,
 };
 
 const FIRST_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x2000_0000;
@@ -28,6 +30,67 @@ impl DurableLogSegment {
 #[derive(Clone, Debug)]
 pub(crate) struct TransactionRegionRuntime(Arc<Mutex<TransactionRegionRuntimeInner>>);
 
+#[derive(Clone, Debug)]
+pub(crate) struct SharedFileBackedStorageConfig {
+    tmemory_file_backing: TMemoryFileBacking,
+    tx_log_path: PathBuf,
+    tx_log_blocks: u32,
+    durable_log_append_lock: Arc<Mutex<()>>,
+    tmemory_commit_lock: Arc<RwLock<()>>,
+}
+
+impl SharedFileBackedStorageConfig {
+    fn new(
+        tmemory_file_backing: TMemoryFileBacking,
+        tx_log_path: PathBuf,
+        tx_log_blocks: u32,
+    ) -> Self {
+        Self {
+            tmemory_file_backing,
+            tx_log_path,
+            tx_log_blocks,
+            durable_log_append_lock: Arc::new(Mutex::new(())),
+            tmemory_commit_lock: Arc::new(RwLock::new(())),
+        }
+    }
+
+    pub(crate) fn transaction_config(&self) -> Result<TransactionConfig> {
+        match &self.tmemory_file_backing {
+            TMemoryFileBacking::Temp => TransactionConfig::with_file_backed_tmemory_temp(),
+            TMemoryFileBacking::Path(path) => {
+                TransactionConfig::with_file_backed_tmemory_path(path.clone())
+            }
+            TMemoryFileBacking::ExistingPath(path) => {
+                TransactionConfig::with_file_backed_tmemory_existing_path(path.clone())
+            }
+        }
+    }
+
+    pub(crate) fn tx_log_path(&self) -> &Path {
+        &self.tx_log_path
+    }
+
+    pub(crate) fn tx_log_blocks(&self) -> u32 {
+        self.tx_log_blocks
+    }
+
+    pub(crate) fn durable_log_append_lock(&self) -> Arc<Mutex<()>> {
+        self.durable_log_append_lock.clone()
+    }
+
+    pub(crate) fn tmemory_commit_lock(&self) -> Arc<RwLock<()>> {
+        self.tmemory_commit_lock.clone()
+    }
+
+    fn with_reused_locks_from(mut self, existing: Option<&SharedFileBackedStorageConfig>) -> Self {
+        if let Some(existing) = existing {
+            self.durable_log_append_lock = existing.durable_log_append_lock();
+            self.tmemory_commit_lock = existing.tmemory_commit_lock();
+        }
+        self
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) next_transaction_id: u64,
@@ -42,6 +105,7 @@ pub(crate) struct TransactionRegionRuntimeInner {
     persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     object_versions: BTreeMap<ObjectId, u32>,
     pub(crate) durable_log: TxDurableLog,
+    pub(crate) file_backed_storage: Option<SharedFileBackedStorageConfig>,
     #[cfg(test)]
     pub(crate) fail_release_transaction_once_for_test: bool,
     #[cfg(test)]
@@ -63,6 +127,7 @@ impl Default for TransactionRegionRuntimeInner {
             persistent_root_versions: BTreeMap::new(),
             object_versions: BTreeMap::new(),
             durable_log: TxDurableLog::default(),
+            file_backed_storage: None,
             #[cfg(test)]
             fail_release_transaction_once_for_test: false,
             #[cfg(test)]
@@ -94,6 +159,84 @@ impl TransactionRegionRuntime {
             .checked_add(1)
             .context("transaction id overflow")?;
         Ok(id)
+    }
+
+    pub(crate) fn shared_file_backed_storage(
+        &self,
+    ) -> Result<Option<SharedFileBackedStorageConfig>> {
+        Ok(self.lock()?.file_backed_storage.clone())
+    }
+
+    pub(crate) fn shared_file_backed_tmemory_commit_lock(&self) -> Result<Option<Arc<RwLock<()>>>> {
+        Ok(self
+            .lock()?
+            .file_backed_storage
+            .as_ref()
+            .map(SharedFileBackedStorageConfig::tmemory_commit_lock))
+    }
+
+    pub(crate) fn with_shared_file_backed_tmemory_commit_read_lock<T>(
+        &self,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if let Some(lock) = self.shared_file_backed_tmemory_commit_lock()? {
+            let _guard = lock.read().map_err(|_| {
+                crate::format_err!("shared file-backed tmemory commit lock poisoned")
+            })?;
+            return f();
+        }
+        f()
+    }
+
+    pub(crate) fn with_shared_file_backed_tmemory_commit_write_lock<T>(
+        &self,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if let Some(lock) = self.shared_file_backed_tmemory_commit_lock()? {
+            let _guard = lock.write().map_err(|_| {
+                crate::format_err!("shared file-backed tmemory commit lock poisoned")
+            })?;
+            return f();
+        }
+        f()
+    }
+
+    pub(crate) fn record_created_file_backed_storage(
+        &self,
+        tmemory_path: &Path,
+        tx_log_path: &Path,
+        tx_log_blocks: u32,
+    ) -> Result<()> {
+        let mut runtime = self.lock()?;
+        let existing = runtime.file_backed_storage.clone();
+        runtime.file_backed_storage = Some(
+            SharedFileBackedStorageConfig::new(
+                TMemoryFileBacking::Path(tmemory_path.to_path_buf()),
+                tx_log_path.to_path_buf(),
+                tx_log_blocks,
+            )
+            .with_reused_locks_from(existing.as_ref()),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn record_opened_file_backed_storage(
+        &self,
+        tmemory_path: &Path,
+        tx_log_path: &Path,
+        tx_log_blocks: u32,
+    ) -> Result<()> {
+        let mut runtime = self.lock()?;
+        let existing = runtime.file_backed_storage.clone();
+        runtime.file_backed_storage = Some(
+            SharedFileBackedStorageConfig::new(
+                TMemoryFileBacking::ExistingPath(tmemory_path.to_path_buf()),
+                tx_log_path.to_path_buf(),
+                tx_log_blocks,
+            )
+            .with_reused_locks_from(existing.as_ref()),
+        );
+        Ok(())
     }
 
     pub(crate) fn current_thread_log_segment(&self) -> Result<DurableLogSegment> {
@@ -423,6 +566,29 @@ impl TransactionRegionRuntime {
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_file_backed_for_test(
+        tmemory_path: &Path,
+        tx_log_path: &Path,
+        tx_log_blocks: u32,
+    ) -> Result<Self> {
+        let runtime = Self::default();
+        TxDurableLog::create_file_backed(tx_log_path, tx_log_blocks)?;
+        runtime.record_created_file_backed_storage(tmemory_path, tx_log_path, tx_log_blocks)?;
+        Ok(runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_file_backed_for_test(
+        tmemory_path: &Path,
+        tx_log_path: &Path,
+    ) -> Result<Self> {
+        let runtime = Self::default();
+        TxDurableLog::open_file_backed(tx_log_path)?;
+        runtime.record_opened_file_backed_storage(tmemory_path, tx_log_path, 0)?;
+        Ok(runtime)
     }
 
     #[cfg(test)]

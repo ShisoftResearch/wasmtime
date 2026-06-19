@@ -13,7 +13,6 @@ use crate::runtime::vm::{
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use std::path::Path;
-#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -320,6 +319,7 @@ struct FileBackedTxDurableLog {
     streams: BTreeMap<u32, crate::runtime::vm::block_region::StreamCursor>,
     pending_data_chunks: BTreeSet<u32>,
     pending_log_blocks: BTreeSet<u32>,
+    shared_append_lock: Option<Arc<Mutex<()>>>,
 }
 
 pub(crate) struct TxDurableLogSink<'a> {
@@ -403,28 +403,69 @@ impl TxDurableLog {
     }
 
     pub(crate) fn create_file_backed(path: &Path, num_blocks: u32) -> Result<Self> {
+        Self::create_file_backed_with_shared_append_lock(path, num_blocks, None)
+    }
+
+    pub(crate) fn create_file_backed_with_append_lock(
+        path: &Path,
+        num_blocks: u32,
+        shared_append_lock: Arc<Mutex<()>>,
+    ) -> Result<Self> {
+        Self::create_file_backed_with_shared_append_lock(path, num_blocks, Some(shared_append_lock))
+    }
+
+    fn create_file_backed_with_shared_append_lock(
+        path: &Path,
+        num_blocks: u32,
+        shared_append_lock: Option<Arc<Mutex<()>>>,
+    ) -> Result<Self> {
         let region =
             crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(
                 path, num_blocks,
             )?;
-        Ok(Self::from_file_backed_region(region))
+        Ok(Self::from_file_backed_region(region, shared_append_lock))
     }
 
     pub(crate) fn open_file_backed(path: &Path) -> Result<Self> {
+        Self::open_file_backed_with_shared_append_lock(path, None)
+    }
+
+    pub(crate) fn open_file_backed_with_append_lock(
+        path: &Path,
+        shared_append_lock: Arc<Mutex<()>>,
+    ) -> Result<Self> {
+        Self::open_file_backed_with_shared_append_lock(path, Some(shared_append_lock))
+    }
+
+    fn open_file_backed_with_shared_append_lock(
+        path: &Path,
+        shared_append_lock: Option<Arc<Mutex<()>>>,
+    ) -> Result<Self> {
+        if let Some(lock) = shared_append_lock.clone() {
+            let _guard = lock
+                .lock()
+                .map_err(|_| crate::format_err!("shared durable log append lock poisoned"))?;
+            let mut region =
+                crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
+            crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
+            return Ok(Self::from_file_backed_region(region, shared_append_lock));
+        }
         let mut region =
             crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
         crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
-        Ok(Self::from_file_backed_region(region))
+        Ok(Self::from_file_backed_region(region, shared_append_lock))
     }
 
     fn from_file_backed_region(
         region: crate::runtime::vm::block_region::FileBackedMemoryBlockRegion,
+        shared_append_lock: Option<Arc<Mutex<()>>>,
     ) -> Self {
         Self::with_backend(FileBackedTxDurableLog {
             region,
             streams: BTreeMap::new(),
             pending_data_chunks: BTreeSet::new(),
             pending_log_blocks: BTreeSet::new(),
+            shared_append_lock,
         })
     }
 
@@ -583,11 +624,23 @@ impl FileBackedTxDurableLog {
         self.streams.insert(stream_id, stream);
         Ok(stream)
     }
+
+    fn with_shared_append_lock<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let shared_append_lock = self.shared_append_lock.clone();
+        if let Some(lock) = shared_append_lock {
+            let _guard = lock
+                .lock()
+                .map_err(|_| crate::format_err!("shared durable log append lock poisoned"))?;
+            self.region.refresh_from_image()?;
+            return f(self);
+        }
+        f(self)
+    }
 }
 
 impl TxDurableLogBackend for FileBackedTxDurableLog {
     fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
-        self.region.append_type_layout_metadata(layout)
+        self.with_shared_append_lock(|this| this.region.append_type_layout_metadata(layout))
     }
 
     fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool> {
@@ -600,23 +653,27 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         data_stream: DurableDataStream,
         record: &[u8],
     ) -> Result<DurableDataRecordPointer> {
-        let data_stream_id = data_stream.file_backed_stream_id(transaction_stream_id)?;
-        let stream = self.stream_cursor(data_stream_id)?;
-        let location = self.region.append_data_record(stream, record)?;
-        self.pending_data_chunks.insert(location.chunk_start_block);
-        Ok(DurableDataRecordPointer {
-            chunk_start_block: location.chunk_start_block,
-            data_block: location.data_block,
-            data_offset: location.data_offset,
-            data_block_generation: self.region.block_generation(location.data_block)?,
+        self.with_shared_append_lock(|this| {
+            let data_stream_id = data_stream.file_backed_stream_id(transaction_stream_id)?;
+            let stream = this.stream_cursor(data_stream_id)?;
+            let location = this.region.append_data_record(stream, record)?;
+            this.pending_data_chunks.insert(location.chunk_start_block);
+            Ok(DurableDataRecordPointer {
+                chunk_start_block: location.chunk_start_block,
+                data_block: location.data_block,
+                data_offset: location.data_offset,
+                data_block_generation: this.region.block_generation(location.data_block)?,
+            })
         })
     }
 
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
-        let stream = self.stream_cursor(transaction_stream_id)?;
-        let log_block = self.region.append_log_entry(stream, entry)?;
-        self.pending_log_blocks.insert(log_block);
-        Ok(())
+        self.with_shared_append_lock(|this| {
+            let stream = this.stream_cursor(transaction_stream_id)?;
+            let log_block = this.region.append_log_entry(stream, entry)?;
+            this.pending_log_blocks.insert(log_block);
+            Ok(())
+        })
     }
 
     fn mark_last_log_entry_committed(

@@ -934,6 +934,16 @@ impl<T> Store<T> {
         &mut self,
         runtime: TransactionRegionRuntime,
     ) {
+        if let Ok(Some(shared)) = runtime.shared_file_backed_storage() {
+            self.inner.transaction_config = shared.transaction_config().unwrap();
+            self.inner
+                .transaction_state
+                .open_shared_file_backed_durable_log(&shared)
+                .unwrap();
+            self.inner
+                .transaction_state
+                .set_shared_region_runtime(Some(runtime.clone()));
+        }
         *self.inner.transaction_region_runtime_mut() = runtime;
     }
 
@@ -1782,9 +1792,17 @@ impl StoreOpaque {
         tx_log_path: PathBuf,
         tx_log_blocks: u32,
     ) -> Result<()> {
-        let config = TransactionConfig::with_file_backed_tmemory_path(tmemory_path)?;
+        let config = TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
+        self.transaction_region_runtime
+            .record_created_file_backed_storage(&tmemory_path, &tx_log_path, tx_log_blocks)?;
+        let shared = self
+            .transaction_region_runtime
+            .shared_file_backed_storage()?
+            .context("shared file-backed storage config was not recorded")?;
         self.transaction_state
-            .create_file_backed_durable_log(&tx_log_path, tx_log_blocks)?;
+            .create_shared_file_backed_durable_log(&shared)?;
+        self.transaction_state
+            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
         self.transaction_config = config;
         Ok(())
     }
@@ -1795,7 +1813,8 @@ impl StoreOpaque {
         tmemory_path: PathBuf,
         tx_log_path: PathBuf,
     ) -> Result<()> {
-        let config = TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path)?;
+        let config =
+            TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path.clone())?;
         let recovered =
             crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(
                 &tx_log_path,
@@ -1818,8 +1837,25 @@ impl StoreOpaque {
             .map(|winner| (winner.logical_id, winner.version));
         self.transaction_state
             .install_recovered_persistent_root_state(recovered_roots, recovered_versions)?;
+        let tx_log_blocks = u32::try_from(
+            std::fs::metadata(&tx_log_path)
+                .with_context(|| {
+                    format!("failed to stat transaction log {}", tx_log_path.display())
+                })?
+                .len()
+                / u64::try_from(crate::runtime::vm::block_region::BLOCK_SIZE).unwrap(),
+        )
+        .context("transaction log block count overflow")?;
+        self.transaction_region_runtime
+            .record_opened_file_backed_storage(&tmemory_path, &tx_log_path, tx_log_blocks)?;
+        let shared = self
+            .transaction_region_runtime
+            .shared_file_backed_storage()?
+            .context("shared file-backed storage config was not recorded")?;
         self.transaction_state
-            .open_file_backed_durable_log(&tx_log_path)?;
+            .open_shared_file_backed_durable_log(&shared)?;
+        self.transaction_state
+            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
         self.transaction_object_table = recovered_object_table;
         self.transaction_config = config;
         Ok(())
