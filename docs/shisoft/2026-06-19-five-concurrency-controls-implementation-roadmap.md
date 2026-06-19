@@ -536,3 +536,12 @@ Repeat the alternate-policy command for:
 
 MVCC should start only after these policies are in place and the storage layer
 has a separate version-retention and garbage-collection plan.
+
+## Implementation Status
+
+- Wound-Wait: implemented
+- Wait-Die: implemented without blocking; `WouldWait` is a structured conflict action
+- Strict Two-Phase Locking: implemented
+- Optimistic Validation Only: implemented with commit-time write validation
+- Pure Timestamp Ordering: implemented as single-version timestamp ordering
+- MVCC: still deferred to a separate storage, recovery, and garbage-collection roadmap
