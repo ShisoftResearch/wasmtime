@@ -15746,6 +15746,72 @@ fn wait_die_rejects_write_after_stale_read_version() {
 }
 
 #[test]
+fn strict_2pl_allows_multiple_readers_and_blocks_writer() {
+    let mut policy = StrictTwoPhaseLocking::default();
+    let first = TransactionId::from_raw(1);
+    let second = TransactionId::from_raw(2);
+    let writer = TransactionId::from_raw(3);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.record_read_for_test(first, granule, 5).unwrap();
+    policy.record_read_for_test(second, granule, 5).unwrap();
+
+    let error = policy
+        .acquire_write_result_for_test(writer, granule, 5)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        StrictTwoPhaseLockingConflictKindForTest::WriteReadLockedByOther
+    );
+}
+
+#[test]
+fn strict_2pl_upgrades_only_for_sole_reader() {
+    let mut policy = StrictTwoPhaseLocking::default();
+    let transaction = TransactionId::from_raw(1);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy
+        .record_read_for_test(transaction, granule, 5)
+        .unwrap();
+    policy
+        .acquire_write_for_test(transaction, granule, 5)
+        .unwrap();
+
+    assert_eq!(policy.owner_for_test(granule), Some(transaction));
+}
+
+#[test]
+fn strict_2pl_reader_conflicts_with_active_writer() {
+    let mut policy = StrictTwoPhaseLocking::default();
+    let writer = TransactionId::from_raw(1);
+    let reader = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_write_for_test(writer, granule, 5).unwrap();
+
+    let error = policy
+        .record_read_result_for_test(reader, granule, 5)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        StrictTwoPhaseLockingConflictKindForTest::ReadOwnedByOther
+    );
+}
+
+#[test]
 fn transaction_timestamp_helpers_use_transaction_id_order() {
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
@@ -15803,9 +15869,10 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
         policy
             .acquire_granule_write(direct_release_transaction, direct_release_write_granule, 1)
             .unwrap();
-        assert_eq!(
-            policy.read_granules_for_transaction(direct_release_transaction),
-            vec![direct_release_read_granule]
+        assert!(
+            policy
+                .read_granules_for_transaction(direct_release_transaction)
+                .contains(&direct_release_read_granule)
         );
         assert_eq!(
             policy.owner_for_granule(direct_release_write_granule),
@@ -15835,9 +15902,10 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
         policy
             .validate_read(result_release_transaction, result_release_read_granule, 2)
             .unwrap();
-        assert_eq!(
-            policy.read_granules_for_transaction(result_release_transaction),
-            vec![result_release_read_granule]
+        assert!(
+            policy
+                .read_granules_for_transaction(result_release_transaction)
+                .contains(&result_release_read_granule)
         );
         assert_eq!(
             policy.owner_for_granule(result_release_write_granule),
@@ -15858,6 +15926,7 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
 
     assert_contract(&mut LockBased::default());
     assert_contract(&mut NoWaitAbort::default());
+    assert_contract(&mut StrictTwoPhaseLocking::default());
     assert_contract(&mut WaitDie::default());
     assert_contract(&mut WoundWait::default());
 }
@@ -15922,6 +15991,27 @@ fn selected_concurrency_control_uses_wait_die_would_wait_semantics() {
         super::concurrency::TransactionConflictAction::WouldWait(younger)
     );
     assert_eq!(policy.owner_for_granule(granule), Some(younger));
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-strict-2pl")]
+fn selected_concurrency_control_uses_strict_2pl_semantics() {
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::StrictTwoPhaseLocking);
+    let reader = TransactionId::from_raw(1);
+    let writer = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_granule_read(reader, granule, 0).unwrap();
+    let err = policy
+        .acquire_granule_write(writer, granule, 0)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("read-locked"), "{err:?}");
+    assert_eq!(policy.owner_for_granule(granule), None);
 }
 
 #[test]

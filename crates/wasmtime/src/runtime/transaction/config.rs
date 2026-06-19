@@ -17,6 +17,10 @@ use std::path::PathBuf;
             feature = "transaction-cc-wait-die"
         ),
         all(
+            feature = "transaction-cc-lockbased",
+            feature = "transaction-cc-strict-2pl"
+        ),
+        all(
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-wound-wait"
         ),
@@ -25,15 +29,28 @@ use std::path::PathBuf;
             feature = "transaction-cc-wait-die"
         ),
         all(
+            feature = "transaction-cc-nowait-abort",
+            feature = "transaction-cc-strict-2pl"
+        ),
+        all(
             feature = "transaction-cc-wound-wait",
             feature = "transaction-cc-wait-die"
+        ),
+        all(
+            feature = "transaction-cc-wound-wait",
+            feature = "transaction-cc-strict-2pl"
+        ),
+        all(
+            feature = "transaction-cc-wait-die",
+            feature = "transaction-cc-strict-2pl"
         )
     )
 ))]
 compile_error!(
     "select exactly one transaction concurrency-control feature: \
      transaction-cc-lockbased, transaction-cc-nowait-abort, \
-     transaction-cc-wound-wait, or transaction-cc-wait-die"
+     transaction-cc-wound-wait, transaction-cc-wait-die, \
+     or transaction-cc-strict-2pl"
 );
 
 #[cfg(all(
@@ -42,13 +59,15 @@ compile_error!(
         feature = "transaction-cc-lockbased",
         feature = "transaction-cc-nowait-abort",
         feature = "transaction-cc-wound-wait",
-        feature = "transaction-cc-wait-die"
+        feature = "transaction-cc-wait-die",
+        feature = "transaction-cc-strict-2pl"
     ))
 ))]
 compile_error!(
     "transaction requires one transaction concurrency-control feature: \
      transaction-cc-lockbased, transaction-cc-nowait-abort, \
-     transaction-cc-wound-wait, or transaction-cc-wait-die"
+     transaction-cc-wound-wait, transaction-cc-wait-die, \
+     or transaction-cc-strict-2pl"
 );
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -97,6 +116,7 @@ pub(crate) enum TMemoryFileBacking {
 pub(crate) enum ConcurrencyControl {
     LockBased,
     NoWaitAbort,
+    StrictTwoPhaseLocking,
     WoundWait,
     WaitDie,
 }
@@ -113,6 +133,11 @@ impl ConcurrencyControl {
             return Self::WoundWait;
         }
 
+        #[cfg(feature = "transaction-cc-strict-2pl")]
+        {
+            return Self::StrictTwoPhaseLocking;
+        }
+
         #[cfg(feature = "transaction-cc-nowait-abort")]
         {
             return Self::NoWaitAbort;
@@ -126,6 +151,7 @@ impl ConcurrencyControl {
         #[cfg(not(any(
             feature = "transaction-cc-wait-die",
             feature = "transaction-cc-wound-wait",
+            feature = "transaction-cc-strict-2pl",
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-lockbased"
         )))]
