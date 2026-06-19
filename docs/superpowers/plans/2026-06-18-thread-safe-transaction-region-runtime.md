@@ -4,7 +4,7 @@
 
 **Goal:** Move the transaction prototype from store-local correctness to a thread-safe persistent-region runtime where multiple host threads and stores can run transactions against the same persistent region.
 
-**Architecture:** Keep live Wasmtime execution state local to each `Store`, but move persistent transaction authority into a shared `Arc<TransactionRegionRuntime>`. The shared runtime owns global transaction ids, granule locks, versions, durable log publication, persistent object index, roots, block allocation, and persistent-GC coordination. Live `VMGcRef` values remain store-local and never cross the shared boundary; shared identity is `ObjectId`/`GranuleId`.
+**Architecture:** Keep live Wasmtime execution state local to each `Store`, but move persistent transaction authority into a shared `Arc<TransactionRegionRuntime>`. The shared runtime owns global transaction ids, granule locks, versions, durable log segment assignment, persistent object index, roots, block allocation coordination, and persistent-GC coordination. Actual data/log/LP publication remains per thread/per stream and must not be serialized through one global runtime publication lock. Live `VMGcRef` values remain store-local and never cross the shared boundary; shared identity is `ObjectId`/`GranuleId`.
 
 **Tech Stack:** Rust, Wasmtime runtime internals, `Arc`, `Mutex`/`RwLock`, existing `transaction` feature gate, existing `TxDurableLog`, `LockBased`, `TMemory`, `ObjectTable`, and file-backed block/chunk region infrastructure.
 
@@ -12,7 +12,7 @@
 
 ## Scope Boundary
 
-This plan makes the prototype semantically thread-safe first, then improves concurrency granularity. The first working version may serialize transaction begin/commit/abort through one shared region mutex. That is acceptable because it proves the persistent identity and commit protocol are correct before performance work.
+This plan makes the prototype semantically thread-safe first, then improves concurrency granularity. The first working version may serialize shared metadata operations such as transaction-id allocation, lock-table updates, version-table updates, and GC maintenance through coarse shared locks. Durable publication is the exception: each thread owns its log segment and publishes append/flush/fence/LP work independently.
 
 Do not base this work on WebAssembly Shared-Everything Threads. The runtime boundary is:
 
@@ -832,9 +832,14 @@ pub(crate) fn create_file_backed_for_test(
 }
 ```
 
-- [ ] **Step 4: Route commit-time undo publication through shared runtime**
+- [ ] **Step 4: Route commit-time undo publication through shared segment assignment**
 
-Keep the existing linear-memory undo scheme, but make the shared runtime own the durable append and LP publication. The store-local `TMemory` may still stage bytes, but the final in-place write must happen after the shared runtime has published and fenced the undo record.
+Keep the existing linear-memory undo scheme, but select the durable `stream_id`
+from the shared runtime's current-thread segment. The store-local transaction
+state still owns the actual durable log sink for now, and append/flush/fence/LP
+publication must not run while holding the shared runtime lock. The store-local
+`TMemory` may still stage bytes, but the final in-place write must happen only
+after the current thread's segment has published and fenced the undo record.
 
 - [ ] **Step 5: Synchronize grow**
 
@@ -1050,7 +1055,7 @@ Replace the single `Mutex<TransactionRegionRuntimeInner>` with:
 pub(crate) struct TransactionRegionRuntimeInner {
     next_transaction_id: AtomicU64,
     locks: Mutex<LockBased>,
-    durable_log: Mutex<TxDurableLog>,
+    log_segments: Mutex<DurableLogSegmentRegistry>,
     persistent_roots: RwLock<BTreeMap<String, (ObjectId, u32)>>,
     object_versions: RwLock<BTreeMap<ObjectId, u32>>,
     gc_state: Mutex<PersistentGcState>,
@@ -1059,7 +1064,11 @@ pub(crate) struct TransactionRegionRuntimeInner {
 
 - [ ] **Step 3: Keep commit ordering unchanged**
 
-Durable publication must still serialize per durable log backend until the log backend has per-stream locking. Do not split log locks before all LP and recovery tests pass under the single log mutex.
+Durable publication must still preserve ordering within each per-thread stream:
+data first, log entry second, LP flip last. Do not introduce a global runtime
+publication mutex. If the durable backend needs internal synchronization, it
+should be per-stream or limited to allocator/free-list metadata, never a lock
+held across unrelated streams' append/flush/fence/LP work.
 
 - [ ] **Step 4: Run concurrency tests repeatedly**
 
@@ -1131,7 +1140,7 @@ Update `docs/shisoft/transactional-wasm-implementation-log.md` with:
 
 - Added `TransactionRegionRuntime` as the shared authority for multi-store transactions.
 - Store-local state now keeps active workspaces and live Wasmtime bridge refs only.
-- Shared state owns transaction id allocation, granule locks, versions, durable publication, persistent roots, and persistent GC coordination.
+- Shared state owns transaction id allocation, granule locks, versions, durable log segment assignment, persistent roots, and persistent GC coordination.
 - Multi-store file-backed transaction persistence tests pass for linear memory, persistent objects, and mixed transactions.
 ```
 
