@@ -1036,6 +1036,253 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
 }
 
 #[test]
+fn shared_runtime_threaded_tmemory_commits_recover_together() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("threaded-tmemory.tmemory");
+    let tx_log_path = dir.path().join("threaded-tmemory.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = threaded_tmemory_module(&engine)?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+
+    warm_shared_module(&engine, &module, &runtime, 0)?;
+
+    let start = Arc::new(Barrier::new(2));
+    let left = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        let start = start.clone();
+        thread::spawn(move || -> Result<()> {
+            start.wait();
+            call_shared_tfunc_i32(&engine, &module, &runtime, "write-left", 0x1122_3344)
+        })
+    };
+    let right = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        thread::spawn(move || -> Result<()> {
+            start.wait();
+            call_shared_tfunc_i32(&engine, &module, &runtime, "write-right", 0x5566_7788)
+        })
+    };
+
+    left.join().unwrap()?;
+    right.join().unwrap()?;
+
+    wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        1,
+        Some(1),
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 0, &0x1122_3344u32.to_le_bytes())?;
+    assert_tmemory_file_bytes(&tmemory_path, 64, &0x5566_7788u32.to_le_bytes())?;
+
+    Ok(())
+}
+
+#[test]
+fn shared_runtime_threaded_object_graphs_recover_both_roots() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("threaded-objects.tmemory");
+    let tx_log_path = dir.path().join("threaded-objects.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = two_root_object_graph_module(&engine)?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+
+    let start = Arc::new(Barrier::new(2));
+    let left = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        let start = start.clone();
+        thread::spawn(move || -> Result<()> {
+            start.wait();
+            call_shared_tfunc_i32(&engine, &module, &runtime, "publish-left", 11)
+        })
+    };
+    let right = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        thread::spawn(move || -> Result<()> {
+            start.wait();
+            call_shared_tfunc_i32(&engine, &module, &runtime, "publish-right", 22)
+        })
+    };
+
+    left.join().unwrap()?;
+    right.join().unwrap()?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids.len(), 2);
+    assert_eq!(recovered.object_winners.len(), 4);
+    assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11, 22]);
+
+    Ok(())
+}
+
+#[test]
+fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() -> Result<()> {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
+
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("threaded-tmemory-conflict.tmemory");
+    let tx_log_path = dir.path().join("threaded-tmemory-conflict.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = blocking_tmemory_module(&engine)?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+
+    warm_shared_module(&engine, &module, &runtime, 1)?;
+
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let first = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        let gate = gate.clone();
+        thread::spawn(move || -> Result<()> {
+            let mut store = shared_store(&engine, &runtime)?;
+            let gate = gate.clone();
+            let pause = Func::wrap(&mut store, move || {
+                let (lock, ready) = &*gate;
+                let mut released = lock.lock().unwrap();
+                *released = true;
+                ready.notify_one();
+                while *released {
+                    released = ready.wait(released).unwrap();
+                }
+            });
+            let instance = Instance::new(&mut store, &module, &[pause.into()])?;
+            instance
+                .get_typed_func::<i32, ()>(&mut store, "write")?
+                .call(&mut store, 0x1122_3344)?;
+            Ok(())
+        })
+    };
+
+    let (lock, ready) = &*gate;
+    let mut released = lock.lock().unwrap();
+    while !*released {
+        released = ready.wait(released).unwrap();
+    }
+
+    let mut second_store = shared_store(&engine, &runtime)?;
+    let second_pause = Func::wrap(&mut second_store, || {});
+    let second_instance = Instance::new(&mut second_store, &module, &[second_pause.into()])?;
+    let err = second_instance
+        .get_typed_func::<i32, ()>(&mut second_store, "write")?
+        .call(&mut second_store, 0x5566_7788)
+        .unwrap_err();
+    let err = format!("{err:?}");
+    assert_transaction_conflict(&err);
+
+    *released = false;
+    ready.notify_one();
+    drop(released);
+    first.join().unwrap()?;
+
+    wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        1,
+        Some(1),
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 0, &0x1122_3344u32.to_le_bytes())?;
+
+    Ok(())
+}
+
+#[test]
+fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> Result<()> {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
+
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("threaded-mixed-conflict.tmemory");
+    let tx_log_path = dir.path().join("threaded-mixed-conflict.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = blocking_mixed_tmemory_object_module(&engine)?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+
+    warm_shared_module(&engine, &module, &runtime, 1)?;
+
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let first = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        let gate = gate.clone();
+        thread::spawn(move || -> Result<()> {
+            let mut store = shared_store(&engine, &runtime)?;
+            let gate = gate.clone();
+            let pause = Func::wrap(&mut store, move || {
+                let (lock, ready) = &*gate;
+                let mut released = lock.lock().unwrap();
+                *released = true;
+                ready.notify_one();
+                while *released {
+                    released = ready.wait(released).unwrap();
+                }
+            });
+            let instance = Instance::new(&mut store, &module, &[pause.into()])?;
+            instance
+                .get_typed_func::<i32, ()>(&mut store, "publish")?
+                .call(&mut store, 11)?;
+            Ok(())
+        })
+    };
+
+    let (lock, ready) = &*gate;
+    let mut released = lock.lock().unwrap();
+    while !*released {
+        released = ready.wait(released).unwrap();
+    }
+
+    let mut second_store = shared_store(&engine, &runtime)?;
+    let second_pause = Func::wrap(&mut second_store, || {});
+    let second_instance = Instance::new(&mut second_store, &module, &[second_pause.into()])?;
+    let err = second_instance
+        .get_typed_func::<i32, ()>(&mut second_store, "publish")?
+        .call(&mut second_store, 22)
+        .unwrap_err();
+    let err = format!("{err:?}");
+    assert_transaction_conflict(&err);
+
+    *released = false;
+    ready.notify_one();
+    drop(released);
+    first.join().unwrap()?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.root_object_ids.len(), 1);
+    assert_eq!(recovered.object_winners.len(), 2);
+    assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11]);
+
+    wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        1,
+        Some(1),
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 0, &11u32.to_le_bytes())?;
+
+    Ok(())
+}
+
+#[test]
 fn shared_runtime_mixed_object_and_tmemory_commits_recover_together() -> Result<()> {
     let dir = tempdir()?;
     let tmemory_path = dir.path().join("multi-store-mixed.tmemory");
@@ -1155,6 +1402,58 @@ fn shared_store(
     Ok(store)
 }
 
+fn warm_shared_module(
+    engine: &Engine,
+    module: &Module,
+    runtime: &SharedTransactionRegionRuntimeForTest,
+    noop_imports: usize,
+) -> Result<()> {
+    let mut store = shared_store(engine, runtime)?;
+    let mut imports: Vec<wasmtime::Extern> = Vec::with_capacity(noop_imports);
+    for _ in 0..noop_imports {
+        imports.push(Func::wrap(&mut store, || {}).into());
+    }
+    Instance::new(&mut store, module, &imports)?;
+    Ok(())
+}
+
+fn call_shared_tfunc_i32(
+    engine: &Engine,
+    module: &Module,
+    runtime: &SharedTransactionRegionRuntimeForTest,
+    name: &str,
+    value: i32,
+) -> Result<()> {
+    let mut store = shared_store(engine, runtime)?;
+    let instance = Instance::new(&mut store, module, &[])?;
+    instance
+        .get_typed_func::<i32, ()>(&mut store, name)?
+        .call(&mut store, value)
+}
+
+fn assert_transaction_conflict(error: &str) {
+    assert!(
+        error.contains("transaction read conflict") || error.contains("transaction write conflict"),
+        "{error}"
+    );
+}
+
+fn threaded_tmemory_module(engine: &Engine) -> Result<Module> {
+    Module::new(
+        engine,
+        wat::parse_str(
+            r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write-left") (param $value i32)
+                (i32.tstore (i32.const 0) (local.get $value)))
+              (tfunc (export "write-right") (param $value i32)
+                (i32.tstore (i32.const 64) (local.get $value))))
+            "#,
+        )?,
+    )
+}
+
 fn two_root_object_graph_module(engine: &Engine) -> Result<Module> {
     Module::new(
         engine,
@@ -1178,6 +1477,23 @@ fn two_root_object_graph_module(engine: &Engine) -> Result<Module> {
     )
 }
 
+fn blocking_tmemory_module(engine: &Engine) -> Result<Module> {
+    Module::new(
+        engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "pause" (func $pause))
+              (tmemory 1)
+              (tfunc (export "write") (param $value i32)
+                (i32.tstore (i32.const 0) (local.get $value))
+                (drop (tmemory.size))
+                (call $pause)))
+            "#,
+        )?,
+    )
+}
+
 fn blocking_single_root_object_module(engine: &Engine) -> Result<Module> {
     Module::new(
         engine,
@@ -1189,6 +1505,29 @@ fn blocking_single_root_object_module(engine: &Engine) -> Result<Module> {
               (type $root (tstruct (field (mut (ref null $leaf)))))
               (tglobal $root (mut (ref null $root)) (ref.null $root))
               (tfunc (export "publish") (param $value i32)
+                (tglobal.set $root
+                  (tstruct.new $root
+                    (tstruct.new $leaf (local.get $value))))
+                (call $pause)))
+            "#,
+        )?,
+    )
+}
+
+fn blocking_mixed_tmemory_object_module(engine: &Engine) -> Result<Module> {
+    Module::new(
+        engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "pause" (func $pause))
+              (tmemory 1)
+              (type $leaf (tstruct (field (mut i32))))
+              (type $root (tstruct (field (mut (ref null $leaf)))))
+              (tglobal $root (mut (ref null $root)) (ref.null $root))
+              (tfunc (export "publish") (param $value i32)
+                (i32.tstore (i32.const 0) (local.get $value))
+                (drop (tmemory.size))
                 (tglobal.set $root
                   (tstruct.new $root
                     (tstruct.new $leaf (local.get $value))))
