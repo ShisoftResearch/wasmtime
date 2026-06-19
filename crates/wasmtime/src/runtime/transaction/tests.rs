@@ -12119,6 +12119,68 @@ fn shared_root_apply_failure_can_retry_with_original_reserved_version() {
 }
 
 #[test]
+fn shared_root_apply_ignores_stale_out_of_order_root_metadata() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let root_key = PersistentRootKey::Global {
+        instance: None,
+        global_index: 0,
+    };
+    let first_root = ObjectId { object_index: 93 };
+    let second_root = ObjectId { object_index: 94 };
+    let first_delta = state::PersistentRootDelta {
+        roots: BTreeMap::from([(root_key, object_set([first_root]))]),
+    };
+    let second_delta = state::PersistentRootDelta {
+        roots: BTreeMap::from([(root_key, object_set([second_root]))]),
+    };
+
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut first = TransactionState::new_for_test(TransactionId::from_raw(607));
+    first.shared_region_runtime = Some(runtime.clone());
+    let first_publications = first.persistent_root_publications(&first_delta).unwrap();
+    assert_eq!(first_publications[0].version, 1);
+
+    let mut second = TransactionState::new_for_test(TransactionId::from_raw(608));
+    second.shared_region_runtime = Some(runtime.clone());
+    let second_publications = second.persistent_root_publications(&second_delta).unwrap();
+    assert_eq!(second_publications[0].version, 2);
+
+    replace_current_thread_transaction(Some(TransactionId::from_raw(608)));
+    second.begin_terminal_commit().unwrap();
+    second
+        .commit_shared_persistent_root_delta_before_complete_commit(second_delta)
+        .unwrap();
+    assert_eq!(
+        runtime.persistent_root_ids_for_test().unwrap(),
+        object_set([second_root])
+    );
+    assert_eq!(
+        runtime.persistent_root_version_for_test(root_key).unwrap(),
+        Some(2)
+    );
+
+    replace_current_thread_transaction(Some(TransactionId::from_raw(607)));
+    first.begin_terminal_commit().unwrap();
+    first
+        .commit_shared_persistent_root_delta_before_complete_commit(first_delta)
+        .unwrap();
+    assert_eq!(
+        runtime.persistent_root_ids_for_test().unwrap(),
+        object_set([second_root])
+    );
+    assert_eq!(
+        runtime.persistent_root_version_for_test(root_key).unwrap(),
+        Some(2)
+    );
+
+    replace_current_thread_transaction(Some(TransactionId::from_raw(608)));
+    second.complete_commit().unwrap();
+    replace_current_thread_transaction(Some(TransactionId::from_raw(607)));
+    first.complete_commit().unwrap();
+}
+
+#[test]
 fn shared_region_runtime_root_ids_change_when_roots_are_removed() {
     let mut objects = ObjectTable::default();
     let root = objects

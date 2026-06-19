@@ -304,8 +304,11 @@ impl TransactionRegionRuntime {
                 .copied()
                 .context("shared persistent root publication version was not reserved")?;
             match runtime.persistent_root_versions.get(&key).copied() {
+                Some(current) if current > version => {
+                    continue;
+                }
                 Some(current) => ensure!(
-                    current >= version,
+                    current == version,
                     "shared persistent root publication version regressed"
                 ),
                 None => {
