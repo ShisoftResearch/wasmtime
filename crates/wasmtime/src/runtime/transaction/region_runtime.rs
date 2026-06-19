@@ -126,6 +126,7 @@ impl SharedFileBackedStorageConfig {
 pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) next_transaction_id: u64,
     pub(crate) next_log_segment_stream_id: u32,
+    pub(crate) next_object_index: u64,
     pub(crate) thread_log_segments: HashMap<ThreadId, DurableLogSegment>,
     pub(crate) free_log_segment_stream_ids: Vec<u32>,
     pub(crate) locks: LockBased,
@@ -150,6 +151,7 @@ impl Default for TransactionRegionRuntimeInner {
         Self {
             next_transaction_id: 10_001,
             next_log_segment_stream_id: FIRST_DURABLE_LOG_SEGMENT_STREAM_ID,
+            next_object_index: 0,
             thread_log_segments: HashMap::new(),
             free_log_segment_stream_ids: Vec::new(),
             locks: LockBased::default(),
@@ -194,6 +196,22 @@ impl TransactionRegionRuntime {
             .checked_add(1)
             .context("transaction id overflow")?;
         Ok(id)
+    }
+
+    pub(crate) fn allocate_persistent_object_id_at_least(
+        &self,
+        min_object_index: u64,
+    ) -> Result<ObjectId> {
+        let mut runtime = self.lock()?;
+        runtime.next_object_index = runtime.next_object_index.max(min_object_index);
+        let object_id = ObjectId {
+            object_index: runtime.next_object_index,
+        };
+        runtime.next_object_index = runtime
+            .next_object_index
+            .checked_add(1)
+            .context("persistent object id overflow")?;
+        Ok(object_id)
     }
 
     pub(crate) fn begin_user_transaction_region(&self) -> Result<UserTransactionRegionPermit> {
@@ -631,6 +649,21 @@ impl TransactionRegionRuntime {
         Ok(())
     }
 
+    pub(crate) fn observe_recovered_object_ids<I>(&self, object_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        let mut runtime = self.lock()?;
+        for object_id in object_ids {
+            let next = object_id
+                .object_index
+                .checked_add(1)
+                .context("persistent object id overflow")?;
+            runtime.next_object_index = runtime.next_object_index.max(next);
+        }
+        Ok(())
+    }
+
     fn check_terminal_owner_conflict(
         runtime: &TransactionRegionRuntimeInner,
         transaction: TransactionId,
@@ -657,7 +690,6 @@ impl TransactionRegionRuntime {
         Self::default()
     }
 
-    #[cfg(test)]
     pub(crate) fn create_file_backed_for_test(
         tmemory_path: &Path,
         tx_log_path: &Path,

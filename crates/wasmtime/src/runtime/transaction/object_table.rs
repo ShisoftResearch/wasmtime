@@ -25,7 +25,7 @@ use super::{
     ObjectValue, PersistentMarkSweepReport, PersistentObjectMarkReport, PersistentObjectMarker,
     PersistentObjectRefRaw, PersistentRecoveryGcReport, PersistentRootError,
     PersistentRootErrorKind, PersistentVolatileSweepReport, TransactionObjectRefRaw,
-    TxObjectHeader, object_gc, object_heap, persist,
+    TransactionRegionRuntime, TxObjectHeader, object_gc, object_heap, persist,
 };
 use wasmtime_environ::VMSharedTypeIndex;
 
@@ -70,6 +70,7 @@ pub(crate) struct ObjectTable {
     pub(crate) next_record_version: u32,
     pub(crate) live_count: usize,
     pub(crate) heap: object_heap::ObjectHeap,
+    shared_region_runtime: Option<TransactionRegionRuntime>,
 }
 
 impl Default for ObjectTable {
@@ -89,6 +90,7 @@ impl Default for ObjectTable {
             next_record_version: 0,
             live_count: 0,
             heap: object_heap::ObjectHeap::default(),
+            shared_region_runtime: None,
         };
         for layout in builtin_type_layouts() {
             table
@@ -734,14 +736,30 @@ impl ObjectTable {
         let reused_slot = self.free_list.last().copied();
         let object_id = match reused_slot {
             Some(object_id) => object_id,
-            None => ObjectId {
-                object_index: u64::try_from(self.slots.len())
-                    .context("object table slot count does not fit u64")?,
-            },
+            None => {
+                if persistent {
+                    if let Some(runtime) = &self.shared_region_runtime {
+                        runtime.allocate_persistent_object_id_at_least(
+                            u64::try_from(self.slots.len())
+                                .context("object table slot count does not fit u64")?,
+                        )?
+                    } else {
+                        ObjectId {
+                            object_index: u64::try_from(self.slots.len())
+                                .context("object table slot count does not fit u64")?,
+                        }
+                    }
+                } else {
+                    ObjectId {
+                        object_index: u64::try_from(self.slots.len())
+                            .context("object table slot count does not fit u64")?,
+                    }
+                }
+            }
         };
         let index = object_slot_index(object_id)?;
-        if index == self.slots.len() {
-            self.slots.push(None);
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
         }
         ensure!(
             index < self.slots.len(),
@@ -828,6 +846,10 @@ impl ObjectTable {
 
     pub(crate) fn live_count(&self) -> usize {
         self.live_count
+    }
+
+    pub(crate) fn set_shared_region_runtime(&mut self, runtime: Option<TransactionRegionRuntime>) {
+        self.shared_region_runtime = runtime;
     }
 
     #[cfg(test)]

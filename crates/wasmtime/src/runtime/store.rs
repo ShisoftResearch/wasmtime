@@ -939,27 +939,36 @@ impl<T> Store<T> {
             .transaction_recover_file_backed_tmemory_for_test(min_pages, max_pages)
     }
 
+    #[cfg(feature = "transaction")]
+    pub(crate) fn adopt_shared_runtime_for_test(
+        &mut self,
+        runtime: TransactionRegionRuntime,
+    ) -> Result<()> {
+        runtime.with_shared_file_backed_tmemory_commit_read_lock(|| {
+            if let Some(shared) = runtime.shared_file_backed_storage_for_store_adoption()? {
+                self.inner.transaction_config = shared.transaction_config()?;
+                self.inner
+                    .transaction_state
+                    .open_shared_file_backed_durable_log(&shared)?;
+                self.inner
+                    .transaction_state
+                    .set_shared_region_runtime(Some(runtime.clone()));
+                self.inner
+                    .transaction_object_table
+                    .set_shared_region_runtime(Some(runtime.clone()));
+            }
+            Ok(())
+        })?;
+        *self.inner.transaction_region_runtime_mut() = runtime;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn set_transaction_region_runtime_for_test(
         &mut self,
         runtime: TransactionRegionRuntime,
     ) {
-        runtime
-            .with_shared_file_backed_tmemory_commit_read_lock(|| {
-                if let Some(shared) = runtime.shared_file_backed_storage_for_store_adoption()? {
-                    self.inner.transaction_config = shared.transaction_config().unwrap();
-                    self.inner
-                        .transaction_state
-                        .open_shared_file_backed_durable_log(&shared)
-                        .unwrap();
-                    self.inner
-                        .transaction_state
-                        .set_shared_region_runtime(Some(runtime.clone()));
-                }
-                Ok(())
-            })
-            .unwrap();
-        *self.inner.transaction_region_runtime_mut() = runtime;
+        self.adopt_shared_runtime_for_test(runtime).unwrap();
     }
 
     #[cfg(test)]
@@ -1818,6 +1827,8 @@ impl StoreOpaque {
             .create_shared_file_backed_durable_log(&shared)?;
         self.transaction_state
             .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
+        self.transaction_object_table
+            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
         self.transaction_config = config;
         Ok(())
     }
@@ -1841,17 +1852,6 @@ impl StoreOpaque {
             &object_winners,
             &recovered.root_object_ids,
         )?;
-        let recovered_roots = recovered
-            .root_object_ids
-            .iter()
-            .copied()
-            .map(|object_index| ObjectId { object_index });
-        let recovered_versions = recovered
-            .winners
-            .iter()
-            .map(|winner| (winner.logical_id, winner.version));
-        self.transaction_state
-            .install_recovered_persistent_root_state(recovered_roots, recovered_versions)?;
         let tx_log_blocks = u32::try_from(
             std::fs::metadata(&tx_log_path)
                 .with_context(|| {
@@ -1875,6 +1875,23 @@ impl StoreOpaque {
             .open_shared_file_backed_durable_log(&shared)?;
         self.transaction_state
             .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
+        recovered_object_table
+            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
+        self.transaction_region_runtime
+            .observe_recovered_object_ids(object_winners.iter().map(|winner| ObjectId {
+                object_index: winner.object_id,
+            }))?;
+        let recovered_roots = recovered
+            .root_object_ids
+            .iter()
+            .copied()
+            .map(|object_index| ObjectId { object_index });
+        let recovered_versions = recovered
+            .winners
+            .iter()
+            .map(|winner| (winner.logical_id, winner.version));
+        self.transaction_state
+            .install_recovered_persistent_root_state(recovered_roots, recovered_versions)?;
         self.transaction_object_table = recovered_object_table;
         self.transaction_config = config;
         Ok(())

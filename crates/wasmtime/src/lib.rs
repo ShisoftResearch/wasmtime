@@ -569,6 +569,32 @@ pub mod _internal {
             retire_completed_linear_undo_chunks_for_test,
         };
 
+        #[derive(Clone, Debug)]
+        pub struct SharedTransactionRegionRuntimeForTest(
+            crate::runtime::transaction::TransactionRegionRuntime,
+        );
+
+        pub fn create_shared_file_backed_runtime_for_test(
+            tmemory_path: std::path::PathBuf,
+            tx_log_path: std::path::PathBuf,
+            tx_log_blocks: u32,
+        ) -> crate::Result<SharedTransactionRegionRuntimeForTest> {
+            Ok(SharedTransactionRegionRuntimeForTest(
+                crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+                    &tmemory_path,
+                    &tx_log_path,
+                    tx_log_blocks,
+                )?,
+            ))
+        }
+
+        pub fn adopt_shared_runtime_for_test<T>(
+            store: &mut crate::Store<T>,
+            runtime: &SharedTransactionRegionRuntimeForTest,
+        ) -> crate::Result<()> {
+            store.adopt_shared_runtime_for_test(runtime.0.clone())
+        }
+
         pub fn create_file_backed_storage_for_test<T>(
             store: &mut crate::Store<T>,
             tmemory_path: std::path::PathBuf,
