@@ -11845,6 +11845,200 @@ fn persistent_root_index_tracks_committed_global_root() {
 }
 
 #[test]
+fn committed_persistent_root_is_visible_to_another_store_using_same_region_runtime() {
+    let mut objects = ObjectTable::default();
+    let root = objects
+        .allocate_persistent_struct_for_gc_ref(0x597, vec![ObjectValue::I32(16)])
+        .unwrap();
+
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut publisher = TransactionState::new_for_test(TransactionId::from_raw(597));
+    publisher.shared_region_runtime = Some(runtime.clone());
+    publisher
+        .stage_global(0, GlobalSnapshot::GcRef(0x597))
+        .unwrap();
+    let delta = publisher
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    publisher.complete_commit().unwrap();
+    publisher
+        .apply_committed_persistent_root_delta_for_test(delta)
+        .unwrap();
+
+    let observer = TransactionState {
+        shared_region_runtime: Some(runtime.clone()),
+        ..TransactionState::default()
+    };
+    assert_eq!(observer.persistent_root_ids_for_test(), object_set([root]));
+    assert_eq!(
+        runtime.persistent_root_ids_for_test().unwrap(),
+        object_set([root])
+    );
+}
+
+#[test]
+fn persistent_root_publication_versions_are_shared_across_states_using_same_region_runtime() {
+    let mut objects = ObjectTable::default();
+    objects
+        .allocate_persistent_struct_for_gc_ref(0x598, vec![ObjectValue::I32(17)])
+        .unwrap();
+    objects
+        .allocate_persistent_struct_for_gc_ref(0x599, vec![ObjectValue::I32(18)])
+        .unwrap();
+
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let root_key = PersistentRootKey::Global {
+        instance: None,
+        global_index: 0,
+    };
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut first = TransactionState::new_for_test(TransactionId::from_raw(598));
+    first.shared_region_runtime = Some(runtime.clone());
+    first.stage_global(0, GlobalSnapshot::GcRef(0x598)).unwrap();
+    let first_delta = first
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    let first_publications = first.persistent_root_publications(&first_delta).unwrap();
+    assert_eq!(first_publications[0].version, 1);
+    first.complete_commit().unwrap();
+    first
+        .apply_committed_persistent_root_delta_for_test(first_delta)
+        .unwrap();
+
+    let mut second = TransactionState::new_for_test(TransactionId::from_raw(599));
+    second.shared_region_runtime = Some(runtime.clone());
+    second
+        .stage_global(0, GlobalSnapshot::GcRef(0x599))
+        .unwrap();
+    let second_delta = second
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    let second_publications = second.persistent_root_publications(&second_delta).unwrap();
+    assert_eq!(second_publications[0].version, 2);
+    assert_eq!(
+        runtime.persistent_root_version_for_test(root_key).unwrap(),
+        Some(1)
+    );
+}
+
+#[test]
+fn shared_region_runtime_root_ids_change_when_roots_are_removed() {
+    let mut objects = ObjectTable::default();
+    let root = objects
+        .allocate_persistent_struct_for_gc_ref(0x59a, vec![ObjectValue::I32(19)])
+        .unwrap();
+
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut installer = TransactionState::new_for_test(TransactionId::from_raw(600));
+    installer.shared_region_runtime = Some(runtime.clone());
+    installer
+        .stage_global(0, GlobalSnapshot::GcRef(0x59a))
+        .unwrap();
+    let install_delta = installer
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    installer.complete_commit().unwrap();
+    installer
+        .apply_committed_persistent_root_delta_for_test(install_delta)
+        .unwrap();
+    assert_eq!(
+        runtime.persistent_root_ids_for_test().unwrap(),
+        object_set([root])
+    );
+
+    let mut remover = TransactionState::new_for_test(TransactionId::from_raw(601));
+    remover.shared_region_runtime = Some(runtime.clone());
+    remover.stage_global(0, GlobalSnapshot::I32(0)).unwrap();
+    let removal_delta = remover
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    remover.complete_commit().unwrap();
+    remover
+        .apply_committed_persistent_root_delta_for_test(removal_delta)
+        .unwrap();
+
+    let observer = TransactionState {
+        shared_region_runtime: Some(runtime.clone()),
+        ..TransactionState::default()
+    };
+    assert_eq!(observer.persistent_root_ids_for_test(), object_set([]));
+    assert_eq!(
+        runtime.persistent_root_ids_for_test().unwrap(),
+        object_set([])
+    );
+}
+
+#[test]
+fn shared_region_runtime_keeps_live_bridge_maps_store_local() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut first_state = TransactionState::default();
+    first_state.shared_region_runtime = Some(runtime.clone());
+    let mut second_state = TransactionState::default();
+    second_state.shared_region_runtime = Some(runtime);
+
+    let mut first_objects = ObjectTable::default();
+    let second_objects = ObjectTable::default();
+    let object = ObjectId { object_index: 88 };
+
+    first_objects
+        .live_bridge_gc_refs_to_objects
+        .insert(0x88, object);
+    first_objects
+        .object_to_live_bridge_gc_ref
+        .insert(object, 0x88);
+    first_objects
+        .transaction_ref_handles_to_objects
+        .insert(0x180, object);
+    first_objects
+        .objects_to_transaction_ref_handles
+        .insert(object, 0x180);
+
+    assert_eq!(
+        first_objects.live_bridge_gc_refs_to_objects.get(&0x88),
+        Some(&object)
+    );
+    assert_eq!(
+        second_objects.live_bridge_gc_refs_to_objects.get(&0x88),
+        None
+    );
+    assert_eq!(
+        first_objects.object_to_live_bridge_gc_ref.get(&object),
+        Some(&0x88)
+    );
+    assert_eq!(
+        second_objects.object_to_live_bridge_gc_ref.get(&object),
+        None
+    );
+    assert_eq!(
+        first_objects.transaction_ref_handles_to_objects.get(&0x180),
+        Some(&object)
+    );
+    assert_eq!(
+        second_objects
+            .transaction_ref_handles_to_objects
+            .get(&0x180),
+        None
+    );
+    assert_eq!(
+        first_objects
+            .objects_to_transaction_ref_handles
+            .get(&object),
+        Some(&0x180)
+    );
+    assert_eq!(
+        second_objects
+            .objects_to_transaction_ref_handles
+            .get(&object),
+        None
+    );
+}
+
+#[test]
 fn persistent_root_index_removes_global_root_on_non_ref_commit() {
     let mut objects = ObjectTable::default();
     let root = objects

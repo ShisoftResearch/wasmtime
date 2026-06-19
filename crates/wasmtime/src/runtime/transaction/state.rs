@@ -1938,13 +1938,16 @@ impl TransactionState {
         self.ensure_active()?;
         let mut publications = Vec::new();
         for (&key, roots) in &delta.roots {
-            let version = self
-                .persistent_root_versions
-                .get(&key)
-                .copied()
-                .unwrap_or(0)
-                .checked_add(1)
-                .context("persistent root publication version overflow")?;
+            let version = if let Some(runtime) = &self.shared_region_runtime {
+                runtime.next_persistent_root_version(key)?
+            } else {
+                self.persistent_root_versions
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .context("persistent root publication version overflow")?
+            };
             match key {
                 PersistentRootKey::Global {
                     instance,
@@ -2039,7 +2042,7 @@ impl TransactionState {
             self.persistent_gc_state = None;
         }
         let committed_roots = if self.persistent_gc_state.is_none() {
-            Some(self.persistent_root_ids())
+            Some(self.persistent_root_ids()?)
         } else {
             None
         };
@@ -2086,6 +2089,10 @@ impl TransactionState {
             return Ok(());
         }
 
+        if let Some(runtime) = &self.shared_region_runtime {
+            return runtime.apply_committed_persistent_root_delta(delta);
+        }
+
         let next_versions = delta
             .roots
             .keys()
@@ -2115,11 +2122,15 @@ impl TransactionState {
         Ok(())
     }
 
-    pub(crate) fn persistent_root_ids(&self) -> BTreeSet<ObjectId> {
-        self.persistent_roots
+    pub(crate) fn persistent_root_ids(&self) -> Result<BTreeSet<ObjectId>> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            return runtime.persistent_root_ids();
+        }
+        Ok(self
+            .persistent_roots
             .values()
             .flat_map(|roots| roots.iter().copied())
-            .collect()
+            .collect())
     }
 
     pub(crate) fn persistent_mark_sweep_collect(
@@ -2132,7 +2143,7 @@ impl TransactionState {
                 && current_thread_transaction().is_none(),
             "persistent object marker cannot run while a transaction is active or suspended"
         );
-        let roots = self.persistent_root_ids();
+        let roots = self.persistent_root_ids()?;
         let report = objects.persistent_mark_sweep_from_roots(roots)?;
         self.persistent_gc_state = None;
         Ok(report)
@@ -2150,7 +2161,7 @@ impl TransactionState {
             "persistent object marker cannot run while a transaction is active or suspended"
         );
         let roots = if self.persistent_gc_state.is_none() {
-            Some(self.persistent_root_ids())
+            Some(self.persistent_root_ids()?)
         } else {
             None
         };
@@ -2326,6 +2337,11 @@ impl TransactionState {
             self.active.is_none() && current_thread_transaction().is_none(),
             "recovered persistent roots can only be installed outside an active transaction"
         );
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.install_recovered_persistent_roots(roots)?;
+            self.persistent_gc_state = None;
+            return Ok(());
+        }
         let roots = roots.into_iter().collect::<BTreeSet<_>>();
         if roots.is_empty() {
             self.persistent_roots.remove(&PersistentRootKey::Recovered);
@@ -2346,6 +2362,15 @@ impl TransactionState {
         I: IntoIterator<Item = ObjectId>,
         J: IntoIterator<Item = (u64, u32)>,
     {
+        ensure!(
+            self.active.is_none() && current_thread_transaction().is_none(),
+            "recovered persistent roots can only be installed outside an active transaction"
+        );
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.install_recovered_persistent_root_state(roots, versions)?;
+            self.persistent_gc_state = None;
+            return Ok(());
+        }
         self.install_recovered_persistent_roots(roots)?;
         for (logical_id, version) in versions {
             let Some(key) = persistent_root_key_from_logical_id(logical_id)? else {
@@ -2977,7 +3002,7 @@ impl TransactionState {
     }
 
     pub(super) fn persistent_root_ids_for_test(&self) -> BTreeSet<ObjectId> {
-        self.persistent_root_ids()
+        self.persistent_root_ids().unwrap()
     }
 
     pub(super) fn persistent_mark_sweep_collect_for_test(

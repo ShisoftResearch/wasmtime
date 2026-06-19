@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
 use super::concurrency::LockBasedConflictKind;
+use super::state::PersistentRootDelta;
 use super::{
-    GranuleId, LockBased, TransactionId, TxDurableLog, granule_uses_transaction_state_version,
+    GranuleId, LockBased, ObjectId, PersistentRootKey, TransactionId, TxDurableLog,
+    granule_uses_transaction_state_version, persistent_root_key_from_logical_id,
 };
 
 const FIRST_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x2000_0000;
@@ -36,6 +38,9 @@ pub(crate) struct TransactionRegionRuntimeInner {
     pub(crate) conflict_aborted_transactions: BTreeSet<TransactionId>,
     pub(crate) terminal_commits: BTreeSet<TransactionId>,
     pub(crate) granule_versions: BTreeMap<GranuleId, u64>,
+    persistent_roots: BTreeMap<PersistentRootKey, BTreeSet<ObjectId>>,
+    persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
+    object_versions: BTreeMap<ObjectId, u32>,
     pub(crate) durable_log: TxDurableLog,
     #[cfg(test)]
     pub(crate) fail_release_transaction_once_for_test: bool,
@@ -52,6 +57,9 @@ impl Default for TransactionRegionRuntimeInner {
             conflict_aborted_transactions: BTreeSet::new(),
             terminal_commits: BTreeSet::new(),
             granule_versions: BTreeMap::new(),
+            persistent_roots: BTreeMap::new(),
+            persistent_root_versions: BTreeMap::new(),
+            object_versions: BTreeMap::new(),
             durable_log: TxDurableLog::default(),
             #[cfg(test)]
             fail_release_transaction_once_for_test: false,
@@ -253,6 +261,129 @@ impl TransactionRegionRuntime {
         Ok(())
     }
 
+    pub(super) fn next_persistent_root_version(&self, key: PersistentRootKey) -> Result<u32> {
+        self.lock()?
+            .persistent_root_versions
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("persistent root publication version overflow")
+    }
+
+    pub(super) fn apply_committed_persistent_root_delta(
+        &self,
+        delta: PersistentRootDelta,
+    ) -> Result<()> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+
+        let mut runtime = self.lock()?;
+        let next_versions = delta
+            .roots
+            .keys()
+            .copied()
+            .map(|key| {
+                let next_version = runtime
+                    .persistent_root_versions
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .context("persistent root version overflow")?;
+                Ok((key, next_version))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (key, roots) in delta.roots {
+            if roots.is_empty() {
+                runtime.persistent_roots.remove(&key);
+            } else {
+                runtime.persistent_roots.insert(key, roots);
+            }
+        }
+        for (key, version) in next_versions {
+            runtime.persistent_root_versions.insert(key, version);
+        }
+        Ok(())
+    }
+
+    pub(super) fn persistent_root_ids(&self) -> Result<BTreeSet<ObjectId>> {
+        Ok(self
+            .lock()?
+            .persistent_roots
+            .values()
+            .flat_map(|roots| roots.iter().copied())
+            .collect())
+    }
+
+    pub(super) fn persistent_root_set(
+        &self,
+        key: PersistentRootKey,
+    ) -> Result<Option<BTreeSet<ObjectId>>> {
+        Ok(self.lock()?.persistent_roots.get(&key).cloned())
+    }
+
+    pub(super) fn persistent_root_version(&self, key: PersistentRootKey) -> Result<Option<u32>> {
+        Ok(self.lock()?.persistent_root_versions.get(&key).copied())
+    }
+
+    pub(super) fn persistent_object_version(&self, object: ObjectId) -> Result<Option<u32>> {
+        Ok(self.lock()?.object_versions.get(&object).copied())
+    }
+
+    pub(super) fn install_recovered_persistent_roots<I>(&self, roots: I) -> Result<()>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        let roots = roots.into_iter().collect::<BTreeSet<_>>();
+        let mut runtime = self.lock()?;
+        if roots.is_empty() {
+            runtime
+                .persistent_roots
+                .remove(&PersistentRootKey::Recovered);
+        } else {
+            runtime
+                .persistent_roots
+                .insert(PersistentRootKey::Recovered, roots);
+        }
+        Ok(())
+    }
+
+    pub(super) fn install_recovered_persistent_root_state<I, J>(
+        &self,
+        roots: I,
+        versions: J,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = ObjectId>,
+        J: IntoIterator<Item = (u64, u32)>,
+    {
+        let roots = roots.into_iter().collect::<BTreeSet<_>>();
+        let mut runtime = self.lock()?;
+        if roots.is_empty() {
+            runtime
+                .persistent_roots
+                .remove(&PersistentRootKey::Recovered);
+        } else {
+            runtime
+                .persistent_roots
+                .insert(PersistentRootKey::Recovered, roots);
+        }
+        for (logical_id, version) in versions {
+            let Some(key) = persistent_root_key_from_logical_id(logical_id)? else {
+                continue;
+            };
+            runtime
+                .persistent_root_versions
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(version))
+                .or_insert(version);
+        }
+        Ok(())
+    }
+
     fn check_terminal_owner_conflict(
         runtime: &TransactionRegionRuntimeInner,
         transaction: TransactionId,
@@ -358,6 +489,35 @@ impl TransactionRegionRuntime {
     #[cfg(test)]
     pub(crate) fn free_log_segment_count_for_test(&self) -> Result<usize> {
         Ok(self.lock()?.free_log_segment_stream_ids.len())
+    }
+
+    #[cfg(test)]
+    pub(super) fn persistent_root_ids_for_test(&self) -> Result<BTreeSet<ObjectId>> {
+        self.persistent_root_ids()
+    }
+
+    #[cfg(test)]
+    pub(super) fn persistent_root_set_for_test(
+        &self,
+        key: PersistentRootKey,
+    ) -> Result<Option<BTreeSet<ObjectId>>> {
+        self.persistent_root_set(key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn persistent_root_version_for_test(
+        &self,
+        key: PersistentRootKey,
+    ) -> Result<Option<u32>> {
+        self.persistent_root_version(key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn persistent_object_version_for_test(
+        &self,
+        object: ObjectId,
+    ) -> Result<Option<u32>> {
+        self.persistent_object_version(object)
     }
 
     #[cfg(test)]
