@@ -25,6 +25,10 @@ use std::path::PathBuf;
             feature = "transaction-cc-optimistic-validation"
         ),
         all(
+            feature = "transaction-cc-lockbased",
+            feature = "transaction-cc-timestamp-ordering"
+        ),
+        all(
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-wound-wait"
         ),
@@ -41,6 +45,10 @@ use std::path::PathBuf;
             feature = "transaction-cc-optimistic-validation"
         ),
         all(
+            feature = "transaction-cc-nowait-abort",
+            feature = "transaction-cc-timestamp-ordering"
+        ),
+        all(
             feature = "transaction-cc-wound-wait",
             feature = "transaction-cc-wait-die"
         ),
@@ -53,6 +61,10 @@ use std::path::PathBuf;
             feature = "transaction-cc-optimistic-validation"
         ),
         all(
+            feature = "transaction-cc-wound-wait",
+            feature = "transaction-cc-timestamp-ordering"
+        ),
+        all(
             feature = "transaction-cc-wait-die",
             feature = "transaction-cc-strict-2pl"
         ),
@@ -61,8 +73,20 @@ use std::path::PathBuf;
             feature = "transaction-cc-optimistic-validation"
         ),
         all(
+            feature = "transaction-cc-wait-die",
+            feature = "transaction-cc-timestamp-ordering"
+        ),
+        all(
             feature = "transaction-cc-strict-2pl",
             feature = "transaction-cc-optimistic-validation"
+        ),
+        all(
+            feature = "transaction-cc-strict-2pl",
+            feature = "transaction-cc-timestamp-ordering"
+        ),
+        all(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
         )
     )
 ))]
@@ -71,7 +95,8 @@ compile_error!(
      transaction-cc-lockbased, transaction-cc-nowait-abort, \
      transaction-cc-wound-wait, transaction-cc-wait-die, \
      transaction-cc-strict-2pl, or \
-     transaction-cc-optimistic-validation"
+     transaction-cc-optimistic-validation, or \
+     transaction-cc-timestamp-ordering"
 );
 
 #[cfg(all(
@@ -82,7 +107,8 @@ compile_error!(
         feature = "transaction-cc-wound-wait",
         feature = "transaction-cc-wait-die",
         feature = "transaction-cc-strict-2pl",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))
 ))]
 compile_error!(
@@ -90,7 +116,8 @@ compile_error!(
      transaction-cc-lockbased, transaction-cc-nowait-abort, \
      transaction-cc-wound-wait, transaction-cc-wait-die, \
      transaction-cc-strict-2pl, or \
-     transaction-cc-optimistic-validation"
+     transaction-cc-optimistic-validation, or \
+     transaction-cc-timestamp-ordering"
 );
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
@@ -143,10 +170,16 @@ pub(crate) enum ConcurrencyControl {
     WoundWait,
     WaitDie,
     OptimisticValidation,
+    TimestampOrdering,
 }
 
 impl ConcurrencyControl {
     pub(crate) const fn default_for_build() -> Self {
+        #[cfg(feature = "transaction-cc-timestamp-ordering")]
+        {
+            return Self::TimestampOrdering;
+        }
+
         #[cfg(feature = "transaction-cc-optimistic-validation")]
         {
             return Self::OptimisticValidation;
@@ -183,7 +216,8 @@ impl ConcurrencyControl {
             feature = "transaction-cc-strict-2pl",
             feature = "transaction-cc-nowait-abort",
             feature = "transaction-cc-lockbased",
-            feature = "transaction-cc-optimistic-validation"
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
         )))]
         {
             return Self::LockBased;

@@ -18,6 +18,19 @@ fn with_transaction_object_metadata(wasm: &[u8], payload: &[u8]) -> Vec<u8> {
     wasm
 }
 
+fn transaction_cc_is_ownerless_multiwriter() -> bool {
+    cfg!(feature = "transaction-cc-optimistic-validation")
+        || cfg!(feature = "transaction-cc-timestamp-ordering")
+}
+
+fn transaction_cc_read_version_conflict_message() -> &'static str {
+    if cfg!(feature = "transaction-cc-timestamp-ordering") {
+        "timestamp ordering read version changed"
+    } else {
+        "optimistic read version changed"
+    }
+}
+
 fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
     crate::Module::new(engine, wat::parse_str(wat).unwrap()).unwrap()
 }
@@ -1076,7 +1089,7 @@ fn shared_region_runtime_detects_cross_thread_write_conflict() {
         let result =
             second_runtime.acquire_granule_write_for_test(TransactionId::from_raw(2), granule, 0);
         attempted_tx.send(()).unwrap();
-        if cfg!(feature = "transaction-cc-optimistic-validation") {
+        if transaction_cc_is_ownerless_multiwriter() {
             result.is_ok()
         } else {
             result.is_err()
@@ -1118,7 +1131,7 @@ fn shared_transaction_states_detect_cross_thread_write_conflict() {
         state.begin_with_region_runtime(&second_runtime).unwrap();
         let result = state.acquire_granule_write(granule, 0);
         attempted_tx.send(()).unwrap();
-        if cfg!(feature = "transaction-cc-optimistic-validation") {
+        if transaction_cc_is_ownerless_multiwriter() {
             if result.is_ok() {
                 state.abort().unwrap();
                 return true;
@@ -1541,7 +1554,7 @@ fn shared_region_runtime_terminal_owner_cannot_be_preempted() {
         .unwrap();
     runtime.begin_terminal_commit_for_test(owner).unwrap();
 
-    if cfg!(feature = "transaction-cc-optimistic-validation") {
+    if transaction_cc_is_ownerless_multiwriter() {
         let action = runtime
             .acquire_granule_write_for_test(older, granule, 0)
             .unwrap();
@@ -3217,7 +3230,7 @@ fn commit_validates_writes_before_apply_callback() {
     state.stage_global(3, GlobalSnapshot::I32(7)).unwrap();
     assert_eq!(state.active_write_granules().unwrap(), vec![granule]);
     let removed_owner = state.concurrency.remove_owner_for_granule_for_test(granule);
-    let current_version = if cfg!(feature = "transaction-cc-optimistic-validation") {
+    let current_version = if transaction_cc_is_ownerless_multiwriter() {
         assert_eq!(removed_owner, None);
         1
     } else {
@@ -3656,7 +3669,7 @@ fn higher_transaction_id_cannot_write_lower_owned_object() {
     state.enter_transaction(higher).unwrap();
     assert!(state.transaction_is_open(lower));
     assert!(state.transaction_is_open(higher));
-    if cfg!(feature = "transaction-cc-optimistic-validation") {
+    if transaction_cc_is_ownerless_multiwriter() {
         state.acquire_object_write(&mut objects, object).unwrap();
         assert!(state.owns_object_write(object));
     } else {
@@ -3754,7 +3767,7 @@ fn aborting_suspended_transaction_releases_only_its_locks() {
         .acquire_memory_granule_write(0, 1, vec![0xbb; TMEMORY_GRANULE_SIZE])
         .unwrap();
 
-    if cfg!(feature = "transaction-cc-optimistic-validation") {
+    if transaction_cc_is_ownerless_multiwriter() {
         state.acquire_memory_granule_read(0, 0).unwrap();
     } else {
         let conflict = state.acquire_memory_granule_read(0, 0).unwrap_err();
@@ -9640,12 +9653,15 @@ mod model_permissions {
                 state.read_granules.contains(&granule),
                 "permission downgrade should preserve read permission for {granule:?}"
             );
-            if cfg!(feature = "transaction-cc-optimistic-validation") {
+            if transaction_cc_is_ownerless_multiwriter() {
                 match &mut state.concurrency {
                     ConcurrencyControlState::OptimisticValidation(policy) => {
                         policy.write_versions.remove(&(transaction, granule));
                     }
-                    _ => unreachable!("optimistic-validation feature should select that policy"),
+                    ConcurrencyControlState::TimestampOrdering(policy) => {
+                        policy.write_versions.remove(&(transaction, granule));
+                    }
+                    _ => unreachable!("ownerless transaction-cc feature should select that policy"),
                 }
             } else {
                 ensure!(
@@ -10485,7 +10501,7 @@ fn object_payload_commit_validates_object_read_versions() {
     assert!(
         error
             .to_string()
-            .contains("optimistic read version changed")
+            .contains(transaction_cc_read_version_conflict_message())
     );
 }
 
@@ -10508,7 +10524,7 @@ fn transaction_object_read_validation_uses_object_table_versions() {
     assert!(
         error
             .to_string()
-            .contains("optimistic read version changed")
+            .contains(transaction_cc_read_version_conflict_message())
     );
 }
 
@@ -12178,7 +12194,7 @@ mod persistent_promotion_commit {
         assert!(
             error
                 .to_string()
-                .contains("optimistic read version changed")
+                .contains(transaction_cc_read_version_conflict_message())
         );
     }
 }
@@ -16002,6 +16018,64 @@ fn optimistic_validation_rejects_changed_write_version() {
 }
 
 #[test]
+fn timestamp_ordering_rejects_write_older_than_read_timestamp() {
+    let mut policy = TimestampOrdering::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.record_read_for_test(younger, granule, 5).unwrap();
+
+    let error = policy
+        .acquire_write_result_for_test(older, granule, 5)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        TimestampOrderingConflictKindForTest::WriteReadTimestampTooNew
+    );
+}
+
+#[test]
+fn timestamp_ordering_committed_write_advances_write_timestamp() {
+    let mut policy = TimestampOrdering::default();
+    let transaction = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy
+        .acquire_write_for_test(transaction, granule, 5)
+        .unwrap();
+    policy.commit_transaction_result(transaction).unwrap();
+
+    assert_eq!(policy.write_timestamp_for_test(granule), Some(transaction));
+}
+
+#[test]
+fn timestamp_ordering_aborted_write_does_not_advance_write_timestamp() {
+    let mut policy = TimestampOrdering::default();
+    let transaction = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy
+        .acquire_write_for_test(transaction, granule, 5)
+        .unwrap();
+    policy.release_transaction(transaction);
+
+    assert_eq!(policy.write_timestamp_for_test(granule), None);
+}
+
+#[test]
 fn transaction_timestamp_helpers_use_transaction_id_order() {
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
@@ -16146,6 +16220,7 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
     assert_contract(&mut WaitDie::default(), true);
     assert_contract(&mut WoundWait::default(), true);
     assert_contract(&mut OptimisticValidation::default(), false);
+    assert_contract(&mut TimestampOrdering::default(), false);
 }
 
 #[test]
@@ -16249,6 +16324,24 @@ fn selected_concurrency_control_uses_optimistic_validation_semantics() {
     assert_eq!(policy.owner_for_granule(granule), None);
     policy.validate_write(first, granule, 5).unwrap();
     policy.validate_write(second, granule, 5).unwrap();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-timestamp-ordering")]
+fn selected_concurrency_control_uses_timestamp_ordering_semantics() {
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::TimestampOrdering);
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 7,
+    };
+
+    policy.acquire_granule_read(younger, granule, 5).unwrap();
+    let err = policy.acquire_granule_write(older, granule, 5).unwrap_err();
+
+    assert!(err.to_string().contains("timestamp"), "{err:?}");
 }
 
 #[test]

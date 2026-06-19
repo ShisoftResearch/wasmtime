@@ -30,8 +30,9 @@ use concurrency::ConcurrencyControlState;
 use concurrency::{
     LockBased, LockBasedConflictKindForTest, LockBasedSnapshotForTest, NoWaitAbort,
     NoWaitAbortConflictKindForTest, OptimisticValidation, OptimisticValidationConflictKindForTest,
-    StrictTwoPhaseLocking, StrictTwoPhaseLockingConflictKindForTest, TransactionConcurrencyControl,
-    WaitDie, WaitDieConflictKindForTest, WoundWait, WoundWaitConflictKindForTest,
+    StrictTwoPhaseLocking, StrictTwoPhaseLockingConflictKindForTest, TimestampOrdering,
+    TimestampOrderingConflictKindForTest, TransactionConcurrencyControl, WaitDie,
+    WaitDieConflictKindForTest, WoundWait, WoundWaitConflictKindForTest,
 };
 use config::ConcurrencyControl;
 #[cfg(test)]
