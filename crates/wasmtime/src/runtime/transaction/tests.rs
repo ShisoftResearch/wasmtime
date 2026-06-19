@@ -1127,25 +1127,277 @@ fn shared_transaction_states_detect_cross_thread_write_conflict() {
 }
 
 #[test]
-fn versioned_granule_version_ignores_poisoned_shared_runtime() {
+fn shared_region_runtime_disjoint_lock_acquisition_can_overlap_before_terminal_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
+    clear_current_thread_transaction_for_test();
+
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
-    let poisoned_runtime = runtime.clone();
-    let _ = thread::spawn(move || {
-        let _guard = poisoned_runtime.lock().unwrap();
-        panic!("poison shared runtime");
-    })
-    .join();
+    let metadata_held = Arc::new(Barrier::new(2));
+    let disjoint_attempted = Arc::new(Barrier::new(2));
+    let progress = Arc::new(AtomicUsize::new(0));
+
+    let first_runtime = runtime.clone();
+    let first_metadata_held = metadata_held.clone();
+    let first_disjoint_attempted = disjoint_attempted.clone();
+    let first_progress = progress.clone();
+    let first = thread::spawn(move || {
+        clear_current_thread_transaction_for_test();
+
+        let mut state = TransactionState::default();
+        state.begin_with_region_runtime(&first_runtime).unwrap();
+        state
+            .acquire_granule_write(global_granule_id(None, 0), 0)
+            .unwrap();
+        first_progress.store(1, Ordering::SeqCst);
+
+        first_runtime
+            .with_root_object_metadata_lock_for_test(|| {
+                first_progress.store(2, Ordering::SeqCst);
+                first_metadata_held.wait();
+                first_disjoint_attempted.wait();
+                assert_eq!(first_progress.load(Ordering::SeqCst), 4);
+                Ok(())
+            })
+            .unwrap();
+
+        state.abort().unwrap();
+        clear_current_thread_transaction_for_test();
+    });
+
+    let second_runtime = runtime.clone();
+    let second_metadata_held = metadata_held;
+    let second_disjoint_attempted = disjoint_attempted;
+    let second_progress = progress.clone();
+    let second = thread::spawn(move || {
+        clear_current_thread_transaction_for_test();
+
+        second_metadata_held.wait();
+
+        let mut state = TransactionState::default();
+        state.begin_with_region_runtime(&second_runtime).unwrap();
+        second_progress.store(3, Ordering::SeqCst);
+
+        let transaction = state.active_transaction_required().unwrap();
+        assert!(
+            second_runtime
+                .try_acquire_granule_write_for_test(transaction, global_granule_id(None, 1), 0)
+                .unwrap()
+                .is_none()
+        );
+        second_progress.store(4, Ordering::SeqCst);
+
+        second_disjoint_attempted.wait();
+        state.clear_active().unwrap();
+        clear_current_thread_transaction_for_test();
+    });
+
+    first.join().unwrap();
+    second.join().unwrap();
+
+    assert_eq!(progress.load(Ordering::SeqCst), 4);
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn shared_region_runtime_disjoint_pre_lp_publications_can_overlap() {
+    use crate::runtime::transaction::persist::RecordingBackendEvent;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    clear_current_thread_transaction_for_test();
+
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let metadata_held = Arc::new(Barrier::new(2));
+    let both_published_before_lp = Arc::new(Barrier::new(2));
+    let pre_lp_publication_count = Arc::new(AtomicUsize::new(0));
+
+    let first_runtime = runtime.clone();
+    let first_metadata_held = metadata_held.clone();
+    let first_both_published_before_lp = both_published_before_lp.clone();
+    let first_pre_lp_publication_count = pre_lp_publication_count.clone();
+    let first = thread::spawn(move || {
+        clear_current_thread_transaction_for_test();
+
+        let (durable_log, events) = TxDurableLog::recording_backend_for_test();
+        let mut state = TransactionState::default();
+        state.durable_log = durable_log;
+        let transaction = state.begin_with_region_runtime(&first_runtime).unwrap();
+        let granule = GranuleId::TMemory {
+            instance: None,
+            memory_index: 0,
+            granule_index: 0,
+        };
+        state.acquire_granule_write(granule, 0).unwrap();
+        let stream_id = first_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        let txid = u32::try_from(transaction.as_raw()).unwrap();
+
+        state.begin_terminal_commit().unwrap();
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0000, 1, vec![0x11; 8]);
+        let marker = state
+            .publish_tmemory_undo_before_in_place_write(stream_id, txid, &undo)
+            .unwrap();
+
+        {
+            let events = events.lock().unwrap();
+            assert!(events.contains(&RecordingBackendEvent::AppendDataRecord(
+                persist::DurableDataStream::TMemoryUndo,
+            )));
+            assert!(events.contains(&RecordingBackendEvent::AppendLogEntry(
+                crate::runtime::vm::TxLogEntryRole::TMemoryUndo,
+            )));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, RecordingBackendEvent::MarkLogEntryCommitted(_)))
+            );
+        }
+
+        first_pre_lp_publication_count.fetch_add(1, Ordering::SeqCst);
+        first_runtime
+            .with_root_object_metadata_lock_for_test(|| {
+                first_metadata_held.wait();
+                first_both_published_before_lp.wait();
+                assert_eq!(first_pre_lp_publication_count.load(Ordering::SeqCst), 2);
+                Ok(())
+            })
+            .unwrap();
+
+        state.publish_commit_lp(stream_id, txid, marker).unwrap();
+        let events = events.lock().unwrap().clone();
+        assert!(
+            events.contains(&RecordingBackendEvent::MarkLogEntryCommitted(
+                crate::runtime::vm::TxLogEntryRole::TMemoryUndo,
+            ))
+        );
+        state.complete_commit().unwrap();
+        clear_current_thread_transaction_for_test();
+
+        (stream_id, txid, events)
+    });
+
+    let second_runtime = runtime;
+    let second_metadata_held = metadata_held;
+    let second_both_published_before_lp = both_published_before_lp;
+    let second_pre_lp_publication_count = pre_lp_publication_count;
+    let second = thread::spawn(move || {
+        clear_current_thread_transaction_for_test();
+
+        second_metadata_held.wait();
+
+        let (durable_log, events) = TxDurableLog::recording_backend_for_test();
+        let mut state = TransactionState::default();
+        state.durable_log = durable_log;
+        let transaction = state.begin_with_region_runtime(&second_runtime).unwrap();
+        let granule = GranuleId::TMemory {
+            instance: None,
+            memory_index: 0,
+            granule_index: 1,
+        };
+        state.acquire_granule_write(granule, 0).unwrap();
+        let stream_id = second_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        let txid = u32::try_from(transaction.as_raw()).unwrap();
+
+        state.begin_terminal_commit().unwrap();
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0001, 1, vec![0x22; 8]);
+        let marker = state
+            .publish_tmemory_undo_before_in_place_write(stream_id, txid, &undo)
+            .unwrap();
+
+        {
+            let events = events.lock().unwrap();
+            assert!(events.contains(&RecordingBackendEvent::AppendDataRecord(
+                persist::DurableDataStream::TMemoryUndo,
+            )));
+            assert!(events.contains(&RecordingBackendEvent::AppendLogEntry(
+                crate::runtime::vm::TxLogEntryRole::TMemoryUndo,
+            )));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, RecordingBackendEvent::MarkLogEntryCommitted(_)))
+            );
+        }
+
+        second_pre_lp_publication_count.fetch_add(1, Ordering::SeqCst);
+        second_both_published_before_lp.wait();
+        assert_eq!(second_pre_lp_publication_count.load(Ordering::SeqCst), 2);
+
+        state.publish_commit_lp(stream_id, txid, marker).unwrap();
+        let events = events.lock().unwrap().clone();
+        assert!(
+            events.contains(&RecordingBackendEvent::MarkLogEntryCommitted(
+                crate::runtime::vm::TxLogEntryRole::TMemoryUndo,
+            ))
+        );
+        state.complete_commit().unwrap();
+        clear_current_thread_transaction_for_test();
+
+        (stream_id, txid, events)
+    });
+
+    let (first_stream_id, first_txid, first_events) = first.join().unwrap();
+    let (second_stream_id, second_txid, second_events) = second.join().unwrap();
+
+    assert_ne!(first_stream_id, first_txid);
+    assert_ne!(second_stream_id, second_txid);
+    assert_ne!(first_stream_id, second_stream_id);
+    assert_eq!(
+        first_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RecordingBackendEvent::MarkLogEntryCommitted(
+                    crate::runtime::vm::TxLogEntryRole::TMemoryUndo
+                )
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        second_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RecordingBackendEvent::MarkLogEntryCommitted(
+                    crate::runtime::vm::TxLogEntryRole::TMemoryUndo
+                )
+            ))
+            .count(),
+        1
+    );
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn current_version_for_granule_reports_poisoned_shared_lock_authority() {
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    runtime.poison_lock_authority_for_test();
 
     let state = TransactionState {
         shared_region_runtime: Some(runtime),
         ..TransactionState::default()
     };
 
-    assert_eq!(
-        state.versioned_granule_version(global_granule_id(None, 0)),
-        0
+    let error = state
+        .current_version_for_granule(global_granule_id(None, 0), 0)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("transaction lock authority lock poisoned"),
+        "{error:?}"
     );
 }
 
@@ -1241,15 +1493,8 @@ fn shared_region_runtime_release_clears_terminal_marker() {
 
 #[test]
 fn shared_region_runtime_poisoned_clear_active_returns_error_without_panic() {
-    use std::thread;
-
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
-    let poisoned_runtime = runtime.clone();
-    let _ = thread::spawn(move || {
-        let _guard = poisoned_runtime.lock().unwrap();
-        panic!("poison shared runtime");
-    })
-    .join();
+    runtime.poison_lock_authority_for_test();
 
     let transaction = TransactionId::from_raw(7);
     let mut state = TransactionState {

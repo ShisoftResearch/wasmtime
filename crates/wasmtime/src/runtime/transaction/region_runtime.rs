@@ -2,6 +2,9 @@ use crate::prelude::*;
 use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::TryLockError;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
@@ -28,7 +31,7 @@ impl DurableLogSegment {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct TransactionRegionRuntime(Arc<Mutex<TransactionRegionRuntimeInner>>);
+pub(crate) struct TransactionRegionRuntime(Arc<TransactionRegionRuntimeInner>);
 
 #[derive(Debug)]
 pub(crate) struct UserTransactionRegionPermit {
@@ -123,86 +126,129 @@ impl SharedFileBackedStorageConfig {
 }
 
 #[derive(Debug)]
-pub(crate) struct TransactionRegionRuntimeInner {
-    pub(crate) next_transaction_id: u64,
-    pub(crate) next_log_segment_stream_id: u32,
-    pub(crate) next_object_index: u64,
-    pub(crate) thread_log_segments: HashMap<ThreadId, DurableLogSegment>,
-    pub(crate) free_log_segment_stream_ids: Vec<u32>,
-    pub(crate) locks: LockBased,
-    pub(crate) conflict_aborted_transactions: BTreeSet<TransactionId>,
-    pub(crate) terminal_commits: BTreeSet<TransactionId>,
-    pub(crate) granule_versions: BTreeMap<GranuleId, u64>,
+struct TransactionRegionRuntimeInner {
+    next_transaction_id: AtomicU64,
+    log_segments: Mutex<DurableLogSegmentRegistry>,
+    lock_authority: Mutex<LockAuthorityState>,
+    persistent_metadata: Mutex<PersistentMetadataState>,
+    file_backed_storage: Mutex<Option<SharedFileBackedStorageConfig>>,
+    gc_state: Mutex<GcCoordinationState>,
+}
+
+#[derive(Debug)]
+struct DurableLogSegmentRegistry {
+    next_log_segment_stream_id: u32,
+    thread_log_segments: HashMap<ThreadId, DurableLogSegment>,
+    free_log_segment_stream_ids: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct LockAuthorityState {
+    locks: LockBased,
+    conflict_aborted_transactions: BTreeSet<TransactionId>,
+    terminal_commits: BTreeSet<TransactionId>,
+    granule_versions: BTreeMap<GranuleId, u64>,
+    #[cfg(test)]
+    fail_release_transaction_once_for_test: bool,
+}
+
+#[derive(Debug, Default)]
+struct PersistentMetadataState {
+    next_object_index: u64,
     persistent_roots: BTreeMap<PersistentRootKey, BTreeSet<ObjectId>>,
     persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     object_versions: BTreeMap<ObjectId, u32>,
-    pub(crate) durable_log: TxDurableLog,
-    pub(crate) file_backed_storage: Option<SharedFileBackedStorageConfig>,
-    pub(crate) active_user_commits: u32,
-    pub(crate) gc_active: bool,
     #[cfg(test)]
-    pub(crate) fail_release_transaction_once_for_test: bool,
-    #[cfg(test)]
-    pub(crate) fail_apply_persistent_root_delta_once_for_test: bool,
+    fail_apply_persistent_root_delta_once_for_test: bool,
+}
+
+#[derive(Debug, Default)]
+struct GcCoordinationState {
+    active_user_commits: u32,
+    gc_active: bool,
+}
+
+impl Default for DurableLogSegmentRegistry {
+    fn default() -> Self {
+        Self {
+            next_log_segment_stream_id: FIRST_DURABLE_LOG_SEGMENT_STREAM_ID,
+            thread_log_segments: HashMap::new(),
+            free_log_segment_stream_ids: Vec::new(),
+        }
+    }
 }
 
 impl Default for TransactionRegionRuntimeInner {
     fn default() -> Self {
         Self {
-            next_transaction_id: 10_001,
-            next_log_segment_stream_id: FIRST_DURABLE_LOG_SEGMENT_STREAM_ID,
-            next_object_index: 0,
-            thread_log_segments: HashMap::new(),
-            free_log_segment_stream_ids: Vec::new(),
-            locks: LockBased::default(),
-            conflict_aborted_transactions: BTreeSet::new(),
-            terminal_commits: BTreeSet::new(),
-            granule_versions: BTreeMap::new(),
-            persistent_roots: BTreeMap::new(),
-            persistent_root_versions: BTreeMap::new(),
-            object_versions: BTreeMap::new(),
-            durable_log: TxDurableLog::default(),
-            file_backed_storage: None,
-            active_user_commits: 0,
-            gc_active: false,
-            #[cfg(test)]
-            fail_release_transaction_once_for_test: false,
-            #[cfg(test)]
-            fail_apply_persistent_root_delta_once_for_test: false,
+            next_transaction_id: AtomicU64::new(10_001),
+            log_segments: Mutex::new(DurableLogSegmentRegistry::default()),
+            lock_authority: Mutex::new(LockAuthorityState::default()),
+            persistent_metadata: Mutex::new(PersistentMetadataState::default()),
+            file_backed_storage: Mutex::new(None),
+            gc_state: Mutex::new(GcCoordinationState::default()),
         }
     }
 }
 
 impl Default for TransactionRegionRuntime {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(
-            TransactionRegionRuntimeInner::default(),
-        )))
+        Self(Arc::new(TransactionRegionRuntimeInner::default()))
     }
 }
 
 impl TransactionRegionRuntime {
-    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, TransactionRegionRuntimeInner>> {
+    fn lock_log_segments(&self) -> Result<MutexGuard<'_, DurableLogSegmentRegistry>> {
         self.0
+            .log_segments
             .lock()
-            .map_err(|_| crate::format_err!("transaction region runtime lock poisoned"))
+            .map_err(|_| crate::format_err!("transaction log segment registry lock poisoned"))
+    }
+
+    fn lock_authority(&self) -> Result<MutexGuard<'_, LockAuthorityState>> {
+        self.0
+            .lock_authority
+            .lock()
+            .map_err(|_| crate::format_err!("transaction lock authority lock poisoned"))
+    }
+
+    fn lock_persistent_metadata(&self) -> Result<MutexGuard<'_, PersistentMetadataState>> {
+        self.0
+            .persistent_metadata
+            .lock()
+            .map_err(|_| crate::format_err!("transaction root metadata lock poisoned"))
+    }
+
+    fn lock_file_backed_storage(
+        &self,
+    ) -> Result<MutexGuard<'_, Option<SharedFileBackedStorageConfig>>> {
+        self.0
+            .file_backed_storage
+            .lock()
+            .map_err(|_| crate::format_err!("shared file-backed storage config lock poisoned"))
+    }
+
+    fn lock_gc_state(&self) -> Result<MutexGuard<'_, GcCoordinationState>> {
+        self.0
+            .gc_state
+            .lock()
+            .map_err(|_| crate::format_err!("transaction GC coordination lock poisoned"))
     }
 
     pub(crate) fn allocate_transaction_id(&self) -> Result<TransactionId> {
-        let mut runtime = self.lock()?;
-        let id = TransactionId::from_raw(runtime.next_transaction_id);
-        runtime.next_transaction_id = runtime
+        let id = self
+            .0
             .next_transaction_id
-            .checked_add(1)
-            .context("transaction id overflow")?;
-        Ok(id)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| crate::format_err!("transaction id overflow"))?;
+        Ok(TransactionId::from_raw(id))
     }
 
     pub(crate) fn allocate_persistent_object_id_at_least(
         &self,
         min_object_index: u64,
     ) -> Result<ObjectId> {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_persistent_metadata()?;
         runtime.next_object_index = runtime.next_object_index.max(min_object_index);
         let object_id = ObjectId {
             object_index: runtime.next_object_index,
@@ -215,7 +261,7 @@ impl TransactionRegionRuntime {
     }
 
     pub(crate) fn begin_user_transaction_region(&self) -> Result<UserTransactionRegionPermit> {
-        let mut inner = self.lock()?;
+        let mut inner = self.lock_gc_state()?;
         ensure!(!inner.gc_active, "persistent GC is active");
         inner.active_user_commits = inner
             .active_user_commits
@@ -227,7 +273,7 @@ impl TransactionRegionRuntime {
     }
 
     pub(crate) fn begin_persistent_gc(&self) -> Result<PersistentGcRegionPermit> {
-        let mut inner = self.lock()?;
+        let mut inner = self.lock_gc_state()?;
         ensure!(!inner.gc_active, "persistent GC is already active");
         ensure!(
             inner.active_user_commits == 0,
@@ -242,35 +288,33 @@ impl TransactionRegionRuntime {
     pub(crate) fn shared_file_backed_storage(
         &self,
     ) -> Result<Option<SharedFileBackedStorageConfig>> {
-        Ok(self.lock()?.file_backed_storage.clone())
+        Ok(self.lock_file_backed_storage()?.clone())
     }
 
     pub(crate) fn shared_file_backed_storage_for_store_adoption(
         &self,
     ) -> Result<Option<SharedFileBackedStorageConfig>> {
-        let mut runtime = self.lock()?;
-        if let Some(shared) = runtime.file_backed_storage.as_mut() {
+        let mut runtime = self.lock_file_backed_storage()?;
+        if let Some(shared) = runtime.as_mut() {
             // Fresh-create runtimes hand the first store a create/truncate path
             // until tmemory is materialized. Once the backing file exists, later
             // stores must reopen it as existing storage so size/capacity come
             // from disk rather than reusing fresh-create semantics.
             shared.reopen_tmemory_for_store_adoption();
         }
-        Ok(runtime.file_backed_storage.clone())
+        Ok(runtime.clone())
     }
 
     pub(crate) fn shared_file_backed_tmemory_commit_lock(&self) -> Result<Option<Arc<RwLock<()>>>> {
         Ok(self
-            .lock()?
-            .file_backed_storage
+            .lock_file_backed_storage()?
             .as_ref()
             .map(SharedFileBackedStorageConfig::tmemory_commit_lock))
     }
 
     pub(crate) fn shared_file_backed_tmemory_pages(&self) -> Result<Option<u64>> {
         Ok(self
-            .lock()?
-            .file_backed_storage
+            .lock_file_backed_storage()?
             .as_ref()
             .and_then(SharedFileBackedStorageConfig::tmemory_pages))
     }
@@ -307,9 +351,9 @@ impl TransactionRegionRuntime {
         tx_log_path: &Path,
         tx_log_blocks: u32,
     ) -> Result<()> {
-        let mut runtime = self.lock()?;
-        let existing = runtime.file_backed_storage.clone();
-        runtime.file_backed_storage = Some(
+        let mut runtime = self.lock_file_backed_storage()?;
+        let existing = runtime.clone();
+        *runtime = Some(
             SharedFileBackedStorageConfig::new(
                 TMemoryFileBacking::Path(tmemory_path.to_path_buf()),
                 tx_log_path.to_path_buf(),
@@ -326,21 +370,21 @@ impl TransactionRegionRuntime {
         tx_log_path: &Path,
         tx_log_blocks: u32,
     ) -> Result<()> {
-        let mut runtime = self.lock()?;
-        let existing = runtime.file_backed_storage.clone();
+        let mut runtime = self.lock_file_backed_storage()?;
+        let existing = runtime.clone();
         let shared = SharedFileBackedStorageConfig::new(
             TMemoryFileBacking::ExistingPath(tmemory_path.to_path_buf()),
             tx_log_path.to_path_buf(),
             tx_log_blocks,
         )
         .with_reused_locks_from(existing.as_ref());
-        runtime.file_backed_storage = Some(shared);
+        *runtime = Some(shared);
         Ok(())
     }
 
     pub(crate) fn record_file_backed_tmemory_pages(&self, tmemory_pages: u64) -> Result<()> {
-        let mut runtime = self.lock()?;
-        if let Some(shared) = runtime.file_backed_storage.as_mut() {
+        let mut runtime = self.lock_file_backed_storage()?;
+        if let Some(shared) = runtime.as_mut() {
             shared.record_tmemory_pages(tmemory_pages);
         }
         Ok(())
@@ -348,7 +392,7 @@ impl TransactionRegionRuntime {
 
     pub(crate) fn current_thread_log_segment(&self) -> Result<DurableLogSegment> {
         let thread_id = std::thread::current().id();
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_log_segments()?;
         if let Some(segment) = runtime.thread_log_segments.get(&thread_id).copied() {
             return Ok(segment);
         }
@@ -382,7 +426,7 @@ impl TransactionRegionRuntime {
 
     fn release_current_thread_log_segment(&self, reusable: bool) -> Result<()> {
         let thread_id = std::thread::current().id();
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_log_segments()?;
         if let Some(segment) = runtime.thread_log_segments.remove(&thread_id) {
             if reusable {
                 runtime
@@ -399,7 +443,7 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_authority()?;
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, false)?;
         let aborted = runtime
             .locks
@@ -417,7 +461,7 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_authority()?;
         Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
         let aborted = runtime
             .locks
@@ -435,7 +479,7 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        self.lock()?
+        self.lock_authority()?
             .locks
             .validate_read(transaction, granule, current_version)
     }
@@ -446,14 +490,14 @@ impl TransactionRegionRuntime {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        self.lock()?
+        self.lock_authority()?
             .locks
             .refresh_read_version(transaction, granule, current_version);
         Ok(())
     }
 
     pub(crate) fn release_transaction(&self, transaction: TransactionId) -> Result<()> {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_authority()?;
         runtime.locks.release_transaction(transaction);
         runtime.conflict_aborted_transactions.remove(&transaction);
         runtime.terminal_commits.remove(&transaction);
@@ -469,13 +513,13 @@ impl TransactionRegionRuntime {
         transaction: TransactionId,
     ) -> Result<bool> {
         Ok(self
-            .lock()?
+            .lock_authority()?
             .conflict_aborted_transactions
             .remove(&transaction))
     }
 
     pub(crate) fn begin_terminal_commit(&self, transaction: TransactionId) -> Result<()> {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_authority()?;
         ensure!(
             !runtime.conflict_aborted_transactions.remove(&transaction),
             "transaction was conflict-aborted by another transaction"
@@ -485,13 +529,13 @@ impl TransactionRegionRuntime {
     }
 
     pub(crate) fn end_terminal_commit(&self, transaction: TransactionId) -> Result<()> {
-        self.lock()?.terminal_commits.remove(&transaction);
+        self.lock_authority()?.terminal_commits.remove(&transaction);
         Ok(())
     }
 
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> Result<u64> {
         Ok(self
-            .lock()?
+            .lock_authority()?
             .granule_versions
             .get(&granule)
             .copied()
@@ -502,7 +546,7 @@ impl TransactionRegionRuntime {
     where
         I: IntoIterator<Item = GranuleId>,
     {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_authority()?;
         for granule in granules {
             if !granule_uses_transaction_state_version(granule) {
                 continue;
@@ -522,7 +566,7 @@ impl TransactionRegionRuntime {
     where
         I: IntoIterator<Item = PersistentRootKey>,
     {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_persistent_metadata()?;
         let mut reserved = BTreeMap::new();
         for key in keys.into_iter().collect::<BTreeSet<_>>() {
             let version = runtime.persistent_root_versions.entry(key).or_insert(0);
@@ -543,7 +587,7 @@ impl TransactionRegionRuntime {
             return Ok(());
         }
 
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_persistent_metadata()?;
         #[cfg(test)]
         if core::mem::take(&mut runtime.fail_apply_persistent_root_delta_once_for_test) {
             bail!("injected shared persistent root apply failure");
@@ -576,7 +620,7 @@ impl TransactionRegionRuntime {
 
     pub(super) fn persistent_root_ids(&self) -> Result<BTreeSet<ObjectId>> {
         Ok(self
-            .lock()?
+            .lock_persistent_metadata()?
             .persistent_roots
             .values()
             .flat_map(|roots| roots.iter().copied())
@@ -587,15 +631,27 @@ impl TransactionRegionRuntime {
         &self,
         key: PersistentRootKey,
     ) -> Result<Option<BTreeSet<ObjectId>>> {
-        Ok(self.lock()?.persistent_roots.get(&key).cloned())
+        Ok(self
+            .lock_persistent_metadata()?
+            .persistent_roots
+            .get(&key)
+            .cloned())
     }
 
     pub(super) fn persistent_root_version(&self, key: PersistentRootKey) -> Result<Option<u32>> {
-        Ok(self.lock()?.persistent_root_versions.get(&key).copied())
+        Ok(self
+            .lock_persistent_metadata()?
+            .persistent_root_versions
+            .get(&key)
+            .copied())
     }
 
     pub(super) fn persistent_object_version(&self, object: ObjectId) -> Result<Option<u32>> {
-        Ok(self.lock()?.object_versions.get(&object).copied())
+        Ok(self
+            .lock_persistent_metadata()?
+            .object_versions
+            .get(&object)
+            .copied())
     }
 
     pub(super) fn install_recovered_persistent_roots<I>(&self, roots: I) -> Result<()>
@@ -603,7 +659,7 @@ impl TransactionRegionRuntime {
         I: IntoIterator<Item = ObjectId>,
     {
         let roots = roots.into_iter().collect::<BTreeSet<_>>();
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_persistent_metadata()?;
         if roots.is_empty() {
             runtime
                 .persistent_roots
@@ -626,7 +682,7 @@ impl TransactionRegionRuntime {
         J: IntoIterator<Item = (u64, u32)>,
     {
         let roots = roots.into_iter().collect::<BTreeSet<_>>();
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_persistent_metadata()?;
         if roots.is_empty() {
             runtime
                 .persistent_roots
@@ -653,7 +709,7 @@ impl TransactionRegionRuntime {
     where
         I: IntoIterator<Item = ObjectId>,
     {
-        let mut runtime = self.lock()?;
+        let mut runtime = self.lock_persistent_metadata()?;
         for object_id in object_ids {
             let next = object_id
                 .object_index
@@ -665,7 +721,7 @@ impl TransactionRegionRuntime {
     }
 
     fn check_terminal_owner_conflict(
-        runtime: &TransactionRegionRuntimeInner,
+        runtime: &LockAuthorityState,
         transaction: TransactionId,
         granule: GranuleId,
         is_write: bool,
@@ -793,7 +849,10 @@ impl TransactionRegionRuntime {
         &self,
         transaction: TransactionId,
     ) -> Result<bool> {
-        Ok(self.lock()?.terminal_commits.contains(&transaction))
+        Ok(self
+            .lock_authority()?
+            .terminal_commits
+            .contains(&transaction))
     }
 
     #[cfg(test)]
@@ -813,12 +872,12 @@ impl TransactionRegionRuntime {
 
     #[cfg(test)]
     pub(crate) fn thread_log_segment_count_for_test(&self) -> Result<usize> {
-        Ok(self.lock()?.thread_log_segments.len())
+        Ok(self.lock_log_segments()?.thread_log_segments.len())
     }
 
     #[cfg(test)]
     pub(crate) fn free_log_segment_count_for_test(&self) -> Result<usize> {
-        Ok(self.lock()?.free_log_segment_stream_ids.len())
+        Ok(self.lock_log_segments()?.free_log_segment_stream_ids.len())
     }
 
     #[cfg(test)]
@@ -852,20 +911,68 @@ impl TransactionRegionRuntime {
 
     #[cfg(test)]
     pub(crate) fn fail_release_transaction_once_for_test(&self) {
-        self.lock().unwrap().fail_release_transaction_once_for_test = true;
+        self.lock_authority()
+            .unwrap()
+            .fail_release_transaction_once_for_test = true;
     }
 
     #[cfg(test)]
     pub(crate) fn fail_apply_persistent_root_delta_once_for_test(&self) {
-        self.lock()
+        self.lock_persistent_metadata()
             .unwrap()
             .fail_apply_persistent_root_delta_once_for_test = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_root_object_metadata_lock_for_test<T>(
+        &self,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self.lock_persistent_metadata()?;
+        f()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_acquire_granule_write_for_test(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<Option<TransactionId>> {
+        let mut runtime = match self.0.lock_authority.try_lock() {
+            Ok(runtime) => runtime,
+            Err(TryLockError::WouldBlock) => {
+                bail!("transaction lock authority lock was unexpectedly held")
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                bail!("transaction lock authority lock poisoned")
+            }
+        };
+        Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
+        let aborted = runtime
+            .locks
+            .acquire_write(transaction, granule, current_version)?;
+        if let Some(aborted) = aborted {
+            runtime.conflict_aborted_transactions.insert(aborted);
+            return Ok(Some(aborted));
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_lock_authority_for_test(&self) {
+        let runtime = self.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = runtime.0.lock_authority.lock().unwrap();
+            panic!("poison transaction lock authority");
+        })
+        .join();
     }
 }
 
 impl Drop for UserTransactionRegionPermit {
     fn drop(&mut self) {
-        let Ok(mut inner) = self.runtime.0.lock() else {
+        let Ok(mut inner) = self.runtime.0.gc_state.lock() else {
             return;
         };
         if inner.active_user_commits > 0 {
@@ -876,7 +983,7 @@ impl Drop for UserTransactionRegionPermit {
 
 impl Drop for PersistentGcRegionPermit {
     fn drop(&mut self) {
-        let Ok(mut inner) = self.runtime.0.lock() else {
+        let Ok(mut inner) = self.runtime.0.gc_state.lock() else {
             return;
         };
         inner.gc_active = false;
