@@ -15513,6 +15513,84 @@ fn no_wait_abort_abort_releases_owned_granules() {
 }
 
 #[test]
+fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
+    fn granule(granule_index: u64) -> GranuleId {
+        GranuleId::TMemory {
+            instance: Some(1),
+            memory_index: 0,
+            granule_index,
+        }
+    }
+
+    fn assert_contract<T: super::concurrency::TransactionConcurrencyControl>(policy: &mut T) {
+        let direct_release_transaction = TransactionId::from_raw(1);
+        let direct_release_read_granule = granule(0);
+        let direct_release_write_granule = granule(1);
+
+        policy
+            .acquire_granule_read(direct_release_transaction, direct_release_read_granule, 1)
+            .unwrap();
+        policy
+            .acquire_granule_write(direct_release_transaction, direct_release_write_granule, 1)
+            .unwrap();
+        assert_eq!(
+            policy.read_granules_for_transaction(direct_release_transaction),
+            vec![direct_release_read_granule]
+        );
+        assert_eq!(
+            policy.owner_for_granule(direct_release_write_granule),
+            Some(direct_release_transaction)
+        );
+
+        policy.release_transaction(direct_release_transaction);
+
+        assert!(
+            policy
+                .read_granules_for_transaction(direct_release_transaction)
+                .is_empty()
+        );
+        assert_eq!(policy.owner_for_granule(direct_release_write_granule), None);
+
+        let result_release_transaction = TransactionId::from_raw(2);
+        let result_release_read_granule = granule(2);
+        let result_release_write_granule = granule(3);
+
+        policy
+            .acquire_granule_read(result_release_transaction, result_release_read_granule, 1)
+            .unwrap();
+        policy
+            .acquire_granule_write(result_release_transaction, result_release_write_granule, 1)
+            .unwrap();
+        policy.refresh_read_version(result_release_transaction, result_release_read_granule, 2);
+        policy
+            .validate_read(result_release_transaction, result_release_read_granule, 2)
+            .unwrap();
+        assert_eq!(
+            policy.read_granules_for_transaction(result_release_transaction),
+            vec![result_release_read_granule]
+        );
+        assert_eq!(
+            policy.owner_for_granule(result_release_write_granule),
+            Some(result_release_transaction)
+        );
+
+        policy
+            .release_transaction_result(result_release_transaction)
+            .unwrap();
+
+        assert!(
+            policy
+                .read_granules_for_transaction(result_release_transaction)
+                .is_empty()
+        );
+        assert_eq!(policy.owner_for_granule(result_release_write_granule), None);
+    }
+
+    assert_contract(&mut LockBased::default());
+    assert_contract(&mut NoWaitAbort::default());
+}
+
+#[test]
 #[cfg(feature = "transaction-cc-nowait-abort")]
 fn selected_concurrency_control_uses_nowait_abort_semantics() {
     let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::NoWaitAbort);

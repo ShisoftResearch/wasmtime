@@ -18,7 +18,30 @@ pub(crate) trait TransactionConcurrencyControl {
         current_version: u64,
     ) -> Result<Option<TransactionId>>;
 
+    fn validate_read(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()>;
+
+    fn refresh_read_version(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    );
+
     fn release_transaction(&mut self, transaction: TransactionId);
+
+    fn release_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
+        self.release_transaction(transaction);
+        Ok(())
+    }
+
+    fn owner_for_granule(&self, granule: GranuleId) -> Option<TransactionId>;
+
+    fn read_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId>;
 }
 
 #[derive(Debug)]
@@ -41,20 +64,28 @@ impl ConcurrencyControlState {
         }
     }
 
+    fn policy(&self) -> &dyn TransactionConcurrencyControl {
+        match self {
+            Self::LockBased(policy) => policy,
+            Self::NoWaitAbort(policy) => policy,
+        }
+    }
+
+    fn policy_mut(&mut self) -> &mut dyn TransactionConcurrencyControl {
+        match self {
+            Self::LockBased(policy) => policy,
+            Self::NoWaitAbort(policy) => policy,
+        }
+    }
+
     pub(crate) fn acquire_granule_read(
         &mut self,
         transaction: TransactionId,
         granule: GranuleId,
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
-        match self {
-            Self::LockBased(policy) => {
-                policy.acquire_granule_read(transaction, granule, current_version)
-            }
-            Self::NoWaitAbort(policy) => {
-                policy.acquire_granule_read(transaction, granule, current_version)
-            }
-        }
+        self.policy_mut()
+            .acquire_granule_read(transaction, granule, current_version)
     }
 
     pub(crate) fn acquire_granule_write(
@@ -63,14 +94,8 @@ impl ConcurrencyControlState {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<Option<TransactionId>> {
-        match self {
-            Self::LockBased(policy) => {
-                policy.acquire_granule_write(transaction, granule, current_version)
-            }
-            Self::NoWaitAbort(policy) => {
-                policy.acquire_granule_write(transaction, granule, current_version)
-            }
-        }
+        self.policy_mut()
+            .acquire_granule_write(transaction, granule, current_version)
     }
 
     pub(crate) fn validate_read(
@@ -79,12 +104,8 @@ impl ConcurrencyControlState {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        match self {
-            Self::LockBased(policy) => policy.validate_read(transaction, granule, current_version),
-            Self::NoWaitAbort(policy) => {
-                policy.validate_read(transaction, granule, current_version)
-            }
-        }
+        self.policy()
+            .validate_read(transaction, granule, current_version)
     }
 
     pub(crate) fn refresh_read_version(
@@ -93,51 +114,27 @@ impl ConcurrencyControlState {
         granule: GranuleId,
         current_version: u64,
     ) {
-        match self {
-            Self::LockBased(policy) => {
-                policy.refresh_read_version(transaction, granule, current_version);
-            }
-            Self::NoWaitAbort(policy) => {
-                policy.refresh_read_version(transaction, granule, current_version);
-            }
-        }
+        self.policy_mut()
+            .refresh_read_version(transaction, granule, current_version);
     }
 
     pub(crate) fn release_transaction(&mut self, transaction: TransactionId) {
-        match self {
-            Self::LockBased(policy) => policy.release_transaction(transaction),
-            Self::NoWaitAbort(policy) => policy.release_transaction(transaction),
-        }
+        self.policy_mut().release_transaction(transaction);
     }
 
     pub(crate) fn release_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
-        self.release_transaction(transaction);
-        Ok(())
+        self.policy_mut().release_transaction_result(transaction)
     }
 
     pub(crate) fn owner_for_granule(&self, granule: GranuleId) -> Option<TransactionId> {
-        match self {
-            Self::LockBased(policy) => policy.owner_for_granule(granule),
-            Self::NoWaitAbort(policy) => policy.owner_for_granule(granule),
-        }
+        self.policy().owner_for_granule(granule)
     }
 
     pub(crate) fn read_granules_for_transaction(
         &self,
         transaction: TransactionId,
     ) -> Vec<GranuleId> {
-        match self {
-            Self::LockBased(policy) => policy
-                .read_versions
-                .keys()
-                .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
-                .collect(),
-            Self::NoWaitAbort(policy) => policy
-                .read_versions
-                .keys()
-                .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
-                .collect(),
-        }
+        self.policy().read_granules_for_transaction(transaction)
     }
 
     #[cfg(test)]
@@ -505,8 +502,41 @@ impl TransactionConcurrencyControl for LockBased {
         self.acquire_write(transaction, granule, current_version)
     }
 
+    fn validate_read(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        LockBased::validate_read(self, transaction, granule, current_version)
+    }
+
+    fn refresh_read_version(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) {
+        LockBased::refresh_read_version(self, transaction, granule, current_version);
+    }
+
     fn release_transaction(&mut self, transaction: TransactionId) {
         LockBased::release_transaction(self, transaction);
+    }
+
+    fn release_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
+        LockBased::release_transaction_result(self, transaction)
+    }
+
+    fn owner_for_granule(&self, granule: GranuleId) -> Option<TransactionId> {
+        LockBased::owner_for_granule(self, granule)
+    }
+
+    fn read_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId> {
+        self.read_versions
+            .keys()
+            .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect()
     }
 }
 
@@ -774,7 +804,40 @@ impl TransactionConcurrencyControl for NoWaitAbort {
         self.acquire_write(transaction, granule, current_version)
     }
 
+    fn validate_read(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        NoWaitAbort::validate_read(self, transaction, granule, current_version)
+    }
+
+    fn refresh_read_version(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) {
+        NoWaitAbort::refresh_read_version(self, transaction, granule, current_version);
+    }
+
     fn release_transaction(&mut self, transaction: TransactionId) {
         NoWaitAbort::release_transaction(self, transaction);
+    }
+
+    fn release_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
+        NoWaitAbort::release_transaction_result(self, transaction)
+    }
+
+    fn owner_for_granule(&self, granule: GranuleId) -> Option<TransactionId> {
+        NoWaitAbort::owner_for_granule(self, granule)
+    }
+
+    fn read_granules_for_transaction(&self, transaction: TransactionId) -> Vec<GranuleId> {
+        self.read_versions
+            .keys()
+            .filter_map(|(reader, granule)| (*reader == transaction).then_some(*granule))
+            .collect()
     }
 }
