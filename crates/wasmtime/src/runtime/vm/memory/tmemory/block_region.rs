@@ -36,7 +36,7 @@ use core::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -53,8 +53,8 @@ pub(crate) const LINE_MARK_SIZE: usize = size_of::<LineMark>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PersistenceMode {
-    ResearchPretendPmem,
-    RequireHardwarePmem,
+    ResearchPretendDaxPmem,
+    RequireDaxPmem,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +111,24 @@ impl FileBackedMapping {
 
     pub(crate) fn len(&self) -> usize {
         self.memory.len()
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn ptr_at(&self, offset: usize) -> Result<NonNull<u8>> {
+        ensure!(
+            offset <= self.len(),
+            "file-backed mapping pointer offset out of bounds"
+        );
+        if self.len() == 0 {
+            return Ok(NonNull::dangling());
+        }
+        let ptr = unsafe {
+            NonNull::new_unchecked(self.memory.as_non_null().cast::<u8>().as_ptr().add(offset))
+        };
+        Ok(ptr)
     }
 
     pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -188,6 +206,145 @@ impl FileBackedMapping {
     }
 }
 
+pub(crate) trait DurableMappedBytes: core::fmt::Debug {
+    fn len(&self) -> usize;
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
+    fn flush(&self, offset: usize, len: usize) -> Result<()>;
+    fn fence(&self) -> Result<()>;
+    fn remap_len(&mut self, new_len: usize) -> Result<()>;
+}
+
+impl DurableMappedBytes for FileBackedMapping {
+    fn len(&self) -> usize {
+        FileBackedMapping::len(self)
+    }
+
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        FileBackedMapping::read(self, offset, len)
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        FileBackedMapping::write(self, offset, bytes)
+    }
+
+    fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        FileBackedMapping::flush(self, offset, len)
+    }
+
+    fn fence(&self) -> Result<()> {
+        FileBackedMapping::fence_data(self)
+    }
+
+    fn remap_len(&mut self, new_len: usize) -> Result<()> {
+        FileBackedMapping::remap_len(self, new_len)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxPmemMapping {
+    mapping: FileBackedMapping,
+    persist: PersistEngine,
+    require_fsdax: bool,
+}
+
+impl DaxPmemMapping {
+    pub(crate) fn new_research_temp(len: usize) -> Result<Self> {
+        Ok(Self {
+            mapping: FileBackedMapping::new_temp(len)?,
+            persist: PersistEngine::for_mode(PersistenceMode::ResearchPretendDaxPmem)?,
+            require_fsdax: false,
+        })
+    }
+
+    pub(crate) fn new_fsdax_path(path: PathBuf, len: usize) -> Result<Self> {
+        let mut mapping = create_fsdax_file_backed_mapping(path.clone(), len)?;
+        mapping.fence_all()?;
+        sync_parent_dir(&path)?;
+        let persist = PersistEngine::for_mode(PersistenceMode::RequireDaxPmem)?;
+        mapping.unlink_on_drop = false;
+        Ok(Self {
+            mapping,
+            persist,
+            require_fsdax: true,
+        })
+    }
+
+    pub(crate) fn open_existing_fsdax_path(path: PathBuf) -> Result<Self> {
+        let mapping = open_existing_fsdax_file_backed_mapping(path.clone())?;
+        Ok(Self {
+            mapping,
+            persist: PersistEngine::for_mode(PersistenceMode::RequireDaxPmem)?,
+            require_fsdax: true,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .with_context(|| {
+            format!(
+                "failed to open parent directory for DAX PMEM fsdax path {}",
+                path.display()
+            )
+        })?
+        .sync_all()
+        .with_context(|| {
+            format!(
+                "failed to sync parent directory for DAX PMEM fsdax path {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+impl DurableMappedBytes for DaxPmemMapping {
+    fn len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.mapping.read(offset, len)
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.mapping.write(offset, bytes)
+    }
+
+    fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .context("DAX PMEM mapping flush range overflow")?;
+        ensure!(
+            end <= self.mapping.len(),
+            "DAX PMEM mapping flush range out of bounds"
+        );
+        let ptr = self.mapping.ptr_at(offset)?;
+        self.persist.flush(ptr, len)
+    }
+
+    fn fence(&self) -> Result<()> {
+        self.persist.fence()
+    }
+
+    fn remap_len(&mut self, new_len: usize) -> Result<()> {
+        self.mapping.remap_len(new_len)?;
+        if self.require_fsdax {
+            ensure_fsdax_path(self.mapping.path())?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for FileBackedMapping {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -195,6 +352,9 @@ impl Drop for FileBackedMapping {
             let _ = unmap_shared_file(self.memory);
         }
         if self.unlink_on_drop {
+            #[cfg(unix)]
+            cleanup_created_file_path(&self.file, &self.path);
+            #[cfg(not(unix))]
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -210,6 +370,64 @@ fn unique_temp_file_path() -> PathBuf {
 
 fn empty_mapping_memory() -> SendSyncPtr<[u8]> {
     SendSyncPtr::new(NonNull::slice_from_raw_parts(NonNull::<u8>::dangling(), 0))
+}
+
+#[cfg(unix)]
+fn create_fsdax_file_backed_mapping(path: PathBuf, len: usize) -> Result<FileBackedMapping> {
+    let file = create_file_read_write_no_follow(&path)?;
+    if let Err(error) = ensure_fsdax_file(&file, &path) {
+        cleanup_created_file_path(&file, &path);
+        return Err(error);
+    }
+    finish_file_backed_mapping(file, path, len, true)
+}
+
+#[cfg(not(unix))]
+fn create_fsdax_file_backed_mapping(_path: PathBuf, _len: usize) -> Result<FileBackedMapping> {
+    bail!("DAX PMEM fsdax mappings are unsupported on this target")
+}
+
+#[cfg(unix)]
+fn open_existing_fsdax_file_backed_mapping(path: PathBuf) -> Result<FileBackedMapping> {
+    let file = open_file_read_write_no_follow(&path)?;
+    ensure_fsdax_file(&file, &path)?;
+    finish_existing_file_backed_mapping(file, path)
+}
+
+#[cfg(not(unix))]
+fn open_existing_fsdax_file_backed_mapping(_path: PathBuf) -> Result<FileBackedMapping> {
+    bail!("DAX PMEM fsdax mappings are unsupported on this target")
+}
+
+#[cfg(unix)]
+fn open_file_read_write_no_follow(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.with_context_open(path, "open DAX PMEM fsdax file")
+}
+
+#[cfg(unix)]
+fn create_file_read_write_no_follow(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true).mode(0o600);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.with_context_open(path, "create DAX PMEM fsdax file")
+}
+
+#[cfg(unix)]
+trait OpenOptionsContext {
+    fn with_context_open(&mut self, path: &Path, op: &str) -> Result<File>;
+}
+
+#[cfg(unix)]
+impl OpenOptionsContext for OpenOptions {
+    fn with_context_open(&mut self, path: &Path, op: &str) -> Result<File> {
+        self.open(path)
+            .with_context(|| format!("failed to {op} {}", path.display()))
+    }
 }
 
 #[cfg(unix)]
@@ -279,6 +497,11 @@ fn open_existing_file_backed_mapping(path: PathBuf) -> Result<FileBackedMapping>
                 path.display()
             )
         })?;
+    finish_existing_file_backed_mapping(file, path)
+}
+
+#[cfg(unix)]
+fn finish_existing_file_backed_mapping(file: File, path: PathBuf) -> Result<FileBackedMapping> {
     let len = usize::try_from(
         file.metadata()
             .with_context(|| format!("failed to stat file-backed tmemory file {}", path.display()))?
@@ -311,7 +534,7 @@ fn finish_file_backed_mapping(
         })
     {
         if unlink_on_drop {
-            let _ = std::fs::remove_file(&path);
+            cleanup_created_file_path(&file, &path);
         }
         return Err(error);
     }
@@ -319,7 +542,7 @@ fn finish_file_backed_mapping(
         Ok(memory) => memory,
         Err(error) => {
             if unlink_on_drop {
-                let _ = std::fs::remove_file(&path);
+                cleanup_created_file_path(&file, &path);
             }
             return Err(error);
         }
@@ -330,6 +553,42 @@ fn finish_file_backed_mapping(
         unlink_on_drop,
         memory,
     })
+}
+
+#[cfg(unix)]
+fn cleanup_created_file_path(file: &File, path: &Path) {
+    let _ = cleanup_created_file_path_impl(file, path);
+}
+
+#[cfg(unix)]
+fn cleanup_created_file_path_impl(file: &File, path: &Path) -> Result<()> {
+    let opened = file.metadata().with_context(|| {
+        format!(
+            "failed to stat created file-backed tmemory file {}",
+            path.display()
+        )
+    })?;
+    let path_metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to stat file-backed tmemory cleanup candidate {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    if opened.dev() == path_metadata.dev() && opened.ino() == path_metadata.ino() {
+        std::fs::remove_file(path).with_context(|| {
+            format!(
+                "failed to remove created file-backed tmemory file {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -384,6 +643,101 @@ fn flush_file_backed_mapping(memory: SendSyncPtr<[u8]>, offset: usize, len: usiz
         .context("failed to msync file-backed tmemory range")?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_fsdax_path(path: &Path) -> Result<()> {
+    ensure!(
+        statx_has_dax_attr(path)?,
+        "DAX PMEM fsdax path {} does not have the DAX inode attribute",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_fsdax_file(file: &File, path: &Path) -> Result<()> {
+    ensure!(
+        statx_fd_has_dax_attr(file, path)?,
+        "DAX PMEM fsdax path {} does not have the DAX inode attribute",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_fsdax_path(path: &Path) -> Result<()> {
+    bail!(
+        "DAX PMEM fsdax path {} is unsupported on this target",
+        path.display()
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_fsdax_file(_file: &File, path: &Path) -> Result<()> {
+    bail!(
+        "DAX PMEM fsdax path {} is unsupported on this target",
+        path.display()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn statx_has_dax_attr(path: &Path) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const STATX_ATTR_DAX_FALLBACK: u64 = 0x0020_0000;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .context("DAX PMEM fsdax path contains interior NUL")?;
+    let mut statx = core::mem::MaybeUninit::<libc::statx>::zeroed();
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS,
+            statx.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to statx DAX PMEM fsdax path {}", path.display()));
+    }
+    let statx = unsafe { statx.assume_init() };
+    let dax = STATX_ATTR_DAX_FALLBACK;
+    Ok((statx.stx_attributes_mask & dax) != 0 && (statx.stx_attributes & dax) != 0)
+}
+
+#[cfg(target_os = "linux")]
+fn statx_fd_has_dax_attr(file: &File, path: &Path) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    const STATX_ATTR_DAX_FALLBACK: u64 = 0x0020_0000;
+
+    let empty = CString::new("").unwrap();
+    let mut statx = core::mem::MaybeUninit::<libc::statx>::zeroed();
+    let rc = unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            empty.as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_BASIC_STATS,
+            statx.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to statx opened DAX PMEM fsdax path {}",
+                path.display()
+            )
+        });
+    }
+    let statx = unsafe { statx.assume_init() };
+    let dax = STATX_ATTR_DAX_FALLBACK;
+    Ok((statx.stx_attributes_mask & dax) != 0 && (statx.stx_attributes & dax) != 0)
 }
 
 fn file_backed_flush_range(
@@ -461,8 +815,8 @@ pub(crate) struct PersistEngine {
 impl PersistEngine {
     pub(crate) fn for_mode(mode: PersistenceMode) -> Result<Self> {
         let flush_kind = match mode {
-            PersistenceMode::ResearchPretendPmem => PersistFlushKind::NoopResearch,
-            PersistenceMode::RequireHardwarePmem => hardware_flush_kind()?,
+            PersistenceMode::ResearchPretendDaxPmem => PersistFlushKind::NoopResearch,
+            PersistenceMode::RequireDaxPmem => hardware_flush_kind()?,
         };
         Ok(Self { mode, flush_kind })
     }
@@ -506,11 +860,11 @@ fn hardware_flush_kind() -> Result<PersistFlushKind> {
         if PersistEngine::hardware_flush_available() {
             return Ok(PersistFlushKind::X86Clwb);
         }
-        bail!("NVMemory requires CLWB support for hardware PMEM mode");
+        bail!("DAX PMEM requires CLWB support for real DAX PMEM mode");
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    bail!("NVMemory is unsupported on this target until a PMEM flush implementation exists")
+    bail!("DAX PMEM is unsupported on this target until a PMEM flush implementation exists")
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -543,7 +897,7 @@ unsafe fn flush_clwb_range(ptr: core::ptr::NonNull<u8>, len: usize) -> Result<()
 
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn flush_clwb_range(_ptr: core::ptr::NonNull<u8>, _len: usize) -> Result<()> {
-    bail!("NVMemory CLWB flush is unsupported on this target")
+    bail!("DAX PMEM CLWB flush is unsupported on this target")
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -558,7 +912,7 @@ unsafe fn sfence() -> Result<()> {
 
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn sfence() -> Result<()> {
-    bail!("NVMemory SFENCE is unsupported on this target")
+    bail!("DAX PMEM SFENCE is unsupported on this target")
 }
 
 #[repr(C)]
@@ -1820,22 +2174,25 @@ impl BlockRegionBackend for VMemoryBlockRegion {
 }
 
 #[derive(Debug)]
-pub(crate) struct NVMemoryBlockRegion {
-    data: Vec<u8>,
+pub(crate) struct DaxPmemBlockRegion {
+    mapping: DaxPmemMapping,
     block_entries: Vec<BlockEntry>,
     block_metas: Vec<BlockMeta>,
     line_marks: Vec<LineMark>,
-    persist: PersistEngine,
 }
 
-impl NVMemoryBlockRegion {
-    pub(crate) fn new(num_blocks: usize, mode: PersistenceMode) -> Result<Self> {
+impl DaxPmemBlockRegion {
+    fn with_mapping(mapping: DaxPmemMapping, num_blocks: usize) -> Result<Self> {
         let bytes_len = num_blocks
             .checked_mul(BLOCK_SIZE)
-            .context("transactional NVMemory block region size overflow")?;
+            .context("transactional DAX PMEM block region size overflow")?;
+        ensure!(
+            mapping.len() >= bytes_len,
+            "transactional DAX PMEM block region mapping is smaller than requested size"
+        );
         let line_count = bytes_len / IMMIX_LINE_SIZE;
         Ok(Self {
-            data: vec![0; bytes_len],
+            mapping,
             block_entries: vec![BlockEntry::default(); num_blocks],
             block_metas: vec![BlockMeta::free(); num_blocks],
             line_marks: vec![
@@ -1844,13 +2201,54 @@ impl NVMemoryBlockRegion {
                 };
                 line_count
             ],
-            persist: PersistEngine::for_mode(mode)?,
         })
     }
 
+    pub(crate) fn new_research(payload_blocks: usize) -> Result<Self> {
+        if payload_blocks == 0 {
+            return Self::with_mapping(DaxPmemMapping::new_research_temp(0)?, 0);
+        }
+        let num_blocks = dax_pmem_region_blocks_for_payload(payload_blocks)?;
+        let bytes_len = num_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM block region size overflow")?;
+        let mut region =
+            Self::with_mapping(DaxPmemMapping::new_research_temp(bytes_len)?, num_blocks)?;
+        region.initialize_region_image()?;
+        Ok(region)
+    }
+
+    pub(crate) fn create_fsdax_path(path: PathBuf, payload_blocks: usize) -> Result<Self> {
+        let num_blocks = dax_pmem_region_blocks_for_payload(payload_blocks)?;
+        let bytes_len = num_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM block region size overflow")?;
+        let mut region =
+            Self::with_mapping(DaxPmemMapping::new_fsdax_path(path, bytes_len)?, num_blocks)?;
+        region.initialize_region_image()?;
+        Ok(region)
+    }
+
+    pub(crate) fn open_fsdax_path(path: PathBuf, payload_blocks: usize) -> Result<Self> {
+        let mapping = DaxPmemMapping::open_existing_fsdax_path(path)?;
+        ensure!(
+            mapping.len() % BLOCK_SIZE == 0,
+            "transactional DAX PMEM block region image length is not block-aligned"
+        );
+        let num_blocks = mapping.len() / BLOCK_SIZE;
+        let required_blocks = dax_pmem_region_blocks_for_payload(payload_blocks)?;
+        ensure!(
+            num_blocks >= required_blocks,
+            "transactional DAX PMEM block region image is smaller than requested capacity"
+        );
+        let mut region = Self::with_mapping(mapping, num_blocks)?;
+        region.load_region_image()?;
+        Ok(region)
+    }
+
     #[cfg(test)]
-    pub(crate) fn new_for_test(num_blocks: usize, mode: PersistenceMode) -> Result<Self> {
-        Self::new(num_blocks, mode)
+    pub(crate) fn new_for_test(num_blocks: usize) -> Result<Self> {
+        Self::new_research(num_blocks)
     }
 
     pub(crate) fn view(&self) -> BlockRegionBackendView<'_> {
@@ -1866,7 +2264,7 @@ impl NVMemoryBlockRegion {
     }
 
     pub(crate) fn bytes_len(&self) -> usize {
-        self.data.len()
+        self.mapping.len()
     }
 
     pub(crate) fn line_count(&self) -> usize {
@@ -1885,15 +2283,15 @@ impl NVMemoryBlockRegion {
     ) -> Result<RegionChunk> {
         ensure!(
             block_count > 0,
-            "transactional NVMemory chunk must contain a block"
+            "transactional DAX PMEM chunk must contain a block"
         );
         ensure!(
             block_count <= self.num_blocks(),
-            "transactional NVMemory chunk exceeds region size"
+            "transactional DAX PMEM chunk exceeds region size"
         );
         ensure!(
             kind != BlockKind::Free,
-            "transactional NVMemory chunk allocations require a durable non-free kind"
+            "transactional DAX PMEM chunk allocations require a durable non-free kind"
         );
 
         let last_start = self.num_blocks() - block_count;
@@ -1918,9 +2316,11 @@ impl NVMemoryBlockRegion {
                 }
                 let meta =
                     BlockMeta::active(kind, generation, owner_thread, chunk_start, chunk_blocks);
-                for block_meta in &mut self.block_metas[start..end] {
-                    *block_meta = meta;
+                for block in start..end {
+                    self.write_block_meta(block, meta)?;
                 }
+                self.flush_block_meta_range(start, block_count)?;
+                self.fence()?;
                 return Ok(RegionChunk {
                     start_block: start,
                     block_count,
@@ -1928,49 +2328,44 @@ impl NVMemoryBlockRegion {
             }
         }
 
-        bail!("transactional NVMemory block region is out of contiguous chunks")
+        bail!("transactional DAX PMEM block region is out of contiguous chunks")
     }
 
     pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         let end = offset
             .checked_add(len)
-            .context("transactional NVMemory block read range overflow")?;
+            .context("transactional DAX PMEM block read range overflow")?;
         ensure!(
-            end <= self.data.len(),
-            "transactional NVMemory block read range out of bounds"
+            end <= self.mapping.len(),
+            "transactional DAX PMEM block read range out of bounds"
         );
-        Ok(self.data[offset..end].to_vec())
+        self.mapping.read(offset, len)
     }
 
     pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
         let end = offset
             .checked_add(bytes.len())
-            .context("transactional NVMemory block write range overflow")?;
+            .context("transactional DAX PMEM block write range overflow")?;
         ensure!(
-            end <= self.data.len(),
-            "transactional NVMemory block write range out of bounds"
+            end <= self.mapping.len(),
+            "transactional DAX PMEM block write range out of bounds"
         );
-        self.data[offset..end].copy_from_slice(bytes);
-        Ok(())
+        self.mapping.write(offset, bytes)
     }
 
     pub(crate) fn flush(&self, offset: usize, len: usize) -> Result<()> {
         let end = offset
             .checked_add(len)
-            .context("transactional NVMemory block flush range overflow")?;
+            .context("transactional DAX PMEM block flush range overflow")?;
         ensure!(
-            end <= self.data.len(),
-            "transactional NVMemory block flush range out of bounds"
+            end <= self.mapping.len(),
+            "transactional DAX PMEM block flush range out of bounds"
         );
-        if len == 0 {
-            return Ok(());
-        }
-        let ptr = core::ptr::NonNull::from(&self.data[offset]).cast::<u8>();
-        self.persist.flush(ptr, len)
+        self.mapping.flush(offset, len)
     }
 
     pub(crate) fn fence(&self) -> Result<()> {
-        self.persist.fence()
+        self.mapping.fence()
     }
 
     pub(crate) fn block_meta(&self, block: u32) -> Result<BlockMeta> {
@@ -1978,11 +2373,309 @@ impl NVMemoryBlockRegion {
         self.block_metas
             .get(block)
             .copied()
-            .context("transactional NVMemory block metadata index out of bounds")
+            .context("transactional DAX PMEM block metadata index out of bounds")
+    }
+
+    fn initialize_region_image(&mut self) -> Result<()> {
+        let reserved_metadata_blocks = reserved_metadata_blocks(self.num_blocks())?;
+        ensure!(
+            self.num_blocks() >= reserved_metadata_blocks,
+            "transactional DAX PMEM region needs at least {reserved_metadata_blocks} blocks for metadata"
+        );
+        self.mark_blocks_used(0, reserved_metadata_blocks)?;
+        self.write_region_header(region_header_for_num_blocks(self.num_blocks())?)?;
+        for block in 0..self.num_blocks() {
+            self.write_block_meta(block, BlockMeta::free())?;
+        }
+        for block in 0..reserved_metadata_blocks {
+            self.write_block_meta(
+                block,
+                BlockMeta::active(BlockKind::Metadata, 0, 0, u32::try_from(block).unwrap(), 1),
+            )?;
+        }
+        self.write_metadata_desc_table()?;
+        self.write_type_layout_metadata_block(&empty_type_layout_metadata_block())?;
+        self.flush(
+            REGION_HEADER_BLOCK as usize * BLOCK_SIZE,
+            reserved_metadata_blocks * BLOCK_SIZE,
+        )?;
+        self.fence()
+    }
+
+    fn load_region_image(&mut self) -> Result<()> {
+        let header = self.region_header()?;
+        self.validate_region_header(header)?;
+        self.load_block_meta_table(header)?;
+        self.validate_reserved_metadata_block_metas()?;
+        self.rebuild_entries_from_block_meta()
+    }
+
+    fn validate_reserved_metadata_block_metas(&self) -> Result<()> {
+        for block in 0..reserved_metadata_blocks(self.num_blocks())? {
+            let expected_start = u32::try_from(block)
+                .context("transactional DAX PMEM reserved metadata block index overflow")?;
+            let meta = self.block_metas[block];
+            ensure!(
+                meta.state()? == BlockState::Active
+                    && meta.kind()? == BlockKind::Metadata
+                    && meta.chunk_start == expected_start
+                    && meta.chunk_blocks == 1,
+                "transactional DAX PMEM region image has malformed reserved metadata block metadata"
+            );
+        }
+        Ok(())
+    }
+
+    fn rebuild_entries_from_block_meta(&mut self) -> Result<()> {
+        for entry in &mut self.block_entries {
+            *entry = BlockEntry::default();
+        }
+        for (block, meta) in self.block_metas.iter().copied().enumerate() {
+            if meta.state()? != BlockState::Free {
+                self.block_entries[block].used = 1;
+                self.block_entries[block].list_num = ListKind::Used as i16;
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_blocks_used(&mut self, start: usize, block_count: usize) -> Result<()> {
+        let end = start
+            .checked_add(block_count)
+            .context("transactional DAX PMEM used-block range overflow")?;
+        ensure!(
+            end <= self.block_entries.len(),
+            "transactional DAX PMEM used-block range out of bounds"
+        );
+        ensure!(
+            self.block_entries[start..end]
+                .iter()
+                .all(|entry| entry.used == 0),
+            "transactional DAX PMEM used-block range overlaps existing chunk"
+        );
+        for entry in &mut self.block_entries[start..end] {
+            entry.used = 1;
+            entry.list_num = ListKind::Used as i16;
+        }
+        Ok(())
+    }
+
+    fn block_table_offset(&self) -> usize {
+        BLOCK_TABLE_START_BLOCK as usize * BLOCK_SIZE
+    }
+
+    fn block_meta_offset(&self, block: usize) -> Result<usize> {
+        self.block_table_offset()
+            .checked_add(
+                block
+                    .checked_mul(BlockMeta::BYTE_LEN)
+                    .context("DAX PMEM block metadata offset overflow")?,
+            )
+            .context("DAX PMEM block metadata offset overflow")
+    }
+
+    fn write_block_meta(&mut self, block: usize, meta: BlockMeta) -> Result<()> {
+        let offset = self.block_meta_offset(block)?;
+        self.block_metas[block] = meta;
+        self.write(offset, &meta.as_bytes())
+    }
+
+    fn flush_block_meta_range(&self, start: usize, count: usize) -> Result<()> {
+        let offset = self.block_meta_offset(start)?;
+        let len = count
+            .checked_mul(BlockMeta::BYTE_LEN)
+            .context("DAX PMEM block metadata flush length overflow")?;
+        self.flush(offset, len)
+    }
+
+    fn load_block_meta_table(&mut self, header: RegionHeader) -> Result<()> {
+        let table_blocks = usize::try_from(header.block_table_block_count)
+            .context("transactional DAX PMEM block table block count overflow")?;
+        ensure!(
+            table_blocks > 0,
+            "transactional DAX PMEM region has no block metadata table"
+        );
+        let table_bytes = table_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM block table byte length overflow")?;
+        let bytes = self.read(self.block_table_offset(), table_bytes)?;
+        for block in 0..self.num_blocks() {
+            let start = block
+                .checked_mul(BlockMeta::BYTE_LEN)
+                .context("DAX PMEM block metadata decode offset overflow")?;
+            let end = start + BlockMeta::BYTE_LEN;
+            self.block_metas[block] = BlockMeta::from_bytes(&bytes[start..end])?;
+        }
+        Ok(())
+    }
+
+    fn region_header(&self) -> Result<RegionHeader> {
+        RegionHeader::from_bytes(self.mapping.read(0, size_of::<RegionHeader>())?)
+    }
+
+    fn write_region_header(&mut self, header: RegionHeader) -> Result<()> {
+        self.mapping.write(0, &header.as_bytes())
+    }
+
+    pub(crate) fn payload_chunk_from_image(
+        &mut self,
+        payload_blocks: usize,
+    ) -> Result<RegionChunk> {
+        let start = reserved_metadata_blocks(self.num_blocks())?;
+        ensure!(
+            start < self.num_blocks(),
+            "transactional DAX PMEM region image has no payload blocks"
+        );
+        let minimum_end = start
+            .checked_add(payload_blocks)
+            .context("transactional DAX PMEM minimum payload chunk range overflow")?;
+        ensure!(
+            minimum_end <= self.num_blocks(),
+            "transactional DAX PMEM minimum payload chunk exceeds region size"
+        );
+
+        let first_meta = self.block_metas[start];
+        if first_meta.state()? == BlockState::Free {
+            ensure!(
+                payload_blocks > 0,
+                "transactional DAX PMEM payload chunk must contain a block"
+            );
+            return self.alloc_chunk(payload_blocks);
+        }
+
+        let chunk_start = u32::try_from(start)
+            .context("transactional DAX PMEM payload chunk start conversion overflow")?;
+        let chunk_blocks = usize::try_from(first_meta.chunk_blocks)
+            .context("transactional DAX PMEM payload chunk block count overflow")?;
+        ensure!(
+            first_meta.state()? == BlockState::Active
+                && first_meta.kind()? == BlockKind::ObjectData
+                && first_meta.chunk_start == chunk_start
+                && chunk_blocks >= payload_blocks
+                && chunk_blocks > 0,
+            "transactional DAX PMEM region image has malformed payload chunk metadata"
+        );
+        let end = start
+            .checked_add(chunk_blocks)
+            .context("transactional DAX PMEM payload chunk range overflow")?;
+        ensure!(
+            end <= self.num_blocks(),
+            "transactional DAX PMEM payload chunk exceeds region size"
+        );
+        for meta in &self.block_metas[start..end] {
+            ensure!(
+                meta.state()? == BlockState::Active
+                    && meta.kind()? == BlockKind::ObjectData
+                    && meta.chunk_start == chunk_start
+                    && usize::try_from(meta.chunk_blocks).ok() == Some(chunk_blocks),
+                "transactional DAX PMEM region image has malformed payload chunk metadata"
+            );
+        }
+        Ok(RegionChunk::new(start, chunk_blocks))
+    }
+
+    fn validate_region_header(&self, header: RegionHeader) -> Result<()> {
+        ensure!(
+            header.magic == REGION_MAGIC,
+            "transactional DAX PMEM region image has invalid magic"
+        );
+        ensure!(
+            usize::try_from(header.block_size).ok() == Some(BLOCK_SIZE),
+            "transactional DAX PMEM region image has unexpected block size"
+        );
+        ensure!(
+            header.block_table_start_block == BLOCK_TABLE_START_BLOCK
+                && header.block_table_block_count == block_table_block_count(self.num_blocks())?
+                && header.metadata_descs_start_block
+                    == metadata_desc_start_block(self.num_blocks())?
+                && header.metadata_descs_block_count == METADATA_DESC_BLOCK_COUNT
+                && header.num_descs == 1,
+            "transactional DAX PMEM region image has malformed metadata descriptor table header"
+        );
+        let expected_blocks = usize::try_from(header.num_blocks)
+            .context("transactional DAX PMEM region block count overflow")?;
+        ensure!(
+            expected_blocks == self.num_blocks(),
+            "transactional DAX PMEM region image length does not match header"
+        );
+        let descs = self.read_metadata_descs(header)?;
+        ensure!(
+            descs.len() == 1,
+            "transactional DAX PMEM region image must contain exactly one metadata descriptor"
+        );
+        validate_type_layout_metadata_desc(descs[0], self.num_blocks())?;
+        Ok(())
+    }
+
+    fn read_metadata_descs(&self, header: RegionHeader) -> Result<Vec<MetaDataDesc>> {
+        let start_block = usize::try_from(header.metadata_descs_start_block)
+            .context("transactional DAX PMEM metadata descriptor start block overflow")?;
+        let offset = start_block
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM metadata descriptor offset overflow")?;
+        let desc_count = usize::try_from(header.num_descs)
+            .context("transactional DAX PMEM metadata descriptor count overflow")?;
+        let byte_len = desc_count
+            .checked_mul(MetaDataDesc::BYTE_LEN)
+            .context("transactional DAX PMEM metadata descriptor table length overflow")?;
+        let table_capacity = usize::try_from(header.metadata_descs_block_count)
+            .context("transactional DAX PMEM metadata descriptor block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM metadata descriptor table capacity overflow")?;
+        ensure!(
+            byte_len <= table_capacity,
+            "transactional DAX PMEM metadata descriptor table exceeds reserved blocks"
+        );
+
+        let bytes = self.read(offset, byte_len)?;
+        let mut descs = Vec::with_capacity(desc_count);
+        for chunk in bytes.chunks_exact(MetaDataDesc::BYTE_LEN) {
+            descs.push(MetaDataDesc::from_bytes(chunk)?);
+        }
+        Ok(descs)
+    }
+
+    fn write_metadata_desc_table(&mut self) -> Result<()> {
+        let offset = self.block_offset(metadata_desc_start_block(self.num_blocks())?)?;
+        let mut bytes = vec![0; BLOCK_SIZE];
+        bytes[..MetaDataDesc::BYTE_LEN]
+            .copy_from_slice(&type_layout_metadata_desc(self.num_blocks())?.as_bytes());
+        self.write(offset, &bytes)
+    }
+
+    fn write_type_layout_metadata_block(&mut self, bytes: &[u8]) -> Result<()> {
+        let offset = self.block_offset(type_layout_metadata_start_block(self.num_blocks())?)?;
+        self.write(offset, bytes)
+    }
+
+    fn block_offset(&self, block: u32) -> Result<usize> {
+        let block =
+            usize::try_from(block).context("transactional DAX PMEM block index overflow")?;
+        ensure!(
+            block < self.num_blocks(),
+            "transactional DAX PMEM block index out of bounds"
+        );
+        block
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM block offset overflow")
     }
 }
 
-impl BlockRegionBackend for NVMemoryBlockRegion {
+fn dax_pmem_region_blocks_for_payload(payload_blocks: usize) -> Result<usize> {
+    let mut total_blocks = payload_blocks;
+    loop {
+        let reserved_blocks = reserved_metadata_blocks(total_blocks)?;
+        let needed_blocks = payload_blocks
+            .checked_add(reserved_blocks)
+            .context("transactional DAX PMEM region block count overflow")?;
+        if needed_blocks == total_blocks {
+            return Ok(total_blocks);
+        }
+        total_blocks = needed_blocks;
+    }
+}
+
+impl BlockRegionBackend for DaxPmemBlockRegion {
     fn block_size(&self) -> usize {
         self.block_size()
     }
@@ -4139,9 +4832,9 @@ mod tests {
 
     #[test]
     fn pmem_research_mode_allows_non_durable_flush_engine() {
-        let engine = PersistEngine::for_mode(PersistenceMode::ResearchPretendPmem).unwrap();
+        let engine = PersistEngine::for_mode(PersistenceMode::ResearchPretendDaxPmem).unwrap();
 
-        assert_eq!(engine.mode(), PersistenceMode::ResearchPretendPmem);
+        assert_eq!(engine.mode(), PersistenceMode::ResearchPretendDaxPmem);
         engine
             .flush(core::ptr::NonNull::<u8>::dangling(), 0)
             .unwrap();
@@ -4150,7 +4843,7 @@ mod tests {
 
     #[test]
     fn pmem_research_mode_allows_nonzero_non_durable_flush() {
-        let engine = PersistEngine::for_mode(PersistenceMode::ResearchPretendPmem).unwrap();
+        let engine = PersistEngine::for_mode(PersistenceMode::ResearchPretendDaxPmem).unwrap();
         let mut bytes = [1u8, 2, 3, 4];
         let ptr = core::ptr::NonNull::from(&mut bytes[0]);
 
@@ -4161,7 +4854,7 @@ mod tests {
 
     #[test]
     fn pmem_real_mode_reports_platform_availability() {
-        let result = PersistEngine::for_mode(PersistenceMode::RequireHardwarePmem);
+        let result = PersistEngine::for_mode(PersistenceMode::RequireDaxPmem);
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -4176,14 +4869,13 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         {
             let error = result.unwrap_err().to_string();
-            assert!(error.contains("NVMemory is unsupported"));
+            assert!(error.contains("DAX PMEM is unsupported"));
         }
     }
 
     #[test]
-    fn nvmemory_block_region_allocates_and_persists_writes_in_research_mode() {
-        let mut region =
-            NVMemoryBlockRegion::new_for_test(2, PersistenceMode::ResearchPretendPmem).unwrap();
+    fn dax_pmem_block_region_allocates_and_persists_writes_in_research_mode() {
+        let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
         let chunk = region.alloc_chunk(1).unwrap();
         let range = chunk.byte_range();
 
@@ -4193,16 +4885,66 @@ mod tests {
 
         assert_eq!(region.read(range.start, 4).unwrap(), vec![1, 2, 3, 4]);
         assert_eq!(region.block_size(), BLOCK_SIZE);
-        assert_eq!(region.num_blocks(), 2);
+        assert!(region.num_blocks() >= 2);
     }
 
     #[test]
-    fn nvmemory_block_region_rejects_out_of_bounds_flush() {
-        let region =
-            NVMemoryBlockRegion::new_for_test(1, PersistenceMode::ResearchPretendPmem).unwrap();
+    fn dax_pmem_block_region_rejects_out_of_bounds_flush() {
+        let region = DaxPmemBlockRegion::new_for_test(1).unwrap();
 
-        let error = region.flush(BLOCK_SIZE, 1).unwrap_err().to_string();
+        let error = region.flush(region.bytes_len(), 1).unwrap_err().to_string();
         assert!(error.contains("flush range out of bounds"));
+    }
+
+    #[test]
+    fn dax_pmem_block_region_persists_chunk_allocation_metadata() {
+        let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
+
+        let chunk = region.alloc_chunk(1).unwrap();
+        let offset = region.block_meta_offset(chunk.start_block()).unwrap();
+        let bytes = region.read(offset, BlockMeta::BYTE_LEN).unwrap();
+        let stored = BlockMeta::from_bytes(&bytes).unwrap();
+
+        assert_eq!(stored.state().unwrap(), BlockState::Active);
+        assert_eq!(stored.kind().unwrap(), BlockKind::ObjectData);
+        assert_eq!(
+            stored.chunk_start,
+            u32::try_from(chunk.start_block()).unwrap()
+        );
+        assert_eq!(
+            stored.chunk_blocks,
+            u32::try_from(chunk.block_count()).unwrap()
+        );
+    }
+
+    #[test]
+    fn dax_pmem_payload_chunk_from_image_uses_persisted_chunk_capacity() {
+        let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
+        let original = region.alloc_chunk(2).unwrap();
+
+        let reopened = region.payload_chunk_from_image(1).unwrap();
+
+        assert_eq!(reopened.start_block(), original.start_block());
+        assert_eq!(reopened.block_count(), original.block_count());
+    }
+
+    #[test]
+    fn dax_pmem_reopen_rejects_free_reserved_metadata_block_meta() {
+        let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
+        let reserved_blocks = reserved_metadata_blocks(region.num_blocks()).unwrap();
+        let corrupt_block = reserved_blocks - 1;
+
+        region
+            .write_block_meta(corrupt_block, BlockMeta::free())
+            .unwrap();
+        region.flush_block_meta_range(corrupt_block, 1).unwrap();
+        region.fence().unwrap();
+
+        let err = region.load_region_image().unwrap_err().to_string();
+        assert!(
+            err.contains("malformed reserved metadata block metadata"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]
@@ -4884,6 +5626,99 @@ mod tests {
         mapping.flush(0, 0).unwrap();
         mapping.fence_data().unwrap();
         mapping.fence_all().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_pmem_mapping_rejects_non_dax_path_in_real_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("non-dax-pmem.bin");
+
+        let error = DaxPmemMapping::new_fsdax_path(path.clone(), 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not have the DAX inode attribute")
+                || error.contains("failed to statx DAX PMEM fsdax path")
+                || error.contains("failed to create DAX PMEM fsdax file"),
+            "unexpected error: {error}"
+        );
+        assert!(!path.exists(), "constructor left behind {}", path.display());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_pmem_mapping_rejects_non_dax_existing_path_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing-non-dax-pmem.bin");
+        std::fs::write(&path, b"keep-me").unwrap();
+
+        let error = DaxPmemMapping::new_fsdax_path(path.clone(), 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not have the DAX inode attribute")
+                || error.contains("failed to statx DAX PMEM fsdax path")
+                || error.contains("failed to create DAX PMEM fsdax file"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep-me");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_pmem_mapping_create_mode_rejects_existing_path_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing-create-mode-pmem.bin");
+        std::fs::write(&path, b"keep-me").unwrap();
+
+        let error = DaxPmemMapping::new_fsdax_path(path.clone(), 4096)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("failed to create DAX PMEM fsdax file") || error.contains("File exists"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep-me");
+    }
+
+    #[test]
+    fn dax_pmem_mapping_research_temp_allows_non_dax_storage() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut mapping = DaxPmemMapping::new_research_temp(16).unwrap();
+
+        mapping.write(4, &[1, 2, 3, 4]).unwrap();
+        mapping.flush(4, 4).unwrap();
+        mapping.fence().unwrap();
+
+        assert_eq!(mapping.read(4, 4).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires real fsdax PMEM and WASMTIME_TEST_REAL_PMEM=1"]
+    fn dax_pmem_mapping_accepts_real_fsdax_path() {
+        if std::env::var_os("WASMTIME_TEST_REAL_PMEM").is_none() {
+            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 to run this test");
+            return;
+        }
+        let root = std::env::var_os("WASMTIME_TEST_DAX_PMEM_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/pmem0/wasmtime-dcpmm"));
+        let path = root.join("dax-pmem-mapping.tmemory");
+        let _ = std::fs::remove_file(&path);
+
+        let mut mapping = DaxPmemMapping::new_fsdax_path(path.clone(), 4096).unwrap();
+        mapping.write(128, b"dax!").unwrap();
+        mapping.flush(128, 4).unwrap();
+        mapping.fence().unwrap();
+        drop(mapping);
+
+        assert_eq!(&std::fs::read(&path).unwrap()[128..132], b"dax!");
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]

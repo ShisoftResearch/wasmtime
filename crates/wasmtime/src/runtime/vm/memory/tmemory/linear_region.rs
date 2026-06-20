@@ -3,10 +3,11 @@
 #![allow(dead_code)]
 
 use crate::prelude::*;
+use crate::runtime::transaction::TMemoryDaxPmemBacking;
 
 use super::block_region::{
-    BLOCK_SIZE, BlockRegionBackend, ChunkList, FileBackedMapping, FileBackedRegionMode,
-    IMMIX_LINE_SIZE, NVMemoryBlockRegion, PersistenceMode, RegionChunk, VMemoryBlockRegion,
+    BLOCK_SIZE, BlockRegionBackend, ChunkList, DaxPmemBlockRegion, FileBackedMapping,
+    FileBackedRegionMode, IMMIX_LINE_SIZE, RegionChunk, VMemoryBlockRegion,
 };
 
 pub(super) trait LinearRegionBackend:
@@ -36,10 +37,27 @@ impl TMemoryRegion {
         })
     }
 
-    pub(super) fn new_nvmemory(byte_capacity: usize, mode: PersistenceMode) -> Result<Self> {
+    pub(super) fn new_dax_pmem(
+        byte_capacity: usize,
+        backing: TMemoryDaxPmemBacking,
+    ) -> Result<Self> {
         let block_count = byte_capacity.div_ceil(BLOCK_SIZE);
-        let mut backend = NVMemoryBlockRegion::new(block_count, mode)?;
-        let chunks = if block_count == 0 {
+        let (mut backend, use_existing_payload_chunk) = match backing {
+            TMemoryDaxPmemBacking::ResearchTemp => {
+                (DaxPmemBlockRegion::new_research(block_count)?, false)
+            }
+            TMemoryDaxPmemBacking::FsDaxPath(path) => (
+                DaxPmemBlockRegion::create_fsdax_path(path, block_count)?,
+                false,
+            ),
+            TMemoryDaxPmemBacking::ExistingFsDaxPath(path) => (
+                DaxPmemBlockRegion::open_fsdax_path(path, block_count)?,
+                true,
+            ),
+        };
+        let chunks = if use_existing_payload_chunk {
+            vec![backend.payload_chunk_from_image(block_count)?]
+        } else if block_count == 0 {
             Vec::new()
         } else {
             vec![backend.alloc_chunk(block_count)?]
@@ -81,6 +99,10 @@ impl TMemoryRegion {
 
     pub(super) fn fence(&self) -> Result<()> {
         self.linear.fence()
+    }
+
+    pub(super) fn logical_len(&self) -> usize {
+        self.linear.logical_len()
     }
 
     pub(super) fn fill(&mut self, range: core::ops::Range<usize>, byte: u8) -> Result<()> {
@@ -290,10 +312,14 @@ impl MappedLinearRegion {
     }
 
     pub(super) fn reserve_file_backed_capacity(&mut self, byte_capacity: usize) -> Result<()> {
+        self.reserve_backend_capacity(byte_capacity, "file-backed")
+    }
+
+    fn reserve_backend_capacity(&mut self, byte_capacity: usize, backend_name: &str) -> Result<()> {
         let new_block_count = byte_capacity.div_ceil(BLOCK_SIZE);
         ensure!(
             new_block_count >= self.backend.num_blocks(),
-            "transactional linear file-backed reserve cannot shrink"
+            "transactional linear {backend_name} reserve cannot shrink"
         );
         self.backend.resize_bytes(byte_capacity)?;
         if new_block_count == self.backend.num_blocks() {
@@ -348,8 +374,7 @@ struct LogicalSegment {
 mod tests {
     use super::*;
     use crate::runtime::vm::memory::tmemory::block_region::{
-        BLOCK_SIZE, ChunkList, FileBackedRegionMode, NVMemoryBlockRegion, PersistenceMode,
-        VMemoryBlockRegion,
+        BLOCK_SIZE, ChunkList, DaxPmemBlockRegion, FileBackedRegionMode, VMemoryBlockRegion,
     };
     use core::ops::Range;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -488,9 +513,8 @@ mod tests {
     }
 
     #[test]
-    fn mapped_linear_region_supports_nvmemory_backend() {
-        let mut backend =
-            NVMemoryBlockRegion::new_for_test(2, PersistenceMode::ResearchPretendPmem).unwrap();
+    fn mapped_linear_region_supports_dax_pmem_backend() {
+        let mut backend = DaxPmemBlockRegion::new_for_test(2).unwrap();
         let chunk = backend.alloc_chunk(1).unwrap();
         let chunks = ChunkList::from_chunks(vec![chunk]).unwrap();
         let mut region = MappedLinearRegion::new(Box::new(backend), chunks);
@@ -574,22 +598,21 @@ mod tests {
     }
 
     #[test]
-    fn nvmemory_region_reports_backend_line_mark_count() {
-        let empty = TMemoryRegion::new_nvmemory(0, PersistenceMode::ResearchPretendPmem).unwrap();
+    fn dax_pmem_region_reports_backend_line_mark_count() {
+        let empty = TMemoryRegion::new_dax_pmem(0, TMemoryDaxPmemBacking::ResearchTemp).unwrap();
         assert_eq!(empty.line_mark_count_for_test(), 0);
 
-        let one_byte =
-            TMemoryRegion::new_nvmemory(1, PersistenceMode::ResearchPretendPmem).unwrap();
+        let one_byte = TMemoryRegion::new_dax_pmem(1, TMemoryDaxPmemBacking::ResearchTemp).unwrap();
         assert_eq!(
             one_byte.line_mark_count_for_test(),
-            BLOCK_SIZE / IMMIX_LINE_SIZE
+            5 * (BLOCK_SIZE / IMMIX_LINE_SIZE)
         );
     }
 
     #[test]
-    fn nvmemory_region_flush_and_fence_paths_are_supported() {
+    fn dax_pmem_region_flush_and_fence_paths_are_supported() {
         let mut region =
-            TMemoryRegion::new_nvmemory(BLOCK_SIZE, PersistenceMode::ResearchPretendPmem).unwrap();
+            TMemoryRegion::new_dax_pmem(BLOCK_SIZE, TMemoryDaxPmemBacking::ResearchTemp).unwrap();
 
         region.write(0, &[1, 2, 3, 4]).unwrap();
         region.flush(0, 4).unwrap();

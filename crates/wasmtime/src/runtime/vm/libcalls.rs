@@ -3546,7 +3546,7 @@ fn tmemory_transaction_owner_key(
         .context("transactional memory operation targeted non-transactional memory")?;
     Ok(match tmemory.backend() {
         TMemoryBackend::FileBackedMemory => None,
-        TMemoryBackend::VMemory | TMemoryBackend::NVMemory => Some(instance),
+        TMemoryBackend::VMemory | TMemoryBackend::DaxPmem => Some(instance),
     })
 }
 

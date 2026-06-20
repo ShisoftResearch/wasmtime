@@ -272,11 +272,12 @@ impl Instance {
             .copied()
             .filter(|memory_index| module.defined_memory_index(*memory_index).is_some())
             .count();
-        if transaction_config.tmemory_backend() == TMemoryBackend::FileBackedMemory
-            && defined_tmemories > 1
-        {
+        let single_path_backed_tmemory = transaction_config.tmemory_backend()
+            == TMemoryBackend::FileBackedMemory
+            || transaction_config.has_path_backed_dax_pmem_tmemory();
+        if single_path_backed_tmemory && defined_tmemories > 1 {
             bail!(
-                "file-backed tmemory supports one transactional memory for now; found {defined_tmemories}"
+                "file-backed tmemory or path-backed DAX PMEM tmemory supports one transactional memory for now; found {defined_tmemories}"
             );
         }
 
@@ -317,6 +318,18 @@ impl Instance {
 
     #[cfg(has_virtual_memory)]
     fn initialize_tmemory_sidecar_static_data(mut self: Pin<&mut Self>) -> Result<(), OutOfMemory> {
+        let existing_dax_pmem_tmemory = self
+            .store
+            .map(|store| unsafe { &*store.0.as_ptr() })
+            .is_some_and(|store| {
+                store
+                    .store_opaque()
+                    .transaction_config()
+                    .has_existing_dax_pmem_tmemory()
+            });
+        if existing_dax_pmem_tmemory {
+            return Ok(());
+        }
         let module = self.runtime_info.env_module();
         let MemoryInitialization::Static { map } = &module.memory_initialization else {
             return Ok(());

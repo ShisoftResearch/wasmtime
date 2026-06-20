@@ -121,7 +121,7 @@ compile_error!(
 );
 
 // Milestone runtime core for proposal WAST progress. The current runtime uses
-// store-local transaction state, `VMemory` and configurable `NVMemory`
+// store-local transaction state, `VMemory` and configurable durable tmemory
 // transactional memory storage, and real `tmemory` sidecars. Remaining
 // `SHISOFT-TWASM-MOCK` tags in this file identify policy selection and
 // object-table gaps.
@@ -131,26 +131,30 @@ compile_error!(
 /// SHISOFT-TWASM-MOCK: backend selection still lives behind transaction
 /// research configuration rather than Wasmtime's public embedding API.
 ///
-/// Milestone runtime support currently implements `VMemory` and research
-/// `NVMemory` by default, with hardware-PMEM mode selectable for experiments.
-/// `FileBackedMemory` is an opt-in mmap-backed durable test/research backend;
-/// ordinary Wasmtime memories still use their existing storage path.
+/// Milestone runtime support currently implements `VMemory`, `FileBackedMemory`,
+/// and research/configurable DAX PMEM backends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TMemoryBackend {
     VMemory,
     FileBackedMemory,
-    NVMemory,
+    DaxPmem,
 }
 
-/// Persistence behavior for `NVMemory` block regions.
+/// Persistence behavior for durable tmemory block regions.
 ///
 /// The research mode is the default so normal tests do not require PMEM
-/// hardware. `RequireHardwarePmem` routes NVMemory through the CLWB/SFENCE
-/// persistence engine and fails construction when the host cannot provide it.
+/// hardware.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TMemoryPersistenceMode {
-    ResearchPretendPmem,
-    RequireHardwarePmem,
+    ResearchPretendDaxPmem,
+    RequireDaxPmem,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TMemoryDaxPmemBacking {
+    ResearchTemp,
+    FsDaxPath(PathBuf),
+    ExistingFsDaxPath(PathBuf),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,6 +265,7 @@ pub(crate) struct TransactionConfig {
     tmemory_backend: TMemoryBackend,
     tmemory_persistence_mode: TMemoryPersistenceMode,
     tmemory_file_backing: Option<TMemoryFileBacking>,
+    tmemory_dax_pmem_backing: Option<TMemoryDaxPmemBacking>,
     concurrency_control: ConcurrencyControl,
     durability_policy: DurabilityPolicy,
     conflict_policy: ConflictPolicy,
@@ -271,8 +276,9 @@ impl Default for TransactionConfig {
     fn default() -> Self {
         Self {
             tmemory_backend: TMemoryBackend::VMemory,
-            tmemory_persistence_mode: TMemoryPersistenceMode::ResearchPretendPmem,
+            tmemory_persistence_mode: TMemoryPersistenceMode::ResearchPretendDaxPmem,
             tmemory_file_backing: None,
+            tmemory_dax_pmem_backing: None,
             concurrency_control: ConcurrencyControl::default_for_build(),
             durability_policy: DurabilityPolicy::VolatileRollbackOnly,
             conflict_policy: ConflictPolicy::AbortOrWizardDefault,
@@ -288,17 +294,29 @@ impl TransactionConfig {
         Ok(config)
     }
 
-    pub(crate) fn with_nvmemory_persistence_mode(
-        tmemory_persistence_mode: TMemoryPersistenceMode,
-    ) -> Result<Self> {
-        let mut config = Self::default();
-        config.set_nvmemory_persistence_mode(tmemory_persistence_mode)?;
-        Ok(config)
-    }
-
     pub(crate) fn with_file_backed_tmemory_temp() -> Result<Self> {
         let mut config = Self::default();
         config.set_file_backed_tmemory(TMemoryFileBacking::Temp)?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_dax_pmem_fsdax_path(path: PathBuf) -> Result<Self> {
+        ensure!(
+            !path.as_os_str().is_empty(),
+            "DAX PMEM fsdax path cannot be empty"
+        );
+        let mut config = Self::default();
+        config.set_dax_pmem_backing(TMemoryDaxPmemBacking::FsDaxPath(path))?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_dax_pmem_existing_fsdax_path(path: PathBuf) -> Result<Self> {
+        ensure!(
+            !path.as_os_str().is_empty(),
+            "DAX PMEM fsdax path cannot be empty"
+        );
+        let mut config = Self::default();
+        config.set_dax_pmem_backing(TMemoryDaxPmemBacking::ExistingFsDaxPath(path))?;
         Ok(config)
     }
 
@@ -350,6 +368,10 @@ impl TransactionConfig {
         self.tmemory_file_backing.clone()
     }
 
+    pub(crate) fn tmemory_dax_pmem_backing(&self) -> Option<TMemoryDaxPmemBacking> {
+        self.tmemory_dax_pmem_backing.clone()
+    }
+
     pub(crate) fn concurrency_control(&self) -> ConcurrencyControl {
         self.concurrency_control
     }
@@ -370,12 +392,34 @@ impl TransactionConfig {
         self.tmemory_backend == TMemoryBackend::VMemory
     }
 
+    pub(crate) fn has_path_backed_dax_pmem_tmemory(&self) -> bool {
+        self.tmemory_backend == TMemoryBackend::DaxPmem
+            && matches!(
+                self.tmemory_dax_pmem_backing,
+                Some(TMemoryDaxPmemBacking::FsDaxPath(_))
+                    | Some(TMemoryDaxPmemBacking::ExistingFsDaxPath(_))
+            )
+    }
+
+    pub(crate) fn has_existing_dax_pmem_tmemory(&self) -> bool {
+        self.tmemory_backend == TMemoryBackend::DaxPmem
+            && matches!(
+                self.tmemory_dax_pmem_backing,
+                Some(TMemoryDaxPmemBacking::ExistingFsDaxPath(_))
+            )
+    }
+
     fn set_tmemory_backend(&mut self, tmemory_backend: TMemoryBackend) -> Result<()> {
         match tmemory_backend {
-            TMemoryBackend::VMemory | TMemoryBackend::NVMemory => {
+            TMemoryBackend::VMemory => {
                 self.tmemory_backend = tmemory_backend;
+                self.tmemory_persistence_mode = TMemoryPersistenceMode::ResearchPretendDaxPmem;
                 self.tmemory_file_backing = None;
+                self.tmemory_dax_pmem_backing = None;
                 Ok(())
+            }
+            TMemoryBackend::DaxPmem => {
+                self.set_dax_pmem_backing(TMemoryDaxPmemBacking::ResearchTemp)
             }
             TMemoryBackend::FileBackedMemory => {
                 bail!("FileBackedMemory requires explicit file backing configuration")
@@ -383,19 +427,23 @@ impl TransactionConfig {
         }
     }
 
-    fn set_nvmemory_persistence_mode(
-        &mut self,
-        tmemory_persistence_mode: TMemoryPersistenceMode,
-    ) -> Result<()> {
-        self.tmemory_backend = TMemoryBackend::NVMemory;
-        self.tmemory_persistence_mode = tmemory_persistence_mode;
-        self.tmemory_file_backing = None;
-        Ok(())
-    }
-
     fn set_file_backed_tmemory(&mut self, file_backing: TMemoryFileBacking) -> Result<()> {
         self.tmemory_backend = TMemoryBackend::FileBackedMemory;
         self.tmemory_file_backing = Some(file_backing);
+        self.tmemory_dax_pmem_backing = None;
+        Ok(())
+    }
+
+    fn set_dax_pmem_backing(&mut self, backing: TMemoryDaxPmemBacking) -> Result<()> {
+        self.tmemory_backend = TMemoryBackend::DaxPmem;
+        self.tmemory_persistence_mode = match &backing {
+            TMemoryDaxPmemBacking::ResearchTemp => TMemoryPersistenceMode::ResearchPretendDaxPmem,
+            TMemoryDaxPmemBacking::FsDaxPath(_) | TMemoryDaxPmemBacking::ExistingFsDaxPath(_) => {
+                TMemoryPersistenceMode::RequireDaxPmem
+            }
+        };
+        self.tmemory_file_backing = None;
+        self.tmemory_dax_pmem_backing = Some(backing);
         Ok(())
     }
 

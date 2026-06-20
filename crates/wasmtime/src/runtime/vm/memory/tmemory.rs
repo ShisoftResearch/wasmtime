@@ -1,16 +1,15 @@
 //! Wizard-style storage for transactional memories.
 //!
-//! This module backs per-instance `tmemory` sidecars with volatile and research
-//! NVMemory block/chunk backends, plus filesystem-backed transactional
-//! `FileBackedMemory`.
+//! This module backs per-instance `tmemory` sidecars with volatile,
+//! DAX-PMEM-capable, and filesystem-backed transactional storage.
 
 #![allow(dead_code)]
 
 use crate::prelude::*;
 use crate::runtime::transaction::PendingGranuleUndo;
 use crate::runtime::transaction::{
-    TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryFileBacking,
-    TMemoryPersistenceMode, TransactionConfig,
+    TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryBackend, TMemoryDaxPmemBacking,
+    TMemoryFileBacking, TMemoryPersistenceMode, TransactionConfig,
 };
 use alloc::collections::BTreeMap;
 use wasmtime_environ::MemoryIndex;
@@ -112,6 +111,7 @@ impl TMemory {
             config.tmemory_backend(),
             config.tmemory_persistence_mode(),
             config.tmemory_file_backing(),
+            config.tmemory_dax_pmem_backing(),
             min_pages,
             max_pages,
         )
@@ -128,8 +128,9 @@ impl TMemory {
     ) -> Result<Self> {
         Self::new_for_backend(
             backend,
-            TMemoryPersistenceMode::ResearchPretendPmem,
+            TMemoryPersistenceMode::ResearchPretendDaxPmem,
             None,
+            (backend == TMemoryBackend::DaxPmem).then_some(TMemoryDaxPmemBacking::ResearchTemp),
             min_pages,
             max_pages,
         )
@@ -425,16 +426,22 @@ impl TMemory {
         backend: TMemoryBackend,
         persistence_mode: TMemoryPersistenceMode,
         file_backing: Option<TMemoryFileBacking>,
+        dax_pmem_backing: Option<TMemoryDaxPmemBacking>,
         min_pages: u64,
         max_pages: Option<u64>,
     ) -> Result<Self> {
         let storage: Box<dyn TMemoryBackendStorage> = match backend {
             TMemoryBackend::VMemory => Box::new(VMemory::new(min_pages, max_pages)?),
-            TMemoryBackend::NVMemory => Box::new(NVMemory::new_with_persistence_mode(
-                min_pages,
-                max_pages,
-                persistence_mode,
-            )?),
+            TMemoryBackend::DaxPmem => {
+                let backing =
+                    dax_pmem_backing.context("DaxPmem requires DAX PMEM backing configuration")?;
+                Box::new(DaxPmemMemory::new_with_backing(
+                    min_pages,
+                    max_pages,
+                    persistence_mode,
+                    backing,
+                )?)
+            }
             TMemoryBackend::FileBackedMemory => {
                 let file_backing = file_backing
                     .context("FileBackedMemory requires explicit file backing configuration")?;
@@ -709,46 +716,69 @@ impl TMemoryBackendStorage for VMemory {
     }
 }
 
-/// Research NVMemory transactional storage backed by a PMEM-capable block region.
+/// DAX-PMEM-capable transactional storage backed by a CLWB/SFENCE flush path.
 #[derive(Debug)]
-pub(crate) struct NVMemory {
+pub(crate) struct DaxPmemMemory {
     region: TMemoryRegion,
-    persistence_mode: block_region::PersistenceMode,
+    backing: TMemoryDaxPmemBacking,
     granules: Vec<TMemoryGranuleInfo>,
     byte_len: usize,
     byte_capacity: usize,
     max_pages: u64,
 }
 
-impl NVMemory {
+impl DaxPmemMemory {
     pub(crate) fn new(min_pages: u64, max_pages: Option<u64>) -> Result<Self> {
-        Self::new_with_persistence_mode(
+        Self::new_with_backing(
             min_pages,
             max_pages,
-            TMemoryPersistenceMode::ResearchPretendPmem,
+            TMemoryPersistenceMode::ResearchPretendDaxPmem,
+            TMemoryDaxPmemBacking::ResearchTemp,
         )
     }
 
-    pub(crate) fn new_with_persistence_mode(
+    pub(crate) fn new_with_backing(
         min_pages: u64,
         max_pages: Option<u64>,
         persistence_mode: TMemoryPersistenceMode,
+        backing: TMemoryDaxPmemBacking,
     ) -> Result<Self> {
+        ensure!(
+            matches!(
+                (&persistence_mode, &backing),
+                (
+                    TMemoryPersistenceMode::ResearchPretendDaxPmem,
+                    TMemoryDaxPmemBacking::ResearchTemp
+                ) | (
+                    TMemoryPersistenceMode::RequireDaxPmem,
+                    TMemoryDaxPmemBacking::FsDaxPath(_)
+                ) | (
+                    TMemoryPersistenceMode::RequireDaxPmem,
+                    TMemoryDaxPmemBacking::ExistingFsDaxPath(_)
+                )
+            ),
+            "DAX PMEM persistence mode does not match backing"
+        );
         let requested_max_pages = max_pages;
         let max_pages = max_pages.unwrap_or(DEFAULT_MAX_WASM_PAGES);
         ensure!(min_pages <= max_pages, "tmemory minimum exceeds maximum");
         let byte_len = pages_to_bytes(min_pages)?;
-        let byte_capacity = match requested_max_pages {
+        let requested_byte_capacity = match requested_max_pages {
             Some(max_pages) => pages_to_bytes(max_pages)?,
             None => byte_len,
         };
 
+        let region = TMemoryRegion::new_dax_pmem(requested_byte_capacity, backing.clone())?;
+        let byte_capacity = if matches!(backing, TMemoryDaxPmemBacking::ExistingFsDaxPath(_)) {
+            region.logical_len().max(requested_byte_capacity)
+        } else {
+            requested_byte_capacity
+        };
         let granule_capacity = granules_for_bytes(byte_capacity);
-        let persistence_mode = block_region_persistence_mode(persistence_mode);
 
         Ok(Self {
-            region: TMemoryRegion::new_nvmemory(byte_capacity, persistence_mode)?,
-            persistence_mode,
+            region,
+            backing,
             granules: vec![TMemoryGranuleInfo::default(); granule_capacity],
             byte_len,
             byte_capacity,
@@ -814,6 +844,14 @@ impl NVMemory {
         let Ok(new_byte_len) = pages_to_bytes(new_pages) else {
             return false;
         };
+        if new_byte_len > self.byte_capacity
+            && matches!(
+                self.backing,
+                TMemoryDaxPmemBacking::FsDaxPath(_) | TMemoryDaxPmemBacking::ExistingFsDaxPath(_)
+            )
+        {
+            return false;
+        }
         new_byte_len >= self.byte_len
     }
 
@@ -827,19 +865,27 @@ impl NVMemory {
             return Ok(());
         }
 
-        let mut region = TMemoryRegion::new_nvmemory(new_byte_capacity, self.persistence_mode)?;
-        if self.byte_len > 0 {
-            let old = self.region.read(0, self.byte_len)?;
-            region.write(0, &old)?;
-            region.flush(0, self.byte_len)?;
-            region.fence()?;
+        match &self.backing {
+            TMemoryDaxPmemBacking::ResearchTemp => {
+                let mut region =
+                    TMemoryRegion::new_dax_pmem(new_byte_capacity, self.backing.clone())?;
+                if self.byte_len > 0 {
+                    let old = self.region.read(0, self.byte_len)?;
+                    region.write(0, &old)?;
+                    region.flush(0, self.byte_len)?;
+                    region.fence()?;
+                }
+                self.region = region;
+            }
+            TMemoryDaxPmemBacking::FsDaxPath(_) | TMemoryDaxPmemBacking::ExistingFsDaxPath(_) => {
+                bail!("DAX PMEM fsdax tmemory growth is not implemented yet")
+            }
         }
 
         let new_granule_capacity = granules_for_bytes(new_byte_capacity);
         self.granules
             .resize(new_granule_capacity, TMemoryGranuleInfo::default());
 
-        self.region = region;
         self.byte_capacity = new_byte_capacity;
         Ok(())
     }
@@ -860,22 +906,9 @@ impl NVMemory {
     }
 }
 
-fn block_region_persistence_mode(
-    persistence_mode: TMemoryPersistenceMode,
-) -> block_region::PersistenceMode {
-    match persistence_mode {
-        TMemoryPersistenceMode::ResearchPretendPmem => {
-            block_region::PersistenceMode::ResearchPretendPmem
-        }
-        TMemoryPersistenceMode::RequireHardwarePmem => {
-            block_region::PersistenceMode::RequireHardwarePmem
-        }
-    }
-}
-
-impl TMemoryBackendStorage for NVMemory {
+impl TMemoryBackendStorage for DaxPmemMemory {
     fn backend_kind(&self) -> TMemoryBackend {
-        TMemoryBackend::NVMemory
+        TMemoryBackend::DaxPmem
     }
 
     fn byte_len(&self) -> usize {
@@ -905,11 +938,11 @@ impl TMemoryBackendStorage for NVMemory {
     }
 
     fn can_grow_to_pages(&self, new_pages: u64) -> bool {
-        NVMemory::can_grow_to_pages(self, new_pages)
+        DaxPmemMemory::can_grow_to_pages(self, new_pages)
     }
 
     fn grow_to_pages(&mut self, new_pages: u64) -> Result<()> {
-        NVMemory::grow_to_pages(self, new_pages)
+        DaxPmemMemory::grow_to_pages(self, new_pages)
     }
 
     fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
@@ -1339,11 +1372,20 @@ mod tests {
     }
 
     #[test]
-    fn tmemory_can_construct_nvmemory_in_research_mode() {
-        let memory =
-            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+    fn tmemory_can_construct_dax_pmem_in_research_mode() {
+        let memory = TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, Some(1)).unwrap();
 
-        assert_eq!(memory.backend(), TMemoryBackend::NVMemory);
+        assert_eq!(memory.backend(), TMemoryBackend::DaxPmem);
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
+        assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE);
+    }
+
+    #[test]
+    fn tmemory_can_construct_dax_pmem_research_backend_from_config() {
+        let config = TransactionConfig::with_tmemory_backend(TMemoryBackend::DaxPmem).unwrap();
+        let memory = TMemory::new(config, 1, Some(1)).unwrap();
+
+        assert_eq!(memory.backend(), TMemoryBackend::DaxPmem);
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
         assert_eq!(memory.granule_len(), GRANULES_PER_WASM_PAGE);
     }
@@ -1404,9 +1446,9 @@ mod tests {
     }
 
     #[test]
-    fn nvmemory_commit_range_writes_and_versions_granules() {
+    fn dax_pmem_commit_range_writes_and_versions_granules() {
         let mut memory =
-            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, Some(1)).unwrap();
 
         memory.commit_range(4, &[10, 11, 12, 13]).unwrap();
 
@@ -1415,9 +1457,9 @@ mod tests {
     }
 
     #[test]
-    fn nvmemory_prepare_undo_record_does_not_publish_or_write() {
+    fn dax_pmem_prepare_undo_record_does_not_publish_or_write() {
         let mut memory =
-            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, Some(1)).unwrap();
         memory.commit_range(0, &[1, 2, 3, 4]).unwrap();
 
         let undo = memory
@@ -1447,7 +1489,7 @@ mod tests {
     #[test]
     fn recovered_tmemory_undo_rollbacks_restore_base_bytes() {
         let mut memory =
-            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, Some(1)).unwrap();
         memory.commit_range(0, &[9, 9, 9, 9]).unwrap();
         let rollback = recovery::RecoveredTMemoryUndoRollback {
             logical_id: pack_tmemory_granule_id(Some(3), 0, 0).unwrap(),
@@ -1468,7 +1510,7 @@ mod tests {
     #[test]
     fn recovered_tmemory_undo_rollbacks_choose_oldest_version_for_same_granule() {
         let mut memory =
-            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1)).unwrap();
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, Some(1)).unwrap();
         memory.commit_range(0, &[9, 9, 9, 9]).unwrap();
         let logical_id = pack_tmemory_granule_id(Some(3), 0, 0).unwrap();
         let older = recovery::RecoveredTMemoryUndoRollback {
@@ -1572,9 +1614,9 @@ mod tests {
     }
 
     #[test]
-    fn nvmemory_direct_constructor_with_limits_reserves_capacity_and_grows() {
+    fn dax_pmem_direct_constructor_with_limits_reserves_capacity_and_grows() {
         let mut memory =
-            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(2)).unwrap();
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, Some(2)).unwrap();
 
         assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
         assert_eq!(memory.byte_capacity(), WASM_PAGE_SIZE * 2);
@@ -1620,9 +1662,9 @@ mod tests {
     }
 
     #[test]
-    fn nvmemory_grow_beyond_capacity_preserves_bytes_and_granule_metadata() {
+    fn dax_pmem_grow_beyond_capacity_preserves_bytes_and_granule_metadata() {
         let mut memory =
-            TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, None).unwrap();
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, None).unwrap();
         memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
         let mut info = memory.granule_info(0).unwrap();
         info.owner = 7;
@@ -1749,7 +1791,7 @@ mod tests {
         let path = dir.path().join("existing-undersized.tmemory");
         std::fs::File::create(&path)
             .unwrap()
-            .set_len(WASM_PAGE_SIZE as u64)
+            .set_len((WASM_PAGE_SIZE - 1) as u64)
             .unwrap();
 
         let config = TransactionConfig::with_file_backed_tmemory_existing_path(path).unwrap();
@@ -1844,41 +1886,83 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn nvmemory_hardware_pmem_mode_is_reachable_from_transaction_config() {
-        let config = TransactionConfig::with_nvmemory_persistence_mode(
-            TMemoryPersistenceMode::RequireHardwarePmem,
-        )
-        .unwrap();
-        let result = TMemory::new(config, 1, Some(1));
+    fn dax_pmem_fsdax_path_rejects_non_dax_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-dax.tmemory");
+        let config = TransactionConfig::with_dax_pmem_fsdax_path(path).unwrap();
+        let error = TMemory::new(config, 1, Some(1)).unwrap_err().to_string();
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            if block_region::PersistEngine::hardware_flush_available() {
-                let memory = result.unwrap();
-                assert_eq!(memory.backend(), TMemoryBackend::NVMemory);
-            } else {
-                let error = result.unwrap_err().to_string();
-                assert!(error.contains("CLWB"));
-            }
-        }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let error = result.unwrap_err().to_string();
-            assert!(error.contains("NVMemory is unsupported"));
-        }
+        assert!(
+            error.contains("does not have the DAX inode attribute")
+                || error.contains("failed to statx DAX PMEM fsdax path"),
+            "{error}"
+        );
     }
 
     #[test]
-    #[ignore = "requires real PMEM hardware and WASMTIME_TEST_REAL_PMEM=1"]
-    fn nvmemory_requires_real_pmem_for_restart_persistence() {
+    fn dax_pmem_fsdax_growth_is_explicitly_unsupported_for_now() {
+        let mut memory = DaxPmemMemory::new(1, None).unwrap();
+        memory.backing = TMemoryDaxPmemBacking::FsDaxPath(std::path::PathBuf::from(
+            "/tmp/not-real-dax-for-growth-test",
+        ));
+
+        assert!(!memory.can_grow_to_pages(2));
+        let error = memory.grow_to_pages(2).unwrap_err().to_string();
+        assert!(
+            error.contains("DAX PMEM fsdax tmemory growth is not implemented yet"),
+            "{error}"
+        );
+    }
+
+    fn real_pmem_test_path(file_name: &str) -> Option<std::path::PathBuf> {
         if std::env::var_os("WASMTIME_TEST_REAL_PMEM").is_none() {
-            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 on a PMEM machine to run this test");
+            return None;
+        }
+        let root = std::env::var_os("WASMTIME_TEST_DAX_PMEM_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/pmem0/wasmtime-dcpmm"));
+        Some(root.join(file_name))
+    }
+
+    #[test]
+    #[ignore = "requires real fsdax PMEM and WASMTIME_TEST_REAL_PMEM=1"]
+    fn dax_pmem_fsdax_commit_survives_reopen() {
+        let Some(path) = real_pmem_test_path("dax-pmem-reopen.tmemory") else {
+            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 to run this test");
             return;
+        };
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let config = TransactionConfig::with_dax_pmem_fsdax_path(path.clone()).unwrap();
+            let mut memory = TMemory::new(config, 1, Some(16)).unwrap();
+            memory
+                .commit_staged_tmemory_granule(0, &[0x5a; TMEMORY_GRANULE_SIZE])
+                .unwrap();
         }
 
-        panic!("real PMEM restart recovery test is not implemented in this backend wave");
+        {
+            let config =
+                TransactionConfig::with_dax_pmem_existing_fsdax_path(path.clone()).unwrap();
+            let mut memory = TMemory::new(config, 1, Some(1)).unwrap();
+            assert_eq!(memory.read_committed(0..4).unwrap(), vec![0x5a; 4]);
+            assert!(memory.byte_capacity() >= 16 * WASM_PAGE_SIZE);
+            assert!(!memory.can_grow_to_pages(16));
+            assert!(memory.grow_to_pages(16).is_err());
+        }
+
+        {
+            let config =
+                TransactionConfig::with_dax_pmem_existing_fsdax_path(path.clone()).unwrap();
+            let memory = TMemory::new(config, 0, None).unwrap();
+            assert_eq!(memory.byte_len(), 0);
+            assert!(memory.byte_capacity() >= 16 * WASM_PAGE_SIZE);
+            assert!(memory.can_grow_to_pages(16));
+        }
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

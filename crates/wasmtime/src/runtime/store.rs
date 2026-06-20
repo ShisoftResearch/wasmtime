@@ -486,7 +486,7 @@ pub struct StoreOpaque {
     #[allow(dead_code)]
     transaction_state: TransactionState,
     transaction_config: TransactionConfig,
-    file_backed_tmemory_count: usize,
+    path_backed_tmemory_count: usize,
     #[allow(dead_code)]
     transaction_object_table: ObjectTable,
     transaction_region_runtime: TransactionRegionRuntime,
@@ -791,7 +791,7 @@ impl<T> Store<T> {
             host_globals: TryPrimaryMap::new(),
             transaction_state: TransactionState::default(),
             transaction_config: TransactionConfig::default(),
-            file_backed_tmemory_count: 0,
+            path_backed_tmemory_count: 0,
             transaction_object_table: ObjectTable::default(),
             transaction_region_runtime: TransactionRegionRuntime::default(),
             transaction_durable_refs: DurableReferenceRegistry::default(),
@@ -2883,7 +2883,7 @@ at https://bytecodealliance.org/security.
         imports: Imports<'_>,
     ) -> Result<InstanceId> {
         let defined_tmemories = count_defined_tmemories(runtime_info.env_module());
-        self.ensure_file_backed_tmemory_capacity(defined_tmemories)?;
+        self.ensure_path_backed_tmemory_capacity(defined_tmemories)?;
         self.instances.reserve(1)?;
 
         let id = self.instances.next_key();
@@ -2936,38 +2936,40 @@ at https://bytecodealliance.org/security.
         // double-check we didn't accidentally allocate two instances and our
         // prediction of what the id would be is indeed the id it should be.
         assert_eq!(id, actual);
-        self.record_file_backed_tmemories(defined_tmemories)?;
+        self.record_path_backed_tmemories(defined_tmemories)?;
 
         Ok(id)
     }
 
-    fn ensure_file_backed_tmemory_capacity(&self, defined_tmemories: usize) -> Result<()> {
-        if self.transaction_config.tmemory_backend() != TMemoryBackend::FileBackedMemory
-            || defined_tmemories == 0
-        {
+    fn ensure_path_backed_tmemory_capacity(&self, defined_tmemories: usize) -> Result<()> {
+        let single_path_backed_tmemory = self.transaction_config.tmemory_backend()
+            == TMemoryBackend::FileBackedMemory
+            || self.transaction_config.has_path_backed_dax_pmem_tmemory();
+        if !single_path_backed_tmemory || defined_tmemories == 0 {
             return Ok(());
         }
         let total = self
-            .file_backed_tmemory_count
+            .path_backed_tmemory_count
             .checked_add(defined_tmemories)
-            .context("file-backed tmemory count overflow")?;
+            .context("path-backed tmemory count overflow")?;
         ensure!(
             total <= 1,
-            "file-backed tmemory supports one transactional memory for now; found {total} across this store"
+            "file-backed tmemory or path-backed DAX PMEM tmemory supports one transactional memory for now; found {total} across this store"
         );
         Ok(())
     }
 
-    fn record_file_backed_tmemories(&mut self, defined_tmemories: usize) -> Result<()> {
-        if self.transaction_config.tmemory_backend() != TMemoryBackend::FileBackedMemory
-            || defined_tmemories == 0
-        {
+    fn record_path_backed_tmemories(&mut self, defined_tmemories: usize) -> Result<()> {
+        let single_path_backed_tmemory = self.transaction_config.tmemory_backend()
+            == TMemoryBackend::FileBackedMemory
+            || self.transaction_config.has_path_backed_dax_pmem_tmemory();
+        if !single_path_backed_tmemory || defined_tmemories == 0 {
             return Ok(());
         }
-        self.file_backed_tmemory_count = self
-            .file_backed_tmemory_count
+        self.path_backed_tmemory_count = self
+            .path_backed_tmemory_count
             .checked_add(defined_tmemories)
-            .context("file-backed tmemory count overflow")?;
+            .context("path-backed tmemory count overflow")?;
         Ok(())
     }
 
@@ -3514,6 +3516,36 @@ mod tests {
             .to_string();
 
         assert!(error.contains("file-backed tmemory"));
+        assert!(error.contains("one transactional memory"));
+    }
+
+    #[cfg(all(feature = "transaction", unix, has_virtual_memory))]
+    #[test]
+    fn dax_pmem_fsdax_transaction_storage_rejects_multiple_tmemories() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("dax-pmem.tmemory");
+        let engine = Engine::default();
+        let module = Module::new(
+            &engine,
+            wat::parse_str(
+                r#"
+                (module
+                  (tmemory 1)
+                  (tmemory 1))
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = Store::new(&engine, ());
+        store.as_store_opaque().transaction_config =
+            TransactionConfig::with_dax_pmem_fsdax_path(tmemory_path).unwrap();
+
+        let error = Instance::new(&mut store, &module, &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("path-backed DAX PMEM tmemory"));
         assert!(error.contains("one transactional memory"));
     }
 

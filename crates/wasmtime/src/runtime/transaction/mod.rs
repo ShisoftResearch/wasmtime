@@ -52,7 +52,8 @@ use config::ConcurrencyControl;
 #[cfg(test)]
 use config::{ConflictPolicy, DurabilityPolicy, ObjectIndexPersistencePolicy};
 pub(crate) use config::{
-    TMemoryBackend, TMemoryFileBacking, TMemoryPersistenceMode, TransactionConfig,
+    TMemoryBackend, TMemoryDaxPmemBacking, TMemoryFileBacking, TMemoryPersistenceMode,
+    TransactionConfig,
 };
 pub(crate) use granule::{
     GranuleId, TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,

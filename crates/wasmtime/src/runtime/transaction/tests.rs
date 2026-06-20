@@ -2683,8 +2683,10 @@ fn default_transaction_config_uses_minimal_vmemory_runtime() {
     assert_eq!(config.tmemory_backend(), TMemoryBackend::VMemory);
     assert_eq!(
         config.tmemory_persistence_mode(),
-        TMemoryPersistenceMode::ResearchPretendPmem
+        TMemoryPersistenceMode::ResearchPretendDaxPmem
     );
+    assert_eq!(config.tmemory_file_backing(), None);
+    assert_eq!(config.tmemory_dax_pmem_backing(), None);
     assert_eq!(
         config.concurrency_control(),
         ConcurrencyControl::default_for_build()
@@ -2785,30 +2787,61 @@ fn generic_file_backed_backend_selection_still_requires_file_mode() {
 }
 
 #[test]
-fn transaction_config_accepts_nvmemory_backend() {
-    let config = TransactionConfig::with_tmemory_backend(TMemoryBackend::NVMemory).unwrap();
+fn transaction_config_accepts_dax_pmem_backend() {
+    let config = TransactionConfig::with_tmemory_backend(TMemoryBackend::DaxPmem).unwrap();
 
-    assert_eq!(config.tmemory_backend(), TMemoryBackend::NVMemory);
+    assert_eq!(config.tmemory_backend(), TMemoryBackend::DaxPmem);
+    assert_eq!(
+        config.tmemory_dax_pmem_backing(),
+        Some(TMemoryDaxPmemBacking::ResearchTemp)
+    );
     assert_eq!(
         config.tmemory_persistence_mode(),
-        TMemoryPersistenceMode::ResearchPretendPmem
+        TMemoryPersistenceMode::ResearchPretendDaxPmem
     );
     assert!(!config.is_vmemory_only());
+    assert!(!config.has_path_backed_dax_pmem_tmemory());
+    assert!(!config.has_existing_dax_pmem_tmemory());
 }
 
 #[test]
-fn transaction_config_accepts_nvmemory_hardware_persistence_mode() {
-    let config = TransactionConfig::with_nvmemory_persistence_mode(
-        TMemoryPersistenceMode::RequireHardwarePmem,
-    )
-    .unwrap();
+fn transaction_config_accepts_dax_pmem_fsdax_path() {
+    let path = std::path::PathBuf::from("/pmem0/wasmtime-dcpmm/test.tmemory");
+    let config = TransactionConfig::with_dax_pmem_fsdax_path(path.clone()).unwrap();
 
-    assert_eq!(config.tmemory_backend(), TMemoryBackend::NVMemory);
+    assert_eq!(config.tmemory_backend(), TMemoryBackend::DaxPmem);
+    assert_eq!(
+        config.tmemory_dax_pmem_backing(),
+        Some(TMemoryDaxPmemBacking::FsDaxPath(path))
+    );
     assert_eq!(
         config.tmemory_persistence_mode(),
-        TMemoryPersistenceMode::RequireHardwarePmem
+        TMemoryPersistenceMode::RequireDaxPmem
     );
     assert!(!config.is_vmemory_only());
+    assert!(config.has_path_backed_dax_pmem_tmemory());
+    assert!(!config.has_existing_dax_pmem_tmemory());
+}
+
+#[test]
+fn transaction_config_marks_existing_dax_pmem_fsdax_path_as_path_backed() {
+    let path = std::path::PathBuf::from("/pmem0/wasmtime-dcpmm/existing.tmemory");
+    let config = TransactionConfig::with_dax_pmem_existing_fsdax_path(path).unwrap();
+
+    assert!(config.has_path_backed_dax_pmem_tmemory());
+    assert!(config.has_existing_dax_pmem_tmemory());
+}
+
+#[test]
+fn transaction_config_rejects_empty_dax_pmem_fsdax_path() {
+    let error = TransactionConfig::with_dax_pmem_fsdax_path(std::path::PathBuf::new())
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("DAX PMEM fsdax path cannot be empty"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4200,9 +4233,9 @@ fn transaction_commit_copies_staged_granules_to_tmemory() {
 }
 
 #[test]
-fn transaction_commit_uses_persistent_tmemory_undo_for_nvmemory() {
+fn transaction_commit_uses_persistent_tmemory_undo_for_dax_pmem() {
     let mut tmemory =
-        crate::runtime::vm::TMemory::new_with_backend_limits(TMemoryBackend::NVMemory, 1, Some(1))
+        crate::runtime::vm::TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, Some(1))
             .expect("tmemory");
     tmemory.commit_range(0, &[1, 2, 3, 4]).unwrap();
     let mut state = TransactionState::new_for_test(TransactionId::from_raw(12));
