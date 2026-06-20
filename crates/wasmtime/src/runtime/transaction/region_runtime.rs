@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
-use super::concurrency::{LockBasedConflictKind, TransactionConflictAction};
+use super::concurrency::TransactionConflictAction;
 use super::state::PersistentRootDelta;
 use super::{
     ConcurrencyControlState, GranuleId, ObjectId, PersistentRootKey, TMemoryFileBacking,
@@ -752,12 +752,11 @@ impl TransactionRegionRuntime {
         {
             return Ok(());
         }
-        let kind = if is_write {
-            LockBasedConflictKind::WriteOwnedByOther
+        if is_write {
+            bail!("transaction write conflict: granule is owned by another transaction")
         } else {
-            LockBasedConflictKind::ReadOwnedByOther
-        };
-        bail!(kind.message())
+            bail!("transaction read conflict: granule is owned by another transaction")
+        }
     }
 
     #[cfg(test)]

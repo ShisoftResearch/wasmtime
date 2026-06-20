@@ -26,14 +26,28 @@ mod state;
 pub(crate) mod type_layout;
 mod wasmtime_layout;
 use concurrency::ConcurrencyControlState;
-#[cfg(test)]
-use concurrency::{
-    LockBased, LockBasedConflictKindForTest, LockBasedSnapshotForTest, NoWaitAbort,
-    NoWaitAbortConflictKindForTest, OptimisticValidation, OptimisticValidationConflictKindForTest,
-    StrictTwoPhaseLocking, StrictTwoPhaseLockingConflictKindForTest, TimestampOrdering,
-    TimestampOrderingConflictKindForTest, TransactionConcurrencyControl, WaitDie,
-    WaitDieConflictKindForTest, WoundWait, WoundWaitConflictKindForTest,
-};
+#[cfg(all(
+    test,
+    any(
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-wound-wait"
+    )
+))]
+use concurrency::TransactionConcurrencyControl;
+#[cfg(all(test, feature = "transaction-cc-lockbased"))]
+use concurrency::{LockBased, LockBasedConflictKindForTest, LockBasedSnapshotForTest};
+#[cfg(all(test, feature = "transaction-cc-nowait-abort"))]
+use concurrency::{NoWaitAbort, NoWaitAbortConflictKindForTest};
+#[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+use concurrency::{OptimisticValidation, OptimisticValidationConflictKindForTest};
+#[cfg(all(test, feature = "transaction-cc-strict-2pl"))]
+use concurrency::{StrictTwoPhaseLocking, StrictTwoPhaseLockingConflictKindForTest};
+#[cfg(all(test, feature = "transaction-cc-timestamp-ordering"))]
+use concurrency::{TimestampOrdering, TimestampOrderingConflictKindForTest};
+#[cfg(all(test, feature = "transaction-cc-wait-die"))]
+use concurrency::{WaitDie, WaitDieConflictKindForTest};
+#[cfg(all(test, feature = "transaction-cc-wound-wait"))]
+use concurrency::{WoundWait, WoundWaitConflictKindForTest};
 use config::ConcurrencyControl;
 #[cfg(test)]
 use config::{ConflictPolicy, DurabilityPolicy, ObjectIndexPersistencePolicy};

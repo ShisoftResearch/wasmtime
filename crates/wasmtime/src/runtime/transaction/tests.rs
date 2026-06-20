@@ -239,10 +239,12 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
     clear_current_thread_transaction_for_test();
 
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
-    let barrier = Arc::new(Barrier::new(2));
+    let ready_barrier = Arc::new(Barrier::new(2));
+    let segment_barrier = Arc::new(Barrier::new(2));
 
     let spawn_commit = |runtime: TransactionRegionRuntime,
-                        barrier: Arc<Barrier>,
+                        ready_barrier: Arc<Barrier>,
+                        segment_barrier: Arc<Barrier>,
                         addr: u64,
                         new_bytes: [u8; 4]|
      -> thread::JoinHandle<(u32, u32, Vec<crate::vm::TxLogEntry>)> {
@@ -265,7 +267,7 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
                 .stage_tmemory_write_for_test(0, 0, addr, &new_bytes, &tmemory)
                 .unwrap();
 
-            barrier.wait();
+            ready_barrier.wait();
 
             let stream_id = runtime
                 .current_thread_log_segment_for_test()
@@ -273,6 +275,7 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
                 .stream_id();
             let txid = u32::try_from(transaction.as_raw()).unwrap();
             assert_ne!(stream_id, txid);
+            segment_barrier.wait();
             assert!(state.commit_tmemory_for_test(&mut tmemory).unwrap());
             let entries = state.durable_log_entries_for_test(stream_id);
             state.clear_active().unwrap();
@@ -281,10 +284,17 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
         })
     };
 
-    let first = spawn_commit(runtime.clone(), barrier.clone(), 0, [1, 2, 3, 4]);
+    let first = spawn_commit(
+        runtime.clone(),
+        ready_barrier.clone(),
+        segment_barrier.clone(),
+        0,
+        [1, 2, 3, 4],
+    );
     let second = spawn_commit(
         runtime.clone(),
-        barrier,
+        ready_barrier,
+        segment_barrier,
         u64::try_from(TMEMORY_GRANULE_SIZE).unwrap(),
         [5, 6, 7, 8],
     );
@@ -2712,6 +2722,24 @@ fn transaction_config_default_concurrency_is_nowait_abort_under_feature() {
 }
 
 #[test]
+fn transaction_config_rejects_uncompiled_concurrency_control() {
+    let selected = ConcurrencyControl::default_for_build();
+    let uncompiled = match selected {
+        ConcurrencyControl::LockBased => ConcurrencyControl::NoWaitAbort,
+        _ => ConcurrencyControl::LockBased,
+    };
+
+    let error = TransactionConfig::with_concurrency_control(uncompiled).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("is not compiled into this build"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn transaction_config_rejects_generic_file_backed_backend_selection() {
     assert!(
         TransactionConfig::with_tmemory_backend(TMemoryBackend::VMemory)
@@ -2834,9 +2862,10 @@ fn commit_success_policy_hook_preserves_default_commit_behavior() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn complete_commit_calls_policy_commit_success_hook() {
     let mut state = TransactionState::default();
-    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased);
+    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased).unwrap();
     let transaction = state.begin().unwrap();
 
     state.stage_global(0, GlobalSnapshot::I32(7)).unwrap();
@@ -2850,9 +2879,10 @@ fn complete_commit_calls_policy_commit_success_hook() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn abort_does_not_call_policy_commit_success_hook() {
     let mut state = TransactionState::default();
-    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased);
+    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased).unwrap();
     state.begin().unwrap();
 
     state.stage_global(0, GlobalSnapshot::I32(7)).unwrap();
@@ -2869,9 +2899,10 @@ fn abort_does_not_call_policy_commit_success_hook() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn commit_success_policy_hook_error_clears_active_transaction() {
     let mut state = TransactionState::default();
-    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased);
+    state.concurrency = ConcurrencyControlState::for_config(ConcurrencyControl::LockBased).unwrap();
     let transaction = state.begin().unwrap();
 
     state.stage_global(0, GlobalSnapshot::I32(7)).unwrap();
@@ -3284,6 +3315,7 @@ fn fail_releases_lock_based_ownership_for_next_transaction() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_transaction_ids_keep_separate_workspaces() {
     clear_current_thread_transaction_for_test();
     let mut state = TransactionState::default();
@@ -8362,6 +8394,7 @@ mod transaction_active {
     }
 }
 
+#[cfg(feature = "transaction-cc-lockbased")]
 mod model_lock_based {
     use super::*;
     use proptest::prelude::*;
@@ -9654,15 +9687,12 @@ mod model_permissions {
                 "permission downgrade should preserve read permission for {granule:?}"
             );
             if transaction_cc_is_ownerless_multiwriter() {
-                match &mut state.concurrency {
-                    ConcurrencyControlState::OptimisticValidation(policy) => {
-                        policy.write_versions.remove(&(transaction, granule));
-                    }
-                    ConcurrencyControlState::TimestampOrdering(policy) => {
-                        policy.write_versions.remove(&(transaction, granule));
-                    }
-                    _ => unreachable!("ownerless transaction-cc feature should select that policy"),
-                }
+                ensure!(
+                    state
+                        .concurrency
+                        .remove_write_version_for_test(transaction, granule),
+                    "ownerless permission downgrade expected tx {transaction:?} to have a write version for {granule:?}"
+                );
             } else {
                 ensure!(
                     state.concurrency.remove_owner_for_granule_for_test(granule)
@@ -15480,6 +15510,7 @@ fn object_set<const N: usize>(objects: [ObjectId; N]) -> BTreeSet<ObjectId> {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_allows_shared_reads_and_writer_upgrade() {
     let mut locks = LockBased::default();
     let first = TransactionId::from_raw(1);
@@ -15496,6 +15527,7 @@ fn lock_based_allows_shared_reads_and_writer_upgrade() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_writer_excludes_other_transactions() {
     let mut locks = LockBased::default();
     let first = TransactionId::from_raw(1);
@@ -15520,6 +15552,7 @@ fn lock_based_writer_excludes_other_transactions() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_conflicts_are_released_on_abort() {
     let mut locks = LockBased::default();
     let first = TransactionId(1);
@@ -15534,6 +15567,7 @@ fn lock_based_conflicts_are_released_on_abort() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_supports_upgrade_and_release() {
     let mut locks = LockBased::default();
     let first = TransactionId(1);
@@ -15547,6 +15581,7 @@ fn lock_based_supports_upgrade_and_release() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_write_conflict_aborts_current_transaction() {
     let mut locks = LockBased::default();
     let first = TransactionId::from_raw(1);
@@ -15580,6 +15615,7 @@ fn lock_based_write_conflict_aborts_current_transaction() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_validates_optimistic_reads_at_commit() {
     let mut locks = LockBased::default();
     let reader = TransactionId::from_raw(1);
@@ -15601,6 +15637,7 @@ fn lock_based_validates_optimistic_reads_at_commit() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_abort_releases_owned_granules() {
     let mut locks = LockBased::default();
     let transaction = TransactionId::from_raw(1);
@@ -15621,6 +15658,7 @@ fn lock_based_abort_releases_owned_granules() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
 fn no_wait_abort_allows_shared_reads_and_writer_upgrade() {
     let mut locks = NoWaitAbort::default();
     let first = TransactionId::from_raw(1);
@@ -15637,6 +15675,7 @@ fn no_wait_abort_allows_shared_reads_and_writer_upgrade() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
 fn no_wait_abort_writer_excludes_other_transactions_without_preemption() {
     let mut locks = NoWaitAbort::default();
     let older = TransactionId::from_raw(1);
@@ -15665,6 +15704,7 @@ fn no_wait_abort_writer_excludes_other_transactions_without_preemption() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
 fn no_wait_abort_validates_optimistic_reads_at_commit() {
     let mut locks = NoWaitAbort::default();
     let reader = TransactionId::from_raw(1);
@@ -15686,6 +15726,7 @@ fn no_wait_abort_validates_optimistic_reads_at_commit() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-nowait-abort")]
 fn no_wait_abort_abort_releases_owned_granules() {
     let mut locks = NoWaitAbort::default();
     let transaction = TransactionId::from_raw(1);
@@ -15706,6 +15747,7 @@ fn no_wait_abort_abort_releases_owned_granules() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
 fn wound_wait_older_writer_wounds_younger_owner() {
     let mut policy = WoundWait::default();
     let older = TransactionId::from_raw(1);
@@ -15724,6 +15766,7 @@ fn wound_wait_older_writer_wounds_younger_owner() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
 fn wound_wait_older_reader_wounds_younger_writer() {
     let mut policy = WoundWait::default();
     let older = TransactionId::from_raw(1);
@@ -15743,6 +15786,7 @@ fn wound_wait_older_reader_wounds_younger_writer() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
 fn wound_wait_younger_requester_conflicts_with_older_owner() {
     let mut policy = WoundWait::default();
     let older = TransactionId::from_raw(1);
@@ -15767,6 +15811,7 @@ fn wound_wait_younger_requester_conflicts_with_older_owner() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
 fn wound_wait_validates_optimistic_reads_at_commit() {
     let mut policy = WoundWait::default();
     let reader = TransactionId::from_raw(1);
@@ -15788,6 +15833,7 @@ fn wound_wait_validates_optimistic_reads_at_commit() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
 fn wound_wait_rejects_write_after_stale_read_version() {
     let mut policy = WoundWait::default();
     let transaction = TransactionId::from_raw(1);
@@ -15808,6 +15854,7 @@ fn wound_wait_rejects_write_after_stale_read_version() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
 fn wound_wait_refreshes_read_version_after_wounding_owner() {
     let mut policy = WoundWait::default();
     let older = TransactionId::from_raw(1);
@@ -15829,6 +15876,7 @@ fn wound_wait_refreshes_read_version_after_wounding_owner() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wait-die")]
 fn wait_die_older_requester_would_wait_for_younger_owner() {
     let mut policy = WaitDie::default();
     let older = TransactionId::from_raw(1);
@@ -15850,6 +15898,7 @@ fn wait_die_older_requester_would_wait_for_younger_owner() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wait-die")]
 fn wait_die_younger_requester_dies_against_older_owner() {
     let mut policy = WaitDie::default();
     let older = TransactionId::from_raw(1);
@@ -15870,6 +15919,7 @@ fn wait_die_younger_requester_dies_against_older_owner() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wait-die")]
 fn wait_die_validates_optimistic_reads_at_commit() {
     let mut policy = WaitDie::default();
     let reader = TransactionId::from_raw(1);
@@ -15891,6 +15941,7 @@ fn wait_die_validates_optimistic_reads_at_commit() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-wait-die")]
 fn wait_die_rejects_write_after_stale_read_version() {
     let mut policy = WaitDie::default();
     let transaction = TransactionId::from_raw(1);
@@ -15911,6 +15962,7 @@ fn wait_die_rejects_write_after_stale_read_version() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-strict-2pl")]
 fn strict_2pl_allows_multiple_readers_and_blocks_writer() {
     let mut policy = StrictTwoPhaseLocking::default();
     let first = TransactionId::from_raw(1);
@@ -15935,6 +15987,7 @@ fn strict_2pl_allows_multiple_readers_and_blocks_writer() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-strict-2pl")]
 fn strict_2pl_upgrades_only_for_sole_reader() {
     let mut policy = StrictTwoPhaseLocking::default();
     let transaction = TransactionId::from_raw(1);
@@ -15955,6 +16008,7 @@ fn strict_2pl_upgrades_only_for_sole_reader() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-strict-2pl")]
 fn strict_2pl_reader_conflicts_with_active_writer() {
     let mut policy = StrictTwoPhaseLocking::default();
     let writer = TransactionId::from_raw(1);
@@ -15977,6 +16031,7 @@ fn strict_2pl_reader_conflicts_with_active_writer() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-optimistic-validation")]
 fn optimistic_validation_records_writes_without_ownership() {
     let mut policy = OptimisticValidation::default();
     let transaction = TransactionId::from_raw(1);
@@ -15997,6 +16052,7 @@ fn optimistic_validation_records_writes_without_ownership() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-optimistic-validation")]
 fn optimistic_validation_rejects_changed_write_version() {
     let mut policy = OptimisticValidation::default();
     let transaction = TransactionId::from_raw(1);
@@ -16018,6 +16074,7 @@ fn optimistic_validation_rejects_changed_write_version() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-timestamp-ordering")]
 fn timestamp_ordering_rejects_write_older_than_read_timestamp() {
     let mut policy = TimestampOrdering::default();
     let older = TransactionId::from_raw(1);
@@ -16040,6 +16097,7 @@ fn timestamp_ordering_rejects_write_older_than_read_timestamp() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-timestamp-ordering")]
 fn timestamp_ordering_committed_write_advances_write_timestamp() {
     let mut policy = TimestampOrdering::default();
     let transaction = TransactionId::from_raw(2);
@@ -16058,6 +16116,7 @@ fn timestamp_ordering_committed_write_advances_write_timestamp() {
 }
 
 #[test]
+#[cfg(feature = "transaction-cc-timestamp-ordering")]
 fn timestamp_ordering_aborted_write_does_not_advance_write_timestamp() {
     let mut policy = TimestampOrdering::default();
     let transaction = TransactionId::from_raw(2);
@@ -16214,19 +16273,16 @@ fn transaction_concurrency_control_trait_covers_runtime_policy_contract() {
         assert_eq!(policy.owner_for_granule(result_release_write_granule), None);
     }
 
-    assert_contract(&mut LockBased::default(), true);
-    assert_contract(&mut NoWaitAbort::default(), true);
-    assert_contract(&mut StrictTwoPhaseLocking::default(), true);
-    assert_contract(&mut WaitDie::default(), true);
-    assert_contract(&mut WoundWait::default(), true);
-    assert_contract(&mut OptimisticValidation::default(), false);
-    assert_contract(&mut TimestampOrdering::default(), false);
+    assert_contract(
+        &mut ConcurrencyControlState::default(),
+        !transaction_cc_is_ownerless_multiwriter(),
+    );
 }
 
 #[test]
 #[cfg(feature = "transaction-cc-nowait-abort")]
 fn selected_concurrency_control_uses_nowait_abort_semantics() {
-    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::NoWaitAbort);
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::NoWaitAbort).unwrap();
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
     let granule = GranuleId::TMemory {
@@ -16247,7 +16303,7 @@ fn selected_concurrency_control_uses_nowait_abort_semantics() {
 #[test]
 #[cfg(feature = "transaction-cc-wound-wait")]
 fn selected_concurrency_control_uses_wound_wait_semantics() {
-    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::WoundWait);
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::WoundWait).unwrap();
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
     let granule = GranuleId::TMemory {
@@ -16266,7 +16322,7 @@ fn selected_concurrency_control_uses_wound_wait_semantics() {
 #[test]
 #[cfg(feature = "transaction-cc-wait-die")]
 fn selected_concurrency_control_uses_wait_die_would_wait_semantics() {
-    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::WaitDie);
+    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::WaitDie).unwrap();
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
     let granule = GranuleId::TMemory {
@@ -16288,7 +16344,8 @@ fn selected_concurrency_control_uses_wait_die_would_wait_semantics() {
 #[test]
 #[cfg(feature = "transaction-cc-strict-2pl")]
 fn selected_concurrency_control_uses_strict_2pl_semantics() {
-    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::StrictTwoPhaseLocking);
+    let mut policy =
+        ConcurrencyControlState::for_config(ConcurrencyControl::StrictTwoPhaseLocking).unwrap();
     let reader = TransactionId::from_raw(1);
     let writer = TransactionId::from_raw(2);
     let granule = GranuleId::TMemory {
@@ -16309,7 +16366,8 @@ fn selected_concurrency_control_uses_strict_2pl_semantics() {
 #[test]
 #[cfg(feature = "transaction-cc-optimistic-validation")]
 fn selected_concurrency_control_uses_optimistic_validation_semantics() {
-    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::OptimisticValidation);
+    let mut policy =
+        ConcurrencyControlState::for_config(ConcurrencyControl::OptimisticValidation).unwrap();
     let first = TransactionId::from_raw(1);
     let second = TransactionId::from_raw(2);
     let granule = GranuleId::TMemory {
@@ -16329,7 +16387,8 @@ fn selected_concurrency_control_uses_optimistic_validation_semantics() {
 #[test]
 #[cfg(feature = "transaction-cc-timestamp-ordering")]
 fn selected_concurrency_control_uses_timestamp_ordering_semantics() {
-    let mut policy = ConcurrencyControlState::for_config(ConcurrencyControl::TimestampOrdering);
+    let mut policy =
+        ConcurrencyControlState::for_config(ConcurrencyControl::TimestampOrdering).unwrap();
     let older = TransactionId::from_raw(1);
     let younger = TransactionId::from_raw(2);
     let granule = GranuleId::TMemory {

@@ -223,6 +223,15 @@ impl ConcurrencyControl {
             return Self::LockBased;
         }
     }
+
+    pub(crate) fn ensure_compiled_for_build(self) -> Result<()> {
+        let selected = Self::default_for_build();
+        ensure!(
+            self == selected,
+            "transaction concurrency-control policy {self:?} is not compiled into this build; selected policy is {selected:?}"
+        );
+        Ok(())
+    }
 }
 
 /// SHISOFT-TWASM-MOCK: durability policy selection is not yet public API.
@@ -391,6 +400,7 @@ impl TransactionConfig {
     }
 
     fn set_concurrency_control(&mut self, concurrency_control: ConcurrencyControl) -> Result<()> {
+        concurrency_control.ensure_compiled_for_build()?;
         self.concurrency_control = concurrency_control;
         Ok(())
     }
