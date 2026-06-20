@@ -4,7 +4,7 @@
 
 **Goal:** Rename and reshape the current `NVMemory` transaction-memory backend into a DAX PMEM backend that can run on Intel DCPMM fsdax today and remain suitable for CXL persistent memory later.
 
-**Architecture:** Use `DaxPmem` as the backend name, not `IntelDcpmm`, because the code depends on Linux DAX semantics rather than vendor-specific media. Extract the durable mapped-block-region logic into a reusable `MappedBlockRegion<M>` core, keep existing file-backed behavior on `FileBackedMapping`, and add `DaxPmemMapping` for fsdax files whose flush path is CLWB/SFENCE through `PersistEngine`. Normal tests use a research temp-file DAX-PMEM mode with no DAX requirement; real hardware tests require an fsdax path and `WASMTIME_TEST_REAL_PMEM=1`.
+**Architecture:** Use `DaxPmem` as the backend name, not `IntelDcpmm`, because the code depends on Linux DAX semantics rather than vendor-specific media. Extract the durable mapped-block-region logic into a reusable `MappedBlockRegion<M>` core, keep existing file-backed behavior on `FileBackedMapping`, and add `DaxPmemMapping` for fsdax files whose transaction flush/fence path is CLWB/SFENCE through `PersistEngine`. DAX PMEM may use filesystem syscalls for setup (`open`, `truncate`, `mmap`, remap), but the hot persistence path must not call `msync`, `fsync`, `sync_data`, or `sync_all`; this is the core point of the DCPMM/fsdax backend.
 
 **Tech Stack:** Rust, Linux fsdax, XFS `dax=always`, `mmap`, `statx` DAX attribute validation through `libc`, x86_64 CLWB/SFENCE, existing `rustix` mmap/param APIs, `cargo test`.
 
@@ -19,6 +19,8 @@
 - Use `/pmem0/wasmtime-dcpmm` and `/pmem1/wasmtime-dcpmm` only in ignored hardware tests.
 - Do not add PMDK/libpmem in this pass.
 - Validate real fsdax files on Linux with `statx` `STATX_ATTR_DAX` before allowing `RequireDaxPmem`.
+- Replace file-backed persistence syscalls in the DAX PMEM transaction path with CPU persistence primitives: `clwb` for dirty cache lines and `sfence` for the persistence barrier.
+- Keep `msync`, `sync_data`, and `sync_all` limited to `FileBackedMemory`; `DaxPmemMapping::flush` and `DaxPmemMapping::fence` must not delegate to `FileBackedMapping::flush`, `fence_data`, or `fence_all`.
 - Keep the existing transaction durable-log and recovery model unchanged except where names and mapped backend plumbing require updates.
 
 ## File Structure
@@ -78,25 +80,19 @@ grep -m1 -o clwb /proc/cpuinfo
 findmnt -T /pmem0/wasmtime-dcpmm -o TARGET,SOURCE,FSTYPE,OPTIONS
 findmnt -T /pmem1/wasmtime-dcpmm -o TARGET,SOURCE,FSTYPE,OPTIONS
 python3 - <<'"'"'PY'"'"'
-import mmap, os
+import os
 for d in ["/pmem0/wasmtime-dcpmm", "/pmem1/wasmtime-dcpmm"]:
     path = os.path.join(d, "wasmtime-plan-smoke.bin")
-    with open(path, "w+b") as f:
-        f.truncate(4096)
-        mm = mmap.mmap(f.fileno(), 4096, access=mmap.ACCESS_WRITE)
-        mm[64:68] = b"dax!"
-        mm.flush(0, 4096)
-        mm.close()
-        os.fsync(f.fileno())
+    with open(path, "wb") as f:
+        f.write(b"dax!")
     with open(path, "rb") as f:
-        f.seek(64)
         assert f.read(4) == b"dax!"
     os.remove(path)
-print("fsdax smoke ok")
+print("fsdax directory smoke ok")
 PY'
 ```
 
-Expected: `clwb`, both mounts show XFS with `dax=always`, and Python prints `fsdax smoke ok`.
+Expected: `clwb`, both mounts show XFS with `dax=always`, and Python prints `fsdax directory smoke ok`. This only verifies setup and write permissions; the runtime DAX PMEM persistence path is verified later with CLWB/SFENCE-specific tests.
 
 ## Task 2: Rename Config Surface To DAX PMEM
 
@@ -603,6 +599,8 @@ impl DurableMappedBytes for DaxPmemMapping {
 }
 ```
 
+Do not implement `DaxPmemMapping::flush` by calling `self.mapping.flush(...)`, and do not implement `DaxPmemMapping::fence` by calling `self.mapping.fence_data()` or `self.mapping.fence_all()`. Those are filesystem persistence syscalls for `FileBackedMemory`; DAX PMEM uses direct CPU persistence instructions.
+
 Add these accessors to `FileBackedMapping`:
 
 ```rust
@@ -693,6 +691,17 @@ cargo test -p wasmtime --lib dax_pmem_mapping -- --format terse
 ```
 
 Expected: local tests pass. The real-mode non-DAX path test should fail by returning an error, which is the expected behavior.
+
+- [ ] **Step 5: Verify the DAX PMEM path does not use filesystem persistence syscalls**
+
+Run:
+
+```bash
+rg -n "DaxPmemMapping|self\\.mapping\\.flush|fence_data|fence_all|sync_data|sync_all|msync" \
+  crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs
+```
+
+Expected: output may show `DaxPmemMapping` declarations and `FileBackedMapping` syscall methods, but there must be no `self.mapping.flush`, `fence_data`, `fence_all`, `sync_data`, `sync_all`, or `msync` call inside the `impl DurableMappedBytes for DaxPmemMapping` block. If the output is ambiguous, inspect that impl directly before proceeding.
 
 ## Task 6: Implement `DaxPmemBlockRegion`
 
@@ -999,6 +1008,8 @@ fn dax_pmem_mapping_accepts_real_fsdax_path() {
     let _ = std::fs::remove_file(path);
 }
 ```
+
+This test must exercise `DaxPmemMapping::flush` and `DaxPmemMapping::fence`, not `FileBackedMapping::flush` or `FileBackedMapping::fence_data`.
 
 - [ ] **Step 4: Run ignored hardware tests on the PMEM machine**
 
