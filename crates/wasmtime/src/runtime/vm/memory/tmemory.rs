@@ -774,6 +774,8 @@ impl DaxPmemMemory {
         } else {
             requested_byte_capacity
         };
+        let existing_pages = byte_capacity.div_ceil(WASM_PAGE_SIZE) as u64;
+        let max_pages = max_pages.max(existing_pages);
         let granule_capacity = granules_for_bytes(byte_capacity);
 
         Ok(Self {
@@ -844,14 +846,6 @@ impl DaxPmemMemory {
         let Ok(new_byte_len) = pages_to_bytes(new_pages) else {
             return false;
         };
-        if new_byte_len > self.byte_capacity
-            && matches!(
-                self.backing,
-                TMemoryDaxPmemBacking::FsDaxPath(_) | TMemoryDaxPmemBacking::ExistingFsDaxPath(_)
-            )
-        {
-            return false;
-        }
         new_byte_len >= self.byte_len
     }
 
@@ -865,22 +859,7 @@ impl DaxPmemMemory {
             return Ok(());
         }
 
-        match &self.backing {
-            TMemoryDaxPmemBacking::ResearchTemp => {
-                let mut region =
-                    TMemoryRegion::new_dax_pmem(new_byte_capacity, self.backing.clone())?;
-                if self.byte_len > 0 {
-                    let old = self.region.read(0, self.byte_len)?;
-                    region.write(0, &old)?;
-                    region.flush(0, self.byte_len)?;
-                    region.fence()?;
-                }
-                self.region = region;
-            }
-            TMemoryDaxPmemBacking::FsDaxPath(_) | TMemoryDaxPmemBacking::ExistingFsDaxPath(_) => {
-                bail!("DAX PMEM fsdax tmemory growth is not implemented yet")
-            }
-        }
+        self.region.reserve_capacity(new_byte_capacity)?;
 
         let new_granule_capacity = granules_for_bytes(new_byte_capacity);
         self.granules
@@ -1068,8 +1047,7 @@ impl FileBackedMemory {
             return Ok(());
         }
 
-        self.region
-            .reserve_file_backed_capacity(new_byte_capacity)?;
+        self.region.reserve_capacity(new_byte_capacity)?;
 
         let new_granule_capacity = granules_for_bytes(new_byte_capacity);
         self.granules
@@ -1902,18 +1880,39 @@ mod tests {
     }
 
     #[test]
-    fn dax_pmem_fsdax_growth_is_explicitly_unsupported_for_now() {
-        let mut memory = DaxPmemMemory::new(1, None).unwrap();
-        memory.backing = TMemoryDaxPmemBacking::FsDaxPath(std::path::PathBuf::from(
-            "/tmp/not-real-dax-for-growth-test",
-        ));
+    fn dax_pmem_research_growth_preserves_committed_bytes() {
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 1, None).unwrap();
+        memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
 
-        assert!(!memory.can_grow_to_pages(2));
-        let error = memory.grow_to_pages(2).unwrap_err().to_string();
-        assert!(
-            error.contains("DAX PMEM fsdax tmemory growth is not implemented yet"),
-            "{error}"
+        assert!(memory.can_grow_to_pages(9));
+        memory.grow_to_pages(9).unwrap();
+        memory
+            .commit_range(block_region::BLOCK_SIZE + 8, &[5, 6, 7, 8])
+            .unwrap();
+
+        assert_eq!(memory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            memory
+                .read_committed(block_region::BLOCK_SIZE + 8..block_region::BLOCK_SIZE + 12)
+                .unwrap(),
+            vec![5, 6, 7, 8]
         );
+    }
+
+    #[test]
+    fn dax_pmem_research_zero_capacity_grows_to_first_page() {
+        let mut memory =
+            TMemory::new_with_backend_limits(TMemoryBackend::DaxPmem, 0, None).unwrap();
+
+        assert_eq!(memory.byte_len(), 0);
+        assert_eq!(memory.byte_capacity(), 0);
+        assert!(memory.can_grow_to_pages(1));
+
+        memory.grow_to_pages(1).unwrap();
+        memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+
+        assert_eq!(memory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
     }
 
     fn real_pmem_test_path(file_name: &str) -> Option<std::path::PathBuf> {
@@ -1949,8 +1948,8 @@ mod tests {
             let mut memory = TMemory::new(config, 1, Some(1)).unwrap();
             assert_eq!(memory.read_committed(0..4).unwrap(), vec![0x5a; 4]);
             assert!(memory.byte_capacity() >= 16 * WASM_PAGE_SIZE);
-            assert!(!memory.can_grow_to_pages(16));
-            assert!(memory.grow_to_pages(16).is_err());
+            assert!(memory.can_grow_to_pages(16));
+            memory.grow_to_pages(16).unwrap();
         }
 
         {
@@ -1960,6 +1959,78 @@ mod tests {
             assert_eq!(memory.byte_len(), 0);
             assert!(memory.byte_capacity() >= 16 * WASM_PAGE_SIZE);
             assert!(memory.can_grow_to_pages(16));
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requires real fsdax PMEM and WASMTIME_TEST_REAL_PMEM=1"]
+    fn dax_pmem_fsdax_growth_survives_reopen() {
+        let Some(path) = real_pmem_test_path("dax-pmem-grow.tmemory") else {
+            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 to run this test");
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let config = TransactionConfig::with_dax_pmem_fsdax_path(path.clone()).unwrap();
+            let mut memory = TMemory::new(config, 1, None).unwrap();
+            memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+            memory.grow_to_pages(9).unwrap();
+            memory
+                .commit_range(block_region::BLOCK_SIZE + 8, &[5, 6, 7, 8])
+                .unwrap();
+        }
+
+        {
+            let config =
+                TransactionConfig::with_dax_pmem_existing_fsdax_path(path.clone()).unwrap();
+            let memory = TMemory::new(config, 9, Some(9)).unwrap();
+            assert_eq!(memory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+            assert_eq!(
+                memory
+                    .read_committed(block_region::BLOCK_SIZE + 8..block_region::BLOCK_SIZE + 12)
+                    .unwrap(),
+                vec![5, 6, 7, 8]
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requires real fsdax PMEM and WASMTIME_TEST_REAL_PMEM=1"]
+    fn dax_pmem_fsdax_zero_capacity_grows_after_reopen() {
+        let Some(path) = real_pmem_test_path("dax-pmem-zero-grow.tmemory") else {
+            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 to run this test");
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let config = TransactionConfig::with_dax_pmem_fsdax_path(path.clone()).unwrap();
+            let memory = TMemory::new(config, 0, None).unwrap();
+            assert_eq!(memory.byte_len(), 0);
+            assert_eq!(memory.byte_capacity(), 0);
+        }
+
+        {
+            let config =
+                TransactionConfig::with_dax_pmem_existing_fsdax_path(path.clone()).unwrap();
+            let mut memory = TMemory::new(config, 0, None).unwrap();
+            assert_eq!(memory.byte_len(), 0);
+            assert_eq!(memory.byte_capacity(), 0);
+            assert!(memory.can_grow_to_pages(1));
+            memory.grow_to_pages(1).unwrap();
+            memory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+        }
+
+        {
+            let config =
+                TransactionConfig::with_dax_pmem_existing_fsdax_path(path.clone()).unwrap();
+            let memory = TMemory::new(config, 1, Some(1)).unwrap();
+            assert_eq!(memory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
         }
 
         let _ = std::fs::remove_file(path);

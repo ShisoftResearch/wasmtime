@@ -56,7 +56,10 @@ impl TMemoryRegion {
             ),
         };
         let chunks = if use_existing_payload_chunk {
-            vec![backend.payload_chunk_from_image(block_count)?]
+            backend
+                .existing_payload_chunk_from_image(block_count)?
+                .into_iter()
+                .collect()
         } else if block_count == 0 {
             Vec::new()
         } else {
@@ -117,8 +120,8 @@ impl TMemoryRegion {
         self.linear.write(range.start, &vec![byte; len])
     }
 
-    pub(super) fn reserve_file_backed_capacity(&mut self, byte_capacity: usize) -> Result<()> {
-        self.linear.reserve_file_backed_capacity(byte_capacity)
+    pub(super) fn reserve_capacity(&mut self, byte_capacity: usize) -> Result<()> {
+        self.linear.reserve_capacity(byte_capacity)
     }
 
     pub(super) fn block_size_for_test(&self) -> usize {
@@ -311,22 +314,26 @@ impl MappedLinearRegion {
         self.backend.fence()
     }
 
-    pub(super) fn reserve_file_backed_capacity(&mut self, byte_capacity: usize) -> Result<()> {
-        self.reserve_backend_capacity(byte_capacity, "file-backed")
+    pub(super) fn reserve_capacity(&mut self, byte_capacity: usize) -> Result<()> {
+        self.reserve_backend_capacity(byte_capacity)
     }
 
-    fn reserve_backend_capacity(&mut self, byte_capacity: usize, backend_name: &str) -> Result<()> {
+    fn reserve_backend_capacity(&mut self, byte_capacity: usize) -> Result<()> {
         let new_block_count = byte_capacity.div_ceil(BLOCK_SIZE);
+        let current_block_count = self.chunks.logical_len().div_ceil(BLOCK_SIZE);
         ensure!(
-            new_block_count >= self.backend.num_blocks(),
-            "transactional linear {backend_name} reserve cannot shrink"
+            new_block_count >= current_block_count,
+            "transactional linear region reserve cannot shrink"
         );
         self.backend.resize_bytes(byte_capacity)?;
-        if new_block_count == self.backend.num_blocks() {
+        if new_block_count == current_block_count {
             return Ok(());
         }
 
-        if let Some(chunk) = self.backend.grow_to_blocks(new_block_count)? {
+        if let Some(chunk) = self
+            .backend
+            .grow_linear_payload_to_blocks(new_block_count)?
+        {
             let mut chunks = self.chunks.chunks().to_vec();
             chunks.push(chunk);
             self.chunks = ChunkList::from_chunks(chunks)?;
@@ -660,7 +667,7 @@ mod tests {
 
         region.write(16, &[1, 2, 3, 4]).unwrap();
         region.flush(16, 4).unwrap();
-        region.reserve_file_backed_capacity(2 * BLOCK_SIZE).unwrap();
+        region.reserve_capacity(2 * BLOCK_SIZE).unwrap();
 
         assert_eq!(
             region.line_mark_count_for_test(),

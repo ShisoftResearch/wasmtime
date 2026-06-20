@@ -5,6 +5,9 @@ use crate::runtime::transaction::PersistentRecoveredRecordLocation;
 use crate::runtime::transaction::type_layout::{
     PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
 };
+use crate::runtime::vm::block_region::{
+    BlockRegionBackendView, DaxPmemBlockRegion, FileBackedMemoryBlockRegion, StreamCursor,
+};
 #[cfg(test)]
 use crate::runtime::vm::unpack_object_granule_id;
 use crate::runtime::vm::{
@@ -316,6 +319,44 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
     fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32>;
 }
 
+trait DurableRegionStorage: core::fmt::Debug + Send + Sync {
+    fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor;
+    fn refresh_from_image(&mut self) -> Result<()>;
+    fn append_type_layout_metadata(&mut self, layout: &PersistentTypeLayout) -> Result<()>;
+    fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry>;
+    fn append_data_record(
+        &mut self,
+        stream: StreamCursor,
+        record: &[u8],
+    ) -> Result<DurableDataRecordPointer>;
+    fn append_data_record_requires_allocation(
+        &self,
+        stream: StreamCursor,
+        record: &[u8],
+    ) -> Result<bool>;
+    fn append_log_entry(&mut self, stream: StreamCursor, entry: TxLogEntry) -> Result<u32>;
+    fn append_log_entry_requires_allocation(&self, stream: StreamCursor) -> Result<bool>;
+    fn mark_last_log_entry_committed(
+        &mut self,
+        stream: StreamCursor,
+        marker: PendingCommitLogEntry,
+    ) -> Result<u32>;
+    fn flush_data_chunk(&self, chunk_start_block: u32) -> Result<()>;
+    fn flush_log_block(&self, log_block: u32) -> Result<()>;
+    fn fence(&self) -> Result<()>;
+    fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
+    where
+        I: IntoIterator<Item = u32>;
+    fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion>;
+    fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>>;
+    fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>>;
+    fn view(&self) -> BlockRegionBackendView<'_>;
+}
+
 #[derive(Debug, Default)]
 struct InMemoryTxDurableLog {
     streams: BTreeMap<u32, TxDurableStreamState>,
@@ -330,9 +371,9 @@ struct TxDurableStreamState {
 }
 
 #[derive(Debug)]
-struct FileBackedTxDurableLog {
-    region: crate::runtime::vm::block_region::FileBackedMemoryBlockRegion,
-    streams: BTreeMap<u32, crate::runtime::vm::block_region::StreamCursor>,
+struct DurableRegionLog<R> {
+    region: R,
+    streams: BTreeMap<u32, StreamCursor>,
     pending_data_chunks: BTreeSet<u32>,
     pending_log_blocks: BTreeSet<u32>,
     // Protects shared free-block allocation and region-metadata refresh across
@@ -441,10 +482,7 @@ impl TxDurableLog {
         num_blocks: u32,
         shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Result<Self> {
-        let region =
-            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(
-                path, num_blocks,
-            )?;
+        let region = FileBackedMemoryBlockRegion::create_for_test(path, num_blocks)?;
         Ok(Self::from_file_backed_region(region, shared_allocator_lock))
     }
 
@@ -467,22 +505,20 @@ impl TxDurableLog {
             let _guard = lock
                 .lock()
                 .map_err(|_| crate::format_err!("shared durable log allocator lock poisoned"))?;
-            let mut region =
-                crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
+            let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
             crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
             return Ok(Self::from_file_backed_region(region, shared_allocator_lock));
         }
-        let mut region =
-            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_for_test(path)?;
+        let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
         crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
         Ok(Self::from_file_backed_region(region, shared_allocator_lock))
     }
 
     fn from_file_backed_region(
-        region: crate::runtime::vm::block_region::FileBackedMemoryBlockRegion,
+        region: FileBackedMemoryBlockRegion,
         shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Self {
-        Self::with_backend(FileBackedTxDurableLog {
+        Self::with_backend(DurableRegionLog {
             region,
             streams: BTreeMap::new(),
             pending_data_chunks: BTreeSet::new(),
@@ -496,6 +532,18 @@ impl TxDurableLog {
         path: &Path,
     ) -> Result<crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion> {
         crate::runtime::vm::block_region::reopen_and_recover_file_backed_region(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_dax_pmem_research_for_test(payload_blocks: usize) -> Result<Self> {
+        let region = DaxPmemBlockRegion::new_for_test(payload_blocks)?;
+        Ok(Self::with_backend(DurableRegionLog {
+            region,
+            streams: BTreeMap::new(),
+            pending_data_chunks: BTreeSet::new(),
+            pending_log_blocks: BTreeSet::new(),
+            shared_allocator_lock: None,
+        }))
     }
 
     #[cfg(test)]
@@ -634,11 +682,222 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
     }
 }
 
-impl FileBackedTxDurableLog {
-    fn stream_cursor(
+impl DurableRegionStorage for FileBackedMemoryBlockRegion {
+    fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
+        FileBackedMemoryBlockRegion::stream_cursor(self, stream_id)
+    }
+
+    fn refresh_from_image(&mut self) -> Result<()> {
+        FileBackedMemoryBlockRegion::refresh_from_image(self)
+    }
+
+    fn append_type_layout_metadata(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
+        FileBackedMemoryBlockRegion::append_type_layout_metadata(self, layout)
+    }
+
+    fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry> {
+        FileBackedMemoryBlockRegion::load_type_layout_metadata(self)
+    }
+
+    fn append_data_record(
         &mut self,
-        stream_id: u32,
-    ) -> Result<crate::runtime::vm::block_region::StreamCursor> {
+        stream: StreamCursor,
+        record: &[u8],
+    ) -> Result<DurableDataRecordPointer> {
+        let location = FileBackedMemoryBlockRegion::append_data_record(self, stream, record)?;
+        Ok(DurableDataRecordPointer {
+            chunk_start_block: location.chunk_start_block,
+            data_block: location.data_block,
+            data_offset: location.data_offset,
+            data_block_generation: FileBackedMemoryBlockRegion::block_generation(
+                self,
+                location.data_block,
+            )?,
+        })
+    }
+
+    fn append_data_record_requires_allocation(
+        &self,
+        stream: StreamCursor,
+        record: &[u8],
+    ) -> Result<bool> {
+        FileBackedMemoryBlockRegion::append_data_record_requires_allocation(self, stream, record)
+    }
+
+    fn append_log_entry(&mut self, stream: StreamCursor, entry: TxLogEntry) -> Result<u32> {
+        FileBackedMemoryBlockRegion::append_log_entry(self, stream, entry)
+    }
+
+    fn append_log_entry_requires_allocation(&self, stream: StreamCursor) -> Result<bool> {
+        FileBackedMemoryBlockRegion::append_log_entry_requires_allocation(self, stream)
+    }
+
+    fn mark_last_log_entry_committed(
+        &mut self,
+        stream: StreamCursor,
+        marker: PendingCommitLogEntry,
+    ) -> Result<u32> {
+        FileBackedMemoryBlockRegion::mark_last_log_entry_committed(
+            self,
+            stream,
+            marker.logical_id,
+            marker.version,
+            marker.data_block,
+            marker.data_offset,
+            marker.data_block_generation,
+            marker.role,
+        )
+    }
+
+    fn flush_data_chunk(&self, chunk_start_block: u32) -> Result<()> {
+        FileBackedMemoryBlockRegion::flush_data_chunk(self, chunk_start_block)
+    }
+
+    fn flush_log_block(&self, log_block: u32) -> Result<()> {
+        FileBackedMemoryBlockRegion::flush_log_block(self, log_block)
+    }
+
+    fn fence(&self) -> Result<()> {
+        FileBackedMemoryBlockRegion::fence(self)
+    }
+
+    fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        FileBackedMemoryBlockRegion::retire_linear_undo_chunks(self, chunk_starts)
+    }
+
+    fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion> {
+        crate::runtime::vm::block_region::recover_file_backed_region_snapshot(self)
+    }
+
+    fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
+        FileBackedMemoryBlockRegion::object_data_chunk_start_for_block(self, data_block)
+    }
+
+    fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        FileBackedMemoryBlockRegion::retire_whole_dead_object_chunks(self, reachable, unreachable)
+    }
+
+    fn view(&self) -> BlockRegionBackendView<'_> {
+        FileBackedMemoryBlockRegion::view(self)
+    }
+}
+
+impl DurableRegionStorage for DaxPmemBlockRegion {
+    fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
+        DaxPmemBlockRegion::stream_cursor(self, stream_id)
+    }
+
+    fn refresh_from_image(&mut self) -> Result<()> {
+        DaxPmemBlockRegion::refresh_from_image(self)
+    }
+
+    fn append_type_layout_metadata(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
+        DaxPmemBlockRegion::append_type_layout_metadata(self, layout)
+    }
+
+    fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry> {
+        DaxPmemBlockRegion::load_type_layout_metadata(self)
+    }
+
+    fn append_data_record(
+        &mut self,
+        stream: StreamCursor,
+        record: &[u8],
+    ) -> Result<DurableDataRecordPointer> {
+        let location = DaxPmemBlockRegion::append_data_record(self, stream, record)?;
+        Ok(DurableDataRecordPointer {
+            chunk_start_block: location.chunk_start_block,
+            data_block: location.data_block,
+            data_offset: location.data_offset,
+            data_block_generation: DaxPmemBlockRegion::block_generation(self, location.data_block)?,
+        })
+    }
+
+    fn append_data_record_requires_allocation(
+        &self,
+        stream: StreamCursor,
+        record: &[u8],
+    ) -> Result<bool> {
+        DaxPmemBlockRegion::append_data_record_requires_allocation(self, stream, record)
+    }
+
+    fn append_log_entry(&mut self, stream: StreamCursor, entry: TxLogEntry) -> Result<u32> {
+        DaxPmemBlockRegion::append_log_entry(self, stream, entry)
+    }
+
+    fn append_log_entry_requires_allocation(&self, stream: StreamCursor) -> Result<bool> {
+        DaxPmemBlockRegion::append_log_entry_requires_allocation(self, stream)
+    }
+
+    fn mark_last_log_entry_committed(
+        &mut self,
+        stream: StreamCursor,
+        marker: PendingCommitLogEntry,
+    ) -> Result<u32> {
+        DaxPmemBlockRegion::mark_last_log_entry_committed(
+            self,
+            stream,
+            marker.logical_id,
+            marker.version,
+            marker.data_block,
+            marker.data_offset,
+            marker.data_block_generation,
+            marker.role,
+        )
+    }
+
+    fn flush_data_chunk(&self, chunk_start_block: u32) -> Result<()> {
+        DaxPmemBlockRegion::flush_data_chunk(self, chunk_start_block)
+    }
+
+    fn flush_log_block(&self, log_block: u32) -> Result<()> {
+        DaxPmemBlockRegion::flush_log_block(self, log_block)
+    }
+
+    fn fence(&self) -> Result<()> {
+        DaxPmemBlockRegion::fence(self)
+    }
+
+    fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        DaxPmemBlockRegion::retire_linear_undo_chunks(self, chunk_starts)
+    }
+
+    fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion> {
+        crate::runtime::vm::block_region::recover_dax_pmem_region_snapshot(self)
+    }
+
+    fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
+        DaxPmemBlockRegion::object_data_chunk_start_for_block(self, data_block)
+    }
+
+    fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        DaxPmemBlockRegion::retire_whole_dead_object_chunks(self, reachable, unreachable)
+    }
+
+    fn view(&self) -> BlockRegionBackendView<'_> {
+        DaxPmemBlockRegion::view(self)
+    }
+}
+
+impl<R> DurableRegionLog<R>
+where
+    R: DurableRegionStorage,
+{
+    fn stream_cursor(&mut self, stream_id: u32) -> Result<StreamCursor> {
         let stream = self.region.stream_cursor(stream_id);
         self.streams.insert(stream_id, stream);
         Ok(stream)
@@ -660,7 +919,10 @@ impl FileBackedTxDurableLog {
     }
 }
 
-impl TxDurableLogBackend for FileBackedTxDurableLog {
+impl<R> TxDurableLogBackend for DurableRegionLog<R>
+where
+    R: DurableRegionStorage,
+{
     fn ensure_type_layout(&mut self, layout: &PersistentTypeLayout) -> Result<()> {
         self.with_shared_allocator_lock(|this| this.region.append_type_layout_metadata(layout))
     }
@@ -679,14 +941,9 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         let stream = self.stream_cursor(data_stream_id)?;
         let append = |this: &mut Self| {
             let stream = this.stream_cursor(data_stream_id)?;
-            let location = this.region.append_data_record(stream, record)?;
-            this.pending_data_chunks.insert(location.chunk_start_block);
-            Ok(DurableDataRecordPointer {
-                chunk_start_block: location.chunk_start_block,
-                data_block: location.data_block,
-                data_offset: location.data_offset,
-                data_block_generation: this.region.block_generation(location.data_block)?,
-            })
+            let pointer = this.region.append_data_record(stream, record)?;
+            this.pending_data_chunks.insert(pointer.chunk_start_block);
+            Ok(pointer)
         };
         if self
             .region
@@ -717,15 +974,7 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
         marker: PendingCommitLogEntry,
     ) -> Result<()> {
         let stream = self.stream_cursor(transaction_stream_id)?;
-        let log_block = self.region.mark_last_log_entry_committed(
-            stream,
-            marker.logical_id,
-            marker.version,
-            marker.data_block,
-            marker.data_offset,
-            marker.data_block_generation,
-            marker.role,
-        )?;
+        let log_block = self.region.mark_last_log_entry_committed(stream, marker)?;
         self.pending_log_blocks.insert(log_block);
         Ok(())
     }
@@ -755,9 +1004,7 @@ impl TxDurableLogBackend for FileBackedTxDurableLog {
     }
 
     fn recover_region_snapshot(&self) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
-        Ok(Some(
-            crate::runtime::vm::block_region::recover_file_backed_region_snapshot(&self.region)?,
-        ))
+        Ok(Some(self.region.recover_region_snapshot()?))
     }
 
     fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
@@ -1879,6 +2126,48 @@ mod tests {
         assert_eq!(recovered.object_winners.len(), 1);
         assert_eq!(recovered.object_winners[0].object_id, 41);
         assert!(recovered.tmemory_undo_rollbacks.is_empty());
+    }
+
+    #[test]
+    fn dax_pmem_durable_region_log_recovers_object_publication() {
+        let mut log = TxDurableLog::create_dax_pmem_research_for_test(32).unwrap();
+        log.ensure_type_layout(&test_struct_type_layout()).unwrap();
+        let publication = PendingPublication::persistent_object_for_test(
+            PackedGranuleDomain::TStruct,
+            41,
+            7,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
+            &encode_object_record_for_test(
+                41,
+                7,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+            )
+            .unwrap(),
+        );
+
+        let marker = {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_object_publication_before_commit(&publication)
+                .unwrap()
+        };
+        {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher.publish_commit_lp(marker).unwrap();
+        }
+
+        let recovered = log.recover_region_snapshot().unwrap().unwrap();
+        let object_winners = recovered.committed_object_winners().unwrap();
+        assert_eq!(object_winners.len(), 1);
+        assert_eq!(object_winners[0].object_id, 41);
+        assert!(
+            recovered
+                .type_layouts
+                .contains(test_struct_type_layout().id())
+        );
     }
 
     #[test]

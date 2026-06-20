@@ -1040,6 +1040,12 @@ pub(crate) trait BlockRegionBackend {
     fn grow_to_blocks(&mut self, _new_block_count: usize) -> Result<Option<RegionChunk>> {
         bail!("transactional block region backend cannot grow")
     }
+    fn grow_linear_payload_to_blocks(
+        &mut self,
+        new_payload_block_count: usize,
+    ) -> Result<Option<RegionChunk>> {
+        self.grow_to_blocks(new_payload_block_count)
+    }
 }
 
 pub(crate) struct BlockRegionBackendView<'a> {
@@ -2179,6 +2185,7 @@ pub(crate) struct DaxPmemBlockRegion {
     block_entries: Vec<BlockEntry>,
     block_metas: Vec<BlockMeta>,
     line_marks: Vec<LineMark>,
+    streams: BTreeMap<u32, StreamState>,
 }
 
 impl DaxPmemBlockRegion {
@@ -2201,6 +2208,7 @@ impl DaxPmemBlockRegion {
                 };
                 line_count
             ],
+            streams: BTreeMap::new(),
         })
     }
 
@@ -2331,6 +2339,593 @@ impl DaxPmemBlockRegion {
         bail!("transactional DAX PMEM block region is out of contiguous chunks")
     }
 
+    pub(crate) fn refresh_from_image(&mut self) -> Result<()> {
+        self.load_region_image()
+    }
+
+    pub(crate) fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
+        self.streams.entry(stream_id).or_default();
+        StreamCursor { stream_id }
+    }
+
+    pub(crate) fn append_data_record_requires_allocation(
+        &self,
+        stream: StreamCursor,
+        bytes: &[u8],
+    ) -> Result<bool> {
+        let kind = block_kind_for_data_record(bytes)?;
+        let state = self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let Some(start_block) = state.current_data_chunk_start else {
+            return Ok(true);
+        };
+        let header = self.data_chunk_header(start_block)?;
+        let current_kind = self.block_meta(start_block)?.kind()?;
+        Ok(!(current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len()))
+    }
+
+    pub(crate) fn append_log_entry_requires_allocation(
+        &self,
+        stream: StreamCursor,
+    ) -> Result<bool> {
+        let state = self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let Some(start_block) = state.current_log_block_start else {
+            return Ok(true);
+        };
+        let header = self.log_block_header(start_block)?;
+        Ok(
+            usize::try_from(header.entry_count)
+                .context("transactional log entry count overflow")?
+                >= self.log_entry_capacity(),
+        )
+    }
+
+    pub(crate) fn append_data_record(
+        &mut self,
+        stream: StreamCursor,
+        bytes: &[u8],
+    ) -> Result<DataRecordLocation> {
+        let kind = block_kind_for_data_record(bytes)?;
+        let mut state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+
+        let chunk_start_block = if let Some(start_block) = state.current_data_chunk_start {
+            let header = self.data_chunk_header(start_block)?;
+            let current_kind = self.block_meta(start_block)?.kind()?;
+            if current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len() {
+                start_block
+            } else {
+                let next_chunk_start = self.alloc_data_chunk_for_kind(
+                    stream.stream_id,
+                    state.next_data_chunk_seq,
+                    kind,
+                    bytes.len(),
+                )?;
+                let mut previous = header;
+                previous.next_chunk = next_chunk_start;
+                self.write_data_chunk_header(start_block, previous)?;
+                state.next_data_chunk_seq = state
+                    .next_data_chunk_seq
+                    .checked_add(1)
+                    .context("transactional data chunk sequence overflow")?;
+                state.current_data_chunk_start = Some(next_chunk_start);
+                next_chunk_start
+            }
+        } else {
+            let start_block = self.alloc_data_chunk_for_kind(
+                stream.stream_id,
+                state.next_data_chunk_seq,
+                kind,
+                bytes.len(),
+            )?;
+            state.next_data_chunk_seq = state
+                .next_data_chunk_seq
+                .checked_add(1)
+                .context("transactional data chunk sequence overflow")?;
+            state.current_data_chunk_start = Some(start_block);
+            start_block
+        };
+
+        let mut header = self.data_chunk_header(chunk_start_block)?;
+        let record_start = self.chunk_tail_offset(header)?;
+        let record_end = record_start
+            .checked_add(bytes.len())
+            .context("transactional data record length overflow")?;
+        ensure!(
+            record_end <= self.chunk_capacity_bytes(header)?,
+            "transactional data record crosses chunk boundary"
+        );
+        let write_offset = self
+            .block_offset(chunk_start_block)?
+            .checked_add(record_start)
+            .context("transactional data record write offset overflow")?;
+        self.write(write_offset, bytes)?;
+        header.tail_block_delta = u32::try_from(record_end / BLOCK_SIZE)
+            .context("transactional data chunk tail block delta overflow")?;
+        header.tail_in_block = u32::try_from(record_end % BLOCK_SIZE)
+            .context("transactional data chunk tail offset overflow")?;
+        self.write_data_chunk_header(chunk_start_block, header)?;
+        self.streams.insert(stream.stream_id, state);
+
+        let data_block = chunk_start_block
+            .checked_add(
+                u32::try_from(record_start / BLOCK_SIZE)
+                    .context("transactional data record block delta overflow")?,
+            )
+            .context("transactional data record block index overflow")?;
+        let data_offset = u32::try_from(record_start % BLOCK_SIZE)
+            .context("transactional data record offset overflow")?;
+        Ok(DataRecordLocation {
+            chunk_start_block,
+            data_block,
+            data_offset,
+        })
+    }
+
+    pub(crate) fn append_log_entry(
+        &mut self,
+        stream: StreamCursor,
+        entry: TxLogEntry,
+    ) -> Result<u32> {
+        let mut state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+
+        let log_block = if let Some(start_block) = state.current_log_block_start {
+            let header = self.log_block_header(start_block)?;
+            if usize::try_from(header.entry_count)
+                .context("transactional log entry count overflow")?
+                < self.log_entry_capacity()
+            {
+                start_block
+            } else {
+                let next_block =
+                    self.alloc_log_block(stream.stream_id, state.next_log_block_seq)?;
+                let mut previous = header;
+                previous.next_block = next_block;
+                self.write_log_block_header(start_block, previous)?;
+                state.next_log_block_seq = state
+                    .next_log_block_seq
+                    .checked_add(1)
+                    .context("transactional log block sequence overflow")?;
+                state.current_log_block_start = Some(next_block);
+                next_block
+            }
+        } else {
+            let start_block = self.alloc_log_block(stream.stream_id, state.next_log_block_seq)?;
+            state.next_log_block_seq = state
+                .next_log_block_seq
+                .checked_add(1)
+                .context("transactional log block sequence overflow")?;
+            state.current_log_block_start = Some(start_block);
+            start_block
+        };
+
+        let mut header = self.log_block_header(log_block)?;
+        let entry_index = usize::try_from(header.entry_count)
+            .context("transactional log entry count overflow")?;
+        ensure!(
+            entry_index < self.log_entry_capacity(),
+            "transactional log block is full"
+        );
+        let write_offset = self
+            .block_offset(log_block)?
+            .checked_add(size_of::<LogBlockHeader>())
+            .and_then(|offset| offset.checked_add(entry_index * size_of::<TxLogEntry>()))
+            .context("transactional log entry write offset overflow")?;
+        self.write(write_offset, &encode_tx_log_entry(entry))?;
+        header.entry_count = header
+            .entry_count
+            .checked_add(1)
+            .context("transactional log entry count overflow")?;
+        self.write_log_block_header(log_block, header)?;
+        self.streams.insert(stream.stream_id, state);
+
+        Ok(log_block)
+    }
+
+    pub(crate) fn mark_last_log_entry_committed(
+        &mut self,
+        stream: StreamCursor,
+        logical_id: u64,
+        version: u32,
+        data_block: u32,
+        data_offset: u32,
+        data_block_generation: u32,
+        role: TxLogEntryRole,
+    ) -> Result<u32> {
+        let state = *self.streams.get(&stream.stream_id).with_context(|| {
+            format!("transactional stream {} is not allocated", stream.stream_id)
+        })?;
+        let log_block = state
+            .current_log_block_start
+            .context("transactional commit LP requires a log entry")?;
+        let header = self.log_block_header(log_block)?;
+        ensure!(
+            header.entry_count > 0,
+            "transactional commit LP requires a log entry"
+        );
+        let entry_index = usize::try_from(header.entry_count - 1)
+            .context("transactional log entry count overflow")?;
+        ensure!(
+            entry_index < self.log_entry_capacity(),
+            "transactional log block entry count exceeds capacity"
+        );
+        let entry_offset = self
+            .block_offset(log_block)?
+            .checked_add(size_of::<LogBlockHeader>())
+            .and_then(|offset| offset.checked_add(entry_index * size_of::<TxLogEntry>()))
+            .context("transactional log entry write offset overflow")?;
+        let mut entry = decode_tx_log_entry(self.read(entry_offset, size_of::<TxLogEntry>())?)?;
+        ensure!(
+            entry.logical_id == logical_id
+                && entry.version == version
+                && entry.data_block == data_block
+                && entry.data_offset == data_offset
+                && entry.data_block_generation() == data_block_generation
+                && entry.role()? == role,
+            "transactional commit LP marker does not match the last log entry"
+        );
+        entry.tx_meta |= 1;
+        self.write(entry_offset, &encode_tx_log_entry(entry))?;
+        Ok(log_block)
+    }
+
+    pub(crate) fn alloc_log_block(&mut self, stream_id: u32, block_seq: u32) -> Result<u32> {
+        let chunk = self.alloc_chunk_for_kind(1, BlockKind::Log, stream_id)?;
+        let start_block = u32::try_from(chunk.start_block())
+            .context("transactional log block start block overflow")?;
+        let header = LogBlockHeader {
+            magic: LOG_BLOCK_MAGIC,
+            stream_id,
+            block_seq,
+            next_block: NO_NEXT_BLOCK,
+            entry_count: 0,
+        };
+        self.write_log_block_header(start_block, header)?;
+        Ok(start_block)
+    }
+
+    fn alloc_data_chunk_for_kind(
+        &mut self,
+        stream_id: u32,
+        chunk_seq: u32,
+        kind: BlockKind,
+        total_bytes: usize,
+    ) -> Result<u32> {
+        let class = if total_bytes <= SMALL_DATA_LIMIT {
+            DataChunkClass::Small
+        } else if total_bytes <= self.block_payload_capacity() {
+            DataChunkClass::Medium
+        } else {
+            DataChunkClass::Large
+        };
+        self.alloc_data_chunk_for_class(stream_id, chunk_seq, class, kind, total_bytes)
+    }
+
+    fn alloc_data_chunk_for_class(
+        &mut self,
+        stream_id: u32,
+        chunk_seq: u32,
+        class: DataChunkClass,
+        kind: BlockKind,
+        total_bytes: usize,
+    ) -> Result<u32> {
+        let chunk_blocks = match class {
+            DataChunkClass::Small | DataChunkClass::Medium => 1,
+            DataChunkClass::Large => self.required_data_chunk_blocks(total_bytes)?,
+        };
+        let chunk = self.alloc_chunk_for_kind(chunk_blocks, kind, stream_id)?;
+        let start_block = u32::try_from(chunk.start_block())
+            .context("transactional data chunk start block overflow")?;
+        let header = DataChunkHeader {
+            magic: DATA_CHUNK_MAGIC,
+            stream_id,
+            chunk_seq,
+            next_chunk: NO_NEXT_BLOCK,
+            chunk_blocks: u32::try_from(chunk_blocks)
+                .context("transactional data chunk block count overflow")?,
+            tail_block_delta: 0,
+            tail_in_block: u32::try_from(size_of::<DataChunkHeader>())
+                .context("transactional data chunk header size overflow")?,
+        };
+        self.write_data_chunk_header(start_block, header)?;
+        Ok(start_block)
+    }
+
+    fn block_payload_capacity(&self) -> usize {
+        BLOCK_SIZE - size_of::<DataChunkHeader>()
+    }
+
+    fn required_data_chunk_blocks(&self, total_bytes: usize) -> Result<usize> {
+        let first_block_capacity = self.block_payload_capacity();
+        if total_bytes <= first_block_capacity {
+            return Ok(1);
+        }
+        let extra_bytes = total_bytes - first_block_capacity;
+        1usize
+            .checked_add(extra_bytes.div_ceil(BLOCK_SIZE))
+            .context("transactional data chunk block count overflow")
+    }
+
+    fn chunk_tail_offset(&self, header: DataChunkHeader) -> Result<usize> {
+        let block_delta = usize::try_from(header.tail_block_delta)
+            .context("transactional data chunk tail block delta conversion overflow")?;
+        let in_block = usize::try_from(header.tail_in_block)
+            .context("transactional data chunk tail offset conversion overflow")?;
+        block_delta
+            .checked_mul(BLOCK_SIZE)
+            .and_then(|offset| offset.checked_add(in_block))
+            .context("transactional data chunk tail overflow")
+    }
+
+    fn chunk_capacity_bytes(&self, header: DataChunkHeader) -> Result<usize> {
+        usize::try_from(header.chunk_blocks)
+            .context("transactional data chunk block count conversion overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional data chunk capacity overflow")
+    }
+
+    fn chunk_remaining_capacity(&self, header: DataChunkHeader) -> Result<usize> {
+        let capacity = self.chunk_capacity_bytes(header)?;
+        let tail = self.chunk_tail_offset(header)?;
+        ensure!(
+            tail <= capacity,
+            "transactional data chunk tail exceeds chunk capacity"
+        );
+        Ok(capacity - tail)
+    }
+
+    fn log_entry_capacity(&self) -> usize {
+        (BLOCK_SIZE - size_of::<LogBlockHeader>()) / size_of::<TxLogEntry>()
+    }
+
+    pub(crate) fn flush_data_chunk(&self, chunk_start_block: u32) -> Result<()> {
+        let header = self.data_chunk_header(chunk_start_block)?;
+        let chunk_blocks = usize::try_from(header.chunk_blocks)
+            .context("transactional data chunk block count overflow")?;
+        let flush_len = chunk_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional data chunk flush length overflow")?;
+        self.flush(self.block_offset(chunk_start_block)?, flush_len)
+    }
+
+    pub(crate) fn flush_log_block(&self, log_block: u32) -> Result<()> {
+        self.flush(self.block_offset(log_block)?, BLOCK_SIZE)
+    }
+
+    pub(crate) fn log_block_header(&self, start_block: u32) -> Result<LogBlockHeader> {
+        LogBlockHeader::from_bytes(
+            self.read_header_bytes(start_block, size_of::<LogBlockHeader>())?,
+        )
+    }
+
+    pub(crate) fn data_chunk_header(&self, start_block: u32) -> Result<DataChunkHeader> {
+        DataChunkHeader::from_bytes(
+            self.read_header_bytes(start_block, size_of::<DataChunkHeader>())?,
+        )
+    }
+
+    fn retire_chunk(&mut self, chunk_start_block: u32, expected_kind: BlockKind) -> Result<()> {
+        let meta = self.block_meta(chunk_start_block)?;
+        if !meta.is_active_or_sealed()? || meta.kind()? != expected_kind {
+            return Ok(());
+        }
+        ensure!(
+            meta.chunk_start == chunk_start_block,
+            "transactional DAX PMEM retired chunk input must point at the chunk start block"
+        );
+
+        let chunk_start =
+            usize::try_from(chunk_start_block).context("DAX PMEM retired chunk start overflow")?;
+        let chunk_blocks =
+            usize::try_from(meta.chunk_blocks).context("DAX PMEM retired chunk count overflow")?;
+        let chunk_end = chunk_start
+            .checked_add(chunk_blocks)
+            .context("DAX PMEM retired chunk range overflow")?;
+        ensure!(
+            chunk_end <= self.num_blocks(),
+            "DAX PMEM retired chunk metadata range is out of bounds"
+        );
+
+        let retired_meta = BlockMeta {
+            state: BlockState::Retired as u8,
+            kind: meta.kind,
+            reserved0: 0,
+            generation: meta.generation,
+            owner_thread: meta.owner_thread,
+            chunk_start: meta.chunk_start,
+            chunk_blocks: meta.chunk_blocks,
+            reserved1: 0,
+        };
+        for block in chunk_start..chunk_end {
+            self.block_entries[block] = BlockEntry::default();
+            self.block_entries[block].list_num = ListKind::LargeFree as i16;
+            self.write_block_meta(block, retired_meta)?;
+        }
+        self.flush_block_meta_range(chunk_start, chunk_blocks)
+    }
+
+    pub(crate) fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut retired = Vec::new();
+        let mut seen = BTreeSet::new();
+        for chunk_start_block in chunk_starts {
+            if !seen.insert(chunk_start_block) {
+                continue;
+            }
+            let meta = self.block_meta(chunk_start_block)?;
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::LinearUndo {
+                continue;
+            }
+            self.retire_chunk(chunk_start_block, BlockKind::LinearUndo)?;
+            retired.push(chunk_start_block);
+        }
+
+        if !retired.is_empty() {
+            self.fence()?;
+        }
+
+        Ok(retired)
+    }
+
+    pub(crate) fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        let mut live_blocks = vec![false; self.num_blocks()];
+        for location in reachable {
+            let range = data_record_block_range(
+                location.data_block,
+                location.data_offset,
+                location.record_len,
+            )?;
+            ensure!(
+                range.end <= self.num_blocks(),
+                "DAX PMEM reachable object record blocks exceed region bounds"
+            );
+            for block in range {
+                live_blocks[block] = true;
+            }
+        }
+
+        let mut candidate_chunks = BTreeMap::<u32, usize>::new();
+        for location in unreachable {
+            let record_range = data_record_block_range(
+                location.data_block,
+                location.data_offset,
+                location.record_len,
+            )?;
+            ensure!(
+                record_range.end <= self.num_blocks(),
+                "DAX PMEM unreachable object record blocks exceed region bounds"
+            );
+
+            let meta = self.block_meta(location.data_block)?;
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+                continue;
+            }
+
+            let chunk_start = usize::try_from(meta.chunk_start)
+                .context("DAX PMEM retired chunk start overflow")?;
+            let chunk_blocks = usize::try_from(meta.chunk_blocks)
+                .context("DAX PMEM retired chunk count overflow")?;
+            let chunk_end = chunk_start
+                .checked_add(chunk_blocks)
+                .context("DAX PMEM retired chunk range overflow")?;
+            ensure!(
+                chunk_end <= self.num_blocks(),
+                "DAX PMEM retired chunk metadata range is out of bounds"
+            );
+            ensure!(
+                record_range.start >= chunk_start && record_range.end <= chunk_end,
+                "DAX PMEM recovered object record extends outside chunk metadata"
+            );
+
+            candidate_chunks.insert(meta.chunk_start, chunk_blocks);
+        }
+
+        let mut retired = Vec::new();
+        for (chunk_start_block, chunk_blocks) in candidate_chunks {
+            let chunk_start = usize::try_from(chunk_start_block)
+                .context("DAX PMEM retired chunk start overflow")?;
+            let chunk_end = chunk_start
+                .checked_add(chunk_blocks)
+                .context("DAX PMEM retired chunk range overflow")?;
+            if live_blocks[chunk_start..chunk_end].iter().any(|live| *live) {
+                continue;
+            }
+
+            let meta = self.block_metas[chunk_start];
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+                continue;
+            }
+
+            self.retire_chunk(chunk_start_block, BlockKind::ObjectData)?;
+            retired.push(chunk_start_block);
+        }
+
+        if !retired.is_empty() {
+            self.fence()?;
+        }
+
+        Ok(retired)
+    }
+
+    fn read_header_bytes(&self, start_block: u32, len: usize) -> Result<Vec<u8>> {
+        self.read(self.block_offset(start_block)?, len)
+    }
+
+    pub(crate) fn block_generation(&self, block: u32) -> Result<u32> {
+        Ok(self.block_meta(block)?.generation)
+    }
+
+    pub(crate) fn object_data_chunk_start_for_block(&self, block: u32) -> Result<Option<u32>> {
+        let meta = self.block_meta(block)?;
+        if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+            return Ok(None);
+        }
+        Ok(Some(meta.chunk_start))
+    }
+
+    fn write_log_block_header(&mut self, start_block: u32, header: LogBlockHeader) -> Result<()> {
+        self.write(self.block_offset(start_block)?, &header.as_bytes())
+    }
+
+    fn write_data_chunk_header(&mut self, start_block: u32, header: DataChunkHeader) -> Result<()> {
+        self.write(self.block_offset(start_block)?, &header.as_bytes())
+    }
+
+    pub(crate) fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry> {
+        let header = self.region_header()?;
+        self.validate_region_header(header)?;
+        let descs = self.read_metadata_descs(header)?;
+        let desc = *descs
+            .first()
+            .context("transactional DAX PMEM region image must contain metadata descriptor")?;
+        validate_type_layout_metadata_desc(desc, self.num_blocks())?;
+        let offset =
+            usize::try_from(desc.offset).context("transactional metadata offset overflow")?;
+        let len = usize::try_from(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+            .context("transactional metadata block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata byte length overflow")?;
+        load_type_layout_registry_from_block(&self.read(offset, len)?)
+    }
+
+    pub(crate) fn append_type_layout_metadata(
+        &mut self,
+        layout: &PersistentTypeLayout,
+    ) -> Result<()> {
+        let header = self.region_header()?;
+        self.validate_region_header(header)?;
+        let descs = self.read_metadata_descs(header)?;
+        let desc = *descs
+            .first()
+            .context("transactional DAX PMEM region image must contain metadata descriptor")?;
+        validate_type_layout_metadata_desc(desc, self.num_blocks())?;
+        let offset =
+            usize::try_from(desc.offset).context("transactional metadata offset overflow")?;
+        let len = usize::try_from(TYPE_LAYOUT_METADATA_BLOCK_COUNT)
+            .context("transactional metadata block count overflow")?
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional metadata byte length overflow")?;
+        let mut bytes = self.read(offset, len)?;
+        if append_type_layout_to_block(&mut bytes, layout)? {
+            self.write(offset, &bytes)?;
+            self.flush(offset, len)?;
+            self.fence()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         let end = offset
             .checked_add(len)
@@ -2366,6 +2961,179 @@ impl DaxPmemBlockRegion {
 
     pub(crate) fn fence(&self) -> Result<()> {
         self.mapping.fence()
+    }
+
+    pub(crate) fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
+        let old_block_count = self.num_blocks();
+        ensure!(
+            new_block_count >= old_block_count,
+            "transactional DAX PMEM block region cannot shrink"
+        );
+        if new_block_count == old_block_count {
+            return Ok(None);
+        }
+        ensure!(
+            block_table_block_count(old_block_count)? == block_table_block_count(new_block_count)?
+                && metadata_desc_start_block(old_block_count)?
+                    == metadata_desc_start_block(new_block_count)?
+                && type_layout_metadata_start_block(old_block_count)?
+                    == type_layout_metadata_start_block(new_block_count)?
+                && reserved_metadata_blocks(old_block_count)?
+                    == reserved_metadata_blocks(new_block_count)?,
+            "DAX PMEM block region grow would require metadata table relocation"
+        );
+
+        let bytes_len = new_block_count
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM block region size overflow")?;
+        self.mapping.remap_len(bytes_len)?;
+
+        let additional_blocks = new_block_count - old_block_count;
+        self.block_entries
+            .resize(new_block_count, BlockEntry::default());
+        self.block_metas.resize(new_block_count, BlockMeta::free());
+        for entry in &mut self.block_entries[old_block_count..new_block_count] {
+            entry.used = 1;
+            entry.list_num = ListKind::Used as i16;
+        }
+        for block in old_block_count..new_block_count {
+            self.write_block_meta(block, BlockMeta::free())?;
+        }
+
+        let line_count = bytes_len / IMMIX_LINE_SIZE;
+        self.line_marks.resize(
+            line_count,
+            LineMark {
+                mark: IMMIX_LINE_MARK_RESET_VALUE,
+            },
+        );
+        self.write_region_header(region_header_for_num_blocks(new_block_count)?)?;
+        self.flush_block_meta_range(old_block_count, additional_blocks)?;
+        self.flush(0, size_of::<RegionHeader>())?;
+        self.fence()?;
+
+        Ok(Some(RegionChunk {
+            start_block: old_block_count,
+            block_count: additional_blocks,
+        }))
+    }
+
+    pub(crate) fn grow_linear_payload_to_blocks(
+        &mut self,
+        new_payload_block_count: usize,
+    ) -> Result<Option<RegionChunk>> {
+        if self.num_blocks() == 0 {
+            if new_payload_block_count == 0 {
+                return Ok(None);
+            }
+            let new_block_count = dax_pmem_region_blocks_for_payload(new_payload_block_count)?;
+            let bytes_len = new_block_count
+                .checked_mul(BLOCK_SIZE)
+                .context("transactional DAX PMEM block region size overflow")?;
+            self.mapping.remap_len(bytes_len)?;
+            self.block_entries
+                .resize(new_block_count, BlockEntry::default());
+            self.block_metas.resize(new_block_count, BlockMeta::free());
+            self.line_marks.resize(
+                bytes_len / IMMIX_LINE_SIZE,
+                LineMark {
+                    mark: IMMIX_LINE_MARK_RESET_VALUE,
+                },
+            );
+            self.initialize_region_image()?;
+            return Ok(Some(self.alloc_chunk(new_payload_block_count)?));
+        }
+
+        let old_block_count = self.num_blocks();
+        let payload_start = reserved_metadata_blocks(old_block_count)?;
+        let (old_payload_block_count, first_meta) = if payload_start < old_block_count {
+            let first_meta = self.block_metas[payload_start];
+            if first_meta.state()? == BlockState::Free {
+                (0, first_meta)
+            } else {
+                ensure!(
+                    first_meta.state()? == BlockState::Active
+                        && first_meta.kind()? == BlockKind::ObjectData,
+                    "transactional DAX PMEM region image has no active payload chunk"
+                );
+                (
+                    usize::try_from(first_meta.chunk_blocks)
+                        .context("transactional DAX PMEM payload chunk block count overflow")?,
+                    first_meta,
+                )
+            }
+        } else {
+            (0, BlockMeta::free())
+        };
+        ensure!(
+            new_payload_block_count >= old_payload_block_count,
+            "transactional DAX PMEM payload grow cannot shrink"
+        );
+        if new_payload_block_count == old_payload_block_count {
+            return Ok(None);
+        }
+
+        let new_block_count = dax_pmem_region_blocks_for_payload(new_payload_block_count)?;
+        ensure!(
+            block_table_block_count(old_block_count)? == block_table_block_count(new_block_count)?
+                && metadata_desc_start_block(old_block_count)?
+                    == metadata_desc_start_block(new_block_count)?
+                && type_layout_metadata_start_block(old_block_count)?
+                    == type_layout_metadata_start_block(new_block_count)?
+                && reserved_metadata_blocks(old_block_count)?
+                    == reserved_metadata_blocks(new_block_count)?,
+            "DAX PMEM payload grow would require metadata table relocation"
+        );
+        let payload_end = payload_start
+            .checked_add(new_payload_block_count)
+            .context("transactional DAX PMEM payload chunk range overflow")?;
+        ensure!(
+            payload_end <= new_block_count,
+            "transactional DAX PMEM payload chunk exceeds grown region"
+        );
+
+        let bytes_len = new_block_count
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM block region size overflow")?;
+        self.mapping.remap_len(bytes_len)?;
+        self.block_entries
+            .resize(new_block_count, BlockEntry::default());
+        self.block_metas.resize(new_block_count, BlockMeta::free());
+        for entry in &mut self.block_entries[payload_start..payload_end] {
+            entry.used = 1;
+            entry.list_num = ListKind::Used as i16;
+        }
+
+        let chunk_start = u32::try_from(payload_start)
+            .context("transactional DAX PMEM payload chunk overflow")?;
+        let chunk_blocks = u32::try_from(new_payload_block_count)
+            .context("transactional DAX PMEM payload chunk block count overflow")?;
+        let meta = BlockMeta::active(
+            BlockKind::ObjectData,
+            first_meta.generation,
+            first_meta.owner_thread,
+            chunk_start,
+            chunk_blocks,
+        );
+        for block in payload_start..payload_end {
+            self.write_block_meta(block, meta)?;
+        }
+
+        self.line_marks.resize(
+            bytes_len / IMMIX_LINE_SIZE,
+            LineMark {
+                mark: IMMIX_LINE_MARK_RESET_VALUE,
+            },
+        );
+        self.write_region_header(region_header_for_num_blocks(new_block_count)?)?;
+        self.flush_block_meta_range(payload_start, new_payload_block_count)?;
+        self.flush(0, size_of::<RegionHeader>())?;
+        self.fence()?;
+
+        Ok(Some(RegionChunk {
+            start_block: payload_start + old_payload_block_count,
+            block_count: new_payload_block_count - old_payload_block_count,
+        }))
     }
 
     pub(crate) fn block_meta(&self, block: u32) -> Result<BlockMeta> {
@@ -2517,15 +3285,18 @@ impl DaxPmemBlockRegion {
         self.mapping.write(0, &header.as_bytes())
     }
 
-    pub(crate) fn payload_chunk_from_image(
+    pub(crate) fn existing_payload_chunk_from_image(
         &mut self,
         payload_blocks: usize,
-    ) -> Result<RegionChunk> {
+    ) -> Result<Option<RegionChunk>> {
         let start = reserved_metadata_blocks(self.num_blocks())?;
-        ensure!(
-            start < self.num_blocks(),
-            "transactional DAX PMEM region image has no payload blocks"
-        );
+        if start >= self.num_blocks() {
+            ensure!(
+                payload_blocks == 0,
+                "transactional DAX PMEM region image has no payload blocks"
+            );
+            return Ok(None);
+        }
         let minimum_end = start
             .checked_add(payload_blocks)
             .context("transactional DAX PMEM minimum payload chunk range overflow")?;
@@ -2536,11 +3307,10 @@ impl DaxPmemBlockRegion {
 
         let first_meta = self.block_metas[start];
         if first_meta.state()? == BlockState::Free {
-            ensure!(
-                payload_blocks > 0,
-                "transactional DAX PMEM payload chunk must contain a block"
-            );
-            return self.alloc_chunk(payload_blocks);
+            if payload_blocks == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(self.alloc_chunk(payload_blocks)?));
         }
 
         let chunk_start = u32::try_from(start)
@@ -2571,7 +3341,15 @@ impl DaxPmemBlockRegion {
                 "transactional DAX PMEM region image has malformed payload chunk metadata"
             );
         }
-        Ok(RegionChunk::new(start, chunk_blocks))
+        Ok(Some(RegionChunk::new(start, chunk_blocks)))
+    }
+
+    pub(crate) fn payload_chunk_from_image(
+        &mut self,
+        payload_blocks: usize,
+    ) -> Result<RegionChunk> {
+        self.existing_payload_chunk_from_image(payload_blocks)?
+            .context("transactional DAX PMEM region image has no payload chunk")
     }
 
     fn validate_region_header(&self, header: RegionHeader) -> Result<()> {
@@ -2714,6 +3492,21 @@ impl BlockRegionBackend for DaxPmemBlockRegion {
 
     fn fence(&self) -> Result<()> {
         self.fence()
+    }
+
+    fn resize_bytes(&mut self, _new_len: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
+        self.grow_to_blocks(new_block_count)
+    }
+
+    fn grow_linear_payload_to_blocks(
+        &mut self,
+        new_payload_block_count: usize,
+    ) -> Result<Option<RegionChunk>> {
+        self.grow_linear_payload_to_blocks(new_payload_block_count)
     }
 }
 
@@ -4546,6 +5339,12 @@ pub(crate) fn recover_file_backed_region_snapshot(
     super::recovery::recover_region(&region.view(), region.load_type_layout_metadata()?)
 }
 
+pub(crate) fn recover_dax_pmem_region_snapshot(
+    region: &DaxPmemBlockRegion,
+) -> Result<super::recovery::RecoveredRegion> {
+    super::recovery::recover_region(&region.view(), region.load_type_layout_metadata()?)
+}
+
 #[cfg(test)]
 pub(crate) fn reopen_and_recover_file_backed_region_for_test(
     path: &Path,
@@ -4926,6 +5725,67 @@ mod tests {
 
         assert_eq!(reopened.start_block(), original.start_block());
         assert_eq!(reopened.block_count(), original.block_count());
+    }
+
+    #[test]
+    fn dax_pmem_payload_grow_extends_persisted_chunk_capacity() {
+        let mut region = DaxPmemBlockRegion::new_for_test(1).unwrap();
+        let original = region.alloc_chunk(1).unwrap();
+
+        let grown = region.grow_linear_payload_to_blocks(2).unwrap().unwrap();
+
+        assert_eq!(grown.start_block(), original.start_block() + 1);
+        assert_eq!(grown.block_count(), 1);
+
+        region.load_region_image().unwrap();
+        let reopened = region.payload_chunk_from_image(2).unwrap();
+        assert_eq!(reopened.start_block(), original.start_block());
+        assert_eq!(reopened.block_count(), 2);
+        for block in original.start_block()..original.start_block() + 2 {
+            let meta = region.block_meta(u32::try_from(block).unwrap()).unwrap();
+            assert_eq!(meta.state().unwrap(), BlockState::Active);
+            assert_eq!(meta.kind().unwrap(), BlockKind::ObjectData);
+            assert_eq!(
+                meta.chunk_start,
+                u32::try_from(original.start_block()).unwrap()
+            );
+            assert_eq!(meta.chunk_blocks, 2);
+        }
+    }
+
+    #[test]
+    fn dax_pmem_metadata_only_image_grows_first_payload_chunk() {
+        let num_blocks = dax_pmem_region_blocks_for_payload(0).unwrap();
+        let bytes_len = num_blocks * BLOCK_SIZE;
+        let mut region = DaxPmemBlockRegion::with_mapping(
+            DaxPmemMapping::new_research_temp(bytes_len).unwrap(),
+            num_blocks,
+        )
+        .unwrap();
+        region.initialize_region_image().unwrap();
+
+        assert!(
+            region
+                .existing_payload_chunk_from_image(0)
+                .unwrap()
+                .is_none()
+        );
+
+        let grown = region.grow_linear_payload_to_blocks(1).unwrap().unwrap();
+
+        assert_eq!(
+            grown.start_block(),
+            reserved_metadata_blocks(num_blocks).unwrap()
+        );
+        assert_eq!(grown.block_count(), 1);
+
+        region.load_region_image().unwrap();
+        let reopened = region
+            .existing_payload_chunk_from_image(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.start_block(), grown.start_block());
+        assert_eq!(reopened.block_count(), 1);
     }
 
     #[test]
