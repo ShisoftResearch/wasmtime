@@ -4628,6 +4628,7 @@ mod tests {
     };
 
     fn recovered_struct_winner(
+        source: &crate::runtime::vm::block_region::SyntheticRecoveredWinnerSourceHandle,
         object_id: ObjectId,
         version: u32,
         fields: Vec<ObjectValue>,
@@ -4640,6 +4641,23 @@ mod tests {
             &ObjectPayload::Struct(fields),
         )
         .unwrap();
+        let data_record = crate::runtime::vm::TMemory::encode_publication_data_record(
+            crate::runtime::vm::pack_object_granule_id(
+                crate::runtime::vm::PackedGranuleDomain::TStruct,
+                object_id.object_index,
+            )
+            .unwrap(),
+            version,
+            crate::runtime::vm::PackedGranuleDomain::TStruct as u16,
+            crate::runtime::transaction::type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            &record_bytes,
+        )
+        .unwrap();
+        let data_record_offset =
+            crate::runtime::vm::block_region::register_synthetic_recovered_winner_data_record_for_test(
+                source,
+                &data_record,
+            );
         crate::runtime::vm::RecoveredObjectWinner {
             object_id: object_id.object_index,
             version,
@@ -4648,8 +4666,8 @@ mod tests {
                 .get(),
             data_block: 0,
             data_offset: 0,
+            data_record_offset,
             record_len: record_bytes.len() as u64,
-            record_bytes,
         }
     }
 
@@ -4669,14 +4687,31 @@ mod tests {
         let root = ObjectId { object_index: 41 };
         let child = ObjectId { object_index: 42 };
         let mut objects = ObjectTable::default();
+        let recovered_fixture_source =
+            crate::runtime::vm::block_region::new_synthetic_recovered_winner_source_for_test();
+        let recovered_source =
+            crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
+                &recovered_fixture_source,
+            );
         objects
-            .rebuild_reachable_from_recovered_object_winners(
+            .rebuild_reachable_from_recovery_with_source_for_test(
                 &TypeLayoutRegistry::default(),
                 &[
-                    recovered_struct_winner(child, 1, vec![ObjectValue::I32(9)]),
-                    recovered_struct_winner(root, 1, vec![ObjectValue::Ref(Some(child))]),
+                    recovered_struct_winner(
+                        &recovered_fixture_source,
+                        child,
+                        1,
+                        vec![ObjectValue::I32(9)],
+                    ),
+                    recovered_struct_winner(
+                        &recovered_fixture_source,
+                        root,
+                        1,
+                        vec![ObjectValue::Ref(Some(child))],
+                    ),
                 ],
                 &[root.object_index],
+                recovered_source.clone(),
             )
             .unwrap();
         let expected_handle = objects.transaction_ref_handle_for_object_id(child).unwrap();
@@ -4709,14 +4744,31 @@ mod tests {
         let root = ObjectId { object_index: 41 };
         let child = ObjectId { object_index: 42 };
         let mut objects = ObjectTable::default();
+        let recovered_fixture_source =
+            crate::runtime::vm::block_region::new_synthetic_recovered_winner_source_for_test();
+        let recovered_source =
+            crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
+                &recovered_fixture_source,
+            );
         objects
-            .rebuild_reachable_from_recovered_object_winners(
+            .rebuild_reachable_from_recovery_with_source_for_test(
                 &TypeLayoutRegistry::default(),
                 &[
-                    recovered_struct_winner(child, 1, vec![ObjectValue::I32(9)]),
-                    recovered_struct_winner(root, 1, vec![ObjectValue::Ref(Some(child))]),
+                    recovered_struct_winner(
+                        &recovered_fixture_source,
+                        child,
+                        1,
+                        vec![ObjectValue::I32(9)],
+                    ),
+                    recovered_struct_winner(
+                        &recovered_fixture_source,
+                        root,
+                        1,
+                        vec![ObjectValue::Ref(Some(child))],
+                    ),
                 ],
                 &[root.object_index],
+                recovered_source.clone(),
             )
             .unwrap();
         let mut durable_refs = DurableReferenceRegistry::default();
@@ -4825,15 +4877,23 @@ mod tests {
     fn live_ref_bridge_resolves_transaction_handle_before_i31_fallback() {
         let object = ObjectId { object_index: 2 };
         let mut objects = ObjectTable::default();
+        let recovered_fixture_source =
+            crate::runtime::vm::block_region::new_synthetic_recovered_winner_source_for_test();
+        let recovered_source =
+            crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
+                &recovered_fixture_source,
+            );
         objects
-            .rebuild_reachable_from_recovered_object_winners(
+            .rebuild_reachable_from_recovery_with_source_for_test(
                 &TypeLayoutRegistry::default(),
                 &[recovered_struct_winner(
+                    &recovered_fixture_source,
                     object,
                     1,
                     vec![ObjectValue::I32(7)],
                 )],
                 &[object.object_index],
+                recovered_source.clone(),
             )
             .unwrap();
         let mut durable_refs = DurableReferenceRegistry::default();
@@ -5162,15 +5222,23 @@ mod tests {
         assert!(!ObjectTable::is_raw_i31_ref(gc_raw));
 
         let mut objects = ObjectTable::default();
+        let recovered_fixture_source =
+            crate::runtime::vm::block_region::new_synthetic_recovered_winner_source_for_test();
+        let recovered_source =
+            crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
+                &recovered_fixture_source,
+            );
         objects
-            .rebuild_reachable_from_recovered_object_winners(
+            .rebuild_reachable_from_recovery_with_source_for_test(
                 &TypeLayoutRegistry::default(),
                 &[recovered_struct_winner(
+                    &recovered_fixture_source,
                     object,
                     1,
                     vec![ObjectValue::I32(7)],
                 )],
                 &[object.object_index],
+                recovered_source.clone(),
             )
             .unwrap();
         let mut durable_refs = DurableReferenceRegistry::default();

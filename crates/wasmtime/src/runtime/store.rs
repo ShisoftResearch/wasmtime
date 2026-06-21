@@ -1846,11 +1846,15 @@ impl StoreOpaque {
                 &tx_log_path,
             )?;
         let object_winners = recovered.committed_object_winners()?;
+        let mapped_source = recovered
+            .cloned_mapped_region_source()
+            .context("recovered file-backed region does not expose a mapped region source")?;
         let mut recovered_object_table = ObjectTable::default();
-        recovered_object_table.rebuild_reachable_from_recovered_object_winners(
+        recovered_object_table.rebuild_reachable_from_mapped_recovered_object_winners(
             &recovered.type_layouts,
             &object_winners,
             &recovered.root_object_ids,
+            mapped_source,
         )?;
         let tx_log_blocks = u32::try_from(
             std::fs::metadata(&tx_log_path)
@@ -3483,6 +3487,12 @@ mod tests {
         assert_eq!(
             store.transaction_object_table().payload(root).unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(7), ObjectValue::I32(9)])
+        );
+        assert!(
+            store
+                .transaction_object_table()
+                .current_record_is_persistent_mapped_for_test(root)
+                .unwrap()
         );
         assert!(store.transaction_object_table().payload(garbage).is_err());
     }

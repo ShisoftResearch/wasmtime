@@ -298,6 +298,22 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
     fn retire_committed_linear_undo_chunk(&mut self, _chunk_start_block: u32) -> Result<()> {
         Ok(())
     }
+    fn with_recovered_region_snapshot(
+        &self,
+        f: &mut dyn FnMut(
+            &crate::runtime::vm::RecoveredRegion,
+            Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>>,
+        ) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(recovered) = self.recover_region_snapshot()? else {
+            return Ok(false);
+        };
+        f(&recovered, None)?;
+        Ok(true)
+    }
+    // This returns recovered metadata and may carry a mapped source when the
+    // backend supports one. Callers that need object record bytes must use a
+    // mapped source from the returned region or `with_recovered_region_snapshot`.
     fn recover_region_snapshot(&self) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
         Ok(None)
     }
@@ -420,10 +436,23 @@ impl TxDurableLog {
         Ok(())
     }
 
+    // This returns recovered metadata and may carry a mapped source when the
+    // backend supports one. Callers that need object record bytes must use a
+    // mapped source from the returned region or `with_recovered_region_snapshot`.
     pub(crate) fn recover_region_snapshot(
         &self,
     ) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
         self.storage.recover_region_snapshot()
+    }
+
+    pub(crate) fn with_recovered_region_snapshot(
+        &self,
+        f: &mut dyn FnMut(
+            &crate::runtime::vm::RecoveredRegion,
+            Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>>,
+        ) -> Result<()>,
+    ) -> Result<bool> {
+        self.storage.with_recovered_region_snapshot(f)
     }
 
     pub(crate) fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
@@ -1028,6 +1057,23 @@ where
         self.region
             .retire_linear_undo_chunks(core::iter::once(chunk_start_block))?;
         Ok(())
+    }
+
+    fn with_recovered_region_snapshot(
+        &self,
+        f: &mut dyn FnMut(
+            &crate::runtime::vm::RecoveredRegion,
+            Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>>,
+        ) -> Result<()>,
+    ) -> Result<bool> {
+        let recovered = self.region.recover_region_snapshot()?;
+        let source = self
+            .region
+            .view()
+            .mapped_region_source()
+            .context("durable region recovery requires mapped source")?;
+        f(&recovered, Some(source))?;
+        Ok(true)
     }
 
     fn recover_region_snapshot(&self) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
@@ -1661,11 +1707,12 @@ fn sample_publications() -> Vec<PendingPublication> {
 mod tests {
     use super::*;
     use crate::runtime::transaction::{
-        ObjectPayload, ObjectValue,
-        object_heap::TxObjectHeader,
+        ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi,
         object_heap::encode_object_record_for_test,
+        object_heap::{TxArrayHeader, TxObjectHeader},
         type_layout::{PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId},
     };
+    use crate::runtime::vm::RecoveredObjectWinner;
 
     const TEST_STRUCT_TYPE_LAYOUT_ID: u32 = 12;
 
@@ -1713,6 +1760,15 @@ mod tests {
         }
     }
 
+    fn scalar_struct_type_layout_for_test(id: u32, body_size: u32) -> PersistentTypeLayout {
+        PersistentTypeLayout::Struct {
+            id: TypeLayoutId::new(id).unwrap(),
+            fingerprint: (u64::from(id) << 32) | u64::from(body_size),
+            body_size,
+            fields: vec![],
+        }
+    }
+
     fn test_struct_type_layout() -> PersistentTypeLayout {
         PersistentTypeLayout::Struct {
             id: TypeLayoutId::new(TEST_STRUCT_TYPE_LAYOUT_ID).unwrap(),
@@ -1752,6 +1808,22 @@ mod tests {
         if let Some(marker) = marker {
             publisher.publish_commit_lp(marker)?;
         }
+        Ok(())
+    }
+
+    fn publish_single_object_publication_for_test(
+        log: &mut TxDurableLog,
+        txid: u32,
+        publication: PendingPublication,
+    ) -> Result<()> {
+        let marker = {
+            let mut sink = log.stream_sink(1);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 1, txid);
+            publisher.publish_object_publication_before_commit(&publication)?
+        };
+        let mut sink = log.stream_sink(1);
+        let mut publisher = StreamPublisher::new_for_test(&mut sink, 1, txid);
+        publisher.publish_commit_lp(marker)?;
         Ok(())
     }
 
@@ -2214,6 +2286,76 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_durable_log_snapshot_callback_reports_absent_recovery() {
+        let log = TxDurableLog::default();
+        let mut called = false;
+
+        let consumed = log
+            .with_recovered_region_snapshot(&mut |_, _| {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!consumed);
+        assert!(!called);
+    }
+
+    #[test]
+    fn dax_pmem_durable_region_log_snapshot_callback_exposes_mapped_source() {
+        let mut log = TxDurableLog::create_dax_pmem_research_for_test(32).unwrap();
+        log.ensure_type_layout(&test_struct_type_layout()).unwrap();
+        let expected_record = encode_object_record_for_test(
+            41,
+            7,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
+            &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+        )
+        .unwrap();
+        let publication = PendingPublication::persistent_object_for_test(
+            PackedGranuleDomain::TStruct,
+            41,
+            7,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
+            &expected_record,
+        );
+
+        let marker = {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher
+                .publish_object_publication_before_commit(&publication)
+                .unwrap()
+        };
+        {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            publisher.publish_commit_lp(marker).unwrap();
+        }
+
+        let mut consumed = false;
+        let mut recovered_record = None;
+        log.with_recovered_region_snapshot(&mut |recovered, mapped_source| {
+            let mapped_source = mapped_source.expect("mapped durable log backend");
+            let winner = recovered
+                .committed_object_winners()?
+                .into_iter()
+                .find(|winner| winner.object_id == 41)
+                .expect("recovered object winner");
+            winner.with_source_record_bytes(mapped_source.as_ref(), &mut |bytes| {
+                recovered_record = Some(bytes.to_vec());
+                Ok(())
+            })?;
+            consumed = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(consumed);
+        assert_eq!(recovered_record, Some(expected_record));
+    }
+
+    #[test]
     fn dax_pmem_durable_log_retires_dead_object_chunk_and_reuses_generation() {
         let mut log = TxDurableLog::create_dax_pmem_research_for_test(32).unwrap();
         log.ensure_type_layout(&test_struct_type_layout()).unwrap();
@@ -2306,6 +2448,1138 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const STRESS_ARRAY_TYPE_LAYOUT_ID: u32 = 13;
+    #[cfg(target_os = "linux")]
+    const STRESS_OBJECT_ENCODED_BATCH_BYTES: u64 = 4 * 1024 * 1024;
+    #[cfg(target_os = "linux")]
+    const STRESS_OBJECT_BATCH_PUBLICATIONS: usize = 256;
+    #[cfg(target_os = "linux")]
+    const STRESS_LINEAR_CHUNK_BYTES: usize = 1024 * 1024;
+    #[cfg(target_os = "linux")]
+    const STRESS_LINEAR_SEGMENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    #[cfg(target_os = "linux")]
+    const STRESS_LINEAR_SAMPLE_BYTES: usize = 256;
+    #[cfg(target_os = "linux")]
+    const STRESS_LINEAR_SAMPLE_STRIDE_BYTES: u64 = 64 * 1024 * 1024;
+    #[cfg(target_os = "linux")]
+    const STRESS_OBJECT_SAMPLE_STRIDE_BYTES: u64 = 64 * 1024 * 1024;
+    #[cfg(target_os = "linux")]
+    const STRESS_OBJECT_SAMPLE_FIRST_COUNT: usize = 4;
+    #[cfg(target_os = "linux")]
+    const STRESS_OBJECT_SAMPLE_LAST_COUNT: usize = 4;
+    #[cfg(target_os = "linux")]
+    const STRESS_OBJECT_SAMPLE_STRIDE_COUNT: usize = 16;
+    #[cfg(target_os = "linux")]
+    const STRESS_DEFAULT_SEED: u64 = 0x5eed_dacc_2026_0621;
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Debug)]
+    struct DaxPmemStressConfig {
+        bytes_per_root: u64,
+        roots: Vec<std::path::PathBuf>,
+        seed: u64,
+        keep_files: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct ObjectStressStats {
+        path: std::path::PathBuf,
+        payload_blocks: usize,
+        object_count: usize,
+        sampled_object_count: usize,
+        bucket_counts: [u64; 5],
+        requested_logical_bytes: u64,
+        encoded_bytes: u64,
+        populate_elapsed: std::time::Duration,
+        recovery_elapsed: std::time::Duration,
+        recovery_workers: usize,
+        recovered_object_count: usize,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct LinearStressStats {
+        paths: Vec<std::path::PathBuf>,
+        committed_bytes: u64,
+        pages: u64,
+        sample_count: usize,
+        populate_elapsed: std::time::Duration,
+        reopen_validate_elapsed: std::time::Duration,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug)]
+    struct StressRng {
+        state: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ObjectRecoverySample {
+        object_id: u64,
+        requested_logical_bytes: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct ObjectRecoverySampleSet {
+        first: Vec<ObjectRecoverySample>,
+        stride: Vec<ObjectRecoverySample>,
+        last: Vec<ObjectRecoverySample>,
+        next_stride_threshold: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl StressRng {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: if seed == 0 {
+                    0x9e37_79b9_7f4a_7c15
+                } else {
+                    seed
+                },
+            }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.state = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, upper_exclusive: u64) -> u64 {
+            debug_assert!(upper_exclusive > 0);
+            self.next_u64() % upper_exclusive
+        }
+
+        fn range_inclusive(&mut self, start: u64, end: u64) -> u64 {
+            debug_assert!(start <= end);
+            start + self.below(end - start + 1)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ObjectRecoverySampleSet {
+        fn new() -> Self {
+            Self {
+                first: Vec::new(),
+                stride: Vec::new(),
+                last: Vec::new(),
+                next_stride_threshold: STRESS_OBJECT_SAMPLE_STRIDE_BYTES,
+            }
+        }
+
+        fn observe(&mut self, object_id: u64, requested_logical_bytes: u64, encoded_bytes: u64) {
+            let sample = ObjectRecoverySample {
+                object_id,
+                requested_logical_bytes,
+            };
+            if self.first.len() < STRESS_OBJECT_SAMPLE_FIRST_COUNT {
+                self.first.push(sample);
+            }
+            self.last.push(sample);
+            if self.last.len() > STRESS_OBJECT_SAMPLE_LAST_COUNT {
+                self.last.remove(0);
+            }
+            while self.next_stride_threshold <= encoded_bytes {
+                if self.stride.len() < STRESS_OBJECT_SAMPLE_STRIDE_COUNT {
+                    self.stride.push(sample);
+                }
+                self.next_stride_threshold = self
+                    .next_stride_threshold
+                    .saturating_add(STRESS_OBJECT_SAMPLE_STRIDE_BYTES);
+                if self.next_stride_threshold == 0 {
+                    break;
+                }
+            }
+        }
+
+        fn into_vec(self) -> Vec<ObjectRecoverySample> {
+            let mut samples = Vec::new();
+            let mut seen = BTreeSet::new();
+            for sample in self.first.into_iter().chain(self.stride).chain(self.last) {
+                if seen.insert(sample.object_id) {
+                    samples.push(sample);
+                }
+            }
+            samples
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dax_pmem_fsdax_stress_impl(config: &DaxPmemStressConfig) -> Result<()> {
+        let object_target_bytes = config
+            .bytes_per_root
+            .checked_mul(45)
+            .context("per-root stress byte budget overflow")?
+            / 100;
+        let linear_target_bytes = config
+            .bytes_per_root
+            .checked_mul(45)
+            .context("per-root stress byte budget overflow")?
+            / 100;
+        let headroom_bytes = config
+            .bytes_per_root
+            .checked_sub(object_target_bytes + linear_target_bytes)
+            .context("per-root stress split overflow")?;
+
+        for (root_index, root) in config.roots.iter().enumerate() {
+            std::fs::create_dir_all(root)
+                .with_context(|| format!("creating DAX stress root {}", root.display()))?;
+
+            let root_seed = config.seed.wrapping_add(u64::try_from(root_index).unwrap())
+                ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9);
+            let object = run_dax_object_stress(
+                root,
+                root_index,
+                object_target_bytes,
+                root_seed ^ 0x0b1e_c710_6a2d_5f51,
+            )?;
+            let linear = run_dax_linear_stress(
+                root,
+                root_index,
+                linear_target_bytes,
+                root_seed ^ 0x1ea4_5eed_2048_abcd,
+            )?;
+
+            eprintln!(
+                "{}",
+                format_dax_stress_line(
+                    root_index,
+                    config.bytes_per_root,
+                    object_target_bytes,
+                    linear_target_bytes,
+                    headroom_bytes,
+                    &object,
+                    &linear,
+                )
+            );
+
+            if !config.keep_files {
+                remove_file_if_exists(&object.path)?;
+                for path in &linear.paths {
+                    remove_file_if_exists(path)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dax_pmem_stress_config_from_env() -> Result<DaxPmemStressConfig> {
+        let bytes_per_root = parse_scaled_env_u64(
+            "WASMTIME_DAX_STRESS_BYTES",
+            &std::env::var("WASMTIME_DAX_STRESS_BYTES")
+                .context("WASMTIME_DAX_STRESS_BYTES must be valid UTF-8")?,
+        )?;
+        let roots = if let Ok(value) = std::env::var("WASMTIME_DAX_STRESS_DIRS") {
+            parse_root_dirs(&value)
+        } else if let Some(root) = std::env::var_os("WASMTIME_TEST_DAX_PMEM_DIR") {
+            vec![std::path::PathBuf::from(root)]
+        } else {
+            vec![std::path::PathBuf::from("/pmem0/wasmtime-dcpmm")]
+        };
+        let seed = match std::env::var("WASMTIME_DAX_STRESS_SEED") {
+            Ok(value) => parse_seed_u64(&value)?,
+            Err(std::env::VarError::NotPresent) => STRESS_DEFAULT_SEED,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("WASMTIME_DAX_STRESS_SEED must be valid UTF-8")
+            }
+        };
+        let keep_files = std::env::var_os("WASMTIME_DAX_STRESS_KEEP_FILES").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        ensure!(
+            !roots.is_empty(),
+            "DAX PMEM stress test requires at least one root directory"
+        );
+
+        Ok(DaxPmemStressConfig {
+            bytes_per_root,
+            roots,
+            seed,
+            keep_files,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_root_dirs(value: &str) -> Vec<std::path::PathBuf> {
+        let roots = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            if let Some(root) = std::env::var_os("WASMTIME_TEST_DAX_PMEM_DIR") {
+                return vec![std::path::PathBuf::from(root)];
+            }
+            return vec![std::path::PathBuf::from("/pmem0/wasmtime-dcpmm")];
+        }
+        roots
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_seed_u64(value: &str) -> Result<u64> {
+        let trimmed = value.trim();
+        ensure!(
+            !trimmed.is_empty(),
+            "WASMTIME_DAX_STRESS_SEED cannot be empty"
+        );
+        if let Some(hex) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
+            return u64::from_str_radix(hex, 16)
+                .with_context(|| format!("invalid hex seed: {trimmed}"));
+        }
+        trimmed
+            .parse::<u64>()
+            .with_context(|| format!("invalid decimal seed: {trimmed}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_scaled_env_u64(name: &str, value: &str) -> Result<u64> {
+        let trimmed = value.trim();
+        ensure!(!trimmed.is_empty(), "{name} cannot be empty");
+        let suffix_start = trimmed
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(trimmed.len());
+        ensure!(suffix_start > 0, "{name} must start with decimal digits");
+        let number = trimmed[..suffix_start]
+            .parse::<u64>()
+            .with_context(|| format!("{name} has an invalid integer value"))?;
+        let suffix = trimmed[suffix_start..].trim().to_ascii_uppercase();
+        let scale = match suffix.as_str() {
+            "" => 1,
+            "K" | "KIB" => 1024,
+            "M" | "MIB" => 1024_u64.pow(2),
+            "G" | "GIB" => 1024_u64.pow(3),
+            "T" | "TIB" => 1024_u64.pow(4),
+            _ => bail!("{name} has an unsupported suffix: {suffix}"),
+        };
+        number
+            .checked_mul(scale)
+            .with_context(|| format!("{name} overflows u64"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_dax_object_stress(
+        root: &Path,
+        root_index: usize,
+        target_encoded_bytes: u64,
+        seed: u64,
+    ) -> Result<ObjectStressStats> {
+        let path = root.join(format!(
+            "dax-pmem-stress-object-{}-{}.log",
+            std::process::id(),
+            root_index
+        ));
+        remove_file_if_exists(&path)?;
+
+        let payload_blocks = estimate_object_payload_blocks(target_encoded_bytes)?;
+        let layout = stress_array_type_layout();
+        let mut log = TxDurableLog::create_dax_pmem_fsdax_for_test(&path, payload_blocks)
+            .with_context(|| format!("creating object stress log {}", path.display()))?;
+        log.ensure_type_layout(&layout)?;
+
+        let mut rng = StressRng::new(seed);
+        let mut object_id = 1u64;
+        let mut txid = 1u32;
+        let mut object_count = 0usize;
+        let mut bucket_counts = [0u64; 5];
+        let mut requested_logical_bytes = 0u64;
+        let mut encoded_bytes = 0u64;
+        let mut batch_encoded_bytes = 0u64;
+        let mut recovery_samples = ObjectRecoverySampleSet::new();
+        let mut batch = Vec::new();
+        let populate_start = std::time::Instant::now();
+
+        while encoded_bytes < target_encoded_bytes {
+            let (requested_bytes, bucket_index) = sample_object_logical_size(&mut rng);
+            let payload = deterministic_array_payload(seed, object_id, requested_bytes)?;
+            let record =
+                encode_object_record_for_test(object_id, 1, STRESS_ARRAY_TYPE_LAYOUT_ID, &payload)?;
+            let record_len =
+                u64::try_from(record.len()).context("object record length exceeds u64")?;
+            batch.push(PendingPublication::persistent_object_for_test(
+                PackedGranuleDomain::TArray,
+                object_id,
+                1,
+                STRESS_ARRAY_TYPE_LAYOUT_ID,
+                &record,
+            ));
+            bucket_counts[bucket_index] += 1;
+            requested_logical_bytes = requested_logical_bytes
+                .checked_add(requested_bytes)
+                .context("object logical byte counter overflow")?;
+            encoded_bytes = encoded_bytes
+                .checked_add(record_len)
+                .context("object encoded byte counter overflow")?;
+            batch_encoded_bytes = batch_encoded_bytes
+                .checked_add(record_len)
+                .context("object batch byte counter overflow")?;
+            recovery_samples.observe(object_id, requested_bytes, encoded_bytes);
+            object_count += 1;
+            object_id = object_id
+                .checked_add(1)
+                .context("object id overflow during stress test")?;
+
+            if batch_encoded_bytes >= STRESS_OBJECT_ENCODED_BATCH_BYTES
+                || batch.len() >= STRESS_OBJECT_BATCH_PUBLICATIONS
+            {
+                publish_object_batch(&mut log, root_index, txid, &batch)?;
+                batch.clear();
+                batch_encoded_bytes = 0;
+                txid = txid.checked_add(1).context("stress txid overflow")?;
+            }
+        }
+
+        if !batch.is_empty() {
+            publish_object_batch(&mut log, root_index, txid, &batch)?;
+        }
+
+        let populate_elapsed = populate_start.elapsed();
+        let recovery_start = std::time::Instant::now();
+        let recovered = log
+            .recover_region_snapshot()?
+            .context("expected DAX PMEM durable log recovery snapshot")?;
+        let recovered_winners = recovered.committed_object_winners()?;
+        let recovered_object_count = recovered_winners.len();
+        let recovery_workers = crate::runtime::vm::recovery_worker_count_for_test(
+            crate::runtime::vm::RecoveryOptions::default(),
+            recovered_winners.len(),
+        );
+        let recovery_elapsed = recovery_start.elapsed();
+        ensure!(
+            recovered_object_count == object_count,
+            "recovered object count mismatch: published {object_count}, recovered {recovered_object_count}"
+        );
+        let recovery_samples = recovery_samples.into_vec();
+        let winners_by_id = recovered_winners
+            .iter()
+            .map(|winner| (winner.object_id, winner))
+            .collect::<BTreeMap<u64, &RecoveredObjectWinner>>();
+        let mapped_source = recovered
+            .mapped_region_source()
+            .context("recovered DAX PMEM snapshot does not expose a mapped region source")?;
+        validate_recovered_object_samples(seed, &recovery_samples, &winners_by_id, mapped_source)?;
+
+        Ok(ObjectStressStats {
+            path,
+            payload_blocks,
+            object_count,
+            sampled_object_count: recovery_samples.len(),
+            bucket_counts,
+            requested_logical_bytes,
+            encoded_bytes,
+            populate_elapsed,
+            recovery_elapsed,
+            recovery_workers,
+            recovered_object_count,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn format_dax_stress_line(
+        root_index: usize,
+        bytes_per_root: u64,
+        object_target_bytes: u64,
+        linear_target_bytes: u64,
+        headroom_bytes: u64,
+        object: &ObjectStressStats,
+        linear: &LinearStressStats,
+    ) -> String {
+        format!(
+            "dax-stress root[{root_index}] target={}MiB split(obj={}MiB lin={}MiB head={}MiB) \
+obj={:.1}MiB/s rec={:.3}s rec_workers={} lin={:.1}MiB/s reopen={:.3}s objects={} recovered={} \
+buckets={:?} logical={}MiB encoded={}MiB linear_samples={} object_samples={} obj_blocks={} \
+pages={} linear_segments={} obj_path={} tmemory_path={}",
+            bytes_to_mib(bytes_per_root),
+            bytes_to_mib(object_target_bytes),
+            bytes_to_mib(linear_target_bytes),
+            bytes_to_mib(headroom_bytes),
+            mib_per_sec(object.encoded_bytes, object.populate_elapsed),
+            object.recovery_elapsed.as_secs_f64(),
+            object.recovery_workers,
+            mib_per_sec(linear.committed_bytes, linear.populate_elapsed),
+            linear.reopen_validate_elapsed.as_secs_f64(),
+            object.object_count,
+            object.recovered_object_count,
+            object.bucket_counts,
+            bytes_to_mib(object.requested_logical_bytes),
+            bytes_to_mib(object.encoded_bytes),
+            linear.sample_count,
+            object.sampled_object_count,
+            object.payload_blocks,
+            linear.pages,
+            linear.paths.len(),
+            object.path.display(),
+            linear
+                .paths
+                .first()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_object_batch(
+        log: &mut TxDurableLog,
+        root_index: usize,
+        txid: u32,
+        publications: &[PendingPublication],
+    ) -> Result<()> {
+        let stream_id = u32::try_from(root_index)
+            .context("stress root index exceeds u32")?
+            .checked_add(1)
+            .context("stress stream id overflow")?;
+        let marker = {
+            let mut sink = log.stream_sink(stream_id);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, stream_id, txid);
+            publisher.publish_object_publications_before_commit(publications)?
+        };
+        if let Some(marker) = marker {
+            let mut sink = log.stream_sink(stream_id);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, stream_id, txid);
+            publisher.publish_commit_lp(marker)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn estimate_object_payload_blocks(target_encoded_bytes: u64) -> Result<usize> {
+        let block_size = u64::try_from(crate::runtime::vm::block_region::BLOCK_SIZE).unwrap();
+        // `target_encoded_bytes` only counts encoded object records. The stress
+        // harness wraps each record in a publication data record and also needs
+        // room for log blocks, data-chunk headers, and persisted type-layout
+        // metadata. Reserve a bounded but conservative region size so large
+        // runs do not exhaust the object log before the `encoded_bytes` loop
+        // target is reached.
+        let estimated_bytes = target_encoded_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(4 * block_size))
+            .context("object stress region size overflow")?;
+        let blocks = estimated_bytes.div_ceil(block_size).max(8);
+        usize::try_from(blocks).context("object stress payload block count exceeds usize")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_pmem_stress_object_capacity_estimate_reserves_durable_overhead() {
+        let block_size = u64::try_from(crate::runtime::vm::block_region::BLOCK_SIZE).unwrap();
+        let target_encoded_bytes = 64 * 1024 * 1024;
+        let blocks = estimate_object_payload_blocks(target_encoded_bytes).unwrap();
+        let estimated_bytes = u64::try_from(blocks).unwrap() * block_size;
+
+        assert!(
+            estimated_bytes >= (2 * target_encoded_bytes) + (4 * block_size),
+            "estimated_bytes={estimated_bytes} target_encoded_bytes={target_encoded_bytes} block_size={block_size}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_pmem_stress_linear_sample_len_rejects_offset_past_end() {
+        let err = linear_sample_len(128, 129).unwrap_err().to_string();
+        assert!(err.contains("linear sample offset 129 exceeds total bytes 128"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_pmem_stress_object_sample_validator_streams_expected_record() {
+        let seed = 0x5150_aa55_0123_4567;
+        let sample = ObjectRecoverySample {
+            object_id: 17,
+            requested_logical_bytes: 257,
+        };
+        let payload =
+            deterministic_array_payload(seed, sample.object_id, sample.requested_logical_bytes)
+                .unwrap();
+        let mut record = encode_object_record_for_test(
+            sample.object_id,
+            1,
+            STRESS_ARRAY_TYPE_LAYOUT_ID,
+            &payload,
+        )
+        .unwrap();
+
+        validate_recovered_stress_array_record(seed, &sample, &record).unwrap();
+
+        let corrupt_offset = record.len() - 3;
+        record[corrupt_offset] ^= 0x5a;
+        let err = validate_recovered_stress_array_record(seed, &sample, &record)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("first_mismatch_offset="));
+        assert!(err.contains(&format!("first_mismatch_offset={corrupt_offset}")));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sample_object_logical_size(rng: &mut StressRng) -> (u64, usize) {
+        let bucket = rng.below(100);
+        match bucket {
+            0..=54 => (rng.range_inclusive(32, 256), 0),
+            55..=79 => (rng.range_inclusive(256, 2 * 1024), 1),
+            80..=94 => (rng.range_inclusive(2 * 1024, 32 * 1024), 2),
+            95..=98 => (rng.range_inclusive(32 * 1024, 512 * 1024), 3),
+            _ => (rng.range_inclusive(512 * 1024, 4 * 1024 * 1024), 4),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_array_payload(
+        seed: u64,
+        object_id: u64,
+        requested_logical_bytes: u64,
+    ) -> Result<ObjectPayload> {
+        let element_count = requested_logical_bytes.div_ceil(8).max(1);
+        let element_count =
+            usize::try_from(element_count).context("array element count exceeds usize")?;
+        let mut values = Vec::with_capacity(element_count);
+        let mut state = mix64(seed ^ object_id.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        for index in 0..element_count {
+            state = mix64(
+                state
+                    ^ u64::try_from(index)
+                        .unwrap()
+                        .wrapping_mul(0xd1b5_4a32_d192_ed03),
+            );
+            values.push(ObjectValue::I64(state as i64));
+        }
+        Ok(ObjectPayload::Array(values))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_array_element_count(requested_logical_bytes: u64) -> Result<usize> {
+        let element_count = requested_logical_bytes.div_ceil(8).max(1);
+        usize::try_from(element_count).context("array element count exceeds usize")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_array_element_value(seed: u64, object_id: u64, element_index: usize) -> i64 {
+        let mut state = mix64(seed ^ object_id.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        for index in 0..=element_index {
+            state = mix64(
+                state
+                    ^ u64::try_from(index)
+                        .unwrap()
+                        .wrapping_mul(0xd1b5_4a32_d192_ed03),
+            );
+        }
+        state as i64
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_array_element_bytes(
+        seed: u64,
+        object_id: u64,
+        element_index: usize,
+    ) -> Result<[u8; 20]> {
+        object_value_i64_bytes(deterministic_array_element_value(
+            seed,
+            object_id,
+            element_index,
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn object_value_i64_bytes(value: i64) -> Result<[u8; 20]> {
+        let abi = ObjectValueAbi::from_object_value(&ObjectValue::I64(value))?;
+        let (tag, low, high) = abi.as_parts();
+        let mut bytes = [0u8; 20];
+        bytes[0..4].copy_from_slice(&tag.to_le_bytes());
+        bytes[4..12].copy_from_slice(&low.to_le_bytes());
+        bytes[12..20].copy_from_slice(&high.to_le_bytes());
+        Ok(bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_array_record_len(element_count: usize) -> Result<usize> {
+        element_count
+            .checked_mul(20)
+            .and_then(|payload_len| payload_len.checked_add(core::mem::size_of::<TxArrayHeader>()))
+            .context("deterministic array record length overflow")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_recovered_object_samples(
+        seed: u64,
+        samples: &[ObjectRecoverySample],
+        winners_by_id: &BTreeMap<u64, &RecoveredObjectWinner>,
+        source: &dyn crate::runtime::vm::block_region::MappedRegionSource,
+    ) -> Result<()> {
+        for sample in samples {
+            let winner = winners_by_id.get(&sample.object_id).with_context(|| {
+                format!(
+                    "missing recovered winner for sampled object {}",
+                    sample.object_id
+                )
+            })?;
+            let mut matched = false;
+            winner.with_source_record_bytes(source, &mut |bytes| {
+                validate_recovered_stress_array_record(seed, sample, bytes)?;
+                matched = true;
+                Ok(())
+            })?;
+            ensure!(
+                matched,
+                "sampled object {} did not map recovered record bytes",
+                sample.object_id,
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_recovered_stress_array_record(
+        seed: u64,
+        sample: &ObjectRecoverySample,
+        actual: &[u8],
+    ) -> Result<()> {
+        let element_count = deterministic_array_element_count(sample.requested_logical_bytes)?;
+        let expected_len = deterministic_array_record_len(element_count)?;
+        if actual.len() != expected_len {
+            bail!(
+                "recovered record mismatch for sampled object {} requested_bytes={} recovered_len={} expected_len={}",
+                sample.object_id,
+                sample.requested_logical_bytes,
+                actual.len(),
+                expected_len
+            );
+        }
+
+        let header = TxObjectHeader {
+            record_len: u64::try_from(expected_len).context("record length exceeds u64")?,
+            object_id: sample.object_id,
+            version: 1,
+            kind: ObjectKind::Array as u16,
+            flags: 0,
+            type_layout_id: STRESS_ARRAY_TYPE_LAYOUT_ID,
+        };
+        if let Some(mismatch_offset) =
+            first_mismatch_in_expected_slice(actual, 0, &header.as_bytes())?
+        {
+            bail_stress_array_record_mismatch(seed, sample, actual, expected_len, mismatch_offset)?;
+        }
+
+        let object_header_len = core::mem::size_of::<TxObjectHeader>();
+        let array_len = u32::try_from(element_count).context("array length exceeds u32")?;
+        if let Some(mismatch_offset) =
+            first_mismatch_in_expected_slice(actual, object_header_len, &array_len.to_le_bytes())?
+        {
+            bail_stress_array_record_mismatch(seed, sample, actual, expected_len, mismatch_offset)?;
+        }
+
+        let payload_start = core::mem::size_of::<TxArrayHeader>();
+        for offset in object_header_len + core::mem::size_of::<u32>()..payload_start {
+            if actual[offset] != 0 {
+                bail_stress_array_record_mismatch(seed, sample, actual, expected_len, offset)?;
+            }
+        }
+
+        let mut state = mix64(seed ^ sample.object_id.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        for element_index in 0..element_count {
+            state = mix64(
+                state
+                    ^ u64::try_from(element_index)
+                        .unwrap()
+                        .wrapping_mul(0xd1b5_4a32_d192_ed03),
+            );
+            let element_offset = payload_start
+                .checked_add(
+                    element_index
+                        .checked_mul(20)
+                        .context("deterministic array element offset overflow")?,
+                )
+                .context("deterministic array payload offset overflow")?;
+            let expected = object_value_i64_bytes(state as i64)?;
+            if let Some(mismatch_offset) =
+                first_mismatch_in_expected_slice(actual, element_offset, &expected)?
+            {
+                bail_stress_array_record_mismatch(
+                    seed,
+                    sample,
+                    actual,
+                    expected_len,
+                    mismatch_offset,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn first_mismatch_in_expected_slice(
+        actual: &[u8],
+        start: usize,
+        expected: &[u8],
+    ) -> Result<Option<usize>> {
+        let end = start
+            .checked_add(expected.len())
+            .context("expected comparison range overflow")?;
+        let actual = actual
+            .get(start..end)
+            .context("expected comparison range exceeds actual record length")?;
+        Ok(actual
+            .iter()
+            .zip(expected.iter())
+            .position(|(actual, expected)| actual != expected)
+            .map(|offset| start + offset))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bail_stress_array_record_mismatch(
+        seed: u64,
+        sample: &ObjectRecoverySample,
+        actual: &[u8],
+        expected_len: usize,
+        mismatch_offset: usize,
+    ) -> Result<()> {
+        bail!(
+            "recovered record mismatch for sampled object {} requested_bytes={} {}",
+            sample.object_id,
+            sample.requested_logical_bytes,
+            describe_stress_array_record_mismatch(
+                seed,
+                sample.object_id,
+                actual,
+                expected_len,
+                mismatch_offset,
+            )?
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn describe_stress_array_record_mismatch(
+        seed: u64,
+        object_id: u64,
+        actual: &[u8],
+        expected_len: usize,
+        mismatch_offset: usize,
+    ) -> Result<String> {
+        let window_start = mismatch_offset.saturating_sub(4);
+        let window_end = (mismatch_offset + 5).min(expected_len).min(actual.len());
+        let mut expected_window = Vec::with_capacity(window_end.saturating_sub(window_start));
+        for offset in window_start..window_end {
+            expected_window.push(expected_stress_array_record_byte(
+                seed,
+                object_id,
+                expected_len,
+                offset,
+            )?);
+        }
+        Ok(format!(
+            "len={} first_mismatch_offset={} expected_window[{}..{}]={} actual_window[{}..{}]={}",
+            expected_len,
+            mismatch_offset,
+            window_start,
+            window_end,
+            format_byte_window(&expected_window),
+            window_start,
+            window_end,
+            format_byte_window(&actual[window_start..window_end]),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expected_stress_array_record_byte(
+        seed: u64,
+        object_id: u64,
+        expected_len: usize,
+        offset: usize,
+    ) -> Result<u8> {
+        let element_count = (expected_len
+            .checked_sub(core::mem::size_of::<TxArrayHeader>())
+            .context("deterministic array record is shorter than array header")?)
+            / 20;
+        let header = TxObjectHeader {
+            record_len: u64::try_from(expected_len).context("record length exceeds u64")?,
+            object_id,
+            version: 1,
+            kind: ObjectKind::Array as u16,
+            flags: 0,
+            type_layout_id: STRESS_ARRAY_TYPE_LAYOUT_ID,
+        };
+        let object_header_len = core::mem::size_of::<TxObjectHeader>();
+        if offset < object_header_len {
+            return Ok(header.as_bytes()[offset]);
+        }
+        let array_length_end = object_header_len + core::mem::size_of::<u32>();
+        if offset < array_length_end {
+            let array_len = u32::try_from(element_count).context("array length exceeds u32")?;
+            return Ok(array_len.to_le_bytes()[offset - object_header_len]);
+        }
+        let payload_start = core::mem::size_of::<TxArrayHeader>();
+        if offset < payload_start {
+            return Ok(0);
+        }
+        let payload_offset = offset - payload_start;
+        let element_index = payload_offset / 20;
+        let element_byte = payload_offset % 20;
+        Ok(deterministic_array_element_bytes(seed, object_id, element_index)?[element_byte])
+    }
+
+    fn describe_record_byte_mismatch(expected: &[u8], actual: &[u8]) -> String {
+        if expected.len() != actual.len() {
+            return format!(
+                "recovered_len={} expected_len={}",
+                actual.len(),
+                expected.len()
+            );
+        }
+
+        let mismatch_offset = expected
+            .iter()
+            .zip(actual.iter())
+            .position(|(expected, actual)| expected != actual)
+            .unwrap_or(expected.len());
+        let window_start = mismatch_offset.saturating_sub(4);
+        let window_end = (mismatch_offset + 5).min(expected.len());
+        format!(
+            "len={} first_mismatch_offset={} expected_window[{}..{}]={} actual_window[{}..{}]={}",
+            expected.len(),
+            mismatch_offset,
+            window_start,
+            window_end,
+            format_byte_window(&expected[window_start..window_end]),
+            window_start,
+            window_end,
+            format_byte_window(&actual[window_start..window_end]),
+        )
+    }
+
+    fn format_byte_window(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stress_array_type_layout() -> PersistentTypeLayout {
+        PersistentTypeLayout::Array {
+            id: TypeLayoutId::new(STRESS_ARRAY_TYPE_LAYOUT_ID).unwrap(),
+            fingerprint: 0xda7a_6600_0000_0020,
+            element_size: 20,
+            element_kind: TraceSlotKind::Scalar,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_dax_linear_stress(
+        root: &Path,
+        root_index: usize,
+        target_bytes: u64,
+        seed: u64,
+    ) -> Result<LinearStressStats> {
+        let wasm_page_size = 64 * 1024;
+        let populate_start = std::time::Instant::now();
+        let mut chunk = vec![0u8; STRESS_LINEAR_CHUNK_BYTES];
+        let mut paths = Vec::new();
+        let mut committed_bytes = 0u64;
+        let mut pages = 0u64;
+        let mut segment_index = 0usize;
+        while committed_bytes < target_bytes {
+            let segment_bytes = (target_bytes - committed_bytes).min(STRESS_LINEAR_SEGMENT_BYTES);
+            let path = root.join(format!(
+                "dax-pmem-stress-linear-{}-{}-{}.tmemory",
+                std::process::id(),
+                root_index,
+                segment_index
+            ));
+            remove_file_if_exists(&path)?;
+
+            let config = crate::runtime::transaction::TransactionConfig::with_dax_pmem_fsdax_path(
+                path.clone(),
+            )?;
+            let mut tmemory = TMemory::new(config, 0, None)?;
+            let segment_pages = segment_bytes.div_ceil(wasm_page_size);
+            if segment_pages > 0 {
+                tmemory.grow_to_pages(segment_pages)?;
+            }
+
+            let mut segment_written = 0u64;
+            while segment_written < segment_bytes {
+                let remaining = segment_bytes - segment_written;
+                let chunk_len = usize::try_from(remaining.min(STRESS_LINEAR_CHUNK_BYTES as u64))
+                    .context("linear chunk length exceeds usize")?;
+                let global_offset = committed_bytes
+                    .checked_add(segment_written)
+                    .context("linear global write offset overflow")?;
+                fill_deterministic_linear_bytes(
+                    &mut chunk[..chunk_len],
+                    seed,
+                    u64::try_from(root_index).unwrap(),
+                    global_offset,
+                );
+                tmemory.commit_range(
+                    usize::try_from(segment_written)
+                        .context("linear write offset exceeds usize")?,
+                    &chunk[..chunk_len],
+                )?;
+                segment_written += u64::try_from(chunk_len).unwrap();
+            }
+            drop(tmemory);
+
+            pages = pages
+                .checked_add(segment_pages)
+                .context("linear page counter overflow")?;
+            committed_bytes = committed_bytes
+                .checked_add(segment_bytes)
+                .context("linear committed byte counter overflow")?;
+            paths.push(path);
+            segment_index += 1;
+        }
+        let populate_elapsed = populate_start.elapsed();
+
+        let reopen_start = std::time::Instant::now();
+        let mut sample_count = 0usize;
+        let mut segment_base = 0u64;
+        for path in &paths {
+            let segment_bytes = (target_bytes - segment_base).min(STRESS_LINEAR_SEGMENT_BYTES);
+            let segment_pages = segment_bytes.div_ceil(wasm_page_size);
+            let config =
+                crate::runtime::transaction::TransactionConfig::with_dax_pmem_existing_fsdax_path(
+                    path.clone(),
+                )?;
+            let reopened = if segment_pages == 0 {
+                TMemory::new(config, 0, None)?
+            } else {
+                TMemory::new(config, segment_pages, Some(segment_pages))?
+            };
+            let sample_offsets = linear_sample_offsets(segment_bytes);
+            sample_count = sample_count
+                .checked_add(sample_offsets.len())
+                .context("linear sample count overflow")?;
+            for offset in &sample_offsets {
+                let len = linear_sample_len(segment_bytes, *offset)?;
+                if len == 0 {
+                    continue;
+                }
+                let range_start =
+                    usize::try_from(*offset).context("linear sample offset exceeds usize")?;
+                let range_end = range_start
+                    .checked_add(len)
+                    .context("linear sample range end overflow")?;
+                let bytes = reopened.read_committed(range_start..range_end)?;
+                let mut expected = vec![0u8; len];
+                let global_offset = segment_base
+                    .checked_add(*offset)
+                    .context("linear global sample offset overflow")?;
+                fill_deterministic_linear_bytes(
+                    &mut expected,
+                    seed,
+                    u64::try_from(root_index).unwrap(),
+                    global_offset,
+                );
+                ensure!(
+                    bytes == expected,
+                    "linear DAX PMEM sample mismatch at offset {global_offset}"
+                );
+            }
+            segment_base = segment_base
+                .checked_add(segment_bytes)
+                .context("linear segment base overflow")?;
+        }
+        let reopen_validate_elapsed = reopen_start.elapsed();
+
+        Ok(LinearStressStats {
+            paths,
+            committed_bytes,
+            pages,
+            sample_count,
+            populate_elapsed,
+            reopen_validate_elapsed,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linear_sample_offsets(total_bytes: u64) -> Vec<u64> {
+        if total_bytes == 0 {
+            return Vec::new();
+        }
+        let mut offsets = Vec::new();
+        offsets.push(0);
+        offsets.push(total_bytes / 2);
+        offsets.push(total_bytes.saturating_sub(STRESS_LINEAR_SAMPLE_BYTES as u64));
+        if total_bytes > STRESS_LINEAR_SAMPLE_STRIDE_BYTES {
+            let mut offset = 0u64;
+            while offset < total_bytes {
+                offsets.push(offset);
+                offset = offset.saturating_add(STRESS_LINEAR_SAMPLE_STRIDE_BYTES);
+            }
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets
+            .into_iter()
+            .map(|offset| offset.min(total_bytes.saturating_sub(1)))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linear_sample_len(total_bytes: u64, offset: u64) -> Result<usize> {
+        ensure!(
+            offset <= total_bytes,
+            "linear sample offset {offset} exceeds total bytes {total_bytes}"
+        );
+        usize::try_from((total_bytes - offset).min(STRESS_LINEAR_SAMPLE_BYTES as u64))
+            .context("linear sample length exceeds usize")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fill_deterministic_linear_bytes(bytes: &mut [u8], seed: u64, root_index: u64, offset: u64) {
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let absolute_offset = offset + u64::try_from(index).unwrap();
+            *byte = linear_pattern_byte(seed, root_index, absolute_offset);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linear_pattern_byte(seed: u64, root_index: u64, absolute_offset: u64) -> u8 {
+        let mixed = mix64(seed ^ root_index.wrapping_mul(0x517c_c1b7_2722_0a95) ^ absolute_offset);
+        mixed as u8
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mix64(mut value: u64) -> u64 {
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_file_if_exists(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bytes_to_mib(bytes: u64) -> u64 {
+        bytes / (1024 * 1024)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mib_per_sec(bytes: u64, elapsed: std::time::Duration) -> f64 {
+        if bytes == 0 {
+            return 0.0;
+        }
+        (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64().max(1e-9)
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires real fsdax PMEM and WASMTIME_TEST_REAL_PMEM=1"]
     fn dax_pmem_fsdax_durable_log_reuses_retired_object_chunk_after_reopen() {
@@ -2384,6 +3658,183 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires real fsdax PMEM, WASMTIME_TEST_REAL_PMEM=1, and WASMTIME_DAX_STRESS_BYTES"]
+    fn dax_pmem_fsdax_persistent_data_stress() {
+        if std::env::var("WASMTIME_TEST_REAL_PMEM").ok().as_deref() != Some("1") {
+            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 to run this test");
+            return;
+        }
+        if std::env::var_os("WASMTIME_DAX_STRESS_BYTES").is_none() {
+            eprintln!("set WASMTIME_DAX_STRESS_BYTES to the per-root byte budget");
+            return;
+        }
+
+        let config = match dax_pmem_stress_config_from_env() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("{err}");
+                return;
+            }
+        };
+
+        dax_pmem_fsdax_stress_impl(&config).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_stress_report_includes_recovery_workers() {
+        let object = ObjectStressStats {
+            path: std::path::PathBuf::from("/tmp/object.log"),
+            payload_blocks: 17,
+            object_count: 23,
+            sampled_object_count: 5,
+            bucket_counts: [1, 2, 3, 4, 5],
+            requested_logical_bytes: 256 * 1024 * 1024,
+            encoded_bytes: 128 * 1024 * 1024,
+            populate_elapsed: std::time::Duration::from_secs(2),
+            recovery_elapsed: std::time::Duration::from_millis(250),
+            recovery_workers: 7,
+            recovered_object_count: 23,
+        };
+        let linear = LinearStressStats {
+            paths: vec![std::path::PathBuf::from("/tmp/linear.log")],
+            committed_bytes: 64 * 1024 * 1024,
+            pages: 42,
+            sample_count: 9,
+            populate_elapsed: std::time::Duration::from_secs(4),
+            reopen_validate_elapsed: std::time::Duration::from_millis(500),
+        };
+
+        let line = format_dax_stress_line(
+            3,
+            1024 * 1024 * 1024,
+            400 * 1024 * 1024,
+            500 * 1024 * 1024,
+            124 * 1024 * 1024,
+            &object,
+            &linear,
+        );
+
+        assert!(line.contains("rec=0.250s rec_workers=7 lin=16.0MiB/s"));
+        assert!(line.contains("objects=23 recovered=23"));
+    }
+
+    #[test]
+    fn file_backed_recovery_handles_many_large_object_records_without_materializing_bytes()
+    -> Result<()> {
+        let temp = tempfile::Builder::new()
+            .prefix("wasmtime-zero-copy-recovery")
+            .tempdir()?;
+        let path = temp.path().join("region.bin");
+        let mut log = TxDurableLog::create_file_backed(&path, 256)?;
+        let layout = scalar_struct_type_layout_for_test(9001, 8192);
+        log.ensure_type_layout(&layout)?;
+        let mut expected_record_lens = Vec::new();
+        let mut sampled_expected_records = BTreeMap::new();
+        let sampled_object_ids = [0u64, 17, 255, 511];
+
+        for object_id in 0..512u64 {
+            let object_record = large_recovery_record_for_test(object_id, layout.id().get())?;
+            expected_record_lens.push(u64::try_from(object_record.len())?);
+            if sampled_object_ids.contains(&object_id) {
+                sampled_expected_records.insert(object_id, object_record.clone());
+            }
+            let publication = PendingPublication::persistent_object(
+                PackedGranuleDomain::TStruct,
+                object_id,
+                1,
+                layout.id().get(),
+                object_record,
+            )?;
+            publish_single_object_publication_for_test(
+                &mut log,
+                u32::try_from(object_id)? + 1,
+                publication,
+            )?;
+        }
+
+        let recovered = log.recover_region_snapshot()?.unwrap();
+        let winners = recovered.committed_object_winners()?;
+        assert_eq!(winners.len(), 512);
+        let recovered_object_ids = winners
+            .iter()
+            .map(|winner| winner.object_id)
+            .collect::<Vec<_>>();
+        assert_eq!(recovered_object_ids, (0..512).collect::<Vec<_>>());
+        assert_eq!(
+            winners
+                .iter()
+                .map(|winner| winner.record_len)
+                .collect::<Vec<_>>(),
+            expected_record_lens
+        );
+        let mapped_source = recovered
+            .mapped_region_source()
+            .context("file-backed recovery should expose a mapped region source")?;
+        let winners_by_id = winners
+            .iter()
+            .map(|winner| (winner.object_id, winner))
+            .collect::<BTreeMap<_, _>>();
+        for (object_id, expected_record) in &sampled_expected_records {
+            let winner = winners_by_id.get(object_id).with_context(|| {
+                format!("missing recovered winner for sampled object {object_id}")
+            })?;
+            assert_recovered_winner_matches_expected_record(
+                winner,
+                mapped_source,
+                expected_record,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn large_recovery_record_for_test(object_id: u64, type_layout_id: u32) -> Result<Vec<u8>> {
+        let word_count = 512usize
+            + usize::try_from((object_id % 11) * 37).context("word count conversion overflow")?;
+        let payload = ObjectPayload::Struct(
+            (0..word_count)
+                .map(|index| {
+                    let pattern = object_id
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .rotate_left(17)
+                        ^ u64::try_from(index)
+                            .unwrap()
+                            .wrapping_mul(0xd1b5_4a32_d192_ed03)
+                            .rotate_right(9);
+                    ObjectValue::I32(pattern as i32)
+                })
+                .collect(),
+        );
+        encode_object_record_for_test(object_id, 1, type_layout_id, &payload)
+    }
+
+    fn assert_recovered_winner_matches_expected_record(
+        winner: &RecoveredObjectWinner,
+        source: &dyn crate::runtime::vm::block_region::MappedRegionSource,
+        expected_record: &[u8],
+    ) -> Result<()> {
+        let mut matched = false;
+        winner.with_source_record_bytes(source, &mut |bytes| {
+            if bytes != expected_record {
+                bail!(
+                    "recovered record mismatch for sampled object {} {}",
+                    winner.object_id,
+                    describe_record_byte_mismatch(expected_record, bytes),
+                );
+            }
+            matched = true;
+            Ok(())
+        })?;
+        ensure!(
+            matched,
+            "sampled object {} did not map recovered record bytes",
+            winner.object_id,
+        );
+        Ok(())
     }
 
     #[test]

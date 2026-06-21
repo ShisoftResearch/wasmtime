@@ -2466,36 +2466,43 @@ impl TransactionState {
             has_unreachable: bool,
         }
 
-        let recovered = self
-            .durable_log
-            .recover_region_snapshot()?
-            .context("persistent object compaction requires a durable block region backend")?;
-        let winners = recovered.committed_object_winners()?;
         let mut chunks = BTreeMap::<u32, ChunkCandidate>::new();
-        for winner in &winners {
-            let object_id = ObjectId {
-                object_index: winner.object_id,
-            };
-            let Some(chunk_start) = self
-                .durable_log
-                .object_data_chunk_start_for_block(winner.data_block)?
-            else {
-                continue;
-            };
-            let location = recovered_record_location_from_winner(winner);
-            let chunk = chunks.entry(chunk_start).or_default();
-            if recovery_report.mark.reachable.contains(&object_id) {
-                chunk.reachable_objects.insert(object_id);
-                chunk.old_locations.push(location);
-            } else if recovery_report
-                .mark
-                .unreachable_persistent
-                .contains(&object_id)
-            {
-                chunk.has_unreachable = true;
-                chunk.old_locations.push(location);
-            }
-        }
+        let consumed =
+            self.durable_log
+                .with_recovered_region_snapshot(&mut |recovered, mapped_source| {
+                    let _mapped_source = mapped_source
+                        .context("persistent object compaction requires mapped durable region")?;
+                    let winners = recovered.committed_object_winners()?;
+                    for winner in &winners {
+                        let object_id = ObjectId {
+                            object_index: winner.object_id,
+                        };
+                        let Some(chunk_start) = self
+                            .durable_log
+                            .object_data_chunk_start_for_block(winner.data_block)?
+                        else {
+                            continue;
+                        };
+                        let location = recovered_record_location_from_winner(winner);
+                        let chunk = chunks.entry(chunk_start).or_default();
+                        if recovery_report.mark.reachable.contains(&object_id) {
+                            chunk.reachable_objects.insert(object_id);
+                            chunk.old_locations.push(location);
+                        } else if recovery_report
+                            .mark
+                            .unreachable_persistent
+                            .contains(&object_id)
+                        {
+                            chunk.has_unreachable = true;
+                            chunk.old_locations.push(location);
+                        }
+                    }
+                    Ok(())
+                })?;
+        ensure!(
+            consumed,
+            "persistent object compaction requires a durable block region backend"
+        );
 
         let mut selected_chunks = Vec::new();
         let mut copied_objects = BTreeSet::new();
@@ -2542,24 +2549,32 @@ impl TransactionState {
             objects.install_persistent_gc_copied_publication(publication)?;
         }
 
-        let recovered_after = self
-            .durable_log
-            .recover_region_snapshot()?
-            .context("persistent object compaction requires a durable block region backend")?;
-        let winners_after = recovered_after.committed_object_winners()?;
-        let reachable_after = winners_after
-            .iter()
-            .filter_map(|winner| {
-                let object_id = ObjectId {
-                    object_index: winner.object_id,
-                };
-                recovery_report
-                    .mark
-                    .reachable
-                    .contains(&object_id)
-                    .then(|| recovered_record_location_from_winner(winner))
-            })
-            .collect::<Vec<_>>();
+        let mut reachable_after = Vec::new();
+        let consumed =
+            self.durable_log
+                .with_recovered_region_snapshot(&mut |recovered, mapped_source| {
+                    let _mapped_source = mapped_source
+                        .context("persistent object compaction requires mapped durable region")?;
+                    let winners_after = recovered.committed_object_winners()?;
+                    reachable_after = winners_after
+                        .iter()
+                        .filter_map(|winner| {
+                            let object_id = ObjectId {
+                                object_index: winner.object_id,
+                            };
+                            recovery_report
+                                .mark
+                                .reachable
+                                .contains(&object_id)
+                                .then(|| recovered_record_location_from_winner(winner))
+                        })
+                        .collect();
+                    Ok(())
+                })?;
+        ensure!(
+            consumed,
+            "persistent object compaction requires a durable block region backend"
+        );
         let retired_chunks = self
             .durable_log
             .retire_whole_dead_object_chunks(&reachable_after, &old_locations)?;

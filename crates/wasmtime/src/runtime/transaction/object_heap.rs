@@ -1,17 +1,24 @@
 use super::type_layout::{PersistentTypeLayout, TraceSlotKind};
 use super::{ObjectId, ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi};
 use crate::prelude::*;
+use crate::runtime::vm::TxDataRecordHeader;
 #[cfg(test)]
 use crate::runtime::vm::block_region::LINE_MARKED;
 use crate::runtime::vm::block_region::{
     BLOCK_SIZE, IMMIX_LINE_SIZE, RegionChunk, VMemoryBlockRegion,
 };
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const DEFAULT_OBJECT_HEAP_BLOCKS: usize = 4;
 const OBJECT_RECORD_ALIGN: usize = 8;
 const OBJECT_VALUE_RECORD_LEN: usize = 20;
+
+#[cfg(test)]
+static DECODE_RECORD_CALLS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TxRecordHandle(u64);
@@ -99,13 +106,26 @@ pub(crate) enum TraceDescriptor {
     Scalar,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+enum ObjectRecordStorage {
+    Volatile {
+        offset: usize,
+        location: ObjectRecordLocation,
+        payload: ObjectPayload,
+    },
+    PersistentMapped {
+        source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+        data_record_offset: usize,
+        record_len: u64,
+        location: ObjectRecordLocation,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct ObjectRecord {
     header: TxObjectHeader,
     array_length: Option<u32>,
-    payload: ObjectPayload,
-    offset: usize,
-    location: ObjectRecordLocation,
+    storage: ObjectRecordStorage,
 }
 
 #[derive(Debug, Default)]
@@ -149,43 +169,55 @@ impl ObjectHeap {
         self.records.push(ObjectRecord {
             header,
             array_length,
-            payload: payload.clone(),
-            offset: location.absolute_offset()?,
-            location,
+            storage: ObjectRecordStorage::Volatile {
+                offset: location.absolute_offset()?,
+                location,
+                payload: payload.clone(),
+            },
         });
         let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
         Ok(TxRecordHandle(handle))
     }
 
     pub(crate) fn install_record_bytes(&mut self, bytes: &[u8]) -> Result<TxRecordHandle> {
-        let header = TxObjectHeader::read_from_prefix(bytes)?;
-        let record_len =
-            usize::try_from(header.record_len).context("record length does not fit usize")?;
-        ensure!(
-            record_len == bytes.len(),
-            "serialized object record length does not match header"
-        );
-        let array_length = if header.kind == ObjectKind::Array as u16 {
-            ensure!(
-                bytes.len() >= size_of::<TxArrayHeader>(),
-                "serialized array record is shorter than expected"
-            );
-            Some(u32::from_le_bytes(
-                bytes[TxObjectHeader::BYTE_LEN..TxObjectHeader::BYTE_LEN + size_of::<u32>()]
-                    .try_into()
-                    .unwrap(),
-            ))
-        } else {
-            None
-        };
-        let payload = decode_payload_bytes(header, array_length, bytes)?;
+        let (header, array_length, payload) = decode_record(bytes)?;
         let location = self.region_mut()?.allocate(bytes)?;
         self.records.push(ObjectRecord {
             header,
             array_length,
-            payload,
-            offset: location.absolute_offset()?,
-            location,
+            storage: ObjectRecordStorage::Volatile {
+                offset: location.absolute_offset()?,
+                location,
+                payload,
+            },
+        });
+        let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
+        Ok(TxRecordHandle(handle))
+    }
+
+    pub(crate) fn install_mapped_persistent_record(
+        &mut self,
+        winner: &crate::runtime::vm::RecoveredObjectWinner,
+        source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+        record_bytes: &[u8],
+    ) -> Result<TxRecordHandle> {
+        let (header, array_length) = decode_record_metadata(record_bytes)?;
+        let location = ObjectRecordLocation {
+            chunk_start_block: winner.data_block,
+            chunk_blocks: 0,
+            data_block: winner.data_block,
+            data_offset: winner.data_offset,
+            record_len: winner.record_len,
+        };
+        self.records.push(ObjectRecord {
+            header,
+            array_length,
+            storage: ObjectRecordStorage::PersistentMapped {
+                source,
+                data_record_offset: winner.data_record_offset,
+                record_len: winner.record_len,
+                location,
+            },
         });
         let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
         Ok(TxRecordHandle(handle))
@@ -211,46 +243,40 @@ impl ObjectHeap {
     }
 
     pub(crate) fn record_location(&self, handle: TxRecordHandle) -> Result<ObjectRecordLocation> {
-        Ok(self.record(handle)?.location)
+        Ok(self.record_location_from_record(self.record(handle)?))
     }
 
     pub(crate) fn record_bytes(&self, handle: TxRecordHandle) -> Result<Vec<u8>> {
-        let record = self.record(handle)?;
-        self.region()?
-            .read(record.offset, usize::try_from(record.header.record_len)?)
+        self.with_record_bytes(handle, |bytes| Ok(bytes.to_vec()))
     }
 
     pub(crate) fn publication_record(
         &self,
         handle: TxRecordHandle,
     ) -> Result<(TxObjectHeader, Vec<u8>)> {
-        let record = self.record(handle)?;
-        let bytes = self
-            .region()?
-            .read(record.offset, usize::try_from(record.header.record_len)?)?;
-        Ok((record.header, bytes))
+        let header = self.record(handle)?.header;
+        self.with_record_bytes(handle, |bytes| Ok((header, bytes.to_vec())))
     }
 
-    pub(crate) fn payload(&self, handle: TxRecordHandle) -> Result<&ObjectPayload> {
-        Ok(&self.record(handle)?.payload)
+    pub(crate) fn payload(&self, handle: TxRecordHandle) -> Result<ObjectPayload> {
+        let record = self.record(handle)?;
+        match &record.storage {
+            ObjectRecordStorage::Volatile { payload, .. } => Ok(payload.clone()),
+            ObjectRecordStorage::PersistentMapped { .. } => self
+                .with_record_bytes(handle, |bytes| {
+                    decode_payload_bytes(record.header, record.array_length, bytes)
+                }),
+        }
     }
 
     pub(crate) fn payload_bytes(&self, handle: TxRecordHandle) -> Result<Vec<u8>> {
-        let record = self.record(handle)?;
-        let payload_start = record
-            .offset
-            .checked_add(payload_offset(record.array_length))
-            .context("object heap payload offset overflow")?;
-        let payload_len = usize::try_from(record.header.record_len)
-            .context("record length does not fit usize")?
-            .checked_sub(payload_offset(record.array_length))
-            .context("object heap payload length underflow")?;
-        self.region()?.read(payload_start, payload_len)
+        self.with_payload_bytes(handle, |payload| Ok(payload.to_vec()))
     }
 
     pub(crate) fn trace_descriptor(&self, handle: TxRecordHandle) -> Result<TraceDescriptor> {
         let record = self.record(handle)?;
-        Ok(match &record.payload {
+        let payload = self.payload(handle)?;
+        Ok(match &payload {
             ObjectPayload::Struct(fields) => TraceDescriptor::Struct(
                 fields
                     .iter()
@@ -274,22 +300,26 @@ impl ObjectHeap {
 
     pub(crate) fn trace_object_ids(&self, handle: TxRecordHandle) -> Result<Vec<ObjectId>> {
         let record = self.record(handle)?;
-        Ok(match &record.payload {
-            ObjectPayload::Struct(fields) | ObjectPayload::Array(fields) => fields
-                .iter()
-                .filter_map(|value| match value {
-                    ObjectValue::Ref(Some(object_id)) => Some(*object_id),
-                    ObjectValue::Ref(None)
-                    | ObjectValue::I31(_)
-                    | ObjectValue::I32(_)
-                    | ObjectValue::I64(_)
-                    | ObjectValue::F32(_)
-                    | ObjectValue::F64(_)
-                    | ObjectValue::V128(_)
-                    | ObjectValue::FuncRef(_)
-                    | ObjectValue::ExternRef(_) => None,
-                })
-                .collect(),
+        self.with_record_bytes(handle, |bytes| {
+            Ok(
+                match decode_payload_bytes(record.header, record.array_length, bytes)? {
+                    ObjectPayload::Struct(fields) | ObjectPayload::Array(fields) => fields
+                        .iter()
+                        .filter_map(|value| match value {
+                            ObjectValue::Ref(Some(object_id)) => Some(*object_id),
+                            ObjectValue::Ref(None)
+                            | ObjectValue::I31(_)
+                            | ObjectValue::I32(_)
+                            | ObjectValue::I64(_)
+                            | ObjectValue::F32(_)
+                            | ObjectValue::F64(_)
+                            | ObjectValue::V128(_)
+                            | ObjectValue::FuncRef(_)
+                            | ObjectValue::ExternRef(_) => None,
+                        })
+                        .collect(),
+                },
+            )
         })
     }
 
@@ -311,6 +341,66 @@ impl ObjectHeap {
             .with_context(|| format!("object heap record is not live: {handle:?}"))
     }
 
+    fn with_record_bytes<T>(
+        &self,
+        handle: TxRecordHandle,
+        f: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let record = self.record(handle)?;
+        match &record.storage {
+            ObjectRecordStorage::Volatile { offset, .. } => {
+                let bytes = self
+                    .region()?
+                    .read(*offset, usize::try_from(record.header.record_len)?)?;
+                f(&bytes)
+            }
+            ObjectRecordStorage::PersistentMapped {
+                source,
+                data_record_offset,
+                record_len,
+                ..
+            } => {
+                let payload_offset = data_record_offset
+                    .checked_add(size_of::<TxDataRecordHeader>())
+                    .context("mapped persistent object payload offset overflow")?;
+                let mut result = None;
+                let mut f = Some(f);
+                source.with_mapped_slice(
+                    payload_offset,
+                    usize::try_from(*record_len)
+                        .context("mapped persistent object record length overflow")?,
+                    &mut |bytes| {
+                        let f = f.take().context("mapped record callback already used")?;
+                        result = Some(f(bytes)?);
+                        Ok(())
+                    },
+                )?;
+                result.context("mapped persistent object record was not read")
+            }
+        }
+    }
+
+    pub(crate) fn with_payload_bytes<T>(
+        &self,
+        handle: TxRecordHandle,
+        f: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let array_length = self.record(handle)?.array_length;
+        self.with_record_bytes(handle, |bytes| {
+            let payload = bytes
+                .get(payload_offset(array_length)..)
+                .context("object heap payload is out of bounds")?;
+            f(payload)
+        })
+    }
+
+    fn record_location_from_record(&self, record: &ObjectRecord) -> ObjectRecordLocation {
+        match &record.storage {
+            ObjectRecordStorage::Volatile { location, .. }
+            | ObjectRecordStorage::PersistentMapped { location, .. } => *location,
+        }
+    }
+
     fn region(&self) -> Result<&ObjectHeapRegion> {
         self.region
             .as_ref()
@@ -326,7 +416,12 @@ impl ObjectHeap {
 
     #[cfg(test)]
     pub(crate) fn record_offset_for_test(&self, handle: TxRecordHandle) -> Result<usize> {
-        Ok(self.record(handle)?.offset)
+        match &self.record(handle)?.storage {
+            ObjectRecordStorage::Volatile { offset, .. } => Ok(*offset),
+            ObjectRecordStorage::PersistentMapped { .. } => {
+                bail!("persistent mapped object records do not have a volatile heap offset")
+            }
+        }
     }
 
     #[cfg(test)]
@@ -354,9 +449,27 @@ impl ObjectHeap {
 
     #[cfg(test)]
     pub(crate) fn line_mark_for_record_for_test(&self, handle: TxRecordHandle) -> Result<bool> {
-        let offset = self.record(handle)?.offset;
+        let offset = self.record_offset_for_test(handle)?;
         self.region()?.line_mark_for_offset(offset)
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_persistent_mapped_for_test(&self, handle: TxRecordHandle) -> Result<bool> {
+        Ok(matches!(
+            &self.record(handle)?.storage,
+            ObjectRecordStorage::PersistentMapped { .. }
+        ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_decode_record_calls_for_test() {
+    DECODE_RECORD_CALLS_FOR_TEST.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn decode_record_calls_for_test() -> usize {
+    DECODE_RECORD_CALLS_FOR_TEST.load(Ordering::SeqCst)
 }
 
 pub(crate) fn encode_object_record(
@@ -536,6 +649,10 @@ fn record_index(handle: TxRecordHandle) -> Result<usize> {
     usize::try_from(raw).context("record handle does not fit usize")
 }
 
+pub(crate) fn payload_offset_for_recovery(array_length: Option<u32>) -> usize {
+    payload_offset(array_length)
+}
+
 fn payload_offset(array_length: Option<u32>) -> usize {
     match array_length {
         Some(_) => size_of::<TxArrayHeader>(),
@@ -556,6 +673,85 @@ fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Res
     header_len
         .checked_add(payload_len)
         .context("record length overflow")
+}
+
+fn decode_record(bytes: &[u8]) -> Result<(TxObjectHeader, Option<u32>, ObjectPayload)> {
+    #[cfg(test)]
+    DECODE_RECORD_CALLS_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+
+    let (header, array_length) = decode_record_metadata(bytes)?;
+    let payload = decode_payload_bytes(header, array_length, bytes)?;
+    Ok((header, array_length, payload))
+}
+
+fn decode_record_metadata(bytes: &[u8]) -> Result<(TxObjectHeader, Option<u32>)> {
+    let header = TxObjectHeader::read_from_prefix(bytes)?;
+    let record_len =
+        usize::try_from(header.record_len).context("record length does not fit usize")?;
+    ensure!(
+        record_len == bytes.len(),
+        "serialized object record length does not match header"
+    );
+    let array_length = if header.kind == ObjectKind::Array as u16 {
+        ensure!(
+            bytes.len() >= size_of::<TxArrayHeader>(),
+            "serialized array record is shorter than expected"
+        );
+        Some(u32::from_le_bytes(
+            bytes[TxObjectHeader::BYTE_LEN..TxObjectHeader::BYTE_LEN + size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ))
+    } else {
+        None
+    };
+    validate_payload_shape(header, array_length, bytes)?;
+    Ok((header, array_length))
+}
+
+fn validate_payload_shape(
+    header: TxObjectHeader,
+    array_length: Option<u32>,
+    bytes: &[u8],
+) -> Result<()> {
+    let payload_start = payload_offset(array_length);
+    ensure!(
+        bytes.len() >= payload_start,
+        "serialized object record is shorter than expected"
+    );
+    let payload_bytes = &bytes[payload_start..];
+    match header.kind {
+        x if x == ObjectKind::Struct as u16 => {
+            ensure!(
+                payload_bytes.len() % OBJECT_VALUE_RECORD_LEN == 0,
+                "serialized struct payload length is not a multiple of object ABI size"
+            );
+            Ok(())
+        }
+        x if x == ObjectKind::Array as u16 => {
+            let length =
+                usize::try_from(array_length.context("serialized array record is missing length")?)
+                    .context("serialized array length does not fit usize")?;
+            let expected_len = length
+                .checked_mul(OBJECT_VALUE_RECORD_LEN)
+                .context("serialized array payload length overflow")?;
+            ensure!(
+                payload_bytes.len() == expected_len,
+                "serialized array payload length does not match array length"
+            );
+            Ok(())
+        }
+        x if x == ObjectKind::I31 as u16 => {
+            bail!("i31 values are encoded inline, not as object-table records")
+        }
+        x if x == ObjectKind::Extern as u16 || x == ObjectKind::Func as u16 => {
+            bail!("function and external references are durable values, not object-table records")
+        }
+        _ => bail!(
+            "unknown object kind tag in persistent record header: {}",
+            header.kind
+        ),
+    }
 }
 
 fn serialize_record(
@@ -644,6 +840,14 @@ fn decode_payload_bytes(
             header.kind
         ),
     })
+}
+
+pub(crate) fn decode_payload_bytes_for_recovery(
+    header: TxObjectHeader,
+    array_length: Option<u32>,
+    bytes: &[u8],
+) -> Result<ObjectPayload> {
+    decode_payload_bytes(header, array_length, bytes)
 }
 
 fn decode_object_values(bytes: &[u8]) -> Result<Vec<ObjectValue>> {
@@ -908,7 +1112,7 @@ mod tests {
 
         assert_eq!(
             heap.payload(handle).unwrap(),
-            &ObjectPayload::Struct(vec![value])
+            ObjectPayload::Struct(vec![value])
         );
     }
 
@@ -929,7 +1133,7 @@ mod tests {
 
         assert_eq!(
             heap.payload(handle).unwrap(),
-            &ObjectPayload::Struct(vec![value])
+            ObjectPayload::Struct(vec![value])
         );
     }
 

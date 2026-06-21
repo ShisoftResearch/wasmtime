@@ -27,17 +27,19 @@ use crate::runtime::transaction::{
     encode_object_record_for_recovery,
 };
 use crate::runtime::vm::SendSyncPtr;
+use crate::sync::RwLock;
 use core::{
     mem::size_of,
     ops::Range,
     ptr::NonNull,
-    sync::atomic::{Ordering, compiler_fence},
+    sync::atomic::{AtomicBool, Ordering, compiler_fence},
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub(crate) const BLOCK_SIZE: usize = 512 * 1024;
@@ -64,12 +66,17 @@ pub(crate) enum FileBackedRegionMode {
     OpenExistingPath(PathBuf),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FileBackedMapping {
+    inner: Arc<FileBackedMappingInner>,
+}
+
+#[derive(Debug)]
+struct FileBackedMappingInner {
     file: File,
     path: PathBuf,
-    unlink_on_drop: bool,
-    memory: SendSyncPtr<[u8]>,
+    unlink_on_drop: AtomicBool,
+    memory: RwLock<SendSyncPtr<[u8]>>,
 }
 
 impl FileBackedMapping {
@@ -110,74 +117,85 @@ impl FileBackedMapping {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.memory.len()
+        self.inner.memory.read().len()
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
-    pub(crate) fn ptr_at(&self, offset: usize) -> Result<NonNull<u8>> {
-        ensure!(
-            offset <= self.len(),
-            "file-backed mapping pointer offset out of bounds"
-        );
-        if self.len() == 0 {
-            return Ok(NonNull::dangling());
-        }
-        let ptr = unsafe {
-            NonNull::new_unchecked(self.memory.as_non_null().cast::<u8>().as_ptr().add(offset))
-        };
-        Ok(ptr)
+    fn set_unlink_on_drop(&self, unlink_on_drop: bool) {
+        self.inner
+            .unlink_on_drop
+            .store(unlink_on_drop, AtomicOrdering::Relaxed);
     }
 
-    pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+    pub(crate) fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let memory = self.inner.memory.read();
         let end = offset
             .checked_add(len)
             .context("file-backed mapping read range overflow")?;
         ensure!(
-            end <= self.len(),
+            end <= memory.len(),
             "file-backed mapping read range out of bounds"
         );
-        let slice = unsafe { self.memory.as_ref() };
-        Ok(slice[offset..end].to_vec())
+        let slice = unsafe { memory.as_ref() };
+        f(&slice[offset..end])
+    }
+
+    pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(len);
+        self.with_mapped_slice(offset, len, &mut |slice| {
+            bytes.extend_from_slice(slice);
+            Ok(())
+        })?;
+        Ok(bytes)
     }
 
     pub(crate) fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let mut memory = self.inner.memory.write();
         let end = offset
             .checked_add(bytes.len())
             .context("file-backed mapping write range overflow")?;
         ensure!(
-            end <= self.len(),
+            end <= memory.len(),
             "file-backed mapping write range out of bounds"
         );
-        let slice = unsafe { self.memory.as_mut() };
+        let slice = unsafe { memory.as_mut() };
         slice[offset..end].copy_from_slice(bytes);
         Ok(())
     }
 
     pub(crate) fn flush(&self, offset: usize, len: usize) -> Result<()> {
+        let memory = self.inner.memory.read();
         let end = offset
             .checked_add(len)
             .context("file-backed mapping flush range overflow")?;
         ensure!(
-            end <= self.len(),
+            end <= memory.len(),
             "file-backed mapping flush range out of bounds"
         );
         if len == 0 {
             return Ok(());
         }
-        flush_file_backed_mapping(self.memory, offset, len)
+        flush_file_backed_mapping(*memory, offset, len)
     }
 
     pub(crate) fn fence_data(&self) -> Result<()> {
-        self.file
+        self.inner
+            .file
             .sync_data()
             .context("failed to sync_data file-backed tmemory")
     }
 
     pub(crate) fn fence_all(&self) -> Result<()> {
-        self.file
+        self.inner
+            .file
             .sync_all()
             .context("failed to sync_all file-backed tmemory")
     }
@@ -185,16 +203,20 @@ impl FileBackedMapping {
     pub(crate) fn remap_len(&mut self, new_len: usize) -> Result<()> {
         #[cfg(unix)]
         {
-            self.file
+            self.inner
+                .file
                 .set_len(u64::try_from(new_len).context("file-backed tmemory length overflow")?)
                 .with_context(|| {
                     format!(
                         "failed to resize file-backed tmemory file {}",
-                        self.path.display()
+                        self.inner.path.display()
                     )
                 })?;
-            let new_memory = unsafe { map_shared_file(&self.file, new_len)? };
-            let old_memory = core::mem::replace(&mut self.memory, new_memory);
+            let new_memory = unsafe { map_shared_file(&self.inner.file, new_len)? };
+            let old_memory = {
+                let mut memory = self.inner.memory.write();
+                core::mem::replace(&mut *memory, new_memory)
+            };
             unsafe { unmap_shared_file(old_memory)? };
             self.fence_all()
         }
@@ -208,6 +230,15 @@ impl FileBackedMapping {
 
 pub(crate) trait DurableMappedBytes: core::fmt::Debug {
     fn len(&self) -> usize;
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let bytes = self.read(offset, len)?;
+        f(&bytes)
+    }
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
     fn flush(&self, offset: usize, len: usize) -> Result<()>;
@@ -218,6 +249,15 @@ pub(crate) trait DurableMappedBytes: core::fmt::Debug {
 impl DurableMappedBytes for FileBackedMapping {
     fn len(&self) -> usize {
         FileBackedMapping::len(self)
+    }
+
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        FileBackedMapping::with_mapped_slice(self, offset, len, f)
     }
 
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -241,6 +281,17 @@ impl DurableMappedBytes for FileBackedMapping {
     }
 }
 
+impl MappedRegionSource for FileBackedMapping {
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        FileBackedMapping::with_mapped_slice(self, offset, len, f)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DaxPmemMapping {
     mapping: FileBackedMapping,
@@ -258,11 +309,11 @@ impl DaxPmemMapping {
     }
 
     pub(crate) fn new_fsdax_path(path: PathBuf, len: usize) -> Result<Self> {
-        let mut mapping = create_fsdax_file_backed_mapping(path.clone(), len)?;
+        let mapping = create_fsdax_file_backed_mapping(path.clone(), len)?;
         mapping.fence_all()?;
         sync_parent_dir(&path)?;
         let persist = PersistEngine::for_mode(PersistenceMode::RequireDaxPmem)?;
-        mapping.unlink_on_drop = false;
+        mapping.set_unlink_on_drop(false);
         Ok(Self {
             mapping,
             persist,
@@ -277,6 +328,15 @@ impl DaxPmemMapping {
             persist: PersistEngine::for_mode(PersistenceMode::RequireDaxPmem)?,
             require_fsdax: true,
         })
+    }
+
+    pub(crate) fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.mapping.with_mapped_slice(offset, len, f)
     }
 }
 
@@ -312,6 +372,15 @@ impl DurableMappedBytes for DaxPmemMapping {
         self.mapping.len()
     }
 
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.mapping.with_mapped_slice(offset, len, f)
+    }
+
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.mapping.read(offset, len)
     }
@@ -328,8 +397,10 @@ impl DurableMappedBytes for DaxPmemMapping {
             end <= self.mapping.len(),
             "DAX PMEM mapping flush range out of bounds"
         );
-        let ptr = self.mapping.ptr_at(offset)?;
-        self.persist.flush(ptr, len)
+        self.with_mapped_slice(offset, len, &mut |bytes| {
+            let ptr = NonNull::new(bytes.as_ptr() as *mut u8).unwrap_or_else(NonNull::dangling);
+            self.persist.flush(ptr, len)
+        })
     }
 
     fn fence(&self) -> Result<()> {
@@ -345,13 +416,13 @@ impl DurableMappedBytes for DaxPmemMapping {
     }
 }
 
-impl Drop for FileBackedMapping {
+impl Drop for FileBackedMappingInner {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
-            let _ = unmap_shared_file(self.memory);
+            let _ = unmap_shared_file(*self.memory.read());
         }
-        if self.unlink_on_drop {
+        if self.unlink_on_drop.load(AtomicOrdering::Relaxed) {
             #[cfg(unix)]
             cleanup_created_file_path(&self.file, &self.path);
             #[cfg(not(unix))]
@@ -460,14 +531,14 @@ fn new_temp_file_backed_mapping(len: usize) -> Result<FileBackedMapping> {
             .open(&path)
         {
             Ok(file) => {
-                let mut mapping = finish_file_backed_mapping(file, path, len, true)?;
-                std::fs::remove_file(&mapping.path).with_context(|| {
+                let mapping = finish_file_backed_mapping(file, path, len, true)?;
+                std::fs::remove_file(mapping.path()).with_context(|| {
                     format!(
                         "failed to unlink temp file-backed tmemory file {}",
-                        mapping.path.display()
+                        mapping.path().display()
                     )
                 })?;
-                mapping.unlink_on_drop = false;
+                mapping.set_unlink_on_drop(false);
                 return Ok(mapping);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -510,10 +581,12 @@ fn finish_existing_file_backed_mapping(file: File, path: PathBuf) -> Result<File
     .context("file-backed tmemory file length overflow")?;
     let memory = unsafe { map_shared_file(&file, len)? };
     Ok(FileBackedMapping {
-        file,
-        path,
-        unlink_on_drop: false,
-        memory,
+        inner: Arc::new(FileBackedMappingInner {
+            file,
+            path,
+            unlink_on_drop: AtomicBool::new(false),
+            memory: RwLock::new(memory),
+        }),
     })
 }
 
@@ -548,10 +621,12 @@ fn finish_file_backed_mapping(
         }
     };
     Ok(FileBackedMapping {
-        file,
-        path,
-        unlink_on_drop,
-        memory,
+        inner: Arc::new(FileBackedMappingInner {
+            file,
+            path,
+            unlink_on_drop: AtomicBool::new(unlink_on_drop),
+            memory: RwLock::new(memory),
+        }),
     })
 }
 
@@ -1021,7 +1096,75 @@ pub(crate) const IMMIX_LINE_MARK_RESET_VALUE: u8 = 0;
 pub(crate) const LINE_FREE: u8 = 0;
 pub(crate) const LINE_MARKED: u8 = 1;
 
-pub(crate) trait BlockRegionBackend {
+pub(crate) trait MappedRegionSource: core::fmt::Debug + Send + Sync {
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()>;
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SyntheticRecoveredWinnerSource {
+    bytes: std::sync::Mutex<Vec<u8>>,
+}
+
+#[cfg(test)]
+pub(crate) type SyntheticRecoveredWinnerSourceHandle = Arc<SyntheticRecoveredWinnerSource>;
+
+#[cfg(test)]
+impl MappedRegionSource for SyntheticRecoveredWinnerSource {
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let bytes = self
+            .bytes
+            .lock()
+            .expect("synthetic recovered winner source lock poisoned");
+        let end = offset
+            .checked_add(len)
+            .context("synthetic recovered winner slice range overflow")?;
+        ensure!(
+            end <= bytes.len(),
+            "synthetic recovered winner slice range out of bounds"
+        );
+        f(&bytes[offset..end])
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn new_synthetic_recovered_winner_source_for_test()
+-> SyntheticRecoveredWinnerSourceHandle {
+    Arc::new(SyntheticRecoveredWinnerSource::default())
+}
+
+#[cfg(test)]
+pub(crate) fn register_synthetic_recovered_winner_data_record_for_test(
+    source: &SyntheticRecoveredWinnerSourceHandle,
+    bytes: &[u8],
+) -> usize {
+    let mut stored = source
+        .bytes
+        .lock()
+        .expect("synthetic recovered winner source lock poisoned");
+    let offset = stored.len();
+    stored.extend_from_slice(bytes);
+    offset
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_recovered_winner_source_for_test(
+    source: &SyntheticRecoveredWinnerSourceHandle,
+) -> Arc<dyn MappedRegionSource> {
+    source.clone() as Arc<dyn MappedRegionSource>
+}
+
+pub(crate) trait BlockRegionBackend: Sync {
     fn block_size(&self) -> usize;
     fn num_blocks(&self) -> usize;
     fn bytes_len(&self) -> usize;
@@ -1030,12 +1173,24 @@ pub(crate) trait BlockRegionBackend {
     fn block_meta(&self, _block: u32) -> Result<BlockMeta> {
         bail!("transactional block region backend does not expose block metadata")
     }
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let bytes = self.read(offset, len)?;
+        f(&bytes)
+    }
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
     fn flush(&self, offset: usize, len: usize) -> Result<()>;
     fn fence(&self) -> Result<()>;
     fn resize_bytes(&mut self, _new_len: usize) -> Result<()> {
         bail!("transactional block region backend cannot resize bytes")
+    }
+    fn mapped_region_source(&self) -> Option<Arc<dyn MappedRegionSource>> {
+        None
     }
     fn grow_to_blocks(&mut self, _new_block_count: usize) -> Result<Option<RegionChunk>> {
         bail!("transactional block region backend cannot grow")
@@ -1265,6 +1420,19 @@ impl<'a> BlockRegionBackendView<'a> {
 
     pub(crate) fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.backend.read(offset, len)
+    }
+
+    pub(crate) fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.backend.with_mapped_slice(offset, len, f)
+    }
+
+    pub(crate) fn mapped_region_source(&self) -> Option<Arc<dyn MappedRegionSource>> {
+        self.backend.mapped_region_source()
     }
 
     pub(crate) fn log_block_entries(&self, start_block: u32) -> Result<Vec<TxLogEntry>> {
@@ -2321,6 +2489,22 @@ impl BlockRegionBackend for VMemoryBlockRegion {
 
     fn block_meta(&self, block: u32) -> Result<BlockMeta> {
         self.block_meta(block)
+    }
+
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .context("transactional block region read range overflow")?;
+        ensure!(
+            end <= self.data.len(),
+            "transactional block region read range out of bounds"
+        );
+        f(&self.data[offset..end])
     }
 
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -3536,6 +3720,15 @@ impl BlockRegionBackend for DaxPmemBlockRegion {
         self.block_meta(block)
     }
 
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.mapping.with_mapped_slice(offset, len, f)
+    }
+
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.read(offset, len)
     }
@@ -3554,6 +3747,10 @@ impl BlockRegionBackend for DaxPmemBlockRegion {
 
     fn resize_bytes(&mut self, _new_len: usize) -> Result<()> {
         Ok(())
+    }
+
+    fn mapped_region_source(&self) -> Option<Arc<dyn MappedRegionSource>> {
+        Some(Arc::new(self.mapping.mapping.clone()) as Arc<dyn MappedRegionSource>)
     }
 
     fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
@@ -4689,6 +4886,15 @@ impl BlockRegionBackend for FileBackedMemoryBlockRegion {
         self.block_meta(block)
     }
 
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.mapping.with_mapped_slice(offset, len, f)
+    }
+
     fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.read(offset, len)
     }
@@ -4703,6 +4909,10 @@ impl BlockRegionBackend for FileBackedMemoryBlockRegion {
 
     fn fence(&self) -> Result<()> {
         self.fence()
+    }
+
+    fn mapped_region_source(&self) -> Option<Arc<dyn MappedRegionSource>> {
+        Some(Arc::new(self.mapping.clone()) as Arc<dyn MappedRegionSource>)
     }
 
     fn grow_to_blocks(&mut self, new_block_count: usize) -> Result<Option<RegionChunk>> {
@@ -5116,6 +5326,9 @@ pub fn reopen_and_recover_file_backed_region(
     path: &Path,
 ) -> Result<TransactionPersistenceRecoveredRegion> {
     let recovered = reopen_and_recover_file_backed_region_for_runtime(path)?;
+    let mapped_source = recovered
+        .cloned_mapped_region_source()
+        .context("recovered file-backed region does not expose a mapped region source")?;
     Ok(TransactionPersistenceRecoveredRegion {
         winners: recovered
             .winners
@@ -5128,12 +5341,19 @@ pub fn reopen_and_recover_file_backed_region(
         object_winners: recovered
             .object_winners
             .into_iter()
-            .map(|winner| TransactionPersistenceRecoveredObjectWinner {
-                object_id: winner.object_id,
-                version: winner.version,
-                record_bytes: winner.record_bytes,
+            .map(|winner| {
+                let mut record_bytes = Vec::new();
+                winner.with_source_record_bytes(mapped_source.as_ref(), &mut |bytes| {
+                    record_bytes.extend_from_slice(bytes);
+                    Ok(())
+                })?;
+                Ok(TransactionPersistenceRecoveredObjectWinner {
+                    object_id: winner.object_id,
+                    version: winner.version,
+                    record_bytes,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
         root_object_ids: recovered.root_object_ids,
         tmemory_undo_rollbacks: recovered
             .tmemory_undo_rollbacks
@@ -5377,9 +5597,22 @@ mod tests {
     const MEDIUM_DATA_RECORD_BYTES: usize = BLOCK_SIZE - size_of::<DataChunkHeader>();
     const LARGE_DATA_RECORD_BYTES: usize = MEDIUM_DATA_RECORD_BYTES + 1;
 
+    fn assert_sync<T: Sync>() {}
+
     fn file_backed_temp_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn mapped_source_bytes(source: &dyn MappedRegionSource, offset: usize, len: usize) -> Vec<u8> {
+        let mut observed = Vec::new();
+        source
+            .with_mapped_slice(offset, len, &mut |bytes| {
+                observed.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        observed
     }
 
     fn sample_struct_layout(id: u32, fingerprint: u64) -> PersistentTypeLayout {
@@ -5624,6 +5857,63 @@ mod tests {
     }
 
     #[test]
+    fn block_region_view_is_sync_for_parallel_recovery() {
+        assert_sync::<BlockRegionBackendView<'_>>();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_mapping_exposes_with_mapped_slice() {
+        let mut mapping = FileBackedMapping::new_temp(4096).unwrap();
+        mapping.write(128, b"mapped-file").unwrap();
+
+        let mut observed = Vec::new();
+        mapping
+            .with_mapped_slice(128, b"mapped-file".len(), &mut |bytes| {
+                observed.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(observed, b"mapped-file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dax_research_mapping_exposes_with_mapped_slice() {
+        let mut mapping = DaxPmemMapping::new_research_temp(4096).unwrap();
+        mapping.write(256, b"mapped-dax").unwrap();
+
+        let mut observed = Vec::new();
+        mapping
+            .with_mapped_slice(256, b"mapped-dax".len(), &mut |bytes| {
+                observed.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(observed, b"mapped-dax");
+    }
+
+    #[test]
+    fn block_region_view_exposes_with_mapped_slice() {
+        let mut region = VMemoryBlockRegion::new_for_test(1).unwrap();
+        region.write(512, b"mapped-view").unwrap();
+
+        let mut observed = Vec::new();
+        region
+            .view()
+            .with_mapped_slice(512, b"mapped-view".len(), &mut |bytes| {
+                observed.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(observed, b"mapped-view");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dax_pmem_block_region_allocates_and_persists_writes_in_research_mode() {
         let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
         let chunk = region.alloc_chunk(1).unwrap();
@@ -5638,6 +5928,7 @@ mod tests {
         assert!(region.num_blocks() >= 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_block_region_rejects_out_of_bounds_flush() {
         let region = DaxPmemBlockRegion::new_for_test(1).unwrap();
@@ -5646,6 +5937,7 @@ mod tests {
         assert!(error.contains("flush range out of bounds"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_block_region_persists_chunk_allocation_metadata() {
         let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
@@ -5667,6 +5959,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_payload_chunk_from_image_uses_persisted_chunk_capacity() {
         let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
@@ -5678,6 +5971,7 @@ mod tests {
         assert_eq!(reopened.block_count(), original.block_count());
     }
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_payload_grow_extends_persisted_chunk_capacity() {
         let mut region = DaxPmemBlockRegion::new_for_test(1).unwrap();
@@ -5704,6 +5998,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_metadata_only_image_grows_first_payload_chunk() {
         let num_blocks = dax_pmem_region_blocks_for_payload(0).unwrap();
@@ -5739,6 +6034,7 @@ mod tests {
         assert_eq!(reopened.block_count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_reopen_rejects_free_reserved_metadata_block_meta() {
         let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
@@ -5798,7 +6094,10 @@ mod tests {
         region.flush(range.start + 16, 4).unwrap();
         region.fence().unwrap();
 
-        let grown = region.grow_to_blocks(6).unwrap().unwrap();
+        let grown = region
+            .grow_to_blocks(region.num_blocks() + 1)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(grown.byte_range(), (5 * BLOCK_SIZE)..(6 * BLOCK_SIZE));
         assert_eq!(region.num_blocks(), 6);
@@ -5817,6 +6116,84 @@ mod tests {
             &bytes[grown.byte_range().start..grown.byte_range().start + 4],
             &[5, 6, 7, 8]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_mapped_source_outlives_region_backend() {
+        let mut region =
+            FileBackedMemoryBlockRegion::new_for_test(2, FileBackedRegionMode::Temp).unwrap();
+        region.write(64, b"source-bytes").unwrap();
+        let source = region.view().mapped_region_source().unwrap();
+
+        drop(region);
+
+        assert_eq!(
+            mapped_source_bytes(source.as_ref(), 64, b"source-bytes".len()),
+            b"source-bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_mapped_source_survives_region_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapped-source-grow.tmemory");
+        let mut region = FileBackedMemoryBlockRegion::create_for_test(&path, 5).unwrap();
+        let source = region.view().mapped_region_source().unwrap();
+
+        region.write(32, b"old!").unwrap();
+        let grown = region
+            .grow_to_blocks(region.num_blocks() + 1)
+            .unwrap()
+            .unwrap();
+        region
+            .write(grown.byte_range().start + 24, b"new!")
+            .unwrap();
+
+        assert_eq!(mapped_source_bytes(source.as_ref(), 32, 4), b"old!");
+        assert_eq!(
+            mapped_source_bytes(source.as_ref(), grown.byte_range().start + 24, 4),
+            b"new!"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dax_pmem_mapped_source_survives_region_grow() {
+        let mut region = DaxPmemBlockRegion::new_for_test(5).unwrap();
+        let source = region.view().mapped_region_source().unwrap();
+
+        region.write(32, b"old!").unwrap();
+        let grown = region
+            .grow_to_blocks(region.num_blocks() + 1)
+            .unwrap()
+            .unwrap();
+        region
+            .write(grown.byte_range().start + 24, b"new!")
+            .unwrap();
+
+        assert_eq!(mapped_source_bytes(source.as_ref(), 32, 4), b"old!");
+        assert_eq!(
+            mapped_source_bytes(source.as_ref(), grown.byte_range().start + 24, 4),
+            b"new!"
+        );
+    }
+
+    #[test]
+    fn synthetic_recovered_winner_sources_are_isolated() {
+        let first = new_synthetic_recovered_winner_source_for_test();
+        let second = new_synthetic_recovered_winner_source_for_test();
+
+        let first_offset =
+            register_synthetic_recovered_winner_data_record_for_test(&first, b"alpha");
+        let second_offset =
+            register_synthetic_recovered_winner_data_record_for_test(&second, b"beta");
+
+        assert_eq!(first_offset, 0);
+        assert_eq!(second_offset, 0);
+        assert_eq!(mapped_source_bytes(first.as_ref(), 0, 5), b"alpha");
+        assert_eq!(mapped_source_bytes(second.as_ref(), 0, 4), b"beta");
     }
 
     #[cfg(unix)]
@@ -6123,6 +6500,7 @@ mod tests {
 
     fn assert_persistent_gc_region_trait<R: PersistentGcRegion>(_region: &mut R) {}
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_region_reuses_retired_object_chunk_with_incremented_generation() {
         let mut region = DaxPmemBlockRegion::new_for_test(32).unwrap();
@@ -6548,6 +6926,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"keep-me");
     }
 
+    #[cfg(unix)]
     #[test]
     fn dax_pmem_mapping_research_temp_allows_non_dax_storage() {
         let _guard = file_backed_temp_test_lock()
@@ -6601,7 +6980,7 @@ mod tests {
 
         let mapping = FileBackedMapping::new_temp(16).unwrap();
 
-        assert_ne!(mapping.path, stale_path);
+        assert_ne!(mapping.path(), stale_path.as_path());
         assert_eq!(std::fs::read(&stale_path).unwrap(), b"stale-bytes");
 
         std::fs::remove_file(stale_path).unwrap();
@@ -6615,7 +6994,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let mut mapping = FileBackedMapping::new_temp(16).unwrap();
 
-        assert!(!mapping.path.exists());
+        assert!(!mapping.path().exists());
 
         mapping.write(0, &[1, 2, 3, 4]).unwrap();
         mapping.flush(0, 4).unwrap();

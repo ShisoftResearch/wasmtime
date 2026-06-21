@@ -2,8 +2,6 @@
 
 use crate::prelude::*;
 use crate::runtime::store::InstanceId;
-#[cfg(test)]
-use crate::runtime::vm::TxDataRecordHeader;
 use crate::runtime::vm::{PackedGranuleDomain, TMemory};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;

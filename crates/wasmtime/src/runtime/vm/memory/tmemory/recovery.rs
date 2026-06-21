@@ -1,4 +1,4 @@
-use super::block_region::BlockRegionBackendView;
+use super::block_region::{BlockRegionBackendView, MappedRegionSource};
 use super::durable_log::BlockKind;
 use super::{
     DATA_CHUNK_MAGIC, DataChunkHeader, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader,
@@ -13,6 +13,7 @@ use crate::runtime::transaction::{
     type_layout::{TypeLayoutId, TypeLayoutRegistry},
 };
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(test)]
@@ -46,6 +47,7 @@ pub(crate) struct RecoveredRegion {
     pub(crate) root_object_ids: Vec<u64>,
     pub(crate) tmemory_undo_rollbacks: Vec<RecoveredTMemoryUndoRollback>,
     pub(crate) next_stream_id: u32,
+    mapped_region_source: Option<Arc<dyn MappedRegionSource>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,8 +58,23 @@ pub(crate) struct RecoveredObjectWinner {
     pub(crate) type_layout_id: u32,
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
+    pub(crate) data_record_offset: usize,
     pub(crate) record_len: u64,
-    pub(crate) record_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct RecoveredClassifiedWinners {
+    object_winners: Vec<RecoveredObjectWinner>,
+    tmemory_size_winners: Vec<RecoveredTMemorySizeWinner>,
+    root_object_ids: Vec<u64>,
+}
+
+#[derive(Debug)]
+enum RecoveredWinnerClassification {
+    Object(RecoveredObjectWinner),
+    TMemorySize(RecoveredTMemorySizeWinner),
+    Roots(Vec<u64>),
+    Ignored,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,50 +133,89 @@ struct PendingTransaction {
     entries: Vec<TxLogEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryParallelism {
+    Serial,
+    Auto,
+    Workers(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryOptions {
+    pub(crate) parallelism: RecoveryParallelism,
+}
+
+impl Default for RecoveryOptions {
+    fn default() -> Self {
+        Self {
+            parallelism: RecoveryParallelism::Auto,
+        }
+    }
+}
+
+const RECOVERY_MAX_WORKERS: usize = 16;
+
+fn recovery_worker_count(options: RecoveryOptions, item_count: usize) -> usize {
+    if item_count <= 1 {
+        return 1;
+    }
+    let requested = match options.parallelism {
+        RecoveryParallelism::Serial => 1,
+        RecoveryParallelism::Auto => std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+        RecoveryParallelism::Workers(workers) => workers.max(1),
+    };
+    requested.min(item_count).min(RECOVERY_MAX_WORKERS).max(1)
+}
+
+fn recovery_partitions(item_count: usize, worker_count: usize) -> Vec<core::ops::Range<usize>> {
+    if item_count == 0 {
+        return Vec::new();
+    }
+
+    let worker_count = worker_count.min(item_count).max(1);
+    let chunk_len = item_count.div_ceil(worker_count);
+    let mut partitions = Vec::new();
+    let mut start = 0usize;
+    while start < item_count {
+        let end = start.saturating_add(chunk_len).min(item_count);
+        partitions.push(start..end);
+        start = end;
+    }
+    partitions
+}
+
 pub(crate) fn recover_region(
     region: &BlockRegionBackendView<'_>,
     type_layouts: TypeLayoutRegistry,
+) -> Result<RecoveredRegion> {
+    recover_region_with_options(region, type_layouts, RecoveryOptions::default())
+}
+
+pub(crate) fn recover_region_with_options(
+    region: &BlockRegionBackendView<'_>,
+    type_layouts: TypeLayoutRegistry,
+    options: RecoveryOptions,
 ) -> Result<RecoveredRegion> {
     let discovered = discover_region(region)?;
     let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
     let mut tmemory_undo_rollbacks = Vec::new();
 
-    for stream in discovered.streams.iter() {
-        let replay = replay_stream(region, stream, &discovered.data_chunk_index)?;
+    let replays = replay_streams(
+        region,
+        &discovered.streams,
+        &discovered.data_chunk_index,
+        options,
+    )?;
+    for replay in replays {
         tmemory_undo_rollbacks.extend(replay.tmemory_undo_rollbacks);
-        for update in replay.winners {
-            match winners.get(&update.logical_id) {
-                Some(current) if current.version > update.version => {}
-                Some(current)
-                    if current.version == update.version
-                        && current.data_block == update.data_block
-                        && current.data_offset == update.data_offset => {}
-                Some(current) if current.version == update.version => {
-                    if let Ok((_, object_id)) = unpack_object_granule_id(update.logical_id) {
-                        bail!(
-                            "duplicate committed object version {} for object id {}",
-                            update.version,
-                            object_id
-                        );
-                    }
-                    bail!(
-                        "duplicate committed version {} for logical id {}",
-                        update.version,
-                        update.logical_id
-                    );
-                }
-                _ => {
-                    winners.insert(update.logical_id, update);
-                }
-            }
-        }
+        merge_recovery_winners(&mut winners, replay.winners)?;
     }
 
     let winners = winners.into_values().collect::<Vec<_>>();
-    let object_winners = replay_object_winners(region, &discovered.data_chunk_index, &winners)?;
-    let tmemory_size_winners =
-        replay_tmemory_size_winners(region, &discovered.data_chunk_index, &winners)?;
-    let root_object_ids = replay_root_object_ids(region, &discovered.data_chunk_index, &winners)?;
+    let classified =
+        classify_recovered_winners(region, &discovered.data_chunk_index, &winners, options)?;
 
     Ok(RecoveredRegion {
         next_stream_id: discovered
@@ -171,17 +227,116 @@ pub(crate) fn recover_region(
             + 1,
         streams: discovered.streams,
         winners,
-        object_winners,
-        tmemory_size_winners,
+        object_winners: classified.object_winners,
+        tmemory_size_winners: classified.tmemory_size_winners,
         type_layouts,
-        root_object_ids,
+        root_object_ids: classified.root_object_ids,
         tmemory_undo_rollbacks,
+        mapped_region_source: region.mapped_region_source(),
     })
+}
+
+fn merge_recovery_winners(
+    winners: &mut BTreeMap<u64, RecoveryWinner>,
+    updates: impl IntoIterator<Item = RecoveryWinner>,
+) -> Result<()> {
+    for update in updates {
+        match winners.get(&update.logical_id) {
+            Some(current) if current.version > update.version => {}
+            Some(current)
+                if current.version == update.version
+                    && current.data_block == update.data_block
+                    && current.data_offset == update.data_offset => {}
+            Some(current) if current.version == update.version => {
+                if let Ok((_, object_id)) = unpack_object_granule_id(update.logical_id) {
+                    bail!(
+                        "duplicate committed object version {} for object id {}",
+                        update.version,
+                        object_id
+                    );
+                }
+                bail!(
+                    "duplicate committed version {} for logical id {}",
+                    update.version,
+                    update.logical_id
+                );
+            }
+            _ => {
+                winners.insert(update.logical_id, update);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replay_streams(
+    region: &BlockRegionBackendView<'_>,
+    streams: &[RecoveredStream],
+    data_chunk_index: &DataChunkIndex,
+    options: RecoveryOptions,
+) -> Result<Vec<StreamReplay>> {
+    let worker_count = recovery_worker_count(options, streams.len());
+    if worker_count == 1 {
+        return streams
+            .iter()
+            .map(|stream| replay_stream(region, stream, data_chunk_index))
+            .collect();
+    }
+    replay_streams_parallel(region, streams, data_chunk_index, worker_count)
+}
+
+fn replay_streams_parallel(
+    region: &BlockRegionBackendView<'_>,
+    streams: &[RecoveredStream],
+    data_chunk_index: &DataChunkIndex,
+    worker_count: usize,
+) -> Result<Vec<StreamReplay>> {
+    let mut indexed = std::thread::scope(|scope| -> Result<Vec<(usize, StreamReplay)>> {
+        let mut handles = Vec::new();
+        for range in recovery_partitions(streams.len(), worker_count) {
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, StreamReplay)>> {
+                let mut out = Vec::new();
+                for index in range {
+                    out.push((
+                        index,
+                        replay_stream(region, &streams[index], data_chunk_index)?,
+                    ));
+                }
+                Ok(out)
+            }));
+        }
+
+        let mut out = Vec::new();
+        for handle in handles {
+            let mut batch = handle.join().map_err(|panic| {
+                if let Some(message) = panic.downcast_ref::<&str>() {
+                    format_err!("parallel recovery stream replay worker panicked: {message}")
+                } else if let Some(message) = panic.downcast_ref::<String>() {
+                    format_err!("parallel recovery stream replay worker panicked: {message}")
+                } else {
+                    format_err!("parallel recovery stream replay worker panicked")
+                }
+            })??;
+            out.append(&mut batch);
+        }
+        Ok(out)
+    })?;
+
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, replay)| replay).collect())
 }
 
 impl RecoveredRegion {
     pub(crate) fn committed_object_winners(&self) -> Result<Vec<RecoveredObjectWinner>> {
         Ok(self.object_winners.clone())
+    }
+
+    pub(crate) fn mapped_region_source(&self) -> Option<&dyn MappedRegionSource> {
+        self.mapped_region_source.as_deref()
+    }
+
+    pub(crate) fn cloned_mapped_region_source(&self) -> Option<Arc<dyn MappedRegionSource>> {
+        self.mapped_region_source.clone()
     }
 
     pub(crate) fn committed_file_backed_tmemory_pages(&self) -> Result<Option<u64>> {
@@ -196,119 +351,247 @@ impl RecoveredRegion {
     }
 }
 
-fn replay_tmemory_size_winners(
+impl RecoveredObjectWinner {
+    pub(crate) fn with_source_record_bytes(
+        &self,
+        source: &dyn crate::runtime::vm::block_region::MappedRegionSource,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let payload_offset = self
+            .data_record_offset
+            .checked_add(size_of::<TxDataRecordHeader>())
+            .context("recovered object payload offset overflow")?;
+        let record_len =
+            usize::try_from(self.record_len).context("recovered object record length overflow")?;
+        source.with_mapped_slice(payload_offset, record_len, f)
+    }
+
+    pub(crate) fn with_view_record_bytes(
+        &self,
+        region: &BlockRegionBackendView<'_>,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let payload_offset = self
+            .data_record_offset
+            .checked_add(size_of::<TxDataRecordHeader>())
+            .context("recovered object payload offset overflow")?;
+        let record_len =
+            usize::try_from(self.record_len).context("recovered object record length overflow")?;
+        region.with_mapped_slice(payload_offset, record_len, f)
+    }
+
+    pub(crate) fn durable_data_record_len(&self) -> Result<u64> {
+        self.record_len
+            .checked_add(u64::try_from(size_of::<TxDataRecordHeader>()).unwrap())
+            .context("recovered object durable data record length overflow")
+    }
+}
+
+fn classify_recovered_winners(
     region: &BlockRegionBackendView<'_>,
     data_chunk_index: &DataChunkIndex,
     winners: &[RecoveryWinner],
-) -> Result<Vec<RecoveredTMemorySizeWinner>> {
-    let mut tmemory_sizes = Vec::new();
-
-    for winner in winners {
-        let Ok(domain) = packed_granule_domain(winner.logical_id) else {
-            continue;
-        };
-        if domain != PackedGranuleDomain::TMemorySize {
-            continue;
-        }
-
-        let (data_header, payload) = load_publication_payload(
-            region,
-            data_chunk_index,
-            winner.data_block,
-            winner.data_offset,
-        )?;
-        ensure!(
-            data_header.logical_id == winner.logical_id,
-            "recovered tmemory size logical id does not match log winner"
-        );
-        ensure!(
-            data_header.version == winner.version,
-            "recovered tmemory size version does not match log winner"
-        );
-        ensure!(
-            data_header.role()? == TxDataRecordRole::TObjectPub,
-            "recovered tmemory size data record has non-publication role"
-        );
-        ensure!(
-            data_header.kind == PackedGranuleDomain::TMemorySize as u16,
-            "recovered tmemory size kind does not match log winner"
-        );
-        ensure!(
-            payload.len() == size_of::<u64>(),
-            "recovered tmemory size payload must be exactly 8 bytes"
-        );
-        let (owner_instance, memory_index) = unpack_tmemory_size_logical_id(winner.logical_id)?;
-        tmemory_sizes.push(RecoveredTMemorySizeWinner {
-            owner_instance,
-            memory_index,
-            version: winner.version,
-            new_pages: u64::from_le_bytes(payload.try_into().unwrap()),
-        });
-    }
-
-    Ok(tmemory_sizes)
+    options: RecoveryOptions,
+) -> Result<RecoveredClassifiedWinners> {
+    let worker_count = recovery_worker_count(options, winners.len());
+    let classifications = if worker_count == 1 {
+        winners
+            .iter()
+            .map(|winner| classify_recovered_winner(region, data_chunk_index, winner))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        classify_recovered_winners_parallel(region, data_chunk_index, winners, worker_count)?
+    };
+    merge_classified_winners(classifications)
 }
 
-fn replay_root_object_ids(
-    region: &BlockRegionBackendView<'_>,
-    data_chunk_index: &DataChunkIndex,
-    winners: &[RecoveryWinner],
-) -> Result<Vec<u64>> {
-    let mut roots = Vec::new();
-
-    for winner in winners {
-        let Ok(domain) = packed_granule_domain(winner.logical_id) else {
-            continue;
-        };
-        match domain {
-            PackedGranuleDomain::TGlobal => {
-                let payload =
-                    load_root_publication_payload(region, data_chunk_index, winner, domain)?;
-                roots.extend(decode_root_object_refs(&payload)?.into_iter().take(1));
-            }
-            PackedGranuleDomain::TTable => {
-                let payload =
-                    load_root_publication_payload(region, data_chunk_index, winner, domain)?;
-                roots.extend(decode_root_object_refs(&payload)?);
-            }
-            _ => {}
-        }
-    }
-
-    roots.sort_unstable();
-    roots.dedup();
-    Ok(roots)
-}
-
-fn load_root_publication_payload(
+fn classify_recovered_winner(
     region: &BlockRegionBackendView<'_>,
     data_chunk_index: &DataChunkIndex,
     winner: &RecoveryWinner,
-    expected_domain: PackedGranuleDomain,
-) -> Result<Vec<u8>> {
-    let (data_header, payload) = load_publication_payload(
+) -> Result<RecoveredWinnerClassification> {
+    if let Ok((domain, object_id)) = unpack_object_granule_id(winner.logical_id) {
+        return Ok(RecoveredWinnerClassification::Object(
+            classify_object_winner(region, data_chunk_index, winner, domain, object_id)?,
+        ));
+    }
+
+    let Ok(domain) = packed_granule_domain(winner.logical_id) else {
+        return Ok(RecoveredWinnerClassification::Ignored);
+    };
+
+    match domain {
+        PackedGranuleDomain::TMemorySize => Ok(RecoveredWinnerClassification::TMemorySize(
+            classify_tmemory_size_winner(region, data_chunk_index, winner)?,
+        )),
+        PackedGranuleDomain::TGlobal | PackedGranuleDomain::TTable => {
+            Ok(RecoveredWinnerClassification::Roots(
+                classify_root_object_ids(region, data_chunk_index, winner, domain)?,
+            ))
+        }
+        _ => Ok(RecoveredWinnerClassification::Ignored),
+    }
+}
+
+fn classify_recovered_winners_parallel(
+    region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
+    winners: &[RecoveryWinner],
+    worker_count: usize,
+) -> Result<Vec<RecoveredWinnerClassification>> {
+    let mut indexed = std::thread::scope(
+        |scope| -> Result<Vec<(usize, RecoveredWinnerClassification)>> {
+            let mut handles = Vec::new();
+            for range in recovery_partitions(winners.len(), worker_count) {
+                handles.push(scope.spawn(
+                    move || -> Result<Vec<(usize, RecoveredWinnerClassification)>> {
+                        let mut out = Vec::new();
+                        for index in range {
+                            out.push((
+                                index,
+                                classify_recovered_winner(
+                                    region,
+                                    data_chunk_index,
+                                    &winners[index],
+                                )?,
+                            ));
+                        }
+                        Ok(out)
+                    },
+                ));
+            }
+
+            let mut out = Vec::new();
+            for handle in handles {
+                let mut batch = handle.join().map_err(|panic| {
+                    if let Some(message) = panic.downcast_ref::<&str>() {
+                        format_err!(
+                            "parallel recovery winner classification worker panicked: {message}"
+                        )
+                    } else if let Some(message) = panic.downcast_ref::<String>() {
+                        format_err!(
+                            "parallel recovery winner classification worker panicked: {message}"
+                        )
+                    } else {
+                        format_err!("parallel recovery winner classification worker panicked")
+                    }
+                })??;
+                out.append(&mut batch);
+            }
+            Ok(out)
+        },
+    )?;
+
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, item)| item).collect())
+}
+
+fn merge_classified_winners(
+    classifications: Vec<RecoveredWinnerClassification>,
+) -> Result<RecoveredClassifiedWinners> {
+    let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
+    let mut tmemory_size_winners = Vec::new();
+    let mut root_object_ids = Vec::new();
+
+    for item in classifications {
+        match item {
+            RecoveredWinnerClassification::Object(candidate) => {
+                match object_winners.get(&candidate.object_id) {
+                    Some(current) if current.version > candidate.version => {}
+                    Some(current) if current.version == candidate.version => {
+                        bail!(
+                            "duplicate committed object version {} for object id {}",
+                            candidate.version,
+                            candidate.object_id
+                        );
+                    }
+                    _ => {
+                        object_winners.insert(candidate.object_id, candidate);
+                    }
+                }
+            }
+            RecoveredWinnerClassification::TMemorySize(winner) => {
+                tmemory_size_winners.push(winner);
+            }
+            RecoveredWinnerClassification::Roots(mut roots) => {
+                root_object_ids.append(&mut roots);
+            }
+            RecoveredWinnerClassification::Ignored => {}
+        }
+    }
+
+    root_object_ids.sort_unstable();
+    root_object_ids.dedup();
+    Ok(RecoveredClassifiedWinners {
+        object_winners: object_winners.into_values().collect(),
+        tmemory_size_winners,
+        root_object_ids,
+    })
+}
+
+fn classify_object_winner(
+    region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
+    winner: &RecoveryWinner,
+    domain: PackedGranuleDomain,
+    object_id: u64,
+) -> Result<RecoveredObjectWinner> {
+    let mut candidate = None;
+    with_publication_payload(
         region,
         data_chunk_index,
         winner.data_block,
         winner.data_offset,
+        &mut |data_header, data_record_offset, record_bytes| {
+            ensure!(
+                data_header.logical_id == winner.logical_id,
+                "recovered object publication logical id does not match log winner"
+            );
+            ensure!(
+                data_header.version == winner.version,
+                "recovered object publication version does not match log winner"
+            );
+            ensure!(
+                data_header.role()? == TxDataRecordRole::TObjectPub,
+                "recovered object publication data record has non-publication role"
+            );
+            ensure!(
+                data_header.kind == domain as u16,
+                "recovered object publication kind does not match object domain"
+            );
+            let object_header = TxObjectHeader::read_from_prefix(record_bytes)?;
+            ensure!(
+                object_header.object_id == object_id,
+                "recovered object record id does not match logical id"
+            );
+            ensure!(
+                object_header.version == winner.version,
+                "recovered object record version does not match log winner"
+            );
+            ensure!(
+                data_header.type_info == object_header.type_layout_id,
+                "recovered object publication outer type layout id does not match object record"
+            );
+            ensure!(
+                object_domain_matches_object_kind(domain, object_header.kind),
+                "recovered object publication outer kind does not match object record kind"
+            );
+            TypeLayoutId::new(object_header.type_layout_id)
+                .context("recovered object record type layout id cannot be zero")?;
+            candidate = Some(RecoveredObjectWinner {
+                object_id,
+                version: winner.version,
+                kind: object_header.kind,
+                type_layout_id: object_header.type_layout_id,
+                data_block: winner.data_block,
+                data_offset: winner.data_offset,
+                data_record_offset,
+                record_len: object_header.record_len,
+            });
+            Ok(())
+        },
     )?;
-    ensure!(
-        data_header.logical_id == winner.logical_id,
-        "recovered root publication logical id does not match log winner"
-    );
-    ensure!(
-        data_header.version == winner.version,
-        "recovered root publication version does not match log winner"
-    );
-    ensure!(
-        data_header.role()? == TxDataRecordRole::TObjectPub,
-        "recovered root publication data record has non-publication role"
-    );
-    ensure!(
-        data_header.kind == expected_domain as u16,
-        "recovered root publication kind does not match granule domain"
-    );
-    Ok(payload)
+    candidate.context("recovered object winner classification did not produce a candidate")
 }
 
 fn decode_root_object_refs(payload: &[u8]) -> Result<Vec<u64>> {
@@ -325,84 +608,89 @@ fn decode_root_object_refs(payload: &[u8]) -> Result<Vec<u64>> {
         .collect::<Vec<_>>())
 }
 
-fn replay_object_winners(
+fn classify_tmemory_size_winner(
     region: &BlockRegionBackendView<'_>,
     data_chunk_index: &DataChunkIndex,
-    winners: &[RecoveryWinner],
-) -> Result<Vec<RecoveredObjectWinner>> {
-    let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
+    winner: &RecoveryWinner,
+) -> Result<RecoveredTMemorySizeWinner> {
+    let mut classified = None;
+    with_publication_payload(
+        region,
+        data_chunk_index,
+        winner.data_block,
+        winner.data_offset,
+        &mut |data_header, _, payload| {
+            ensure!(
+                data_header.logical_id == winner.logical_id,
+                "recovered tmemory size logical id does not match log winner"
+            );
+            ensure!(
+                data_header.version == winner.version,
+                "recovered tmemory size version does not match log winner"
+            );
+            ensure!(
+                data_header.role()? == TxDataRecordRole::TObjectPub,
+                "recovered tmemory size data record has non-publication role"
+            );
+            ensure!(
+                data_header.kind == PackedGranuleDomain::TMemorySize as u16,
+                "recovered tmemory size kind does not match log winner"
+            );
+            ensure!(
+                payload.len() == size_of::<u64>(),
+                "recovered tmemory size payload must be exactly 8 bytes"
+            );
+            let (owner_instance, memory_index) = unpack_tmemory_size_logical_id(winner.logical_id)?;
+            classified = Some(RecoveredTMemorySizeWinner {
+                owner_instance,
+                memory_index,
+                version: winner.version,
+                new_pages: u64::from_le_bytes(payload.try_into().unwrap()),
+            });
+            Ok(())
+        },
+    )?;
+    classified.context("recovered tmemory size classification did not produce a candidate")
+}
 
-    for winner in winners {
-        let Ok((domain, object_id)) = unpack_object_granule_id(winner.logical_id) else {
-            continue;
-        };
-        let (data_header, record_bytes) = load_publication_payload(
-            region,
-            data_chunk_index,
-            winner.data_block,
-            winner.data_offset,
-        )?;
-        ensure!(
-            data_header.logical_id == winner.logical_id,
-            "recovered object publication logical id does not match log winner"
-        );
-        ensure!(
-            data_header.version == winner.version,
-            "recovered object publication version does not match log winner"
-        );
-        ensure!(
-            data_header.role()? == TxDataRecordRole::TObjectPub,
-            "recovered object publication data record has non-publication role"
-        );
-        ensure!(
-            data_header.kind == domain as u16,
-            "recovered object publication kind does not match object domain"
-        );
-        let object_header = TxObjectHeader::read_from_prefix(&record_bytes)?;
-        ensure!(
-            object_header.object_id == object_id,
-            "recovered object record id does not match logical id"
-        );
-        ensure!(
-            object_header.version == winner.version,
-            "recovered object record version does not match log winner"
-        );
-        ensure!(
-            data_header.type_info == object_header.type_layout_id,
-            "recovered object publication outer type layout id does not match object record"
-        );
-        ensure!(
-            object_domain_matches_object_kind(domain, object_header.kind),
-            "recovered object publication outer kind does not match object record kind"
-        );
-        TypeLayoutId::new(object_header.type_layout_id)
-            .context("recovered object record type layout id cannot be zero")?;
-        let candidate = RecoveredObjectWinner {
-            object_id,
-            version: winner.version,
-            kind: object_header.kind,
-            type_layout_id: object_header.type_layout_id,
-            data_block: winner.data_block,
-            data_offset: winner.data_offset,
-            record_len: object_header.record_len,
-            record_bytes,
-        };
-        match object_winners.get(&object_id) {
-            Some(current) if current.version > candidate.version => {}
-            Some(current) if current.version == candidate.version => {
-                bail!(
-                    "duplicate committed object version {} for object id {}",
-                    candidate.version,
-                    object_id
-                );
+fn classify_root_object_ids(
+    region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
+    winner: &RecoveryWinner,
+    expected_domain: PackedGranuleDomain,
+) -> Result<Vec<u64>> {
+    let mut decoded_roots = None;
+    with_publication_payload(
+        region,
+        data_chunk_index,
+        winner.data_block,
+        winner.data_offset,
+        &mut |data_header, _, payload| {
+            ensure!(
+                data_header.logical_id == winner.logical_id,
+                "recovered root publication logical id does not match log winner"
+            );
+            ensure!(
+                data_header.version == winner.version,
+                "recovered root publication version does not match log winner"
+            );
+            ensure!(
+                data_header.role()? == TxDataRecordRole::TObjectPub,
+                "recovered root publication data record has non-publication role"
+            );
+            ensure!(
+                data_header.kind == expected_domain as u16,
+                "recovered root publication kind does not match granule domain"
+            );
+            let mut roots = decode_root_object_refs(payload)?;
+            if expected_domain == PackedGranuleDomain::TGlobal {
+                roots.truncate(1);
             }
-            _ => {
-                object_winners.insert(object_id, candidate);
-            }
-        }
-    }
-
-    Ok(object_winners.into_values().collect())
+            decoded_roots = Some(roots);
+            Ok(())
+        },
+    )?;
+    decoded_roots.context("recovered root publication classification did not produce roots")
 }
 
 fn object_domain_matches_object_kind(domain: PackedGranuleDomain, object_kind: u16) -> bool {
@@ -413,17 +701,25 @@ fn object_domain_matches_object_kind(domain: PackedGranuleDomain, object_kind: u
     }
 }
 
-fn load_publication_payload(
+fn with_publication_payload_impl(
     region: &BlockRegionBackendView<'_>,
     data_chunk_index: &DataChunkIndex,
     data_block: u32,
     data_offset: u32,
-) -> Result<(TxDataRecordHeader, Vec<u8>)> {
+    f: &mut dyn FnMut(TxDataRecordHeader, usize, &[u8]) -> Result<()>,
+) -> Result<()> {
     let (record_offset, chunk_tail_offset) =
         data_chunk_index.locate_data_record_offset(region, data_block, data_offset)?;
-    let header = TxDataRecordHeader::from_bytes(
-        region.read(record_offset, size_of::<TxDataRecordHeader>())?,
+    let mut header = None;
+    region.with_mapped_slice(
+        record_offset,
+        size_of::<TxDataRecordHeader>(),
+        &mut |bytes| {
+            header = Some(TxDataRecordHeader::from_bytes(bytes)?);
+            Ok(())
+        },
     )?;
+    let header = header.context("publication data record header was not observed")?;
     let payload_len =
         usize::try_from(header.payload_len).context("publication payload length overflow")?;
     let payload_offset = record_offset
@@ -436,8 +732,19 @@ fn load_publication_payload(
         payload_end <= chunk_tail_offset,
         "publication data record extends beyond data chunk tail"
     );
-    let payload = region.read(payload_offset, payload_len)?;
-    Ok((header, payload))
+    region.with_mapped_slice(payload_offset, payload_len, &mut |payload| {
+        f(header, record_offset, payload)
+    })
+}
+
+fn with_publication_payload(
+    region: &BlockRegionBackendView<'_>,
+    data_chunk_index: &DataChunkIndex,
+    data_block: u32,
+    data_offset: u32,
+    f: &mut dyn FnMut(TxDataRecordHeader, usize, &[u8]) -> Result<()>,
+) -> Result<()> {
+    with_publication_payload_impl(region, data_chunk_index, data_block, data_offset, f)
 }
 
 fn validated_chunk_blocks(
@@ -756,12 +1063,19 @@ fn validate_committed_entry(
     data_chunk_index: &DataChunkIndex,
     entry: TxLogEntry,
 ) -> Result<()> {
-    let (data_header, _) = load_publication_payload(
+    let mut data_header = None;
+    with_publication_payload(
         region,
         data_chunk_index,
         entry.data_block,
         entry.data_offset,
+        &mut |header, _, _| {
+            data_header = Some(header);
+            Ok(())
+        },
     )?;
+    let data_header =
+        data_header.context("committed data record validation did not observe a header")?;
     ensure!(
         data_header.logical_id == entry.logical_id,
         "committed data record logical id does not match log entry"
@@ -798,35 +1112,40 @@ fn loose_end_tmemory_undo_rollbacks(
         if !validate_entry_data_block(region, entry)? {
             continue;
         }
-        let (data_header, old_granule_bytes) = load_publication_payload(
+        let mut rollback = None;
+        with_publication_payload(
             region,
             data_chunk_index,
             entry.data_block,
             entry.data_offset,
+            &mut |data_header, _, old_granule_bytes| {
+                ensure!(
+                    data_header.role()? == TxDataRecordRole::TMemoryUndo,
+                    "tmemory undo data record has non-undo role"
+                );
+                ensure!(
+                    data_header.logical_id == entry.logical_id,
+                    "tmemory undo logical id does not match log entry"
+                );
+                ensure!(
+                    data_header.version == entry.version,
+                    "tmemory undo version does not match log entry"
+                );
+                ensure!(
+                    data_header.kind == PackedGranuleDomain::TMemory as u16,
+                    "tmemory undo data record kind is not TMemory"
+                );
+                rollback = Some(RecoveredTMemoryUndoRollback {
+                    logical_id: entry.logical_id,
+                    version: entry.version,
+                    data_block: entry.data_block,
+                    data_offset: entry.data_offset,
+                    old_granule_bytes: old_granule_bytes.to_vec(),
+                });
+                Ok(())
+            },
         )?;
-        ensure!(
-            data_header.role()? == TxDataRecordRole::TMemoryUndo,
-            "tmemory undo data record has non-undo role"
-        );
-        ensure!(
-            data_header.logical_id == entry.logical_id,
-            "tmemory undo logical id does not match log entry"
-        );
-        ensure!(
-            data_header.version == entry.version,
-            "tmemory undo version does not match log entry"
-        );
-        ensure!(
-            data_header.kind == PackedGranuleDomain::TMemory as u16,
-            "tmemory undo data record kind is not TMemory"
-        );
-        rollbacks.push(RecoveredTMemoryUndoRollback {
-            logical_id: entry.logical_id,
-            version: entry.version,
-            data_block: entry.data_block,
-            data_offset: entry.data_offset,
-            old_granule_bytes,
-        });
+        rollbacks.push(rollback.context("tmemory undo rollback did not observe payload")?);
     }
     Ok(rollbacks)
 }
@@ -843,6 +1162,11 @@ fn is_final_lp(entry: TxLogEntry) -> bool {
 pub(crate) fn recover_region_for_test(region: &VMemoryBlockRegion) -> Result<RecoveredRegion> {
     let type_layouts = region.load_type_layout_metadata()?;
     recover_region(&region.view(), type_layouts)
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_worker_count_for_test(options: RecoveryOptions, item_count: usize) -> usize {
+    recovery_worker_count(options, item_count)
 }
 
 #[cfg(test)]
@@ -884,6 +1208,404 @@ mod tests {
     }
 
     #[test]
+    fn recovery_options_serial_matches_default_recovery() {
+        let mut region = VMemoryBlockRegion::new(16).unwrap();
+        let type_layouts = TypeLayoutRegistry::default();
+        let stream_a = 1;
+        let stream_b = 2;
+        let stream_a_cursor = region.stream_cursor(stream_a);
+        let stream_b_cursor = region.stream_cursor(stream_b);
+
+        append_publication_record(&mut region, stream_a, stream_a_cursor, 1, 0x1000, 1, 11);
+        append_publication_record(&mut region, stream_b, stream_b_cursor, 1, 0x1001, 1, 22);
+        append_publication_record(&mut region, stream_a, stream_a_cursor, 2, 0x1000, 2, 33);
+
+        let default = recover_region(&region.view(), type_layouts.clone()).unwrap();
+        let serial = recover_region_with_options(
+            &region.view(),
+            type_layouts,
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Serial,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            default.next_stream_id, serial.next_stream_id,
+            "serial recovery next stream id should match default recovery"
+        );
+        assert_eq!(
+            default
+                .streams
+                .iter()
+                .map(|stream| {
+                    (
+                        stream.stream_id,
+                        stream.log_blocks.clone(),
+                        stream.data_chunks.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            serial
+                .streams
+                .iter()
+                .map(|stream| {
+                    (
+                        stream.stream_id,
+                        stream.log_blocks.clone(),
+                        stream.data_chunks.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "serial recovery stream discovery should match default recovery"
+        );
+        assert_eq!(
+            default
+                .winners
+                .iter()
+                .map(|winner| (
+                    winner.logical_id,
+                    winner.version,
+                    winner.data_block,
+                    winner.data_offset
+                ))
+                .collect::<Vec<_>>(),
+            serial
+                .winners
+                .iter()
+                .map(|winner| (
+                    winner.logical_id,
+                    winner.version,
+                    winner.data_block,
+                    winner.data_offset
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            default.object_winners, serial.object_winners,
+            "serial recovery object winners should match default recovery"
+        );
+        assert_eq!(
+            default.tmemory_size_winners, serial.tmemory_size_winners,
+            "serial recovery tmemory size winners should match default recovery"
+        );
+        assert_eq!(
+            default.root_object_ids, serial.root_object_ids,
+            "serial recovery root object ids should match default recovery"
+        );
+        assert_eq!(
+            default.tmemory_undo_rollbacks, serial.tmemory_undo_rollbacks,
+            "serial recovery tmemory undo rollbacks should match default recovery"
+        );
+    }
+
+    #[test]
+    fn parallel_stream_replay_matches_serial_recovery() {
+        let mut region = VMemoryBlockRegion::new(64).unwrap();
+        let type_layouts = TypeLayoutRegistry::default();
+        let stream1 = region.stream_cursor(1);
+        let stream2 = region.stream_cursor(2);
+        let stream3 = region.stream_cursor(3);
+        let stream4 = region.stream_cursor(4);
+        let stream5 = region.stream_cursor(5);
+
+        append_publication_record(&mut region, 1, stream1, 1, 0x1000, 1, 11);
+        append_publication_record(&mut region, 2, stream2, 1, 0x1001, 1, 22);
+        append_publication_record(&mut region, 1, stream1, 2, 0x1000, 2, 44);
+        append_committed_object_update(
+            &mut region,
+            3,
+            stream3,
+            1,
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+            1,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(33)]),
+        );
+        append_committed_root_update(
+            &mut region,
+            4,
+            stream4,
+            1,
+            pack_test_granule_id(PackedGranuleDomain::TGlobal, 1),
+            1,
+            &[Some(41)],
+        );
+        append_tmemory_undo_record(
+            &mut region,
+            5,
+            stream5,
+            1,
+            pack_test_granule_id(PackedGranuleDomain::TMemory, 7),
+            3,
+            &[9, 8, 7, 6],
+            false,
+        );
+
+        let serial = recover_region_with_options(
+            &region.view(),
+            type_layouts.clone(),
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Serial,
+            },
+        )
+        .unwrap();
+        let parallel = recover_region_with_options(
+            &region.view(),
+            type_layouts,
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Workers(2),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(serial.next_stream_id, parallel.next_stream_id);
+        assert_eq!(
+            serial
+                .streams
+                .iter()
+                .map(|stream| {
+                    (
+                        stream.stream_id,
+                        stream.log_blocks.clone(),
+                        stream.data_chunks.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            parallel
+                .streams
+                .iter()
+                .map(|stream| {
+                    (
+                        stream.stream_id,
+                        stream.log_blocks.clone(),
+                        stream.data_chunks.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serial
+                .winners
+                .iter()
+                .map(|winner| (
+                    winner.logical_id,
+                    winner.version,
+                    winner.data_block,
+                    winner.data_offset
+                ))
+                .collect::<Vec<_>>(),
+            parallel
+                .winners
+                .iter()
+                .map(|winner| (
+                    winner.logical_id,
+                    winner.version,
+                    winner.data_block,
+                    winner.data_offset
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(serial.object_winners, parallel.object_winners);
+        assert_eq!(serial.tmemory_size_winners, parallel.tmemory_size_winners);
+        assert_eq!(serial.root_object_ids, parallel.root_object_ids);
+        assert_eq!(
+            serial.tmemory_undo_rollbacks,
+            parallel.tmemory_undo_rollbacks
+        );
+    }
+
+    #[test]
+    fn parallel_winner_classification_matches_serial_recovery() {
+        let mut region = VMemoryBlockRegion::new(64).unwrap();
+        let stream = region.stream_cursor(1);
+
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream,
+            1,
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+            1,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+        );
+        append_committed_object_update(
+            &mut region,
+            1,
+            stream,
+            2,
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 42).unwrap(),
+            2,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(22)]),
+        );
+        append_committed_root_update(
+            &mut region,
+            1,
+            stream,
+            3,
+            pack_test_granule_id(PackedGranuleDomain::TGlobal, 1),
+            3,
+            &[Some(41)],
+        );
+        append_committed_root_update(
+            &mut region,
+            1,
+            stream,
+            4,
+            pack_test_granule_id(PackedGranuleDomain::TTable, 2),
+            4,
+            &[Some(42), Some(41), None],
+        );
+        append_committed_tmemory_size_update(&mut region, 1, stream, 5, Some(7), 4, 5, 8);
+        append_committed_tmemory_size_update(&mut region, 1, stream, 6, Some(8), 2, 6, 16);
+
+        let discovered = discover_region(&region.view()).unwrap();
+        let replays = replay_streams(
+            &region.view(),
+            &discovered.streams,
+            &discovered.data_chunk_index,
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Serial,
+            },
+        )
+        .unwrap();
+        let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
+        for replay in replays {
+            merge_recovery_winners(&mut winners, replay.winners).unwrap();
+        }
+        let winners = winners.into_values().collect::<Vec<_>>();
+
+        assert!(winners.len() >= 6);
+
+        let serial = classify_recovered_winners(
+            &region.view(),
+            &discovered.data_chunk_index,
+            &winners,
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Serial,
+            },
+        )
+        .unwrap();
+        let parallel = classify_recovered_winners(
+            &region.view(),
+            &discovered.data_chunk_index,
+            &winners,
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Workers(2),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(serial.object_winners, parallel.object_winners);
+        assert_eq!(serial.root_object_ids, parallel.root_object_ids);
+        assert_eq!(serial.tmemory_size_winners, parallel.tmemory_size_winners);
+
+        let recovered_serial = recover_region_with_options(
+            &region.view(),
+            TypeLayoutRegistry::default(),
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Serial,
+            },
+        )
+        .unwrap();
+        let recovered_parallel = recover_region_with_options(
+            &region.view(),
+            TypeLayoutRegistry::default(),
+            RecoveryOptions {
+                parallelism: RecoveryParallelism::Workers(2),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            recovered_serial.object_winners,
+            recovered_parallel.object_winners
+        );
+        assert_eq!(
+            recovered_serial.root_object_ids,
+            recovered_parallel.root_object_ids
+        );
+        assert_eq!(
+            recovered_serial.tmemory_size_winners,
+            recovered_parallel.tmemory_size_winners
+        );
+    }
+
+    #[test]
+    fn recovery_worker_count_respects_serial_and_worker_limits() {
+        assert_eq!(
+            recovery_worker_count(
+                RecoveryOptions {
+                    parallelism: RecoveryParallelism::Workers(4),
+                },
+                0,
+            ),
+            1
+        );
+        assert_eq!(
+            recovery_worker_count(
+                RecoveryOptions {
+                    parallelism: RecoveryParallelism::Workers(4),
+                },
+                1,
+            ),
+            1
+        );
+        assert_eq!(
+            recovery_worker_count(
+                RecoveryOptions {
+                    parallelism: RecoveryParallelism::Serial,
+                },
+                8,
+            ),
+            1
+        );
+        assert_eq!(
+            recovery_worker_count(
+                RecoveryOptions {
+                    parallelism: RecoveryParallelism::Workers(0),
+                },
+                8,
+            ),
+            1
+        );
+        assert_eq!(
+            recovery_worker_count(
+                RecoveryOptions {
+                    parallelism: RecoveryParallelism::Workers(2),
+                },
+                8,
+            ),
+            2
+        );
+        assert_eq!(
+            recovery_worker_count(
+                RecoveryOptions {
+                    parallelism: RecoveryParallelism::Workers(64),
+                },
+                8,
+            ),
+            8
+        );
+    }
+
+    #[test]
+    fn recovery_partitions_are_non_empty_and_cover_all_items() {
+        assert_eq!(
+            recovery_partitions(0, 4),
+            Vec::<core::ops::Range<usize>>::new()
+        );
+        assert_eq!(recovery_partitions(1, 4), vec![0..1]);
+        assert_eq!(recovery_partitions(4, 0), vec![0..4]);
+        assert_eq!(recovery_partitions(4, 1), vec![0..4]);
+
+        let partitions = recovery_partitions(10, 3);
+        assert_eq!(partitions, vec![0..4, 4..8, 8..10]);
+    }
+
+    #[test]
     fn recovery_rejects_corrupt_non_final_log_entry() {
         let region = sample_region_with_corrupt_non_final_log_entry();
         let err = recover_region_for_test(&region).unwrap_err();
@@ -903,6 +1625,55 @@ mod tests {
             objects[0].kind,
             crate::runtime::transaction::ObjectKind::Struct as u16
         );
+    }
+
+    #[test]
+    fn recovered_object_winner_maps_record_bytes_from_region() {
+        let mut region = VMemoryBlockRegion::new(8).unwrap();
+        let stream = region.alloc_stream(7).unwrap();
+        let record = crate::runtime::transaction::encode_object_record_for_recovery(
+            41,
+            3,
+            ObjectKind::Struct as u16,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            &crate::runtime::transaction::ObjectPayload::Struct(vec![
+                crate::runtime::transaction::ObjectValue::I32(11),
+            ]),
+        )
+        .unwrap();
+        let data_record = TMemory::encode_publication_data_record(
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+            3,
+            PackedGranuleDomain::TStruct as u16,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            &record,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &data_record).unwrap();
+        let log_block = region.alloc_log_block(7, 0).unwrap();
+        let entry = TMemory::publication_log_entry(
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+            3,
+            14,
+            location.data_block,
+            location.data_offset,
+            region.block_meta(location.data_block).unwrap().generation,
+            true,
+        )
+        .unwrap();
+        write_log_entries(&mut region, log_block, &[entry]);
+
+        let recovered = recover_region(&region.view(), TypeLayoutRegistry::default()).unwrap();
+        let winners = recovered.committed_object_winners().unwrap();
+        let mut observed = Vec::new();
+        winners[0]
+            .with_view_record_bytes(&region.view(), &mut |bytes| {
+                observed.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(observed, record);
     }
 
     #[test]
@@ -929,6 +1700,7 @@ mod tests {
             root_object_ids: Vec::new(),
             tmemory_undo_rollbacks: Vec::new(),
             next_stream_id: 1,
+            mapped_region_source: None,
         };
 
         assert_eq!(
@@ -1129,7 +1901,7 @@ mod tests {
             });
         let discovered = discover_region(&region.view()).unwrap();
         let err =
-            replay_tmemory_size_winners(&region.view(), &discovered.data_chunk_index, &[winner])
+            classify_tmemory_size_winner(&region.view(), &discovered.data_chunk_index, &winner)
                 .unwrap_err();
 
         assert!(
@@ -1146,7 +1918,7 @@ mod tests {
             });
         let discovered = discover_region(&region.view()).unwrap();
         let err =
-            replay_tmemory_size_winners(&region.view(), &discovered.data_chunk_index, &[winner])
+            classify_tmemory_size_winner(&region.view(), &discovered.data_chunk_index, &winner)
                 .unwrap_err();
 
         assert!(
@@ -1163,7 +1935,7 @@ mod tests {
             });
         let discovered = discover_region(&region.view()).unwrap();
         let err =
-            replay_tmemory_size_winners(&region.view(), &discovered.data_chunk_index, &[winner])
+            classify_tmemory_size_winner(&region.view(), &discovered.data_chunk_index, &winner)
                 .unwrap_err();
 
         assert!(
@@ -1809,6 +2581,41 @@ mod tests {
             logical_id,
             version,
             domain as u16,
+            0,
+            &payload,
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let log_block = region.alloc_log_block(stream_id, block_seq).unwrap();
+        let entry = TMemory::publication_log_entry(
+            logical_id,
+            version,
+            stream_id << 1,
+            location.data_block,
+            location.data_offset,
+            0,
+            true,
+        )
+        .unwrap();
+        write_log_entries(region, log_block, &[entry]);
+    }
+
+    fn append_committed_tmemory_size_update(
+        region: &mut VMemoryBlockRegion,
+        stream_id: u32,
+        stream: StreamCursor,
+        block_seq: u32,
+        owner_instance: Option<u32>,
+        memory_index: u32,
+        version: u32,
+        new_pages: u64,
+    ) {
+        let logical_id = pack_tmemory_size_logical_id(owner_instance, memory_index).unwrap();
+        let payload = new_pages.to_le_bytes();
+        let record = TMemory::encode_publication_data_record(
+            logical_id,
+            version,
+            PackedGranuleDomain::TMemorySize as u16,
             0,
             &payload,
         )
