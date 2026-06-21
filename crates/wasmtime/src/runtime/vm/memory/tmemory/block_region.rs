@@ -1048,6 +1048,171 @@ pub(crate) trait BlockRegionBackend {
     }
 }
 
+pub(crate) trait PersistentGcRegion {
+    fn gc_num_blocks(&self) -> usize;
+    fn gc_block_meta(&self, block: u32) -> Result<BlockMeta>;
+    fn gc_mark_block_large_free(&mut self, block: usize);
+    fn gc_write_block_meta(&mut self, block: usize, meta: BlockMeta) -> Result<()>;
+    fn gc_flush_block_meta_range(&self, start: usize, count: usize) -> Result<()>;
+    fn gc_fence(&self) -> Result<()>;
+
+    fn gc_block_meta_at(&self, block: usize) -> Result<BlockMeta> {
+        self.gc_block_meta(u32::try_from(block).context("persistent GC block index overflow")?)
+    }
+
+    fn retire_chunk_for_gc(
+        &mut self,
+        chunk_start_block: u32,
+        expected_kind: BlockKind,
+    ) -> Result<()> {
+        let meta = self.gc_block_meta(chunk_start_block)?;
+        if !meta.is_active_or_sealed()? || meta.kind()? != expected_kind {
+            return Ok(());
+        }
+        ensure!(
+            meta.chunk_start == chunk_start_block,
+            "persistent GC retired chunk input must point at the chunk start block"
+        );
+
+        let chunk_start = usize::try_from(chunk_start_block)
+            .context("persistent GC retired chunk start block overflow")?;
+        let chunk_blocks = usize::try_from(meta.chunk_blocks)
+            .context("persistent GC retired chunk block count overflow")?;
+        let chunk_end = chunk_start
+            .checked_add(chunk_blocks)
+            .context("persistent GC retired chunk block range overflow")?;
+        ensure!(
+            chunk_end <= self.gc_num_blocks(),
+            "persistent GC retired chunk metadata range is out of bounds"
+        );
+
+        let retired_meta = BlockMeta {
+            state: BlockState::Retired as u8,
+            kind: meta.kind,
+            reserved0: 0,
+            generation: meta.generation,
+            owner_thread: meta.owner_thread,
+            chunk_start: meta.chunk_start,
+            chunk_blocks: meta.chunk_blocks,
+            reserved1: 0,
+        };
+        for block in chunk_start..chunk_end {
+            self.gc_mark_block_large_free(block);
+            self.gc_write_block_meta(block, retired_meta)?;
+        }
+        self.gc_flush_block_meta_range(chunk_start, chunk_blocks)
+    }
+
+    fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut retired = Vec::new();
+        let mut seen = BTreeSet::new();
+        for chunk_start_block in chunk_starts {
+            if !seen.insert(chunk_start_block) {
+                continue;
+            }
+            let meta = self.gc_block_meta(chunk_start_block)?;
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::LinearUndo {
+                continue;
+            }
+            self.retire_chunk_for_gc(chunk_start_block, BlockKind::LinearUndo)?;
+            retired.push(chunk_start_block);
+        }
+
+        if !retired.is_empty() {
+            self.gc_fence()?;
+        }
+
+        Ok(retired)
+    }
+
+    fn retire_whole_dead_object_chunks(
+        &mut self,
+        reachable: &[PersistentRecoveredRecordLocation],
+        unreachable: &[PersistentRecoveredRecordLocation],
+    ) -> Result<Vec<u32>> {
+        let mut live_blocks = vec![false; self.gc_num_blocks()];
+        for location in reachable {
+            let range = data_record_block_range(
+                location.data_block,
+                location.data_offset,
+                location.record_len,
+            )?;
+            ensure!(
+                range.end <= self.gc_num_blocks(),
+                "persistent GC reachable object record blocks exceed region bounds"
+            );
+            for block in range {
+                live_blocks[block] = true;
+            }
+        }
+
+        let mut candidate_chunks = BTreeMap::<u32, usize>::new();
+        for location in unreachable {
+            let record_range = data_record_block_range(
+                location.data_block,
+                location.data_offset,
+                location.record_len,
+            )?;
+            ensure!(
+                record_range.end <= self.gc_num_blocks(),
+                "persistent GC unreachable object record blocks exceed region bounds"
+            );
+
+            let meta = self.gc_block_meta(location.data_block)?;
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+                continue;
+            }
+
+            let chunk_start = usize::try_from(meta.chunk_start)
+                .context("persistent GC retired chunk start block overflow")?;
+            let chunk_blocks = usize::try_from(meta.chunk_blocks)
+                .context("persistent GC retired chunk block count overflow")?;
+            let chunk_end = chunk_start
+                .checked_add(chunk_blocks)
+                .context("persistent GC retired chunk block range overflow")?;
+            ensure!(
+                chunk_end <= self.gc_num_blocks(),
+                "persistent GC retired chunk metadata range is out of bounds"
+            );
+            ensure!(
+                record_range.start >= chunk_start && record_range.end <= chunk_end,
+                "persistent GC recovered object record extends outside chunk metadata"
+            );
+
+            candidate_chunks.insert(meta.chunk_start, chunk_blocks);
+        }
+
+        let mut retired = Vec::new();
+        for (chunk_start_block, chunk_blocks) in candidate_chunks {
+            let chunk_start = usize::try_from(chunk_start_block)
+                .context("persistent GC retired chunk start block overflow")?;
+            let chunk_end = chunk_start
+                .checked_add(chunk_blocks)
+                .context("persistent GC retired chunk block range overflow")?;
+            if live_blocks[chunk_start..chunk_end].iter().any(|live| *live) {
+                continue;
+            }
+
+            let meta = self.gc_block_meta_at(chunk_start)?;
+            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
+                continue;
+            }
+
+            self.retire_chunk_for_gc(chunk_start_block, BlockKind::ObjectData)?;
+            retired.push(chunk_start_block);
+        }
+
+        if !retired.is_empty() {
+            self.gc_fence()?;
+        }
+
+        Ok(retired)
+    }
+}
+
 pub(crate) struct BlockRegionBackendView<'a> {
     backend: &'a dyn BlockRegionBackend,
 }
@@ -2710,69 +2875,11 @@ impl DaxPmemBlockRegion {
         )
     }
 
-    fn retire_chunk(&mut self, chunk_start_block: u32, expected_kind: BlockKind) -> Result<()> {
-        let meta = self.block_meta(chunk_start_block)?;
-        if !meta.is_active_or_sealed()? || meta.kind()? != expected_kind {
-            return Ok(());
-        }
-        ensure!(
-            meta.chunk_start == chunk_start_block,
-            "transactional DAX PMEM retired chunk input must point at the chunk start block"
-        );
-
-        let chunk_start =
-            usize::try_from(chunk_start_block).context("DAX PMEM retired chunk start overflow")?;
-        let chunk_blocks =
-            usize::try_from(meta.chunk_blocks).context("DAX PMEM retired chunk count overflow")?;
-        let chunk_end = chunk_start
-            .checked_add(chunk_blocks)
-            .context("DAX PMEM retired chunk range overflow")?;
-        ensure!(
-            chunk_end <= self.num_blocks(),
-            "DAX PMEM retired chunk metadata range is out of bounds"
-        );
-
-        let retired_meta = BlockMeta {
-            state: BlockState::Retired as u8,
-            kind: meta.kind,
-            reserved0: 0,
-            generation: meta.generation,
-            owner_thread: meta.owner_thread,
-            chunk_start: meta.chunk_start,
-            chunk_blocks: meta.chunk_blocks,
-            reserved1: 0,
-        };
-        for block in chunk_start..chunk_end {
-            self.block_entries[block] = BlockEntry::default();
-            self.block_entries[block].list_num = ListKind::LargeFree as i16;
-            self.write_block_meta(block, retired_meta)?;
-        }
-        self.flush_block_meta_range(chunk_start, chunk_blocks)
-    }
-
     pub(crate) fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
     where
         I: IntoIterator<Item = u32>,
     {
-        let mut retired = Vec::new();
-        let mut seen = BTreeSet::new();
-        for chunk_start_block in chunk_starts {
-            if !seen.insert(chunk_start_block) {
-                continue;
-            }
-            let meta = self.block_meta(chunk_start_block)?;
-            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::LinearUndo {
-                continue;
-            }
-            self.retire_chunk(chunk_start_block, BlockKind::LinearUndo)?;
-            retired.push(chunk_start_block);
-        }
-
-        if !retired.is_empty() {
-            self.fence()?;
-        }
-
-        Ok(retired)
+        <Self as PersistentGcRegion>::retire_linear_undo_chunks(self, chunk_starts)
     }
 
     pub(crate) fn retire_whole_dead_object_chunks(
@@ -2780,83 +2887,7 @@ impl DaxPmemBlockRegion {
         reachable: &[PersistentRecoveredRecordLocation],
         unreachable: &[PersistentRecoveredRecordLocation],
     ) -> Result<Vec<u32>> {
-        let mut live_blocks = vec![false; self.num_blocks()];
-        for location in reachable {
-            let range = data_record_block_range(
-                location.data_block,
-                location.data_offset,
-                location.record_len,
-            )?;
-            ensure!(
-                range.end <= self.num_blocks(),
-                "DAX PMEM reachable object record blocks exceed region bounds"
-            );
-            for block in range {
-                live_blocks[block] = true;
-            }
-        }
-
-        let mut candidate_chunks = BTreeMap::<u32, usize>::new();
-        for location in unreachable {
-            let record_range = data_record_block_range(
-                location.data_block,
-                location.data_offset,
-                location.record_len,
-            )?;
-            ensure!(
-                record_range.end <= self.num_blocks(),
-                "DAX PMEM unreachable object record blocks exceed region bounds"
-            );
-
-            let meta = self.block_meta(location.data_block)?;
-            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
-                continue;
-            }
-
-            let chunk_start = usize::try_from(meta.chunk_start)
-                .context("DAX PMEM retired chunk start overflow")?;
-            let chunk_blocks = usize::try_from(meta.chunk_blocks)
-                .context("DAX PMEM retired chunk count overflow")?;
-            let chunk_end = chunk_start
-                .checked_add(chunk_blocks)
-                .context("DAX PMEM retired chunk range overflow")?;
-            ensure!(
-                chunk_end <= self.num_blocks(),
-                "DAX PMEM retired chunk metadata range is out of bounds"
-            );
-            ensure!(
-                record_range.start >= chunk_start && record_range.end <= chunk_end,
-                "DAX PMEM recovered object record extends outside chunk metadata"
-            );
-
-            candidate_chunks.insert(meta.chunk_start, chunk_blocks);
-        }
-
-        let mut retired = Vec::new();
-        for (chunk_start_block, chunk_blocks) in candidate_chunks {
-            let chunk_start = usize::try_from(chunk_start_block)
-                .context("DAX PMEM retired chunk start overflow")?;
-            let chunk_end = chunk_start
-                .checked_add(chunk_blocks)
-                .context("DAX PMEM retired chunk range overflow")?;
-            if live_blocks[chunk_start..chunk_end].iter().any(|live| *live) {
-                continue;
-            }
-
-            let meta = self.block_metas[chunk_start];
-            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
-                continue;
-            }
-
-            self.retire_chunk(chunk_start_block, BlockKind::ObjectData)?;
-            retired.push(chunk_start_block);
-        }
-
-        if !retired.is_empty() {
-            self.fence()?;
-        }
-
-        Ok(retired)
+        <Self as PersistentGcRegion>::retire_whole_dead_object_chunks(self, reachable, unreachable)
     }
 
     fn read_header_bytes(&self, start_block: u32, len: usize) -> Result<Vec<u8>> {
@@ -3199,7 +3230,7 @@ impl DaxPmemBlockRegion {
             *entry = BlockEntry::default();
         }
         for (block, meta) in self.block_metas.iter().copied().enumerate() {
-            if meta.state()? != BlockState::Free {
+            if meta.is_active_or_sealed()? {
                 self.block_entries[block].used = 1;
                 self.block_entries[block].list_num = ListKind::Used as i16;
             }
@@ -3450,6 +3481,33 @@ fn dax_pmem_region_blocks_for_payload(payload_blocks: usize) -> Result<usize> {
             return Ok(total_blocks);
         }
         total_blocks = needed_blocks;
+    }
+}
+
+impl PersistentGcRegion for DaxPmemBlockRegion {
+    fn gc_num_blocks(&self) -> usize {
+        self.num_blocks()
+    }
+
+    fn gc_block_meta(&self, block: u32) -> Result<BlockMeta> {
+        self.block_meta(block)
+    }
+
+    fn gc_mark_block_large_free(&mut self, block: usize) {
+        self.block_entries[block] = BlockEntry::default();
+        self.block_entries[block].list_num = ListKind::LargeFree as i16;
+    }
+
+    fn gc_write_block_meta(&mut self, block: usize, meta: BlockMeta) -> Result<()> {
+        self.write_block_meta(block, meta)
+    }
+
+    fn gc_flush_block_meta_range(&self, start: usize, count: usize) -> Result<()> {
+        self.flush_block_meta_range(start, count)
+    }
+
+    fn gc_fence(&self) -> Result<()> {
+        self.fence()
     }
 }
 
@@ -3984,69 +4042,11 @@ impl FileBackedMemoryBlockRegion {
         )
     }
 
-    fn retire_chunk(&mut self, chunk_start_block: u32, expected_kind: BlockKind) -> Result<()> {
-        let meta = self.block_meta(chunk_start_block)?;
-        if !meta.is_active_or_sealed()? || meta.kind()? != expected_kind {
-            return Ok(());
-        }
-        ensure!(
-            meta.chunk_start == chunk_start_block,
-            "transactional retired chunk input must point at the chunk start block"
-        );
-
-        let chunk_start =
-            usize::try_from(chunk_start_block).context("retired chunk start block overflow")?;
-        let chunk_blocks =
-            usize::try_from(meta.chunk_blocks).context("retired chunk block count overflow")?;
-        let chunk_end = chunk_start
-            .checked_add(chunk_blocks)
-            .context("retired chunk block range overflow")?;
-        ensure!(
-            chunk_end <= self.num_blocks(),
-            "retired chunk metadata range is out of bounds"
-        );
-
-        let retired_meta = BlockMeta {
-            state: BlockState::Retired as u8,
-            kind: meta.kind,
-            reserved0: 0,
-            generation: meta.generation,
-            owner_thread: meta.owner_thread,
-            chunk_start: meta.chunk_start,
-            chunk_blocks: meta.chunk_blocks,
-            reserved1: 0,
-        };
-        for block in chunk_start..chunk_end {
-            self.block_entries[block] = BlockEntry::default();
-            self.block_entries[block].list_num = ListKind::LargeFree as i16;
-            self.write_block_meta(block, retired_meta)?;
-        }
-        self.flush_block_meta_range(chunk_start, chunk_blocks)
-    }
-
     pub(crate) fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
     where
         I: IntoIterator<Item = u32>,
     {
-        let mut retired = Vec::new();
-        let mut seen = BTreeSet::new();
-        for chunk_start_block in chunk_starts {
-            if !seen.insert(chunk_start_block) {
-                continue;
-            }
-            let meta = self.block_meta(chunk_start_block)?;
-            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::LinearUndo {
-                continue;
-            }
-            self.retire_chunk(chunk_start_block, BlockKind::LinearUndo)?;
-            retired.push(chunk_start_block);
-        }
-
-        if !retired.is_empty() {
-            self.fence()?;
-        }
-
-        Ok(retired)
+        <Self as PersistentGcRegion>::retire_linear_undo_chunks(self, chunk_starts)
     }
 
     pub(crate) fn retire_whole_dead_object_chunks(
@@ -4054,83 +4054,7 @@ impl FileBackedMemoryBlockRegion {
         reachable: &[PersistentRecoveredRecordLocation],
         unreachable: &[PersistentRecoveredRecordLocation],
     ) -> Result<Vec<u32>> {
-        let mut live_blocks = vec![false; self.num_blocks()];
-        for location in reachable {
-            let range = data_record_block_range(
-                location.data_block,
-                location.data_offset,
-                location.record_len,
-            )?;
-            ensure!(
-                range.end <= self.num_blocks(),
-                "reachable object record blocks exceed region bounds"
-            );
-            for block in range {
-                live_blocks[block] = true;
-            }
-        }
-
-        let mut candidate_chunks = BTreeMap::<u32, usize>::new();
-        for location in unreachable {
-            let record_range = data_record_block_range(
-                location.data_block,
-                location.data_offset,
-                location.record_len,
-            )?;
-            ensure!(
-                record_range.end <= self.num_blocks(),
-                "unreachable object record blocks exceed region bounds"
-            );
-
-            let meta = self.block_meta(location.data_block)?;
-            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
-                continue;
-            }
-
-            let chunk_start =
-                usize::try_from(meta.chunk_start).context("retired chunk start block overflow")?;
-            let chunk_blocks =
-                usize::try_from(meta.chunk_blocks).context("retired chunk block count overflow")?;
-            let chunk_end = chunk_start
-                .checked_add(chunk_blocks)
-                .context("retired chunk block range overflow")?;
-            ensure!(
-                chunk_end <= self.num_blocks(),
-                "retired chunk metadata range is out of bounds"
-            );
-            ensure!(
-                record_range.start >= chunk_start && record_range.end <= chunk_end,
-                "recovered object record extends outside chunk metadata"
-            );
-
-            candidate_chunks.insert(meta.chunk_start, chunk_blocks);
-        }
-
-        let mut retired = Vec::new();
-        for (chunk_start_block, chunk_blocks) in candidate_chunks {
-            let chunk_start =
-                usize::try_from(chunk_start_block).context("retired chunk start block overflow")?;
-            let chunk_end = chunk_start
-                .checked_add(chunk_blocks)
-                .context("retired chunk block range overflow")?;
-            if live_blocks[chunk_start..chunk_end].iter().any(|live| *live) {
-                continue;
-            }
-
-            let meta = self.block_metas[chunk_start];
-            if !meta.is_active_or_sealed()? || meta.kind()? != BlockKind::ObjectData {
-                continue;
-            }
-
-            self.retire_chunk(chunk_start_block, BlockKind::ObjectData)?;
-            retired.push(chunk_start_block);
-        }
-
-        if !retired.is_empty() {
-            self.fence()?;
-        }
-
-        Ok(retired)
+        <Self as PersistentGcRegion>::retire_whole_dead_object_chunks(self, reachable, unreachable)
     }
 
     pub(crate) fn load_type_layout_metadata(&self) -> Result<TypeLayoutRegistry> {
@@ -4710,6 +4634,33 @@ impl FileBackedMemoryBlockRegion {
 
     fn write_data_chunk_header(&mut self, start_block: u32, header: DataChunkHeader) -> Result<()> {
         self.write(self.block_offset(start_block)?, &header.as_bytes())
+    }
+}
+
+impl PersistentGcRegion for FileBackedMemoryBlockRegion {
+    fn gc_num_blocks(&self) -> usize {
+        self.num_blocks()
+    }
+
+    fn gc_block_meta(&self, block: u32) -> Result<BlockMeta> {
+        self.block_meta(block)
+    }
+
+    fn gc_mark_block_large_free(&mut self, block: usize) {
+        self.block_entries[block] = BlockEntry::default();
+        self.block_entries[block].list_num = ListKind::LargeFree as i16;
+    }
+
+    fn gc_write_block_meta(&mut self, block: usize, meta: BlockMeta) -> Result<()> {
+        self.write_block_meta(block, meta)
+    }
+
+    fn gc_flush_block_meta_range(&self, start: usize, count: usize) -> Result<()> {
+        self.flush_block_meta_range(start, count)
+    }
+
+    fn gc_fence(&self) -> Result<()> {
+        self.fence()
     }
 }
 
@@ -6166,6 +6117,60 @@ mod tests {
                 .block_meta_for_test(usize::try_from(location.data_block).unwrap())
                 .unwrap()
                 .generation,
+            old_generation + 1
+        );
+    }
+
+    fn assert_persistent_gc_region_trait<R: PersistentGcRegion>(_region: &mut R) {}
+
+    #[test]
+    fn dax_pmem_region_reuses_retired_object_chunk_with_incremented_generation() {
+        let mut region = DaxPmemBlockRegion::new_for_test(32).unwrap();
+        assert_persistent_gc_region_trait(&mut region);
+
+        let stream = region.stream_cursor(7);
+        let record = TMemory::encode_publication_data_record(
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap(),
+            1,
+            PackedGranuleDomain::TStruct as u16,
+            19,
+            &[1, 2, 3, 4],
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+        let retired_chunk = location.chunk_start_block;
+        let old_generation = region.block_meta(location.data_block).unwrap().generation;
+
+        let retired = region
+            .retire_whole_dead_object_chunks(
+                &[],
+                &[PersistentRecoveredRecordLocation {
+                    object_id: crate::runtime::transaction::ObjectId { object_index: 41 },
+                    version: 1,
+                    data_block: location.data_block,
+                    data_offset: location.data_offset,
+                    record_len: u64::try_from(record.len()).unwrap(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(retired, vec![retired_chunk]);
+
+        region.load_region_image().unwrap();
+        let stream = region.stream_cursor(8);
+        let record = TMemory::encode_publication_data_record(
+            pack_object_granule_id(PackedGranuleDomain::TStruct, 42).unwrap(),
+            1,
+            PackedGranuleDomain::TStruct as u16,
+            19,
+            &[5, 6, 7, 8],
+        )
+        .unwrap();
+        let location = region.append_data_record(stream, &record).unwrap();
+
+        assert_eq!(location.chunk_start_block, retired_chunk);
+        assert_eq!(
+            region.block_meta(location.data_block).unwrap().generation,
             old_generation + 1
         );
     }

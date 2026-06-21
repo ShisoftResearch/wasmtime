@@ -547,6 +547,33 @@ impl TxDurableLog {
     }
 
     #[cfg(test)]
+    pub(crate) fn create_dax_pmem_fsdax_for_test(
+        path: &Path,
+        payload_blocks: usize,
+    ) -> Result<Self> {
+        let region = DaxPmemBlockRegion::create_fsdax_path(path.to_path_buf(), payload_blocks)?;
+        Ok(Self::with_backend(DurableRegionLog {
+            region,
+            streams: BTreeMap::new(),
+            pending_data_chunks: BTreeSet::new(),
+            pending_log_blocks: BTreeSet::new(),
+            shared_allocator_lock: None,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_dax_pmem_fsdax_for_test(path: &Path, payload_blocks: usize) -> Result<Self> {
+        let region = DaxPmemBlockRegion::open_fsdax_path(path.to_path_buf(), payload_blocks)?;
+        Ok(Self::with_backend(DurableRegionLog {
+            region,
+            streams: BTreeMap::new(),
+            pending_data_chunks: BTreeSet::new(),
+            pending_log_blocks: BTreeSet::new(),
+            shared_allocator_lock: None,
+        }))
+    }
+
+    #[cfg(test)]
     pub(crate) fn recording_backend_for_test() -> (Self, Arc<Mutex<Vec<RecordingBackendEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
@@ -1700,6 +1727,22 @@ mod tests {
         }
     }
 
+    fn test_struct_publication(object_index: u64, version: u32, value: i32) -> PendingPublication {
+        PendingPublication::persistent_object_for_test(
+            PackedGranuleDomain::TStruct,
+            object_index,
+            version,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
+            &encode_object_record_for_test(
+                object_index,
+                version,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(value)]),
+            )
+            .unwrap(),
+        )
+    }
+
     fn publish_sample_publications_with_lp<S>(publisher: &mut StreamPublisher<'_, S>) -> Result<()>
     where
         S: DurableSink,
@@ -2168,6 +2211,179 @@ mod tests {
                 .type_layouts
                 .contains(test_struct_type_layout().id())
         );
+    }
+
+    #[test]
+    fn dax_pmem_durable_log_retires_dead_object_chunk_and_reuses_generation() {
+        let mut log = TxDurableLog::create_dax_pmem_research_for_test(32).unwrap();
+        log.ensure_type_layout(&test_struct_type_layout()).unwrap();
+        let first_publication = PendingPublication::persistent_object_for_test(
+            PackedGranuleDomain::TStruct,
+            41,
+            7,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
+            &encode_object_record_for_test(
+                41,
+                7,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(9)]),
+            )
+            .unwrap(),
+        );
+
+        let first_marker = {
+            let mut sink = log.stream_sink(12);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+            let marker = publisher
+                .publish_object_publication_before_commit(&first_publication)
+                .unwrap();
+            publisher.publish_commit_lp(marker).unwrap();
+            marker
+        };
+
+        let recovered = log.recover_region_snapshot().unwrap().unwrap();
+        let first_winner = recovered
+            .committed_object_winners()
+            .unwrap()
+            .into_iter()
+            .find(|winner| winner.object_id == 41)
+            .unwrap();
+        let retired = log
+            .retire_whole_dead_object_chunks(
+                &[],
+                &[PersistentRecoveredRecordLocation {
+                    object_id: crate::runtime::transaction::ObjectId { object_index: 41 },
+                    version: first_winner.version,
+                    data_block: first_winner.data_block,
+                    data_offset: first_winner.data_offset,
+                    record_len: first_winner.record_len,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(retired, vec![first_marker.chunk_start_block]);
+
+        let second_publication = PendingPublication::persistent_object_for_test(
+            PackedGranuleDomain::TStruct,
+            42,
+            1,
+            TEST_STRUCT_TYPE_LAYOUT_ID,
+            &encode_object_record_for_test(
+                42,
+                1,
+                TEST_STRUCT_TYPE_LAYOUT_ID,
+                &ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+            )
+            .unwrap(),
+        );
+        let second_marker = {
+            let mut sink = log.stream_sink(13);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+            publisher
+                .publish_object_publication_before_commit(&second_publication)
+                .unwrap()
+        };
+
+        assert_eq!(
+            second_marker.chunk_start_block,
+            first_marker.chunk_start_block
+        );
+        assert_eq!(
+            second_marker.data_block_generation,
+            first_marker.data_block_generation + 1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn real_pmem_durable_log_test_path(file_name: &str) -> Option<std::path::PathBuf> {
+        if std::env::var_os("WASMTIME_TEST_REAL_PMEM").is_none() {
+            return None;
+        }
+        let root = std::env::var_os("WASMTIME_TEST_DAX_PMEM_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/pmem0/wasmtime-dcpmm"));
+        Some(root.join(file_name))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires real fsdax PMEM and WASMTIME_TEST_REAL_PMEM=1"]
+    fn dax_pmem_fsdax_durable_log_reuses_retired_object_chunk_after_reopen() {
+        let file_name = format!("dax-pmem-object-gc-{}.log", std::process::id());
+        let Some(path) = real_pmem_durable_log_test_path(&file_name) else {
+            eprintln!("set WASMTIME_TEST_REAL_PMEM=1 to run this test");
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        let first_marker;
+
+        {
+            let mut log = TxDurableLog::create_dax_pmem_fsdax_for_test(&path, 32).unwrap();
+            log.ensure_type_layout(&test_struct_type_layout()).unwrap();
+            first_marker = {
+                let mut sink = log.stream_sink(12);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+                let marker = publisher
+                    .publish_object_publication_before_commit(&test_struct_publication(41, 7, 9))
+                    .unwrap();
+                publisher.publish_commit_lp(marker).unwrap();
+                marker
+            };
+
+            let recovered = log.recover_region_snapshot().unwrap().unwrap();
+            let first_winner = recovered
+                .committed_object_winners()
+                .unwrap()
+                .into_iter()
+                .find(|winner| winner.object_id == 41)
+                .unwrap();
+            let retired = log
+                .retire_whole_dead_object_chunks(
+                    &[],
+                    &[PersistentRecoveredRecordLocation {
+                        object_id: crate::runtime::transaction::ObjectId { object_index: 41 },
+                        version: first_winner.version,
+                        data_block: first_winner.data_block,
+                        data_offset: first_winner.data_offset,
+                        record_len: first_winner.record_len,
+                    }],
+                )
+                .unwrap();
+            assert_eq!(retired, vec![first_marker.chunk_start_block]);
+        }
+
+        {
+            let mut log = TxDurableLog::open_dax_pmem_fsdax_for_test(&path, 32).unwrap();
+            let second_marker = {
+                let mut sink = log.stream_sink(13);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+                let marker = publisher
+                    .publish_object_publication_before_commit(&test_struct_publication(42, 1, 11))
+                    .unwrap();
+                publisher.publish_commit_lp(marker).unwrap();
+                marker
+            };
+
+            assert_eq!(
+                second_marker.chunk_start_block,
+                first_marker.chunk_start_block
+            );
+            assert_eq!(
+                second_marker.data_block_generation,
+                first_marker.data_block_generation + 1
+            );
+
+            let winners = log
+                .recover_region_snapshot()
+                .unwrap()
+                .unwrap()
+                .committed_object_winners()
+                .unwrap();
+            assert!(winners.iter().any(|winner| winner.object_id == 42));
+            assert!(!winners.iter().any(|winner| winner.object_id == 41));
+        }
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
