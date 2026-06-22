@@ -2653,6 +2653,15 @@ mod tests {
         roots: Vec<std::path::PathBuf>,
         seed: u64,
         keep_files: bool,
+        object_only: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct DaxPmemStressSplit {
+        object_target_bytes: u64,
+        linear_target_bytes: u64,
+        headroom_bytes: u64,
     }
 
     #[cfg(target_os = "linux")]
@@ -2987,21 +2996,44 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn dax_pmem_fsdax_stress_impl(config: &DaxPmemStressConfig) -> Result<()> {
-        let object_target_bytes = config
-            .bytes_per_root
+    fn dax_pmem_stress_split(bytes_per_root: u64, object_only: bool) -> Result<DaxPmemStressSplit> {
+        if object_only {
+            return Ok(DaxPmemStressSplit {
+                object_target_bytes: bytes_per_root,
+                linear_target_bytes: 0,
+                headroom_bytes: 0,
+            });
+        }
+
+        let object_target_bytes = bytes_per_root
             .checked_mul(45)
             .context("per-root stress byte budget overflow")?
             / 100;
-        let linear_target_bytes = config
-            .bytes_per_root
+        let linear_target_bytes = bytes_per_root
             .checked_mul(45)
             .context("per-root stress byte budget overflow")?
             / 100;
-        let headroom_bytes = config
-            .bytes_per_root
+        let headroom_bytes = bytes_per_root
             .checked_sub(object_target_bytes + linear_target_bytes)
             .context("per-root stress split overflow")?;
+        Ok(DaxPmemStressSplit {
+            object_target_bytes,
+            linear_target_bytes,
+            headroom_bytes,
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn dax_stress_split_for_test(
+        bytes_per_root: u64,
+        object_only: bool,
+    ) -> Result<DaxPmemStressSplit> {
+        dax_pmem_stress_split(bytes_per_root, object_only)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dax_pmem_fsdax_stress_impl(config: &DaxPmemStressConfig) -> Result<()> {
+        let split = dax_pmem_stress_split(config.bytes_per_root, config.object_only)?;
         let mut multi_region_object_logs = Vec::with_capacity(config.roots.len());
         let mut cleanup_paths = Vec::new();
 
@@ -3012,22 +3044,34 @@ mod tests {
             let root_seed = config.seed.wrapping_add(u64::try_from(root_index).unwrap())
                 ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9);
             let object_seed = root_seed ^ 0x0b1e_c710_6a2d_5f51;
-            let object = run_dax_object_stress(root, root_index, object_target_bytes, object_seed)?;
-            let linear = run_dax_linear_stress(
-                root,
-                root_index,
-                linear_target_bytes,
-                root_seed ^ 0x1ea4_5eed_2048_abcd,
-            )?;
+            let object =
+                run_dax_object_stress(root, root_index, split.object_target_bytes, object_seed)?;
+            let linear = if split.linear_target_bytes == 0 {
+                LinearStressStats {
+                    paths: Vec::new(),
+                    committed_bytes: 0,
+                    pages: 0,
+                    sample_count: 0,
+                    populate_elapsed: std::time::Duration::ZERO,
+                    reopen_validate_elapsed: std::time::Duration::ZERO,
+                }
+            } else {
+                run_dax_linear_stress(
+                    root,
+                    root_index,
+                    split.linear_target_bytes,
+                    root_seed ^ 0x1ea4_5eed_2048_abcd,
+                )?
+            };
 
             eprintln!(
                 "{}",
                 format_dax_stress_line(
                     root_index,
                     config.bytes_per_root,
-                    object_target_bytes,
-                    linear_target_bytes,
-                    headroom_bytes,
+                    split.object_target_bytes,
+                    split.linear_target_bytes,
+                    split.headroom_bytes,
                     &object,
                     &linear,
                 )
@@ -3091,6 +3135,8 @@ mod tests {
         };
         let keep_files = std::env::var_os("WASMTIME_DAX_STRESS_KEEP_FILES").as_deref()
             == Some(std::ffi::OsStr::new("1"));
+        let object_only = std::env::var_os("WASMTIME_DAX_STRESS_OBJECT_ONLY").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
         ensure!(
             !roots.is_empty(),
             "DAX PMEM stress test requires at least one root directory"
@@ -3101,6 +3147,7 @@ mod tests {
             roots,
             seed,
             keep_files,
+            object_only,
         })
     }
 
@@ -4216,6 +4263,16 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
 
         assert!(line.contains("rec=0.250s rec_workers=7 lin=16.0MiB/s"));
         assert!(line.contains("objects=23 recovered=23"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_stress_split_supports_object_only_mode() {
+        let split = dax_stress_split_for_test(1024, true).unwrap();
+
+        assert_eq!(split.object_target_bytes, 1024);
+        assert_eq!(split.linear_target_bytes, 0);
+        assert_eq!(split.headroom_bytes, 0);
     }
 
     #[cfg(target_os = "linux")]
