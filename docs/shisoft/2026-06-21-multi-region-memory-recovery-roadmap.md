@@ -367,6 +367,19 @@ The first target is to preserve the current single-region recovery throughput
 per region while reducing total two-region recovery wall time through parallel
 region recovery.
 
+Latest 256GiB Optane result on `192.168.10.74` with 8 workers per region:
+
+- Dataset: `WASMTIME_DAX_STRESS_BYTES=128GiB` for each of `/pmem0` and
+  `/pmem1`, 117969MiB recovered total.
+- Worker locality: `/pmem0` recovery workers sampled on NUMA node 0 and
+  `/pmem1` recovery workers sampled on NUMA node 1.
+- After vector-reducing only the cross-region merge: region recovery
+  `[1.522,1.539]s`, merge `0.158s`, total `1.698s`, total throughput
+  `69471.9MiB/s`.
+- After also vector-reducing region-local replay winners: region recovery
+  `[1.395,1.381]s`, merge `0.136s`, total `1.531s`, total throughput
+  `77037.3MiB/s`.
+
 ## Non-Goals
 
 - Do not change durable log record typing.

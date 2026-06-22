@@ -304,7 +304,7 @@ pub(crate) fn recover_region_with_options(
     options: RecoveryOptions,
 ) -> Result<RecoveredRegion> {
     let discovered = discover_region(region)?;
-    let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
+    let mut winners = Vec::new();
     let mut tmemory_undo_rollbacks = Vec::new();
 
     let replays = replay_streams(
@@ -317,10 +317,10 @@ pub(crate) fn recover_region_with_options(
     let mut recovery_worker_nodes_for_test = replays.worker_nodes;
     for replay in replays.value {
         tmemory_undo_rollbacks.extend(replay.tmemory_undo_rollbacks);
-        merge_recovery_winners(&mut winners, replay.winners)?;
+        winners.extend(replay.winners);
     }
 
-    let winners = winners.into_values().collect::<Vec<_>>();
+    let winners = reduce_recovery_winners_vec(winners)?;
     let classified =
         classify_recovered_winners(region, &discovered.data_chunk_index, &winners, options)?;
     #[cfg(test)]
@@ -348,60 +348,78 @@ pub(crate) fn recover_region_with_options(
     })
 }
 
-fn merge_recovery_winners(
-    winners: &mut BTreeMap<u64, RecoveryWinner>,
-    updates: impl IntoIterator<Item = RecoveryWinner>,
-) -> Result<()> {
-    for update in updates {
-        match winners.get(&update.logical_id) {
-            Some(current) if current.version > update.version => {}
-            Some(current)
-                if current.version == update.version
-                    && current.data_block == update.data_block
-                    && current.data_offset == update.data_offset => {}
-            Some(current) if current.version == update.version => {
-                if let Ok((_, object_id)) = unpack_object_granule_id(update.logical_id) {
-                    bail!(
-                        "duplicate committed object version {} for object id {}",
-                        update.version,
-                        object_id
-                    );
-                }
-                bail!(
-                    "duplicate committed version {} for logical id {}",
-                    update.version,
-                    update.logical_id
-                );
-            }
-            _ => {
-                winners.insert(update.logical_id, update);
-            }
+fn reduce_recovery_winners_vec(mut winners: Vec<RecoveryWinner>) -> Result<Vec<RecoveryWinner>> {
+    winners.sort_unstable_by_key(|winner| winner.logical_id);
+    let mut out = Vec::<RecoveryWinner>::with_capacity(winners.len());
+    for update in winners {
+        let Some(current) = out.last_mut() else {
+            out.push(update);
+            continue;
+        };
+        if current.logical_id != update.logical_id {
+            out.push(update);
+            continue;
         }
-    }
-    Ok(())
-}
 
-fn merge_recovered_object_winners(
-    winners: &mut BTreeMap<u64, RecoveredObjectWinner>,
-    updates: impl IntoIterator<Item = RecoveredObjectWinner>,
-) -> Result<()> {
-    for update in updates {
-        match winners.get(&update.object_id) {
-            Some(current) if current.version > update.version => {}
-            Some(current) if current.version == update.version && current == &update => {}
-            Some(current) if current.version == update.version => {
+        if current.version > update.version {
+            continue;
+        }
+        if current.version == update.version
+            && current.data_block == update.data_block
+            && current.data_offset == update.data_offset
+        {
+            continue;
+        }
+        if current.version == update.version {
+            if let Ok((_, object_id)) = unpack_object_granule_id(update.logical_id) {
                 bail!(
                     "duplicate committed object version {} for object id {}",
                     update.version,
-                    update.object_id
+                    object_id
                 );
             }
-            _ => {
-                winners.insert(update.object_id, update);
-            }
+            bail!(
+                "duplicate committed version {} for logical id {}",
+                update.version,
+                update.logical_id
+            );
         }
+        *current = update;
     }
-    Ok(())
+    Ok(out)
+}
+
+fn reduce_recovered_object_winners_vec(
+    mut winners: Vec<RecoveredObjectWinner>,
+) -> Result<Vec<RecoveredObjectWinner>> {
+    winners.sort_unstable_by_key(|winner| winner.object_id);
+    let mut out = Vec::<RecoveredObjectWinner>::with_capacity(winners.len());
+    for update in winners {
+        let Some(current) = out.last_mut() else {
+            out.push(update);
+            continue;
+        };
+        if current.object_id != update.object_id {
+            out.push(update);
+            continue;
+        }
+
+        if current.version > update.version {
+            continue;
+        }
+        if current.version == update.version && current == &update {
+            continue;
+        }
+        if current.version == update.version {
+            bail!(
+                "duplicate committed object version {} for object id {}",
+                update.version,
+                update.object_id
+            );
+        }
+        *current = update;
+    }
+    Ok(out)
 }
 
 fn merge_type_layout_registries(
@@ -603,8 +621,8 @@ impl RecoveredRegion {
         let mut block_base = 0u32;
         let mut composite_segments = Vec::with_capacity(inputs.len());
         let mut streams = Vec::new();
-        let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
-        let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
+        let mut winners = Vec::new();
+        let mut object_winners = Vec::new();
         let mut type_layouts = TypeLayoutRegistry::default();
         let mut tmemory_undo_rollbacks = Vec::new();
         let mut next_stream_id = 0u32;
@@ -629,8 +647,8 @@ impl RecoveredRegion {
                     .iter()
                     .copied(),
             );
-            merge_recovery_winners(&mut winners, input.recovered.winners)?;
-            merge_recovered_object_winners(&mut object_winners, input.recovered.object_winners)?;
+            winners.extend(input.recovered.winners);
+            object_winners.extend(input.recovered.object_winners);
             merge_type_layout_registries(&mut type_layouts, &input.recovered.type_layouts)?;
             streams.extend(input.recovered.streams);
             tmemory_undo_rollbacks.extend(input.recovered.tmemory_undo_rollbacks);
@@ -652,14 +670,15 @@ impl RecoveredRegion {
             composite_segments,
             byte_base,
         )) as Arc<dyn MappedRegionSource>;
-        let winners = winners.into_values().collect::<Vec<_>>();
+        let winners = reduce_recovery_winners_vec(winners)?;
+        let object_winners = reduce_recovered_object_winners_vec(object_winners)?;
         let classified =
             classify_recovered_winners_from_source(composite_source.as_ref(), &winners)?;
 
         Ok(RecoveredRegion {
             streams,
             winners,
-            object_winners: object_winners.into_values().collect(),
+            object_winners,
             tmemory_size_winners: classified.tmemory_size_winners,
             type_layouts,
             root_object_ids: classified.root_object_ids,
@@ -1955,11 +1974,11 @@ mod tests {
             },
         )
         .unwrap();
-        let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
+        let mut winners = Vec::new();
         for replay in replays.value {
-            merge_recovery_winners(&mut winners, replay.winners).unwrap();
+            winners.extend(replay.winners);
         }
-        let winners = winners.into_values().collect::<Vec<_>>();
+        let winners = reduce_recovery_winners_vec(winners).unwrap();
 
         assert!(winners.len() >= 6);
 
@@ -2206,6 +2225,75 @@ mod tests {
         assert_eq!(
             recovered.committed_file_backed_tmemory_pages().unwrap(),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn reduce_recovery_winners_vec_keeps_highest_versions_and_rejects_conflicts() {
+        let logical_id = pack_test_granule_id(PackedGranuleDomain::TMemorySize, 7);
+        let mut reduced = reduce_recovery_winners_vec(vec![
+            RecoveryWinner {
+                logical_id,
+                version: 1,
+                data_block: 1,
+                data_offset: 8,
+            },
+            RecoveryWinner {
+                logical_id,
+                version: 3,
+                data_block: 2,
+                data_offset: 16,
+            },
+            RecoveryWinner {
+                logical_id,
+                version: 3,
+                data_block: 2,
+                data_offset: 16,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(reduced.len(), 1);
+        assert_eq!(reduced.remove(0).version, 3);
+
+        let err = reduce_recovery_winners_vec(vec![
+            RecoveryWinner {
+                logical_id,
+                version: 4,
+                data_block: 3,
+                data_offset: 24,
+            },
+            RecoveryWinner {
+                logical_id,
+                version: 4,
+                data_block: 4,
+                data_offset: 32,
+            },
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate committed version"));
+    }
+
+    #[test]
+    fn reduce_recovered_object_winners_vec_keeps_highest_versions_and_rejects_conflicts() {
+        let mut reduced = reduce_recovered_object_winners_vec(vec![
+            recovered_object_winner_for_test(41, 1, 1, 8),
+            recovered_object_winner_for_test(41, 3, 2, 16),
+            recovered_object_winner_for_test(41, 3, 2, 16),
+        ])
+        .unwrap();
+
+        assert_eq!(reduced.len(), 1);
+        assert_eq!(reduced.remove(0).version, 3);
+
+        let err = reduce_recovered_object_winners_vec(vec![
+            recovered_object_winner_for_test(41, 4, 3, 24),
+            recovered_object_winner_for_test(41, 4, 4, 32),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate committed object version")
         );
     }
 
@@ -3716,6 +3804,24 @@ mod tests {
         let mut header = TxDataRecordHeader::from_bytes(bytes).unwrap();
         update(&mut header);
         region.write(record_offset, &header.as_bytes()).unwrap();
+    }
+
+    fn recovered_object_winner_for_test(
+        object_id: u64,
+        version: u32,
+        data_block: u32,
+        data_offset: u32,
+    ) -> RecoveredObjectWinner {
+        RecoveredObjectWinner {
+            object_id,
+            version,
+            kind: ObjectKind::Struct as u16,
+            type_layout_id: TypeLayoutId::DEFAULT_STRUCT.get(),
+            data_block,
+            data_offset,
+            data_record_offset: data_record_offset_for_location(data_block, data_offset).unwrap(),
+            record_len: 0,
+        }
     }
 
     fn synthetic_object_region_input(
