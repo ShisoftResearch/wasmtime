@@ -385,6 +385,7 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MultiRegionRecoveryTimingForTest {
     pub(crate) region_recovery_elapsed: Vec<std::time::Duration>,
+    pub(crate) region_worker_nodes: Vec<Vec<Option<i32>>>,
     pub(crate) merge_elapsed: std::time::Duration,
     pub(crate) total_elapsed: std::time::Duration,
 }
@@ -552,8 +553,7 @@ impl TxDurableLog {
     pub(crate) fn latest_multi_region_recovery_timing_for_test(
         &self,
     ) -> Option<MultiRegionRecoveryTimingForTest> {
-        self.storage
-            .latest_multi_region_recovery_timing_for_test()
+        self.storage.latest_multi_region_recovery_timing_for_test()
     }
 
     #[cfg(test)]
@@ -2684,11 +2684,12 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     struct RegionRecoveryStatsForTest {
         root_index: usize,
         numa_node: Option<i32>,
         workers: usize,
+        worker_nodes: Vec<Option<i32>>,
         recovered_bytes: u64,
         elapsed: std::time::Duration,
     }
@@ -2871,7 +2872,8 @@ mod tests {
                 reserved_len,
                 STRESS_MULTI_REGION_WINDOW_STRIDE_U64
             );
-            let slot_u64 = u64::try_from(slot).context("multi-region stress region slot overflow")?;
+            let slot_u64 =
+                u64::try_from(slot).context("multi-region stress region slot overflow")?;
             let address_base_u64 = STRESS_MULTI_REGION_WINDOW_BASE_U64
                 .checked_add(
                     slot_u64
@@ -2880,9 +2882,7 @@ mod tests {
                 )
                 .context("multi-region stress fixed-window base overflow")?;
             let address_base = usize::try_from(address_base_u64).with_context(|| {
-                format!(
-                    "multi-region stress fixed-window base {address_base_u64:#x} exceeds usize"
-                )
+                format!("multi-region stress fixed-window base {address_base_u64:#x} exceeds usize")
             })?;
             configs.push(TMemoryRegionConfig {
                 path: region.path.clone(),
@@ -2929,8 +2929,17 @@ mod tests {
             timing.region_recovery_elapsed.len(),
             regions.len()
         );
+        ensure!(
+            timing.region_worker_nodes.len() == regions.len(),
+            "multi-region DAX object recovery reported {} region worker-node samples for {} regions",
+            timing.region_worker_nodes.len(),
+            regions.len()
+        );
         let recovered_winners = recovered.committed_object_winners()?;
-        let expected_object_count = regions.iter().map(|region| region.object_count).sum::<usize>();
+        let expected_object_count = regions
+            .iter()
+            .map(|region| region.object_count)
+            .sum::<usize>();
         ensure!(
             recovered_winners.len() == expected_object_count,
             "multi-region recovered object count mismatch: published {expected_object_count}, recovered {}",
@@ -2940,9 +2949,9 @@ mod tests {
             .iter()
             .map(|winner| (winner.object_id, winner))
             .collect::<BTreeMap<u64, &RecoveredObjectWinner>>();
-        let mapped_source = recovered
-            .mapped_region_source()
-            .context("multi-region recovered DAX PMEM snapshot does not expose a mapped region source")?;
+        let mapped_source = recovered.mapped_region_source().context(
+            "multi-region recovered DAX PMEM snapshot does not expose a mapped region source",
+        )?;
         for region in regions {
             validate_recovered_object_samples(
                 region.seed,
@@ -2962,13 +2971,17 @@ mod tests {
             .iter()
             .zip(worker_counts)
             .zip(timing.region_recovery_elapsed.iter().copied())
-            .map(|((region, workers), elapsed)| RegionRecoveryStatsForTest {
-                root_index: region.root_index,
-                numa_node: region.numa_node,
-                workers,
-                recovered_bytes: region.encoded_bytes,
-                elapsed,
-            })
+            .zip(timing.region_worker_nodes.iter().cloned())
+            .map(
+                |(((region, workers), elapsed), worker_nodes)| RegionRecoveryStatsForTest {
+                    root_index: region.root_index,
+                    numa_node: region.numa_node,
+                    workers,
+                    worker_nodes,
+                    recovered_bytes: region.encoded_bytes,
+                    elapsed,
+                },
+            )
             .collect::<Vec<_>>();
         Ok((region_stats, timing.merge_elapsed, timing.total_elapsed))
     }
@@ -2999,12 +3012,7 @@ mod tests {
             let root_seed = config.seed.wrapping_add(u64::try_from(root_index).unwrap())
                 ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9);
             let object_seed = root_seed ^ 0x0b1e_c710_6a2d_5f51;
-            let object = run_dax_object_stress(
-                root,
-                root_index,
-                object_target_bytes,
-                object_seed,
-            )?;
+            let object = run_dax_object_stress(root, root_index, object_target_bytes, object_seed)?;
             let linear = run_dax_linear_stress(
                 root,
                 root_index,
@@ -3343,6 +3351,22 @@ pages={} linear_segments={} obj_path={} tmemory_path={}",
             })
             .collect::<Vec<_>>()
             .join(",");
+        let region_worker_nodes = regions
+            .iter()
+            .map(|region| {
+                let nodes = region
+                    .worker_nodes
+                    .iter()
+                    .map(|node| match node {
+                        Some(node) => node.to_string(),
+                        None => "?".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("[{nodes}]")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let region_recovery_mibps = regions
             .iter()
             .map(|region| format!("{:.1}", mib_per_sec(region.recovered_bytes, region.elapsed)))
@@ -3366,7 +3390,7 @@ pages={} linear_segments={} obj_path={} tmemory_path={}",
 
         format!(
             "dax-stress multi-root roots=[{roots}] region_workers=[{region_workers}] \
-total_workers={total_workers} worker_budget=planned numa=[{numa}] region_recovery_mibps=[{region_recovery_mibps}] \
+total_workers={total_workers} worker_budget=planned numa=[{numa}] region_worker_nodes=[{region_worker_nodes}] region_recovery_mibps=[{region_recovery_mibps}] \
 region_recovery_elapsed=[{region_recovery_elapsed}]s region_recovery_max={:.3}s merge_elapsed={:.3}s \
 total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
             region_recovery_max.as_secs_f64(),
@@ -4201,14 +4225,16 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
             RegionRecoveryStatsForTest {
                 root_index: 0,
                 numa_node: Some(0),
-                workers: 16,
+                workers: 8,
+                worker_nodes: vec![Some(0), Some(0)],
                 recovered_bytes: 512 * 1024 * 1024,
                 elapsed: std::time::Duration::from_secs(1),
             },
             RegionRecoveryStatsForTest {
                 root_index: 1,
                 numa_node: Some(1),
-                workers: 16,
+                workers: 8,
+                worker_nodes: vec![Some(1), Some(1)],
                 recovered_bytes: 512 * 1024 * 1024,
                 elapsed: std::time::Duration::from_secs(1),
             },
@@ -4220,11 +4246,12 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
             std::time::Duration::from_millis(1250),
         );
 
-        assert!(line.contains("region_workers=[16,16]"));
-        assert!(line.contains("total_workers=32"));
+        assert!(line.contains("region_workers=[8,8]"));
+        assert!(line.contains("total_workers=16"));
         assert!(line.contains("worker_budget=planned"));
         assert!(line.contains("numa=[0,1]"));
         assert!(line.contains("region_recovery_elapsed=["));
+        assert!(line.contains("region_worker_nodes=[[0,0],[1,1]]"));
         assert!(line.contains("region_recovery_max=1.000s"));
         assert!(line.contains("merge_elapsed=0.250s"));
         assert!(line.contains("total_recovery_elapsed=1.250s"));

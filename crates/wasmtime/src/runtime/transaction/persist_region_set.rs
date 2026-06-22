@@ -1,26 +1,26 @@
+#[cfg(test)]
+use super::persist::MultiRegionRecoveryTimingForTest;
 use super::persist::{
     DurableDataRecordPointer, DurableDataStream, DurableRegionLog, DurableRegionStorage,
     PendingCommitLogEntry, TxDurableLogBackend,
 };
-#[cfg(test)]
-use super::persist::MultiRegionRecoveryTimingForTest;
 use super::type_layout::{PersistentTypeLayout, TypeLayoutId};
 use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::transaction::config::TMemoryRegionConfig;
+#[cfg(test)]
+use crate::runtime::vm::cpus_for_node;
 use crate::runtime::vm::{
     CpuSet, NumaNode, RecoveryOptions, RecoveryParallelism, TxLogEntry, current_cpu, node_for_cpu,
     pin_current_thread,
 };
-#[cfg(test)]
-use crate::runtime::vm::cpus_for_node;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Mutex;
 
-const REGION_RECOVERY_WORKERS: usize = 16;
+const REGION_RECOVERY_WORKERS: usize = 8;
 static NEXT_MULTI_REGION_BACKEND_ID: AtomicUsize = AtomicUsize::new(1);
 
 std::thread_local! {
@@ -62,10 +62,7 @@ fn placements_for_regions(regions: &[TMemoryRegionConfig]) -> Result<Vec<RegionP
                 Some(node) => cpus_for_node(node)?,
                 None => None,
             };
-            Ok(RegionPlacement {
-                numa_node,
-                cpu_set,
-            })
+            Ok(RegionPlacement { numa_node, cpu_set })
         })
         .collect()
 }
@@ -269,6 +266,7 @@ where
     ) -> Result<(
         Vec<crate::runtime::vm::RecoveredRegionInput>,
         Vec<std::time::Duration>,
+        Vec<Vec<Option<i32>>>,
     )> {
         #[cfg(test)]
         {
@@ -308,23 +306,29 @@ where
                         .with_context(|| {
                             format!("failed to recover multi-region durable log region {index}")
                         })?;
-                    Ok((input, started.elapsed()))
+                    #[cfg(test)]
+                    let worker_nodes = input.recovered.recovery_worker_nodes_for_test().to_vec();
+                    #[cfg(not(test))]
+                    let worker_nodes = Vec::new();
+                    Ok((input, started.elapsed(), worker_nodes))
                 }));
             }
 
             let mut inputs = Vec::with_capacity(handles.len());
             let mut elapsed = Vec::with_capacity(handles.len());
+            let mut worker_nodes = Vec::with_capacity(handles.len());
             for handle in handles {
                 match handle.join() {
                     Ok(result) => {
-                        let (input, region_elapsed) = result?;
+                        let (input, region_elapsed, region_worker_nodes) = result?;
                         inputs.push(input);
                         elapsed.push(region_elapsed);
+                        worker_nodes.push(region_worker_nodes);
                     }
                     Err(panic) => std::panic::resume_unwind(panic),
                 }
             }
-            Ok((inputs, elapsed))
+            Ok((inputs, elapsed, worker_nodes))
         })
     }
 
@@ -365,7 +369,8 @@ where
             return Ok(None);
         }
         let total_started = std::time::Instant::now();
-        let (inputs, region_recovery_elapsed) = self.recovered_region_inputs()?;
+        let (inputs, region_recovery_elapsed, region_worker_nodes) =
+            self.recovered_region_inputs()?;
         let merge_started = std::time::Instant::now();
         let recovered = crate::runtime::vm::RecoveredRegion::merge_region_set(inputs)?;
         let merge_elapsed = merge_started.elapsed();
@@ -373,12 +378,18 @@ where
         #[cfg(test)]
         self.record_recovery_timing_for_test(MultiRegionRecoveryTimingForTest {
             region_recovery_elapsed,
+            region_worker_nodes,
             merge_elapsed,
             total_elapsed,
         });
         #[cfg(not(test))]
         {
-            let _ = (region_recovery_elapsed, merge_elapsed, total_elapsed);
+            let _ = (
+                region_recovery_elapsed,
+                region_worker_nodes,
+                merge_elapsed,
+                total_elapsed,
+            );
         }
         Ok(Some(recovered))
     }
@@ -1406,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_region_parallel_recovery_recovers_all_regions_and_plans_16_workers_per_region() {
+    fn multi_region_parallel_recovery_recovers_all_regions_and_plans_8_workers_per_region() {
         let layout = test_layout();
         let publication_region0 = test_publication_with(41, 7, layout.id().get(), 11);
         let publication_region1 = test_publication_with(99, 3, layout.id().get(), 22);
@@ -1441,18 +1452,19 @@ mod tests {
         assert_eq!(winners[1].version, 3);
         assert_eq!(
             backend.latest_planned_recovery_worker_counts_for_test(),
-            vec![16, 16],
+            vec![8, 8],
             "multi-region recovery records the planned/requested worker budget per region"
         );
         assert_eq!(
             backend.latest_planned_recovery_total_workers_for_test(),
-            32,
+            16,
             "multi-region recovery records the total planned/requested worker budget"
         );
         let timing = backend
             .latest_recovery_timing_for_test()
             .expect("multi-region recovery should record phase timing");
         assert_eq!(timing.region_recovery_elapsed.len(), 2);
+        assert_eq!(timing.region_worker_nodes.len(), 2);
         assert!(timing.merge_elapsed <= timing.total_elapsed);
     }
 

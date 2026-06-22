@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement user-configured multi-region transactional memory with address-window placement and NUMA-local parallel recovery using 16 recovery workers per PMEM region.
+**Goal:** Implement user-configured multi-region transactional memory with address-window placement and NUMA-local parallel recovery using 8 recovery workers per PMEM region.
 
-**Architecture:** Add a `RegionSet` layer below one transactional memory. Each region owns one fixed virtual address window, one homogeneous backend storage object, and one local metadata/allocator/log image. Normal object and linear-memory reads and writes use mapped addresses directly; region logic exists only in allocation, mapping, recovery, GC, and tests. Recovery runs one top-level task per region and uses the existing 16-worker region recovery inside each task.
+**Architecture:** Add a `RegionSet` layer below one transactional memory. Each region owns one fixed virtual address window, one homogeneous backend storage object, and one local metadata/allocator/log image. Normal object and linear-memory reads and writes use mapped addresses directly; region logic exists only in allocation, mapping, recovery, GC, and tests. Recovery runs one top-level task per region and uses 8-worker region recovery inside each task.
 
 **Tech Stack:** Rust, Wasmtime runtime transaction internals, Linux `mmap`/`sched_getcpu`/`sched_setaffinity`, fsdax DAX mappings, file-backed mappings, existing `RecoveryOptions`, `cargo test`.
 
@@ -24,7 +24,7 @@ Required invariants from that roadmap:
 - Use virtual address windows as the placement contract.
 - Allow one Wasmtime transactional memory to contain multiple regions.
 - Require all regions in one memory to use the same backend kind.
-- Recover `/pmem0` with 16 workers on socket 0 and `/pmem1` with 16 workers on socket 1 for 32 total workers on the two-socket Optane machine.
+- Recover `/pmem0` with 8 workers on socket 0 and `/pmem1` with 8 workers on socket 1 for 16 total workers on the two-socket Optane machine.
 
 ## File Structure
 
@@ -1102,7 +1102,7 @@ In `MultiRegionDurableLogBackend<R>::with_recovered_region_snapshot`:
 
 - spawn one scoped thread per region
 - pin each top-level recovery thread to the region CPU set when available
-- call region-local recovery with `RecoveryOptions { parallelism: RecoveryParallelism::Workers(16) }`
+- call region-local recovery with `RecoveryOptions { parallelism: RecoveryParallelism::Workers(8) }`
 - collect per-region timing and worker count for test/benchmark reporting
 - merge recovered regions after all top-level recovery tasks complete
 
@@ -1357,8 +1357,8 @@ fn dax_stress_line_reports_multi_region_recovery_workers() {
         ],
         std::time::Duration::from_millis(1900),
     );
-    assert!(line.contains("region_workers=[16,16]"));
-    assert!(line.contains("total_workers=32"));
+    assert!(line.contains("region_workers=[8,8]"));
+    assert!(line.contains("total_workers=16"));
     assert!(line.contains("numa=[0,1]"));
 }
 ```
@@ -1381,7 +1381,7 @@ Extend the ignored DAX stress harness:
 - populate each region with object and linear data
 - recover all regions concurrently through the multi-region backend
 - print per-region recovery throughput and total combined throughput
-- report `region_workers=[16,16] total_workers=32` for the two-region Optane target
+- report `region_workers=[8,8] total_workers=16` for the two-region Optane target
 
 - [ ] **Step 4: Run local formatting test**
 
@@ -1406,9 +1406,9 @@ ssh shisoft@192.168.10.74 'cd /home/shisoft/Code/Research/wasmtime && \
 
 Expected:
 
-- `/pmem0` reports 16 recovery workers
-- `/pmem1` reports 16 recovery workers
-- total recovery workers is 32
+- `/pmem0` reports 8 recovery workers
+- `/pmem1` reports 8 recovery workers
+- total recovery workers is 16
 - total wall time trends toward the slower region time rather than the sum of both region times
 - no recovered object sample validation failures
 
@@ -1476,7 +1476,7 @@ ssh shisoft@192.168.10.74 'cd /home/shisoft/Code/Research/wasmtime && \
   cargo test -p wasmtime dax_pmem_fsdax_stress --release --lib -- --ignored --nocapture'
 ```
 
-Expected: report includes 16 workers per region and 32 total workers. Record the per-region and combined recovery throughput in the roadmap.
+Expected: report includes 8 workers per region and 16 total workers. Record the per-region and combined recovery throughput in the roadmap.
 
 - [ ] **Step 5: Commit benchmark note**
 
@@ -1492,4 +1492,4 @@ git commit -m "docs: record multi-region recovery benchmark"
 - Region identity is implied by the mapped file/backend being recovered. Durable log entries keep local block offsets.
 - Composite mapped sources and virtual recovered block ranges are recovery/GC management structures only. Normal object and linear-memory access remains direct address access.
 - The initial production placement policy is `ThreadOwned`: the first durable allocation on a thread binds that thread to a region. `Pinned` exists for deterministic tests.
-- If one NUMA node owns multiple regions, recovery should share that node's 16-worker budget across those regions. The two-socket Optane target with one region per socket uses 16 workers per region.
+- If one NUMA node owns multiple regions, recovery should share that node's 8-worker budget across those regions. The two-socket Optane target with one region per socket uses 8 workers per region.

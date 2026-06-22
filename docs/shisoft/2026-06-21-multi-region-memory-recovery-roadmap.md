@@ -248,13 +248,13 @@ intra-region parallel recovery.
 For a two-socket DAX setup:
 
 ```text
-/pmem0 region recovery -> node 0 CPU set -> 16 intra-region workers
-/pmem1 region recovery -> node 1 CPU set -> 16 intra-region workers
+/pmem0 region recovery -> node 0 CPU set -> 8 intra-region workers
+/pmem1 region recovery -> node 1 CPU set -> 8 intra-region workers
 ```
 
 This is a per-region worker budget, not a global cap. On the Optane box with
-two PMEM regions, recovery should therefore run 32 recovery workers total:
-16 workers scanning `/pmem0` on socket 0 and 16 workers scanning `/pmem1` on
+two PMEM regions, recovery should therefore run 16 recovery workers total:
+8 workers scanning `/pmem0` on socket 0 and 8 workers scanning `/pmem1` on
 socket 1. The goal is to combine the bandwidth of both PMEM regions while
 keeping each worker group local to the socket that owns its region.
 
@@ -267,16 +267,16 @@ General rule:
 - merge recovered summaries after all region tasks finish
 
 If multiple regions share one NUMA node, the scheduler should share that node's
-worker budget across those regions instead of blindly running 16 workers per
-region on the same socket.
+worker budget across those regions instead of blindly running the full
+per-region budget multiple times on the same socket.
 
 Exit criteria:
 
 - On the Optane box, `/pmem0` and `/pmem1` recover concurrently.
 - The recovery report prints per-region time, bytes, objects, workers, and
   NUMA node.
-- The two-region Optane run reports 16 recovery workers for `/pmem0`, 16
-  recovery workers for `/pmem1`, and 32 total recovery workers.
+- The two-region Optane run reports 8 recovery workers for `/pmem0`, 8
+  recovery workers for `/pmem1`, and 16 total recovery workers.
 - The total two-region wall time trends toward the slower per-region recovery
   time rather than the sum of both regions.
 
@@ -360,7 +360,7 @@ Record:
 - per-region recovery throughput
 - total recovery wall time
 - worker count per region, with the two-region Optane target fixed at
-  16 workers per region and 32 workers total
+  8 workers per region and 16 workers total
 - CPU affinity or NUMA node used by each recovery task
 
 The first target is to preserve the current single-region recovery throughput

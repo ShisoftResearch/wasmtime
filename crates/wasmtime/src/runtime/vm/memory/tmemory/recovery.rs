@@ -48,6 +48,8 @@ pub(crate) struct RecoveredRegion {
     pub(crate) tmemory_undo_rollbacks: Vec<RecoveredTMemoryUndoRollback>,
     pub(crate) next_stream_id: u32,
     mapped_region_source: Option<Arc<dyn MappedRegionSource>>,
+    #[cfg(test)]
+    recovery_worker_nodes_for_test: Vec<Option<i32>>,
 }
 
 #[derive(Debug)]
@@ -153,6 +155,30 @@ struct PendingTransaction {
     entries: Vec<TxLogEntry>,
 }
 
+#[derive(Debug)]
+struct RecoveryPhaseResult<T> {
+    value: T,
+    #[cfg(test)]
+    worker_nodes: Vec<Option<i32>>,
+}
+
+#[derive(Debug)]
+struct RecoveryWorkerBatch<T> {
+    value: T,
+    #[cfg(test)]
+    worker_node: Option<i32>,
+}
+
+impl<T> RecoveryWorkerBatch<T> {
+    fn from_current_thread(value: T) -> Self {
+        Self {
+            value,
+            #[cfg(test)]
+            worker_node: current_worker_numa_node_for_test(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryParallelism {
     Serial,
@@ -173,7 +199,13 @@ impl Default for RecoveryOptions {
     }
 }
 
-const RECOVERY_MAX_WORKERS: usize = 16;
+const RECOVERY_MAX_WORKERS: usize = 8;
+
+#[cfg(test)]
+fn current_worker_numa_node_for_test() -> Option<i32> {
+    let cpu = super::numa::current_cpu().ok()?;
+    super::numa::node_for_cpu(cpu).ok().flatten()
+}
 
 impl CompositeMappedRegionSource {
     fn new(segments: Vec<CompositeMappedRegionSegment>, total_len: usize) -> Self {
@@ -281,7 +313,9 @@ pub(crate) fn recover_region_with_options(
         &discovered.data_chunk_index,
         options,
     )?;
-    for replay in replays {
+    #[cfg(test)]
+    let mut recovery_worker_nodes_for_test = replays.worker_nodes;
+    for replay in replays.value {
         tmemory_undo_rollbacks.extend(replay.tmemory_undo_rollbacks);
         merge_recovery_winners(&mut winners, replay.winners)?;
     }
@@ -289,6 +323,9 @@ pub(crate) fn recover_region_with_options(
     let winners = winners.into_values().collect::<Vec<_>>();
     let classified =
         classify_recovered_winners(region, &discovered.data_chunk_index, &winners, options)?;
+    #[cfg(test)]
+    recovery_worker_nodes_for_test.extend(classified.worker_nodes);
+    let classified = classified.value;
 
     Ok(RecoveredRegion {
         next_stream_id: discovered
@@ -306,6 +343,8 @@ pub(crate) fn recover_region_with_options(
         root_object_ids: classified.root_object_ids,
         tmemory_undo_rollbacks,
         mapped_region_source: region.mapped_region_source(),
+        #[cfg(test)]
+        recovery_worker_nodes_for_test,
     })
 }
 
@@ -480,13 +519,17 @@ fn replay_streams(
     streams: &[RecoveredStream],
     data_chunk_index: &DataChunkIndex,
     options: RecoveryOptions,
-) -> Result<Vec<StreamReplay>> {
+) -> Result<RecoveryPhaseResult<Vec<StreamReplay>>> {
     let worker_count = recovery_worker_count(options, streams.len());
     if worker_count == 1 {
-        return streams
-            .iter()
-            .map(|stream| replay_stream(region, stream, data_chunk_index))
-            .collect();
+        return Ok(RecoveryPhaseResult {
+            value: streams
+                .iter()
+                .map(|stream| replay_stream(region, stream, data_chunk_index))
+                .collect::<Result<Vec<_>>>()?,
+            #[cfg(test)]
+            worker_nodes: Vec::new(),
+        });
     }
     replay_streams_parallel(region, streams, data_chunk_index, worker_count)
 }
@@ -496,40 +539,57 @@ fn replay_streams_parallel(
     streams: &[RecoveredStream],
     data_chunk_index: &DataChunkIndex,
     worker_count: usize,
-) -> Result<Vec<StreamReplay>> {
-    let mut indexed = std::thread::scope(|scope| -> Result<Vec<(usize, StreamReplay)>> {
-        let mut handles = Vec::new();
-        for range in recovery_partitions(streams.len(), worker_count) {
-            handles.push(scope.spawn(move || -> Result<Vec<(usize, StreamReplay)>> {
-                let mut out = Vec::new();
-                for index in range {
-                    out.push((
-                        index,
-                        replay_stream(region, &streams[index], data_chunk_index)?,
-                    ));
-                }
-                Ok(out)
-            }));
-        }
+) -> Result<RecoveryPhaseResult<Vec<StreamReplay>>> {
+    let phase = std::thread::scope(
+        |scope| -> Result<RecoveryPhaseResult<Vec<(usize, StreamReplay)>>> {
+            let mut handles = Vec::new();
+            for range in recovery_partitions(streams.len(), worker_count) {
+                handles.push(scope.spawn(
+                    move || -> Result<RecoveryWorkerBatch<Vec<(usize, StreamReplay)>>> {
+                        let mut out = Vec::new();
+                        for index in range {
+                            out.push((
+                                index,
+                                replay_stream(region, &streams[index], data_chunk_index)?,
+                            ));
+                        }
+                        Ok(RecoveryWorkerBatch::from_current_thread(out))
+                    },
+                ));
+            }
 
-        let mut out = Vec::new();
-        for handle in handles {
-            let mut batch = handle.join().map_err(|panic| {
-                if let Some(message) = panic.downcast_ref::<&str>() {
-                    format_err!("parallel recovery stream replay worker panicked: {message}")
-                } else if let Some(message) = panic.downcast_ref::<String>() {
-                    format_err!("parallel recovery stream replay worker panicked: {message}")
-                } else {
-                    format_err!("parallel recovery stream replay worker panicked")
-                }
-            })??;
-            out.append(&mut batch);
-        }
-        Ok(out)
-    })?;
+            let mut out = Vec::new();
+            #[cfg(test)]
+            let mut worker_nodes = Vec::new();
+            for handle in handles {
+                let mut batch = handle.join().map_err(|panic| {
+                    if let Some(message) = panic.downcast_ref::<&str>() {
+                        format_err!("parallel recovery stream replay worker panicked: {message}")
+                    } else if let Some(message) = panic.downcast_ref::<String>() {
+                        format_err!("parallel recovery stream replay worker panicked: {message}")
+                    } else {
+                        format_err!("parallel recovery stream replay worker panicked")
+                    }
+                })??;
+                #[cfg(test)]
+                worker_nodes.push(batch.worker_node);
+                out.append(&mut batch.value);
+            }
+            Ok(RecoveryPhaseResult {
+                value: out,
+                #[cfg(test)]
+                worker_nodes,
+            })
+        },
+    )?;
 
+    let mut indexed = phase.value;
     indexed.sort_by_key(|(index, _)| *index);
-    Ok(indexed.into_iter().map(|(_, replay)| replay).collect())
+    Ok(RecoveryPhaseResult {
+        value: indexed.into_iter().map(|(_, replay)| replay).collect(),
+        #[cfg(test)]
+        worker_nodes: phase.worker_nodes,
+    })
 }
 
 impl RecoveredRegion {
@@ -548,6 +608,8 @@ impl RecoveredRegion {
         let mut type_layouts = TypeLayoutRegistry::default();
         let mut tmemory_undo_rollbacks = Vec::new();
         let mut next_stream_id = 0u32;
+        #[cfg(test)]
+        let mut recovery_worker_nodes_for_test = Vec::new();
 
         for mut input in inputs {
             ensure!(
@@ -559,6 +621,14 @@ impl RecoveredRegion {
                 u32::try_from(block_count).context("recovered region block count overflow")?;
 
             adjust_recovered_region_offsets(&mut input.recovered, byte_base, block_base)?;
+            #[cfg(test)]
+            recovery_worker_nodes_for_test.extend(
+                input
+                    .recovered
+                    .recovery_worker_nodes_for_test
+                    .iter()
+                    .copied(),
+            );
             merge_recovery_winners(&mut winners, input.recovered.winners)?;
             merge_recovered_object_winners(&mut object_winners, input.recovered.object_winners)?;
             merge_type_layout_registries(&mut type_layouts, &input.recovered.type_layouts)?;
@@ -596,7 +666,14 @@ impl RecoveredRegion {
             tmemory_undo_rollbacks,
             next_stream_id,
             mapped_region_source: Some(composite_source),
+            #[cfg(test)]
+            recovery_worker_nodes_for_test,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_worker_nodes_for_test(&self) -> &[Option<i32>] {
+        &self.recovery_worker_nodes_for_test
     }
 
     pub(crate) fn committed_object_winners(&self) -> Result<Vec<RecoveredObjectWinner>> {
@@ -664,17 +741,25 @@ fn classify_recovered_winners(
     data_chunk_index: &DataChunkIndex,
     winners: &[RecoveryWinner],
     options: RecoveryOptions,
-) -> Result<RecoveredClassifiedWinners> {
+) -> Result<RecoveryPhaseResult<RecoveredClassifiedWinners>> {
     let worker_count = recovery_worker_count(options, winners.len());
     let classifications = if worker_count == 1 {
-        winners
-            .iter()
-            .map(|winner| classify_recovered_winner(region, data_chunk_index, winner))
-            .collect::<Result<Vec<_>>>()?
+        RecoveryPhaseResult {
+            value: winners
+                .iter()
+                .map(|winner| classify_recovered_winner(region, data_chunk_index, winner))
+                .collect::<Result<Vec<_>>>()?,
+            #[cfg(test)]
+            worker_nodes: Vec::new(),
+        }
     } else {
         classify_recovered_winners_parallel(region, data_chunk_index, winners, worker_count)?
     };
-    merge_classified_winners(classifications)
+    Ok(RecoveryPhaseResult {
+        value: merge_classified_winners(classifications.value)?,
+        #[cfg(test)]
+        worker_nodes: classifications.worker_nodes,
+    })
 }
 
 fn classify_recovered_winner(
@@ -710,13 +795,15 @@ fn classify_recovered_winners_parallel(
     data_chunk_index: &DataChunkIndex,
     winners: &[RecoveryWinner],
     worker_count: usize,
-) -> Result<Vec<RecoveredWinnerClassification>> {
-    let mut indexed = std::thread::scope(
-        |scope| -> Result<Vec<(usize, RecoveredWinnerClassification)>> {
+) -> Result<RecoveryPhaseResult<Vec<RecoveredWinnerClassification>>> {
+    let phase = std::thread::scope(
+        |scope| -> Result<RecoveryPhaseResult<Vec<(usize, RecoveredWinnerClassification)>>> {
             let mut handles = Vec::new();
             for range in recovery_partitions(winners.len(), worker_count) {
                 handles.push(scope.spawn(
-                    move || -> Result<Vec<(usize, RecoveredWinnerClassification)>> {
+                    move || -> Result<
+                        RecoveryWorkerBatch<Vec<(usize, RecoveredWinnerClassification)>>,
+                    > {
                         let mut out = Vec::new();
                         for index in range {
                             out.push((
@@ -728,12 +815,14 @@ fn classify_recovered_winners_parallel(
                                 )?,
                             ));
                         }
-                        Ok(out)
+                        Ok(RecoveryWorkerBatch::from_current_thread(out))
                     },
                 ));
             }
 
             let mut out = Vec::new();
+            #[cfg(test)]
+            let mut worker_nodes = Vec::new();
             for handle in handles {
                 let mut batch = handle.join().map_err(|panic| {
                     if let Some(message) = panic.downcast_ref::<&str>() {
@@ -748,14 +837,25 @@ fn classify_recovered_winners_parallel(
                         format_err!("parallel recovery winner classification worker panicked")
                     }
                 })??;
-                out.append(&mut batch);
+                #[cfg(test)]
+                worker_nodes.push(batch.worker_node);
+                out.append(&mut batch.value);
             }
-            Ok(out)
+            Ok(RecoveryPhaseResult {
+                value: out,
+                #[cfg(test)]
+                worker_nodes,
+            })
         },
     )?;
 
+    let mut indexed = phase.value;
     indexed.sort_by_key(|(index, _)| *index);
-    Ok(indexed.into_iter().map(|(_, item)| item).collect())
+    Ok(RecoveryPhaseResult {
+        value: indexed.into_iter().map(|(_, item)| item).collect(),
+        #[cfg(test)]
+        worker_nodes: phase.worker_nodes,
+    })
 }
 
 fn merge_classified_winners(
@@ -1793,6 +1893,10 @@ mod tests {
             serial.tmemory_undo_rollbacks,
             parallel.tmemory_undo_rollbacks
         );
+        assert!(
+            !parallel.recovery_worker_nodes_for_test().is_empty(),
+            "parallel recovery should record worker NUMA-node samples for test diagnostics"
+        );
     }
 
     #[test]
@@ -1852,7 +1956,7 @@ mod tests {
         )
         .unwrap();
         let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
-        for replay in replays {
+        for replay in replays.value {
             merge_recovery_winners(&mut winners, replay.winners).unwrap();
         }
         let winners = winners.into_values().collect::<Vec<_>>();
@@ -1868,6 +1972,7 @@ mod tests {
             },
         )
         .unwrap();
+        let serial = serial.value;
         let parallel = classify_recovered_winners(
             &region.view(),
             &discovered.data_chunk_index,
@@ -1877,6 +1982,11 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(
+            !parallel.worker_nodes.is_empty(),
+            "parallel classification should record worker NUMA-node samples for test diagnostics"
+        );
+        let parallel = parallel.value;
 
         assert_eq!(serial.object_winners, parallel.object_winners);
         assert_eq!(serial.root_object_ids, parallel.root_object_ids);
@@ -1966,6 +2076,15 @@ mod tests {
                     parallelism: RecoveryParallelism::Workers(64),
                 },
                 8,
+            ),
+            8
+        );
+        assert_eq!(
+            recovery_worker_count(
+                RecoveryOptions {
+                    parallelism: RecoveryParallelism::Workers(64),
+                },
+                64,
             ),
             8
         );
@@ -2081,6 +2200,7 @@ mod tests {
             tmemory_undo_rollbacks: Vec::new(),
             next_stream_id: 1,
             mapped_region_source: None,
+            recovery_worker_nodes_for_test: Vec::new(),
         };
 
         assert_eq!(
@@ -2259,6 +2379,7 @@ mod tests {
                 tmemory_undo_rollbacks: Vec::new(),
                 next_stream_id: 1,
                 mapped_region_source: None,
+                recovery_worker_nodes_for_test: Vec::new(),
             },
             mapped_source: Arc::new(PanicOnObjectReadSource),
             mapped_len: BLOCK_SIZE,
@@ -3626,6 +3747,7 @@ mod tests {
                 tmemory_undo_rollbacks: Vec::new(),
                 next_stream_id: 1,
                 mapped_region_source: None,
+                recovery_worker_nodes_for_test: Vec::new(),
             },
             mapped_source:
                 crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
@@ -3651,6 +3773,7 @@ mod tests {
                 tmemory_undo_rollbacks: Vec::new(),
                 next_stream_id: 1,
                 mapped_region_source: None,
+                recovery_worker_nodes_for_test: Vec::new(),
             },
             mapped_source:
                 crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
@@ -3699,6 +3822,7 @@ mod tests {
                 tmemory_undo_rollbacks: Vec::new(),
                 next_stream_id: 1,
                 mapped_region_source: None,
+                recovery_worker_nodes_for_test: Vec::new(),
             },
             mapped_source:
                 crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
