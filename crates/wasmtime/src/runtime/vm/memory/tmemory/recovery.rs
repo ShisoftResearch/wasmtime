@@ -1,4 +1,4 @@
-use super::block_region::{BlockRegionBackendView, MappedRegionSource};
+use super::block_region::{BLOCK_SIZE, BlockRegionBackendView, MappedRegionSource};
 use super::durable_log::BlockKind;
 use super::{
     DATA_CHUNK_MAGIC, DataChunkHeader, LOG_BLOCK_MAGIC, PackedGranuleDomain, TxDataRecordHeader,
@@ -17,7 +17,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(test)]
-use super::block_region::{BLOCK_SIZE, StreamCursor, VMemoryBlockRegion};
+use super::block_region::{StreamCursor, VMemoryBlockRegion};
 #[cfg(test)]
 use super::{DataRecordLocation, LogBlockHeader, TMemory};
 use core::mem::size_of;
@@ -48,6 +48,26 @@ pub(crate) struct RecoveredRegion {
     pub(crate) tmemory_undo_rollbacks: Vec<RecoveredTMemoryUndoRollback>,
     pub(crate) next_stream_id: u32,
     mapped_region_source: Option<Arc<dyn MappedRegionSource>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveredRegionInput {
+    pub(crate) recovered: RecoveredRegion,
+    pub(crate) mapped_source: Arc<dyn MappedRegionSource>,
+    pub(crate) mapped_len: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompositeMappedRegionSource {
+    segments: Vec<CompositeMappedRegionSegment>,
+    total_len: usize,
+}
+
+#[derive(Debug)]
+struct CompositeMappedRegionSegment {
+    byte_base: usize,
+    byte_len: usize,
+    source: Arc<dyn MappedRegionSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +174,59 @@ impl Default for RecoveryOptions {
 }
 
 const RECOVERY_MAX_WORKERS: usize = 16;
+
+impl CompositeMappedRegionSource {
+    fn new(segments: Vec<CompositeMappedRegionSegment>, total_len: usize) -> Self {
+        Self {
+            segments,
+            total_len,
+        }
+    }
+}
+
+impl CompositeMappedRegionSegment {
+    fn byte_end(&self) -> Result<usize> {
+        self.byte_base
+            .checked_add(self.byte_len)
+            .context("composite mapped region byte range overflow")
+    }
+}
+
+impl MappedRegionSource for CompositeMappedRegionSource {
+    fn with_mapped_slice(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .context("composite mapped region slice range overflow")?;
+        ensure!(
+            end <= self.total_len,
+            "composite mapped region slice range out of bounds"
+        );
+        if len == 0 {
+            return f(&[]);
+        }
+
+        for segment in &self.segments {
+            let segment_end = segment.byte_end()?;
+            if offset < segment.byte_base || offset >= segment_end {
+                continue;
+            }
+            ensure!(
+                end <= segment_end,
+                "composite mapped region slice spans multiple source regions"
+            );
+            return segment
+                .source
+                .with_mapped_slice(offset - segment.byte_base, len, f);
+        }
+
+        bail!("composite mapped region slice range out of bounds");
+    }
+}
 
 fn recovery_worker_count(options: RecoveryOptions, item_count: usize) -> usize {
     if item_count <= 1 {
@@ -269,6 +342,139 @@ fn merge_recovery_winners(
     Ok(())
 }
 
+fn merge_recovered_object_winners(
+    winners: &mut BTreeMap<u64, RecoveredObjectWinner>,
+    updates: impl IntoIterator<Item = RecoveredObjectWinner>,
+) -> Result<()> {
+    for update in updates {
+        match winners.get(&update.object_id) {
+            Some(current) if current.version > update.version => {}
+            Some(current) if current.version == update.version && current == &update => {}
+            Some(current) if current.version == update.version => {
+                bail!(
+                    "duplicate committed object version {} for object id {}",
+                    update.version,
+                    update.object_id
+                );
+            }
+            _ => {
+                winners.insert(update.object_id, update);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_type_layout_registries(
+    merged: &mut TypeLayoutRegistry,
+    incoming: &TypeLayoutRegistry,
+) -> Result<()> {
+    for layout in incoming.iter() {
+        merged
+            .insert(layout.clone())
+            .context("type layout conflict")?;
+    }
+    Ok(())
+}
+
+fn data_record_offset_for_location(data_block: u32, data_offset: u32) -> Result<usize> {
+    let block = usize::try_from(data_block).context("recovered data block overflow")?;
+    let offset = usize::try_from(data_offset).context("recovered data offset overflow")?;
+    ensure!(
+        offset < BLOCK_SIZE,
+        "recovered data offset exceeds block size"
+    );
+    block
+        .checked_mul(BLOCK_SIZE)
+        .and_then(|base| base.checked_add(offset))
+        .context("recovered data record offset overflow")
+}
+
+fn adjust_block_id(block: &mut u32, block_base: u32, what: &str) -> Result<()> {
+    *block = block
+        .checked_add(block_base)
+        .with_context(|| format!("{what} overflow"))?;
+    Ok(())
+}
+
+fn adjust_recovered_region_offsets(
+    recovered: &mut RecoveredRegion,
+    byte_base: usize,
+    block_base: u32,
+) -> Result<()> {
+    for stream in &mut recovered.streams {
+        for block in &mut stream.log_blocks {
+            adjust_block_id(block, block_base, "merged recovered stream log block")?;
+        }
+        for block in &mut stream.data_chunks {
+            adjust_block_id(
+                block,
+                block_base,
+                "merged recovered stream data chunk block",
+            )?;
+        }
+    }
+    for winner in &mut recovered.winners {
+        adjust_block_id(
+            &mut winner.data_block,
+            block_base,
+            "merged recovered winner data block",
+        )?;
+    }
+    for winner in &mut recovered.object_winners {
+        adjust_block_id(
+            &mut winner.data_block,
+            block_base,
+            "merged recovered object winner data block",
+        )?;
+        winner.data_record_offset = winner
+            .data_record_offset
+            .checked_add(byte_base)
+            .context("merged recovered object winner data record offset overflow")?;
+        ensure!(
+            winner.data_record_offset
+                == data_record_offset_for_location(winner.data_block, winner.data_offset)?,
+            "recovered object winner data record offset does not match data location"
+        );
+    }
+    for rollback in &mut recovered.tmemory_undo_rollbacks {
+        adjust_block_id(
+            &mut rollback.data_block,
+            block_base,
+            "merged recovered tmemory undo data block",
+        )?;
+    }
+    recovered.mapped_region_source = None;
+    Ok(())
+}
+
+fn classify_recovered_winners_from_source(
+    source: &dyn MappedRegionSource,
+    winners: &[RecoveryWinner],
+) -> Result<RecoveredClassifiedWinners> {
+    let mut classified = RecoveredClassifiedWinners::default();
+    for winner in winners {
+        let Ok(domain) = packed_granule_domain(winner.logical_id) else {
+            continue;
+        };
+        match domain {
+            PackedGranuleDomain::TMemorySize => {
+                classified
+                    .tmemory_size_winners
+                    .push(classify_tmemory_size_winner_from_source(source, winner)?);
+            }
+            PackedGranuleDomain::TGlobal | PackedGranuleDomain::TTable => {
+                let mut roots = classify_root_object_ids_from_source(source, winner, domain)?;
+                classified.root_object_ids.append(&mut roots);
+            }
+            _ => {}
+        }
+    }
+    classified.root_object_ids.sort_unstable();
+    classified.root_object_ids.dedup();
+    Ok(classified)
+}
+
 fn replay_streams(
     region: &BlockRegionBackendView<'_>,
     streams: &[RecoveredStream],
@@ -327,6 +533,72 @@ fn replay_streams_parallel(
 }
 
 impl RecoveredRegion {
+    pub(crate) fn merge_region_set(inputs: Vec<RecoveredRegionInput>) -> Result<RecoveredRegion> {
+        ensure!(
+            !inputs.is_empty(),
+            "recovered region merge requires at least one input"
+        );
+
+        let mut byte_base = 0usize;
+        let mut block_base = 0u32;
+        let mut composite_segments = Vec::with_capacity(inputs.len());
+        let mut streams = Vec::new();
+        let mut winners = BTreeMap::<u64, RecoveryWinner>::new();
+        let mut object_winners = BTreeMap::<u64, RecoveredObjectWinner>::new();
+        let mut type_layouts = TypeLayoutRegistry::default();
+        let mut tmemory_undo_rollbacks = Vec::new();
+        let mut next_stream_id = 0u32;
+
+        for mut input in inputs {
+            ensure!(
+                input.mapped_len % BLOCK_SIZE == 0,
+                "recovered region mapped length must be block-aligned"
+            );
+            let block_count = input.mapped_len / BLOCK_SIZE;
+            let block_count =
+                u32::try_from(block_count).context("recovered region block count overflow")?;
+
+            adjust_recovered_region_offsets(&mut input.recovered, byte_base, block_base)?;
+            merge_recovery_winners(&mut winners, input.recovered.winners)?;
+            merge_recovered_object_winners(&mut object_winners, input.recovered.object_winners)?;
+            merge_type_layout_registries(&mut type_layouts, &input.recovered.type_layouts)?;
+            streams.extend(input.recovered.streams);
+            tmemory_undo_rollbacks.extend(input.recovered.tmemory_undo_rollbacks);
+            next_stream_id = next_stream_id.max(input.recovered.next_stream_id);
+            composite_segments.push(CompositeMappedRegionSegment {
+                byte_base,
+                byte_len: input.mapped_len,
+                source: input.mapped_source,
+            });
+            byte_base = byte_base
+                .checked_add(input.mapped_len)
+                .context("merged recovered region byte base overflow")?;
+            block_base = block_base
+                .checked_add(block_count)
+                .context("merged recovered region block base overflow")?;
+        }
+
+        let composite_source = Arc::new(CompositeMappedRegionSource::new(
+            composite_segments,
+            byte_base,
+        )) as Arc<dyn MappedRegionSource>;
+        let winners = winners.into_values().collect::<Vec<_>>();
+        let classified =
+            classify_recovered_winners_from_source(composite_source.as_ref(), &winners)?;
+
+        Ok(RecoveredRegion {
+            streams,
+            winners,
+            object_winners: object_winners.into_values().collect(),
+            tmemory_size_winners: classified.tmemory_size_winners,
+            type_layouts,
+            root_object_ids: classified.root_object_ids,
+            tmemory_undo_rollbacks,
+            next_stream_id,
+            mapped_region_source: Some(composite_source),
+        })
+    }
+
     pub(crate) fn committed_object_winners(&self) -> Result<Vec<RecoveredObjectWinner>> {
         Ok(self.object_winners.clone())
     }
@@ -745,6 +1017,114 @@ fn with_publication_payload(
     f: &mut dyn FnMut(TxDataRecordHeader, usize, &[u8]) -> Result<()>,
 ) -> Result<()> {
     with_publication_payload_impl(region, data_chunk_index, data_block, data_offset, f)
+}
+
+fn with_publication_payload_from_source(
+    source: &dyn MappedRegionSource,
+    data_block: u32,
+    data_offset: u32,
+    f: &mut dyn FnMut(TxDataRecordHeader, usize, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let record_offset = data_record_offset_for_location(data_block, data_offset)?;
+    let mut header = None;
+    source.with_mapped_slice(
+        record_offset,
+        size_of::<TxDataRecordHeader>(),
+        &mut |bytes| {
+            header = Some(TxDataRecordHeader::from_bytes(bytes)?);
+            Ok(())
+        },
+    )?;
+    let header = header.context("publication data record header was not observed")?;
+    let payload_len =
+        usize::try_from(header.payload_len).context("publication payload length overflow")?;
+    let payload_offset = record_offset
+        .checked_add(size_of::<TxDataRecordHeader>())
+        .context("publication payload offset overflow")?;
+    source.with_mapped_slice(payload_offset, payload_len, &mut |payload| {
+        f(header, record_offset, payload)
+    })
+}
+
+fn classify_tmemory_size_winner_from_source(
+    source: &dyn MappedRegionSource,
+    winner: &RecoveryWinner,
+) -> Result<RecoveredTMemorySizeWinner> {
+    let mut classified = None;
+    with_publication_payload_from_source(
+        source,
+        winner.data_block,
+        winner.data_offset,
+        &mut |data_header, _, payload| {
+            ensure!(
+                data_header.logical_id == winner.logical_id,
+                "recovered tmemory size logical id does not match log winner"
+            );
+            ensure!(
+                data_header.version == winner.version,
+                "recovered tmemory size version does not match log winner"
+            );
+            ensure!(
+                data_header.role()? == TxDataRecordRole::TObjectPub,
+                "recovered tmemory size data record has non-publication role"
+            );
+            ensure!(
+                data_header.kind == PackedGranuleDomain::TMemorySize as u16,
+                "recovered tmemory size kind does not match log winner"
+            );
+            ensure!(
+                payload.len() == size_of::<u64>(),
+                "recovered tmemory size payload must be exactly 8 bytes"
+            );
+            let (owner_instance, memory_index) = unpack_tmemory_size_logical_id(winner.logical_id)?;
+            classified = Some(RecoveredTMemorySizeWinner {
+                owner_instance,
+                memory_index,
+                version: winner.version,
+                new_pages: u64::from_le_bytes(payload.try_into().unwrap()),
+            });
+            Ok(())
+        },
+    )?;
+    classified.context("recovered tmemory size classification did not produce a candidate")
+}
+
+fn classify_root_object_ids_from_source(
+    source: &dyn MappedRegionSource,
+    winner: &RecoveryWinner,
+    expected_domain: PackedGranuleDomain,
+) -> Result<Vec<u64>> {
+    let mut decoded_roots = None;
+    with_publication_payload_from_source(
+        source,
+        winner.data_block,
+        winner.data_offset,
+        &mut |data_header, _, payload| {
+            ensure!(
+                data_header.logical_id == winner.logical_id,
+                "recovered root publication logical id does not match log winner"
+            );
+            ensure!(
+                data_header.version == winner.version,
+                "recovered root publication version does not match log winner"
+            );
+            ensure!(
+                data_header.role()? == TxDataRecordRole::TObjectPub,
+                "recovered root publication data record has non-publication role"
+            );
+            ensure!(
+                data_header.kind == expected_domain as u16,
+                "recovered root publication kind does not match granule domain"
+            );
+            let mut roots = decode_root_object_refs(payload)?;
+            if expected_domain == PackedGranuleDomain::TGlobal {
+                roots.truncate(1);
+            }
+            decoded_roots = Some(roots);
+            Ok(())
+        },
+    )?;
+    decoded_roots.context("recovered root publication classification did not produce roots")
 }
 
 fn validated_chunk_blocks(
@@ -1716,6 +2096,221 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("duplicate committed object version")
+        );
+    }
+
+    #[test]
+    fn merged_recovered_regions_latest_object_version_across_two_inputs_wins() {
+        let input1 = synthetic_object_region_input(
+            41,
+            1,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+        );
+        let input2 = synthetic_object_region_input(
+            41,
+            3,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(33)]),
+        );
+
+        let merged = RecoveredRegion::merge_region_set(vec![input1, input2]).unwrap();
+        let winners = merged.committed_object_winners().unwrap();
+
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].object_id, 41);
+        assert_eq!(winners[0].version, 3);
+        assert_eq!(winners[0].data_block, 1);
+        assert_eq!(winners[0].data_record_offset, BLOCK_SIZE);
+    }
+
+    #[test]
+    fn merged_recovered_regions_equal_version_conflicting_object_winners_reject() {
+        let input1 = synthetic_object_region_input(
+            41,
+            7,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+        );
+        let input2 = synthetic_object_region_input(
+            41,
+            7,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(22)]),
+        );
+
+        let err = RecoveredRegion::merge_region_set(vec![input1, input2]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("duplicate committed object version 7 for object id 41")
+        );
+    }
+
+    #[test]
+    fn merged_recovered_regions_type_layout_id_conflict_rejects() {
+        let input1 = synthetic_type_layout_region_input(struct_layout(101));
+        let input2 = synthetic_type_layout_region_input(array_layout(101));
+
+        let err = RecoveredRegion::merge_region_set(vec![input1, input2]).unwrap_err();
+
+        assert!(err.to_string().contains("type layout conflict"));
+    }
+
+    #[test]
+    fn merged_recovered_regions_composite_mapped_source_reads_selected_winner_bytes() {
+        let expected_record = encode_object_record_for_test(
+            41,
+            3,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            &ObjectPayload::Struct(vec![ObjectValue::I32(33)]),
+        )
+        .unwrap();
+        let input1 = synthetic_object_region_input(
+            41,
+            1,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+        );
+        let input2 = synthetic_object_region_input(
+            41,
+            3,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(33)]),
+        );
+
+        let merged = RecoveredRegion::merge_region_set(vec![input1, input2]).unwrap();
+        let mapped_source = merged.cloned_mapped_region_source().unwrap();
+        let winner = merged.committed_object_winners().unwrap().remove(0);
+        let mut observed = Vec::new();
+        winner
+            .with_source_record_bytes(mapped_source.as_ref(), &mut |bytes| {
+                observed.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(observed, expected_record);
+    }
+
+    #[test]
+    fn merged_recovered_regions_composite_mapped_source_rejects_slice_spanning_multiple_inputs() {
+        let input1 = synthetic_object_region_input(
+            41,
+            1,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+        );
+        let input2 = synthetic_object_region_input(
+            42,
+            1,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(22)]),
+        );
+
+        let merged = RecoveredRegion::merge_region_set(vec![input1, input2]).unwrap();
+        let mapped_source = merged.cloned_mapped_region_source().unwrap();
+        let err = mapped_source
+            .with_mapped_slice(BLOCK_SIZE - 1, 2, &mut |_: &[u8]| Ok(()))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("spans multiple source regions"));
+    }
+
+    #[test]
+    fn merged_recovered_regions_reuses_classified_object_winners_without_source_reads() {
+        #[derive(Debug)]
+        struct PanicOnObjectReadSource;
+
+        impl MappedRegionSource for PanicOnObjectReadSource {
+            fn with_mapped_slice(
+                &self,
+                _offset: usize,
+                _len: usize,
+                _f: &mut dyn FnMut(&[u8]) -> Result<()>,
+            ) -> Result<()> {
+                bail!("merge should not re-read classified object payload bytes");
+            }
+        }
+
+        let logical_id = pack_object_granule_id(PackedGranuleDomain::TStruct, 41).unwrap();
+        let input = RecoveredRegionInput {
+            recovered: RecoveredRegion {
+                streams: Vec::new(),
+                winners: vec![RecoveryWinner {
+                    logical_id,
+                    version: 7,
+                    data_block: 0,
+                    data_offset: 0,
+                }],
+                object_winners: vec![RecoveredObjectWinner {
+                    object_id: 41,
+                    version: 7,
+                    kind: ObjectKind::Struct as u16,
+                    type_layout_id: TypeLayoutId::DEFAULT_STRUCT.get(),
+                    data_block: 0,
+                    data_offset: 0,
+                    data_record_offset: 0,
+                    record_len: 32,
+                }],
+                tmemory_size_winners: Vec::new(),
+                type_layouts: TypeLayoutRegistry::default(),
+                root_object_ids: Vec::new(),
+                tmemory_undo_rollbacks: Vec::new(),
+                next_stream_id: 1,
+                mapped_region_source: None,
+            },
+            mapped_source: Arc::new(PanicOnObjectReadSource),
+            mapped_len: BLOCK_SIZE,
+        };
+
+        let merged = RecoveredRegion::merge_region_set(vec![input]).unwrap();
+
+        assert_eq!(merged.object_winners.len(), 1);
+        assert_eq!(merged.object_winners[0].object_id, 41);
+        assert_eq!(merged.object_winners[0].version, 7);
+    }
+
+    #[test]
+    fn merged_recovered_regions_root_and_tmemory_size_merge_respects_latest_version() {
+        let input1 = synthetic_root_and_tmemory_region_input(
+            1,
+            Some(41),
+            1,
+            2,
+            vec![9001],
+            vec![RecoveredTMemorySizeWinner {
+                owner_instance: Some(7),
+                memory_index: 4,
+                version: 99,
+                new_pages: 99,
+            }],
+        );
+        let input2 = synthetic_root_and_tmemory_region_input(
+            2,
+            Some(42),
+            2,
+            7,
+            vec![9002],
+            vec![RecoveredTMemorySizeWinner {
+                owner_instance: Some(7),
+                memory_index: 4,
+                version: 100,
+                new_pages: 100,
+            }],
+        );
+
+        let merged = RecoveredRegion::merge_region_set(vec![input1, input2]).unwrap();
+
+        assert_eq!(merged.root_object_ids, vec![42]);
+        assert_eq!(
+            merged.tmemory_size_winners,
+            vec![RecoveredTMemorySizeWinner {
+                owner_instance: Some(7),
+                memory_index: 4,
+                version: 2,
+                new_pages: 7,
+            }]
         );
     }
 
@@ -3000,5 +3595,186 @@ mod tests {
         let mut header = TxDataRecordHeader::from_bytes(bytes).unwrap();
         update(&mut header);
         region.write(record_offset, &header.as_bytes()).unwrap();
+    }
+
+    fn synthetic_object_region_input(
+        object_id: u64,
+        version: u32,
+        type_layout_id: u32,
+        payload: ObjectPayload,
+    ) -> RecoveredRegionInput {
+        let source =
+            crate::runtime::vm::block_region::new_synthetic_recovered_winner_source_for_test();
+        let record =
+            encode_object_record_for_test(object_id, version, type_layout_id, &payload).unwrap();
+        let winner = synthetic_object_winner(
+            &source,
+            object_id,
+            version,
+            object_kind_for_payload(&payload) as u16,
+            type_layout_id,
+            &record,
+        );
+        RecoveredRegionInput {
+            recovered: RecoveredRegion {
+                streams: Vec::new(),
+                winners: Vec::new(),
+                object_winners: vec![winner],
+                tmemory_size_winners: Vec::new(),
+                type_layouts: TypeLayoutRegistry::default(),
+                root_object_ids: Vec::new(),
+                tmemory_undo_rollbacks: Vec::new(),
+                next_stream_id: 1,
+                mapped_region_source: None,
+            },
+            mapped_source:
+                crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
+                    &source,
+                ),
+            mapped_len: BLOCK_SIZE,
+        }
+    }
+
+    fn synthetic_type_layout_region_input(layout: PersistentTypeLayout) -> RecoveredRegionInput {
+        let source =
+            crate::runtime::vm::block_region::new_synthetic_recovered_winner_source_for_test();
+        let mut type_layouts = TypeLayoutRegistry::default();
+        type_layouts.insert(layout).unwrap();
+        RecoveredRegionInput {
+            recovered: RecoveredRegion {
+                streams: Vec::new(),
+                winners: Vec::new(),
+                object_winners: Vec::new(),
+                tmemory_size_winners: Vec::new(),
+                type_layouts,
+                root_object_ids: Vec::new(),
+                tmemory_undo_rollbacks: Vec::new(),
+                next_stream_id: 1,
+                mapped_region_source: None,
+            },
+            mapped_source:
+                crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
+                    &source,
+                ),
+            mapped_len: BLOCK_SIZE,
+        }
+    }
+
+    fn synthetic_root_and_tmemory_region_input(
+        root_version: u32,
+        root: Option<u64>,
+        tmemory_size_version: u32,
+        tmemory_pages: u64,
+        stale_root_object_ids: Vec<u64>,
+        stale_tmemory_size_winners: Vec<RecoveredTMemorySizeWinner>,
+    ) -> RecoveredRegionInput {
+        let source =
+            crate::runtime::vm::block_region::new_synthetic_recovered_winner_source_for_test();
+        let root_logical_id = pack_test_granule_id(PackedGranuleDomain::TGlobal, 1);
+        let tmemory_logical_id = pack_tmemory_size_logical_id(Some(7), 4).unwrap();
+        let root_winner = synthetic_publication_winner(
+            &source,
+            root_logical_id,
+            root_version,
+            PackedGranuleDomain::TGlobal as u16,
+            0,
+            &encode_root_object_refs(&[root]),
+        );
+        let tmemory_size_winner = synthetic_publication_winner(
+            &source,
+            tmemory_logical_id,
+            tmemory_size_version,
+            PackedGranuleDomain::TMemorySize as u16,
+            0,
+            &tmemory_pages.to_le_bytes(),
+        );
+        RecoveredRegionInput {
+            recovered: RecoveredRegion {
+                streams: Vec::new(),
+                winners: vec![root_winner, tmemory_size_winner],
+                object_winners: Vec::new(),
+                tmemory_size_winners: stale_tmemory_size_winners,
+                type_layouts: TypeLayoutRegistry::default(),
+                root_object_ids: stale_root_object_ids,
+                tmemory_undo_rollbacks: Vec::new(),
+                next_stream_id: 1,
+                mapped_region_source: None,
+            },
+            mapped_source:
+                crate::runtime::vm::block_region::synthetic_recovered_winner_source_for_test(
+                    &source,
+                ),
+            mapped_len: BLOCK_SIZE,
+        }
+    }
+
+    fn synthetic_publication_winner(
+        source: &crate::runtime::vm::block_region::SyntheticRecoveredWinnerSourceHandle,
+        logical_id: u64,
+        version: u32,
+        kind: u16,
+        type_info: u32,
+        payload: &[u8],
+    ) -> RecoveryWinner {
+        let data_record =
+            TMemory::encode_publication_data_record(logical_id, version, kind, type_info, payload)
+                .unwrap();
+        let offset =
+            crate::runtime::vm::block_region::register_synthetic_recovered_winner_data_record_for_test(
+                source,
+                &data_record,
+            );
+        RecoveryWinner {
+            logical_id,
+            version,
+            data_block: u32::try_from(offset / BLOCK_SIZE).unwrap(),
+            data_offset: u32::try_from(offset % BLOCK_SIZE).unwrap(),
+        }
+    }
+
+    fn synthetic_object_winner(
+        source: &crate::runtime::vm::block_region::SyntheticRecoveredWinnerSourceHandle,
+        object_id: u64,
+        version: u32,
+        kind: u16,
+        type_layout_id: u32,
+        record: &[u8],
+    ) -> RecoveredObjectWinner {
+        let domain = match kind {
+            value if value == ObjectKind::Struct as u16 => PackedGranuleDomain::TStruct,
+            value if value == ObjectKind::Array as u16 => PackedGranuleDomain::TArray,
+            _ => unreachable!("unsupported object kind {kind}"),
+        };
+        let logical_id = pack_object_granule_id(domain, object_id).unwrap();
+        let data_record = TMemory::encode_publication_data_record(
+            logical_id,
+            version,
+            domain as u16,
+            type_layout_id,
+            record,
+        )
+        .unwrap();
+        let offset =
+            crate::runtime::vm::block_region::register_synthetic_recovered_winner_data_record_for_test(
+                source,
+                &data_record,
+            );
+        RecoveredObjectWinner {
+            object_id,
+            version,
+            kind,
+            type_layout_id,
+            data_block: u32::try_from(offset / BLOCK_SIZE).unwrap(),
+            data_offset: u32::try_from(offset % BLOCK_SIZE).unwrap(),
+            data_record_offset: offset,
+            record_len: u64::try_from(record.len()).unwrap(),
+        }
+    }
+
+    fn object_kind_for_payload(payload: &ObjectPayload) -> ObjectKind {
+        match payload {
+            ObjectPayload::Struct(_) => ObjectKind::Struct,
+            ObjectPayload::Array(_) => ObjectKind::Array,
+        }
     }
 }

@@ -18,6 +18,7 @@ mod object_heap;
 mod object_table;
 mod object_value;
 mod persist;
+mod persist_region_set;
 mod promotion;
 mod region_runtime;
 mod state;
@@ -51,7 +52,7 @@ use config::ConcurrencyControl;
 use config::{ConflictPolicy, DurabilityPolicy, ObjectIndexPersistencePolicy};
 pub(crate) use config::{
     TMemoryBackend, TMemoryDaxPmemBacking, TMemoryFileBacking, TMemoryPersistenceMode,
-    TransactionConfig,
+    TMemoryRegionConfig, TransactionConfig,
 };
 pub(crate) use granule::{
     GranuleId, TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,

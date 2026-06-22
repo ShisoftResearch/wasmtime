@@ -80,6 +80,12 @@ impl SharedFileBackedStorageConfig {
             TMemoryFileBacking::ExistingPath(path) => {
                 TransactionConfig::with_file_backed_tmemory_existing_path(path.clone())
             }
+            TMemoryFileBacking::Regions(regions) => {
+                TransactionConfig::with_file_backed_tmemory_regions(regions.clone())
+            }
+            TMemoryFileBacking::ExistingRegions(regions) => {
+                TransactionConfig::with_file_backed_tmemory_existing_regions(regions.clone())
+            }
         }
     }
 

@@ -121,19 +121,38 @@ pub(crate) use crate::runtime::vm::memory::tmemory::TxLogEntryRole;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::block_region;
 #[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::numa::{
+    CpuSet, NumaNode, current_cpu, node_for_cpu, pin_current_thread,
+};
+#[cfg(test)]
+pub(crate) use crate::runtime::vm::memory::tmemory::numa::cpus_for_node;
+#[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::pack_tmemory_size_logical_id;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredObjectWinner;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredRegion;
+#[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::recovery::RecoveredRegionInput;
 #[cfg(all(has_virtual_memory, test))]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::recover_region_for_test;
 #[cfg(all(has_virtual_memory, test))]
+pub(crate) use crate::runtime::vm::memory::tmemory::recovery::recovery_worker_count_for_test;
+#[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::recovery::{
-    RecoveryOptions, recovery_worker_count_for_test,
+    RecoveryOptions, RecoveryParallelism,
+};
+#[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::region::{
+    RegionAddressWindow, RegionBackendKind, RegionDescriptor, RegionId, RegionSetDescriptor,
 };
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::unpack_object_granule_id;
+
+#[cfg(all(has_virtual_memory, test))]
+pub(crate) fn tmemory_reserved_metadata_blocks(num_blocks: usize) -> Result<usize> {
+    crate::runtime::vm::memory::tmemory::metadata::reserved_metadata_blocks(num_blocks)
+}
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::{PackedGranuleDomain, pack_object_granule_id};
 pub use crate::runtime::vm::memory::{

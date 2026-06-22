@@ -45,7 +45,24 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 pub(crate) const BLOCK_SIZE: usize = 512 * 1024;
 pub(crate) const IMMIX_LINE_SIZE: usize = 256;
 pub(crate) const PMEM_CACHE_LINE_SIZE: usize = 64;
+pub(crate) const FIXED_WINDOW_TMEMORY_UNSUPPORTED_MESSAGE: &str =
+    "multi-region fixed-window tmemory mappings are unsupported on this target";
 static FILE_BACKED_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+std::thread_local! {
+    static INJECT_NEXT_FILE_BACKED_MMAP_FAILURE: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+struct FileBackedMmapFailureGuard;
+
+#[cfg(test)]
+impl Drop for FileBackedMmapFailureGuard {
+    fn drop(&mut self) {
+        clear_file_backed_mmap_failure_for_test();
+    }
+}
 
 pub(crate) const PW_REGION_HEADER_SIZE: usize = size_of::<PWRegionHeader>();
 pub(crate) const META_DATA_DESC_SIZE: usize = size_of::<MetaDataDesc>();
@@ -66,6 +83,12 @@ pub(crate) enum FileBackedRegionMode {
     OpenExistingPath(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MappedAddressWindow {
+    pub(crate) base: usize,
+    pub(crate) reserved_len: usize,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FileBackedMapping {
     inner: Arc<FileBackedMappingInner>,
@@ -76,6 +99,7 @@ struct FileBackedMappingInner {
     file: File,
     path: PathBuf,
     unlink_on_drop: AtomicBool,
+    fixed_window: Option<MappedAddressWindow>,
     memory: RwLock<SendSyncPtr<[u8]>>,
 }
 
@@ -98,8 +122,25 @@ impl FileBackedMapping {
         Self::new_path_with_unlink(path, len, false)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_path_in_window(
+        path: PathBuf,
+        len: usize,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        Self::new_path_with_unlink_in_window(path, len, false, window)
+    }
+
     pub(crate) fn open_existing_path(path: PathBuf) -> Result<Self> {
         open_existing_file_backed_mapping(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_existing_path_in_window(
+        path: PathBuf,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        open_existing_file_backed_mapping_in_window(path, window)
     }
 
     fn open_existing_path_with_len(path: PathBuf, len: usize) -> Result<Self> {
@@ -114,6 +155,16 @@ impl FileBackedMapping {
 
     fn new_path_with_unlink(path: PathBuf, len: usize, unlink_on_drop: bool) -> Result<Self> {
         new_file_backed_mapping(path, len, unlink_on_drop)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn new_path_with_unlink_in_window(
+        path: PathBuf,
+        len: usize,
+        unlink_on_drop: bool,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        new_file_backed_mapping_in_window(path, len, unlink_on_drop, window)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -203,6 +254,46 @@ impl FileBackedMapping {
     pub(crate) fn remap_len(&mut self, new_len: usize) -> Result<()> {
         #[cfg(unix)]
         {
+            #[cfg(target_os = "linux")]
+            if let Some(window) = self.inner.fixed_window {
+                validate_mapped_address_window(window, new_len)?;
+                let new_len_u64 =
+                    u64::try_from(new_len).context("file-backed tmemory length overflow")?;
+                let mut memory = self.inner.memory.write();
+                let old_len = memory.len();
+                ensure!(
+                    new_len >= old_len,
+                    "file-backed fixed mapping does not support shrinking: current length {old_len}, requested {new_len}",
+                );
+                self.inner.file.set_len(new_len_u64).with_context(|| {
+                    format!(
+                        "failed to resize file-backed tmemory file {}",
+                        self.inner.path.display()
+                    )
+                })?;
+                let new_memory =
+                    match unsafe { map_shared_file_in_window(&self.inner.file, new_len, window) } {
+                        Ok(new_memory) => new_memory,
+                        Err(error) => {
+                            return restore_file_backed_len_after_mmap_error(
+                                error,
+                                old_len,
+                                |old_len_u64| {
+                                    self.inner.file.set_len(old_len_u64).with_context(|| {
+                                        format!(
+                                            "failed to restore file-backed tmemory length for {}",
+                                            self.inner.path.display()
+                                        )
+                                    })
+                                },
+                            );
+                        }
+                    };
+                *memory = new_memory;
+                drop(memory);
+                return self.fence_all();
+            }
+            let old_len = self.inner.memory.read().len();
             self.inner
                 .file
                 .set_len(u64::try_from(new_len).context("file-backed tmemory length overflow")?)
@@ -212,7 +303,23 @@ impl FileBackedMapping {
                         self.inner.path.display()
                     )
                 })?;
-            let new_memory = unsafe { map_shared_file(&self.inner.file, new_len)? };
+            let new_memory = match unsafe { map_shared_file(&self.inner.file, new_len) } {
+                Ok(new_memory) => new_memory,
+                Err(error) => {
+                    return restore_file_backed_len_after_mmap_error(
+                        error,
+                        old_len,
+                        |old_len_u64| {
+                            self.inner.file.set_len(old_len_u64).with_context(|| {
+                                format!(
+                                    "failed to restore file-backed tmemory length for {}",
+                                    self.inner.path.display()
+                                )
+                            })
+                        },
+                    );
+                }
+            };
             let old_memory = {
                 let mut memory = self.inner.memory.write();
                 core::mem::replace(&mut *memory, new_memory)
@@ -224,6 +331,16 @@ impl FileBackedMapping {
         {
             let _ = new_len;
             bail!("FileBackedMemory remap is unsupported on this target")
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn base_addr_for_test(&self) -> Option<usize> {
+        let memory = self.inner.memory.read();
+        if memory.len() == 0 {
+            None
+        } else {
+            Some(memory.as_non_null().cast::<u8>().as_ptr().addr())
         }
     }
 }
@@ -321,8 +438,39 @@ impl DaxPmemMapping {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_fsdax_path_in_window(
+        path: PathBuf,
+        len: usize,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        let mapping = create_fsdax_file_backed_mapping_in_window(path.clone(), len, window)?;
+        mapping.fence_all()?;
+        sync_parent_dir(&path)?;
+        let persist = PersistEngine::for_mode(PersistenceMode::RequireDaxPmem)?;
+        mapping.set_unlink_on_drop(false);
+        Ok(Self {
+            mapping,
+            persist,
+            require_fsdax: true,
+        })
+    }
+
     pub(crate) fn open_existing_fsdax_path(path: PathBuf) -> Result<Self> {
         let mapping = open_existing_fsdax_file_backed_mapping(path.clone())?;
+        Ok(Self {
+            mapping,
+            persist: PersistEngine::for_mode(PersistenceMode::RequireDaxPmem)?,
+            require_fsdax: true,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_existing_fsdax_path_in_window(
+        path: PathBuf,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        let mapping = open_existing_fsdax_file_backed_mapping_in_window(path.clone(), window)?;
         Ok(Self {
             mapping,
             persist: PersistEngine::for_mode(PersistenceMode::RequireDaxPmem)?,
@@ -420,6 +568,13 @@ impl Drop for FileBackedMappingInner {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
+            #[cfg(target_os = "linux")]
+            if let Some(window) = self.fixed_window {
+                let _ = unmap_mapped_window(window);
+            } else {
+                let _ = unmap_shared_file(*self.memory.read());
+            }
+            #[cfg(not(target_os = "linux"))]
             let _ = unmap_shared_file(*self.memory.read());
         }
         if self.unlink_on_drop.load(AtomicOrdering::Relaxed) {
@@ -443,6 +598,26 @@ fn empty_mapping_memory() -> SendSyncPtr<[u8]> {
     SendSyncPtr::new(NonNull::slice_from_raw_parts(NonNull::<u8>::dangling(), 0))
 }
 
+#[cfg(test)]
+fn inject_next_file_backed_mmap_failure_for_test() -> FileBackedMmapFailureGuard {
+    INJECT_NEXT_FILE_BACKED_MMAP_FAILURE.with(|inject| inject.set(true));
+    FileBackedMmapFailureGuard
+}
+
+#[cfg(test)]
+fn clear_file_backed_mmap_failure_for_test() {
+    INJECT_NEXT_FILE_BACKED_MMAP_FAILURE.with(|inject| inject.set(false));
+}
+
+#[cfg(test)]
+fn take_file_backed_mmap_failure_for_test() -> bool {
+    INJECT_NEXT_FILE_BACKED_MMAP_FAILURE.with(|inject| {
+        let should_fail = inject.get();
+        inject.set(false);
+        should_fail
+    })
+}
+
 #[cfg(unix)]
 fn create_fsdax_file_backed_mapping(path: PathBuf, len: usize) -> Result<FileBackedMapping> {
     let file = create_file_read_write_no_follow(&path)?;
@@ -451,6 +626,20 @@ fn create_fsdax_file_backed_mapping(path: PathBuf, len: usize) -> Result<FileBac
         return Err(error);
     }
     finish_file_backed_mapping(file, path, len, true)
+}
+
+#[cfg(target_os = "linux")]
+fn create_fsdax_file_backed_mapping_in_window(
+    path: PathBuf,
+    len: usize,
+    window: MappedAddressWindow,
+) -> Result<FileBackedMapping> {
+    let file = create_file_read_write_no_follow(&path)?;
+    if let Err(error) = ensure_fsdax_file(&file, &path) {
+        cleanup_created_file_path(&file, &path);
+        return Err(error);
+    }
+    finish_file_backed_mapping_in_window(file, path, len, true, window)
 }
 
 #[cfg(not(unix))]
@@ -463,6 +652,16 @@ fn open_existing_fsdax_file_backed_mapping(path: PathBuf) -> Result<FileBackedMa
     let file = open_file_read_write_no_follow(&path)?;
     ensure_fsdax_file(&file, &path)?;
     finish_existing_file_backed_mapping(file, path)
+}
+
+#[cfg(target_os = "linux")]
+fn open_existing_fsdax_file_backed_mapping_in_window(
+    path: PathBuf,
+    window: MappedAddressWindow,
+) -> Result<FileBackedMapping> {
+    let file = open_file_read_write_no_follow(&path)?;
+    ensure_fsdax_file(&file, &path)?;
+    finish_existing_file_backed_mapping_in_window(file, path, window)
 }
 
 #[cfg(not(unix))]
@@ -515,6 +714,24 @@ fn new_file_backed_mapping(
         .open(&path)
         .with_context(|| format!("failed to open file-backed tmemory file {}", path.display()))?;
     finish_file_backed_mapping(file, path, len, unlink_on_drop)
+}
+
+#[cfg(target_os = "linux")]
+fn new_file_backed_mapping_in_window(
+    path: PathBuf,
+    len: usize,
+    unlink_on_drop: bool,
+    window: MappedAddressWindow,
+) -> Result<FileBackedMapping> {
+    validate_mapped_address_window(window, len)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("failed to open file-backed tmemory file {}", path.display()))?;
+    finish_file_backed_mapping_in_window(file, path, len, unlink_on_drop, window)
 }
 
 #[cfg(unix)]
@@ -571,6 +788,24 @@ fn open_existing_file_backed_mapping(path: PathBuf) -> Result<FileBackedMapping>
     finish_existing_file_backed_mapping(file, path)
 }
 
+#[cfg(target_os = "linux")]
+fn open_existing_file_backed_mapping_in_window(
+    path: PathBuf,
+    window: MappedAddressWindow,
+) -> Result<FileBackedMapping> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "failed to open existing file-backed tmemory file {}",
+                path.display()
+            )
+        })?;
+    finish_existing_file_backed_mapping_in_window(file, path, window)
+}
+
 #[cfg(unix)]
 fn finish_existing_file_backed_mapping(file: File, path: PathBuf) -> Result<FileBackedMapping> {
     let len = usize::try_from(
@@ -585,6 +820,32 @@ fn finish_existing_file_backed_mapping(file: File, path: PathBuf) -> Result<File
             file,
             path,
             unlink_on_drop: AtomicBool::new(false),
+            fixed_window: None,
+            memory: RwLock::new(memory),
+        }),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn finish_existing_file_backed_mapping_in_window(
+    file: File,
+    path: PathBuf,
+    window: MappedAddressWindow,
+) -> Result<FileBackedMapping> {
+    let len = usize::try_from(
+        file.metadata()
+            .with_context(|| format!("failed to stat file-backed tmemory file {}", path.display()))?
+            .len(),
+    )
+    .context("file-backed tmemory file length overflow")?;
+    validate_mapped_address_window(window, len)?;
+    let memory = unsafe { map_new_shared_file_in_window(&file, len, window)? };
+    Ok(FileBackedMapping {
+        inner: Arc::new(FileBackedMappingInner {
+            file,
+            path,
+            unlink_on_drop: AtomicBool::new(false),
+            fixed_window: Some(window),
             memory: RwLock::new(memory),
         }),
     })
@@ -625,6 +886,55 @@ fn finish_file_backed_mapping(
             file,
             path,
             unlink_on_drop: AtomicBool::new(unlink_on_drop),
+            fixed_window: None,
+            memory: RwLock::new(memory),
+        }),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn finish_file_backed_mapping_in_window(
+    file: File,
+    path: PathBuf,
+    len: usize,
+    unlink_on_drop: bool,
+    window: MappedAddressWindow,
+) -> Result<FileBackedMapping> {
+    if let Err(error) = validate_mapped_address_window(window, len) {
+        if unlink_on_drop {
+            cleanup_created_file_path(&file, &path);
+        }
+        return Err(error);
+    }
+    if let Err(error) = file
+        .set_len(u64::try_from(len).context("file-backed tmemory length overflow")?)
+        .with_context(|| {
+            format!(
+                "failed to resize file-backed tmemory file {}",
+                path.display()
+            )
+        })
+    {
+        if unlink_on_drop {
+            cleanup_created_file_path(&file, &path);
+        }
+        return Err(error);
+    }
+    let memory = match unsafe { map_new_shared_file_in_window(&file, len, window) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            if unlink_on_drop {
+                cleanup_created_file_path(&file, &path);
+            }
+            return Err(error);
+        }
+    };
+    Ok(FileBackedMapping {
+        inner: Arc::new(FileBackedMappingInner {
+            file,
+            path,
+            unlink_on_drop: AtomicBool::new(unlink_on_drop),
+            fixed_window: Some(window),
             memory: RwLock::new(memory),
         }),
     })
@@ -668,6 +978,10 @@ fn cleanup_created_file_path_impl(file: &File, path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 unsafe fn map_shared_file(file: &File, len: usize) -> Result<SendSyncPtr<[u8]>> {
+    #[cfg(test)]
+    if take_file_backed_mmap_failure_for_test() {
+        bail!("injected file-backed mmap failure");
+    }
     if len == 0 {
         return Ok(empty_mapping_memory());
     }
@@ -687,6 +1001,171 @@ unsafe fn map_shared_file(file: &File, len: usize) -> Result<SendSyncPtr<[u8]>> 
 }
 
 #[cfg(unix)]
+fn restore_file_backed_len_after_mmap_error(
+    mmap_error: Error,
+    old_len: usize,
+    restore_len: impl FnOnce(u64) -> Result<()>,
+) -> Result<()> {
+    let rollback = u64::try_from(old_len)
+        .context("failed to restore file-backed tmemory length")
+        .and_then(restore_len);
+    if let Err(rollback_error) = rollback {
+        bail!(
+            "file-backed tmemory mmap failed after file growth: {mmap_error}; failed to restore file-backed tmemory length: {rollback_error}"
+        );
+    }
+    Err(mmap_error)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_mapped_address_window(window: MappedAddressWindow, len: usize) -> Result<()> {
+    let page_size = rustix::param::page_size();
+    ensure!(
+        window.base % page_size == 0,
+        "file-backed fixed mapping base must be page aligned"
+    );
+    ensure!(
+        window.reserved_len > 0,
+        "file-backed fixed mapping reserved window length must be nonzero"
+    );
+    ensure!(
+        window.reserved_len % page_size == 0,
+        "file-backed fixed mapping reserved window length must be page aligned"
+    );
+    ensure!(
+        len == 0 || len % page_size == 0,
+        "file-backed fixed mapping length must be page aligned"
+    );
+    window
+        .base
+        .checked_add(window.reserved_len)
+        .context("file-backed fixed mapping window range overflow")?;
+    ensure!(
+        len <= window.reserved_len,
+        "file-backed fixed mapping length {len} exceeds reserved window length {}",
+        window.reserved_len
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn map_new_shared_file_in_window(
+    file: &File,
+    len: usize,
+    window: MappedAddressWindow,
+) -> Result<SendSyncPtr<[u8]>> {
+    validate_mapped_address_window(window, len)?;
+    if let Err(error) = unsafe { reserve_mapped_window(window) } {
+        return Err(error);
+    }
+    match unsafe { map_shared_file_in_window(file, len, window) } {
+        Ok(memory) => Ok(memory),
+        Err(error) => {
+            let _ = unsafe { unmap_mapped_window(window) };
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn reserve_mapped_window(window: MappedAddressWindow) -> Result<()> {
+    let ptr = unsafe {
+        libc::mmap(
+            window.base as *mut libc::c_void,
+            window.reserved_len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to reserve fixed file-backed tmemory address window");
+    }
+    ensure_fixed_mmap_address(
+        ptr,
+        window.base,
+        window.reserved_len,
+        "fixed file-backed tmemory address window reservation",
+        |ptr, len| unsafe { unmap_unexpected_fixed_mmap(ptr, len) },
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn map_shared_file_in_window(
+    file: &File,
+    len: usize,
+    window: MappedAddressWindow,
+) -> Result<SendSyncPtr<[u8]>> {
+    use std::os::fd::AsRawFd;
+
+    validate_mapped_address_window(window, len)?;
+    #[cfg(test)]
+    if take_file_backed_mmap_failure_for_test() {
+        bail!("injected file-backed mmap failure");
+    }
+    if len == 0 {
+        return Ok(empty_mapping_memory());
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            window.base as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to mmap fixed shared file-backed tmemory region");
+    }
+    ensure_fixed_mmap_address(
+        ptr,
+        window.base,
+        len,
+        "fixed shared file-backed tmemory mmap",
+        |ptr, len| unsafe { unmap_unexpected_fixed_mmap(ptr, len) },
+    )?;
+    let slice = core::ptr::slice_from_raw_parts_mut(ptr.cast::<u8>(), len);
+    Ok(SendSyncPtr::new(NonNull::new(slice).unwrap()))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_fixed_mmap_address(
+    ptr: *mut libc::c_void,
+    expected_base: usize,
+    len: usize,
+    mmap_context: &str,
+    unmap: impl FnOnce(*mut libc::c_void, usize) -> Result<()>,
+) -> Result<()> {
+    if ptr as usize == expected_base {
+        return Ok(());
+    }
+    let returned = ptr as usize;
+    let unmap_result = unmap(ptr, len);
+    if let Err(error) = unmap_result {
+        bail!(
+            "{mmap_context} returned different address {returned:#x}, expected {expected_base:#x}; failed to unmap unexpected mapping: {error}"
+        );
+    }
+    bail!("{mmap_context} returned different address {returned:#x}, expected {expected_base:#x}");
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn unmap_unexpected_fixed_mmap(ptr: *mut libc::c_void, len: usize) -> Result<()> {
+    let rc = unsafe { libc::munmap(ptr, len) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to unmap unexpected fixed file-backed tmemory mapping");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 unsafe fn unmap_shared_file(memory: SendSyncPtr<[u8]>) -> Result<()> {
     let len = memory.len();
     if len == 0 {
@@ -695,6 +1174,15 @@ unsafe fn unmap_shared_file(memory: SendSyncPtr<[u8]>) -> Result<()> {
     unsafe {
         rustix::mm::munmap(memory.as_non_null().cast::<u8>().as_ptr().cast(), len)
             .context("failed to munmap file-backed tmemory region")?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn unmap_mapped_window(window: MappedAddressWindow) -> Result<()> {
+    unsafe {
+        rustix::mm::munmap(window.base as *mut _, window.reserved_len)
+            .context("failed to munmap fixed file-backed tmemory window")?;
     }
     Ok(())
 }
@@ -1383,6 +1871,10 @@ impl<'a> BlockRegionBackendView<'a> {
 
     pub(crate) fn num_blocks(&self) -> usize {
         self.backend.num_blocks()
+    }
+
+    pub(crate) fn bytes_len(&self) -> usize {
+        self.backend.bytes_len()
     }
 
     pub(crate) fn block_magic(&self, start_block: u32) -> Result<u32> {
@@ -2586,6 +3078,33 @@ impl DaxPmemBlockRegion {
         Ok(region)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_fsdax_path_in_window(
+        path: PathBuf,
+        payload_blocks: usize,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        let num_blocks = dax_pmem_region_blocks_for_payload(payload_blocks)?;
+        let bytes_len = num_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional DAX PMEM block region size overflow")?;
+        let mut region = Self::with_mapping(
+            DaxPmemMapping::new_fsdax_path_in_window(path, bytes_len, window)?,
+            num_blocks,
+        )?;
+        region.initialize_region_image()?;
+        Ok(region)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn create_fsdax_path_in_window(
+        _path: PathBuf,
+        _payload_blocks: usize,
+        _window: MappedAddressWindow,
+    ) -> Result<Self> {
+        bail!("{FIXED_WINDOW_TMEMORY_UNSUPPORTED_MESSAGE}")
+    }
+
     pub(crate) fn open_fsdax_path(path: PathBuf, payload_blocks: usize) -> Result<Self> {
         let mapping = DaxPmemMapping::open_existing_fsdax_path(path)?;
         ensure!(
@@ -2601,6 +3120,37 @@ impl DaxPmemBlockRegion {
         let mut region = Self::with_mapping(mapping, num_blocks)?;
         region.load_region_image()?;
         Ok(region)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_fsdax_path_in_window(
+        path: PathBuf,
+        payload_blocks: usize,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        let mapping = DaxPmemMapping::open_existing_fsdax_path_in_window(path, window)?;
+        ensure!(
+            mapping.len() % BLOCK_SIZE == 0,
+            "transactional DAX PMEM block region image length is not block-aligned"
+        );
+        let num_blocks = mapping.len() / BLOCK_SIZE;
+        let required_blocks = dax_pmem_region_blocks_for_payload(payload_blocks)?;
+        ensure!(
+            num_blocks >= required_blocks,
+            "transactional DAX PMEM block region image is smaller than requested capacity"
+        );
+        let mut region = Self::with_mapping(mapping, num_blocks)?;
+        region.load_region_image()?;
+        Ok(region)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open_fsdax_path_in_window(
+        _path: PathBuf,
+        _payload_blocks: usize,
+        _window: MappedAddressWindow,
+    ) -> Result<Self> {
+        bail!("{FIXED_WINDOW_TMEMORY_UNSUPPORTED_MESSAGE}")
     }
 
     #[cfg(test)]
@@ -3775,13 +4325,17 @@ pub(crate) struct FileBackedMemoryBlockRegion {
 }
 
 impl FileBackedMemoryBlockRegion {
-    pub(crate) fn new(num_blocks: usize, mode: FileBackedRegionMode) -> Result<Self> {
+    fn with_mapping(mapping: FileBackedMapping, num_blocks: usize) -> Result<Self> {
         let bytes_len = num_blocks
             .checked_mul(BLOCK_SIZE)
             .context("transactional FileBackedMemory block region size overflow")?;
+        ensure!(
+            mapping.len() >= bytes_len,
+            "transactional file-backed region mapping is smaller than requested size"
+        );
         let line_count = bytes_len / IMMIX_LINE_SIZE;
         Ok(Self {
-            mapping: FileBackedMapping::new(mode, bytes_len)?,
+            mapping,
             block_entries: vec![BlockEntry::default(); num_blocks],
             block_metas: vec![BlockMeta::free(); num_blocks],
             line_marks: vec![
@@ -3792,6 +4346,13 @@ impl FileBackedMemoryBlockRegion {
             ],
             streams: BTreeMap::new(),
         })
+    }
+
+    pub(crate) fn new(num_blocks: usize, mode: FileBackedRegionMode) -> Result<Self> {
+        let bytes_len = num_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional FileBackedMemory block region size overflow")?;
+        Self::with_mapping(FileBackedMapping::new(mode, bytes_len)?, num_blocks)
     }
 
     #[cfg(test)]
@@ -3832,8 +4393,56 @@ impl FileBackedMemoryBlockRegion {
         Ok(region)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_in_window(
+        path: &Path,
+        num_blocks: u32,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        let num_blocks = usize::try_from(num_blocks)
+            .context("transactional file-backed region size overflow")?;
+        let reserved_metadata_blocks = reserved_metadata_blocks(num_blocks)?;
+        ensure!(
+            num_blocks >= reserved_metadata_blocks,
+            "transactional file-backed region must have at least {reserved_metadata_blocks} blocks"
+        );
+        let bytes_len = num_blocks
+            .checked_mul(BLOCK_SIZE)
+            .context("transactional FileBackedMemory block region size overflow")?;
+        let mut region = Self::with_mapping(
+            FileBackedMapping::new_path_in_window(path.to_path_buf(), bytes_len, window)?,
+            num_blocks,
+        )?;
+        region.initialize_region_image()?;
+        Ok(region)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn create_in_window(
+        _path: &Path,
+        _num_blocks: u32,
+        _window: MappedAddressWindow,
+    ) -> Result<Self> {
+        bail!("{FIXED_WINDOW_TMEMORY_UNSUPPORTED_MESSAGE}")
+    }
+
     pub(crate) fn open_for_test(path: &Path) -> Result<Self> {
         let mapping = FileBackedMapping::open_existing_path(path.to_path_buf())?;
+        Self::open_from_mapping(mapping)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_in_window(path: &Path, window: MappedAddressWindow) -> Result<Self> {
+        let mapping = FileBackedMapping::open_existing_path_in_window(path.to_path_buf(), window)?;
+        Self::open_from_mapping(mapping)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open_in_window(_path: &Path, _window: MappedAddressWindow) -> Result<Self> {
+        bail!("{FIXED_WINDOW_TMEMORY_UNSUPPORTED_MESSAGE}")
+    }
+
+    fn open_from_mapping(mapping: FileBackedMapping) -> Result<Self> {
         ensure!(
             mapping.len() >= BLOCK_SIZE,
             "transactional file-backed region image is smaller than one block"
@@ -3844,19 +4453,7 @@ impl FileBackedMemoryBlockRegion {
         );
 
         let num_blocks = mapping.len() / BLOCK_SIZE;
-        let line_count = mapping.len() / IMMIX_LINE_SIZE;
-        let mut region = Self {
-            mapping,
-            block_entries: vec![BlockEntry::default(); num_blocks],
-            block_metas: vec![BlockMeta::free(); num_blocks],
-            line_marks: vec![
-                LineMark {
-                    mark: IMMIX_LINE_MARK_RESET_VALUE,
-                };
-                line_count
-            ],
-            streams: BTreeMap::new(),
-        };
+        let mut region = Self::with_mapping(mapping, num_blocks)?;
         let header = region.region_header()?;
         region.validate_region_header(header)?;
         region.load_block_meta_table(header)?;
@@ -5507,13 +6104,41 @@ pub(crate) fn reopen_and_recover_file_backed_region_for_runtime(
 pub(crate) fn recover_file_backed_region_snapshot(
     region: &FileBackedMemoryBlockRegion,
 ) -> Result<super::recovery::RecoveredRegion> {
-    super::recovery::recover_region(&region.view(), region.load_type_layout_metadata()?)
+    recover_file_backed_region_snapshot_with_options(
+        region,
+        super::recovery::RecoveryOptions::default(),
+    )
+}
+
+pub(crate) fn recover_file_backed_region_snapshot_with_options(
+    region: &FileBackedMemoryBlockRegion,
+    options: super::recovery::RecoveryOptions,
+) -> Result<super::recovery::RecoveredRegion> {
+    super::recovery::recover_region_with_options(
+        &region.view(),
+        region.load_type_layout_metadata()?,
+        options,
+    )
 }
 
 pub(crate) fn recover_dax_pmem_region_snapshot(
     region: &DaxPmemBlockRegion,
 ) -> Result<super::recovery::RecoveredRegion> {
-    super::recovery::recover_region(&region.view(), region.load_type_layout_metadata()?)
+    recover_dax_pmem_region_snapshot_with_options(
+        region,
+        super::recovery::RecoveryOptions::default(),
+    )
+}
+
+pub(crate) fn recover_dax_pmem_region_snapshot_with_options(
+    region: &DaxPmemBlockRegion,
+    options: super::recovery::RecoveryOptions,
+) -> Result<super::recovery::RecoveredRegion> {
+    super::recovery::recover_region_with_options(
+        &region.view(),
+        region.load_type_layout_metadata()?,
+        options,
+    )
 }
 
 #[cfg(test)]
@@ -6237,6 +6862,333 @@ mod tests {
 
         assert_eq!(mapping.read(32, 4).unwrap(), vec![9, 8, 7, 6]);
         assert_eq!(std::fs::metadata(path).unwrap().len(), 8192);
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn reserve_test_window(len: usize) -> usize {
+        unsafe {
+            let ptr = libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            libc::munmap(ptr, len);
+            ptr as usize
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn new_fixed_test_mapping(
+        path: PathBuf,
+        len: usize,
+        reserved_len: usize,
+    ) -> (FileBackedMapping, usize) {
+        const MAX_ATTEMPTS: usize = 32;
+        let mut last_reservation_collision = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let base = reserve_test_window(reserved_len);
+            match FileBackedMapping::new_path_in_window(
+                path.clone(),
+                len,
+                MappedAddressWindow { base, reserved_len },
+            ) {
+                Ok(mapping) => return (mapping, base),
+                Err(error) => {
+                    let rendered = format!("{error:?}");
+                    if rendered
+                        .contains("failed to reserve fixed file-backed tmemory address window")
+                        && rendered.contains("File exists")
+                    {
+                        last_reservation_collision = Some(rendered);
+                        continue;
+                    }
+                    panic!("failed to create fixed test mapping: {rendered}");
+                }
+            }
+        }
+        panic!(
+            "failed to reserve fixed test mapping after {MAX_ATTEMPTS} attempts: {last_reservation_collision:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_mapping_uses_requested_fixed_window() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let len = 4096;
+        let path = unique_temp_file_path();
+        let (mut mapping, base) = new_fixed_test_mapping(path.clone(), len, len);
+        assert_eq!(mapping.base_addr_for_test(), Some(base));
+        mapping.write(0, b"fixed").unwrap();
+        mapping.flush(0, 5).unwrap();
+        mapping.fence_all().unwrap();
+        drop(mapping);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_mapping_grow_keeps_fixed_base() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let initial_len = 4096;
+        let reserved_len = 8192;
+        let path = unique_temp_file_path();
+        let (mut mapping, base) = new_fixed_test_mapping(path.clone(), initial_len, reserved_len);
+        assert_eq!(mapping.base_addr_for_test(), Some(base));
+
+        mapping.write(32, b"old!").unwrap();
+        mapping.flush(32, 4).unwrap();
+        mapping.fence_all().unwrap();
+
+        mapping.remap_len(8192).unwrap();
+        assert_eq!(mapping.base_addr_for_test(), Some(base));
+        assert_eq!(mapping.read(32, 4).unwrap(), b"old!");
+        mapping.write(4096, b"grow").unwrap();
+        mapping.flush(4096, 4).unwrap();
+        mapping.fence_all().unwrap();
+        drop(mapping);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[32..36], b"old!");
+        assert_eq!(&bytes[4096..4100], b"grow");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_mapping_reopen_fixed_window_rejects_tail_collision() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let len = 4096;
+        let reserved_len = 8192;
+        let path = unique_temp_file_path();
+        drop(FileBackedMapping::new_path(path.clone(), len).unwrap());
+
+        const MAX_ATTEMPTS: usize = 32;
+        let mut reopen_error = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let base = reserve_test_window(reserved_len);
+            let tail_ptr = unsafe {
+                libc::mmap(
+                    (base + len) as *mut libc::c_void,
+                    reserved_len - len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if tail_ptr == libc::MAP_FAILED {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                panic!("failed to map fixed-window tail collision: {error}");
+            }
+
+            assert_eq!(tail_ptr as usize, base + len);
+            reopen_error = Some(
+                FileBackedMapping::open_existing_path_in_window(
+                    path.clone(),
+                    MappedAddressWindow { base, reserved_len },
+                )
+                .unwrap_err()
+                .to_string(),
+            );
+            let rc = unsafe { libc::munmap(tail_ptr, reserved_len - len) };
+            assert_eq!(rc, 0);
+            break;
+        }
+
+        let error =
+            reopen_error.expect("failed to establish a fixed-window tail collision for reopen");
+        assert!(
+            error.contains("failed to reserve fixed file-backed tmemory address window"),
+            "{error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_backed_mapping_remap_failure_restores_state() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = unique_temp_file_path();
+        let mut mapping = FileBackedMapping::new_path(path.clone(), 4096).unwrap();
+
+        mapping.write(32, b"old!").unwrap();
+        mapping.flush(32, 4).unwrap();
+        mapping.fence_all().unwrap();
+
+        let _mmap_failure = inject_next_file_backed_mmap_failure_for_test();
+        let error = mapping.remap_len(8192).unwrap_err().to_string();
+        assert!(error.contains("injected file-backed mmap failure"));
+        assert_eq!(mapping.len(), 4096);
+        assert_eq!(mapping.read(32, 4).unwrap(), b"old!");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+
+        drop(mapping);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_fixed_mapping_remap_failure_restores_state() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = unique_temp_file_path();
+        let (mut mapping, base) = new_fixed_test_mapping(path.clone(), 4096, 8192);
+
+        mapping.write(32, b"old!").unwrap();
+        mapping.flush(32, 4).unwrap();
+        mapping.fence_all().unwrap();
+
+        let _mmap_failure = inject_next_file_backed_mmap_failure_for_test();
+        let error = mapping.remap_len(8192).unwrap_err().to_string();
+        assert!(error.contains("injected file-backed mmap failure"));
+        assert_eq!(mapping.len(), 4096);
+        assert_eq!(mapping.base_addr_for_test(), Some(base));
+        assert_eq!(mapping.read(32, 4).unwrap(), b"old!");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+
+        drop(mapping);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_mmap_failure_guard_clears_unconsumed_hook() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = unique_temp_file_path();
+        let (mut mapping, base) = new_fixed_test_mapping(path.clone(), 4096, 8192);
+
+        {
+            let _mmap_failure = inject_next_file_backed_mmap_failure_for_test();
+            let error = mapping.remap_len(4097).unwrap_err().to_string();
+            assert!(error.contains("page aligned"));
+        }
+
+        mapping.remap_len(8192).unwrap();
+        assert_eq!(mapping.len(), 8192);
+        assert_eq!(mapping.base_addr_for_test(), Some(base));
+
+        drop(mapping);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_mapping_fixed_window_rejects_shrink_without_state_change() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let len = 8192;
+        let path = unique_temp_file_path();
+        let (mut mapping, _) = new_fixed_test_mapping(path.clone(), len, len);
+        mapping.write(4096, b"keep").unwrap();
+
+        let error = mapping.remap_len(4096).unwrap_err().to_string();
+        assert!(error.contains("does not support shrinking"));
+        assert_eq!(mapping.len(), len);
+        assert_eq!(mapping.read(4096, 4).unwrap(), b"keep");
+
+        drop(mapping);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_mapping_fixed_window_rejects_unaligned_len_without_state_change() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let len = 4096;
+        let path = unique_temp_file_path();
+        let (mut mapping, _) = new_fixed_test_mapping(path.clone(), len, len * 2);
+        mapping.write(0, b"keep").unwrap();
+
+        let error = mapping.remap_len(4097).unwrap_err().to_string();
+        assert!(error.contains("page aligned"));
+        assert_eq!(mapping.len(), len);
+        assert_eq!(mapping.read(0, 4).unwrap(), b"keep");
+
+        drop(mapping);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_backed_mapping_fixed_window_rejects_unaligned_base() {
+        let _guard = file_backed_temp_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let len = 4096;
+        let path = unique_temp_file_path();
+        let base = reserve_test_window(len) + 1;
+
+        let error = FileBackedMapping::new_path_in_window(
+            path.clone(),
+            len,
+            MappedAddressWindow {
+                base,
+                reserved_len: len,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("page aligned"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fixed_window_address_mismatch_error_mentions_different_address() {
+        let mut unmapped = None;
+        let error = ensure_fixed_mmap_address(
+            0x2000usize as *mut libc::c_void,
+            0x1000usize,
+            4096,
+            "test mmap",
+            |ptr, len| {
+                unmapped = Some((ptr as usize, len));
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("different address"));
+        assert_eq!(unmapped, Some((0x2000usize, 4096usize)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_backed_len_rollback_error_mentions_mmap_and_restore_failure() {
+        let error =
+            restore_file_backed_len_after_mmap_error(Error::msg("mmap failed"), 4096, |_old_len| {
+                bail!("rollback failed")
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("mmap failed"));
+        assert!(error.contains("failed to restore file-backed tmemory length"));
+        assert!(error.contains("rollback failed"));
     }
 
     #[cfg(unix)]

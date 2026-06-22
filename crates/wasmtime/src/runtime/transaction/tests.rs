@@ -1,3 +1,4 @@
+use super::config::TMemoryRegionConfig;
 use super::*;
 
 fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
@@ -2830,6 +2831,301 @@ fn transaction_config_marks_existing_dax_pmem_fsdax_path_as_path_backed() {
 
     assert!(config.has_path_backed_dax_pmem_tmemory());
     assert!(config.has_existing_dax_pmem_tmemory());
+}
+
+#[test]
+fn dax_pmem_multi_region_config_requires_dax_backend() {
+    let regions = vec![
+        TMemoryRegionConfig::new_for_test("/pmem0/wasmtime-a", 0x4000_0000_0000, 1 << 30),
+        TMemoryRegionConfig::new_for_test("/pmem1/wasmtime-b", 0x5000_0000_0000, 1 << 30),
+    ];
+    let config = TransactionConfig::with_dax_pmem_fsdax_regions(regions.clone()).unwrap();
+    assert_eq!(config.tmemory_backend(), TMemoryBackend::DaxPmem);
+    assert_eq!(
+        config.tmemory_dax_pmem_backing(),
+        Some(TMemoryDaxPmemBacking::FsDaxRegions(regions))
+    );
+    assert_eq!(
+        config.tmemory_persistence_mode(),
+        TMemoryPersistenceMode::RequireDaxPmem
+    );
+    assert!(config.has_path_backed_dax_pmem_tmemory());
+    assert!(!config.has_existing_dax_pmem_tmemory());
+}
+
+#[test]
+fn file_backed_multi_region_config_requires_file_backend() {
+    let regions = vec![
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-a", 0x6000_0000_0000, 1 << 30),
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-b", 0x7000_0000_0000, 1 << 30),
+    ];
+    let config = TransactionConfig::with_file_backed_tmemory_regions(regions.clone()).unwrap();
+    assert_eq!(config.tmemory_backend(), TMemoryBackend::FileBackedMemory);
+    assert_eq!(
+        config.tmemory_file_backing(),
+        Some(TMemoryFileBacking::Regions(regions))
+    );
+}
+
+#[test]
+fn existing_file_backed_multi_region_config_uses_existing_regions() {
+    let regions = vec![
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-existing-a", 0x6000_0000_0000, 1 << 30),
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-existing-b", 0x7000_0000_0000, 1 << 30),
+    ];
+    let config =
+        TransactionConfig::with_file_backed_tmemory_existing_regions(regions.clone()).unwrap();
+    assert_eq!(config.tmemory_backend(), TMemoryBackend::FileBackedMemory);
+    assert_eq!(
+        config.tmemory_file_backing(),
+        Some(TMemoryFileBacking::ExistingRegions(regions))
+    );
+}
+
+#[test]
+fn existing_dax_pmem_multi_region_config_is_existing_path_backed() {
+    let regions = vec![
+        TMemoryRegionConfig::new_for_test("/pmem0/wasmtime-existing-a", 0x4000_0000_0000, 1 << 30),
+        TMemoryRegionConfig::new_for_test("/pmem1/wasmtime-existing-b", 0x5000_0000_0000, 1 << 30),
+    ];
+    let config = TransactionConfig::with_dax_pmem_existing_fsdax_regions(regions.clone()).unwrap();
+    assert_eq!(
+        config.tmemory_dax_pmem_backing(),
+        Some(TMemoryDaxPmemBacking::ExistingFsDaxRegions(regions))
+    );
+    assert!(config.has_path_backed_dax_pmem_tmemory());
+    assert!(config.has_existing_dax_pmem_tmemory());
+}
+
+#[test]
+fn multi_region_config_rejects_empty_region_list() {
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("at least one region"));
+}
+
+#[test]
+fn multi_region_config_rejects_empty_dax_region_path() {
+    let error =
+        TransactionConfig::with_dax_pmem_fsdax_regions(vec![TMemoryRegionConfig::new_for_test(
+            "",
+            0x4000_0000_0000,
+            1 << 30,
+        )])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("DAX PMEM fsdax path cannot be empty"));
+}
+
+#[test]
+fn multi_region_config_rejects_empty_file_region_path() {
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![
+        TMemoryRegionConfig::new_for_test("", 0x6000_0000_0000, 1 << 30),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("file-backed tmemory path cannot be empty"));
+}
+
+#[test]
+fn multi_region_config_rejects_zero_reserved_length() {
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-zero", 0x6000_0000_0000, 0),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("reserved length"));
+}
+
+#[test]
+fn multi_region_config_rejects_region_window_overflow() {
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-overflow", usize::MAX, 1),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("overflow"));
+}
+
+#[test]
+fn multi_region_config_rejects_overlapping_windows() {
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-overlap-a", 0x6000_0000_0000, 1 << 30),
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-overlap-b", 0x6000_1000_0000, 1 << 30),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("overlap"));
+}
+
+#[test]
+fn multi_region_config_rejects_duplicate_region_paths() {
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-duplicate", 0x6000_0000_0000, 1 << 30),
+        TMemoryRegionConfig::new_for_test("/tmp/wasmtime-duplicate", 0x7000_0000_0000, 1 << 30),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("duplicate region path"));
+}
+
+#[test]
+fn multi_region_config_rejects_lexically_equivalent_region_paths() {
+    let cwd = std::env::current_dir().unwrap();
+    let path = "target/wasmtime-lexically-equivalent-region";
+
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![
+        TMemoryRegionConfig::new_for_test(cwd.join(path), 0x6000_0000_0000, 1 << 30),
+        TMemoryRegionConfig::new_for_test(
+            "target/./wasmtime-lexically-equivalent-region",
+            0x7000_0000_0000,
+            1 << 30,
+        ),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("duplicate region path"));
+}
+
+#[test]
+fn multi_region_config_rejects_negative_numa_node() {
+    let error = TransactionConfig::with_file_backed_tmemory_regions(vec![TMemoryRegionConfig {
+        path: std::path::PathBuf::from("/tmp/wasmtime-numa"),
+        address_base: 0x6000_0000_0000,
+        reserved_len: 1 << 30,
+        numa_node: Some(-1),
+    }])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("NUMA node"));
+}
+
+#[cfg(unix)]
+#[test]
+fn dax_pmem_multi_region_backing_uses_backend_validation_instead_of_not_implemented() {
+    let dir = tempfile::tempdir().unwrap();
+    let reserved_len = 8 * crate::runtime::vm::block_region::BLOCK_SIZE;
+    let regions = vec![
+        TMemoryRegionConfig::new_for_test(
+            dir.path().join("dax-a.tmemory"),
+            0x4000_0000_0000,
+            reserved_len,
+        ),
+        TMemoryRegionConfig::new_for_test(
+            dir.path().join("dax-b.tmemory"),
+            0x4000_0100_0000,
+            reserved_len,
+        ),
+    ];
+    let config = TransactionConfig::with_dax_pmem_fsdax_regions(regions).unwrap();
+
+    let error = crate::runtime::vm::TMemory::new(config, 1, Some(9))
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        !error.contains("multi-region DAX PMEM tmemory is not implemented yet"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("DAX PMEM persistence mode does not match backing"),
+        "{error}"
+    );
+    assert!(
+        error.contains("does not have the DAX inode attribute")
+            || error.contains("failed to statx DAX PMEM fsdax path")
+            || error.contains("unsupported on this target"),
+        "{error}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn file_backed_multi_region_backing_constructs_commits_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let region_a = TMemoryRegionConfig::new_for_test(
+        dir.path().join("region-a.tmemory"),
+        0x5000_0000_0000,
+        crate::runtime::vm::block_region::BLOCK_SIZE,
+    );
+    let region_b = TMemoryRegionConfig::new_for_test(
+        dir.path().join("region-b.tmemory"),
+        0x5000_0010_0000,
+        crate::runtime::vm::block_region::BLOCK_SIZE,
+    );
+    let regions = vec![region_a.clone(), region_b.clone()];
+    let boundary = crate::runtime::vm::block_region::BLOCK_SIZE;
+    let requested_capacity = 9 * 64 * 1024;
+
+    {
+        let config = TransactionConfig::with_file_backed_tmemory_regions(regions.clone()).unwrap();
+        let mut tmemory = crate::runtime::vm::TMemory::new(config, 9, Some(9)).unwrap();
+
+        assert_eq!(tmemory.byte_capacity(), requested_capacity);
+        tmemory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+        tmemory.commit_range(boundary + 8, &[5, 6, 7, 8]).unwrap();
+
+        assert_eq!(tmemory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            tmemory.read_committed(boundary + 8..boundary + 12).unwrap(),
+            vec![5, 6, 7, 8]
+        );
+    }
+
+    let config = TransactionConfig::with_file_backed_tmemory_existing_regions(regions).unwrap();
+    let reopened = crate::runtime::vm::TMemory::new(config, 9, Some(9)).unwrap();
+
+    assert_eq!(reopened.byte_capacity(), 2 * boundary);
+    assert_eq!(reopened.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(
+        reopened
+            .read_committed(boundary + 8..boundary + 12)
+            .unwrap(),
+        vec![5, 6, 7, 8]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn file_backed_multi_region_backing_without_max_pages_grows_into_second_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let region_a = TMemoryRegionConfig::new_for_test(
+        dir.path().join("region-a.tmemory"),
+        0x5100_0000_0000,
+        crate::runtime::vm::block_region::BLOCK_SIZE,
+    );
+    let region_b = TMemoryRegionConfig::new_for_test(
+        dir.path().join("region-b.tmemory"),
+        0x5100_0010_0000,
+        crate::runtime::vm::block_region::BLOCK_SIZE,
+    );
+    let region_c = TMemoryRegionConfig::new_for_test(
+        dir.path().join("region-c.tmemory"),
+        0x5100_0020_0000,
+        crate::runtime::vm::block_region::BLOCK_SIZE,
+    );
+    let boundary = crate::runtime::vm::block_region::BLOCK_SIZE;
+    let config = TransactionConfig::with_file_backed_tmemory_regions(vec![
+        region_a, region_b, region_c,
+    ])
+    .unwrap();
+    let mut tmemory = crate::runtime::vm::TMemory::new(config, 1, None).unwrap();
+
+    assert_eq!(tmemory.byte_capacity(), 64 * 1024);
+    assert!(tmemory.can_grow_to_pages(9));
+
+    tmemory.commit_range(8, &[1, 2, 3, 4]).unwrap();
+    tmemory.grow_to_pages(9).unwrap();
+    tmemory.commit_range(boundary + 8, &[5, 6, 7, 8]).unwrap();
+
+    assert_eq!(tmemory.byte_len(), 9 * 64 * 1024);
+    assert_eq!(tmemory.byte_capacity(), 9 * 64 * 1024);
+    assert_eq!(tmemory.read_committed(8..12).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(
+        tmemory.read_committed(boundary + 8..boundary + 12).unwrap(),
+        vec![5, 6, 7, 8]
+    );
 }
 
 #[test]

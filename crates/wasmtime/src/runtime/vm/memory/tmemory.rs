@@ -18,7 +18,9 @@ pub(crate) mod block_region;
 mod durable_log;
 mod linear_region;
 pub(crate) mod metadata;
+pub(crate) mod numa;
 pub(crate) mod recovery;
+pub(crate) mod region;
 
 use self::linear_region::TMemoryRegion;
 pub(crate) use durable_log::*;
@@ -755,6 +757,12 @@ impl DaxPmemMemory {
                 ) | (
                     TMemoryPersistenceMode::RequireDaxPmem,
                     TMemoryDaxPmemBacking::ExistingFsDaxPath(_)
+                ) | (
+                    TMemoryPersistenceMode::RequireDaxPmem,
+                    TMemoryDaxPmemBacking::FsDaxRegions(_)
+                ) | (
+                    TMemoryPersistenceMode::RequireDaxPmem,
+                    TMemoryDaxPmemBacking::ExistingFsDaxRegions(_)
                 )
             ),
             "DAX PMEM persistence mode does not match backing"
@@ -768,8 +776,22 @@ impl DaxPmemMemory {
             None => byte_len,
         };
 
-        let region = TMemoryRegion::new_dax_pmem(requested_byte_capacity, backing.clone())?;
-        let byte_capacity = if matches!(backing, TMemoryDaxPmemBacking::ExistingFsDaxPath(_)) {
+        let region = match &backing {
+            TMemoryDaxPmemBacking::FsDaxRegions(regions) => TMemoryRegion::new_dax_pmem_regions(
+                requested_byte_capacity,
+                regions.clone(),
+                false,
+            )?,
+            TMemoryDaxPmemBacking::ExistingFsDaxRegions(regions) => {
+                TMemoryRegion::new_dax_pmem_regions(requested_byte_capacity, regions.clone(), true)?
+            }
+            _ => TMemoryRegion::new_dax_pmem(requested_byte_capacity, backing.clone())?,
+        };
+        let byte_capacity = if matches!(
+            backing,
+            TMemoryDaxPmemBacking::ExistingFsDaxPath(_)
+                | TMemoryDaxPmemBacking::ExistingFsDaxRegions(_)
+        ) {
             region.logical_len().max(requested_byte_capacity)
         } else {
             requested_byte_capacity
@@ -973,18 +995,41 @@ impl FileBackedMemory {
             Some(max_pages) => pages_to_bytes(max_pages)?,
             None => byte_len,
         };
-        let byte_capacity =
-            existing_file_backed_len(&file_backing)?.unwrap_or(requested_byte_capacity);
-        let byte_capacity = byte_capacity.max(requested_byte_capacity);
+        let (region, byte_capacity) = match &file_backing {
+            TMemoryFileBacking::Regions(regions) => {
+                let region = TMemoryRegion::new_file_backed_regions(
+                    requested_byte_capacity,
+                    regions.clone(),
+                    false,
+                )?;
+                (region, requested_byte_capacity)
+            }
+            TMemoryFileBacking::ExistingRegions(regions) => {
+                let region = TMemoryRegion::new_file_backed_regions(
+                    requested_byte_capacity,
+                    regions.clone(),
+                    true,
+                )?;
+                let byte_capacity = region.logical_len().max(requested_byte_capacity);
+                (region, byte_capacity)
+            }
+            _ => {
+                let byte_capacity =
+                    existing_file_backed_len(&file_backing)?.unwrap_or(requested_byte_capacity);
+                let byte_capacity = byte_capacity.max(requested_byte_capacity);
+                let region = TMemoryRegion::new_file_backed(
+                    byte_capacity,
+                    file_backed_region_mode(&file_backing)?,
+                )?;
+                (region, byte_capacity)
+            }
+        };
         let existing_pages = byte_capacity.div_ceil(WASM_PAGE_SIZE) as u64;
         let max_pages = max_pages.max(existing_pages);
         let granule_capacity = granules_for_bytes(byte_capacity);
 
         Ok(Self {
-            region: TMemoryRegion::new_file_backed(
-                byte_capacity,
-                file_backed_region_mode(&file_backing),
-            )?,
+            region,
             file_backing,
             granules: vec![TMemoryGranuleInfo::default(); granule_capacity],
             byte_len,
@@ -1109,14 +1154,17 @@ fn existing_file_backed_len(file_backing: &TMemoryFileBacking) -> Result<Option<
 
 fn file_backed_region_mode(
     file_backing: &TMemoryFileBacking,
-) -> block_region::FileBackedRegionMode {
-    match file_backing {
+) -> Result<block_region::FileBackedRegionMode> {
+    Ok(match file_backing {
         TMemoryFileBacking::Temp => block_region::FileBackedRegionMode::Temp,
         TMemoryFileBacking::Path(path) => block_region::FileBackedRegionMode::Path(path.clone()),
         TMemoryFileBacking::ExistingPath(path) => {
             block_region::FileBackedRegionMode::OpenExistingPath(path.clone())
         }
-    }
+        TMemoryFileBacking::Regions(_) | TMemoryFileBacking::ExistingRegions(_) => {
+            bail!("multi-region file-backed tmemory is not implemented yet")
+        }
+    })
 }
 
 impl TMemoryBackendStorage for FileBackedMemory {

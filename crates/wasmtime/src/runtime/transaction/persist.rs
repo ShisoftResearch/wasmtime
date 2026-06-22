@@ -2,6 +2,8 @@ use crate::prelude::*;
 #[cfg(test)]
 use crate::runtime::transaction::PersistentObjectRefRaw;
 use crate::runtime::transaction::PersistentRecoveredRecordLocation;
+#[cfg(test)]
+use crate::runtime::transaction::config::TMemoryRegionConfig;
 use crate::runtime::transaction::type_layout::{
     PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
 };
@@ -18,6 +20,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use super::persist_region_set::MultiRegionDurableLogBackend;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingPublication {
@@ -332,10 +337,59 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
     fn log_entries_for_test(&self, stream_id: u32) -> Vec<TxLogEntry>;
 
     #[cfg(test)]
+    fn latest_planned_recovery_worker_counts_for_test(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    #[cfg(test)]
+    fn latest_multi_region_recovery_timing_for_test(
+        &self,
+    ) -> Option<MultiRegionRecoveryTimingForTest> {
+        None
+    }
+
+    #[cfg(test)]
+    fn region_count_for_test(&self) -> usize {
+        1
+    }
+
+    #[cfg(test)]
+    fn log_entries_for_region_for_test(
+        &self,
+        region_index: usize,
+        stream_id: u32,
+    ) -> Vec<TxLogEntry> {
+        if region_index == 0 {
+            return self.log_entries_for_test(stream_id);
+        }
+        Vec::new()
+    }
+
+    #[cfg(test)]
+    fn has_type_layout_for_region_for_test(
+        &self,
+        region_index: usize,
+        id: TypeLayoutId,
+    ) -> Result<bool> {
+        if region_index == 0 {
+            return self.has_type_layout(id);
+        }
+        Ok(false)
+    }
+
+    #[cfg(test)]
     fn data_chunk_stream_id_for_data_block_for_test(&self, data_block: u32) -> Result<u32>;
 }
 
-trait DurableRegionStorage: core::fmt::Debug + Send + Sync {
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MultiRegionRecoveryTimingForTest {
+    pub(crate) region_recovery_elapsed: Vec<std::time::Duration>,
+    pub(crate) merge_elapsed: std::time::Duration,
+    pub(crate) total_elapsed: std::time::Duration,
+}
+
+pub(super) trait DurableRegionStorage: core::fmt::Debug + Send + Sync {
     fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor;
     fn refresh_from_image(&mut self) -> Result<()>;
     fn append_type_layout_metadata(&mut self, layout: &PersistentTypeLayout) -> Result<()>;
@@ -364,6 +418,13 @@ trait DurableRegionStorage: core::fmt::Debug + Send + Sync {
     where
         I: IntoIterator<Item = u32>;
     fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion>;
+    fn recover_region_snapshot_with_options(
+        &self,
+        options: crate::runtime::vm::RecoveryOptions,
+    ) -> Result<crate::runtime::vm::RecoveredRegion> {
+        let _ = options;
+        self.recover_region_snapshot()
+    }
     fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>>;
     fn retire_whole_dead_object_chunks(
         &mut self,
@@ -387,7 +448,7 @@ struct TxDurableStreamState {
 }
 
 #[derive(Debug)]
-struct DurableRegionLog<R> {
+pub(super) struct DurableRegionLog<R> {
     region: R,
     streams: BTreeMap<u32, StreamCursor>,
     pending_data_chunks: BTreeSet<u32>,
@@ -482,6 +543,45 @@ impl TxDurableLog {
     }
 
     #[cfg(test)]
+    pub(crate) fn latest_planned_recovery_worker_counts_for_test(&self) -> Vec<usize> {
+        self.storage
+            .latest_planned_recovery_worker_counts_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_multi_region_recovery_timing_for_test(
+        &self,
+    ) -> Option<MultiRegionRecoveryTimingForTest> {
+        self.storage
+            .latest_multi_region_recovery_timing_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn region_count_for_test(&self) -> usize {
+        self.storage.region_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn log_entries_for_region_for_test(
+        &self,
+        region_index: usize,
+        stream_id: u32,
+    ) -> Vec<TxLogEntry> {
+        self.storage
+            .log_entries_for_region_for_test(region_index, stream_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_type_layout_for_region_for_test(
+        &self,
+        region_index: usize,
+        id: TypeLayoutId,
+    ) -> Result<bool> {
+        self.storage
+            .has_type_layout_for_region_for_test(region_index, id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn data_chunk_stream_id_for_data_block_for_test(
         &self,
         data_block: u32,
@@ -547,13 +647,7 @@ impl TxDurableLog {
         region: FileBackedMemoryBlockRegion,
         shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Self {
-        Self::with_backend(DurableRegionLog {
-            region,
-            streams: BTreeMap::new(),
-            pending_data_chunks: BTreeSet::new(),
-            pending_log_blocks: BTreeSet::new(),
-            shared_allocator_lock,
-        })
+        Self::with_backend(DurableRegionLog::new(region, shared_allocator_lock))
     }
 
     #[cfg(test)]
@@ -566,13 +660,7 @@ impl TxDurableLog {
     #[cfg(test)]
     pub(crate) fn create_dax_pmem_research_for_test(payload_blocks: usize) -> Result<Self> {
         let region = DaxPmemBlockRegion::new_for_test(payload_blocks)?;
-        Ok(Self::with_backend(DurableRegionLog {
-            region,
-            streams: BTreeMap::new(),
-            pending_data_chunks: BTreeSet::new(),
-            pending_log_blocks: BTreeSet::new(),
-            shared_allocator_lock: None,
-        }))
+        Ok(Self::with_backend(DurableRegionLog::new(region, None)))
     }
 
     #[cfg(test)]
@@ -581,25 +669,49 @@ impl TxDurableLog {
         payload_blocks: usize,
     ) -> Result<Self> {
         let region = DaxPmemBlockRegion::create_fsdax_path(path.to_path_buf(), payload_blocks)?;
-        Ok(Self::with_backend(DurableRegionLog {
-            region,
-            streams: BTreeMap::new(),
-            pending_data_chunks: BTreeSet::new(),
-            pending_log_blocks: BTreeSet::new(),
-            shared_allocator_lock: None,
-        }))
+        Ok(Self::with_backend(DurableRegionLog::new(region, None)))
     }
 
     #[cfg(test)]
     pub(crate) fn open_dax_pmem_fsdax_for_test(path: &Path, payload_blocks: usize) -> Result<Self> {
         let region = DaxPmemBlockRegion::open_fsdax_path(path.to_path_buf(), payload_blocks)?;
-        Ok(Self::with_backend(DurableRegionLog {
-            region,
-            streams: BTreeMap::new(),
-            pending_data_chunks: BTreeSet::new(),
-            pending_log_blocks: BTreeSet::new(),
-            shared_allocator_lock: None,
-        }))
+        Ok(Self::with_backend(DurableRegionLog::new(region, None)))
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn create_dax_pmem_fsdax_regions_for_test(
+        regions: Vec<TMemoryRegionConfig>,
+    ) -> Result<Self> {
+        Ok(Self::with_backend(
+            MultiRegionDurableLogBackend::create_fsdax_regions_for_test(regions)?,
+        ))
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn open_dax_pmem_fsdax_regions_for_test(
+        regions: Vec<TMemoryRegionConfig>,
+    ) -> Result<Self> {
+        Ok(Self::with_backend(
+            MultiRegionDurableLogBackend::open_fsdax_regions_for_test(regions)?,
+        ))
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn create_file_backed_regions_for_test(
+        regions: Vec<TMemoryRegionConfig>,
+    ) -> Result<Self> {
+        Ok(Self::with_backend(
+            MultiRegionDurableLogBackend::create_file_backed_regions_for_test(regions)?,
+        ))
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn open_file_backed_regions_for_test(
+        regions: Vec<TMemoryRegionConfig>,
+    ) -> Result<Self> {
+        Ok(Self::with_backend(
+            MultiRegionDurableLogBackend::open_file_backed_regions_for_test(regions)?,
+        ))
     }
 
     #[cfg(test)]
@@ -828,6 +940,15 @@ impl DurableRegionStorage for FileBackedMemoryBlockRegion {
         crate::runtime::vm::block_region::recover_file_backed_region_snapshot(self)
     }
 
+    fn recover_region_snapshot_with_options(
+        &self,
+        options: crate::runtime::vm::RecoveryOptions,
+    ) -> Result<crate::runtime::vm::RecoveredRegion> {
+        crate::runtime::vm::block_region::recover_file_backed_region_snapshot_with_options(
+            self, options,
+        )
+    }
+
     fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
         FileBackedMemoryBlockRegion::object_data_chunk_start_for_block(self, data_block)
     }
@@ -932,6 +1053,15 @@ impl DurableRegionStorage for DaxPmemBlockRegion {
         crate::runtime::vm::block_region::recover_dax_pmem_region_snapshot(self)
     }
 
+    fn recover_region_snapshot_with_options(
+        &self,
+        options: crate::runtime::vm::RecoveryOptions,
+    ) -> Result<crate::runtime::vm::RecoveredRegion> {
+        crate::runtime::vm::block_region::recover_dax_pmem_region_snapshot_with_options(
+            self, options,
+        )
+    }
+
     fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
         DaxPmemBlockRegion::object_data_chunk_start_for_block(self, data_block)
     }
@@ -953,6 +1083,16 @@ impl<R> DurableRegionLog<R>
 where
     R: DurableRegionStorage,
 {
+    pub(super) fn new(region: R, shared_allocator_lock: Option<Arc<Mutex<()>>>) -> Self {
+        Self {
+            region,
+            streams: BTreeMap::new(),
+            pending_data_chunks: BTreeSet::new(),
+            pending_log_blocks: BTreeSet::new(),
+            shared_allocator_lock,
+        }
+    }
+
     fn stream_cursor(&mut self, stream_id: u32) -> Result<StreamCursor> {
         let stream = self.region.stream_cursor(stream_id);
         self.streams.insert(stream_id, stream);
@@ -972,6 +1112,37 @@ where
             return f(self);
         }
         f(self)
+    }
+
+    pub(super) fn mapped_len_bytes(&self) -> usize {
+        self.region.view().bytes_len()
+    }
+
+    pub(super) fn mapped_block_len(&self) -> Result<u32> {
+        let blocks = self.mapped_len_bytes() / crate::runtime::vm::block_region::BLOCK_SIZE;
+        u32::try_from(blocks).context("durable region block count overflow")
+    }
+
+    pub(super) fn recovered_region_input(
+        &self,
+    ) -> Result<crate::runtime::vm::RecoveredRegionInput> {
+        self.recovered_region_input_with_options(crate::runtime::vm::RecoveryOptions::default())
+    }
+
+    pub(super) fn recovered_region_input_with_options(
+        &self,
+        options: crate::runtime::vm::RecoveryOptions,
+    ) -> Result<crate::runtime::vm::RecoveredRegionInput> {
+        let recovered = self.region.recover_region_snapshot_with_options(options)?;
+        let view = self.region.view();
+        let mapped_source = view
+            .mapped_region_source()
+            .context("durable region recovery requires mapped source")?;
+        Ok(crate::runtime::vm::RecoveredRegionInput {
+            recovered,
+            mapped_source,
+            mapped_len: view.bytes_len(),
+        })
     }
 }
 
@@ -1066,13 +1237,8 @@ where
             Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>>,
         ) -> Result<()>,
     ) -> Result<bool> {
-        let recovered = self.region.recover_region_snapshot()?;
-        let source = self
-            .region
-            .view()
-            .mapped_region_source()
-            .context("durable region recovery requires mapped source")?;
-        f(&recovered, Some(source))?;
+        let input = self.recovered_region_input()?;
+        f(&input.recovered, Some(input.mapped_source))?;
         Ok(true)
     }
 
@@ -1708,6 +1874,7 @@ mod tests {
     use super::*;
     use crate::runtime::transaction::{
         ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi,
+        config::TMemoryRegionConfig,
         object_heap::encode_object_record_for_test,
         object_heap::{TxArrayHeader, TxObjectHeader},
         type_layout::{PersistentTypeLayout, StructTraceField, TraceSlotKind, TypeLayoutId},
@@ -2471,6 +2638,13 @@ mod tests {
     const STRESS_OBJECT_SAMPLE_STRIDE_COUNT: usize = 16;
     #[cfg(target_os = "linux")]
     const STRESS_DEFAULT_SEED: u64 = 0x5eed_dacc_2026_0621;
+    const STRESS_OBJECT_ID_ROOT_SHIFT: u32 = 48;
+    #[cfg(target_os = "linux")]
+    const STRESS_OBJECT_ID_LOCAL_MASK: u64 = (1u64 << STRESS_OBJECT_ID_ROOT_SHIFT) - 1;
+    #[cfg(target_os = "linux")]
+    const STRESS_MULTI_REGION_WINDOW_BASE_U64: u64 = 0x4000_0000_0000;
+    #[cfg(target_os = "linux")]
+    const STRESS_MULTI_REGION_WINDOW_STRIDE_U64: u64 = 1u64 << 40;
 
     #[cfg(target_os = "linux")]
     #[derive(Clone, Debug)]
@@ -2493,6 +2667,7 @@ mod tests {
         encoded_bytes: u64,
         populate_elapsed: std::time::Duration,
         recovery_elapsed: std::time::Duration,
+        recovery_samples: Vec<ObjectRecoverySample>,
         recovery_workers: usize,
         recovered_object_count: usize,
     }
@@ -2506,6 +2681,16 @@ mod tests {
         sample_count: usize,
         populate_elapsed: std::time::Duration,
         reopen_validate_elapsed: std::time::Duration,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug)]
+    struct RegionRecoveryStatsForTest {
+        root_index: usize,
+        numa_node: Option<i32>,
+        workers: usize,
+        recovered_bytes: u64,
+        elapsed: std::time::Duration,
     }
 
     #[cfg(target_os = "linux")]
@@ -2528,6 +2713,18 @@ mod tests {
         stride: Vec<ObjectRecoverySample>,
         last: Vec<ObjectRecoverySample>,
         next_stride_threshold: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct MultiRegionDaxObjectLogForTest {
+        root_index: usize,
+        path: std::path::PathBuf,
+        numa_node: Option<i32>,
+        object_count: usize,
+        encoded_bytes: u64,
+        seed: u64,
+        recovery_samples: Vec<ObjectRecoverySample>,
     }
 
     #[cfg(target_os = "linux")]
@@ -2611,6 +2808,172 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn dax_stress_object_id(root_index: usize, local_ordinal: u64) -> Result<u64> {
+        ensure!(
+            local_ordinal > 0,
+            "DAX stress object id local ordinal must be nonzero"
+        );
+        ensure!(
+            local_ordinal <= STRESS_OBJECT_ID_LOCAL_MASK,
+            "DAX stress object id local ordinal {local_ordinal} exceeds {}",
+            STRESS_OBJECT_ID_LOCAL_MASK
+        );
+        let root_slot = u64::try_from(root_index).context("stress root index exceeds u64")?;
+        let root_base = root_slot
+            .checked_shl(STRESS_OBJECT_ID_ROOT_SHIFT)
+            .context("stress object id root partition shift overflow")?;
+        let object_id = root_base
+            .checked_add(local_ordinal)
+            .context("stress object id overflow")?;
+        ensure!(
+            object_id < (1u64 << 60),
+            "DAX stress object id {object_id} exceeds packed object id limit"
+        );
+        Ok(object_id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dax_stress_existing_file_len(path: &Path) -> Result<usize> {
+        let len = std::fs::metadata(path)
+            .with_context(|| format!("reading metadata for {}", path.display()))?
+            .len();
+        ensure!(len > 0, "DAX stress log {} is empty", path.display());
+        usize::try_from(len).with_context(|| {
+            format!(
+                "DAX stress log {} length {len} exceeds addressable usize",
+                path.display()
+            )
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_multi_region_dax_object_log_configs_for_test(
+        regions: &[MultiRegionDaxObjectLogForTest],
+    ) -> Result<Vec<TMemoryRegionConfig>> {
+        ensure!(
+            !regions.is_empty(),
+            "multi-region DAX object recovery requires at least one region"
+        );
+
+        let mut configs = Vec::with_capacity(regions.len());
+        for (slot, region) in regions.iter().enumerate() {
+            let reserved_len = dax_stress_existing_file_len(&region.path)?;
+            ensure!(
+                reserved_len % crate::runtime::vm::block_region::BLOCK_SIZE == 0,
+                "multi-region DAX object log {} length {} is not block-aligned",
+                region.path.display(),
+                reserved_len
+            );
+            ensure!(
+                u64::try_from(reserved_len).unwrap() <= STRESS_MULTI_REGION_WINDOW_STRIDE_U64,
+                "multi-region DAX object log {} length {} exceeds fixed window stride {}",
+                region.path.display(),
+                reserved_len,
+                STRESS_MULTI_REGION_WINDOW_STRIDE_U64
+            );
+            let slot_u64 = u64::try_from(slot).context("multi-region stress region slot overflow")?;
+            let address_base_u64 = STRESS_MULTI_REGION_WINDOW_BASE_U64
+                .checked_add(
+                    slot_u64
+                        .checked_mul(STRESS_MULTI_REGION_WINDOW_STRIDE_U64)
+                        .context("multi-region stress fixed-window offset overflow")?,
+                )
+                .context("multi-region stress fixed-window base overflow")?;
+            let address_base = usize::try_from(address_base_u64).with_context(|| {
+                format!(
+                    "multi-region stress fixed-window base {address_base_u64:#x} exceeds usize"
+                )
+            })?;
+            configs.push(TMemoryRegionConfig {
+                path: region.path.clone(),
+                address_base,
+                reserved_len,
+                numa_node: region.numa_node,
+            });
+        }
+
+        Ok(configs)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_multi_region_dax_object_recovery_for_test(
+        regions: &[MultiRegionDaxObjectLogForTest],
+    ) -> Result<(
+        Vec<RegionRecoveryStatsForTest>,
+        std::time::Duration,
+        std::time::Duration,
+    )> {
+        ensure!(
+            regions.len() >= 2,
+            "multi-region DAX object recovery requires at least two regions"
+        );
+
+        let configs = build_multi_region_dax_object_log_configs_for_test(regions)?;
+        let log = TxDurableLog::open_dax_pmem_fsdax_regions_for_test(configs)?;
+        let recovered = log
+            .recover_region_snapshot()?
+            .context("expected multi-region DAX PMEM durable log recovery snapshot")?;
+        let timing = log
+            .latest_multi_region_recovery_timing_for_test()
+            .context("multi-region DAX object recovery did not report phase timing")?;
+        let worker_counts = log.latest_planned_recovery_worker_counts_for_test();
+        ensure!(
+            worker_counts.len() == regions.len(),
+            "multi-region DAX object recovery reported {} region worker counts for {} regions",
+            worker_counts.len(),
+            regions.len()
+        );
+        ensure!(
+            timing.region_recovery_elapsed.len() == regions.len(),
+            "multi-region DAX object recovery reported {} region timings for {} regions",
+            timing.region_recovery_elapsed.len(),
+            regions.len()
+        );
+        let recovered_winners = recovered.committed_object_winners()?;
+        let expected_object_count = regions.iter().map(|region| region.object_count).sum::<usize>();
+        ensure!(
+            recovered_winners.len() == expected_object_count,
+            "multi-region recovered object count mismatch: published {expected_object_count}, recovered {}",
+            recovered_winners.len()
+        );
+        let winners_by_id = recovered_winners
+            .iter()
+            .map(|winner| (winner.object_id, winner))
+            .collect::<BTreeMap<u64, &RecoveredObjectWinner>>();
+        let mapped_source = recovered
+            .mapped_region_source()
+            .context("multi-region recovered DAX PMEM snapshot does not expose a mapped region source")?;
+        for region in regions {
+            validate_recovered_object_samples(
+                region.seed,
+                &region.recovery_samples,
+                &winners_by_id,
+                mapped_source,
+            )
+            .with_context(|| {
+                format!(
+                    "validating multi-region DAX object recovery samples for root {}",
+                    region.root_index
+                )
+            })?;
+        }
+
+        let region_stats = regions
+            .iter()
+            .zip(worker_counts)
+            .zip(timing.region_recovery_elapsed.iter().copied())
+            .map(|((region, workers), elapsed)| RegionRecoveryStatsForTest {
+                root_index: region.root_index,
+                numa_node: region.numa_node,
+                workers,
+                recovered_bytes: region.encoded_bytes,
+                elapsed,
+            })
+            .collect::<Vec<_>>();
+        Ok((region_stats, timing.merge_elapsed, timing.total_elapsed))
+    }
+
+    #[cfg(target_os = "linux")]
     fn dax_pmem_fsdax_stress_impl(config: &DaxPmemStressConfig) -> Result<()> {
         let object_target_bytes = config
             .bytes_per_root
@@ -2626,6 +2989,8 @@ mod tests {
             .bytes_per_root
             .checked_sub(object_target_bytes + linear_target_bytes)
             .context("per-root stress split overflow")?;
+        let mut multi_region_object_logs = Vec::with_capacity(config.roots.len());
+        let mut cleanup_paths = Vec::new();
 
         for (root_index, root) in config.roots.iter().enumerate() {
             std::fs::create_dir_all(root)
@@ -2633,11 +2998,12 @@ mod tests {
 
             let root_seed = config.seed.wrapping_add(u64::try_from(root_index).unwrap())
                 ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9);
+            let object_seed = root_seed ^ 0x0b1e_c710_6a2d_5f51;
             let object = run_dax_object_stress(
                 root,
                 root_index,
                 object_target_bytes,
-                root_seed ^ 0x0b1e_c710_6a2d_5f51,
+                object_seed,
             )?;
             let linear = run_dax_linear_stress(
                 root,
@@ -2658,12 +3024,36 @@ mod tests {
                     &linear,
                 )
             );
+            let numa_node = infer_dax_stress_numa_node(root);
+            multi_region_object_logs.push(MultiRegionDaxObjectLogForTest {
+                root_index,
+                path: object.path.clone(),
+                numa_node,
+                object_count: object.object_count,
+                encoded_bytes: object.encoded_bytes,
+                seed: object_seed,
+                recovery_samples: object.recovery_samples.clone(),
+            });
+            cleanup_paths.push(object.path.clone());
+            cleanup_paths.extend(linear.paths.iter().cloned());
+        }
 
-            if !config.keep_files {
-                remove_file_if_exists(&object.path)?;
-                for path in &linear.paths {
-                    remove_file_if_exists(path)?;
-                }
+        if multi_region_object_logs.len() >= 2 {
+            let (region_recovery, merge_elapsed, total_elapsed) =
+                run_multi_region_dax_object_recovery_for_test(&multi_region_object_logs)?;
+            eprintln!(
+                "{}",
+                format_multi_region_dax_recovery_line_for_test(
+                    &region_recovery,
+                    merge_elapsed,
+                    total_elapsed,
+                )
+            );
+        }
+
+        if !config.keep_files {
+            for path in cleanup_paths {
+                remove_file_if_exists(&path)?;
             }
         }
 
@@ -2788,7 +3178,7 @@ mod tests {
         log.ensure_type_layout(&layout)?;
 
         let mut rng = StressRng::new(seed);
-        let mut object_id = 1u64;
+        let mut local_object_ordinal = 1u64;
         let mut txid = 1u32;
         let mut object_count = 0usize;
         let mut bucket_counts = [0u64; 5];
@@ -2801,6 +3191,7 @@ mod tests {
 
         while encoded_bytes < target_encoded_bytes {
             let (requested_bytes, bucket_index) = sample_object_logical_size(&mut rng);
+            let object_id = dax_stress_object_id(root_index, local_object_ordinal)?;
             let payload = deterministic_array_payload(seed, object_id, requested_bytes)?;
             let record =
                 encode_object_record_for_test(object_id, 1, STRESS_ARRAY_TYPE_LAYOUT_ID, &payload)?;
@@ -2825,9 +3216,9 @@ mod tests {
                 .context("object batch byte counter overflow")?;
             recovery_samples.observe(object_id, requested_bytes, encoded_bytes);
             object_count += 1;
-            object_id = object_id
+            local_object_ordinal = local_object_ordinal
                 .checked_add(1)
-                .context("object id overflow during stress test")?;
+                .context("stress object ordinal overflow during stress test")?;
 
             if batch_encoded_bytes >= STRESS_OBJECT_ENCODED_BATCH_BYTES
                 || batch.len() >= STRESS_OBJECT_BATCH_PUBLICATIONS
@@ -2879,6 +3270,7 @@ mod tests {
             encoded_bytes,
             populate_elapsed,
             recovery_elapsed,
+            recovery_samples,
             recovery_workers,
             recovered_object_count,
         })
@@ -2925,6 +3317,84 @@ pages={} linear_segments={} obj_path={} tmemory_path={}",
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn format_multi_region_dax_recovery_line_for_test(
+        regions: &[RegionRecoveryStatsForTest],
+        merge_elapsed: std::time::Duration,
+        total_elapsed: std::time::Duration,
+    ) -> String {
+        let roots = regions
+            .iter()
+            .map(|region| region.root_index.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let region_workers = regions
+            .iter()
+            .map(|region| region.workers.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let numa = regions
+            .iter()
+            .map(|region| match region.numa_node {
+                Some(node) => node.to_string(),
+                None => "?".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let region_recovery_mibps = regions
+            .iter()
+            .map(|region| format!("{:.1}", mib_per_sec(region.recovered_bytes, region.elapsed)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let region_recovery_elapsed = regions
+            .iter()
+            .map(|region| format!("{:.3}", region.elapsed.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let region_recovery_max = regions
+            .iter()
+            .map(|region| region.elapsed)
+            .max()
+            .unwrap_or_default();
+        let total_workers = regions.iter().map(|region| region.workers).sum::<usize>();
+        let total_recovered_bytes = regions
+            .iter()
+            .map(|region| region.recovered_bytes)
+            .sum::<u64>();
+
+        format!(
+            "dax-stress multi-root roots=[{roots}] region_workers=[{region_workers}] \
+total_workers={total_workers} worker_budget=planned numa=[{numa}] region_recovery_mibps=[{region_recovery_mibps}] \
+region_recovery_elapsed=[{region_recovery_elapsed}]s region_recovery_max={:.3}s merge_elapsed={:.3}s \
+total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
+            region_recovery_max.as_secs_f64(),
+            merge_elapsed.as_secs_f64(),
+            mib_per_sec(total_recovered_bytes, total_elapsed),
+            bytes_to_mib(total_recovered_bytes),
+            total_elapsed.as_secs_f64(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn infer_dax_stress_numa_node(root: &Path) -> Option<i32> {
+        root.components().find_map(|component| {
+            let std::path::Component::Normal(name) = component else {
+                return None;
+            };
+            let name = name.to_str()?;
+            parse_dax_stress_numa_component(name)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_dax_stress_numa_component(component: &str) -> Option<i32> {
+        let suffix = component.strip_prefix("pmem")?;
+        if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        suffix.parse::<i32>().ok()
     }
 
     #[cfg(target_os = "linux")]
@@ -3697,6 +4167,7 @@ pages={} linear_segments={} obj_path={} tmemory_path={}",
             encoded_bytes: 128 * 1024 * 1024,
             populate_elapsed: std::time::Duration::from_secs(2),
             recovery_elapsed: std::time::Duration::from_millis(250),
+            recovery_samples: Vec::new(),
             recovery_workers: 7,
             recovered_object_count: 23,
         };
@@ -3721,6 +4192,107 @@ pages={} linear_segments={} obj_path={} tmemory_path={}",
 
         assert!(line.contains("rec=0.250s rec_workers=7 lin=16.0MiB/s"));
         assert!(line.contains("objects=23 recovered=23"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_stress_line_reports_multi_region_recovery_workers() {
+        let regions = vec![
+            RegionRecoveryStatsForTest {
+                root_index: 0,
+                numa_node: Some(0),
+                workers: 16,
+                recovered_bytes: 512 * 1024 * 1024,
+                elapsed: std::time::Duration::from_secs(1),
+            },
+            RegionRecoveryStatsForTest {
+                root_index: 1,
+                numa_node: Some(1),
+                workers: 16,
+                recovered_bytes: 512 * 1024 * 1024,
+                elapsed: std::time::Duration::from_secs(1),
+            },
+        ];
+
+        let line = format_multi_region_dax_recovery_line_for_test(
+            &regions,
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(1250),
+        );
+
+        assert!(line.contains("region_workers=[16,16]"));
+        assert!(line.contains("total_workers=32"));
+        assert!(line.contains("worker_budget=planned"));
+        assert!(line.contains("numa=[0,1]"));
+        assert!(line.contains("region_recovery_elapsed=["));
+        assert!(line.contains("region_recovery_max=1.000s"));
+        assert!(line.contains("merge_elapsed=0.250s"));
+        assert!(line.contains("total_recovery_elapsed=1.250s"));
+        assert!(line.contains("total_recovery_mibps=819.2"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_stress_multi_region_object_log_configs_use_existing_file_lengths() {
+        let temp = tempfile::tempdir().unwrap();
+        let pmem0 = temp.path().join("pmem0");
+        let pmem1 = temp.path().join("pmem1");
+        std::fs::create_dir_all(&pmem0).unwrap();
+        std::fs::create_dir_all(&pmem1).unwrap();
+
+        let path0 = pmem0.join("object-0.log");
+        let path1 = pmem1.join("object-1.log");
+        std::fs::File::create(&path0)
+            .unwrap()
+            .set_len(16 * 1024 * 1024)
+            .unwrap();
+        std::fs::File::create(&path1)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+
+        let regions = vec![
+            MultiRegionDaxObjectLogForTest {
+                root_index: 0,
+                path: path0.clone(),
+                numa_node: infer_dax_stress_numa_node(&pmem0),
+                object_count: 0,
+                encoded_bytes: 0,
+                seed: 0,
+                recovery_samples: Vec::new(),
+            },
+            MultiRegionDaxObjectLogForTest {
+                root_index: 1,
+                path: path1.clone(),
+                numa_node: infer_dax_stress_numa_node(&pmem1),
+                object_count: 0,
+                encoded_bytes: 0,
+                seed: 0,
+                recovery_samples: Vec::new(),
+            },
+        ];
+
+        let configs = build_multi_region_dax_object_log_configs_for_test(&regions).unwrap();
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].path, path0);
+        assert_eq!(configs[0].reserved_len, 16 * 1024 * 1024);
+        assert_eq!(configs[0].numa_node, Some(0));
+        assert_eq!(configs[1].path, path1);
+        assert_eq!(configs[1].reserved_len, 32 * 1024 * 1024);
+        assert_eq!(configs[1].numa_node, Some(1));
+        assert!(configs[0].address_base < configs[1].address_base);
+        assert!(configs[0].address_base + configs[0].reserved_len <= configs[1].address_base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dax_stress_object_ids_are_root_unique() {
+        assert_eq!(dax_stress_object_id(0, 1).unwrap(), 1);
+        let second_root_first = dax_stress_object_id(1, 1).unwrap();
+        let second_root_second = dax_stress_object_id(1, 2).unwrap();
+        assert!(second_root_first > dax_stress_object_id(0, 2).unwrap());
+        assert_eq!(second_root_second, second_root_first + 1);
     }
 
     #[test]
@@ -3961,6 +4533,32 @@ pages={} linear_segments={} obj_path={} tmemory_path={}",
 
         let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
         assert_eq!(recovered.tmemory_undo_rollbacks.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_backed_multi_region_durable_log_test_constructors_expose_region_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let reserved_len = 32 * crate::runtime::vm::block_region::BLOCK_SIZE;
+        let regions = vec![
+            TMemoryRegionConfig::new_for_test(
+                dir.path().join("tx-log-a.bin"),
+                0x6000_0000_0000,
+                reserved_len,
+            ),
+            TMemoryRegionConfig::new_for_test(
+                dir.path().join("tx-log-b.bin"),
+                0x6000_0200_0000,
+                reserved_len,
+            ),
+        ];
+
+        let log = TxDurableLog::create_file_backed_regions_for_test(regions.clone()).unwrap();
+        assert_eq!(log.region_count_for_test(), 2);
+        drop(log);
+
+        let reopened = TxDurableLog::open_file_backed_regions_for_test(regions).unwrap();
+        assert_eq!(reopened.region_count_for_test(), 2);
     }
 
     #[test]

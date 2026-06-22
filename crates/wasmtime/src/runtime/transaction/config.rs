@@ -1,4 +1,7 @@
 use crate::prelude::*;
+use crate::runtime::vm::{
+    RegionAddressWindow, RegionBackendKind, RegionDescriptor, RegionId, RegionSetDescriptor,
+};
 use std::path::PathBuf;
 
 #[cfg(all(
@@ -151,10 +154,36 @@ pub(crate) enum TMemoryPersistenceMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TMemoryRegionConfig {
+    pub(crate) path: PathBuf,
+    pub(crate) address_base: usize,
+    pub(crate) reserved_len: usize,
+    pub(crate) numa_node: Option<i32>,
+}
+
+impl TMemoryRegionConfig {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        path: impl Into<PathBuf>,
+        address_base: usize,
+        reserved_len: usize,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            address_base,
+            reserved_len,
+            numa_node: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TMemoryDaxPmemBacking {
     ResearchTemp,
     FsDaxPath(PathBuf),
     ExistingFsDaxPath(PathBuf),
+    FsDaxRegions(Vec<TMemoryRegionConfig>),
+    ExistingFsDaxRegions(Vec<TMemoryRegionConfig>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +191,45 @@ pub(crate) enum TMemoryFileBacking {
     Temp,
     Path(PathBuf),
     ExistingPath(PathBuf),
+    Regions(Vec<TMemoryRegionConfig>),
+    ExistingRegions(Vec<TMemoryRegionConfig>),
+}
+
+fn validate_tmemory_regions(
+    regions: &[TMemoryRegionConfig],
+    empty_path_message: &'static str,
+    backend: RegionBackendKind,
+) -> Result<()> {
+    ensure!(
+        !regions.is_empty(),
+        "multi-region tmemory configuration requires at least one region"
+    );
+
+    let descriptors = regions
+        .iter()
+        .enumerate()
+        .map(|(index, region)| {
+            let id = u32::try_from(index).context("too many regions in tmemory configuration")?;
+
+            ensure!(!region.path.as_os_str().is_empty(), "{empty_path_message}");
+            Ok(RegionDescriptor {
+                id: RegionId(id),
+                backend,
+                path: region.path.clone(),
+                window: RegionAddressWindow {
+                    base: region.address_base,
+                    reserved_len: region.reserved_len,
+                    mapped_len: region.reserved_len,
+                },
+                numa_node: region.numa_node,
+                cpu_set: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let _ = RegionSetDescriptor::new(descriptors)?;
+
+    Ok(())
 }
 
 /// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. Policy selection is
@@ -340,6 +408,56 @@ impl TransactionConfig {
         Ok(config)
     }
 
+    pub(crate) fn with_dax_pmem_fsdax_regions(regions: Vec<TMemoryRegionConfig>) -> Result<Self> {
+        validate_tmemory_regions(
+            &regions,
+            "DAX PMEM fsdax path cannot be empty",
+            RegionBackendKind::DaxPmem,
+        )?;
+        let mut config = Self::default();
+        config.set_dax_pmem_backing(TMemoryDaxPmemBacking::FsDaxRegions(regions))?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_dax_pmem_existing_fsdax_regions(
+        regions: Vec<TMemoryRegionConfig>,
+    ) -> Result<Self> {
+        validate_tmemory_regions(
+            &regions,
+            "DAX PMEM fsdax path cannot be empty",
+            RegionBackendKind::DaxPmem,
+        )?;
+        let mut config = Self::default();
+        config.set_dax_pmem_backing(TMemoryDaxPmemBacking::ExistingFsDaxRegions(regions))?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_file_backed_tmemory_regions(
+        regions: Vec<TMemoryRegionConfig>,
+    ) -> Result<Self> {
+        validate_tmemory_regions(
+            &regions,
+            "file-backed tmemory path cannot be empty",
+            RegionBackendKind::FileBacked,
+        )?;
+        let mut config = Self::default();
+        config.set_file_backed_tmemory(TMemoryFileBacking::Regions(regions))?;
+        Ok(config)
+    }
+
+    pub(crate) fn with_file_backed_tmemory_existing_regions(
+        regions: Vec<TMemoryRegionConfig>,
+    ) -> Result<Self> {
+        validate_tmemory_regions(
+            &regions,
+            "file-backed tmemory path cannot be empty",
+            RegionBackendKind::FileBacked,
+        )?;
+        let mut config = Self::default();
+        config.set_file_backed_tmemory(TMemoryFileBacking::ExistingRegions(regions))?;
+        Ok(config)
+    }
+
     pub(crate) fn with_object_index_persistence_policy(
         object_index_persistence_policy: ObjectIndexPersistencePolicy,
     ) -> Result<Self> {
@@ -395,17 +513,20 @@ impl TransactionConfig {
     pub(crate) fn has_path_backed_dax_pmem_tmemory(&self) -> bool {
         self.tmemory_backend == TMemoryBackend::DaxPmem
             && matches!(
-                self.tmemory_dax_pmem_backing,
+                self.tmemory_dax_pmem_backing.as_ref(),
                 Some(TMemoryDaxPmemBacking::FsDaxPath(_))
                     | Some(TMemoryDaxPmemBacking::ExistingFsDaxPath(_))
+                    | Some(TMemoryDaxPmemBacking::FsDaxRegions(_))
+                    | Some(TMemoryDaxPmemBacking::ExistingFsDaxRegions(_))
             )
     }
 
     pub(crate) fn has_existing_dax_pmem_tmemory(&self) -> bool {
         self.tmemory_backend == TMemoryBackend::DaxPmem
             && matches!(
-                self.tmemory_dax_pmem_backing,
+                self.tmemory_dax_pmem_backing.as_ref(),
                 Some(TMemoryDaxPmemBacking::ExistingFsDaxPath(_))
+                    | Some(TMemoryDaxPmemBacking::ExistingFsDaxRegions(_))
             )
     }
 
@@ -438,7 +559,10 @@ impl TransactionConfig {
         self.tmemory_backend = TMemoryBackend::DaxPmem;
         self.tmemory_persistence_mode = match &backing {
             TMemoryDaxPmemBacking::ResearchTemp => TMemoryPersistenceMode::ResearchPretendDaxPmem,
-            TMemoryDaxPmemBacking::FsDaxPath(_) | TMemoryDaxPmemBacking::ExistingFsDaxPath(_) => {
+            TMemoryDaxPmemBacking::FsDaxPath(_)
+            | TMemoryDaxPmemBacking::ExistingFsDaxPath(_)
+            | TMemoryDaxPmemBacking::FsDaxRegions(_)
+            | TMemoryDaxPmemBacking::ExistingFsDaxRegions(_) => {
                 TMemoryPersistenceMode::RequireDaxPmem
             }
         };
