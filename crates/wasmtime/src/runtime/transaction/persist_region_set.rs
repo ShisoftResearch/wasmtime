@@ -517,6 +517,14 @@ where
         )?))
     }
 
+    fn cloned_mapped_region_source(
+        &self,
+    ) -> Option<alloc::sync::Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>> {
+        self.selected_region()
+            .ok()
+            .and_then(DurableRegionLog::cloned_mapped_region_source)
+    }
+
     fn retire_whole_dead_object_chunks(
         &mut self,
         reachable: &[crate::runtime::transaction::PersistentRecoveredRecordLocation],

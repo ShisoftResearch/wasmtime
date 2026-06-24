@@ -22,7 +22,7 @@ pub(crate) struct TransactionState {
     pub(super) staged_memory_sizes: BTreeMap<GranuleId, u64>,
     pub(super) staged_table_sizes: BTreeMap<GranuleId, u64>,
     pub(super) staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
-    pub(super) staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    pub(super) staged_objects: BTreeMap<ObjectId, StagedObjectRecord>,
     pub(super) pending_persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     pub(super) promoted_objects: BTreeMap<ObjectId, ObjectId>,
     pub(super) promoted_gc_refs: BTreeMap<u32, ObjectId>,
@@ -47,7 +47,7 @@ pub(super) struct TransactionWorkspace {
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
     staged_table_sizes: BTreeMap<GranuleId, u64>,
     staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
-    staged_objects: BTreeMap<ObjectId, ObjectPayload>,
+    staged_objects: BTreeMap<ObjectId, StagedObjectRecord>,
     pending_persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
     promoted_gc_refs: BTreeMap<u32, ObjectId>,
@@ -100,6 +100,25 @@ impl Default for TransactionState {
             pending_memory_store: None,
             durable_log: TxDurableLog::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StagedObjectRecord {
+    payload: ObjectPayload,
+}
+
+impl StagedObjectRecord {
+    pub(crate) fn new(payload: ObjectPayload) -> Self {
+        Self { payload }
+    }
+
+    pub(crate) fn payload(&self) -> &ObjectPayload {
+        &self.payload
+    }
+
+    pub(crate) fn into_payload(self) -> ObjectPayload {
+        self.payload
     }
 }
 
@@ -401,8 +420,26 @@ impl TransactionState {
         object_table: &ObjectTable,
         publications: &[persist::PendingPublication],
     ) -> Result<Option<PendingCommitLogEntry>> {
+        Ok(self
+            .publish_object_publications_before_commit_with_markers(
+                stream_id,
+                txid,
+                object_table,
+                publications,
+            )?
+            .last()
+            .copied())
+    }
+
+    pub(crate) fn publish_object_publications_before_commit_with_markers(
+        &mut self,
+        stream_id: u32,
+        txid: u32,
+        object_table: &ObjectTable,
+        publications: &[persist::PendingPublication],
+    ) -> Result<Vec<PendingCommitLogEntry>> {
         if publications.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         self.uncommitted_publication_streams.insert(stream_id);
         let mut required_layout_ids = BTreeSet::new();
@@ -421,7 +458,37 @@ impl TransactionState {
 
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-        publisher.publish_object_publications_before_commit(publications)
+        publisher.publish_object_publications_before_commit_with_markers(publications)
+    }
+
+    pub(crate) fn install_committed_mapped_object_publications(
+        &self,
+        object_table: &mut ObjectTable,
+        publications: &[persist::PendingPublication],
+        markers: &[PendingCommitLogEntry],
+    ) -> Result<Vec<ObjectId>> {
+        ensure!(
+            publications.len() == markers.len(),
+            "committed publication marker count does not match publication count"
+        );
+        let mut has_object_publication = false;
+        for publication in publications {
+            if publication.persistent_object_type_layout_id()?.is_some() {
+                has_object_publication = true;
+                break;
+            }
+        }
+        if !has_object_publication {
+            return Ok(Vec::new());
+        }
+        let Some(mapped_source) = self.durable_log.cloned_mapped_region_source() else {
+            return object_table.install_committed_serialized_persistent_publications(publications);
+        };
+        object_table.install_committed_mapped_persistent_publications(
+            publications,
+            markers,
+            mapped_source,
+        )
     }
 
     pub(crate) fn publish_commit_lp(
@@ -1810,8 +1877,8 @@ impl TransactionState {
                 "transactional object read permission was not acquired"
             );
         }
-        if let Some(payload) = self.staged_objects.get(&object_id) {
-            return Ok(payload.clone());
+        if let Some(record) = self.staged_objects.get(&object_id) {
+            return Ok(record.payload().clone());
         }
         object_table.payload(object_id)
     }
@@ -1833,7 +1900,10 @@ impl TransactionState {
                 "transactional object write permission was not acquired"
             );
         }
-        Ok(self.staged_objects.insert(object_id, payload).is_none())
+        Ok(self
+            .staged_objects
+            .insert(object_id, StagedObjectRecord::new(payload))
+            .is_none())
     }
 
     pub(crate) fn read_struct_field(
@@ -1996,7 +2066,10 @@ impl TransactionState {
         &mut self,
         object_table: &mut ObjectTable,
     ) -> Result<bool> {
-        self.commit_object_payloads_with(object_table, |_| Ok(()))
+        let mut publications = Vec::new();
+        let committed = self.commit_object_payloads_into(object_table, &mut publications)?;
+        object_table.install_committed_serialized_persistent_publications(&publications)?;
+        Ok(committed)
     }
 
     pub(crate) fn commit_object_payloads_into(
@@ -2188,7 +2261,7 @@ impl TransactionState {
             let (_, object_index) =
                 crate::runtime::vm::unpack_object_granule_id(publication.logical_id)?;
             let from = ObjectId { object_index };
-            for to in object_table.trace_object_ids(from)? {
+            for to in object_table.trace_persistent_publication_object_ids(publication)? {
                 if let Ok(slot) = object_table.live_slot(to)
                     && slot.persistent
                 {
@@ -2536,18 +2609,18 @@ impl TransactionState {
             .next_id
             .checked_add(1)
             .context("transaction id overflow")?;
-        let marker = self
-            .publish_object_publications_before_commit(
-                stream_id,
-                stream_id,
-                objects,
-                &publications,
-            )?
+        let markers = self.publish_object_publications_before_commit_with_markers(
+            stream_id,
+            stream_id,
+            objects,
+            &publications,
+        )?;
+        let marker = markers
+            .last()
+            .copied()
             .context("GC maintenance transaction did not publish copied object records")?;
         self.publish_commit_lp(stream_id, stream_id, marker)?;
-        for publication in &publications {
-            objects.install_persistent_gc_copied_publication(publication)?;
-        }
+        self.install_committed_mapped_object_publications(objects, &publications, &markers)?;
 
         let mut reachable_after = Vec::new();
         let consumed =
@@ -2664,7 +2737,8 @@ impl TransactionState {
         let updates = self
             .staged_objects
             .iter()
-            .map(|(&object_id, payload)| {
+            .map(|(&object_id, record)| {
+                let payload = record.payload();
                 ensure!(
                     object_table.kind(object_id)? == payload.kind(),
                     "object payload kind does not match object table slot kind"
@@ -2675,11 +2749,12 @@ impl TransactionState {
         for (object_id, payload) in updates {
             let persistent = object_table.is_persistent(object_id)?;
             if persistent {
-                object_table.validate_persistent_payload_refs(&payload)?;
-            }
-            object_table.update_payload(object_id, payload)?;
-            if persistent {
-                publish(object_table.object_pending_publication(object_id)?)?;
+                publish(
+                    object_table
+                        .persistent_object_pending_publication_from_payload(object_id, &payload)?,
+                )?;
+            } else {
+                object_table.update_payload(object_id, payload)?;
             }
         }
         self.staged_objects.clear();
@@ -3333,7 +3408,9 @@ impl TransactionState {
         &self,
         object_id: ObjectId,
     ) -> Option<&ObjectPayload> {
-        self.staged_objects.get(&object_id)
+        self.staged_objects
+            .get(&object_id)
+            .map(StagedObjectRecord::payload)
     }
 
     pub(super) fn allocated_object_count_for_test(&self) -> usize {

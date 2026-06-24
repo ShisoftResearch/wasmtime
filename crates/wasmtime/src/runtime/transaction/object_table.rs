@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use crate::runtime::store::InstanceId;
-use crate::runtime::vm::block_region::MappedRegionSource;
+use crate::runtime::vm::block_region::{BLOCK_SIZE, MappedRegionSource};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -28,6 +28,8 @@ use super::{
     TransactionRegionRuntime, TxObjectHeader, object_gc, object_heap, persist,
 };
 use wasmtime_environ::VMSharedTypeIndex;
+
+const TX_DATA_RECORD_ROLE_OBJECT_PUBLICATION: u16 = 0;
 
 #[cfg(test)]
 use super::wasmtime_layout::{
@@ -1236,6 +1238,91 @@ impl ObjectTable {
             })
     }
 
+    pub(crate) fn trace_persistent_publication_object_ids(
+        &self,
+        publication: &persist::PendingPublication,
+    ) -> Result<Vec<ObjectId>> {
+        let (domain, object_index) =
+            crate::runtime::vm::unpack_object_granule_id(publication.logical_id)?;
+        ensure!(
+            publication.kind == domain as u16,
+            "persistent publication kind does not match logical id domain"
+        );
+        let header = TxObjectHeader::read_from_prefix(&publication.payload)?;
+        let kind = object_kind_from_u16(header.kind)?;
+        let type_layout_id = TypeLayoutId::new(header.type_layout_id)
+            .context("persistent publication object record type layout id cannot be zero")?;
+        ensure!(
+            header.object_id == object_index,
+            "persistent publication object record id does not match logical id"
+        );
+        ensure!(
+            header.version == publication.version,
+            "persistent publication object record version does not match publication"
+        );
+        ensure!(
+            header.type_layout_id == publication.type_layout_id,
+            "persistent publication object record type layout id does not match publication"
+        );
+        ensure!(
+            match domain {
+                crate::runtime::vm::PackedGranuleDomain::TStruct => {
+                    header.kind == ObjectKind::Struct as u16
+                }
+                crate::runtime::vm::PackedGranuleDomain::TArray => {
+                    header.kind == ObjectKind::Array as u16
+                }
+                _ => false,
+            },
+            "persistent publication object record kind does not match logical id domain"
+        );
+        self.validate_type_layout_for_object_kind(kind, type_layout_id)?;
+        self.trace_persistent_object_record_bytes(header, type_layout_id, &publication.payload)
+    }
+
+    fn trace_persistent_object_record_bytes(
+        &self,
+        header: TxObjectHeader,
+        type_layout_id: TypeLayoutId,
+        record_bytes: &[u8],
+    ) -> Result<Vec<ObjectId>> {
+        let array_length = if header.kind == ObjectKind::Array as u16 {
+            ensure!(
+                record_bytes.len() >= core::mem::size_of::<object_heap::TxArrayHeader>(),
+                "serialized array record is shorter than expected"
+            );
+            Some(u32::from_le_bytes(
+                record_bytes[core::mem::size_of::<TxObjectHeader>()
+                    ..core::mem::size_of::<TxObjectHeader>() + core::mem::size_of::<u32>()]
+                    .try_into()
+                    .unwrap(),
+            ))
+        } else {
+            None
+        };
+        let payload_start = object_heap::payload_offset_for_recovery(array_length);
+        let payload = record_bytes
+            .get(payload_start..)
+            .context("persistent object record payload is out of bounds")?;
+        let mut out = Vec::new();
+        if uses_placeholder_persistent_trace_fallback(type_layout_id) {
+            let decoded =
+                object_heap::decode_payload_bytes_for_recovery(header, array_length, record_bytes)?;
+            match decoded {
+                ObjectPayload::Struct(fields) | ObjectPayload::Array(fields) => {
+                    out.extend(fields.into_iter().filter_map(|value| match value {
+                        ObjectValue::Ref(Some(object_id)) => Some(object_id),
+                        _ => None,
+                    }));
+                }
+            }
+        } else {
+            let layout = self.require_type_layout(type_layout_id)?;
+            object_heap::trace_object_refs_with_layout(layout, payload, &mut out)?;
+        }
+        Ok(out)
+    }
+
     pub(crate) fn update_payload(
         &mut self,
         object_id: ObjectId,
@@ -1304,6 +1391,43 @@ impl ObjectTable {
         )
     }
 
+    pub(crate) fn persistent_object_pending_publication_from_payload(
+        &mut self,
+        object_id: ObjectId,
+        payload: &ObjectPayload,
+    ) -> Result<persist::PendingPublication> {
+        let slot = self.live_slot(object_id)?.clone();
+        ensure!(
+            slot.persistent,
+            "persistent object publication requires a persistent object: {object_id:?}"
+        );
+        ensure!(
+            slot.kind == payload.kind(),
+            "object payload kind does not match object table slot kind"
+        );
+        self.validate_persistent_payload_refs(payload)?;
+        let record_version = self.bump_record_version()?;
+        let record = object_heap::encode_object_record(
+            object_id.object_index,
+            record_version,
+            slot.kind as u16,
+            slot.type_layout_id,
+            payload,
+        )?;
+        let domain = match slot.kind {
+            ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
+            ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
+            other => bail!("object kind {other:?} is not a persistent object granule"),
+        };
+        persist::PendingPublication::persistent_object(
+            domain,
+            object_id.object_index,
+            record_version,
+            slot.type_layout_id,
+            record,
+        )
+    }
+
     pub(crate) fn persistent_gc_copy_publication(
         &mut self,
         object_id: ObjectId,
@@ -1335,6 +1459,179 @@ impl ObjectTable {
             slot.type_layout_id,
             record,
         )
+    }
+
+    pub(crate) fn install_committed_mapped_persistent_publications(
+        &mut self,
+        publications: &[persist::PendingPublication],
+        markers: &[persist::PendingCommitLogEntry],
+        mapped_source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+    ) -> Result<Vec<ObjectId>> {
+        ensure!(
+            publications.len() == markers.len(),
+            "committed publication marker count does not match publication count"
+        );
+        let mut installed = Vec::new();
+        for (publication, marker) in publications.iter().zip(markers) {
+            if let Some(object_id) = self.install_committed_mapped_persistent_publication(
+                publication,
+                *marker,
+                mapped_source.clone(),
+            )? {
+                installed.push(object_id);
+            }
+        }
+        Ok(installed)
+    }
+
+    pub(crate) fn install_committed_mapped_persistent_publication(
+        &mut self,
+        publication: &persist::PendingPublication,
+        marker: persist::PendingCommitLogEntry,
+        mapped_source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+    ) -> Result<Option<ObjectId>> {
+        let Some(type_layout_id) = publication.persistent_object_type_layout_id()? else {
+            return Ok(None);
+        };
+        ensure!(
+            marker.role == crate::runtime::vm::TxLogEntryRole::TObjectPub,
+            "committed persistent object marker must reference an object publication"
+        );
+        ensure!(
+            marker.logical_id == publication.logical_id && marker.version == publication.version,
+            "committed persistent object marker does not match publication"
+        );
+        let (domain, object_index) = crate::runtime::vm::unpack_object_granule_id(
+            publication.logical_id,
+        )
+        .context("committed persistent object publication logical id is not an object granule")?;
+        ensure!(
+            publication.kind == domain as u16,
+            "committed persistent object publication kind does not match logical id domain"
+        );
+        let object_id = ObjectId { object_index };
+        let index = object_slot_index(object_id)?;
+        let slot = self.live_slot(object_id)?.clone();
+        ensure!(
+            slot.persistent,
+            "committed persistent object install requires a persistent object: {object_id:?}"
+        );
+
+        let object_header = TxObjectHeader::read_from_prefix(&publication.payload)?;
+        let kind = object_kind_from_u16(object_header.kind)?;
+        let expected_kind = match domain {
+            crate::runtime::vm::PackedGranuleDomain::TStruct => ObjectKind::Struct,
+            crate::runtime::vm::PackedGranuleDomain::TArray => ObjectKind::Array,
+            _ => unreachable!("unpack_object_granule_id only returns durable object domains"),
+        };
+        ensure!(
+            kind == expected_kind,
+            "committed persistent object record kind does not match publication domain"
+        );
+        ensure!(
+            slot.kind == kind,
+            "committed persistent object record kind does not match object slot kind"
+        );
+        ensure!(
+            object_header.object_id == object_id.object_index,
+            "committed persistent object record id does not match publication"
+        );
+        ensure!(
+            object_header.version == publication.version,
+            "committed persistent object record version does not match publication"
+        );
+        ensure!(
+            object_header.type_layout_id == publication.type_layout_id,
+            "committed persistent object record type layout id does not match publication"
+        );
+        ensure!(
+            object_header.type_layout_id == type_layout_id.get(),
+            "committed persistent object record type layout id is not registered"
+        );
+        let publication_payload_len = u64::try_from(publication.payload.len())
+            .context("committed persistent object payload length overflow")?;
+        ensure!(
+            publication_payload_len == object_header.record_len,
+            "committed persistent object publication payload length does not match object record length"
+        );
+        self.validate_type_layout_for_object_kind(kind, type_layout_id)?;
+
+        let data_record_offset = durable_data_record_offset(marker.data_block, marker.data_offset)?;
+        let mut data_header = None;
+        mapped_source.with_mapped_slice(
+            data_record_offset,
+            core::mem::size_of::<crate::runtime::vm::TxDataRecordHeader>(),
+            &mut |bytes| {
+                data_header = Some(crate::runtime::vm::TxDataRecordHeader::from_bytes(bytes)?);
+                Ok(())
+            },
+        )?;
+        let data_header =
+            data_header.context("committed persistent object data header was not mapped")?;
+        ensure!(
+            data_header.logical_id == publication.logical_id
+                && data_header.version == publication.version
+                && data_header.kind == publication.kind
+                && data_header.role == TX_DATA_RECORD_ROLE_OBJECT_PUBLICATION
+                && data_header.type_info == publication.type_layout_id,
+            "mapped committed persistent object data header does not match publication"
+        );
+        ensure!(
+            u64::from(data_header.payload_len) == object_header.record_len,
+            "mapped committed persistent object data payload length does not match object record"
+        );
+
+        let winner = crate::runtime::vm::RecoveredObjectWinner {
+            object_id: object_id.object_index,
+            version: publication.version,
+            kind: object_header.kind,
+            type_layout_id: object_header.type_layout_id,
+            data_block: marker.data_block,
+            data_offset: marker.data_offset,
+            data_record_offset,
+            record_len: object_header.record_len,
+        };
+        let mut record = None;
+        let record_len =
+            usize::try_from(object_header.record_len).context("object record length overflow")?;
+        let payload_offset = data_record_offset
+            .checked_add(core::mem::size_of::<crate::runtime::vm::TxDataRecordHeader>())
+            .context("committed persistent object payload offset overflow")?;
+        mapped_source.with_mapped_slice(payload_offset, record_len, &mut |record_bytes| {
+            record = Some(self.heap.install_mapped_persistent_record(
+                &winner,
+                mapped_source.clone(),
+                record_bytes,
+            )?);
+            Ok(())
+        })?;
+        let record =
+            record.context("committed mapped persistent object record was not installed")?;
+        self.next_record_version = self.next_record_version.max(object_header.version);
+        let version = self.bump_object_version()?;
+        self.slots[index] = Some(ObjectTableSlot {
+            kind,
+            version,
+            type_layout_id: object_header.type_layout_id,
+            runtime_type_index: slot.runtime_type_index,
+            persistent: true,
+            current_record: record,
+        });
+        Ok(Some(object_id))
+    }
+
+    pub(crate) fn install_committed_serialized_persistent_publications(
+        &mut self,
+        publications: &[persist::PendingPublication],
+    ) -> Result<Vec<ObjectId>> {
+        let mut installed = Vec::new();
+        for publication in publications {
+            if publication.persistent_object_type_layout_id()?.is_none() {
+                continue;
+            }
+            installed.push(self.install_persistent_gc_copied_publication(publication)?);
+        }
+        Ok(installed)
     }
 
     pub(crate) fn install_persistent_gc_copied_publication(
@@ -2279,6 +2576,19 @@ fn rebuild_recovered_slots_len(
             .context("object slot range does not fit usize")
         })
         .transpose()
+}
+
+fn durable_data_record_offset(data_block: u32, data_offset: u32) -> Result<usize> {
+    let block = usize::try_from(data_block).context("durable data block overflow")?;
+    let offset = usize::try_from(data_offset).context("durable data offset overflow")?;
+    ensure!(
+        offset < BLOCK_SIZE,
+        "durable data offset exceeds block size"
+    );
+    block
+        .checked_mul(BLOCK_SIZE)
+        .and_then(|base| base.checked_add(offset))
+        .context("durable data record offset overflow")
 }
 
 /// Retires whole-dead object-data chunks in a recovered file-backed region image.

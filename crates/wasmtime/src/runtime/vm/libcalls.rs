@@ -812,18 +812,19 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         object_publications.extend(tmemory_size_publications);
         (object_publications, root_delta, persistent_gc_delta)
     };
+    let mut durable_publication_markers = Vec::new();
     if !durable_publications.is_empty() {
-        let object_marker = {
+        durable_publication_markers = {
             let store = store.store_opaque_mut();
             let (state, object_table) = store.transaction_state_and_object_table_mut();
-            state.publish_object_publications_before_commit(
+            state.publish_object_publications_before_commit_with_markers(
                 stream_id,
                 txid,
                 &*object_table,
                 &durable_publications,
             )?
         };
-        final_marker = object_marker.or(final_marker);
+        final_marker = durable_publication_markers.last().copied().or(final_marker);
     }
     let mut lp_published = false;
     if let Some(marker) = final_marker {
@@ -847,10 +848,33 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         .complete_commit_with_persistent_root_delta(root_delta);
     if let Err(error) = commit_result {
         if lp_published {
+            let object_install_result = if durable_publication_markers.is_empty() {
+                Ok(())
+            } else {
+                let store = store.store_opaque_mut();
+                let (state, object_table) = store.transaction_state_and_object_table_mut();
+                state
+                    .install_committed_mapped_object_publications(
+                        object_table,
+                        &durable_publications,
+                        &durable_publication_markers,
+                    )
+                    .map(|_| ())
+            };
             let cleanup_result = store
                 .store_opaque_mut()
                 .transaction_state_mut()
                 .finish_committed_cleanup_after_durable_commit_error();
+            if let Err(install_error) = object_install_result {
+                return match cleanup_result {
+                    Ok(()) => Err(install_error.context(format!(
+                        "transaction committed durably but object publication install after commit failure failed: {error}"
+                    ))),
+                    Err(cleanup_error) => Err(cleanup_error.context(format!(
+                        "transaction committed durably but object publication install and cleanup after commit failure also failed: {error}; object install error: {install_error}"
+                    ))),
+                };
+            }
             return match cleanup_result {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error.context(format!(
@@ -863,6 +887,13 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
 
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
+    if !durable_publication_markers.is_empty() {
+        state.install_committed_mapped_object_publications(
+            object_table,
+            &durable_publications,
+            &durable_publication_markers,
+        )?;
+    }
     // The transaction is already committed at this point. Persistent GC
     // observation is opportunistic runtime maintenance and must not turn a
     // completed commit into an apparent failure.

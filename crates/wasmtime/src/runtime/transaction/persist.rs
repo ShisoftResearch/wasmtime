@@ -325,6 +325,11 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
     fn object_data_chunk_start_for_block(&self, _data_block: u32) -> Result<Option<u32>> {
         Ok(None)
     }
+    fn cloned_mapped_region_source(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>> {
+        None
+    }
     fn retire_whole_dead_object_chunks(
         &mut self,
         _reachable: &[PersistentRecoveredRecordLocation],
@@ -519,6 +524,12 @@ impl TxDurableLog {
 
     pub(crate) fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
         self.storage.object_data_chunk_start_for_block(data_block)
+    }
+
+    pub(crate) fn cloned_mapped_region_source(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>> {
+        self.storage.cloned_mapped_region_source()
     }
 
     pub(crate) fn retire_whole_dead_object_chunks(
@@ -1123,6 +1134,12 @@ where
         u32::try_from(blocks).context("durable region block count overflow")
     }
 
+    pub(super) fn cloned_mapped_region_source(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>> {
+        self.region.view().mapped_region_source()
+    }
+
     pub(super) fn recovered_region_input(
         &self,
     ) -> Result<crate::runtime::vm::RecoveredRegionInput> {
@@ -1248,6 +1265,12 @@ where
 
     fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
         self.region.object_data_chunk_start_for_block(data_block)
+    }
+
+    fn cloned_mapped_region_source(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>> {
+        DurableRegionLog::cloned_mapped_region_source(self)
     }
 
     fn retire_whole_dead_object_chunks(
@@ -1459,9 +1482,19 @@ where
         &mut self,
         publications: &[PendingPublication],
     ) -> Result<Option<PendingCommitLogEntry>> {
+        Ok(self
+            .publish_object_publications_before_commit_with_markers(publications)?
+            .last()
+            .copied())
+    }
+
+    pub(crate) fn publish_object_publications_before_commit_with_markers(
+        &mut self,
+        publications: &[PendingPublication],
+    ) -> Result<Vec<PendingCommitLogEntry>> {
         let _ = self.stream_id;
         if publications.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let mut records = Vec::with_capacity(publications.len());
@@ -1476,7 +1509,7 @@ where
         self.sink.flush_data()?;
         self.sink.fence()?;
 
-        let mut final_marker = None;
+        let mut markers = Vec::with_capacity(records.len());
         for (publication, pointer) in records {
             self.sink.append_log_entry(
                 publication.logical_id,
@@ -1488,7 +1521,7 @@ where
                 false,
                 TxLogEntryRole::TObjectPub,
             )?;
-            final_marker = Some(PendingCommitLogEntry {
+            markers.push(PendingCommitLogEntry {
                 logical_id: publication.logical_id,
                 version: publication.version,
                 chunk_start_block: pointer.chunk_start_block,
@@ -1500,7 +1533,7 @@ where
         }
         self.sink.flush_log()?;
 
-        Ok(final_marker)
+        Ok(markers)
     }
 
     pub(crate) fn publish_commit_lp(&mut self, marker: PendingCommitLogEntry) -> Result<()> {

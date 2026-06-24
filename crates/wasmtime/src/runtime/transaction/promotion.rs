@@ -161,7 +161,7 @@ impl TransactionState {
         let source_payload = self
             .staged_objects
             .get(&source)
-            .cloned()
+            .map(|record| record.payload().clone())
             .unwrap_or(object_table.payload(source)?);
         let promoted_payload = self.rewrite_payload_refs_for_promotion_in_attempt(
             object_table,
@@ -169,7 +169,8 @@ impl TransactionState {
             attempt,
         )?;
         object_table.validate_persistent_payload_refs(&promoted_payload)?;
-        self.staged_objects.insert(promoted, promoted_payload);
+        self.staged_objects
+            .insert(promoted, StagedObjectRecord::new(promoted_payload));
         Ok(promoted)
     }
 
@@ -338,7 +339,8 @@ impl TransactionState {
                     .collect::<Result<Vec<_>>>()?;
                 let payload = ObjectPayload::Struct(fields);
                 object_table.validate_persistent_payload_refs(&payload)?;
-                self.staged_objects.insert(promoted, payload);
+                self.staged_objects
+                    .insert(promoted, StagedObjectRecord::new(payload));
                 Ok(Some(promoted))
             }
             OrdinaryGcPromotionSource::Array {
@@ -365,7 +367,8 @@ impl TransactionState {
                     .collect::<Result<Vec<_>>>()?;
                 let payload = ObjectPayload::Array(elements);
                 object_table.validate_persistent_payload_refs(&payload)?;
-                self.staged_objects.insert(promoted, payload);
+                self.staged_objects
+                    .insert(promoted, StagedObjectRecord::new(payload));
                 Ok(Some(promoted))
             }
         }
@@ -551,7 +554,7 @@ impl TransactionState {
         let staged_objects = self
             .staged_objects
             .iter()
-            .map(|(&object_id, payload)| (object_id, payload.clone()))
+            .map(|(&object_id, record)| (object_id, record.payload().clone()))
             .collect::<Vec<_>>();
         for (object_id, payload) in staged_objects {
             if !object_table.is_persistent(object_id)? {
@@ -560,7 +563,8 @@ impl TransactionState {
             let rewritten =
                 self.rewrite_payload_refs_for_promotion(object_table, payload.clone())?;
             if rewritten != payload {
-                self.staged_objects.insert(object_id, rewritten);
+                self.staged_objects
+                    .insert(object_id, StagedObjectRecord::new(rewritten));
                 changed = true;
             }
         }

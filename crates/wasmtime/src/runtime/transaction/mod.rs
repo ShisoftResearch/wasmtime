@@ -124,7 +124,9 @@ use type_layout::TypeLayoutId;
 use type_layout::{PersistentTypeKind, PersistentTypeLayout, TraceSlotKind, TypeLayoutRegistry};
 
 use state::PersistentRootKey;
-pub(crate) use state::{GlobalSnapshot, StagedRecord, TableElementSnapshot, TransactionState};
+pub(crate) use state::{
+    GlobalSnapshot, StagedObjectRecord, StagedRecord, TableElementSnapshot, TransactionState,
+};
 
 pub(crate) fn collect_tmemory_access_snapshot(
     tmemory: &TMemory,

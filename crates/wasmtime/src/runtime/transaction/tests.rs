@@ -7314,6 +7314,116 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
+    fn committed_persistent_object_record_is_backed_by_mapped_storage() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tx_log_path = dir.path().join("persistent-object-records.bin");
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(0xa81),
+            durable_log,
+        );
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+            0xa810,
+            0xa81,
+            1,
+            vec![ObjectValue::I32(1)],
+        )?;
+
+        state.acquire_object_write(&mut objects, object)?;
+        state.stage_struct_field(&objects, object, 0, ObjectValue::I32(42))?;
+        state.stage_global(0, GlobalSnapshot::GcRef(0xa810))?;
+        commit_active_file_backed_publications_for_test(0xa81, 0xa81, &mut objects, &mut state)?;
+
+        assert!(
+            objects.current_record_is_persistent_mapped_for_test(object)?,
+            "committed persistent object records must be backed by the mapped durable object heap"
+        );
+        assert_eq!(
+            objects.payload(object)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(42)])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_persistent_object_publication_does_not_replace_live_mapped_record() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tx_log_path = dir.path().join("persistent-object-stage.bin");
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(0xa82),
+            durable_log,
+        );
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+            0xa820,
+            0xa82,
+            1,
+            vec![ObjectValue::I32(1)],
+        )?;
+
+        state.acquire_object_write(&mut objects, object)?;
+        state.stage_struct_field(&objects, object, 0, ObjectValue::I32(42))?;
+        state.stage_global(0, GlobalSnapshot::GcRef(0xa820))?;
+        commit_active_file_backed_publications_for_test(0xa82, 0xa82, &mut objects, &mut state)?;
+        assert!(objects.current_record_is_persistent_mapped_for_test(object)?);
+        let committed_handle = objects.current_record_handle_for_test(object)?;
+
+        let second_tx = state.begin()?;
+        state.acquire_object_write(&mut objects, object)?;
+        state.stage_struct_field(&objects, object, 0, ObjectValue::I32(43))?;
+        let mut publications = Vec::new();
+        assert!(state.commit_object_payloads_into(&mut objects, &mut publications)?);
+
+        assert_eq!(
+            objects.current_record_handle_for_test(object)?,
+            committed_handle,
+            "pre-LP persistent staging must not move the live object table slot to a transient record"
+        );
+        assert!(objects.current_record_is_persistent_mapped_for_test(object)?);
+        assert_eq!(
+            objects.payload(object)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(42)])
+        );
+
+        let markers = state.publish_object_publications_before_commit_with_markers(
+            u32::try_from(second_tx.as_raw())?,
+            u32::try_from(second_tx.as_raw())?,
+            &objects,
+            &publications,
+        )?;
+        let marker = markers
+            .last()
+            .copied()
+            .context("expected committed persistent object publication")?;
+        state.publish_commit_lp(
+            u32::try_from(second_tx.as_raw())?,
+            u32::try_from(second_tx.as_raw())?,
+            marker,
+        )?;
+        state.complete_commit()?;
+        state.install_committed_mapped_object_publications(
+            &mut objects,
+            &publications,
+            &markers,
+        )?;
+
+        assert!(objects.current_record_is_persistent_mapped_for_test(object)?);
+        assert_ne!(
+            objects.current_record_handle_for_test(object)?,
+            committed_handle
+        );
+        assert_eq!(
+            objects.payload(object)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(43)])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn file_backed_persistent_gc_recovery_filters_root_replaced_object() {
         let dir = tempfile::tempdir().unwrap();
         let tx_log_path = dir.path().join("persistent-gc-root-replaced.bin");
@@ -10230,6 +10340,7 @@ mod model_permissions {
         let staged_value = state
             .staged_objects
             .get(&object)
+            .map(StagedObjectRecord::payload)
             .map(payload_i32)
             .transpose()?;
         Ok(PermissionRuntimeSnapshot {
@@ -11530,10 +11641,18 @@ where
         state.commit_object_payloads_into(&mut objects, &mut publications)?,
         "expected staged persistent object publications"
     );
-    let marker = state
-        .publish_object_publications_before_commit(txid, txid, &objects, &publications)?
+    let markers = state.publish_object_publications_before_commit_with_markers(
+        txid,
+        txid,
+        &objects,
+        &publications,
+    )?;
+    let marker = markers
+        .last()
+        .copied()
         .context("expected committed persistent object publication")?;
     state.publish_commit_lp(txid, txid, marker)?;
+    state.install_committed_mapped_object_publications(&mut objects, &publications, &markers)?;
     drop(state);
     let recovered = recover_file_backed_objects_from_path_for_test(&tx_log_path)?;
     Ok((expected, recovered))
@@ -11633,13 +11752,18 @@ where
     let persistent_gc_delta = state.persistent_gc_commit_delta(&objects, &publications)?;
     publications.extend(state.persistent_root_publications(&root_delta)?);
 
-    if let Some(marker) =
-        state.publish_object_publications_before_commit(txid, txid, &objects, &publications)?
-    {
+    let markers = state.publish_object_publications_before_commit_with_markers(
+        txid,
+        txid,
+        &objects,
+        &publications,
+    )?;
+    if let Some(marker) = markers.last().copied() {
         state.publish_commit_lp(txid, txid, marker)?;
     }
     state.complete_commit()?;
     state.apply_committed_persistent_root_delta(root_delta)?;
+    state.install_committed_mapped_object_publications(&mut objects, &publications, &markers)?;
     let _ =
         state.observe_persistent_gc_commit_delta_after_commit(&objects, &persistent_gc_delta)?;
     drop(state);
@@ -11662,13 +11786,18 @@ fn commit_active_file_backed_publications_for_test(
     let persistent_gc_delta = state.persistent_gc_commit_delta(objects, &publications)?;
     publications.extend(state.persistent_root_publications(&root_delta)?);
 
-    if let Some(marker) =
-        state.publish_object_publications_before_commit(stream_id, txid, objects, &publications)?
-    {
+    let markers = state.publish_object_publications_before_commit_with_markers(
+        stream_id,
+        txid,
+        objects,
+        &publications,
+    )?;
+    if let Some(marker) = markers.last().copied() {
         state.publish_commit_lp(stream_id, txid, marker)?;
     }
     state.complete_commit()?;
     state.apply_committed_persistent_root_delta(root_delta)?;
+    state.install_committed_mapped_object_publications(objects, &publications, &markers)?;
     let _ = state.observe_persistent_gc_commit_delta_after_commit(objects, &persistent_gc_delta)?;
     Ok(())
 }
@@ -13818,10 +13947,15 @@ fn shared_root_apply_failure_after_lp_keeps_committed_allocated_object_and_clear
         .unwrap()
         .stream_id();
     let txid = u32::try_from(state.active_transaction_required_raw().unwrap()).unwrap();
-    let marker = state
-        .publish_object_publications_before_commit(stream_id, txid, &objects, &publications)
-        .unwrap()
+    let markers = state
+        .publish_object_publications_before_commit_with_markers(
+            stream_id,
+            txid,
+            &objects,
+            &publications,
+        )
         .unwrap();
+    let marker = markers.last().copied().unwrap();
     state.publish_commit_lp(stream_id, txid, marker).unwrap();
     state.begin_terminal_commit().unwrap();
 
@@ -13838,6 +13972,9 @@ fn shared_root_apply_failure_after_lp_keeps_committed_allocated_object_and_clear
 
     state
         .finish_committed_cleanup_after_durable_commit_error_for_test()
+        .unwrap();
+    state
+        .install_committed_mapped_object_publications(&mut objects, &publications, &markers)
         .unwrap();
     assert_eq!(state.active_transaction(), None);
     assert!(!state.terminal_commit_active);
