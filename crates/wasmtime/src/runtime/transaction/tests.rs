@@ -1,5 +1,6 @@
 use super::config::TMemoryRegionConfig;
 use super::*;
+use crate::runtime::store::AsStoreOpaque;
 
 fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
     with_transaction_object_metadata(wasm, &[1, 1, 0, 0])
@@ -80,6 +81,37 @@ fn transaction_region_runtime_can_be_shared_between_stores_for_test() {
     second.set_transaction_region_runtime_for_test(runtime);
 
     assert!(first.transaction_region_runtime_is_same_for_test(&second));
+
+    let first_object = first
+        .transaction_object_table_mut()
+        .allocate_persistent_struct_for_gc_ref(0x7000, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let second_object = second
+        .transaction_object_table_mut()
+        .allocate_persistent_struct_for_gc_ref(0x7001, vec![ObjectValue::I32(2)])
+        .unwrap();
+    assert_ne!(first_object, second_object);
+}
+
+#[test]
+fn two_stores_attach_to_same_transaction_region_runtime() {
+    let engine = crate::Engine::default();
+    let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
+    let config = TransactionConfig::default();
+
+    let mut first = crate::Store::new(&engine, ());
+    let mut second = crate::Store::new(&engine, ());
+
+    first
+        .transaction_attach_region_runtime_for_test(runtime.clone(), config.clone())
+        .unwrap();
+    second
+        .transaction_attach_region_runtime_for_test(runtime, config.clone())
+        .unwrap();
+
+    assert!(first.transaction_region_runtime_is_same_for_test(&second));
+    assert_eq!(first.as_store_opaque().transaction_config(), &config);
+    assert_eq!(second.as_store_opaque().transaction_config(), &config);
 }
 
 #[test]

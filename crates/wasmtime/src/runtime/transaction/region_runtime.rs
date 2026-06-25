@@ -979,9 +979,13 @@ impl TransactionRegionRuntime {
             .contains(&transaction))
     }
 
+    pub(crate) fn is_shared_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     #[cfg(test)]
     pub(crate) fn ptr_eq_for_test(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        self.is_shared_with(other)
     }
 
     #[cfg(test)]

@@ -940,26 +940,32 @@ impl<T> Store<T> {
     }
 
     #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_attach_region_runtime_for_test(
+        &mut self,
+        runtime: TransactionRegionRuntime,
+        config: TransactionConfig,
+    ) -> Result<()> {
+        self.inner
+            .transaction_attach_region_runtime_for_test(runtime, config)
+    }
+
+    #[cfg(feature = "transaction")]
     pub(crate) fn adopt_shared_runtime_for_test(
         &mut self,
         runtime: TransactionRegionRuntime,
     ) -> Result<()> {
+        let mut config = self.inner.transaction_config().clone();
         runtime.with_shared_file_backed_tmemory_commit_read_lock(|| {
             if let Some(shared) = runtime.shared_file_backed_storage_for_store_adoption()? {
-                self.inner.transaction_config = shared.transaction_config()?;
+                config = shared.transaction_config()?;
                 self.inner
                     .transaction_state
                     .open_shared_file_backed_durable_log(&shared)?;
-                self.inner
-                    .transaction_state
-                    .set_shared_region_runtime(Some(runtime.clone()));
-                self.inner
-                    .transaction_object_table
-                    .set_shared_region_runtime(Some(runtime.clone()));
             }
             Ok(())
         })?;
-        *self.inner.transaction_region_runtime_mut() = runtime;
+        self.inner
+            .transaction_attach_region_runtime_for_test(runtime, config)?;
         Ok(())
     }
 
@@ -1807,6 +1813,21 @@ impl StoreOpaque {
     #[allow(dead_code)]
     pub(crate) fn transaction_state_mut(&mut self) -> &mut TransactionState {
         &mut self.transaction_state
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_attach_region_runtime_for_test(
+        &mut self,
+        runtime: TransactionRegionRuntime,
+        config: TransactionConfig,
+    ) -> Result<()> {
+        self.transaction_region_runtime = runtime;
+        self.transaction_state
+            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
+        self.transaction_object_table
+            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
+        self.transaction_config = config;
+        Ok(())
     }
 
     #[cfg(feature = "transaction")]
