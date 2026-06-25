@@ -662,6 +662,20 @@ impl TransactionState {
         }
     }
 
+    fn current_object_version_for_granule(
+        &self,
+        granule: GranuleId,
+        object_table: &ObjectTable,
+    ) -> Result<u64> {
+        let Some(object_id) = object_granule_object_id(granule) else {
+            return Ok(0);
+        };
+        if let Some(runtime) = &self.shared_region_runtime {
+            return runtime.persistent_object_directory_version(object_id);
+        }
+        object_table.version(object_id)
+    }
+
     fn acquire_granule_read_authority(
         &mut self,
         transaction: TransactionId,
@@ -1818,10 +1832,9 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<bool> {
-        let acquired = self.acquire_granule_read(
-            object_table.granule_id(object_id)?,
-            object_table.version(object_id)?,
-        )?;
+        let granule = object_table.granule_id(object_id)?;
+        let version = self.current_object_version_for_granule(granule, object_table)?;
+        let acquired = self.acquire_granule_read(granule, version)?;
         self.drain_conflict_aborted_allocated_objects(object_table)?;
         Ok(acquired)
     }
@@ -1831,10 +1844,9 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<bool> {
-        let acquired = self.acquire_granule_write(
-            object_table.granule_id(object_id)?,
-            object_table.version(object_id)?,
-        )?;
+        let granule = object_table.granule_id(object_id)?;
+        let version = self.current_object_version_for_granule(granule, object_table)?;
+        let acquired = self.acquire_granule_write(granule, version)?;
         self.drain_conflict_aborted_allocated_objects(object_table)?;
         Ok(acquired)
     }
@@ -2763,10 +2775,11 @@ impl TransactionState {
 
     pub(crate) fn validate_active_object_reads(&self, object_table: &ObjectTable) -> Result<()> {
         for granule in self.active_read_granules()? {
-            let Some(object_id) = object_granule_object_id(granule) else {
+            if object_granule_object_id(granule).is_none() {
                 continue;
-            };
-            self.validate_active_read(granule, object_table.version(object_id)?)?;
+            }
+            let version = self.current_object_version_for_granule(granule, object_table)?;
+            self.validate_active_read(granule, version)?;
         }
         Ok(())
     }

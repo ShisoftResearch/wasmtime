@@ -156,6 +156,27 @@ fn shared_object_directory_keeps_highest_record_version() {
 }
 
 #[test]
+fn shared_runtime_object_directory_version_is_authoritative() {
+    let runtime = TransactionRegionRuntime::default();
+    let object = ObjectId { object_index: 19 };
+
+    runtime
+        .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: 1,
+            type_layout_id: 1,
+            runtime_type_index: None,
+            record_source: None,
+        }])
+        .unwrap();
+
+    let version = runtime.persistent_object_directory_version(object).unwrap();
+    assert!(version > 0);
+}
+
+#[test]
 fn persistent_gc_excludes_user_transaction_commits() {
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
     let permit = runtime.begin_user_transaction_region_for_test().unwrap();
@@ -11172,6 +11193,66 @@ fn transaction_object_read_validation_uses_object_table_versions() {
             .to_string()
             .contains(transaction_cc_read_version_conflict_message())
     );
+}
+
+#[test]
+fn transaction_object_read_validation_uses_shared_runtime_versions() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut objects = ObjectTable::default();
+    let object = objects
+        .allocate_persistent_struct_for_gc_ref(0x713, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let mut state = TransactionState::new_for_test(TransactionId::from_raw(712));
+    state.shared_region_runtime = Some(runtime.clone());
+
+    runtime
+        .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: 1,
+            type_layout_id: TypeLayoutId::DEFAULT_STRUCT.get(),
+            runtime_type_index: None,
+            record_source: None,
+        }])
+        .unwrap();
+
+    state.acquire_object_read(&mut objects, object).unwrap();
+    state.validate_active_object_reads(&objects).unwrap();
+
+    runtime
+        .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: 2,
+            type_layout_id: TypeLayoutId::DEFAULT_STRUCT.get(),
+            runtime_type_index: None,
+            record_source: None,
+        }])
+        .unwrap();
+
+    let error = state.validate_active_object_reads(&objects).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(transaction_cc_read_version_conflict_message())
+    );
+}
+
+#[test]
+fn shared_runtime_object_read_validation_uses_same_version_for_unpublished_object() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime.clone()));
+    let object = objects
+        .allocate_persistent_struct_for_gc_ref(0x714, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+
+    state.acquire_object_read(&mut objects, object).unwrap();
+    state.validate_active_object_reads(&objects).unwrap();
 }
 
 #[test]
