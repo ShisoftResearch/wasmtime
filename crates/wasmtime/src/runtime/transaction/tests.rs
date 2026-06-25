@@ -123,7 +123,7 @@ fn shared_object_directory_keeps_highest_record_version() {
     let runtime = TransactionRegionRuntime::default();
     let object = ObjectId { object_index: 11 };
 
-    runtime
+    let installed = runtime
         .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
             object_id: object,
             kind: ObjectKind::Struct,
@@ -134,6 +134,8 @@ fn shared_object_directory_keeps_highest_record_version() {
             record_source: None,
         }])
         .unwrap();
+    assert_eq!(installed.len(), 1);
+    let first_directory_version = installed[0].directory_version;
 
     runtime
         .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
@@ -147,12 +149,29 @@ fn shared_object_directory_keeps_highest_record_version() {
         }])
         .unwrap();
 
+    let equal_installed = runtime
+        .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: 2,
+            type_layout_id: 1,
+            runtime_type_index: None,
+            record_source: None,
+        }])
+        .unwrap();
+    assert_eq!(equal_installed.len(), 1);
+    assert_eq!(
+        equal_installed[0].directory_version,
+        first_directory_version
+    );
+
     let entry = runtime
         .persistent_object_directory_entry(object)
         .unwrap()
         .unwrap();
     assert_eq!(entry.record_version, 2);
-    assert!(entry.directory_version > 0);
+    assert_eq!(entry.directory_version, first_directory_version);
 }
 
 #[test]
@@ -3191,10 +3210,9 @@ fn file_backed_multi_region_backing_without_max_pages_grows_into_second_region()
         crate::runtime::vm::block_region::BLOCK_SIZE,
     );
     let boundary = crate::runtime::vm::block_region::BLOCK_SIZE;
-    let config = TransactionConfig::with_file_backed_tmemory_regions(vec![
-        region_a, region_b, region_c,
-    ])
-    .unwrap();
+    let config =
+        TransactionConfig::with_file_backed_tmemory_regions(vec![region_a, region_b, region_c])
+            .unwrap();
     let mut tmemory = crate::runtime::vm::TMemory::new(config, 1, None).unwrap();
 
     assert_eq!(tmemory.byte_capacity(), 64 * 1024);
@@ -7571,8 +7589,8 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
-    fn store_local_object_table_materialized_directory_entry_advances_local_version_counters(
-    ) -> Result<()> {
+    fn store_local_object_table_materialized_directory_entry_advances_local_version_counters()
+    -> Result<()> {
         let object = ObjectId { object_index: 41 };
         let (_fixture_source, entry) = synthetic_directory_entry_for_test(
             object,
@@ -7605,8 +7623,8 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
-    fn store_local_object_table_rejects_shared_directory_entry_with_mismatched_record_header(
-    ) -> Result<()> {
+    fn store_local_object_table_rejects_shared_directory_entry_with_mismatched_record_header()
+    -> Result<()> {
         let object = ObjectId { object_index: 41 };
         let (_fixture_source, entry) = synthetic_directory_entry_for_test(
             object,
@@ -7623,7 +7641,9 @@ mod file_backed_object_layout_recovery {
         );
         let mut objects = ObjectTable::default();
 
-        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
+        let err = objects
+            .install_persistent_object_directory_entry(entry)
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("mapped persistent object record id does not match object identity")
@@ -7633,8 +7653,8 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
-    fn store_local_object_table_rejects_directory_materialization_over_live_volatile_slot(
-    ) -> Result<()> {
+    fn store_local_object_table_rejects_directory_materialization_over_live_volatile_slot()
+    -> Result<()> {
         let mut objects = ObjectTable::default();
         let object = objects.allocate_struct(vec![ObjectValue::I32(1)])?;
         let original_handle = objects.current_record_handle_for_test(object)?;
@@ -7653,13 +7673,18 @@ mod file_backed_object_layout_recovery {
             )?,
         );
 
-        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
+        let err = objects
+            .install_persistent_object_directory_entry(entry)
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("persistent object directory entry collides with live volatile slot")
         );
         assert!(!objects.live_slot(object)?.persistent);
-        assert_eq!(objects.current_record_handle_for_test(object)?, original_handle);
+        assert_eq!(
+            objects.current_record_handle_for_test(object)?,
+            original_handle
+        );
         assert_eq!(
             objects.transaction_ref_handle_for_object_id(object)?,
             transaction_handle
@@ -7668,8 +7693,8 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
-    fn store_local_object_table_materialized_directory_entry_is_removed_from_free_list(
-    ) -> Result<()> {
+    fn store_local_object_table_materialized_directory_entry_is_removed_from_free_list()
+    -> Result<()> {
         let mut objects = ObjectTable::default();
         let object = objects.allocate_struct(vec![ObjectValue::I32(1)])?;
         assert!(objects.free(object)?);
@@ -7698,8 +7723,8 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
-    fn store_local_object_table_rejects_directory_entry_with_mismatched_location_offset(
-    ) -> Result<()> {
+    fn store_local_object_table_rejects_directory_entry_with_mismatched_location_offset()
+    -> Result<()> {
         let object = ObjectId { object_index: 41 };
         let (_fixture_source, mut entry) = synthetic_directory_entry_for_test(
             object,
@@ -7717,7 +7742,9 @@ mod file_backed_object_layout_recovery {
         entry.record_source.as_mut().unwrap().location.data_offset += 1;
         let mut objects = ObjectTable::default();
 
-        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
+        let err = objects
+            .install_persistent_object_directory_entry(entry)
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("mapped persistent object location does not match data record offset")
@@ -7727,8 +7754,8 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
-    fn store_local_object_table_rejects_directory_entry_with_wrong_kind_type_layout(
-    ) -> Result<()> {
+    fn store_local_object_table_rejects_directory_entry_with_wrong_kind_type_layout() -> Result<()>
+    {
         let object = ObjectId { object_index: 41 };
         let (_fixture_source, entry) = synthetic_directory_entry_for_test(
             object,
@@ -7745,7 +7772,9 @@ mod file_backed_object_layout_recovery {
         );
         let mut objects = ObjectTable::default();
 
-        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
+        let err = objects
+            .install_persistent_object_directory_entry(entry)
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("persistent type layout kind Array does not match object kind Struct")
@@ -7860,6 +7889,127 @@ mod file_backed_object_layout_recovery {
         assert_eq!(
             objects.payload(object)?,
             ObjectPayload::Struct(vec![ObjectValue::I32(43)])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_mapped_object_publication_updates_shared_directory() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tx_log_path = dir.path().join("persistent-object-shared-directory.bin");
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let mut state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(0xa83),
+            durable_log,
+        );
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        state.shared_region_runtime = Some(runtime.clone());
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_persistent_struct_for_gc_ref_with_wasmtime_type_namespace(
+            0xa830,
+            0xa83,
+            1,
+            vec![ObjectValue::I32(1)],
+        )?;
+
+        state.acquire_object_write(&mut objects, object)?;
+        state.stage_struct_field(&mut objects, object, 0, ObjectValue::I32(42))?;
+        commit_active_file_backed_publications_for_test(0xa83, 0xa83, &mut objects, &mut state)?;
+
+        let entry = runtime
+            .persistent_object_directory_entry(object)?
+            .context("expected shared directory entry after mapped persistent commit")?;
+        assert!(entry.record_source.is_some());
+        assert!(
+            objects.current_record_is_persistent_mapped_for_test(object)?,
+            "shared-directory install must keep the local object record mapped"
+        );
+        assert_eq!(
+            objects.payload(object)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(42)])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_object_publications_reserve_global_record_versions_across_store_caches() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let tx_log_path = dir
+            .path()
+            .join("persistent-object-global-record-versions.bin");
+        let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let mut seed_state = TransactionState::new_for_test_with_durable_log(
+            TransactionId::from_raw(0xa84),
+            durable_log,
+        );
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        seed_state.shared_region_runtime = Some(runtime.clone());
+        let mut seed_objects = ObjectTable::default();
+        let object = seed_objects
+            .allocate_persistent_struct_for_gc_ref(0xa840, vec![ObjectValue::I32(1)])?;
+
+        seed_state.acquire_object_write(&mut seed_objects, object)?;
+        seed_state.stage_struct_field(&mut seed_objects, object, 0, ObjectValue::I32(10))?;
+        commit_active_file_backed_publications_for_test(
+            0xa84,
+            0xa84,
+            &mut seed_objects,
+            &mut seed_state,
+        )?;
+
+        fn object_publication_version(
+            publications: &[persist::PendingPublication],
+            object: ObjectId,
+        ) -> Result<u32> {
+            for publication in publications {
+                if publication.persistent_object_type_layout_id()?.is_none() {
+                    continue;
+                }
+                let (_, object_index) =
+                    crate::runtime::vm::unpack_object_granule_id(publication.logical_id)?;
+                if object_index == object.object_index {
+                    return Ok(publication.version);
+                }
+            }
+            bail!("missing persistent object publication for {object:?}")
+        }
+
+        let mut first_objects = ObjectTable::default();
+        first_objects.set_shared_region_runtime(Some(runtime.clone()));
+        assert!(first_objects.refresh_persistent_object_from_shared_directory(object)?);
+
+        let mut second_objects = ObjectTable::default();
+        second_objects.set_shared_region_runtime(Some(runtime.clone()));
+        assert!(second_objects.refresh_persistent_object_from_shared_directory(object)?);
+
+        let mut first_state = TransactionState::default();
+        first_state.begin_with_region_runtime(&runtime)?;
+        first_state.staged_objects.insert(
+            object,
+            StagedObjectRecord::new(ObjectPayload::Struct(vec![ObjectValue::I32(11)])),
+        );
+        let mut first_publications = Vec::new();
+        first_state.commit_object_payloads_into(&mut first_objects, &mut first_publications)?;
+        let first_version = object_publication_version(&first_publications, object)?;
+        first_state.clear_active()?;
+
+        let mut second_state = TransactionState::default();
+        second_state.begin_with_region_runtime(&runtime)?;
+        second_state.staged_objects.insert(
+            object,
+            StagedObjectRecord::new(ObjectPayload::Struct(vec![ObjectValue::I32(12)])),
+        );
+        let mut second_publications = Vec::new();
+        second_state.commit_object_payloads_into(&mut second_objects, &mut second_publications)?;
+        let second_version = object_publication_version(&second_publications, object)?;
+        second_state.clear_active()?;
+
+        assert!(
+            second_version > first_version,
+            "shared stores must reserve globally increasing object record versions; first={first_version}, second={second_version}"
         );
         Ok(())
     }
@@ -11731,29 +11881,6 @@ fn second_store_deref_refreshes_stale_persistent_object_cache() -> Result<()> {
     );
     publisher_state.shared_region_runtime = Some(runtime.clone());
 
-    let install_latest_runtime_entry = || -> Result<()> {
-        let (recovered, winners) = recover_file_backed_recovery_inputs_for_test(&tx_log_path)?;
-        let winner = recovered_object_winner_by_id_for_test(&winners, object);
-        runtime.install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
-            object_id: object,
-            kind: ObjectKind::Struct,
-            directory_version: 0,
-            record_version: winner.version,
-            type_layout_id: winner.type_layout_id,
-            runtime_type_index: None,
-            record_source: Some(PersistentObjectRecordSource {
-                mapped_source: recovered_mapped_source_for_test(&recovered),
-                location: PersistentObjectRecordLocation {
-                    data_block: winner.data_block,
-                    data_offset: winner.data_offset,
-                    data_record_offset: u64::try_from(winner.data_record_offset)?,
-                    record_len: winner.record_len,
-                },
-            }),
-        }])?;
-        Ok(())
-    };
-
     publisher_state.acquire_object_write(&mut publisher_objects, object)?;
     publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(11))?;
     commit_active_file_backed_publications_for_test(
@@ -11762,7 +11889,7 @@ fn second_store_deref_refreshes_stale_persistent_object_cache() -> Result<()> {
         &mut publisher_objects,
         &mut publisher_state,
     )?;
-    install_latest_runtime_entry()?;
+    assert!(runtime.persistent_object_directory_entry(object)?.is_some());
     assert_eq!(runtime.persistent_object_directory_version(object)?, 1);
 
     let mut observer_objects = ObjectTable::default();
@@ -11784,7 +11911,7 @@ fn second_store_deref_refreshes_stale_persistent_object_cache() -> Result<()> {
         &mut publisher_objects,
         &mut publisher_state,
     )?;
-    install_latest_runtime_entry()?;
+    assert!(runtime.persistent_object_directory_entry(object)?.is_some());
     assert_eq!(runtime.persistent_object_directory_version(object)?, 2);
     assert_eq!(
         observer_objects.payload(object)?,

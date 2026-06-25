@@ -484,11 +484,38 @@ impl TransactionState {
         let Some(mapped_source) = self.durable_log.cloned_mapped_region_source() else {
             return object_table.install_committed_serialized_persistent_publications(publications);
         };
-        object_table.install_committed_mapped_persistent_publications(
+        let Some(runtime) = &self.shared_region_runtime else {
+            return object_table.install_committed_mapped_persistent_publications(
+                publications,
+                markers,
+                mapped_source,
+            );
+        };
+        let candidates = object_table.committed_mapped_persistent_publication_entries(
             publications,
             markers,
             mapped_source,
-        )
+        )?;
+        for candidate in &candidates {
+            object_table
+                .validate_persistent_object_directory_entry_source(&candidate.directory_entry)?;
+        }
+        let installed = runtime.install_persistent_object_directory_entries(
+            candidates.into_iter().map(|candidate| {
+                debug_assert_eq!(candidate.object_id, candidate.directory_entry.object_id);
+                candidate.directory_entry
+            }),
+        )?;
+        let mut installed_ids = Vec::with_capacity(installed.len());
+        for entry in installed {
+            ensure!(
+                entry.record_source.is_some(),
+                "shared persistent object directory entry has no mapped record source"
+            );
+            installed_ids.push(entry.object_id);
+            object_table.install_persistent_object_directory_entry(entry)?;
+        }
+        Ok(installed_ids)
     }
 
     pub(crate) fn publish_commit_lp(
@@ -2616,8 +2643,20 @@ impl TransactionState {
         }
 
         let mut publications = Vec::new();
+        let reserved_object_versions = if let Some(runtime) = &self.shared_region_runtime {
+            runtime.reserve_persistent_object_record_versions(copied_objects.iter().copied())?
+        } else {
+            BTreeMap::new()
+        };
         for object_id in &copied_objects {
-            publications.push(objects.persistent_gc_copy_publication(*object_id)?);
+            let publication = if let Some(version) =
+                reserved_object_versions.get(object_id).copied()
+            {
+                objects.persistent_gc_copy_publication_with_record_version(*object_id, version)?
+            } else {
+                objects.persistent_gc_copy_publication(*object_id)?
+            };
+            publications.push(publication);
         }
 
         let stream_id =
@@ -2760,16 +2799,36 @@ impl TransactionState {
                     object_table.kind(object_id)? == payload.kind(),
                     "object payload kind does not match object table slot kind"
                 );
-                Ok((object_id, payload.clone()))
+                Ok((
+                    object_id,
+                    payload.clone(),
+                    object_table.is_persistent(object_id)?,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
-        for (object_id, payload) in updates {
-            let persistent = object_table.is_persistent(object_id)?;
+        let reserved_object_versions = if let Some(runtime) = &self.shared_region_runtime {
+            runtime.reserve_persistent_object_record_versions(
+                updates
+                    .iter()
+                    .filter_map(|(object_id, _, persistent)| persistent.then_some(*object_id)),
+            )?
+        } else {
+            BTreeMap::new()
+        };
+        for (object_id, payload, persistent) in updates {
             if persistent {
-                publish(
+                let publication = if let Some(version) =
+                    reserved_object_versions.get(&object_id).copied()
+                {
                     object_table
-                        .persistent_object_pending_publication_from_payload(object_id, &payload)?,
-                )?;
+                        .persistent_object_pending_publication_from_payload_with_record_version(
+                            object_id, &payload, version,
+                        )?
+                } else {
+                    object_table
+                        .persistent_object_pending_publication_from_payload(object_id, &payload)?
+                };
+                publish(publication)?;
             } else {
                 object_table.update_payload(object_id, payload)?;
             }

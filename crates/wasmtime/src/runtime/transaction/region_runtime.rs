@@ -288,12 +288,25 @@ impl TransactionRegionRuntime {
     where
         I: IntoIterator<Item = PersistentObjectDirectoryEntry>,
     {
+        let mut metadata = self.lock_persistent_metadata()?;
         let mut directory = self.lock_object_directory()?;
         let mut installed = Vec::new();
         for mut entry in entries {
             match directory.entries.get(&entry.object_id) {
-                Some(current) if current.record_version > entry.record_version => continue,
+                Some(current) if current.record_version > entry.record_version => {
+                    metadata
+                        .object_versions
+                        .entry(current.object_id)
+                        .and_modify(|version| *version = (*version).max(current.record_version))
+                        .or_insert(current.record_version);
+                    continue;
+                }
                 Some(current) if current.record_version == entry.record_version => {
+                    metadata
+                        .object_versions
+                        .entry(current.object_id)
+                        .and_modify(|version| *version = (*version).max(current.record_version))
+                        .or_insert(current.record_version);
                     installed.push(current.clone());
                     continue;
                 }
@@ -308,6 +321,11 @@ impl TransactionRegionRuntime {
             entry.directory_version = next_version;
 
             directory.entries.insert(entry.object_id, entry.clone());
+            metadata
+                .object_versions
+                .entry(entry.object_id)
+                .and_modify(|version| *version = (*version).max(entry.record_version))
+                .or_insert(entry.record_version);
             installed.push(entry);
         }
         Ok(installed)
@@ -662,6 +680,25 @@ impl TransactionRegionRuntime {
                 .checked_add(1)
                 .context("persistent root publication version overflow")?;
             reserved.insert(key, *version);
+        }
+        Ok(reserved)
+    }
+
+    pub(super) fn reserve_persistent_object_record_versions<I>(
+        &self,
+        object_ids: I,
+    ) -> Result<BTreeMap<ObjectId, u32>>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        let mut runtime = self.lock_persistent_metadata()?;
+        let mut reserved = BTreeMap::new();
+        for object_id in object_ids.into_iter().collect::<BTreeSet<_>>() {
+            let version = runtime.object_versions.entry(object_id).or_insert(0);
+            *version = (*version)
+                .checked_add(1)
+                .context("persistent object publication version overflow")?;
+            reserved.insert(object_id, *version);
         }
         Ok(reserved)
     }

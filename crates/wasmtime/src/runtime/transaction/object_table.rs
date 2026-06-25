@@ -24,9 +24,10 @@ use super::{
     OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, ObjectId, ObjectKind, ObjectPayload,
     ObjectValue, PersistentMarkSweepReport, PersistentObjectDirectoryEntry,
     PersistentObjectMarkReport, PersistentObjectMarker, PersistentObjectRecordLocation,
-    PersistentObjectRefRaw, PersistentRecoveryGcReport, PersistentRootError,
-    PersistentRootErrorKind, PersistentVolatileSweepReport, TransactionObjectRefRaw,
-    TransactionRegionRuntime, TxObjectHeader, object_gc, object_heap, persist,
+    PersistentObjectRecordSource, PersistentObjectRefRaw, PersistentRecoveryGcReport,
+    PersistentRootError, PersistentRootErrorKind, PersistentVolatileSweepReport,
+    TransactionObjectRefRaw, TransactionRegionRuntime, TxObjectHeader, object_gc, object_heap,
+    persist,
 };
 use wasmtime_environ::VMSharedTypeIndex;
 
@@ -43,6 +44,12 @@ pub(crate) struct ObjectTableSlot {
     pub(crate) runtime_type_index: Option<VMSharedTypeIndex>,
     pub(crate) persistent: bool,
     pub(crate) current_record: object_heap::TxRecordHandle,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InstalledPersistentObjectPublication {
+    pub(crate) object_id: ObjectId,
+    pub(crate) directory_entry: PersistentObjectDirectoryEntry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1426,6 +1433,20 @@ impl ObjectTable {
         object_id: ObjectId,
         payload: &ObjectPayload,
     ) -> Result<persist::PendingPublication> {
+        let record_version = self.bump_record_version()?;
+        self.persistent_object_pending_publication_from_payload_with_record_version(
+            object_id,
+            payload,
+            record_version,
+        )
+    }
+
+    pub(crate) fn persistent_object_pending_publication_from_payload_with_record_version(
+        &mut self,
+        object_id: ObjectId,
+        payload: &ObjectPayload,
+        record_version: u32,
+    ) -> Result<persist::PendingPublication> {
         let slot = self.live_slot(object_id)?.clone();
         ensure!(
             slot.persistent,
@@ -1436,7 +1457,7 @@ impl ObjectTable {
             "object payload kind does not match object table slot kind"
         );
         self.validate_persistent_payload_refs(payload)?;
-        let record_version = self.bump_record_version()?;
+        self.next_record_version = self.next_record_version.max(record_version);
         let record = object_heap::encode_object_record(
             object_id.object_index,
             record_version,
@@ -1462,6 +1483,15 @@ impl ObjectTable {
         &mut self,
         object_id: ObjectId,
     ) -> Result<persist::PendingPublication> {
+        let record_version = self.bump_record_version()?;
+        self.persistent_gc_copy_publication_with_record_version(object_id, record_version)
+    }
+
+    pub(crate) fn persistent_gc_copy_publication_with_record_version(
+        &mut self,
+        object_id: ObjectId,
+        record_version: u32,
+    ) -> Result<persist::PendingPublication> {
         let slot = self.live_slot(object_id)?.clone();
         ensure!(
             slot.persistent,
@@ -1469,7 +1499,7 @@ impl ObjectTable {
         );
         let payload = self.heap.payload(slot.current_record)?;
         self.validate_persistent_payload_refs(&payload)?;
-        let record_version = self.bump_record_version()?;
+        self.next_record_version = self.next_record_version.max(record_version);
         let record = object_heap::encode_object_record(
             object_id.object_index,
             record_version,
@@ -1509,6 +1539,29 @@ impl ObjectTable {
                 mapped_source.clone(),
             )? {
                 installed.push(object_id);
+            }
+        }
+        Ok(installed)
+    }
+
+    pub(crate) fn committed_mapped_persistent_publication_entries(
+        &self,
+        publications: &[persist::PendingPublication],
+        markers: &[persist::PendingCommitLogEntry],
+        mapped_source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+    ) -> Result<Vec<InstalledPersistentObjectPublication>> {
+        ensure!(
+            publications.len() == markers.len(),
+            "committed publication marker count does not match publication count"
+        );
+        let mut installed = Vec::new();
+        for (publication, marker) in publications.iter().zip(markers) {
+            if let Some(entry) = self.committed_mapped_persistent_publication_entry(
+                publication,
+                *marker,
+                mapped_source.clone(),
+            )? {
+                installed.push(entry);
             }
         }
         Ok(installed)
@@ -1567,12 +1620,47 @@ impl ObjectTable {
         Ok(())
     }
 
+    pub(crate) fn validate_persistent_object_directory_entry_source(
+        &self,
+        entry: &PersistentObjectDirectoryEntry,
+    ) -> Result<()> {
+        let source = entry
+            .record_source
+            .as_ref()
+            .context("persistent object directory entry has no mapped record source")?;
+        object_heap::ObjectHeap::validate_mapped_persistent_record_from_source(
+            entry.object_id,
+            entry.kind,
+            entry.record_version,
+            entry.type_layout_id,
+            &source.mapped_source,
+            &source.location,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn install_committed_mapped_persistent_publication(
         &mut self,
         publication: &persist::PendingPublication,
         marker: persist::PendingCommitLogEntry,
         mapped_source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
     ) -> Result<Option<ObjectId>> {
+        let Some(mut installed) =
+            self.committed_mapped_persistent_publication_entry(publication, marker, mapped_source)?
+        else {
+            return Ok(None);
+        };
+        installed.directory_entry.directory_version = self.bump_object_version()?;
+        self.install_persistent_object_directory_entry(installed.directory_entry)?;
+        Ok(Some(installed.object_id))
+    }
+
+    fn committed_mapped_persistent_publication_entry(
+        &self,
+        publication: &persist::PendingPublication,
+        marker: persist::PendingCommitLogEntry,
+        mapped_source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+    ) -> Result<Option<InstalledPersistentObjectPublication>> {
         let Some(type_layout_id) = publication.persistent_object_type_layout_id()? else {
             return Ok(None);
         };
@@ -1593,7 +1681,6 @@ impl ObjectTable {
             "committed persistent object publication kind does not match logical id domain"
         );
         let object_id = ObjectId { object_index };
-        let index = object_slot_index(object_id)?;
         let slot = self.live_slot(object_id)?.clone();
         ensure!(
             slot.persistent,
@@ -1640,31 +1727,28 @@ impl ObjectTable {
         self.validate_type_layout_for_object_kind(kind, type_layout_id)?;
 
         let data_record_offset = durable_data_record_offset(marker.data_block, marker.data_offset)?;
-        let record = self.heap.install_mapped_persistent_record_from_source(
+        let location = PersistentObjectRecordLocation {
+            data_block: marker.data_block,
+            data_offset: marker.data_offset,
+            data_record_offset: u64::try_from(data_record_offset)
+                .context("committed persistent object data record offset overflow")?,
+            record_len: object_header.record_len,
+        };
+        Ok(Some(InstalledPersistentObjectPublication {
             object_id,
-            kind,
-            publication.version,
-            object_header.type_layout_id,
-            &mapped_source,
-            &PersistentObjectRecordLocation {
-                data_block: marker.data_block,
-                data_offset: marker.data_offset,
-                data_record_offset: u64::try_from(data_record_offset)
-                    .context("committed persistent object data record offset overflow")?,
-                record_len: object_header.record_len,
+            directory_entry: PersistentObjectDirectoryEntry {
+                object_id,
+                kind,
+                directory_version: 0,
+                record_version: object_header.version,
+                type_layout_id: object_header.type_layout_id,
+                runtime_type_index: slot.runtime_type_index,
+                record_source: Some(PersistentObjectRecordSource {
+                    mapped_source,
+                    location,
+                }),
             },
-        )?;
-        self.next_record_version = self.next_record_version.max(object_header.version);
-        let version = self.bump_object_version()?;
-        self.slots[index] = Some(ObjectTableSlot {
-            kind,
-            version,
-            type_layout_id: object_header.type_layout_id,
-            runtime_type_index: slot.runtime_type_index,
-            persistent: true,
-            current_record: record,
-        });
-        Ok(Some(object_id))
+        }))
     }
 
     pub(crate) fn install_committed_serialized_persistent_publications(

@@ -236,6 +236,40 @@ impl ObjectHeap {
         source: &Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
         location: &PersistentObjectRecordLocation,
     ) -> Result<TxRecordHandle> {
+        let winner = Self::validate_mapped_persistent_record_from_source(
+            object_id,
+            kind,
+            version,
+            type_layout_id,
+            source,
+            location,
+        )?;
+        let payload_offset = winner
+            .data_record_offset
+            .checked_add(size_of::<TxDataRecordHeader>())
+            .context("mapped persistent object payload offset overflow")?;
+        let record_len = usize::try_from(location.record_len)
+            .context("mapped persistent object record length overflow")?;
+        let mut handle = None;
+        source.with_mapped_slice(payload_offset, record_len, &mut |record_bytes| {
+            handle = Some(self.install_mapped_persistent_record(
+                &winner,
+                source.clone(),
+                record_bytes,
+            )?);
+            Ok(())
+        })?;
+        handle.context("mapped persistent object record was not installed")
+    }
+
+    pub(crate) fn validate_mapped_persistent_record_from_source(
+        object_id: ObjectId,
+        kind: ObjectKind,
+        version: u32,
+        type_layout_id: u32,
+        source: &Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+        location: &PersistentObjectRecordLocation,
+    ) -> Result<crate::runtime::vm::RecoveredObjectWinner> {
         let domain = match kind {
             ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
             ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
@@ -299,7 +333,6 @@ impl ObjectHeap {
             .context("mapped persistent object payload offset overflow")?;
         let record_len = usize::try_from(location.record_len)
             .context("mapped persistent object record length overflow")?;
-        let mut handle = None;
         source.with_mapped_slice(payload_offset, record_len, &mut |record_bytes| {
             let (header, _) = decode_record_metadata(record_bytes)?;
             ensure!(
@@ -318,14 +351,9 @@ impl ObjectHeap {
                 header.type_layout_id == type_layout_id,
                 "mapped persistent object record type layout id does not match object identity"
             );
-            handle = Some(self.install_mapped_persistent_record(
-                &winner,
-                source.clone(),
-                record_bytes,
-            )?);
             Ok(())
         })?;
-        handle.context("mapped persistent object record was not installed")
+        Ok(winner)
     }
 
     pub(crate) fn header(&self, handle: TxRecordHandle) -> Result<TxObjectHeader> {
