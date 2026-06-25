@@ -11,9 +11,9 @@ use std::thread::ThreadId;
 use super::concurrency::TransactionConflictAction;
 use super::state::PersistentRootDelta;
 use super::{
-    ConcurrencyControlState, GranuleId, ObjectId, PersistentRootKey, TMemoryFileBacking,
-    TransactionConfig, TransactionId, TxDurableLog, granule_uses_transaction_state_version,
-    persistent_root_key_from_logical_id,
+    ConcurrencyControlState, GranuleId, ObjectId, PersistentObjectDirectoryEntry,
+    PersistentRootKey, TMemoryFileBacking, TransactionConfig, TransactionId, TxDurableLog,
+    granule_uses_transaction_state_version, persistent_root_key_from_logical_id,
 };
 
 const FIRST_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x2000_0000;
@@ -137,6 +137,7 @@ struct TransactionRegionRuntimeInner {
     log_segments: Mutex<DurableLogSegmentRegistry>,
     lock_authority: Mutex<LockAuthorityState>,
     persistent_metadata: Mutex<PersistentMetadataState>,
+    object_directory: Mutex<PersistentObjectDirectoryState>,
     file_backed_storage: Mutex<Option<SharedFileBackedStorageConfig>>,
     gc_state: Mutex<GcCoordinationState>,
 }
@@ -169,6 +170,12 @@ struct PersistentMetadataState {
 }
 
 #[derive(Debug, Default)]
+struct PersistentObjectDirectoryState {
+    entries: BTreeMap<ObjectId, PersistentObjectDirectoryEntry>,
+    next_directory_version: u64,
+}
+
+#[derive(Debug, Default)]
 struct GcCoordinationState {
     active_user_commits: u32,
     gc_active: bool,
@@ -191,6 +198,7 @@ impl Default for TransactionRegionRuntimeInner {
             log_segments: Mutex::new(DurableLogSegmentRegistry::default()),
             lock_authority: Mutex::new(LockAuthorityState::default()),
             persistent_metadata: Mutex::new(PersistentMetadataState::default()),
+            object_directory: Mutex::new(PersistentObjectDirectoryState::default()),
             file_backed_storage: Mutex::new(None),
             gc_state: Mutex::new(GcCoordinationState::default()),
         }
@@ -223,6 +231,13 @@ impl TransactionRegionRuntime {
             .persistent_metadata
             .lock()
             .map_err(|_| crate::format_err!("transaction root metadata lock poisoned"))
+    }
+
+    fn lock_object_directory(&self) -> Result<MutexGuard<'_, PersistentObjectDirectoryState>> {
+        self.0
+            .object_directory
+            .lock()
+            .map_err(|_| crate::format_err!("persistent object directory lock poisoned"))
     }
 
     fn lock_file_backed_storage(
@@ -264,6 +279,54 @@ impl TransactionRegionRuntime {
             .checked_add(1)
             .context("persistent object id overflow")?;
         Ok(object_id)
+    }
+
+    pub(crate) fn install_persistent_object_directory_entries<I>(
+        &self,
+        entries: I,
+    ) -> Result<Vec<PersistentObjectDirectoryEntry>>
+    where
+        I: IntoIterator<Item = PersistentObjectDirectoryEntry>,
+    {
+        let mut directory = self.lock_object_directory()?;
+        let mut installed = Vec::new();
+        for mut entry in entries {
+            match directory.entries.get(&entry.object_id) {
+                Some(current) if current.record_version > entry.record_version => continue,
+                Some(current) if current.record_version == entry.record_version => {
+                    installed.push(current.clone());
+                    continue;
+                }
+                _ => {}
+            }
+
+            let next_version = directory
+                .next_directory_version
+                .checked_add(1)
+                .context("persistent object directory version overflow")?;
+            directory.next_directory_version = next_version;
+            entry.directory_version = next_version;
+
+            directory.entries.insert(entry.object_id, entry.clone());
+            installed.push(entry);
+        }
+        Ok(installed)
+    }
+
+    pub(crate) fn persistent_object_directory_entry(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<Option<PersistentObjectDirectoryEntry>> {
+        Ok(self.lock_object_directory()?.entries.get(&object_id).cloned())
+    }
+
+    pub(crate) fn persistent_object_directory_version(&self, object_id: ObjectId) -> Result<u64> {
+        Ok(self
+            .lock_object_directory()?
+            .entries
+            .get(&object_id)
+            .map(|entry| entry.directory_version)
+            .unwrap_or(0))
     }
 
     pub(crate) fn begin_user_transaction_region(&self) -> Result<UserTransactionRegionPermit> {

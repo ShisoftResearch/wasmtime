@@ -119,6 +119,43 @@ fn persistent_object_directory_entry_rejects_wrong_object_id() {
 }
 
 #[test]
+fn shared_object_directory_keeps_highest_record_version() {
+    let runtime = TransactionRegionRuntime::default();
+    let object = ObjectId { object_index: 11 };
+
+    runtime
+        .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: 2,
+            type_layout_id: 1,
+            runtime_type_index: None,
+            record_source: None,
+        }])
+        .unwrap();
+
+    runtime
+        .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: 1,
+            type_layout_id: 1,
+            runtime_type_index: None,
+            record_source: None,
+        }])
+        .unwrap();
+
+    let entry = runtime
+        .persistent_object_directory_entry(object)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.record_version, 2);
+    assert!(entry.directory_version > 0);
+}
+
+#[test]
 fn persistent_gc_excludes_user_transaction_commits() {
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
     let permit = runtime.begin_user_transaction_region_for_test().unwrap();
