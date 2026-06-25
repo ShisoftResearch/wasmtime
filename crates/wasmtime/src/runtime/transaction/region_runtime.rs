@@ -11,7 +11,7 @@ use std::thread::ThreadId;
 use super::concurrency::TransactionConflictAction;
 use super::state::PersistentRootDelta;
 use super::{
-    ConcurrencyControlState, GranuleId, ObjectId, PersistentObjectDirectoryEntry,
+    ConcurrencyControlState, GranuleId, ObjectId, ObjectKind, PersistentObjectDirectoryEntry,
     PersistentRootKey, TMemoryFileBacking, TransactionConfig, TransactionId, TxDurableLog,
     granule_uses_transaction_state_version, persistent_root_key_from_logical_id,
 };
@@ -172,7 +172,14 @@ struct PersistentMetadataState {
 #[derive(Debug, Default)]
 struct PersistentObjectDirectoryState {
     entries: BTreeMap<ObjectId, PersistentObjectDirectoryEntry>,
+    reservations: BTreeMap<ObjectId, PersistentObjectReservation>,
     next_directory_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PersistentObjectReservation {
+    kind: ObjectKind,
+    type_layout_id: u32,
 }
 
 #[derive(Debug, Default)]
@@ -209,6 +216,21 @@ impl Default for TransactionRegionRuntime {
     fn default() -> Self {
         Self(Arc::new(TransactionRegionRuntimeInner::default()))
     }
+}
+
+fn ensure_matching_persistent_object_metadata(
+    object_id: ObjectId,
+    kind: ObjectKind,
+    type_layout_id: u32,
+    expected_kind: ObjectKind,
+    expected_type_layout_id: u32,
+    context: &str,
+) -> Result<()> {
+    ensure!(
+        kind == expected_kind && type_layout_id == expected_type_layout_id,
+        "{context}: object {object_id:?} expected kind {expected_kind:?} type_layout_id {expected_type_layout_id}, got kind {kind:?} type_layout_id {type_layout_id}",
+    );
+    Ok(())
 }
 
 impl TransactionRegionRuntime {
@@ -281,6 +303,45 @@ impl TransactionRegionRuntime {
         Ok(object_id)
     }
 
+    pub(crate) fn reserve_persistent_object_metadata(
+        &self,
+        object_id: ObjectId,
+        kind: ObjectKind,
+        type_layout_id: u32,
+    ) -> Result<()> {
+        let mut directory = self.lock_object_directory()?;
+        if let Some(entry) = directory.entries.get(&object_id) {
+            ensure_matching_persistent_object_metadata(
+                object_id,
+                kind,
+                type_layout_id,
+                entry.kind,
+                entry.type_layout_id,
+                "persistent object reservation conflicts with committed directory entry",
+            )?;
+            return Ok(());
+        }
+        if let Some(reservation) = directory.reservations.get(&object_id).copied() {
+            ensure_matching_persistent_object_metadata(
+                object_id,
+                kind,
+                type_layout_id,
+                reservation.kind,
+                reservation.type_layout_id,
+                "persistent object reservation conflicts with existing reservation",
+            )?;
+            return Ok(());
+        }
+        directory.reservations.insert(
+            object_id,
+            PersistentObjectReservation {
+                kind,
+                type_layout_id,
+            },
+        );
+        Ok(())
+    }
+
     pub(crate) fn install_persistent_object_directory_entries<I>(
         &self,
         entries: I,
@@ -292,13 +353,36 @@ impl TransactionRegionRuntime {
         let mut directory = self.lock_object_directory()?;
         let mut installed = Vec::new();
         for mut entry in entries {
-            match directory.entries.get(&entry.object_id) {
+            let current = directory.entries.get(&entry.object_id).cloned();
+            if let Some(current) = current.as_ref() {
+                ensure_matching_persistent_object_metadata(
+                    entry.object_id,
+                    entry.kind,
+                    entry.type_layout_id,
+                    current.kind,
+                    current.type_layout_id,
+                    "persistent object directory entry conflicts with committed directory metadata",
+                )?;
+            }
+            if let Some(reservation) = directory.reservations.get(&entry.object_id).copied() {
+                ensure_matching_persistent_object_metadata(
+                    entry.object_id,
+                    entry.kind,
+                    entry.type_layout_id,
+                    reservation.kind,
+                    reservation.type_layout_id,
+                    "persistent object directory entry conflicts with reserved metadata",
+                )?;
+            }
+
+            match current {
                 Some(current) if current.record_version > entry.record_version => {
                     metadata
                         .object_versions
                         .entry(current.object_id)
                         .and_modify(|version| *version = (*version).max(current.record_version))
                         .or_insert(current.record_version);
+                    directory.reservations.remove(&current.object_id);
                     continue;
                 }
                 Some(current) if current.record_version == entry.record_version => {
@@ -307,6 +391,7 @@ impl TransactionRegionRuntime {
                         .entry(current.object_id)
                         .and_modify(|version| *version = (*version).max(current.record_version))
                         .or_insert(current.record_version);
+                    directory.reservations.remove(&current.object_id);
                     installed.push(current.clone());
                     continue;
                 }
@@ -321,6 +406,7 @@ impl TransactionRegionRuntime {
             entry.directory_version = next_version;
 
             directory.entries.insert(entry.object_id, entry.clone());
+            directory.reservations.remove(&entry.object_id);
             metadata
                 .object_versions
                 .entry(entry.object_id)

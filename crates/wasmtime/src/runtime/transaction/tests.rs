@@ -94,6 +94,52 @@ fn transaction_region_runtime_can_be_shared_between_stores_for_test() {
 }
 
 #[test]
+fn shared_runtime_allocates_unique_persistent_object_ids_across_object_tables() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut first = ObjectTable::default();
+    first.set_shared_region_runtime(Some(runtime.clone()));
+    let mut second = ObjectTable::default();
+    second.set_shared_region_runtime(Some(runtime));
+
+    let first_object = first
+        .allocate_persistent_struct_for_gc_ref(0x7002, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let second_object = second
+        .allocate_persistent_struct_for_gc_ref(0x7003, vec![ObjectValue::I32(2)])
+        .unwrap();
+
+    assert_ne!(first_object, second_object);
+    assert!(first_object.object_index < second_object.object_index);
+}
+
+#[test]
+fn shared_runtime_persistent_allocations_ignore_local_free_list_holes() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut first = ObjectTable::default();
+    first.set_shared_region_runtime(Some(runtime.clone()));
+    let mut second = ObjectTable::default();
+    second.set_shared_region_runtime(Some(runtime));
+
+    let first_hole = first.allocate(ObjectKind::Struct).unwrap();
+    let second_hole = second.allocate(ObjectKind::Struct).unwrap();
+    assert_eq!(first_hole, ObjectId { object_index: 0 });
+    assert_eq!(second_hole, ObjectId { object_index: 0 });
+    assert!(first.free(first_hole).unwrap());
+    assert!(second.free(second_hole).unwrap());
+
+    let first_object = first
+        .allocate_persistent_struct_for_gc_ref(0x7004, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let second_object = second
+        .allocate_persistent_struct_for_gc_ref(0x7005, vec![ObjectValue::I32(2)])
+        .unwrap();
+
+    assert_ne!(first_object, first_hole);
+    assert_ne!(second_object, second_hole);
+    assert_ne!(first_object, second_object);
+}
+
+#[test]
 fn two_stores_attach_to_same_transaction_region_runtime() {
     let engine = crate::Engine::default();
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
@@ -147,6 +193,79 @@ fn persistent_object_directory_entry_rejects_wrong_object_id() {
         entry
             .ensure_matches_object(ObjectId { object_index: 8 })
             .is_err()
+    );
+}
+
+#[test]
+fn shared_runtime_rejects_duplicate_persistent_object_reservation() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let object = ObjectId { object_index: 41 };
+
+    runtime
+        .reserve_persistent_object_metadata(
+            object,
+            ObjectKind::Struct,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+        )
+        .unwrap();
+    runtime
+        .reserve_persistent_object_metadata(
+            object,
+            ObjectKind::Struct,
+            TypeLayoutId::DEFAULT_STRUCT.get(),
+        )
+        .unwrap();
+    assert!(runtime.persistent_object_directory_entry(object).unwrap().is_none());
+    assert!(
+        runtime
+            .reserve_persistent_object_metadata(
+                object,
+                ObjectKind::Array,
+                TypeLayoutId::DEFAULT_ARRAY.get(),
+            )
+            .is_err()
+    );
+    assert!(
+        runtime
+            .reserve_persistent_object_metadata(
+                object,
+                ObjectKind::Struct,
+                TypeLayoutId::DEFAULT_ARRAY.get(),
+            )
+            .is_err()
+    );
+    assert!(
+        runtime
+            .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+                object_id: object,
+                kind: ObjectKind::Array,
+                directory_version: 0,
+                record_version: 1,
+                type_layout_id: TypeLayoutId::DEFAULT_ARRAY.get(),
+                runtime_type_index: None,
+                record_source: None,
+            }])
+            .is_err()
+    );
+    let installed = runtime
+        .install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: 1,
+            type_layout_id: TypeLayoutId::DEFAULT_STRUCT.get(),
+            runtime_type_index: None,
+            record_source: None,
+        }])
+        .unwrap();
+    assert_eq!(installed.len(), 1);
+    assert_eq!(
+        runtime
+            .persistent_object_directory_entry(object)
+            .unwrap()
+            .unwrap()
+            .kind,
+        ObjectKind::Struct
     );
 }
 

@@ -744,7 +744,10 @@ impl ObjectTable {
     ) -> Result<ObjectId> {
         self.validate_type_layout_for_object_kind(payload.kind(), type_layout_id)?;
 
-        let reused_slot = self.free_list.last().copied();
+        let shared_persistent = persistent && self.shared_region_runtime.is_some();
+        let reused_slot = (!shared_persistent)
+            .then(|| self.free_list.last().copied())
+            .flatten();
         let object_id = match reused_slot {
             Some(object_id) => object_id,
             None => {
@@ -781,6 +784,11 @@ impl ObjectTable {
             "object table freelist entry points at a live slot"
         );
         let kind = payload.kind();
+        if persistent {
+            if let Some(runtime) = &self.shared_region_runtime {
+                runtime.reserve_persistent_object_metadata(object_id, kind, type_layout_id.get())?;
+            }
+        }
         let record_version = self.bump_record_version()?;
         let record = self.heap.allocate_record(
             object_id,
@@ -1868,11 +1876,18 @@ impl ObjectTable {
     }
 
     pub(crate) fn free(&mut self, object_id: ObjectId) -> Result<bool> {
+        let shared_persistent = self.shared_region_runtime.is_some()
+            && self
+                .live_slot(object_id)
+                .map(|slot| slot.persistent)
+                .unwrap_or(false);
         if !self.clear_live_slot_for_volatile_gc(object_id)? {
             return Ok(false);
         }
         self.bump_object_version()?;
-        self.free_list.push(object_id);
+        if !shared_persistent {
+            self.free_list.push(object_id);
+        }
         Ok(true)
     }
 
@@ -1937,6 +1952,9 @@ impl ObjectTable {
 
     pub(crate) fn rebuild_free_list_holes(&mut self) -> Result<()> {
         self.free_list.clear();
+        if self.shared_region_runtime.is_some() {
+            return Ok(());
+        }
         for (index, slot) in self.slots.iter().enumerate() {
             if slot.is_none() {
                 self.free_list.push(ObjectId {
