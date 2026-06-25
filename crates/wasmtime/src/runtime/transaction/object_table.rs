@@ -1523,6 +1523,15 @@ impl ObjectTable {
         if index >= self.slots.len() {
             self.slots.resize_with(index + 1, || None);
         }
+        let type_layout_id = TypeLayoutId::new(entry.type_layout_id)
+            .context("persistent object directory entry type layout id cannot be zero")?;
+        self.validate_type_layout_for_object_kind(entry.kind, type_layout_id)?;
+        if let Some(slot) = self.slots[index].as_ref() {
+            ensure!(
+                slot.persistent,
+                "persistent object directory entry collides with live volatile slot"
+            );
+        }
 
         let record = match &entry.record_source {
             Some(source) => self.heap.install_mapped_persistent_record_from_source(
@@ -1539,6 +1548,8 @@ impl ObjectTable {
         };
 
         let was_live = self.slots[index].is_some();
+        self.next_version = self.next_version.max(entry.directory_version);
+        self.next_record_version = self.next_record_version.max(entry.record_version);
         self.slots[index] = Some(ObjectTableSlot {
             kind: entry.kind,
             version: entry.directory_version,
@@ -1548,6 +1559,7 @@ impl ObjectTable {
             current_record: record,
         });
         if !was_live {
+            self.free_list.retain(|free| *free != entry.object_id);
             self.live_count = self
                 .live_count
                 .checked_add(1)

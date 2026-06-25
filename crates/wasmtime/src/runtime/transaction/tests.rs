@@ -6979,6 +6979,60 @@ fn file_backed_mixed_loose_end_rolls_back_tmemory_and_drops_object_publication()
 mod file_backed_object_layout_recovery {
     use super::*;
 
+    fn synthetic_directory_location_for_test(
+        data_record_offset: usize,
+        record_len: u64,
+    ) -> PersistentObjectRecordLocation {
+        let block_size = crate::runtime::vm::block_region::BLOCK_SIZE;
+        PersistentObjectRecordLocation {
+            data_block: u32::try_from(data_record_offset / block_size).unwrap(),
+            data_offset: u32::try_from(data_record_offset % block_size).unwrap(),
+            data_record_offset: u64::try_from(data_record_offset).unwrap(),
+            record_len,
+        }
+    }
+
+    fn synthetic_directory_entry_for_test(
+        object_id: ObjectId,
+        directory_version: u64,
+        record_version: u32,
+        kind: ObjectKind,
+        type_layout_id: u32,
+        record_bytes: Vec<u8>,
+    ) -> (
+        crate::runtime::vm::block_region::SyntheticRecoveredWinnerSourceHandle,
+        PersistentObjectDirectoryEntry,
+    ) {
+        let (fixture_source, recovered_source) = synthetic_recovered_mapped_source_for_test();
+        let winner = recovered_object_winner_with_location_for_test(
+            &fixture_source,
+            object_id.object_index,
+            record_version,
+            kind as u16,
+            type_layout_id,
+            0,
+            0,
+            record_bytes,
+        );
+        let location =
+            synthetic_directory_location_for_test(winner.data_record_offset, winner.record_len);
+        (
+            fixture_source,
+            PersistentObjectDirectoryEntry {
+                object_id,
+                kind,
+                directory_version,
+                record_version: winner.version,
+                type_layout_id: winner.type_layout_id,
+                runtime_type_index: None,
+                record_source: Some(PersistentObjectRecordSource {
+                    mapped_source: recovered_source,
+                    location,
+                }),
+            },
+        )
+    }
+
     #[test]
     fn persistent_struct_with_only_scalars_recovers_payload_and_layout() {
         let ((object, layout_id), recovered) =
@@ -7468,19 +7522,49 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
+    fn store_local_object_table_materialized_directory_entry_advances_local_version_counters(
+    ) -> Result<()> {
+        let object = ObjectId { object_index: 41 };
+        let (_fixture_source, entry) = synthetic_directory_entry_for_test(
+            object,
+            50,
+            40,
+            ObjectKind::Struct,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            encode_object_record_for_test(
+                object.object_index,
+                40,
+                type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+            )?,
+        );
+        let mut objects = ObjectTable::default();
+
+        objects.install_persistent_object_directory_entry(entry)?;
+
+        let copied = objects.persistent_gc_copy_publication_for_test(object)?;
+        assert!(
+            copied.version > 40,
+            "materialized record versions must keep local record-version allocation monotonic"
+        );
+        objects.install_persistent_gc_copied_publication_for_test(&copied)?;
+        assert!(
+            objects.version(object)? > 50,
+            "materialized directory versions must keep local object-version allocation monotonic"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn store_local_object_table_rejects_shared_directory_entry_with_mismatched_record_header(
     ) -> Result<()> {
-        let runtime = TransactionRegionRuntime::new_for_test();
         let object = ObjectId { object_index: 41 };
-        let (fixture_source, recovered_source) = synthetic_recovered_mapped_source_for_test();
-        let winner = recovered_object_winner_with_location_for_test(
-            &fixture_source,
-            object.object_index,
+        let (_fixture_source, entry) = synthetic_directory_entry_for_test(
+            object,
             1,
-            ObjectKind::Struct as u16,
+            1,
+            ObjectKind::Struct,
             type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
-            11,
-            101,
             encode_object_record_for_test(
                 99,
                 1,
@@ -7488,33 +7572,134 @@ mod file_backed_object_layout_recovery {
                 &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
             )?,
         );
-        runtime.install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
-            object_id: object,
-            kind: ObjectKind::Struct,
-            directory_version: 0,
-            record_version: winner.version,
-            type_layout_id: winner.type_layout_id,
-            runtime_type_index: None,
-            record_source: Some(PersistentObjectRecordSource {
-                mapped_source: recovered_source,
-                location: PersistentObjectRecordLocation {
-                    data_block: winner.data_block,
-                    data_offset: winner.data_offset,
-                    data_record_offset: u64::try_from(winner.data_record_offset).unwrap(),
-                    record_len: winner.record_len,
-                },
-            }),
-        }])?;
-
         let mut objects = ObjectTable::default();
-        objects.set_shared_region_runtime(Some(runtime));
 
-        let err = objects
-            .refresh_persistent_object_from_shared_directory(object)
-            .unwrap_err();
+        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
         assert!(
             err.to_string()
                 .contains("mapped persistent object record id does not match object identity")
+        );
+        assert!(objects.live_slot(object).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn store_local_object_table_rejects_directory_materialization_over_live_volatile_slot(
+    ) -> Result<()> {
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)])?;
+        let original_handle = objects.current_record_handle_for_test(object)?;
+        let transaction_handle = objects.transaction_ref_handle_for_object_id(object)?;
+        let (_fixture_source, entry) = synthetic_directory_entry_for_test(
+            object,
+            2,
+            3,
+            ObjectKind::Struct,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            encode_object_record_for_test(
+                object.object_index,
+                3,
+                type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+            )?,
+        );
+
+        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("persistent object directory entry collides with live volatile slot")
+        );
+        assert!(!objects.live_slot(object)?.persistent);
+        assert_eq!(objects.current_record_handle_for_test(object)?, original_handle);
+        assert_eq!(
+            objects.transaction_ref_handle_for_object_id(object)?,
+            transaction_handle
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn store_local_object_table_materialized_directory_entry_is_removed_from_free_list(
+    ) -> Result<()> {
+        let mut objects = ObjectTable::default();
+        let object = objects.allocate_struct(vec![ObjectValue::I32(1)])?;
+        assert!(objects.free(object)?);
+        assert!(objects.free_list.contains(&object));
+        let (_fixture_source, entry) = synthetic_directory_entry_for_test(
+            object,
+            2,
+            3,
+            ObjectKind::Struct,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            encode_object_record_for_test(
+                object.object_index,
+                3,
+                type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+            )?,
+        );
+
+        objects.install_persistent_object_directory_entry(entry)?;
+
+        assert!(!objects.free_list.contains(&object));
+        let next = objects.allocate_struct(vec![ObjectValue::I32(2)])?;
+        assert_ne!(next, object);
+        assert!(objects.live_slot(object)?.persistent);
+        Ok(())
+    }
+
+    #[test]
+    fn store_local_object_table_rejects_directory_entry_with_mismatched_location_offset(
+    ) -> Result<()> {
+        let object = ObjectId { object_index: 41 };
+        let (_fixture_source, mut entry) = synthetic_directory_entry_for_test(
+            object,
+            2,
+            3,
+            ObjectKind::Struct,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            encode_object_record_for_test(
+                object.object_index,
+                3,
+                type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+            )?,
+        );
+        entry.record_source.as_mut().unwrap().location.data_offset += 1;
+        let mut objects = ObjectTable::default();
+
+        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mapped persistent object location does not match data record offset")
+        );
+        assert!(objects.live_slot(object).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn store_local_object_table_rejects_directory_entry_with_wrong_kind_type_layout(
+    ) -> Result<()> {
+        let object = ObjectId { object_index: 41 };
+        let (_fixture_source, entry) = synthetic_directory_entry_for_test(
+            object,
+            2,
+            3,
+            ObjectKind::Struct,
+            type_layout::TypeLayoutId::DEFAULT_ARRAY.get(),
+            encode_object_record_for_test(
+                object.object_index,
+                3,
+                type_layout::TypeLayoutId::DEFAULT_ARRAY.get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+            )?,
+        );
+        let mut objects = ObjectTable::default();
+
+        let err = objects.install_persistent_object_directory_entry(entry).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("persistent type layout kind Array does not match object kind Struct")
         );
         assert!(objects.live_slot(object).is_err());
         Ok(())

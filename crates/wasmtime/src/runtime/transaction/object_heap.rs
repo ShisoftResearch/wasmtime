@@ -243,6 +243,22 @@ impl ObjectHeap {
         };
         let data_record_offset = usize::try_from(location.data_record_offset)
             .context("mapped persistent object data record offset overflow")?;
+        let data_block = usize::try_from(location.data_block)
+            .context("mapped persistent object data block index overflow")?;
+        let data_offset = usize::try_from(location.data_offset)
+            .context("mapped persistent object data offset overflow")?;
+        ensure!(
+            data_offset < BLOCK_SIZE,
+            "mapped persistent object location offset is outside block bounds"
+        );
+        let expected_data_record_offset = data_block
+            .checked_mul(BLOCK_SIZE)
+            .and_then(|offset| offset.checked_add(data_offset))
+            .context("mapped persistent object location absolute offset overflow")?;
+        ensure!(
+            expected_data_record_offset == data_record_offset,
+            "mapped persistent object location does not match data record offset"
+        );
         let mut data_header = None;
         source.with_mapped_slice(
             data_record_offset,
