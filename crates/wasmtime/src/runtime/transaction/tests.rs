@@ -733,6 +733,57 @@ fn shared_region_runtime_late_store_adopts_existing_file_backed_tmemory_after_gr
 
 #[cfg(all(unix, has_virtual_memory))]
 #[test]
+fn two_stores_share_transactional_linear_memory_backend_bytes() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write") (param i32 i32)
+                (i32.tstore (local.get 0) (local.get 1)))
+              (tfunc (export "read") (param i32) (result i32)
+                (i32.tload (local.get 0))))
+        "#,
+    );
+
+    let addr = 64;
+    let expected = 0x4433_2211;
+
+    let mut first_store = crate::Store::new(&engine, ());
+    first_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let first_instance = crate::Instance::new(&mut first_store, &module, &[]).unwrap();
+    let write = first_instance
+        .get_typed_func::<(i32, i32), ()>(&mut first_store, "write")
+        .unwrap();
+    write.call(&mut first_store, (addr, expected)).unwrap();
+
+    let mut second_store = crate::Store::new(&engine, ());
+    second_store.set_transaction_region_runtime_for_test(runtime);
+    let second_instance = crate::Instance::new(&mut second_store, &module, &[]).unwrap();
+    let read = second_instance
+        .get_typed_func::<i32, i32>(&mut second_store, "read")
+        .unwrap();
+
+    assert_eq!(read.call(&mut second_store, addr).unwrap(), expected);
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
 fn shared_region_runtime_shared_file_backed_tmemory_uses_physical_owner_key_across_stores() {
     clear_current_thread_transaction_for_test();
 
@@ -1319,6 +1370,106 @@ fn shared_region_runtime_commit_path_uses_transaction_id_in_tmemory_undo_tx_meta
         crate::vm::TxLogEntryRole::TMemoryUndo
     );
 
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(unix, has_virtual_memory))]
+#[test]
+fn linear_memory_commit_logs_only_touched_shared_file_backed_granules() {
+    clear_current_thread_transaction_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let runtime =
+        crate::runtime::transaction::TransactionRegionRuntime::create_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+            64,
+        )
+        .unwrap();
+    let mut tmemory = crate::runtime::vm::TMemory::new(
+        TransactionConfig::with_file_backed_tmemory_path(tmemory_path).unwrap(),
+        1,
+        Some(1),
+    )
+    .unwrap();
+
+    let granule0_addr = 8usize;
+    let granule1_addr = TMEMORY_GRANULE_SIZE + 8;
+    let granule2_addr = TMEMORY_GRANULE_SIZE * 2 + 8;
+    tmemory.commit_range(granule0_addr, &[0x10, 0x11, 0x12, 0x13]).unwrap();
+    tmemory.commit_range(granule1_addr, &[0x20, 0x21, 0x22, 0x23]).unwrap();
+    tmemory.commit_range(granule2_addr, &[0x30, 0x31, 0x32, 0x33]).unwrap();
+
+    let mut state = TransactionState::default();
+    let shared = runtime
+        .shared_file_backed_storage()
+        .unwrap()
+        .expect("shared file-backed storage config");
+    state.open_shared_file_backed_durable_log(&shared).unwrap();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state
+        .stage_tmemory_write_for_test(
+            0,
+            0,
+            u64::try_from(granule0_addr).unwrap(),
+            &[0xa0, 0xa1, 0xa2, 0xa3],
+            &tmemory,
+        )
+        .unwrap();
+    state
+        .stage_tmemory_write_for_test(
+            0,
+            0,
+            u64::try_from(granule2_addr).unwrap(),
+            &[0xc0, 0xc1, 0xc2, 0xc3],
+            &tmemory,
+        )
+        .unwrap();
+
+    let stream_id = runtime
+        .current_thread_log_segment_for_test()
+        .unwrap()
+        .stream_id();
+    assert!(state.commit_tmemory_for_test(&mut tmemory).unwrap());
+
+    let entries = state.durable_log_entries_for_test(stream_id);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| {
+        entry.role().unwrap() == crate::runtime::vm::TxLogEntryRole::TMemoryUndo
+    }));
+    let staged_granule = vec![0; TMEMORY_GRANULE_SIZE];
+    let expected_undo_logical_ids = BTreeSet::from([
+        tmemory
+            .prepare_tmemory_undo_record(Some(0), 0, 0, &staged_granule)
+            .unwrap()
+            .logical_id,
+        tmemory
+            .prepare_tmemory_undo_record(Some(0), 0, 2, &staged_granule)
+            .unwrap()
+            .logical_id,
+    ]);
+    let undo_logical_ids = entries
+        .iter()
+        .map(|entry| entry.logical_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(undo_logical_ids, expected_undo_logical_ids);
+
+    assert_eq!(
+        tmemory.read_committed(granule0_addr..granule0_addr + 4).unwrap(),
+        vec![0xa0, 0xa1, 0xa2, 0xa3]
+    );
+    assert_eq!(
+        tmemory.read_committed(granule1_addr..granule1_addr + 4).unwrap(),
+        vec![0x20, 0x21, 0x22, 0x23]
+    );
+    assert_eq!(
+        tmemory.read_committed(granule2_addr..granule2_addr + 4).unwrap(),
+        vec![0xc0, 0xc1, 0xc2, 0xc3]
+    );
+
+    state.clear_active().unwrap();
     clear_current_thread_transaction_for_test();
 }
 
