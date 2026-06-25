@@ -1871,12 +1871,28 @@ impl StoreOpaque {
             .cloned_mapped_region_source()
             .context("recovered file-backed region does not expose a mapped region source")?;
         let mut recovered_object_table = ObjectTable::default();
-        recovered_object_table.rebuild_reachable_from_mapped_recovered_object_winners(
+        let report = recovered_object_table.rebuild_reachable_from_mapped_recovered_object_winners(
             &recovered.type_layouts,
             &object_winners,
             &recovered.root_object_ids,
-            mapped_source,
+            mapped_source.clone(),
         )?;
+        let reachable_winners = object_winners
+            .iter()
+            .filter(|winner| {
+                report.mark.reachable.contains(&ObjectId {
+                    object_index: winner.object_id,
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.transaction_region_runtime
+            .install_recovered_type_layouts(&recovered.type_layouts)?;
+        self.transaction_region_runtime
+            .install_recovered_persistent_object_directory_entries(
+                &reachable_winners,
+                mapped_source,
+            )?;
         let tx_log_blocks = u32::try_from(
             std::fs::metadata(&tx_log_path)
                 .with_context(|| {
@@ -3516,6 +3532,64 @@ mod tests {
                 .unwrap()
         );
         assert!(store.transaction_object_table().payload(garbage).is_err());
+    }
+
+    #[cfg(all(feature = "transaction", unix))]
+    #[test]
+    fn recovered_store_shared_directory_filters_unreachable_objects() {
+        use crate::runtime::transaction::{ObjectId, ObjectPayload, ObjectValue};
+        use crate::runtime::vm::TMemory;
+        use crate::runtime::vm::block_region::{
+            create_file_backed_region_image, publish_committed_global_object_root,
+            publish_committed_struct_object,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let root = ObjectId { object_index: 41 };
+        let garbage = ObjectId { object_index: 42 };
+
+        let tmemory_config =
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap();
+        drop(TMemory::new(tmemory_config, 1, Some(1)).unwrap());
+        create_file_backed_region_image(&tx_log_path, 64).unwrap();
+        publish_committed_struct_object(&tx_log_path, 1, root.object_index, 1, 12, &[7, 9])
+            .unwrap();
+        publish_committed_struct_object(&tx_log_path, 2, garbage.object_index, 1, 12, &[1, 3])
+            .unwrap();
+        publish_committed_global_object_root(&tx_log_path, 3, root.object_index).unwrap();
+
+        let engine = Engine::default();
+        let mut recovered_store = Store::new(&engine, ());
+        recovered_store
+            .transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)
+            .unwrap();
+        let recovered_runtime = recovered_store
+            .as_store_opaque()
+            .transaction_region_runtime()
+            .clone();
+
+        let mut fresh_store = Store::new(&engine, ());
+        fresh_store.set_transaction_region_runtime_for_test(recovered_runtime);
+
+        assert!(
+            fresh_store
+                .transaction_object_table_mut()
+                .refresh_persistent_object_from_shared_directory(root)
+                .unwrap()
+        );
+        assert_eq!(
+            fresh_store.transaction_object_table().payload(root).unwrap(),
+            ObjectPayload::Struct(vec![ObjectValue::I32(7), ObjectValue::I32(9)])
+        );
+        assert!(
+            !fresh_store
+                .transaction_object_table_mut()
+                .refresh_persistent_object_from_shared_directory(garbage)
+                .unwrap()
+        );
+        assert!(fresh_store.transaction_object_table().payload(garbage).is_err());
     }
 
     #[cfg(all(feature = "transaction", unix, has_virtual_memory))]

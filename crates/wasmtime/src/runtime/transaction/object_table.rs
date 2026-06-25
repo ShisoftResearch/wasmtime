@@ -136,6 +136,13 @@ impl ObjectTable {
         for layout in builtin_type_layouts() {
             self.register_type_layout(layout)?;
         }
+        self.merge_recovered_type_layouts(recovered_type_layouts)
+    }
+
+    pub(crate) fn merge_recovered_type_layouts(
+        &mut self,
+        recovered_type_layouts: &TypeLayoutRegistry,
+    ) -> Result<()> {
         for layout in recovered_type_layouts.iter().cloned() {
             if is_builtin_type_layout_id(layout.id()) {
                 continue;
@@ -887,6 +894,10 @@ impl ObjectTable {
                 return Ok(false);
             }
         }
+
+        TypeLayoutId::new(entry.type_layout_id)
+            .context("persistent object directory entry type layout id cannot be zero")?;
+        self.merge_recovered_type_layouts(&runtime.recovered_type_layouts()?)?;
 
         self.install_persistent_object_directory_entry(entry)?;
         Ok(true)

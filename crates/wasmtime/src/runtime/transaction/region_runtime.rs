@@ -9,10 +9,13 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
 use super::concurrency::TransactionConflictAction;
+use super::object_value::object_kind_from_u16;
 use super::state::PersistentRootDelta;
+use super::type_layout::TypeLayoutRegistry;
 use super::{
     ConcurrencyControlState, GranuleId, ObjectId, ObjectKind, PersistentObjectDirectoryEntry,
-    PersistentRootKey, TMemoryFileBacking, TransactionConfig, TransactionId, TxDurableLog,
+    ObjectTable, PersistentObjectRecordLocation, PersistentObjectRecordSource, PersistentRootKey,
+    TMemoryFileBacking, TransactionConfig, TransactionId, TxDurableLog,
     granule_uses_transaction_state_version, persistent_root_key_from_logical_id,
 };
 
@@ -174,6 +177,7 @@ struct PersistentObjectDirectoryState {
     entries: BTreeMap<ObjectId, PersistentObjectDirectoryEntry>,
     reservations: BTreeMap<ObjectId, PersistentObjectReservation>,
     next_directory_version: u64,
+    type_layouts: TypeLayoutRegistry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -415,6 +419,55 @@ impl TransactionRegionRuntime {
             installed.push(entry);
         }
         Ok(installed)
+    }
+
+    pub(crate) fn install_recovered_persistent_object_directory_entries(
+        &self,
+        winners: &[crate::runtime::vm::RecoveredObjectWinner],
+        mapped_source: Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+    ) -> Result<()> {
+        let entries = winners
+            .iter()
+            .map(|winner| {
+                Ok(PersistentObjectDirectoryEntry {
+                    object_id: ObjectId {
+                        object_index: winner.object_id,
+                    },
+                    kind: object_kind_from_u16(winner.kind)?,
+                    directory_version: 0,
+                    record_version: winner.version,
+                    type_layout_id: winner.type_layout_id,
+                    runtime_type_index: None,
+                    record_source: Some(PersistentObjectRecordSource {
+                        mapped_source: mapped_source.clone(),
+                        location: PersistentObjectRecordLocation {
+                            data_block: winner.data_block,
+                            data_offset: winner.data_offset,
+                            data_record_offset: u64::try_from(winner.data_record_offset)
+                                .context("recovered object data record offset overflow")?,
+                            record_len: winner.record_len,
+                        },
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.install_persistent_object_directory_entries(entries)
+            .map(|_| ())
+    }
+
+    pub(crate) fn install_recovered_type_layouts(
+        &self,
+        recovered_type_layouts: &TypeLayoutRegistry,
+    ) -> Result<()> {
+        let mut directory = self.lock_object_directory()?;
+        for layout in recovered_type_layouts.iter().cloned() {
+            directory.type_layouts.insert(layout)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recovered_type_layouts(&self) -> Result<TypeLayoutRegistry> {
+        Ok(self.lock_object_directory()?.type_layouts.clone())
     }
 
     pub(crate) fn persistent_object_directory_entry(
@@ -978,6 +1031,25 @@ impl TransactionRegionRuntime {
             crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(
                 tx_log_path,
             )?;
+        let object_winners = recovered.committed_object_winners()?;
+        let mapped_source = recovered
+            .cloned_mapped_region_source()
+            .context("recovered file-backed region does not expose a mapped region source")?;
+        let report = ObjectTable::persistent_recovery_gc_report_mapped(
+            &recovered.type_layouts,
+            &object_winners,
+            &recovered.root_object_ids,
+            mapped_source.clone(),
+        )?;
+        let reachable_winners = object_winners
+            .iter()
+            .filter(|winner| {
+                report.mark.reachable.contains(&ObjectId {
+                    object_index: winner.object_id,
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let tx_log_blocks = u32::try_from(
             std::fs::metadata(tx_log_path)
                 .with_context(|| {
@@ -991,6 +1063,14 @@ impl TransactionRegionRuntime {
         if let Some(tmemory_pages) = recovered.committed_file_backed_tmemory_pages()? {
             runtime.record_file_backed_tmemory_pages(tmemory_pages)?;
         }
+        runtime.install_recovered_type_layouts(&recovered.type_layouts)?;
+        runtime.install_recovered_persistent_object_directory_entries(
+            &reachable_winners,
+            mapped_source,
+        )?;
+        runtime.observe_recovered_object_ids(object_winners.iter().map(|winner| ObjectId {
+            object_index: winner.object_id,
+        }))?;
         Ok(runtime)
     }
 

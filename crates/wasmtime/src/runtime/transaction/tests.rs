@@ -7692,6 +7692,214 @@ mod file_backed_object_layout_recovery {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovered_shared_runtime_advances_persistent_object_id_allocation() -> Result<()> {
+        use crate::runtime::vm::TMemory;
+        use crate::runtime::vm::block_region::{
+            create_file_backed_region_image, publish_committed_struct_object,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let recovered_object = ObjectId { object_index: 41 };
+
+        let tmemory_config =
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
+        drop(TMemory::new(tmemory_config, 1, Some(1))?);
+        create_file_backed_region_image(&tx_log_path, 64)?;
+        publish_committed_struct_object(
+            &tx_log_path,
+            1,
+            recovered_object.object_index,
+            1,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            &[7],
+        )?;
+
+        let runtime = crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+        )?;
+        let mut objects = ObjectTable::default();
+        objects.set_shared_region_runtime(Some(runtime));
+
+        let new_object =
+            objects.allocate_persistent_struct_for_gc_ref(0x7041, vec![ObjectValue::I32(1)])?;
+        assert!(new_object.object_index > recovered_object.object_index);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_shared_runtime_allows_fresh_store_to_materialize_object_without_recopy(
+    ) -> Result<()> {
+        use crate::runtime::vm::TMemory;
+        use crate::runtime::vm::block_region::{
+            create_file_backed_region_image, publish_committed_global_object_root,
+            publish_committed_struct_object,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let object = ObjectId { object_index: 41 };
+
+        let tmemory_config =
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
+        drop(TMemory::new(tmemory_config, 1, Some(1))?);
+        create_file_backed_region_image(&tx_log_path, 64)?;
+        publish_committed_struct_object(
+            &tx_log_path,
+            1,
+            object.object_index,
+            1,
+            101,
+            &[7, 9],
+        )?;
+        publish_committed_global_object_root(&tx_log_path, 2, object.object_index)?;
+
+        let engine = crate::Engine::default();
+        let mut recovered_store = crate::Store::new(&engine, ());
+        recovered_store.transaction_open_file_backed_storage_for_test(
+            tmemory_path,
+            tx_log_path,
+        )?;
+        let recovered_runtime = recovered_store
+            .as_store_opaque()
+            .transaction_region_runtime()
+            .clone();
+
+        let mut fresh_store = crate::Store::new(&engine, ());
+        fresh_store.set_transaction_region_runtime_for_test(recovered_runtime);
+        assert_eq!(fresh_store.transaction_object_table().live_count(), 0);
+
+        object_heap::reset_decode_record_calls_for_test();
+        assert!(
+            fresh_store
+                .transaction_object_table_mut()
+                .refresh_persistent_object_from_shared_directory(object)?
+        );
+        assert_eq!(
+            object_heap::decode_record_calls_for_test(),
+            0,
+            "shared-directory refresh should install the recovered mapped record without decode"
+        );
+        assert_eq!(
+            fresh_store.transaction_object_table().payload(object)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(7), ObjectValue::I32(9)])
+        );
+        assert!(
+            fresh_store
+                .transaction_object_table()
+                .current_record_is_persistent_mapped_for_test(object)?
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_runtime_shared_directory_filters_unreachable_objects() -> Result<()> {
+        use crate::runtime::vm::TMemory;
+        use crate::runtime::vm::block_region::{
+            create_file_backed_region_image, publish_committed_global_object_root,
+            publish_committed_struct_object,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let root = ObjectId { object_index: 41 };
+        let garbage = ObjectId { object_index: 42 };
+
+        let tmemory_config =
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
+        drop(TMemory::new(tmemory_config, 1, Some(1))?);
+        create_file_backed_region_image(&tx_log_path, 64)?;
+        publish_committed_struct_object(&tx_log_path, 1, root.object_index, 1, 101, &[7, 9])?;
+        publish_committed_struct_object(
+            &tx_log_path,
+            2,
+            garbage.object_index,
+            1,
+            101,
+            &[1, 3],
+        )?;
+        publish_committed_global_object_root(&tx_log_path, 3, root.object_index)?;
+
+        let runtime = crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+        )?;
+        let mut objects = ObjectTable::default();
+        objects.set_shared_region_runtime(Some(runtime));
+
+        assert!(objects.refresh_persistent_object_from_shared_directory(root)?);
+        assert_eq!(
+            objects.payload(root)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(7), ObjectValue::I32(9)])
+        );
+        assert!(!objects.refresh_persistent_object_from_shared_directory(garbage)?);
+        assert!(objects.payload(garbage).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_directory_refresh_rejects_conflicting_recovered_type_layout() -> Result<()> {
+        use crate::runtime::vm::TMemory;
+        use crate::runtime::vm::block_region::{
+            create_file_backed_region_image, publish_committed_global_object_root,
+            publish_committed_struct_object,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let tmemory_path = dir.path().join("phase.tmemory");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let object = ObjectId { object_index: 41 };
+
+        let tmemory_config =
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
+        drop(TMemory::new(tmemory_config, 1, Some(1))?);
+        create_file_backed_region_image(&tx_log_path, 64)?;
+        publish_committed_struct_object(
+            &tx_log_path,
+            1,
+            object.object_index,
+            1,
+            101,
+            &[7, 9],
+        )?;
+        publish_committed_global_object_root(&tx_log_path, 2, object.object_index)?;
+
+        let runtime = crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+            &tmemory_path,
+            &tx_log_path,
+        )?;
+        let mut objects = ObjectTable::default();
+        objects.set_shared_region_runtime(Some(runtime));
+        objects.register_type_layout(type_layout::PersistentTypeLayout::Struct {
+            id: type_layout::TypeLayoutId::new(101).unwrap(),
+            fingerprint: 0x5354_5255_4354_0065,
+            body_size: 8,
+            fields: vec![type_layout::StructTraceField {
+                field_index: 0,
+                field_offset: 0,
+                value_size: 8,
+                kind: type_layout::TraceSlotKind::ObjectRef,
+            }],
+        })?;
+
+        let err = objects
+            .refresh_persistent_object_from_shared_directory(object)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("conflicting persistent type layout for id 101"));
+        assert!(objects.live_slot(object).is_err());
+        Ok(())
+    }
+
     #[test]
     fn shared_runtime_refresh_skips_live_volatile_object_id_collision() -> Result<()> {
         let runtime = TransactionRegionRuntime::new_for_test();
