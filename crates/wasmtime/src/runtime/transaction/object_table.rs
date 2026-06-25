@@ -22,14 +22,13 @@ use super::wasmtime_layout::{
 use super::{
     DanglingObjectRef, DanglingObjectRefKind, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, ObjectId, ObjectKind, ObjectPayload,
-    ObjectValue, PersistentMarkSweepReport, PersistentObjectMarkReport, PersistentObjectMarker,
+    ObjectValue, PersistentMarkSweepReport, PersistentObjectDirectoryEntry,
+    PersistentObjectMarkReport, PersistentObjectMarker, PersistentObjectRecordLocation,
     PersistentObjectRefRaw, PersistentRecoveryGcReport, PersistentRootError,
     PersistentRootErrorKind, PersistentVolatileSweepReport, TransactionObjectRefRaw,
     TransactionRegionRuntime, TxObjectHeader, object_gc, object_heap, persist,
 };
 use wasmtime_environ::VMSharedTypeIndex;
-
-const TX_DATA_RECORD_ROLE_OBJECT_PUBLICATION: u16 = 0;
 
 #[cfg(test)]
 use super::wasmtime_layout::{
@@ -857,6 +856,28 @@ impl ObjectTable {
         self.shared_region_runtime = runtime;
     }
 
+    pub(crate) fn refresh_persistent_object_from_shared_directory(
+        &mut self,
+        object_id: ObjectId,
+    ) -> Result<bool> {
+        let Some(runtime) = &self.shared_region_runtime else {
+            return Ok(false);
+        };
+        let Some(entry) = runtime.persistent_object_directory_entry(object_id)? else {
+            return Ok(false);
+        };
+
+        if let Ok(slot) = self.live_slot(object_id)
+            && slot.persistent
+            && slot.version >= entry.directory_version
+        {
+            return Ok(false);
+        }
+
+        self.install_persistent_object_directory_entry(entry)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn live_object_ids_for_test(&self) -> Vec<ObjectId> {
         self.slots
@@ -1205,6 +1226,11 @@ impl ObjectTable {
         Ok(self.live_slot(object_id)?.version)
     }
 
+    pub(crate) fn refreshed_version(&mut self, object_id: ObjectId) -> Result<u64> {
+        self.refresh_persistent_object_from_shared_directory(object_id)?;
+        self.version(object_id)
+    }
+
     pub(crate) fn is_persistent(&self, object_id: ObjectId) -> Result<bool> {
         Ok(self.live_slot(object_id)?.persistent)
     }
@@ -1212,6 +1238,11 @@ impl ObjectTable {
     pub(crate) fn payload(&self, object_id: ObjectId) -> Result<ObjectPayload> {
         let slot = self.live_slot(object_id)?;
         self.heap.payload(slot.current_record)
+    }
+
+    pub(crate) fn refreshed_payload(&mut self, object_id: ObjectId) -> Result<ObjectPayload> {
+        self.refresh_persistent_object_from_shared_directory(object_id)?;
+        self.payload(object_id)
     }
 
     pub(crate) fn trace_object_ids(&self, object_id: ObjectId) -> Result<Vec<ObjectId>> {
@@ -1484,6 +1515,47 @@ impl ObjectTable {
         Ok(installed)
     }
 
+    pub(crate) fn install_persistent_object_directory_entry(
+        &mut self,
+        entry: PersistentObjectDirectoryEntry,
+    ) -> Result<()> {
+        let index = object_slot_index(entry.object_id)?;
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+
+        let record = match &entry.record_source {
+            Some(source) => self.heap.install_mapped_persistent_record_from_source(
+                entry.object_id,
+                entry.kind,
+                entry.record_version,
+                entry.type_layout_id,
+                &source.mapped_source,
+                &source.location,
+            )?,
+            None => {
+                bail!("persistent object directory entry has no mapped record source")
+            }
+        };
+
+        let was_live = self.slots[index].is_some();
+        self.slots[index] = Some(ObjectTableSlot {
+            kind: entry.kind,
+            version: entry.directory_version,
+            type_layout_id: entry.type_layout_id,
+            runtime_type_index: entry.runtime_type_index,
+            persistent: true,
+            current_record: record,
+        });
+        if !was_live {
+            self.live_count = self
+                .live_count
+                .checked_add(1)
+                .context("object table live count overflow")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn install_committed_mapped_persistent_publication(
         &mut self,
         publication: &persist::PendingPublication,
@@ -1557,56 +1629,20 @@ impl ObjectTable {
         self.validate_type_layout_for_object_kind(kind, type_layout_id)?;
 
         let data_record_offset = durable_data_record_offset(marker.data_block, marker.data_offset)?;
-        let mut data_header = None;
-        mapped_source.with_mapped_slice(
-            data_record_offset,
-            core::mem::size_of::<crate::runtime::vm::TxDataRecordHeader>(),
-            &mut |bytes| {
-                data_header = Some(crate::runtime::vm::TxDataRecordHeader::from_bytes(bytes)?);
-                Ok(())
+        let record = self.heap.install_mapped_persistent_record_from_source(
+            object_id,
+            kind,
+            publication.version,
+            object_header.type_layout_id,
+            &mapped_source,
+            &PersistentObjectRecordLocation {
+                data_block: marker.data_block,
+                data_offset: marker.data_offset,
+                data_record_offset: u64::try_from(data_record_offset)
+                    .context("committed persistent object data record offset overflow")?,
+                record_len: object_header.record_len,
             },
         )?;
-        let data_header =
-            data_header.context("committed persistent object data header was not mapped")?;
-        ensure!(
-            data_header.logical_id == publication.logical_id
-                && data_header.version == publication.version
-                && data_header.kind == publication.kind
-                && data_header.role == TX_DATA_RECORD_ROLE_OBJECT_PUBLICATION
-                && data_header.type_info == publication.type_layout_id,
-            "mapped committed persistent object data header does not match publication"
-        );
-        ensure!(
-            u64::from(data_header.payload_len) == object_header.record_len,
-            "mapped committed persistent object data payload length does not match object record"
-        );
-
-        let winner = crate::runtime::vm::RecoveredObjectWinner {
-            object_id: object_id.object_index,
-            version: publication.version,
-            kind: object_header.kind,
-            type_layout_id: object_header.type_layout_id,
-            data_block: marker.data_block,
-            data_offset: marker.data_offset,
-            data_record_offset,
-            record_len: object_header.record_len,
-        };
-        let mut record = None;
-        let record_len =
-            usize::try_from(object_header.record_len).context("object record length overflow")?;
-        let payload_offset = data_record_offset
-            .checked_add(core::mem::size_of::<crate::runtime::vm::TxDataRecordHeader>())
-            .context("committed persistent object payload offset overflow")?;
-        mapped_source.with_mapped_slice(payload_offset, record_len, &mut |record_bytes| {
-            record = Some(self.heap.install_mapped_persistent_record(
-                &winner,
-                mapped_source.clone(),
-                record_bytes,
-            )?);
-            Ok(())
-        })?;
-        let record =
-            record.context("committed mapped persistent object record was not installed")?;
         self.next_record_version = self.next_record_version.max(object_header.version);
         let version = self.bump_object_version()?;
         self.slots[index] = Some(ObjectTableSlot {

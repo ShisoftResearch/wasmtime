@@ -7399,6 +7399,75 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
+    fn store_local_object_table_materializes_shared_persistent_object_entry() -> Result<()> {
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let temp = tempfile::Builder::new()
+            .prefix("wasmtime-shared-object-directory")
+            .tempdir()?;
+        let path = temp.path().join("region.bin");
+        let mut region =
+            crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(
+                &path, 8,
+            )?;
+        let object = ObjectId { object_index: 41 };
+        crate::runtime::vm::block_region::publish_committed_struct_object(
+            &path,
+            7,
+            object.object_index,
+            1,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            &[7],
+        )?;
+        region.refresh_from_image()?;
+
+        let recovered =
+            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(
+                &path,
+            )?;
+        let winner = recovered
+            .committed_object_winners()?
+            .into_iter()
+            .find(|winner| winner.object_id == object.object_index)
+            .context("expected committed object winner for shared-directory refresh test")?;
+        let mapped_source = recovered_mapped_source_for_test(&recovered);
+        runtime.install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: winner.version,
+            type_layout_id: winner.type_layout_id,
+            runtime_type_index: None,
+            record_source: Some(PersistentObjectRecordSource {
+                mapped_source,
+                location: PersistentObjectRecordLocation {
+                    data_block: winner.data_block,
+                    data_offset: winner.data_offset,
+                    data_record_offset: u64::try_from(winner.data_record_offset).unwrap(),
+                    record_len: winner.record_len,
+                },
+            }),
+        }])?;
+
+        let mut objects = ObjectTable::default();
+        objects.set_shared_region_runtime(Some(runtime.clone()));
+
+        assert!(objects.live_slot(object).is_err());
+        assert!(objects.refresh_persistent_object_from_shared_directory(object)?);
+        assert_eq!(objects.live_count(), 1);
+        assert!(objects.live_slot(object)?.persistent);
+        assert_eq!(
+            objects.refreshed_version(object)?,
+            runtime.persistent_object_directory_version(object)?
+        );
+        assert_eq!(
+            objects.refreshed_payload(object)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(7)])
+        );
+        assert!(objects.current_record_is_persistent_mapped_for_test(object)?);
+        Ok(())
+    }
+
+    #[test]
     fn committed_persistent_object_record_is_backed_by_mapped_storage() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let tx_log_path = dir.path().join("persistent-object-records.bin");

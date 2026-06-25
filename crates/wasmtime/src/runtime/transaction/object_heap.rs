@@ -1,5 +1,8 @@
 use super::type_layout::{PersistentTypeLayout, TraceSlotKind};
-use super::{ObjectId, ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi};
+use super::{
+    ObjectId, ObjectKind, ObjectPayload, ObjectValue, ObjectValueAbi,
+    PersistentObjectRecordLocation,
+};
 use crate::prelude::*;
 use crate::runtime::vm::TxDataRecordHeader;
 #[cfg(test)]
@@ -16,6 +19,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const DEFAULT_OBJECT_HEAP_BLOCKS: usize = 4;
 const OBJECT_RECORD_ALIGN: usize = 8;
 const OBJECT_VALUE_RECORD_LEN: usize = 20;
+const TX_DATA_RECORD_ROLE_OBJECT_PUBLICATION: u16 = 0;
 
 #[cfg(test)]
 static DECODE_RECORD_CALLS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
@@ -221,6 +225,74 @@ impl ObjectHeap {
         });
         let handle = u64::try_from(self.records.len()).context("record handle overflow")?;
         Ok(TxRecordHandle(handle))
+    }
+
+    pub(crate) fn install_mapped_persistent_record_from_source(
+        &mut self,
+        object_id: ObjectId,
+        kind: ObjectKind,
+        version: u32,
+        type_layout_id: u32,
+        source: &Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+        location: &PersistentObjectRecordLocation,
+    ) -> Result<TxRecordHandle> {
+        let domain = match kind {
+            ObjectKind::Struct => crate::runtime::vm::PackedGranuleDomain::TStruct,
+            ObjectKind::Array => crate::runtime::vm::PackedGranuleDomain::TArray,
+            other => bail!("object kind {other:?} is not a persistent object granule"),
+        };
+        let data_record_offset = usize::try_from(location.data_record_offset)
+            .context("mapped persistent object data record offset overflow")?;
+        let mut data_header = None;
+        source.with_mapped_slice(
+            data_record_offset,
+            size_of::<TxDataRecordHeader>(),
+            &mut |bytes| {
+                data_header = Some(TxDataRecordHeader::from_bytes(bytes)?);
+                Ok(())
+            },
+        )?;
+        let data_header =
+            data_header.context("mapped persistent object data header was not mapped")?;
+        ensure!(
+            data_header.logical_id
+                == crate::runtime::vm::pack_object_granule_id(domain, object_id.object_index)?
+                && data_header.version == version
+                && data_header.kind == domain as u16
+                && data_header.role == TX_DATA_RECORD_ROLE_OBJECT_PUBLICATION
+                && data_header.type_info == type_layout_id,
+            "mapped persistent object data header does not match object identity"
+        );
+        ensure!(
+            u64::from(data_header.payload_len) == location.record_len,
+            "mapped persistent object data payload length does not match object record"
+        );
+
+        let winner = crate::runtime::vm::RecoveredObjectWinner {
+            object_id: object_id.object_index,
+            version,
+            kind: kind as u16,
+            type_layout_id,
+            data_block: location.data_block,
+            data_offset: location.data_offset,
+            data_record_offset,
+            record_len: location.record_len,
+        };
+        let payload_offset = data_record_offset
+            .checked_add(size_of::<TxDataRecordHeader>())
+            .context("mapped persistent object payload offset overflow")?;
+        let record_len = usize::try_from(location.record_len)
+            .context("mapped persistent object record length overflow")?;
+        let mut handle = None;
+        source.with_mapped_slice(payload_offset, record_len, &mut |record_bytes| {
+            handle = Some(self.install_mapped_persistent_record(
+                &winner,
+                source.clone(),
+                record_bytes,
+            )?);
+            Ok(())
+        })?;
+        handle.context("mapped persistent object record was not installed")
     }
 
     pub(crate) fn header(&self, handle: TxRecordHandle) -> Result<TxObjectHeader> {
