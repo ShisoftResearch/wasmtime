@@ -92,6 +92,33 @@ fn stores_have_distinct_transaction_region_runtimes_by_default() {
 }
 
 #[test]
+fn persistent_object_directory_entry_rejects_wrong_object_id() {
+    let _location = PersistentObjectRecordLocation {
+        data_block: 0,
+        data_offset: 0,
+        data_record_offset: 0,
+        record_len: 0,
+    };
+    let _: Option<PersistentObjectRecordSource> = None;
+
+    let entry = PersistentObjectDirectoryEntry {
+        object_id: ObjectId { object_index: 7 },
+        kind: ObjectKind::Struct,
+        directory_version: 3,
+        record_version: 2,
+        type_layout_id: 1,
+        runtime_type_index: None,
+        record_source: None,
+    };
+
+    assert!(
+        entry
+            .ensure_matches_object(ObjectId { object_index: 8 })
+            .is_err()
+    );
+}
+
+#[test]
 fn persistent_gc_excludes_user_transaction_commits() {
     let runtime = crate::runtime::transaction::TransactionRegionRuntime::new_for_test();
     let permit = runtime.begin_user_transaction_region_for_test().unwrap();

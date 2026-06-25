@@ -13,6 +13,7 @@ mod config;
 mod durable_ref;
 mod granule;
 mod ids;
+mod object_directory;
 mod object_gc;
 mod object_heap;
 mod object_table;
@@ -66,6 +67,9 @@ use ids::{
     current_thread_transaction_for_test,
 };
 use ids::{current_thread_transaction, replace_current_thread_transaction};
+pub(crate) use object_directory::{
+    PersistentObjectDirectoryEntry, PersistentObjectRecordLocation, PersistentObjectRecordSource,
+};
 #[cfg(test)]
 use object_gc::PersistentObjectEdge;
 pub(crate) use object_gc::{
