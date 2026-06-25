@@ -3855,7 +3855,7 @@ fn lower_transaction_id_aborts_higher_suspended_object_writer() {
     state.enter_transaction(higher).unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(100))
         .unwrap();
     state.restore_transaction(None).unwrap();
     assert!(state.transaction_is_open(higher));
@@ -3863,14 +3863,14 @@ fn lower_transaction_id_aborts_higher_suspended_object_writer() {
     state.enter_transaction(lower).unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(7))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(7))
         .unwrap();
 
     assert!(!state.transaction_is_open(higher));
     assert!(state.transaction_is_open(lower));
     assert!(state.owns_object_write(object));
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(7)
     );
 
@@ -3898,7 +3898,7 @@ fn lower_transaction_id_cannot_preempt_higher_suspended_object_writer_under_nowa
     state.enter_transaction(higher).unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(100))
         .unwrap();
     state.restore_transaction(None).unwrap();
     assert!(state.transaction_is_open(higher));
@@ -3920,7 +3920,7 @@ fn lower_transaction_id_cannot_preempt_higher_suspended_object_writer_under_nowa
     state.restore_transaction(Some(higher)).unwrap();
     assert!(state.owns_object_write(object));
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(100)
     );
     state.abort().unwrap();
@@ -3945,7 +3945,7 @@ fn object_conflict_aborted_suspended_transaction_frees_new_object_records() {
     state.record_allocated_object(allocated).unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(100))
         .unwrap();
     state.restore_transaction(None).unwrap();
     assert_eq!(objects.live_count(), 2);
@@ -4108,7 +4108,7 @@ fn higher_transaction_id_cannot_write_lower_owned_object() {
     state.enter_transaction(lower).unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(11))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(11))
         .unwrap();
     state.restore_transaction(None).unwrap();
 
@@ -4134,7 +4134,7 @@ fn higher_transaction_id_cannot_write_lower_owned_object() {
     state.restore_transaction(Some(lower)).unwrap();
     assert!(state.owns_object_write(object));
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(11)
     );
 
@@ -4160,7 +4160,7 @@ fn mixed_object_and_tmemory_transaction_survives_object_conflict_and_commits_bot
     state.enter_transaction(higher).unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(100))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(100))
         .unwrap();
     state
         .stage_tmemory_write_for_test(0, 0, 4, &[1, 2, 3, 4], &tmemory)
@@ -4173,7 +4173,7 @@ fn mixed_object_and_tmemory_transaction_survives_object_conflict_and_commits_bot
         .unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(7))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(7))
         .unwrap();
 
     assert!(!state.transaction_is_open(higher));
@@ -4892,11 +4892,11 @@ fn tref_cast_does_not_lock_ordinary_gc_bridge_refs_without_handle() {
     assert!(!state.owns_object_read(object));
     assert!(!state.owns_object_write(object));
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(7)
     );
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(8))
         .unwrap();
 }
 
@@ -4913,7 +4913,9 @@ fn object_payload_access_requires_prior_tref_permission() {
 
     state.begin().unwrap();
 
-    let error = state.read_struct_field(&objects, object, 0).unwrap_err();
+    let error = state
+        .read_struct_field(&mut objects, object, 0)
+        .unwrap_err();
     assert!(
         error
             .to_string()
@@ -4924,12 +4926,12 @@ fn object_payload_access_requires_prior_tref_permission() {
         .acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)
         .unwrap();
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(7)
     );
 
     let error = state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(8))
         .unwrap_err();
     assert!(
         error
@@ -4941,10 +4943,10 @@ fn object_payload_access_requires_prior_tref_permission() {
         .acquire_tref_write_for_transaction_ref_handle(&mut objects, handle)
         .unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(8))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(8))
         .unwrap();
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(8)
     );
 }
@@ -5384,7 +5386,7 @@ fn persistent_object_publication_struct_allocation_uses_wasmtime_layout_id() {
 
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(7))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(7))
         .unwrap();
     let mut publications = Vec::new();
     assert!(
@@ -5496,7 +5498,7 @@ fn persistent_object_publication_array_allocation_uses_wasmtime_layout_id() {
 
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_array_element(&objects, object, 0, ObjectValue::Ref(Some(first)))
+        .stage_array_element(&mut objects, object, 0, ObjectValue::Ref(Some(first)))
         .unwrap();
     let mut publications = Vec::new();
     assert!(
@@ -6353,7 +6355,7 @@ fn object_payload_updates_are_copy_on_write_until_commit() {
     state.begin().unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     assert_eq!(
-        state.read_object_payload(&objects, object).unwrap(),
+        state.read_object_payload(&mut objects, object).unwrap(),
         ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::Ref(None)])
     );
     state
@@ -6364,7 +6366,7 @@ fn object_payload_updates_are_copy_on_write_until_commit() {
         )
         .unwrap();
     assert_eq!(
-        state.read_object_payload(&objects, object).unwrap(),
+        state.read_object_payload(&mut objects, object).unwrap(),
         ObjectPayload::Struct(vec![ObjectValue::I32(2), ObjectValue::Ref(None)])
     );
     state.abort().unwrap();
@@ -6408,7 +6410,7 @@ fn transaction_state_publishes_committed_object_payload_to_file_backed_log() {
 
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(9))
         .unwrap();
     let mut publications = Vec::new();
     assert!(
@@ -6776,7 +6778,7 @@ fn transaction_state_does_not_publish_volatile_object_payload_to_durable_log() {
     state.begin().unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(9))
         .unwrap();
     let mut publications = Vec::new();
     assert!(
@@ -6825,7 +6827,7 @@ fn file_backed_mixed_commit_recovers_tmemory_and_reuses_committed_linear_undo_ch
 
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(9))
         .unwrap();
     let mut publications = Vec::new();
     assert!(
@@ -6936,7 +6938,7 @@ fn file_backed_mixed_loose_end_rolls_back_tmemory_and_drops_object_publication()
 
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(9))
         .unwrap();
     let mut publications = Vec::new();
     assert!(
@@ -7522,6 +7524,53 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
+    fn shared_runtime_refresh_skips_live_volatile_object_id_collision() -> Result<()> {
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let object = ObjectId { object_index: 0 };
+        let (_fixture_source, entry) = synthetic_directory_entry_for_test(
+            object,
+            2,
+            3,
+            ObjectKind::Struct,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            encode_object_record_for_test(
+                object.object_index,
+                3,
+                type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+            )?,
+        );
+        runtime.install_persistent_object_directory_entries([entry])?;
+
+        let mut objects = ObjectTable::default();
+        objects.set_shared_region_runtime(Some(runtime.clone()));
+        let volatile = objects.allocate_struct(vec![ObjectValue::I32(1)])?;
+        assert_eq!(volatile, object);
+        assert!(!objects.live_slot(volatile)?.persistent);
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let mut state = TransactionState::default();
+        state.begin_with_region_runtime(&runtime)?;
+
+        assert_eq!(
+            state.read_struct_field(&mut objects, volatile, 0)?,
+            ObjectValue::I32(1)
+        );
+        state.stage_struct_field(&mut objects, volatile, 0, ObjectValue::I32(9))?;
+        assert_eq!(
+            state.read_struct_field(&mut objects, volatile, 0)?,
+            ObjectValue::I32(9)
+        );
+        assert!(!objects.live_slot(volatile)?.persistent);
+        assert_eq!(
+            objects.payload(volatile)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(1)])
+        );
+        state.abort()?;
+        Ok(())
+    }
+
+    #[test]
     fn store_local_object_table_materialized_directory_entry_advances_local_version_counters(
     ) -> Result<()> {
         let object = ObjectId { object_index: 41 };
@@ -7724,7 +7773,7 @@ mod file_backed_object_layout_recovery {
         )?;
 
         state.acquire_object_write(&mut objects, object)?;
-        state.stage_struct_field(&objects, object, 0, ObjectValue::I32(42))?;
+        state.stage_struct_field(&mut objects, object, 0, ObjectValue::I32(42))?;
         state.stage_global(0, GlobalSnapshot::GcRef(0xa810))?;
         commit_active_file_backed_publications_for_test(0xa81, 0xa81, &mut objects, &mut state)?;
 
@@ -7758,7 +7807,7 @@ mod file_backed_object_layout_recovery {
         )?;
 
         state.acquire_object_write(&mut objects, object)?;
-        state.stage_struct_field(&objects, object, 0, ObjectValue::I32(42))?;
+        state.stage_struct_field(&mut objects, object, 0, ObjectValue::I32(42))?;
         state.stage_global(0, GlobalSnapshot::GcRef(0xa820))?;
         commit_active_file_backed_publications_for_test(0xa82, 0xa82, &mut objects, &mut state)?;
         assert!(objects.current_record_is_persistent_mapped_for_test(object)?);
@@ -7766,7 +7815,7 @@ mod file_backed_object_layout_recovery {
 
         let second_tx = state.begin()?;
         state.acquire_object_write(&mut objects, object)?;
-        state.stage_struct_field(&objects, object, 0, ObjectValue::I32(43))?;
+        state.stage_struct_field(&mut objects, object, 0, ObjectValue::I32(43))?;
         let mut publications = Vec::new();
         assert!(state.commit_object_payloads_into(&mut objects, &mut publications)?);
 
@@ -7837,7 +7886,7 @@ mod file_backed_object_layout_recovery {
 
         state.acquire_object_write(&mut objects, object_a).unwrap();
         state
-            .stage_struct_field(&objects, object_a, 0, ObjectValue::I32(11))
+            .stage_struct_field(&mut objects, object_a, 0, ObjectValue::I32(11))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x8120))
@@ -7856,7 +7905,7 @@ mod file_backed_object_layout_recovery {
             .unwrap();
         state.acquire_object_write(&mut objects, object_b).unwrap();
         state
-            .stage_struct_field(&objects, object_b, 0, ObjectValue::I32(22))
+            .stage_struct_field(&mut objects, object_b, 0, ObjectValue::I32(22))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x8121))
@@ -7922,7 +7971,7 @@ mod file_backed_object_layout_recovery {
 
         state.acquire_object_write(&mut objects, object_a).unwrap();
         state
-            .stage_struct_field(&objects, object_a, 0, ObjectValue::I32(11))
+            .stage_struct_field(&mut objects, object_a, 0, ObjectValue::I32(11))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x8130))
@@ -7941,7 +7990,7 @@ mod file_backed_object_layout_recovery {
             .unwrap();
         state.acquire_object_write(&mut objects, object_b).unwrap();
         state
-            .stage_struct_field(&objects, object_b, 0, ObjectValue::I32(22))
+            .stage_struct_field(&mut objects, object_b, 0, ObjectValue::I32(22))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x8131))
@@ -8036,11 +8085,11 @@ mod file_backed_object_layout_recovery {
 
         state.acquire_object_write(&mut objects, live).unwrap();
         state
-            .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+            .stage_struct_field(&mut objects, live, 0, ObjectValue::I32(11))
             .unwrap();
         state.acquire_object_write(&mut objects, dead).unwrap();
         state
-            .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+            .stage_struct_field(&mut objects, dead, 0, ObjectValue::I32(22))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x8140))
@@ -8106,11 +8155,11 @@ mod file_backed_object_layout_recovery {
 
         state.acquire_object_write(&mut objects, live).unwrap();
         state
-            .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+            .stage_struct_field(&mut objects, live, 0, ObjectValue::I32(11))
             .unwrap();
         state.acquire_object_write(&mut objects, dead).unwrap();
         state
-            .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+            .stage_struct_field(&mut objects, dead, 0, ObjectValue::I32(22))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x9000))
@@ -8212,11 +8261,11 @@ mod file_backed_object_layout_recovery {
 
         state.acquire_object_write(&mut objects, live).unwrap();
         state
-            .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+            .stage_struct_field(&mut objects, live, 0, ObjectValue::I32(11))
             .unwrap();
         state.acquire_object_write(&mut objects, dead).unwrap();
         state
-            .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+            .stage_struct_field(&mut objects, dead, 0, ObjectValue::I32(22))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x9200))
@@ -8279,11 +8328,11 @@ mod file_backed_object_layout_recovery {
 
         state.acquire_object_write(&mut objects, live).unwrap();
         state
-            .stage_struct_field(&objects, live, 0, ObjectValue::I32(11))
+            .stage_struct_field(&mut objects, live, 0, ObjectValue::I32(11))
             .unwrap();
         state.acquire_object_write(&mut objects, dead).unwrap();
         state
-            .stage_struct_field(&objects, dead, 0, ObjectValue::I32(22))
+            .stage_struct_field(&mut objects, dead, 0, ObjectValue::I32(22))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x9300))
@@ -8363,19 +8412,19 @@ mod file_backed_object_layout_recovery {
             .acquire_object_write(&mut objects, old_global_root)
             .unwrap();
         state
-            .stage_struct_field(&objects, old_global_root, 0, ObjectValue::I32(11))
+            .stage_struct_field(&mut objects, old_global_root, 0, ObjectValue::I32(11))
             .unwrap();
         state
             .acquire_object_write(&mut objects, new_global_root)
             .unwrap();
         state
-            .stage_struct_field(&objects, new_global_root, 0, ObjectValue::I32(22))
+            .stage_struct_field(&mut objects, new_global_root, 0, ObjectValue::I32(22))
             .unwrap();
         state
             .acquire_object_write(&mut objects, table_root)
             .unwrap();
         state
-            .stage_struct_field(&objects, table_root, 0, ObjectValue::I32(33))
+            .stage_struct_field(&mut objects, table_root, 0, ObjectValue::I32(33))
             .unwrap();
         state
             .stage_global(0, GlobalSnapshot::GcRef(0x8110))
@@ -8490,7 +8539,7 @@ mod file_backed_mixed_tmemory_object_recovery {
 
         state.acquire_object_write(&mut objects, object).unwrap();
         state
-            .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+            .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(9))
             .unwrap();
         let mut publications = Vec::new();
         assert!(
@@ -8590,7 +8639,7 @@ mod file_backed_mixed_tmemory_object_recovery {
 
         state.acquire_object_write(&mut objects, object).unwrap();
         state
-            .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+            .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(9))
             .unwrap();
         let mut publications = Vec::new();
         assert!(
@@ -8903,7 +8952,12 @@ mod model_mixed_participants {
                     .copied()
                     .context("object model id is outside the prepared object slots")?;
                 state.acquire_object_write(&mut objects, handle)?;
-                state.stage_struct_field(&objects, handle, 0, ObjectValue::I32(write.new_value))?;
+                state.stage_struct_field(
+                    &mut objects,
+                    handle,
+                    0,
+                    ObjectValue::I32(write.new_value),
+                )?;
             }
 
             let mut publications = Vec::new();
@@ -9124,22 +9178,26 @@ mod transaction_active {
         assert_requires_active(state.acquire_object_read(&mut objects, struct_object));
         assert_requires_active(state.acquire_object_write(&mut objects, struct_object));
         assert!(
-            state.read_struct_field(&objects, struct_object, 0).is_err(),
+            state
+                .read_struct_field(&mut objects, struct_object, 0)
+                .is_err(),
             "persistent object read without an active transaction should not succeed"
         );
         assert!(
             state
-                .stage_struct_field(&objects, struct_object, 0, ObjectValue::I32(12))
+                .stage_struct_field(&mut objects, struct_object, 0, ObjectValue::I32(12))
                 .is_err(),
             "persistent object write without an active transaction should not succeed"
         );
         assert!(
-            state.read_array_element(&objects, array_object, 0).is_err(),
+            state
+                .read_array_element(&mut objects, array_object, 0)
+                .is_err(),
             "persistent array read without an active transaction should not succeed"
         );
         assert!(
             state
-                .stage_array_element(&objects, array_object, 0, ObjectValue::I32(12))
+                .stage_array_element(&mut objects, array_object, 0, ObjectValue::I32(12))
                 .is_err(),
             "persistent array write without an active transaction should not succeed"
         );
@@ -11223,11 +11281,11 @@ fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed
     state.acquire_object_write(&mut objects, object).unwrap();
 
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(1)
     );
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(9))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(9))
         .unwrap();
 
     assert_eq!(objects.version(object).unwrap(), 1);
@@ -11236,7 +11294,7 @@ fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed
         ObjectPayload::Struct(vec![ObjectValue::I32(1), ObjectValue::I64(2)])
     );
     assert_eq!(
-        state.read_struct_field(&objects, object, 0).unwrap(),
+        state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(9)
     );
     assert!(state.owns_object_write(object));
@@ -11262,10 +11320,10 @@ fn transaction_object_tstruct_field_abort_discards_staged_payload() {
     state.begin().unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 1, ObjectValue::I32(7))
+        .stage_struct_field(&mut objects, object, 1, ObjectValue::I32(7))
         .unwrap();
     assert_eq!(
-        state.read_struct_field(&objects, object, 1).unwrap(),
+        state.read_struct_field(&mut objects, object, 1).unwrap(),
         ObjectValue::I32(7)
     );
 
@@ -11341,24 +11399,24 @@ fn transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges() {
     state.begin().unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
 
-    assert_eq!(state.read_array_len(&objects, object).unwrap(), 5);
+    assert_eq!(state.read_array_len(&mut objects, object).unwrap(), 5);
     assert_eq!(
-        state.read_array_element(&objects, object, 2).unwrap(),
+        state.read_array_element(&mut objects, object, 2).unwrap(),
         ObjectValue::I32(2)
     );
 
     state
-        .stage_array_element(&objects, object, 2, ObjectValue::I32(20))
+        .stage_array_element(&mut objects, object, 2, ObjectValue::I32(20))
         .unwrap();
     state
-        .fill_array_range(&objects, object, 3, 2, ObjectValue::I32(9))
+        .fill_array_range(&mut objects, object, 3, 2, ObjectValue::I32(9))
         .unwrap();
     state
-        .copy_array_range(&objects, object, 0, object, 2, 3)
+        .copy_array_range(&mut objects, object, 0, object, 2, 3)
         .unwrap();
     state
         .write_array_range(
-            &objects,
+            &mut objects,
             object,
             1,
             vec![ObjectValue::I32(30), ObjectValue::I32(31)],
@@ -11366,7 +11424,7 @@ fn transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges() {
         .unwrap();
 
     assert_eq!(
-        state.read_object_payload(&objects, object).unwrap(),
+        state.read_object_payload(&mut objects, object).unwrap(),
         ObjectPayload::Array(vec![
             ObjectValue::I32(20),
             ObjectValue::I32(30),
@@ -11411,11 +11469,13 @@ fn transaction_object_tarray_range_helpers_validate_bounds() {
     state.begin().unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
 
-    let error = state.read_array_element(&objects, object, 1).unwrap_err();
+    let error = state
+        .read_array_element(&mut objects, object, 1)
+        .unwrap_err();
     assert!(error.to_string().contains("out of bounds array access"));
 
     let error = state
-        .fill_array_range(&objects, object, 1, 1, ObjectValue::I32(3))
+        .fill_array_range(&mut objects, object, 1, 1, ObjectValue::I32(3))
         .unwrap_err();
     assert!(error.to_string().contains("out of bounds array access"));
 }
@@ -11465,7 +11525,7 @@ fn object_payload_commit_validates_object_read_versions() {
 
     state.begin().unwrap();
     state.acquire_object_read(&mut objects, object).unwrap();
-    state.read_object_payload(&objects, object).unwrap();
+    state.read_object_payload(&mut objects, object).unwrap();
     objects
         .update_payload(object, ObjectPayload::Struct(vec![ObjectValue::I32(2)]))
         .unwrap();
@@ -11560,6 +11620,185 @@ fn shared_runtime_object_read_validation_uses_same_version_for_unpublished_objec
 
     state.acquire_object_read(&mut objects, object).unwrap();
     state.validate_active_object_reads(&objects).unwrap();
+}
+
+#[test]
+fn shared_runtime_deref_rejects_refreshed_payload_under_stale_read_authority() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut publisher_objects = ObjectTable::default();
+    let object = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x7151, vec![ObjectValue::I32(1)])?;
+    let mut publisher_state = TransactionState::new_for_test_with_durable_log(
+        TransactionId::from_raw(0x716),
+        durable_log,
+    );
+    publisher_state.shared_region_runtime = Some(runtime.clone());
+
+    let install_latest_runtime_entry = || -> Result<()> {
+        let (recovered, winners) = recover_file_backed_recovery_inputs_for_test(&tx_log_path)?;
+        let winner = recovered_object_winner_by_id_for_test(&winners, object);
+        runtime.install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: winner.version,
+            type_layout_id: winner.type_layout_id,
+            runtime_type_index: None,
+            record_source: Some(PersistentObjectRecordSource {
+                mapped_source: recovered_mapped_source_for_test(&recovered),
+                location: PersistentObjectRecordLocation {
+                    data_block: winner.data_block,
+                    data_offset: winner.data_offset,
+                    data_record_offset: u64::try_from(winner.data_record_offset)?,
+                    record_len: winner.record_len,
+                },
+            }),
+        }])?;
+        Ok(())
+    };
+
+    publisher_state.acquire_object_write(&mut publisher_objects, object)?;
+    publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(11))?;
+    commit_active_file_backed_publications_for_test(
+        0x716,
+        0x716,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+    install_latest_runtime_entry()?;
+
+    let mut observer_objects = ObjectTable::default();
+    observer_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(observer_objects.refresh_persistent_object_from_shared_directory(object)?);
+
+    let mut observer_state = TransactionState::default();
+    let observer_tx = observer_state.begin_with_region_runtime(&runtime)?;
+    observer_state.acquire_object_read(&mut observer_objects, object)?;
+    assert_eq!(
+        observer_objects.payload(object)?,
+        ObjectPayload::Struct(vec![ObjectValue::I32(11)])
+    );
+    observer_state.restore_transaction(None)?;
+
+    let second_tx = publisher_state.begin_with_region_runtime(&runtime)?;
+    publisher_state.acquire_object_write(&mut publisher_objects, object)?;
+    publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(22))?;
+    commit_active_file_backed_publications_for_test(
+        u32::try_from(second_tx.as_raw())?,
+        u32::try_from(second_tx.as_raw())?,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+    install_latest_runtime_entry()?;
+
+    observer_state.restore_transaction(Some(observer_tx))?;
+    let error = observer_state
+        .read_object_payload(&mut observer_objects, object)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(transaction_cc_read_version_conflict_message()),
+        "{error:?}"
+    );
+    assert_eq!(
+        observer_objects.payload(object)?,
+        ObjectPayload::Struct(vec![ObjectValue::I32(22)])
+    );
+    observer_state.abort()?;
+    Ok(())
+}
+
+#[test]
+fn second_store_deref_refreshes_stale_persistent_object_cache() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut publisher_objects = ObjectTable::default();
+    let object = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x7150, vec![ObjectValue::I32(1)])?;
+    let mut publisher_state = TransactionState::new_for_test_with_durable_log(
+        TransactionId::from_raw(0x715),
+        durable_log,
+    );
+    publisher_state.shared_region_runtime = Some(runtime.clone());
+
+    let install_latest_runtime_entry = || -> Result<()> {
+        let (recovered, winners) = recover_file_backed_recovery_inputs_for_test(&tx_log_path)?;
+        let winner = recovered_object_winner_by_id_for_test(&winners, object);
+        runtime.install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: winner.version,
+            type_layout_id: winner.type_layout_id,
+            runtime_type_index: None,
+            record_source: Some(PersistentObjectRecordSource {
+                mapped_source: recovered_mapped_source_for_test(&recovered),
+                location: PersistentObjectRecordLocation {
+                    data_block: winner.data_block,
+                    data_offset: winner.data_offset,
+                    data_record_offset: u64::try_from(winner.data_record_offset)?,
+                    record_len: winner.record_len,
+                },
+            }),
+        }])?;
+        Ok(())
+    };
+
+    publisher_state.acquire_object_write(&mut publisher_objects, object)?;
+    publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(11))?;
+    commit_active_file_backed_publications_for_test(
+        0x715,
+        0x715,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+    install_latest_runtime_entry()?;
+    assert_eq!(runtime.persistent_object_directory_version(object)?, 1);
+
+    let mut observer_objects = ObjectTable::default();
+    observer_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(observer_objects.refresh_persistent_object_from_shared_directory(object)?);
+    assert_eq!(
+        observer_objects.payload(object)?,
+        ObjectPayload::Struct(vec![ObjectValue::I32(11)])
+    );
+
+    // This positive case currently exercises acquisition-side refresh: the
+    // observer acquires read only after the shared directory has advanced.
+    let second_tx = publisher_state.begin_with_region_runtime(&runtime)?;
+    publisher_state.acquire_object_write(&mut publisher_objects, object)?;
+    publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(22))?;
+    commit_active_file_backed_publications_for_test(
+        u32::try_from(second_tx.as_raw())?,
+        u32::try_from(second_tx.as_raw())?,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+    install_latest_runtime_entry()?;
+    assert_eq!(runtime.persistent_object_directory_version(object)?, 2);
+    assert_eq!(
+        observer_objects.payload(object)?,
+        ObjectPayload::Struct(vec![ObjectValue::I32(11)])
+    );
+
+    let mut observer_state = TransactionState::default();
+    observer_state.begin_with_region_runtime(&runtime)?;
+    observer_state.acquire_object_read(&mut observer_objects, object)?;
+    assert_eq!(
+        observer_state.read_object_payload(&mut observer_objects, object)?,
+        ObjectPayload::Struct(vec![ObjectValue::I32(22)])
+    );
+    Ok(())
 }
 
 #[test]
@@ -13197,7 +13436,7 @@ mod persistent_promotion_commit {
         let mut state = TransactionState::new_for_test(TransactionId::from_raw(731));
         state.acquire_object_write(&mut objects, owner).unwrap();
         state
-            .stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
+            .stage_struct_field(&mut objects, owner, 0, ObjectValue::Ref(Some(child)))
             .unwrap();
 
         state
@@ -14047,15 +14286,15 @@ fn file_backed_persistent_gc_migrated_graph_recovers_only_reachable() {
 
     state.acquire_object_write(&mut objects, leaf).unwrap();
     state
-        .stage_struct_field(&objects, leaf, 0, ObjectValue::I32(70))
+        .stage_struct_field(&mut objects, leaf, 0, ObjectValue::I32(70))
         .unwrap();
     state.acquire_object_write(&mut objects, root).unwrap();
     state
-        .stage_struct_field(&objects, root, 1, ObjectValue::I32(110))
+        .stage_struct_field(&mut objects, root, 1, ObjectValue::I32(110))
         .unwrap();
     state.acquire_object_write(&mut objects, garbage).unwrap();
     state
-        .stage_struct_field(&objects, garbage, 0, ObjectValue::I32(405))
+        .stage_struct_field(&mut objects, garbage, 0, ObjectValue::I32(405))
         .unwrap();
     state
         .stage_global(0, GlobalSnapshot::GcRef(0xa801))
@@ -14381,7 +14620,7 @@ fn shared_root_apply_failure_after_lp_keeps_committed_allocated_object_and_clear
     state.record_allocated_object(object).unwrap();
     state.acquire_object_write(&mut objects, object).unwrap();
     state
-        .stage_struct_field(&objects, object, 0, ObjectValue::I32(23))
+        .stage_struct_field(&mut objects, object, 0, ObjectValue::I32(23))
         .unwrap();
     state.stage_global(0, GlobalSnapshot::GcRef(0x59e)).unwrap();
 
@@ -15210,7 +15449,7 @@ fn persistent_gc_commit_sequence_observes_edges_only_after_commit() {
     state.begin().unwrap();
     state.acquire_object_write(&mut objects, owner).unwrap();
     state
-        .stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
+        .stage_struct_field(&mut objects, owner, 0, ObjectValue::Ref(Some(child)))
         .unwrap();
     let mut publications = Vec::new();
     state
@@ -15333,7 +15572,7 @@ fn persistent_gc_commit_delta_invalidates_cached_reachability_on_root_removal() 
     state.begin().unwrap();
     state.acquire_object_write(&mut objects, root).unwrap();
     state
-        .stage_struct_field(&objects, root, 0, ObjectValue::Ref(Some(child)))
+        .stage_struct_field(&mut objects, root, 0, ObjectValue::Ref(Some(child)))
         .unwrap();
     let mut publications = Vec::new();
     state
@@ -15379,7 +15618,7 @@ fn persistent_gc_commit_barrier_enqueues_child_when_owner_is_marked() {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
         let mut tx = TransactionState::new_for_test(TransactionId::from_raw(541));
         tx.acquire_object_write(&mut objects, owner).unwrap();
-        tx.stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
+        tx.stage_struct_field(&mut objects, owner, 0, ObjectValue::Ref(Some(child)))
             .unwrap();
         let mut publications = Vec::new();
         tx.commit_object_payloads_into(&mut objects, &mut publications)
@@ -15430,7 +15669,7 @@ fn persistent_gc_commit_barrier_ignores_child_when_owner_is_unmarked() {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
         let mut tx = TransactionState::new_for_test(TransactionId::from_raw(542));
         tx.acquire_object_write(&mut objects, owner).unwrap();
-        tx.stage_struct_field(&objects, owner, 0, ObjectValue::Ref(Some(child)))
+        tx.stage_struct_field(&mut objects, owner, 0, ObjectValue::Ref(Some(child)))
             .unwrap();
         let mut publications = Vec::new();
         tx.commit_object_payloads_into(&mut objects, &mut publications)

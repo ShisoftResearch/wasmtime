@@ -1832,6 +1832,7 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<bool> {
+        object_table.refresh_persistent_object_from_shared_directory(object_id)?;
         let granule = object_table.granule_id(object_id)?;
         let version = self.current_object_version_for_granule(granule, object_table)?;
         let acquired = self.acquire_granule_read(granule, version)?;
@@ -1844,6 +1845,7 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<bool> {
+        object_table.refresh_persistent_object_from_shared_directory(object_id)?;
         let granule = object_table.granule_id(object_id)?;
         let version = self.current_object_version_for_granule(granule, object_table)?;
         let acquired = self.acquire_granule_write(granule, version)?;
@@ -1879,15 +1881,18 @@ impl TransactionState {
 
     pub(crate) fn read_object_payload(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<ObjectPayload> {
+        object_table.refresh_persistent_object_from_shared_directory(object_id)?;
         if object_table.is_persistent(object_id)? {
             let granule = object_table.granule_id(object_id)?;
             ensure!(
                 self.owns_granule_read(granule),
                 "transactional object read permission was not acquired"
             );
+            let version = self.current_object_version_for_granule(granule, object_table)?;
+            self.validate_active_read(granule, version)?;
         }
         if let Some(record) = self.staged_objects.get(&object_id) {
             return Ok(record.payload().clone());
@@ -1920,7 +1925,7 @@ impl TransactionState {
 
     pub(crate) fn read_struct_field(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
         field_index: usize,
     ) -> Result<ObjectValue> {
@@ -1936,7 +1941,7 @@ impl TransactionState {
 
     pub(crate) fn stage_struct_field(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
         field_index: usize,
         value: ObjectValue,
@@ -1955,7 +1960,7 @@ impl TransactionState {
 
     pub(crate) fn read_array_len(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<usize> {
         let payload = self.read_object_payload(object_table, object_id)?;
@@ -1967,7 +1972,7 @@ impl TransactionState {
 
     pub(crate) fn read_array_element(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
         element_index: usize,
     ) -> Result<ObjectValue> {
@@ -1983,7 +1988,7 @@ impl TransactionState {
 
     pub(crate) fn stage_array_element(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
         element_index: usize,
         value: ObjectValue,
@@ -2002,7 +2007,7 @@ impl TransactionState {
 
     pub(crate) fn fill_array_range(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
         start: usize,
         len: usize,
@@ -2021,7 +2026,7 @@ impl TransactionState {
 
     pub(crate) fn write_array_range(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         object_id: ObjectId,
         start: usize,
         values: Vec<ObjectValue>,
@@ -2039,7 +2044,7 @@ impl TransactionState {
 
     pub(crate) fn copy_array_range(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         dst_object_id: ObjectId,
         dst_start: usize,
         src_object_id: ObjectId,

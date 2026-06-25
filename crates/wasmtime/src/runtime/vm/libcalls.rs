@@ -744,6 +744,9 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
     };
 
     for granule in read_granules {
+        if matches!(granule, GranuleId::Object { .. }) {
+            continue;
+        }
         let current_version = current_granule_version(store, instance, granule)?;
         store
             .store_opaque_mut()
@@ -2204,12 +2207,15 @@ fn transaction_tstruct_get_bytes_impl(
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
     let field = usize::try_from(field).context("transactional struct field index overflow")?;
+    let value = {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+        state.read_struct_field(object_table, object_id, field)?
+    };
     let abi = {
         let store = store.store_opaque_mut();
-        let (durable_refs, state, object_table) =
-            store.transaction_durable_refs_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
-        let value = state.read_struct_field(object_table, object_id, field)?;
+        let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
         live_transaction_abi_from_object_value(durable_refs, object_table, &value)?
     };
     Ok(object_value_abi_bytes(abi))
@@ -2987,12 +2993,15 @@ fn transaction_tarray_get_bytes_impl(
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
     let index = usize::try_from(index).context("transactional array index overflow")?;
+    let value = {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+        state.read_array_element(object_table, object_id, index)?
+    };
     let abi = {
         let store = store.store_opaque_mut();
-        let (durable_refs, state, object_table) =
-            store.transaction_durable_refs_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
-        let value = state.read_array_element(object_table, object_id, index)?;
+        let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
         live_transaction_abi_from_object_value(durable_refs, object_table, &value)?
     };
     Ok(object_value_abi_bytes(abi))

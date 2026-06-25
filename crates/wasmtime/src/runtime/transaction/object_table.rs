@@ -867,11 +867,10 @@ impl ObjectTable {
             return Ok(false);
         };
 
-        if let Ok(slot) = self.live_slot(object_id)
-            && slot.persistent
-            && slot.version >= entry.directory_version
-        {
-            return Ok(false);
+        if let Ok(slot) = self.live_slot(object_id) {
+            if !slot.persistent || slot.version >= entry.directory_version {
+                return Ok(false);
+            }
         }
 
         self.install_persistent_object_directory_entry(entry)?;
