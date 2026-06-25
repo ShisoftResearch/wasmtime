@@ -285,6 +285,23 @@ impl ObjectHeap {
             .context("mapped persistent object record length overflow")?;
         let mut handle = None;
         source.with_mapped_slice(payload_offset, record_len, &mut |record_bytes| {
+            let (header, _) = decode_record_metadata(record_bytes)?;
+            ensure!(
+                header.object_id == object_id.object_index,
+                "mapped persistent object record id does not match object identity"
+            );
+            ensure!(
+                header.version == version,
+                "mapped persistent object record version does not match object identity"
+            );
+            ensure!(
+                header.kind == kind as u16,
+                "mapped persistent object record kind does not match object identity"
+            );
+            ensure!(
+                header.type_layout_id == type_layout_id,
+                "mapped persistent object record type layout id does not match object identity"
+            );
             handle = Some(self.install_mapped_persistent_record(
                 &winner,
                 source.clone(),

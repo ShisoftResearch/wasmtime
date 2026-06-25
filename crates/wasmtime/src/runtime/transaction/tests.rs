@@ -7468,6 +7468,59 @@ mod file_backed_object_layout_recovery {
     }
 
     #[test]
+    fn store_local_object_table_rejects_shared_directory_entry_with_mismatched_record_header(
+    ) -> Result<()> {
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let object = ObjectId { object_index: 41 };
+        let (fixture_source, recovered_source) = synthetic_recovered_mapped_source_for_test();
+        let winner = recovered_object_winner_with_location_for_test(
+            &fixture_source,
+            object.object_index,
+            1,
+            ObjectKind::Struct as u16,
+            type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+            11,
+            101,
+            encode_object_record_for_test(
+                99,
+                1,
+                type_layout::TypeLayoutId::DEFAULT_STRUCT.get(),
+                &ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+            )?,
+        );
+        runtime.install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+            object_id: object,
+            kind: ObjectKind::Struct,
+            directory_version: 0,
+            record_version: winner.version,
+            type_layout_id: winner.type_layout_id,
+            runtime_type_index: None,
+            record_source: Some(PersistentObjectRecordSource {
+                mapped_source: recovered_source,
+                location: PersistentObjectRecordLocation {
+                    data_block: winner.data_block,
+                    data_offset: winner.data_offset,
+                    data_record_offset: u64::try_from(winner.data_record_offset).unwrap(),
+                    record_len: winner.record_len,
+                },
+            }),
+        }])?;
+
+        let mut objects = ObjectTable::default();
+        objects.set_shared_region_runtime(Some(runtime));
+
+        let err = objects
+            .refresh_persistent_object_from_shared_directory(object)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mapped persistent object record id does not match object identity")
+        );
+        assert!(objects.live_slot(object).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn committed_persistent_object_record_is_backed_by_mapped_storage() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let tx_log_path = dir.path().join("persistent-object-records.bin");
