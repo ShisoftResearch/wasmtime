@@ -12016,7 +12016,192 @@ fn shared_runtime_deref_rejects_refreshed_payload_under_stale_read_authority() -
 }
 
 #[test]
+fn two_stores_conflict_on_same_persistent_object_write() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir.path().join("two-store-persistent-object-write-conflict.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut publisher_objects = ObjectTable::default();
+    let object = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x7152, vec![ObjectValue::I32(1)])?;
+    let mut publisher_state = TransactionState::new_for_test_with_durable_log(
+        TransactionId::from_raw(0x717),
+        durable_log,
+    );
+    publisher_state.shared_region_runtime = Some(runtime.clone());
+
+    publisher_state.acquire_object_write(&mut publisher_objects, object)?;
+    publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(11))?;
+    commit_active_file_backed_publications_for_test(
+        0x717,
+        0x717,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+    assert!(runtime.persistent_object_directory_entry(object)?.is_some());
+
+    let mut first_objects = ObjectTable::default();
+    first_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(first_objects.refresh_persistent_object_from_shared_directory(object)?);
+
+    let mut second_objects = ObjectTable::default();
+    second_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(second_objects.refresh_persistent_object_from_shared_directory(object)?);
+
+    let mut first_state = TransactionState::default();
+    let first_tx = first_state.begin_with_region_runtime(&runtime)?;
+    first_state.acquire_object_write(&mut first_objects, object)?;
+    assert!(first_state.owns_object_write(object));
+    first_state.restore_transaction(None)?;
+    assert!(first_state.transaction_is_open(first_tx));
+
+    let mut second_state = TransactionState::default();
+    let second_tx = second_state.begin_with_region_runtime(&runtime)?;
+    assert!(second_state.transaction_is_open(second_tx));
+    if transaction_cc_is_ownerless_multiwriter() {
+        second_state.acquire_object_write(&mut second_objects, object)?;
+        assert!(second_state.owns_object_write(object));
+    } else {
+        let error = second_state
+            .acquire_object_write(&mut second_objects, object)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("transaction write conflict")
+                || error
+                    .to_string()
+                    .contains("transaction conflict would wait"),
+            "{error:?}"
+        );
+        assert!(!second_state.owns_object_write(object));
+    }
+
+    second_state.abort()?;
+    first_state.restore_transaction(Some(first_tx))?;
+    first_state.abort()?;
+    assert_eq!(current_thread_transaction_for_test(), None);
+    Ok(())
+}
+
+#[test]
+#[cfg(any(
+    feature = "transaction-cc-wait-die",
+    feature = "transaction-cc-wound-wait"
+))]
+fn two_stores_conflict_on_same_persistent_object_write_with_older_requester() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir
+        .path()
+        .join("two-store-persistent-object-write-older-requester.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut publisher_objects = ObjectTable::default();
+    let object = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x7153, vec![ObjectValue::I32(1)])?;
+    let mut publisher_state = TransactionState::new_for_test_with_durable_log(
+        TransactionId::from_raw(0x718),
+        durable_log,
+    );
+    publisher_state.shared_region_runtime = Some(runtime.clone());
+
+    publisher_state.acquire_object_write(&mut publisher_objects, object)?;
+    publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(11))?;
+    commit_active_file_backed_publications_for_test(
+        0x718,
+        0x718,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+    assert!(runtime.persistent_object_directory_entry(object)?.is_some());
+
+    let mut owner_objects = ObjectTable::default();
+    owner_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(owner_objects.refresh_persistent_object_from_shared_directory(object)?);
+
+    let mut requester_objects = ObjectTable::default();
+    requester_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(requester_objects.refresh_persistent_object_from_shared_directory(object)?);
+
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+
+    let mut owner_state = TransactionState::default();
+    owner_state.shared_region_runtime = Some(runtime.clone());
+    owner_state.enter_transaction(younger)?;
+    owner_state.acquire_object_write(&mut owner_objects, object)?;
+    owner_state.restore_transaction(None)?;
+    assert!(owner_state.transaction_is_open(younger));
+
+    let mut requester_state = TransactionState::default();
+    requester_state.shared_region_runtime = Some(runtime.clone());
+    requester_state.enter_transaction(older)?;
+    assert!(requester_state.transaction_is_open(older));
+
+    #[cfg(feature = "transaction-cc-wait-die")]
+    {
+        let error = requester_state
+            .acquire_object_write(&mut requester_objects, object)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transaction conflict would wait"),
+            "{error:?}"
+        );
+        assert!(!requester_state.owns_object_write(object));
+        requester_state.abort()?;
+        assert_eq!(current_thread_transaction_for_test(), None);
+
+        owner_state.restore_transaction(Some(younger))?;
+        assert!(owner_state.owns_object_write(object));
+        owner_state.abort()?;
+        assert_eq!(current_thread_transaction_for_test(), None);
+        return Ok(());
+    }
+
+    #[cfg(all(not(feature = "transaction-cc-wait-die"), feature = "transaction-cc-wound-wait"))]
+    {
+        requester_state.acquire_object_write(&mut requester_objects, object)?;
+        assert!(requester_state.owns_object_write(object));
+        requester_state.restore_transaction(None)?;
+        assert!(requester_state.transaction_is_open(older));
+        assert_eq!(current_thread_transaction_for_test(), None);
+
+        owner_state.restore_transaction(Some(younger))?;
+        let error = owner_state.begin_terminal_commit().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transaction was conflict-aborted by another transaction"),
+            "{error:?}"
+        );
+        assert!(!owner_state.transaction_is_open(younger));
+        assert_eq!(current_thread_transaction_for_test(), None);
+
+        requester_state.restore_transaction(Some(older))?;
+        assert!(requester_state.owns_object_write(object));
+        requester_state.abort()?;
+        assert_eq!(current_thread_transaction_for_test(), None);
+        return Ok(());
+    }
+
+    unreachable!("test requires wait-die or wound-wait concurrency control");
+}
+
+#[test]
 fn second_store_deref_refreshes_stale_persistent_object_cache() -> Result<()> {
+    assert_second_store_reads_latest_persistent_object_after_first_store_commits()
+}
+
+#[test]
+fn second_store_reads_latest_persistent_object_after_first_store_commits() -> Result<()> {
+    assert_second_store_reads_latest_persistent_object_after_first_store_commits()
+}
+
+fn assert_second_store_reads_latest_persistent_object_after_first_store_commits() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let tx_log_path = dir.path().join("tx-log.bin");
     let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
@@ -12076,6 +12261,8 @@ fn second_store_deref_refreshes_stale_persistent_object_cache() -> Result<()> {
         observer_state.read_object_payload(&mut observer_objects, object)?,
         ObjectPayload::Struct(vec![ObjectValue::I32(22)])
     );
+    observer_state.abort()?;
+    assert_eq!(current_thread_transaction_for_test(), None);
     Ok(())
 }
 
