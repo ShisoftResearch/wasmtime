@@ -901,7 +901,7 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
     // observation is opportunistic runtime maintenance and must not turn a
     // completed commit into an apparent failure.
     let _ = state.observe_persistent_gc_commit_delta_after_commit_best_effort(
-        &*object_table,
+        object_table,
         &persistent_gc_delta,
     );
     Ok(())

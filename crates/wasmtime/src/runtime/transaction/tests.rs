@@ -13128,8 +13128,8 @@ where
     state.complete_commit()?;
     state.apply_committed_persistent_root_delta(root_delta)?;
     state.install_committed_mapped_object_publications(&mut objects, &publications, &markers)?;
-    let _ =
-        state.observe_persistent_gc_commit_delta_after_commit(&objects, &persistent_gc_delta)?;
+    let _ = state
+        .observe_persistent_gc_commit_delta_after_commit(&mut objects, &persistent_gc_delta)?;
     drop(state);
 
     let (recovered_region, object_winners) =
@@ -13159,8 +13159,7 @@ fn commit_active_file_backed_publications_for_test(
     if let Some(marker) = markers.last().copied() {
         state.publish_commit_lp(stream_id, txid, marker)?;
     }
-    state.complete_commit()?;
-    state.apply_committed_persistent_root_delta(root_delta)?;
+    state.complete_commit_with_persistent_root_delta_for_test(root_delta)?;
     state.install_committed_mapped_object_publications(objects, &publications, &markers)?;
     let _ = state.observe_persistent_gc_commit_delta_after_commit(objects, &persistent_gc_delta)?;
     Ok(())
@@ -14760,7 +14759,7 @@ fn persistent_object_marker_marks_root_closure_and_reports_unreachable() {
         .allocate_persistent_struct_for_gc_ref(0x504, vec![ObjectValue::I32(9)])
         .unwrap();
 
-    let report = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+    let report = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
 
     assert_eq!(report.reachable, object_set([root, child, leaf]));
     assert_eq!(report.unreachable_persistent, object_set([unreachable]));
@@ -14780,7 +14779,7 @@ fn persistent_gc_migrated_linked_list_survives_incremental_collection() {
     state.install_recovered_persistent_roots([list]).unwrap();
 
     state
-        .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(7))
+        .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(7))
         .unwrap();
     let report = state
         .finish_persistent_gc_cycle_and_sweep_for_test(&mut objects)
@@ -14807,7 +14806,7 @@ fn persistent_gc_migrated_deep_struct_chain_survives_maintenance_steps() {
 
     for _ in 0..8 {
         state
-            .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+            .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(1))
             .unwrap();
     }
 
@@ -14833,7 +14832,7 @@ fn persistent_gc_migrated_binary_tree_marks_complete_closure() {
         .allocate_persistent_struct_for_gc_ref(0x9c0, vec![ObjectValue::I32(404)])
         .unwrap();
 
-    let mark = PersistentObjectMarker::mark(&objects, [tree]).unwrap();
+    let mark = PersistentObjectMarker::mark(&mut objects, [tree]).unwrap();
 
     assert_eq!(
         persistent_binary_tree_sum_for_test(&objects, Some(tree)),
@@ -14871,7 +14870,7 @@ fn persistent_gc_migrated_array_refs_trace_live_elements_only() {
         )
         .unwrap();
 
-    let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+    let mark = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
 
     assert_eq!(mark.reachable, object_set([root, first, second]));
     assert_eq!(mark.unreachable_persistent, object_set([garbage]));
@@ -15017,11 +15016,11 @@ fn persistent_object_marker_budgeted_state_tracks_partial_progress() {
         .allocate_persistent_struct_for_gc_ref(0x508, vec![ObjectValue::I32(8)])
         .unwrap();
 
-    let mut state = PersistentGcState::new(&objects, [root]).unwrap();
+    let mut state = PersistentGcState::new(&mut objects, [root]).unwrap();
 
     assert_eq!(
         state
-            .mark_step(&objects, PersistentGcBudget::objects(1))
+            .mark_step(&mut objects, PersistentGcBudget::objects(1))
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -15032,7 +15031,7 @@ fn persistent_object_marker_budgeted_state_tracks_partial_progress() {
 
     assert_eq!(
         state
-            .mark_step(&objects, PersistentGcBudget::objects(1))
+            .mark_step(&mut objects, PersistentGcBudget::objects(1))
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -15043,7 +15042,7 @@ fn persistent_object_marker_budgeted_state_tracks_partial_progress() {
 
     assert_eq!(
         state
-            .mark_step(&objects, PersistentGcBudget::objects(1))
+            .mark_step(&mut objects, PersistentGcBudget::objects(1))
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -15083,10 +15082,10 @@ fn persistent_gc_commit_barrier_enqueues_new_root() {
         }
     );
 
-    let mut state = PersistentGcState::new(&objects, []).unwrap();
+    let mut state = PersistentGcState::new(&mut objects, []).unwrap();
     assert_eq!(
         state
-            .observe_commit_delta(&objects, &delta, PersistentGcBudget::objects(1))
+            .observe_commit_delta(&mut objects, &delta, PersistentGcBudget::objects(1))
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -15931,7 +15930,7 @@ fn persistent_gc_after_commit_observer_stores_marker_progress() {
 
     assert_eq!(
         state
-            .observe_persistent_gc_commit_delta_after_commit(&objects, &delta)
+            .observe_persistent_gc_commit_delta_after_commit(&mut objects, &delta)
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -15941,7 +15940,7 @@ fn persistent_gc_after_commit_observer_stores_marker_progress() {
     assert_eq!(
         state
             .observe_persistent_gc_commit_delta_after_commit(
-                &objects,
+                &mut objects,
                 &PersistentGcCommitDelta::default(),
             )
             .unwrap(),
@@ -15953,7 +15952,7 @@ fn persistent_gc_after_commit_observer_stores_marker_progress() {
     assert_eq!(
         state
             .observe_persistent_gc_commit_delta_after_commit(
-                &objects,
+                &mut objects,
                 &PersistentGcCommitDelta::default(),
             )
             .unwrap(),
@@ -15975,10 +15974,10 @@ fn persistent_gc_maintenance_step_advances_read_heavy_cycle() {
     state.install_recovered_persistent_roots([root]).unwrap();
 
     let first = state
-        .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+        .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(1))
         .unwrap();
     let second = state
-        .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+        .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(1))
         .unwrap();
 
     assert_eq!(
@@ -15998,6 +15997,223 @@ fn persistent_gc_maintenance_step_advances_read_heavy_cycle() {
 }
 
 #[test]
+fn persistent_gc_marks_latest_shared_object_records() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir.path().join("persistent-gc-shared-latest.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut publisher_objects = ObjectTable::default();
+    let old_child = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x6761, vec![ObjectValue::I32(1)])?;
+    let root = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x6762, vec![ObjectValue::Ref(Some(old_child))])?;
+    let mut publisher_state = TransactionState::new_for_test_with_durable_log(
+        TransactionId::from_raw(0x676),
+        durable_log,
+    );
+    publisher_state.shared_region_runtime = Some(runtime.clone());
+    publisher_state.acquire_object_write(&mut publisher_objects, old_child)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        old_child,
+        0,
+        ObjectValue::I32(1),
+    )?;
+    publisher_state.acquire_object_write(&mut publisher_objects, root)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        root,
+        0,
+        ObjectValue::Ref(Some(old_child)),
+    )?;
+    publisher_state.stage_global(0, GlobalSnapshot::GcRef(0x6762))?;
+    commit_active_file_backed_publications_for_test(
+        0x676,
+        0x676,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+
+    let mut observer_objects = ObjectTable::default();
+    observer_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(observer_objects.refresh_persistent_object_from_shared_directory(root)?);
+    assert!(observer_objects.refresh_persistent_object_from_shared_directory(old_child)?);
+    assert_eq!(
+        observer_objects.payload(root)?,
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(old_child))])
+    );
+
+    let next_tx = publisher_state.begin_with_region_runtime(&runtime)?;
+    let new_child = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x6763, vec![ObjectValue::I32(2)])?;
+    publisher_state.acquire_object_write(&mut publisher_objects, new_child)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        new_child,
+        0,
+        ObjectValue::I32(2),
+    )?;
+    publisher_state.acquire_object_write(&mut publisher_objects, root)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        root,
+        0,
+        ObjectValue::Ref(Some(new_child)),
+    )?;
+    commit_active_file_backed_publications_for_test(
+        u32::try_from(next_tx.as_raw())?,
+        u32::try_from(next_tx.as_raw())?,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+
+    assert_eq!(
+        observer_objects.payload(root)?,
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(old_child))])
+    );
+    assert!(observer_objects.live_slot(new_child).is_err());
+
+    let mut observer_state = TransactionState {
+        shared_region_runtime: Some(runtime.clone()),
+        ..TransactionState::default()
+    };
+    let report = observer_state.persistent_mark_sweep_collect_for_test(&mut observer_objects)?;
+
+    assert_eq!(report.mark.reachable, object_set([root, new_child]));
+    assert_eq!(report.mark.unreachable_persistent, object_set([old_child]));
+    assert_eq!(report.sweep.retained_objects, vec![root, new_child]);
+    assert_eq!(report.sweep.removed_objects, vec![old_child]);
+    assert_eq!(
+        observer_objects.payload(root)?,
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(new_child))])
+    );
+    assert!(observer_objects.live_slot(old_child).is_err());
+    Ok(())
+}
+
+#[test]
+fn shared_incremental_persistent_gc_restarts_after_concurrent_commit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir.path().join("shared-incremental-persistent-gc.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+
+    let mut publisher_objects = ObjectTable::default();
+    let old_child = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x6771, vec![ObjectValue::I32(1)])?;
+    let root = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x6772, vec![ObjectValue::Ref(Some(old_child))])?;
+    let mut publisher_state = TransactionState::new_for_test_with_durable_log(
+        TransactionId::from_raw(0x677),
+        durable_log,
+    );
+    publisher_state.shared_region_runtime = Some(runtime.clone());
+    publisher_state.acquire_object_write(&mut publisher_objects, old_child)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        old_child,
+        0,
+        ObjectValue::I32(1),
+    )?;
+    publisher_state.acquire_object_write(&mut publisher_objects, root)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        root,
+        0,
+        ObjectValue::Ref(Some(old_child)),
+    )?;
+    publisher_state.stage_global(0, GlobalSnapshot::GcRef(0x6772))?;
+    commit_active_file_backed_publications_for_test(
+        0x677,
+        0x677,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+
+    let mut observer_objects = ObjectTable::default();
+    observer_objects.set_shared_region_runtime(Some(runtime.clone()));
+    assert!(observer_objects.refresh_persistent_object_from_shared_directory(root)?);
+    assert!(observer_objects.refresh_persistent_object_from_shared_directory(old_child)?);
+
+    let mut observer_state = TransactionState {
+        shared_region_runtime: Some(runtime.clone()),
+        ..TransactionState::default()
+    };
+    let first = observer_state.persistent_gc_maintenance_step_for_test(
+        &mut observer_objects,
+        PersistentGcBudget::objects(1),
+    )?;
+    assert_eq!(
+        first,
+        PersistentGcStepReport {
+            scanned_objects: 1,
+            enqueued_objects: 1,
+        }
+    );
+    assert_eq!(
+        observer_state
+            .persistent_gc_state
+            .as_ref()
+            .expect("incremental shared GC should retain in-progress mark state")
+            .pending_object_count(),
+        1
+    );
+
+    let next_tx = publisher_state.begin_with_region_runtime(&runtime)?;
+    let new_child = publisher_objects
+        .allocate_persistent_struct_for_gc_ref(0x6773, vec![ObjectValue::I32(2)])?;
+    publisher_state.acquire_object_write(&mut publisher_objects, new_child)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        new_child,
+        0,
+        ObjectValue::I32(2),
+    )?;
+    publisher_state.acquire_object_write(&mut publisher_objects, root)?;
+    publisher_state.stage_struct_field(
+        &mut publisher_objects,
+        root,
+        0,
+        ObjectValue::Ref(Some(new_child)),
+    )?;
+    commit_active_file_backed_publications_for_test(
+        u32::try_from(next_tx.as_raw())?,
+        u32::try_from(next_tx.as_raw())?,
+        &mut publisher_objects,
+        &mut publisher_state,
+    )?;
+
+    assert_eq!(
+        observer_objects.payload(root)?,
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(old_child))])
+    );
+    assert!(observer_objects.refresh_persistent_object_from_shared_directory(new_child)?);
+    assert_eq!(
+        observer_objects.payload(new_child)?,
+        ObjectPayload::Struct(vec![ObjectValue::I32(2)])
+    );
+
+    let report = observer_state
+        .finish_persistent_gc_cycle_and_sweep_for_test(&mut observer_objects)?
+        .expect("maintenance cycle should exist");
+
+    assert_eq!(report.mark.reachable, object_set([root, new_child]));
+    assert_eq!(report.mark.unreachable_persistent, object_set([old_child]));
+    assert_eq!(report.sweep.retained_objects, vec![root, new_child]);
+    assert_eq!(report.sweep.removed_objects, vec![old_child]);
+    assert_eq!(
+        observer_objects.payload(root)?,
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(new_child))])
+    );
+    assert!(observer_objects.live_slot(old_child).is_err());
+    assert!(observer_objects.live_slot(new_child).is_ok());
+    Ok(())
+}
+
+#[test]
 fn persistent_gc_finish_cycle_sweeps_unreachable_after_incremental_marking() {
     let mut objects = ObjectTable::default();
     let root = objects
@@ -16011,7 +16227,7 @@ fn persistent_gc_finish_cycle_sweeps_unreachable_after_incremental_marking() {
     state.install_recovered_persistent_roots([root]).unwrap();
 
     state
-        .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+        .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(1))
         .unwrap();
 
     let report = state
@@ -16040,7 +16256,7 @@ fn persistent_gc_maintenance_step_rejects_suspended_transaction() {
     assert!(state.transaction_is_open(transaction));
 
     let err = state
-        .persistent_gc_maintenance_step_for_test(&objects, PersistentGcBudget::objects(1))
+        .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(1))
         .unwrap_err();
 
     assert!(
@@ -16099,7 +16315,7 @@ fn persistent_gc_commit_sequence_observes_edges_only_after_commit() {
     state.complete_commit().unwrap();
     assert_eq!(
         state
-            .observe_persistent_gc_commit_delta_after_commit(&objects, &initial_delta)
+            .observe_persistent_gc_commit_delta_after_commit(&mut objects, &initial_delta)
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -16109,7 +16325,7 @@ fn persistent_gc_commit_sequence_observes_edges_only_after_commit() {
     assert_eq!(
         state
             .observe_persistent_gc_commit_delta_after_commit(
-                &objects,
+                &mut objects,
                 &PersistentGcCommitDelta::default(),
             )
             .unwrap(),
@@ -16142,7 +16358,7 @@ fn persistent_gc_commit_sequence_observes_edges_only_after_commit() {
     state.complete_commit().unwrap();
     assert_eq!(
         state
-            .observe_persistent_gc_commit_delta_after_commit(&objects, &edge_delta)
+            .observe_persistent_gc_commit_delta_after_commit(&mut objects, &edge_delta)
             .unwrap(),
         PersistentGcStepReport::default()
     );
@@ -16160,7 +16376,7 @@ fn persistent_gc_after_commit_observer_rejects_active_transaction_use() {
     let delta = state.persistent_gc_commit_delta(&objects, &[]).unwrap();
 
     let err = state
-        .observe_persistent_gc_commit_delta_after_commit(&objects, &delta)
+        .observe_persistent_gc_commit_delta_after_commit(&mut objects, &delta)
         .unwrap_err();
 
     assert_eq!(delta.new_roots, object_set([root]));
@@ -16188,7 +16404,7 @@ fn persistent_gc_best_effort_observer_does_not_report_post_commit_failure() {
 
     assert_eq!(
         state
-            .observe_persistent_gc_commit_delta_after_commit(&objects, &delta)
+            .observe_persistent_gc_commit_delta_after_commit(&mut objects, &delta)
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -16198,7 +16414,7 @@ fn persistent_gc_best_effort_observer_does_not_report_post_commit_failure() {
 
     objects.free(child).unwrap();
     let report = state.observe_persistent_gc_commit_delta_after_commit_best_effort(
-        &objects,
+        &mut objects,
         &PersistentGcCommitDelta::default(),
     );
     assert_eq!(report, PersistentGcStepReport::default());
@@ -16221,7 +16437,7 @@ fn persistent_gc_commit_delta_invalidates_cached_reachability_on_root_removal() 
     state.complete_commit().unwrap();
     assert_eq!(
         state
-            .observe_persistent_gc_commit_delta_after_commit(&objects, &initial_delta)
+            .observe_persistent_gc_commit_delta_after_commit(&mut objects, &initial_delta)
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -16237,7 +16453,7 @@ fn persistent_gc_commit_delta_invalidates_cached_reachability_on_root_removal() 
     state.complete_commit().unwrap();
     assert_eq!(
         state
-            .observe_persistent_gc_commit_delta_after_commit(&objects, &removal_delta)
+            .observe_persistent_gc_commit_delta_after_commit(&mut objects, &removal_delta)
             .unwrap(),
         PersistentGcStepReport::default()
     );
@@ -16259,7 +16475,7 @@ fn persistent_gc_commit_delta_invalidates_cached_reachability_on_root_removal() 
 
     assert_eq!(
         state
-            .observe_persistent_gc_commit_delta_after_commit(&objects, &edge_delta)
+            .observe_persistent_gc_commit_delta_after_commit(&mut objects, &edge_delta)
             .unwrap(),
         PersistentGcStepReport::default()
     );
@@ -16275,10 +16491,10 @@ fn persistent_gc_commit_barrier_enqueues_child_when_owner_is_marked() {
         .allocate_persistent_struct_for_gc_ref(0x542, vec![ObjectValue::Ref(None)])
         .unwrap();
 
-    let mut state = PersistentGcState::new(&objects, [owner]).unwrap();
+    let mut state = PersistentGcState::new(&mut objects, [owner]).unwrap();
     assert_eq!(
         state
-            .mark_step(&objects, PersistentGcBudget::objects(1))
+            .mark_step(&mut objects, PersistentGcBudget::objects(1))
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -16314,7 +16530,7 @@ fn persistent_gc_commit_barrier_enqueues_child_when_owner_is_marked() {
 
     assert_eq!(
         state
-            .observe_commit_delta(&objects, &delta, PersistentGcBudget::objects(1))
+            .observe_commit_delta(&mut objects, &delta, PersistentGcBudget::objects(1))
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 1,
@@ -16351,10 +16567,10 @@ fn persistent_gc_commit_barrier_ignores_child_when_owner_is_unmarked() {
             .unwrap()
     };
 
-    let mut state = PersistentGcState::new(&objects, []).unwrap();
+    let mut state = PersistentGcState::new(&mut objects, []).unwrap();
     assert_eq!(
         state
-            .observe_commit_delta(&objects, &delta, PersistentGcBudget::objects(1))
+            .observe_commit_delta(&mut objects, &delta, PersistentGcBudget::objects(1))
             .unwrap(),
         PersistentGcStepReport {
             scanned_objects: 0,
@@ -16387,7 +16603,7 @@ fn persistent_gc_volatile_sweep_reports_unreachable_objects() {
         )
         .unwrap();
 
-    let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+    let mark = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
     let report = objects.apply_volatile_persistent_sweep(&mark).unwrap();
 
     assert_eq!(report.retained_objects, vec![root, child]);
@@ -16404,7 +16620,7 @@ fn persistent_gc_volatile_sweep_removes_unreachable_slots_when_requested() {
         .allocate_persistent_struct_for_gc_ref(0x554, vec![ObjectValue::I32(2)])
         .unwrap();
 
-    let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+    let mark = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
     let report = objects.apply_volatile_persistent_sweep(&mark).unwrap();
 
     assert_eq!(report.retained_objects, vec![root]);
@@ -16429,7 +16645,7 @@ fn persistent_gc_volatile_sweep_does_not_persist_dead_state() {
     let garbage_handle = objects.current_record_handle_for_test(garbage).unwrap();
     let garbage_bytes = objects.heap.record_bytes_for_test(garbage_handle).unwrap();
 
-    let mark = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+    let mark = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
     objects.apply_volatile_persistent_sweep(&mark).unwrap();
 
     assert!(objects.live_slot(garbage).is_err());
@@ -16531,10 +16747,10 @@ fn persistent_object_marker_budgeted_state_rejects_zero_budget_with_pending_work
         .allocate_persistent_struct_for_gc_ref(0x509, vec![ObjectValue::I32(9)])
         .unwrap();
 
-    let mut state = PersistentGcState::new(&objects, [root]).unwrap();
+    let mut state = PersistentGcState::new(&mut objects, [root]).unwrap();
 
     let err = state
-        .mark_step(&objects, PersistentGcBudget::objects(0))
+        .mark_step(&mut objects, PersistentGcBudget::objects(0))
         .unwrap_err();
 
     assert!(
@@ -16554,7 +16770,7 @@ fn persistent_object_marker_budgeted_state_rejects_incomplete_report() {
         .allocate_persistent_struct_for_gc_ref(0x50b, vec![ObjectValue::Ref(Some(leaf))])
         .unwrap();
 
-    let state = PersistentGcState::new(&objects, [root]).unwrap();
+    let state = PersistentGcState::new(&mut objects, [root]).unwrap();
 
     let err = state.into_report(&objects).unwrap_err();
 
@@ -16571,12 +16787,12 @@ fn persistent_object_marker_budgeted_state_rejects_active_transaction_use() {
     let root = objects
         .allocate_persistent_struct_for_gc_ref(0x50c, vec![ObjectValue::I32(12)])
         .unwrap();
-    let mut state = PersistentGcState::new(&objects, [root]).unwrap();
+    let mut state = PersistentGcState::new(&mut objects, [root]).unwrap();
     let _cleanup = clear_current_thread_transaction_on_drop_for_test();
     let _state = TransactionState::new_for_test(TransactionId::from_raw(532));
 
     let err = state
-        .mark_step(&objects, PersistentGcBudget::objects(1))
+        .mark_step(&mut objects, PersistentGcBudget::objects(1))
         .unwrap_err();
 
     assert!(
@@ -16604,7 +16820,7 @@ fn persistent_object_marker_preserves_lifo_dangling_ref_order() {
         )
         .unwrap();
 
-    let report = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+    let report = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
 
     assert_eq!(
         report.dangling_refs,
@@ -16651,7 +16867,7 @@ fn persistent_object_marker_handles_cycles_and_shared_children() {
         )
         .unwrap();
 
-    let report = PersistentObjectMarker::mark(&objects, [left]).unwrap();
+    let report = PersistentObjectMarker::mark(&mut objects, [left]).unwrap();
 
     assert_eq!(report.reachable, object_set([left, right, shared]));
     assert!(report.unreachable_persistent.is_empty());
@@ -16665,7 +16881,7 @@ fn persistent_object_marker_reports_invalid_roots() {
     let volatile = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
     let missing = ObjectId { object_index: 999 };
 
-    let report = PersistentObjectMarker::mark(&objects, [volatile, missing]).unwrap();
+    let report = PersistentObjectMarker::mark(&mut objects, [volatile, missing]).unwrap();
 
     assert!(report.reachable.is_empty());
     assert!(report.unreachable_persistent.is_empty());
@@ -16693,7 +16909,7 @@ fn persistent_object_marker_reports_dangling_child_refs() {
         .allocate_persistent_struct_for_gc_ref(0x521, vec![ObjectValue::Ref(Some(missing))])
         .unwrap();
 
-    let report = PersistentObjectMarker::mark(&objects, [root]).unwrap();
+    let report = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
 
     assert_eq!(report.reachable, object_set([root]));
     assert!(report.unreachable_persistent.is_empty());
@@ -16749,7 +16965,8 @@ fn persistent_object_marker_rejects_layout_tracing_errors() {
         )
         .unwrap();
 
-    let err = PersistentObjectMarker::mark(&rebuilt, [ObjectId { object_index: 41 }]).unwrap_err();
+    let err =
+        PersistentObjectMarker::mark(&mut rebuilt, [ObjectId { object_index: 41 }]).unwrap_err();
 
     let error = format!("{err:?}");
     assert!(
@@ -16767,7 +16984,7 @@ fn persistent_object_marker_rejects_active_transaction() {
     let _cleanup = clear_current_thread_transaction_on_drop_for_test();
     let _state = TransactionState::new_for_test(TransactionId::from_raw(531));
 
-    let err = PersistentObjectMarker::mark(&objects, [object]).unwrap_err();
+    let err = PersistentObjectMarker::mark(&mut objects, [object]).unwrap_err();
 
     assert!(
         err.to_string()
@@ -16798,7 +17015,7 @@ fn persistent_object_marker_marks_recovered_root_ids() {
         .iter()
         .map(|&object_index| ObjectId { object_index });
 
-    let report = PersistentObjectMarker::mark(&rebuilt, roots).unwrap();
+    let report = PersistentObjectMarker::mark(&mut rebuilt, roots).unwrap();
 
     assert_eq!(
         report.reachable,

@@ -2320,16 +2320,18 @@ impl TransactionState {
 
     pub(crate) fn observe_persistent_gc_commit_delta_after_commit(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         delta: &PersistentGcCommitDelta,
     ) -> Result<PersistentGcStepReport> {
         ensure!(
             self.active.is_none() && current_thread_transaction().is_none(),
             "persistent object marker cannot run while a transaction is active"
         );
+        let shared_epoch = self.current_shared_persistent_gc_epoch()?;
         if delta.invalidates_reachable_cache {
             self.persistent_gc_state = None;
         }
+        self.reset_stale_shared_persistent_gc_state(shared_epoch);
         let committed_roots = if self.persistent_gc_state.is_none() {
             Some(self.persistent_root_ids()?)
         } else {
@@ -2344,17 +2346,23 @@ impl TransactionState {
         }
         let state = match self.persistent_gc_state.as_mut() {
             Some(state) => state,
-            None => self.persistent_gc_state.insert(PersistentGcState::new(
-                object_table,
-                committed_roots.unwrap_or_default(),
-            )?),
+            None => self
+                .persistent_gc_state
+                .insert(Self::new_persistent_gc_state_for_epoch(
+                    object_table,
+                    committed_roots.unwrap_or_default(),
+                    shared_epoch,
+                )?),
         };
+        if shared_epoch.is_some() {
+            state.set_shared_epoch(shared_epoch);
+        }
         state.observe_commit_delta(object_table, delta, PersistentGcBudget::objects(1))
     }
 
     pub(crate) fn observe_persistent_gc_commit_delta_after_commit_best_effort(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         delta: &PersistentGcCommitDelta,
     ) -> PersistentGcStepReport {
         match self.observe_persistent_gc_commit_delta_after_commit(object_table, delta) {
@@ -2489,6 +2497,8 @@ impl TransactionState {
             "persistent object marker cannot run while a transaction is active or suspended"
         );
         let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
+            // All stores observe the shared directory, but one store coordinates a
+            // GC cycle while the permit excludes concurrent user commits.
             Some(runtime.begin_persistent_gc()?)
         } else {
             None
@@ -2501,7 +2511,7 @@ impl TransactionState {
 
     pub(crate) fn persistent_gc_maintenance_step(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         budget: PersistentGcBudget,
     ) -> Result<PersistentGcStepReport> {
         ensure!(
@@ -2511,10 +2521,14 @@ impl TransactionState {
             "persistent object marker cannot run while a transaction is active or suspended"
         );
         let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
+            // All stores observe the shared directory, but one store coordinates a
+            // GC cycle while the permit excludes concurrent user commits.
             Some(runtime.begin_persistent_gc()?)
         } else {
             None
         };
+        let shared_epoch = self.current_shared_persistent_gc_epoch()?;
+        self.reset_stale_shared_persistent_gc_state(shared_epoch);
         let roots = if self.persistent_gc_state.is_none() {
             Some(self.persistent_root_ids()?)
         } else {
@@ -2522,11 +2536,17 @@ impl TransactionState {
         };
         let state = match self.persistent_gc_state.as_mut() {
             Some(state) => state,
-            None => self.persistent_gc_state.insert(PersistentGcState::new(
-                object_table,
-                roots.unwrap_or_default(),
-            )?),
+            None => self
+                .persistent_gc_state
+                .insert(Self::new_persistent_gc_state_for_epoch(
+                    object_table,
+                    roots.unwrap_or_default(),
+                    shared_epoch,
+                )?),
         };
+        if shared_epoch.is_some() {
+            state.set_shared_epoch(shared_epoch);
+        }
         state.mark_step(object_table, budget)
     }
 
@@ -2541,13 +2561,28 @@ impl TransactionState {
             "persistent object marker cannot run while a transaction is active or suspended"
         );
         let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
+            // All stores observe the shared directory, but one store coordinates a
+            // GC cycle while the permit excludes concurrent user commits.
             Some(runtime.begin_persistent_gc()?)
         } else {
             None
         };
-        let Some(mut state) = self.persistent_gc_state.take() else {
-            return Ok(None);
+        let shared_epoch = self.current_shared_persistent_gc_epoch()?;
+        let rebuild_stale_state = self.reset_stale_shared_persistent_gc_state(shared_epoch);
+        let mut state = match self.persistent_gc_state.take() {
+            Some(state) => state,
+            None if rebuild_stale_state => Self::new_persistent_gc_state_for_epoch(
+                objects,
+                self.persistent_root_ids()?,
+                shared_epoch,
+            )?,
+            None => {
+                return Ok(None);
+            }
         };
+        if shared_epoch.is_some() {
+            state.set_shared_epoch(shared_epoch);
+        }
         while !state.is_complete() {
             let pending = state.pending_object_count();
             state.mark_step(objects, PersistentGcBudget::objects(pending.max(1)))?;
@@ -2556,6 +2591,39 @@ impl TransactionState {
         mark.ensure_sweepable()?;
         let sweep = objects.apply_volatile_persistent_sweep(&mark)?;
         Ok(Some(PersistentMarkSweepReport { mark, sweep }))
+    }
+
+    fn current_shared_persistent_gc_epoch(&self) -> Result<Option<u64>> {
+        self.shared_region_runtime
+            .as_ref()
+            .map(TransactionRegionRuntime::persistent_gc_epoch)
+            .transpose()
+    }
+
+    fn reset_stale_shared_persistent_gc_state(&mut self, shared_epoch: Option<u64>) -> bool {
+        let Some(shared_epoch) = shared_epoch else {
+            return false;
+        };
+        let stale = self
+            .persistent_gc_state
+            .as_ref()
+            .is_some_and(|state| state.shared_epoch() != Some(shared_epoch));
+        if stale {
+            self.persistent_gc_state = None;
+        }
+        stale
+    }
+
+    fn new_persistent_gc_state_for_epoch(
+        object_table: &mut ObjectTable,
+        roots: BTreeSet<ObjectId>,
+        shared_epoch: Option<u64>,
+    ) -> Result<PersistentGcState> {
+        let mut state = PersistentGcState::new(object_table, roots)?;
+        if shared_epoch.is_some() {
+            state.set_shared_epoch(shared_epoch);
+        }
+        Ok(state)
     }
 
     pub(crate) fn compact_persistent_object_chunks(
@@ -3444,7 +3512,7 @@ impl TransactionState {
 
     pub(super) fn persistent_gc_maintenance_step_for_test(
         &mut self,
-        object_table: &ObjectTable,
+        object_table: &mut ObjectTable,
         budget: PersistentGcBudget,
     ) -> Result<PersistentGcStepReport> {
         self.persistent_gc_maintenance_step(object_table, budget)

@@ -13,9 +13,9 @@ use super::object_value::object_kind_from_u16;
 use super::state::PersistentRootDelta;
 use super::type_layout::TypeLayoutRegistry;
 use super::{
-    ConcurrencyControlState, GranuleId, ObjectId, ObjectKind, PersistentObjectDirectoryEntry,
-    ObjectTable, PersistentObjectRecordLocation, PersistentObjectRecordSource, PersistentRootKey,
-    TMemoryFileBacking, TransactionConfig, TransactionId, TxDurableLog,
+    ConcurrencyControlState, GranuleId, ObjectId, ObjectKind, ObjectTable,
+    PersistentObjectDirectoryEntry, PersistentObjectRecordLocation, PersistentObjectRecordSource,
+    PersistentRootKey, TMemoryFileBacking, TransactionConfig, TransactionId, TxDurableLog,
     granule_uses_transaction_state_version, persistent_root_key_from_logical_id,
 };
 
@@ -190,6 +190,7 @@ struct PersistentObjectReservation {
 struct GcCoordinationState {
     active_user_commits: u32,
     gc_active: bool,
+    persistent_gc_epoch: u64,
 }
 
 impl Default for DurableLogSegmentRegistry {
@@ -353,70 +354,78 @@ impl TransactionRegionRuntime {
     where
         I: IntoIterator<Item = PersistentObjectDirectoryEntry>,
     {
-        let mut metadata = self.lock_persistent_metadata()?;
-        let mut directory = self.lock_object_directory()?;
-        let mut installed = Vec::new();
-        for mut entry in entries {
-            let current = directory.entries.get(&entry.object_id).cloned();
-            if let Some(current) = current.as_ref() {
-                ensure_matching_persistent_object_metadata(
-                    entry.object_id,
-                    entry.kind,
-                    entry.type_layout_id,
-                    current.kind,
-                    current.type_layout_id,
-                    "persistent object directory entry conflicts with committed directory metadata",
-                )?;
-            }
-            if let Some(reservation) = directory.reservations.get(&entry.object_id).copied() {
-                ensure_matching_persistent_object_metadata(
-                    entry.object_id,
-                    entry.kind,
-                    entry.type_layout_id,
-                    reservation.kind,
-                    reservation.type_layout_id,
-                    "persistent object directory entry conflicts with reserved metadata",
-                )?;
-            }
-
-            match current {
-                Some(current) if current.record_version > entry.record_version => {
-                    metadata
-                        .object_versions
-                        .entry(current.object_id)
-                        .and_modify(|version| *version = (*version).max(current.record_version))
-                        .or_insert(current.record_version);
-                    directory.reservations.remove(&current.object_id);
-                    continue;
+        let mut bumped_epoch = false;
+        let installed = {
+            let mut metadata = self.lock_persistent_metadata()?;
+            let mut directory = self.lock_object_directory()?;
+            let mut installed = Vec::new();
+            for mut entry in entries {
+                let current = directory.entries.get(&entry.object_id).cloned();
+                if let Some(current) = current.as_ref() {
+                    ensure_matching_persistent_object_metadata(
+                        entry.object_id,
+                        entry.kind,
+                        entry.type_layout_id,
+                        current.kind,
+                        current.type_layout_id,
+                        "persistent object directory entry conflicts with committed directory metadata",
+                    )?;
                 }
-                Some(current) if current.record_version == entry.record_version => {
-                    metadata
-                        .object_versions
-                        .entry(current.object_id)
-                        .and_modify(|version| *version = (*version).max(current.record_version))
-                        .or_insert(current.record_version);
-                    directory.reservations.remove(&current.object_id);
-                    installed.push(current.clone());
-                    continue;
+                if let Some(reservation) = directory.reservations.get(&entry.object_id).copied() {
+                    ensure_matching_persistent_object_metadata(
+                        entry.object_id,
+                        entry.kind,
+                        entry.type_layout_id,
+                        reservation.kind,
+                        reservation.type_layout_id,
+                        "persistent object directory entry conflicts with reserved metadata",
+                    )?;
                 }
-                _ => {}
+
+                match current {
+                    Some(current) if current.record_version > entry.record_version => {
+                        metadata
+                            .object_versions
+                            .entry(current.object_id)
+                            .and_modify(|version| *version = (*version).max(current.record_version))
+                            .or_insert(current.record_version);
+                        directory.reservations.remove(&current.object_id);
+                        continue;
+                    }
+                    Some(current) if current.record_version == entry.record_version => {
+                        metadata
+                            .object_versions
+                            .entry(current.object_id)
+                            .and_modify(|version| *version = (*version).max(current.record_version))
+                            .or_insert(current.record_version);
+                        directory.reservations.remove(&current.object_id);
+                        installed.push(current.clone());
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                let next_version = directory
+                    .next_directory_version
+                    .checked_add(1)
+                    .context("persistent object directory version overflow")?;
+                directory.next_directory_version = next_version;
+                entry.directory_version = next_version;
+
+                directory.entries.insert(entry.object_id, entry.clone());
+                directory.reservations.remove(&entry.object_id);
+                metadata
+                    .object_versions
+                    .entry(entry.object_id)
+                    .and_modify(|version| *version = (*version).max(entry.record_version))
+                    .or_insert(entry.record_version);
+                installed.push(entry);
+                bumped_epoch = true;
             }
-
-            let next_version = directory
-                .next_directory_version
-                .checked_add(1)
-                .context("persistent object directory version overflow")?;
-            directory.next_directory_version = next_version;
-            entry.directory_version = next_version;
-
-            directory.entries.insert(entry.object_id, entry.clone());
-            directory.reservations.remove(&entry.object_id);
-            metadata
-                .object_versions
-                .entry(entry.object_id)
-                .and_modify(|version| *version = (*version).max(entry.record_version))
-                .or_insert(entry.record_version);
-            installed.push(entry);
+            installed
+        };
+        if bumped_epoch {
+            self.bump_persistent_gc_epoch()?;
         }
         Ok(installed)
     }
@@ -484,6 +493,19 @@ impl TransactionRegionRuntime {
             .get(&object_id)
             .map(|entry| entry.directory_version)
             .unwrap_or(0))
+    }
+
+    fn bump_persistent_gc_epoch(&self) -> Result<u64> {
+        let mut runtime = self.lock_gc_state()?;
+        runtime.persistent_gc_epoch = runtime
+            .persistent_gc_epoch
+            .checked_add(1)
+            .context("persistent GC epoch overflow")?;
+        Ok(runtime.persistent_gc_epoch)
+    }
+
+    pub(crate) fn persistent_gc_epoch(&self) -> Result<u64> {
+        Ok(self.lock_gc_state()?.persistent_gc_epoch)
     }
 
     pub(crate) fn begin_user_transaction_region(&self) -> Result<UserTransactionRegionPermit> {
@@ -851,33 +873,41 @@ impl TransactionRegionRuntime {
             return Ok(());
         }
 
-        let mut runtime = self.lock_persistent_metadata()?;
-        #[cfg(test)]
-        if core::mem::take(&mut runtime.fail_apply_persistent_root_delta_once_for_test) {
-            bail!("injected shared persistent root apply failure");
-        }
-        for (key, roots) in delta.roots {
-            let version = reserved_versions
-                .get(&key)
-                .copied()
-                .context("shared persistent root publication version was not reserved")?;
-            match runtime.persistent_root_versions.get(&key).copied() {
-                Some(current) if current > version => {
-                    continue;
-                }
-                Some(current) => ensure!(
-                    current == version,
-                    "shared persistent root publication version regressed"
-                ),
-                None => {
-                    runtime.persistent_root_versions.insert(key, version);
-                }
+        let applied = {
+            let mut runtime = self.lock_persistent_metadata()?;
+            #[cfg(test)]
+            if core::mem::take(&mut runtime.fail_apply_persistent_root_delta_once_for_test) {
+                bail!("injected shared persistent root apply failure");
             }
-            if roots.is_empty() {
-                runtime.persistent_roots.remove(&key);
-            } else {
-                runtime.persistent_roots.insert(key, roots);
+            let mut applied = false;
+            for (key, roots) in delta.roots {
+                let version = reserved_versions
+                    .get(&key)
+                    .copied()
+                    .context("shared persistent root publication version was not reserved")?;
+                match runtime.persistent_root_versions.get(&key).copied() {
+                    Some(current) if current > version => {
+                        continue;
+                    }
+                    Some(current) => ensure!(
+                        current == version,
+                        "shared persistent root publication version regressed"
+                    ),
+                    None => {
+                        runtime.persistent_root_versions.insert(key, version);
+                    }
+                }
+                if roots.is_empty() {
+                    runtime.persistent_roots.remove(&key);
+                } else {
+                    runtime.persistent_roots.insert(key, roots);
+                }
+                applied = true;
             }
+            applied
+        };
+        if applied {
+            self.bump_persistent_gc_epoch()?;
         }
         Ok(())
     }

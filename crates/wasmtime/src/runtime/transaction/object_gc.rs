@@ -105,6 +105,7 @@ pub(crate) struct PersistentGcCommitDelta {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistentGcState {
+    shared_epoch: Option<u64>,
     reachable: BTreeSet<ObjectId>,
     grey: Vec<ObjectId>,
     dangling_refs: Vec<DanglingObjectRef>,
@@ -128,32 +129,33 @@ impl PersistentObjectMarkReport {
 }
 
 impl PersistentGcState {
-    pub(crate) fn new<I>(objects: &ObjectTable, roots: I) -> Result<Self>
+    pub(crate) fn new<I>(objects: &mut ObjectTable, roots: I) -> Result<Self>
     where
         I: IntoIterator<Item = ObjectId>,
     {
         ensure_marker_inactive()?;
         let mut state = Self {
+            shared_epoch: None,
             reachable: BTreeSet::new(),
             grey: Vec::new(),
             dangling_refs: Vec::new(),
             invalid_roots: Vec::new(),
         };
         for root in roots {
-            state.seed_root(objects, root);
+            state.seed_root(objects, root)?;
         }
         Ok(state)
     }
 
     pub(crate) fn observe_commit_delta(
         &mut self,
-        objects: &ObjectTable,
+        objects: &mut ObjectTable,
         delta: &PersistentGcCommitDelta,
         budget: PersistentGcBudget,
     ) -> Result<PersistentGcStepReport> {
         ensure_marker_inactive()?;
         for &root in &delta.new_roots {
-            self.enqueue_reachable(root);
+            self.seed_root(objects, root)?;
         }
         for edge in &delta.edges {
             if self.reachable.contains(&edge.from) {
@@ -165,7 +167,7 @@ impl PersistentGcState {
 
     pub(crate) fn mark_step(
         &mut self,
-        objects: &ObjectTable,
+        objects: &mut ObjectTable,
         budget: PersistentGcBudget,
     ) -> Result<PersistentGcStepReport> {
         ensure_marker_inactive()?;
@@ -179,10 +181,12 @@ impl PersistentGcState {
                 break;
             };
             report.scanned_objects += 1;
+            objects.refresh_persistent_object_from_shared_directory(object)?;
             for child in objects
                 .trace_object_ids(object)
                 .with_context(|| format!("failed to trace persistent object {object:?}"))?
             {
+                objects.refresh_persistent_object_from_shared_directory(child)?;
                 match objects.live_slot(child) {
                     Ok(slot) if slot.persistent => {
                         if self.enqueue_reachable(child) {
@@ -207,6 +211,14 @@ impl PersistentGcState {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.grey.is_empty()
+    }
+
+    pub(crate) fn shared_epoch(&self) -> Option<u64> {
+        self.shared_epoch
+    }
+
+    pub(crate) fn set_shared_epoch(&mut self, shared_epoch: Option<u64>) {
+        self.shared_epoch = shared_epoch;
     }
 
     pub(crate) fn pending_object_count(&self) -> usize {
@@ -241,7 +253,8 @@ impl PersistentGcState {
         }
     }
 
-    fn seed_root(&mut self, objects: &ObjectTable, root: ObjectId) {
+    fn seed_root(&mut self, objects: &mut ObjectTable, root: ObjectId) -> Result<()> {
+        objects.refresh_persistent_object_from_shared_directory(root)?;
         match objects.live_slot(root) {
             Ok(slot) if slot.persistent => {
                 self.enqueue_reachable(root);
@@ -255,6 +268,7 @@ impl PersistentGcState {
                 kind: PersistentRootErrorKind::Missing,
             }),
         }
+        Ok(())
     }
 }
 
@@ -269,7 +283,7 @@ fn ensure_marker_inactive() -> Result<()> {
 pub(crate) struct PersistentObjectMarker;
 
 impl PersistentObjectMarker {
-    pub(crate) fn mark<I>(objects: &ObjectTable, roots: I) -> Result<PersistentObjectMarkReport>
+    pub(crate) fn mark<I>(objects: &mut ObjectTable, roots: I) -> Result<PersistentObjectMarkReport>
     where
         I: IntoIterator<Item = ObjectId>,
     {
