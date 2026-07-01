@@ -76,10 +76,6 @@ fn parses_copyable_types_and_sources() {
     let json = br#"{
         "version": 1,
         "module": "transaction-kotlin-bank",
-        "gcWasm": {
-            "capture": "allModuleGcTypes",
-            "denyTypes": []
-        },
         "persistentTypes": [
             {
                 "name": "Account",
@@ -89,23 +85,35 @@ fn parses_copyable_types_and_sources() {
         ],
         "copyableTypes": [
             {
-                "name": "TransferNote",
+                "name": "TransferSource",
                 "kind": "struct",
                 "fields": [
                     {
-                        "name": "text",
-                        "kind": "ref",
-                        "type": "kotlin.String",
-                        "nullable": false
-                    },
-                    {
-                        "name": "source",
+                        "name": "account",
                         "kind": "ref",
                         "type": "Account",
                         "nullable": false
                     }
                 ],
                 "source": "serializable"
+            },
+            {
+                "name": "TransferReceipt",
+                "kind": "struct",
+                "fields": [
+                    {
+                        "name": "source",
+                        "kind": "ref",
+                        "type": "TransferSource",
+                        "nullable": false
+                    },
+                    {
+                        "name": "account",
+                        "kind": "ref",
+                        "type": "Account",
+                        "nullable": false
+                    }
+                ]
             }
         ],
         "transactionFunctions": ["transfer"],
@@ -119,11 +127,16 @@ fn parses_copyable_types_and_sources() {
     }"#;
 
     let sidecar = parse_kotlin_sidecar(&json[..]).unwrap();
+    assert_eq!(sidecar.gc_wasm.capture, KotlinGcWasmCapture::SidecarTypes);
     assert_eq!(sidecar.persistent_types.len(), 1);
-    assert_eq!(sidecar.copyable_types.len(), 1);
+    assert_eq!(sidecar.copyable_types.len(), 2);
     assert_eq!(
         sidecar.copyable_types[0].source,
         KotlinCopyableSource::Serializable
+    );
+    assert_eq!(
+        sidecar.copyable_types[1].source,
+        KotlinCopyableSource::TxCopyable
     );
 }
 
@@ -159,6 +172,7 @@ fn kotlin_sidecar_constructor_uses_default_gc_policy() {
     assert_eq!(sidecar.module, "constructor-fixture");
     assert_eq!(sidecar.gc_wasm.capture, KotlinGcWasmCapture::SidecarTypes);
     assert!(sidecar.gc_wasm.deny_types.is_empty());
+    assert!(sidecar.copyable_types.is_empty());
 }
 
 #[test]
@@ -211,6 +225,64 @@ fn rejects_copyable_types_that_are_already_persistent() {
 
     let err = parse_kotlin_sidecar(&json[..]).unwrap_err().to_string();
     assert!(err.contains("@Persistent already implies TxCopyable"));
+}
+
+#[test]
+fn rejects_duplicate_copyable_type_names() {
+    let json = br#"{
+        "version": 1,
+        "module": "transaction-kotlin-bank",
+        "persistentTypes": [],
+        "copyableTypes": [
+            {
+                "name": "TransferReceipt",
+                "kind": "struct",
+                "fields": []
+            },
+            {
+                "name": "TransferReceipt",
+                "kind": "struct",
+                "fields": []
+            }
+        ],
+        "transactionFunctions": ["transfer"],
+        "roots": []
+    }"#;
+
+    let err = parse_kotlin_sidecar(&json[..]).unwrap_err().to_string();
+    assert!(err.contains("duplicate copyable type name: TransferReceipt"));
+}
+
+#[test]
+fn rejects_copyable_ref_fields_without_known_targets() {
+    let json = br#"{
+        "version": 1,
+        "module": "bad",
+        "persistentTypes": [
+            {
+                "name": "Account",
+                "kind": "struct",
+                "fields": []
+            }
+        ],
+        "copyableTypes": [
+            {
+                "name": "TransferReceipt",
+                "kind": "struct",
+                "fields": [
+                    { "name": "account", "kind": "ref", "type": "Account", "nullable": false },
+                    { "name": "peer", "kind": "ref", "type": "UnknownReceipt", "nullable": false }
+                ]
+            }
+        ],
+        "transactionFunctions": [],
+        "roots": []
+    }"#;
+
+    let err = parse_kotlin_sidecar(&json[..]).unwrap_err().to_string();
+    assert!(err.contains(
+        "copyable type TransferReceipt field peer references unknown persistent or copyable type: UnknownReceipt"
+    ));
 }
 
 #[test]
