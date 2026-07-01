@@ -1313,6 +1313,99 @@ fn rewrite_rejects_direct_ordinary_ref_into_persistent_field_without_txref() {
 }
 
 #[test]
+fn rewrite_rejects_global_ordinary_ref_into_persistent_field_without_txref() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (global $source (ref null $kotlin.String)
+            ref.null $kotlin.String)
+          (func (export "publish") (result (ref null $Bank))
+            global.get $source
+            struct.new $Bank))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains(
+            "ordinary WasmGC reference enters persistent field Bank.note without make_txn_ref"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn rewrite_rejects_branch_local_that_may_hold_ordinary_ref_without_txref() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $TxRefString (struct (field (mut (ref null $kotlin.String)))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (global $source (ref null $kotlin.String)
+            ref.null $kotlin.String)
+          (func $"twasm.TxRef.get"
+                (param $txref (ref $TxRefString))
+                (result (ref null $kotlin.String))
+            local.get $txref
+            struct.get $TxRefString 0)
+          (func (export "publish")
+                (param $txref (ref $TxRefString))
+                (param $use_global i32)
+                (result (ref null $Bank))
+            (local $note (ref null $kotlin.String))
+            local.get $use_global
+            if
+              global.get $source
+              local.set $note
+            else
+              local.get $txref
+              call $"twasm.TxRef.get"
+              local.set $note
+            end
+            local.get $note
+            struct.new $Bank))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains(
+            "ordinary WasmGC reference enters persistent field Bank.note without make_txn_ref"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
 fn rewrite_accepts_copyable_txref_get_into_persistent_field_without_rewriting_constructor() {
     let input = wat::parse_str(
         r#"

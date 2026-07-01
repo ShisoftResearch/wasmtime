@@ -18,8 +18,8 @@ use wasmparser::{
 };
 
 use super::metadata::{
-    KotlinField, KotlinFieldKind, KotlinGcWasmCapture, KotlinPersistentKind, KotlinPersistentType,
-    KotlinSidecar, validate_kotlin_sidecar,
+    KotlinCopyableType, KotlinField, KotlinFieldKind, KotlinGcWasmCapture, KotlinPersistentKind,
+    KotlinPersistentType, KotlinSidecar, validate_kotlin_sidecar,
 };
 
 const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
@@ -49,7 +49,10 @@ struct PersistentTypeIndices {
 #[derive(Default)]
 struct GcTypeInfo {
     persistent: PersistentTypeIndices,
+    explicit_persistent: PersistentTypeIndices,
+    copyable: PersistentTypeIndices,
     module_type_indices: BTreeMap<String, u32>,
+    copyable_type_indices: BTreeMap<String, u32>,
     denied_type_indices: BTreeSet<u32>,
     sidecar_type_indices: BTreeMap<String, u32>,
     struct_field_counts: BTreeMap<u32, usize>,
@@ -58,6 +61,11 @@ struct GcTypeInfo {
     array_element_storage: BTreeMap<u32, StorageType>,
     struct_fields: BTreeMap<(u32, u32), ParserValType>,
     array_elements: BTreeMap<u32, ParserValType>,
+    globals: BTreeMap<u32, ParserValType>,
+    explicit_persistent_struct_fields: BTreeMap<(u32, u32), KotlinField>,
+    explicit_persistent_array_elements: BTreeMap<u32, KotlinField>,
+    copyable_struct_fields: BTreeMap<(u32, u32), KotlinField>,
+    copyable_array_elements: BTreeMap<u32, KotlinField>,
 }
 
 #[derive(Default)]
@@ -98,6 +106,61 @@ struct RootLowering {
 struct FunctionSignature {
     params: Vec<ParserValType>,
     results: Vec<ParserValType>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefProvenance {
+    NonRef,
+    NullRef,
+    OrdinaryRef,
+    PersistentRef,
+    TxnRefAllowed,
+    TxnLocalCopyable,
+    UnknownRef,
+}
+
+impl RefProvenance {
+    fn can_enter_persistent_value(self) -> bool {
+        matches!(
+            self,
+            Self::NullRef | Self::PersistentRef | Self::TxnRefAllowed | Self::TxnLocalCopyable
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StackValue {
+    type_index: Option<u32>,
+    provenance: RefProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProvenanceControlKind {
+    Block,
+    Loop,
+    If,
+}
+
+struct ProvenanceControlFrame {
+    kind: ProvenanceControlKind,
+    entry_locals: Vec<StackValue>,
+    then_locals: Option<Vec<StackValue>>,
+}
+
+impl StackValue {
+    fn non_ref() -> Self {
+        Self {
+            type_index: None,
+            provenance: RefProvenance::NonRef,
+        }
+    }
+
+    fn ref_value(type_index: Option<u32>, provenance: RefProvenance) -> Self {
+        Self {
+            type_index,
+            provenance,
+        }
+    }
 }
 
 struct KotlinIndexRemapper {
@@ -304,6 +367,10 @@ pub fn rewrite_kotlin_module(
         persistent_accessor_function_indices(input, sidecar)?;
     let mut object_rewrite_function_indices = transaction_call_closure_function_indices.clone();
     object_rewrite_function_indices.extend(persistent_accessor_function_indices.iter().copied());
+    let txref_get_function_indices = txref_get_function_indices(input)?;
+    for index in &txref_get_function_indices {
+        object_rewrite_function_indices.remove(index);
+    }
     let mut transaction_objects = transaction_objects(input)?;
     let gc_type_info = gc_type_info(input, sidecar)?;
     let root_lowering = root_lowering(input, sidecar, &gc_type_info)?;
@@ -322,6 +389,7 @@ pub fn rewrite_kotlin_module(
         .globals
         .extend(root_lowering.globals.iter().map(|root| root.global_index));
     let func_type_params = function_type_params(input)?;
+    let function_signatures = function_signatures_by_index(input)?;
     let defined_function_types = defined_function_type_indices(input)?;
     let root_marker_function_indices = root_marker_function_indices(
         input,
@@ -485,6 +553,8 @@ pub fn rewrite_kotlin_module(
                         &root_lowering,
                         &mut index_remapper,
                         &params,
+                        &function_signatures,
+                        &txref_get_function_indices,
                         &marker_literals,
                         &mut report,
                     )?;
@@ -533,6 +603,8 @@ fn rewrite_function_body(
     root_lowering: &RootLowering,
     index_remapper: &mut KotlinIndexRemapper,
     params: &[ParserValType],
+    function_signatures: &BTreeMap<u32, FunctionSignature>,
+    txref_get_function_indices: &BTreeSet<u32>,
     marker_literals: &KotlinMarkerLiterals,
     report: &mut KotlinRewriteReport,
 ) -> Result<Function> {
@@ -542,7 +614,13 @@ fn rewrite_function_body(
     let (local_decls, temp_locals) =
         local_decls_with_temps(&mut type_reencoder, body, &local_types, required_temps)?;
     let mut function = Function::new(local_decls);
-    let mut type_stack = Vec::new();
+    let mut value_stack = Vec::new();
+    let mut local_values = local_types
+        .iter()
+        .copied()
+        .map(|ty| stack_value_for_type(ty, gc_type_info))
+        .collect::<Vec<_>>();
+    let mut control_frames = Vec::new();
     let mut reader = body.get_operators_reader()?;
     let mut operators = Vec::new();
 
@@ -556,6 +634,11 @@ fn rewrite_function_body(
             match_inline_set_root_marker(&operators, index, &local_types, marker_literals)?
         {
             if let Some(root) = root_for_marker_type(root_lowering, marker.type_index)? {
+                let value = local_values
+                    .get(marker.value_local as usize)
+                    .copied()
+                    .unwrap_or_else(StackValue::non_ref);
+                validate_root_value_boundary(root, value, gc_type_info)?;
                 let unit_getter = root_lowering
                     .unit_getter_func
                     .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
@@ -565,7 +648,7 @@ fn rewrite_function_body(
                     global_index: root.global_index,
                 });
                 function.instruction(&Instruction::Call(unit_getter));
-                type_stack.push(None);
+                value_stack.push(StackValue::non_ref());
                 index = marker.next_index;
                 continue;
             }
@@ -577,7 +660,10 @@ fn rewrite_function_body(
             function.instruction(&Instruction::TGlobalGet {
                 global_index: root.global_index,
             });
-            type_stack.push(Some(root.type_index));
+            value_stack.push(StackValue::ref_value(
+                Some(root.type_index),
+                RefProvenance::PersistentRef,
+            ));
             index = marker.next_index;
             continue;
         }
@@ -588,12 +674,17 @@ fn rewrite_function_body(
                 function.instruction(&Instruction::TGlobalGet {
                     global_index: root.global_index,
                 });
-                type_stack.push(Some(root.type_index));
+                value_stack.push(StackValue::ref_value(
+                    Some(root.type_index),
+                    RefProvenance::PersistentRef,
+                ));
                 index += 1;
                 continue;
             }
             if let Some(root) = root_lowering.set_imports.get(&function_index) {
-                if let Some(Some(type_index)) = type_stack.pop()
+                let value = value_stack.pop().unwrap_or_else(StackValue::non_ref);
+                validate_root_value_boundary(root, value, gc_type_info)?;
+                if let Some(type_index) = value.type_index
                     && type_index != root.type_index
                 {
                     bail!(
@@ -610,16 +701,39 @@ fn rewrite_function_body(
                     global_index: root.global_index,
                 });
                 function.instruction(&Instruction::Call(unit_getter));
-                type_stack.push(None);
+                value_stack.push(StackValue::non_ref());
+                index += 1;
+                continue;
+            }
+            if txref_get_function_indices.contains(&function_index) {
+                update_stack_for_call(
+                    function_signatures.get(&function_index),
+                    gc_type_info,
+                    &mut value_stack,
+                    RefProvenance::TxnRefAllowed,
+                );
+                function
+                    .instruction(&index_remapper.instruction(Operator::Call { function_index })?);
                 index += 1;
                 continue;
             }
         }
         let is_array_len = matches!(op, Operator::ArrayLen);
         let array_len_operand = if is_array_len {
-            type_stack.pop().flatten()
+            value_stack.pop().and_then(|value| value.type_index)
         } else {
-            update_type_stack_for_operator(&op, &local_types, &mut type_stack);
+            if rewrite_object_ops {
+                validate_persistent_boundaries_for_operator(&op, gc_type_info, &value_stack)?;
+            }
+            update_value_stack_for_operator(
+                &op,
+                &local_types,
+                &mut local_values,
+                &mut control_frames,
+                function_signatures,
+                gc_type_info,
+                &mut value_stack,
+            );
             None
         };
         match op {
@@ -742,12 +856,12 @@ fn rewrite_function_body(
             {
                 function.instruction(&Instruction::TArrayLen);
                 report.rewritten_object_ops += 1;
-                type_stack.push(None);
+                value_stack.push(StackValue::non_ref());
             }
             _ => {
                 function.instruction(&index_remapper.instruction(op)?);
                 if is_array_len {
-                    type_stack.push(None);
+                    value_stack.push(StackValue::non_ref());
                 }
             }
         }
@@ -1086,67 +1200,684 @@ fn matching_block_end(operators: &[Operator<'_>], start: usize) -> Option<usize>
     None
 }
 
-fn update_type_stack_for_operator(
+fn validate_persistent_boundaries_for_operator(
+    op: &Operator<'_>,
+    gc_type_info: &GcTypeInfo,
+    value_stack: &[StackValue],
+) -> Result<()> {
+    match op {
+        Operator::StructNew { struct_type_index } => {
+            validate_struct_constructor_boundary(*struct_type_index, gc_type_info, value_stack)
+        }
+        Operator::StructSet {
+            struct_type_index,
+            field_index,
+        } => validate_struct_field_value_boundary(
+            *struct_type_index,
+            *field_index,
+            value_stack
+                .last()
+                .copied()
+                .unwrap_or_else(StackValue::non_ref),
+            gc_type_info,
+        ),
+        Operator::ArrayNew { array_type_index } => {
+            let value = value_stack
+                .iter()
+                .rev()
+                .nth(1)
+                .copied()
+                .unwrap_or_else(StackValue::non_ref);
+            validate_array_element_value_boundary(*array_type_index, value, gc_type_info)
+        }
+        Operator::ArrayNewFixed {
+            array_type_index,
+            array_size,
+        } => {
+            if !array_requires_source_boundary(*array_type_index, gc_type_info) {
+                return Ok(());
+            }
+            let array_size =
+                usize::try_from(*array_size).context("Kotlin rewrite array size overflow")?;
+            for value in value_stack.iter().rev().take(array_size).copied() {
+                validate_array_element_value_boundary(*array_type_index, value, gc_type_info)?;
+            }
+            Ok(())
+        }
+        Operator::ArraySet { array_type_index } => {
+            let value = value_stack
+                .last()
+                .copied()
+                .unwrap_or_else(StackValue::non_ref);
+            validate_array_element_value_boundary(*array_type_index, value, gc_type_info)
+        }
+        Operator::ArrayFill { array_type_index } => {
+            let value = value_stack
+                .iter()
+                .rev()
+                .nth(1)
+                .copied()
+                .unwrap_or_else(StackValue::non_ref);
+            validate_array_element_value_boundary(*array_type_index, value, gc_type_info)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn update_value_stack_for_operator(
     op: &Operator<'_>,
     local_types: &[ParserValType],
-    type_stack: &mut Vec<Option<u32>>,
+    local_values: &mut Vec<StackValue>,
+    control_frames: &mut Vec<ProvenanceControlFrame>,
+    function_signatures: &BTreeMap<u32, FunctionSignature>,
+    gc_type_info: &GcTypeInfo,
+    value_stack: &mut Vec<StackValue>,
 ) {
     match op {
+        Operator::Block { .. } => {
+            control_frames.push(ProvenanceControlFrame {
+                kind: ProvenanceControlKind::Block,
+                entry_locals: local_values.clone(),
+                then_locals: None,
+            });
+            value_stack.clear();
+        }
+        Operator::Loop { .. } => {
+            control_frames.push(ProvenanceControlFrame {
+                kind: ProvenanceControlKind::Loop,
+                entry_locals: local_values.clone(),
+                then_locals: None,
+            });
+            value_stack.clear();
+        }
+        Operator::If { .. } => {
+            value_stack.pop();
+            control_frames.push(ProvenanceControlFrame {
+                kind: ProvenanceControlKind::If,
+                entry_locals: local_values.clone(),
+                then_locals: None,
+            });
+            value_stack.clear();
+        }
+        Operator::Else => {
+            value_stack.clear();
+            if let Some(frame) = control_frames.last_mut()
+                && frame.kind == ProvenanceControlKind::If
+            {
+                frame.then_locals = Some(local_values.clone());
+                *local_values = frame.entry_locals.clone();
+            } else {
+                invalidate_ref_locals(local_values, local_types, gc_type_info);
+            }
+        }
+        Operator::End => {
+            value_stack.clear();
+            if let Some(frame) = control_frames.pop()
+                && frame.kind == ProvenanceControlKind::If
+            {
+                let current_locals = local_values.clone();
+                let merged = if let Some(then_locals) = frame.then_locals {
+                    merge_local_values(&then_locals, &current_locals, local_types, gc_type_info)
+                } else {
+                    merge_local_values(
+                        &frame.entry_locals,
+                        &current_locals,
+                        local_types,
+                        gc_type_info,
+                    )
+                };
+                *local_values = merged;
+            }
+        }
         Operator::LocalGet { local_index } => {
-            let type_index = local_types
+            let value = local_values
                 .get(*local_index as usize)
                 .copied()
-                .and_then(module_ref_type_index);
-            type_stack.push(type_index);
+                .unwrap_or_else(StackValue::non_ref);
+            value_stack.push(value);
         }
         Operator::Drop => {
-            type_stack.pop();
+            value_stack.pop();
         }
-        Operator::LocalSet { .. } => {
-            type_stack.pop();
+        Operator::LocalSet { local_index } => {
+            let value = value_stack.pop().unwrap_or_else(StackValue::non_ref);
+            ensure_local_value_capacity(local_values, local_types, *local_index, gc_type_info);
+            if let Some(local) = local_values.get_mut(*local_index as usize) {
+                *local = value;
+            }
         }
         Operator::LocalTee { local_index } => {
-            type_stack.pop();
-            let type_index = local_types
-                .get(*local_index as usize)
+            let value = value_stack
+                .last()
                 .copied()
-                .and_then(module_ref_type_index);
-            type_stack.push(type_index);
+                .unwrap_or_else(StackValue::non_ref);
+            ensure_local_value_capacity(local_values, local_types, *local_index, gc_type_info);
+            if let Some(local) = local_values.get_mut(*local_index as usize) {
+                *local = value;
+            }
+        }
+        Operator::GlobalGet { global_index } => {
+            let value = gc_type_info
+                .globals
+                .get(global_index)
+                .copied()
+                .map(|ty| stack_value_for_type(ty, gc_type_info))
+                .unwrap_or_else(|| StackValue::ref_value(None, RefProvenance::UnknownRef));
+            value_stack.push(value);
+        }
+        Operator::GlobalSet { .. } => {
+            value_stack.pop();
         }
         Operator::I32Const { .. }
         | Operator::I64Const { .. }
         | Operator::F32Const { .. }
         | Operator::F64Const { .. }
         | Operator::V128Const { .. } => {
-            type_stack.push(None);
+            value_stack.push(StackValue::non_ref());
         }
         Operator::StructGet { .. } | Operator::StructGetS { .. } | Operator::StructGetU { .. } => {
-            type_stack.pop();
-            type_stack.push(None);
+            let (struct_type_index, field_index) = match op {
+                Operator::StructGet {
+                    struct_type_index,
+                    field_index,
+                }
+                | Operator::StructGetS {
+                    struct_type_index,
+                    field_index,
+                }
+                | Operator::StructGetU {
+                    struct_type_index,
+                    field_index,
+                } => (*struct_type_index, *field_index),
+                _ => unreachable!(),
+            };
+            let receiver = value_stack.pop().unwrap_or_else(StackValue::non_ref);
+            let field_ty = gc_type_info
+                .struct_fields
+                .get(&(struct_type_index, field_index))
+                .copied();
+            value_stack.push(stack_value_for_read_field(field_ty, receiver, gc_type_info));
         }
         Operator::StructSet { .. } => {
-            pop_n(type_stack, 2);
+            pop_n(value_stack, 2);
+        }
+        Operator::StructNew { struct_type_index } => {
+            let count = gc_type_info
+                .struct_field_counts
+                .get(struct_type_index)
+                .copied()
+                .unwrap_or(0);
+            pop_n(value_stack, count);
+            value_stack.push(stack_value_for_constructor(
+                *struct_type_index,
+                gc_type_info,
+            ));
+        }
+        Operator::StructNewDefault { struct_type_index } => {
+            value_stack.push(stack_value_for_constructor(
+                *struct_type_index,
+                gc_type_info,
+            ));
         }
         Operator::ArrayGet { .. } | Operator::ArrayGetS { .. } | Operator::ArrayGetU { .. } => {
-            pop_n(type_stack, 2);
-            type_stack.push(None);
+            let array_type_index = match op {
+                Operator::ArrayGet { array_type_index }
+                | Operator::ArrayGetS { array_type_index }
+                | Operator::ArrayGetU { array_type_index } => *array_type_index,
+                _ => unreachable!(),
+            };
+            let _index = value_stack.pop();
+            let receiver = value_stack.pop().unwrap_or_else(StackValue::non_ref);
+            let element_ty = gc_type_info.array_elements.get(&array_type_index).copied();
+            value_stack.push(stack_value_for_read_field(
+                element_ty,
+                receiver,
+                gc_type_info,
+            ));
         }
         Operator::ArraySet { .. } => {
-            pop_n(type_stack, 3);
+            pop_n(value_stack, 3);
+        }
+        Operator::ArrayNew { array_type_index } => {
+            pop_n(value_stack, 2);
+            value_stack.push(stack_value_for_constructor(*array_type_index, gc_type_info));
+        }
+        Operator::ArrayNewDefault { array_type_index } => {
+            value_stack.pop();
+            value_stack.push(stack_value_for_constructor(*array_type_index, gc_type_info));
+        }
+        Operator::ArrayNewFixed {
+            array_type_index,
+            array_size,
+        } => {
+            pop_n(
+                value_stack,
+                usize::try_from(*array_size).unwrap_or(usize::MAX),
+            );
+            value_stack.push(stack_value_for_constructor(*array_type_index, gc_type_info));
+        }
+        Operator::ArrayNewData {
+            array_type_index, ..
+        }
+        | Operator::ArrayNewElem {
+            array_type_index, ..
+        } => {
+            pop_n(value_stack, 2);
+            value_stack.push(stack_value_for_constructor(*array_type_index, gc_type_info));
+        }
+        Operator::ArrayFill { .. } => {
+            pop_n(value_stack, 4);
         }
         Operator::RefNull { hty } => {
-            type_stack.push(heap_type_index(*hty));
+            value_stack.push(StackValue::ref_value(
+                heap_type_index(*hty),
+                RefProvenance::NullRef,
+            ));
+        }
+        Operator::RefAsNonNull => {}
+        Operator::Call { function_index } => {
+            update_stack_for_call(
+                function_signatures.get(function_index),
+                gc_type_info,
+                value_stack,
+                RefProvenance::UnknownRef,
+            );
+        }
+        Operator::Br { .. }
+        | Operator::BrIf { .. }
+        | Operator::BrTable { .. }
+        | Operator::Return
+        | Operator::ReturnCall { .. }
+        | Operator::ReturnCallIndirect { .. }
+        | Operator::Unreachable
+        | Operator::Throw { .. }
+        | Operator::Rethrow { .. }
+        | Operator::ThrowRef => {
+            invalidate_ref_locals(local_values, local_types, gc_type_info);
+            value_stack.clear();
         }
         _ => {
-            type_stack.clear();
+            value_stack.clear();
         }
     }
 }
 
-fn pop_n(type_stack: &mut Vec<Option<u32>>, count: usize) {
+fn pop_n<T>(stack: &mut Vec<T>, count: usize) {
     for _ in 0..count {
-        type_stack.pop();
+        stack.pop();
     }
+}
+
+fn ensure_local_value_capacity(
+    local_values: &mut Vec<StackValue>,
+    local_types: &[ParserValType],
+    local_index: u32,
+    gc_type_info: &GcTypeInfo,
+) {
+    while local_values.len() <= local_index as usize {
+        let value = local_types
+            .get(local_values.len())
+            .copied()
+            .map(|ty| stack_value_for_type(ty, gc_type_info))
+            .unwrap_or_else(StackValue::non_ref);
+        local_values.push(value);
+    }
+}
+
+fn merge_local_values(
+    left: &[StackValue],
+    right: &[StackValue],
+    local_types: &[ParserValType],
+    gc_type_info: &GcTypeInfo,
+) -> Vec<StackValue> {
+    let len = left.len().max(right.len()).max(local_types.len());
+    (0..len)
+        .map(|index| {
+            let fallback = local_types
+                .get(index)
+                .copied()
+                .map(|ty| stack_value_for_type(ty, gc_type_info))
+                .unwrap_or_else(StackValue::non_ref);
+            let left = left.get(index).copied().unwrap_or(fallback);
+            let right = right.get(index).copied().unwrap_or(fallback);
+            merge_stack_value(left, right, fallback)
+        })
+        .collect()
+}
+
+fn merge_stack_value(left: StackValue, right: StackValue, fallback: StackValue) -> StackValue {
+    if left == right {
+        return left;
+    }
+    if fallback.provenance == RefProvenance::NonRef {
+        return StackValue::non_ref();
+    }
+    StackValue::ref_value(
+        fallback.type_index.or(left.type_index).or(right.type_index),
+        RefProvenance::UnknownRef,
+    )
+}
+
+fn invalidate_ref_locals(
+    local_values: &mut [StackValue],
+    local_types: &[ParserValType],
+    gc_type_info: &GcTypeInfo,
+) {
+    for (index, local) in local_values.iter_mut().enumerate() {
+        let fallback = local_types
+            .get(index)
+            .copied()
+            .map(|ty| stack_value_for_type(ty, gc_type_info))
+            .unwrap_or_else(StackValue::non_ref);
+        if fallback.provenance != RefProvenance::NonRef || local.provenance != RefProvenance::NonRef
+        {
+            *local = StackValue::ref_value(
+                fallback.type_index.or(local.type_index),
+                RefProvenance::UnknownRef,
+            );
+        }
+    }
+}
+
+fn update_stack_for_call(
+    signature: Option<&FunctionSignature>,
+    gc_type_info: &GcTypeInfo,
+    value_stack: &mut Vec<StackValue>,
+    ref_result_provenance: RefProvenance,
+) {
+    let Some(signature) = signature else {
+        value_stack.clear();
+        return;
+    };
+    pop_n(value_stack, signature.params.len());
+    for result in &signature.results {
+        let mut value = stack_value_for_type(*result, gc_type_info);
+        if value.provenance != RefProvenance::NonRef {
+            value.provenance = ref_result_provenance;
+        }
+        value_stack.push(value);
+    }
+}
+
+fn validate_root_value_boundary(
+    root: &RootGlobal,
+    value: StackValue,
+    gc_type_info: &GcTypeInfo,
+) -> Result<()> {
+    validate_ref_value_boundary(
+        &format!("persistent root {}", root.name),
+        value,
+        Some(root.type_index),
+        gc_type_info,
+    )
+}
+
+fn validate_struct_constructor_boundary(
+    struct_type_index: u32,
+    gc_type_info: &GcTypeInfo,
+    value_stack: &[StackValue],
+) -> Result<()> {
+    if !struct_requires_source_boundary(struct_type_index, gc_type_info) {
+        return Ok(());
+    }
+    let fields = sidecar_struct_fields_for_boundary(struct_type_index, gc_type_info);
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let count = *gc_type_info
+        .struct_field_counts
+        .get(&struct_type_index)
+        .context("missing Kotlin rewrite struct field count")?;
+    let values = value_stack.iter().rev().take(count).collect::<Vec<_>>();
+    for (field_index, field) in fields {
+        let offset = count
+            .checked_sub(1 + field_index as usize)
+            .context("Kotlin rewrite struct field index overflow")?;
+        let value = values
+            .get(offset)
+            .copied()
+            .copied()
+            .unwrap_or_else(StackValue::non_ref);
+        if field.kind == KotlinFieldKind::Ref {
+            validate_ref_value_boundary(
+                &field_boundary_context(struct_type_index, field_index, field, gc_type_info),
+                value,
+                expected_type_index_for_field(field, gc_type_info),
+                gc_type_info,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_struct_field_value_boundary(
+    struct_type_index: u32,
+    field_index: u32,
+    value: StackValue,
+    gc_type_info: &GcTypeInfo,
+) -> Result<()> {
+    let Some(field) =
+        sidecar_struct_field_for_boundary(struct_type_index, field_index, gc_type_info)
+    else {
+        return Ok(());
+    };
+    if field.kind != KotlinFieldKind::Ref {
+        return Ok(());
+    }
+    validate_ref_value_boundary(
+        &field_boundary_context(struct_type_index, field_index, field, gc_type_info),
+        value,
+        expected_type_index_for_field(field, gc_type_info),
+        gc_type_info,
+    )
+}
+
+fn validate_array_element_value_boundary(
+    array_type_index: u32,
+    value: StackValue,
+    gc_type_info: &GcTypeInfo,
+) -> Result<()> {
+    let Some(element) = sidecar_array_element_for_boundary(array_type_index, gc_type_info) else {
+        return Ok(());
+    };
+    if element.kind != KotlinFieldKind::Ref {
+        return Ok(());
+    }
+    validate_ref_value_boundary(
+        &format!(
+            "persistent array {} element",
+            type_name_for_index(array_type_index, gc_type_info)
+                .unwrap_or_else(|| array_type_index.to_string())
+        ),
+        value,
+        expected_type_index_for_field(element, gc_type_info),
+        gc_type_info,
+    )
+}
+
+fn validate_ref_value_boundary(
+    context: &str,
+    value: StackValue,
+    expected_type_index: Option<u32>,
+    gc_type_info: &GcTypeInfo,
+) -> Result<()> {
+    if value.provenance == RefProvenance::NonRef {
+        if expected_type_index.is_some() {
+            bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
+        }
+        return Ok(());
+    }
+    if value.provenance == RefProvenance::NullRef {
+        return Ok(());
+    }
+    let Some(type_index) = value.type_index.or(expected_type_index) else {
+        bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
+    };
+    if value.provenance == RefProvenance::UnknownRef {
+        bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
+    }
+    ensure!(
+        is_copyable_type(gc_type_info, type_index),
+        "{context} references non-copyable GC type index {type_index}"
+    );
+    if !value.provenance.can_enter_persistent_value() {
+        bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
+    }
+    Ok(())
+}
+
+fn sidecar_struct_fields_for_boundary(
+    struct_type_index: u32,
+    gc_type_info: &GcTypeInfo,
+) -> Vec<(u32, &KotlinField)> {
+    gc_type_info
+        .explicit_persistent_struct_fields
+        .iter()
+        .chain(gc_type_info.copyable_struct_fields.iter())
+        .filter_map(|((type_index, field_index), field)| {
+            (*type_index == struct_type_index).then_some((*field_index, field))
+        })
+        .collect()
+}
+
+fn sidecar_struct_field_for_boundary<'a>(
+    struct_type_index: u32,
+    field_index: u32,
+    gc_type_info: &'a GcTypeInfo,
+) -> Option<&'a KotlinField> {
+    gc_type_info
+        .explicit_persistent_struct_fields
+        .get(&(struct_type_index, field_index))
+        .or_else(|| {
+            gc_type_info
+                .copyable_struct_fields
+                .get(&(struct_type_index, field_index))
+        })
+}
+
+fn sidecar_array_element_for_boundary(
+    array_type_index: u32,
+    gc_type_info: &GcTypeInfo,
+) -> Option<&KotlinField> {
+    gc_type_info
+        .explicit_persistent_array_elements
+        .get(&array_type_index)
+        .or_else(|| gc_type_info.copyable_array_elements.get(&array_type_index))
+}
+
+fn expected_type_index_for_field(field: &KotlinField, gc_type_info: &GcTypeInfo) -> Option<u32> {
+    field
+        .r#type
+        .as_deref()
+        .and_then(|name| gc_type_info.sidecar_type_indices.get(name).copied())
+}
+
+fn field_boundary_context(
+    struct_type_index: u32,
+    field_index: u32,
+    field: &KotlinField,
+    gc_type_info: &GcTypeInfo,
+) -> String {
+    let type_name = type_name_for_index(struct_type_index, gc_type_info)
+        .unwrap_or_else(|| struct_type_index.to_string());
+    let field_name = if field.name.is_empty() {
+        field_index.to_string()
+    } else {
+        field.name.clone()
+    };
+    format!("persistent field {type_name}.{field_name}")
+}
+
+fn stack_value_for_read_field(
+    ty: Option<ParserValType>,
+    receiver: StackValue,
+    gc_type_info: &GcTypeInfo,
+) -> StackValue {
+    let Some(ty) = ty else {
+        return StackValue::non_ref();
+    };
+    let mut value = stack_value_for_type(ty, gc_type_info);
+    if value.provenance != RefProvenance::NonRef {
+        value.provenance = if receiver.provenance == RefProvenance::PersistentRef {
+            RefProvenance::PersistentRef
+        } else {
+            RefProvenance::OrdinaryRef
+        };
+    }
+    value
+}
+
+fn stack_value_for_constructor(type_index: u32, gc_type_info: &GcTypeInfo) -> StackValue {
+    let provenance = if is_declared_copyable_constructor_type(gc_type_info, type_index) {
+        RefProvenance::TxnLocalCopyable
+    } else {
+        RefProvenance::OrdinaryRef
+    };
+    StackValue::ref_value(Some(type_index), provenance)
+}
+
+fn stack_value_for_type(ty: ParserValType, gc_type_info: &GcTypeInfo) -> StackValue {
+    let Some(type_index) = module_ref_type_index(ty) else {
+        return StackValue::non_ref();
+    };
+    let provenance = if is_explicit_persistent_type(gc_type_info, type_index) {
+        RefProvenance::PersistentRef
+    } else {
+        RefProvenance::OrdinaryRef
+    };
+    StackValue::ref_value(Some(type_index), provenance)
+}
+
+fn struct_requires_source_boundary(type_index: u32, gc_type_info: &GcTypeInfo) -> bool {
+    gc_type_info
+        .explicit_persistent
+        .structs
+        .contains(&type_index)
+        || gc_type_info.copyable_type_indices.values().any(|index| {
+            *index == type_index && gc_type_info.copyable.structs.contains(&type_index)
+        })
+}
+
+fn array_requires_source_boundary(type_index: u32, gc_type_info: &GcTypeInfo) -> bool {
+    gc_type_info
+        .explicit_persistent
+        .arrays
+        .contains(&type_index)
+        || gc_type_info
+            .copyable_type_indices
+            .values()
+            .any(|index| *index == type_index && gc_type_info.copyable.arrays.contains(&type_index))
+}
+
+fn is_copyable_type(gc_type_info: &GcTypeInfo, type_index: u32) -> bool {
+    gc_type_info.copyable.structs.contains(&type_index)
+        || gc_type_info.copyable.arrays.contains(&type_index)
+}
+
+fn is_explicit_persistent_type(gc_type_info: &GcTypeInfo, type_index: u32) -> bool {
+    gc_type_info
+        .explicit_persistent
+        .structs
+        .contains(&type_index)
+        || gc_type_info
+            .explicit_persistent
+            .arrays
+            .contains(&type_index)
+}
+
+fn is_declared_copyable_constructor_type(gc_type_info: &GcTypeInfo, type_index: u32) -> bool {
+    is_explicit_persistent_type(gc_type_info, type_index)
+        || gc_type_info
+            .copyable_type_indices
+            .values()
+            .any(|copyable_index| *copyable_index == type_index)
+}
+
+fn type_name_for_index(type_index: u32, gc_type_info: &GcTypeInfo) -> Option<String> {
+    gc_type_info
+        .sidecar_type_indices
+        .iter()
+        .find_map(|(name, index)| (*index == type_index).then_some(name.clone()))
 }
 
 fn module_ref_type_index(ty: ParserValType) -> Option<u32> {
@@ -1754,6 +2485,15 @@ fn function_index_by_exact_name(input: &[u8], expected: &str) -> Result<Option<u
     }
 }
 
+fn txref_get_function_indices(input: &[u8]) -> Result<BTreeSet<u32>> {
+    function_indices_by_name(input, |name| {
+        name == "twasm.TxRef.get"
+            || name.ends_with(".TxRef.get")
+            || name.ends_with("TxRef.<get-value>")
+            || (name.contains("TxRef") && name.ends_with(".get"))
+    })
+}
+
 fn function_indices_by_name(
     input: &[u8],
     mut predicate: impl FnMut(&str) -> bool,
@@ -1907,6 +2647,24 @@ fn function_type_signatures(input: &[u8]) -> Result<BTreeMap<u32, FunctionSignat
     Ok(signatures)
 }
 
+fn function_signatures_by_index(input: &[u8]) -> Result<BTreeMap<u32, FunctionSignature>> {
+    let type_signatures = function_type_signatures(input)?;
+    let mut function_signatures = BTreeMap::new();
+    for (function_index, type_index) in imported_function_type_indices(input)?
+        .into_iter()
+        .chain(defined_function_type_indices(input)?.into_iter())
+        .enumerate()
+    {
+        if let Some(signature) = type_signatures.get(&type_index).cloned() {
+            function_signatures.insert(
+                u32::try_from(function_index).context("Kotlin rewrite function index overflow")?,
+                signature,
+            );
+        }
+    }
+    Ok(function_signatures)
+}
+
 fn defined_function_type_indices(input: &[u8]) -> Result<Vec<u32>> {
     let mut type_indices = Vec::new();
 
@@ -1968,6 +2726,24 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
                         }
                         next_type_index += 1;
                     }
+                }
+            }
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import.context("failed to parse Kotlin rewrite import")?;
+                    if let TypeRef::Global(global) = import.ty {
+                        let global_index = u32::try_from(info.globals.len())
+                            .context("Kotlin rewrite global index overflow")?;
+                        info.globals.insert(global_index, global.content_type);
+                    }
+                }
+            }
+            Payload::GlobalSection(section) => {
+                for global in section {
+                    let global = global.context("failed to parse Kotlin rewrite global")?;
+                    let global_index = u32::try_from(info.globals.len())
+                        .context("Kotlin rewrite global index overflow")?;
+                    info.globals.insert(global_index, global.ty.content_type);
                 }
             }
             _ => {}
@@ -2116,9 +2892,45 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
         match persistent_type.kind {
             KotlinPersistentKind::Struct => {
                 info.persistent.structs.insert(type_index);
+                info.explicit_persistent.structs.insert(type_index);
+                info.copyable.structs.insert(type_index);
             }
             KotlinPersistentKind::Array => {
                 info.persistent.arrays.insert(type_index);
+                info.explicit_persistent.arrays.insert(type_index);
+                info.copyable.arrays.insert(type_index);
+            }
+        }
+    }
+
+    for copyable_type in &sidecar.copyable_types {
+        ensure_runtime_type_mapping(
+            &mut info,
+            &type_names,
+            &sidecar.gc_wasm.deny_types,
+            &copyable_type.name,
+            &format!("copyable type {}", copyable_type.name),
+        )?;
+        let type_index = info.sidecar_type_indices[&copyable_type.name];
+        let actual_kind = gc_type_kind(&info, type_index)
+            .context("named copyable type did not map to a GC type")?;
+        if actual_kind != copyable_type.kind {
+            bail!(
+                "copyable type {} expected {:?} at GC type index {}, found {:?}",
+                copyable_type.name,
+                copyable_type.kind,
+                type_index,
+                actual_kind
+            );
+        }
+        info.copyable_type_indices
+            .insert(copyable_type.name.clone(), type_index);
+        match copyable_type.kind {
+            KotlinPersistentKind::Struct => {
+                info.copyable.structs.insert(type_index);
+            }
+            KotlinPersistentKind::Array => {
+                info.copyable.arrays.insert(type_index);
             }
         }
     }
@@ -2153,10 +2965,38 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
             )?;
         }
     }
+    for copyable_type in &sidecar.copyable_types {
+        for field in copyable_type
+            .fields
+            .iter()
+            .chain(copyable_type.element.iter())
+        {
+            let Some(target_name) = field.r#type.as_deref() else {
+                continue;
+            };
+            ensure_runtime_type_mapping(
+                &mut info,
+                &type_names,
+                &sidecar.gc_wasm.deny_types,
+                target_name,
+                &format!(
+                    "copyable type {} field {} references denied type {}",
+                    copyable_type.name, field.name, target_name
+                ),
+            )?;
+        }
+    }
+
+    mark_builtin_copyable_types(&mut info);
 
     for persistent_type in &sidecar.persistent_types {
         let type_index = info.sidecar_type_indices[&persistent_type.name];
         validate_persistent_type_shape(type_index, persistent_type, &info)?;
+        record_sidecar_boundary_fields(type_index, persistent_type, true, &mut info)?;
+    }
+    for copyable_type in &sidecar.copyable_types {
+        let type_index = info.copyable_type_indices[&copyable_type.name];
+        record_copyable_boundary_fields(type_index, copyable_type, &mut info)?;
     }
 
     Ok(info)
@@ -2236,6 +3076,44 @@ fn kotlin_type_denied(name: &str, deny_types: &[String]) -> bool {
                     .is_some_and(|suffix| suffix.starts_with('.'))
         }) || pattern == name
     })
+}
+
+fn mark_builtin_copyable_types(info: &mut GcTypeInfo) {
+    let builtin_indices = info
+        .sidecar_type_indices
+        .iter()
+        .filter_map(|(name, type_index)| {
+            is_builtin_copyable_type_name(name).then_some((*type_index, name.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (type_index, _name) in builtin_indices {
+        match gc_type_kind(info, type_index) {
+            Some(KotlinPersistentKind::Struct) => {
+                info.copyable.structs.insert(type_index);
+            }
+            Some(KotlinPersistentKind::Array) => {
+                info.copyable.arrays.insert(type_index);
+            }
+            None => {}
+        }
+    }
+}
+
+fn is_builtin_copyable_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "kotlin.String"
+            | "String"
+            | "kotlin.Boolean"
+            | "kotlin.Byte"
+            | "kotlin.Short"
+            | "kotlin.Int"
+            | "kotlin.Long"
+            | "kotlin.Float"
+            | "kotlin.Double"
+            | "kotlin.Char"
+            | "kotlin.Unit"
+    )
 }
 
 fn name_section_function_names(input: &[u8]) -> Result<Vec<(String, u32)>> {
@@ -2448,6 +3326,93 @@ fn validate_persistent_type_shape(
     }
 
     Ok(())
+}
+
+fn record_sidecar_boundary_fields(
+    type_index: u32,
+    persistent_type: &KotlinPersistentType,
+    explicit_persistent: bool,
+    info: &mut GcTypeInfo,
+) -> Result<()> {
+    match persistent_type.kind {
+        KotlinPersistentKind::Struct => {
+            let fields = sidecar_struct_field_indices(type_index, &persistent_type.fields, info)?;
+            for (field_index, field) in fields {
+                if explicit_persistent {
+                    info.explicit_persistent_struct_fields
+                        .insert((type_index, field_index), field.clone());
+                } else {
+                    info.copyable_struct_fields
+                        .insert((type_index, field_index), field.clone());
+                }
+            }
+        }
+        KotlinPersistentKind::Array => {
+            let Some(element) = persistent_type.element.clone() else {
+                return Ok(());
+            };
+            if explicit_persistent {
+                info.explicit_persistent_array_elements
+                    .insert(type_index, element);
+            } else {
+                info.copyable_array_elements.insert(type_index, element);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_copyable_boundary_fields(
+    type_index: u32,
+    copyable_type: &KotlinCopyableType,
+    info: &mut GcTypeInfo,
+) -> Result<()> {
+    let persistent_like = KotlinPersistentType {
+        name: copyable_type.name.clone(),
+        kind: copyable_type.kind,
+        fields: copyable_type.fields.clone(),
+        element: copyable_type.element.clone(),
+    };
+    record_sidecar_boundary_fields(type_index, &persistent_like, false, info)
+}
+
+fn sidecar_struct_field_indices<'a>(
+    type_index: u32,
+    fields: &'a [KotlinField],
+    info: &GcTypeInfo,
+) -> Result<Vec<(u32, &'a KotlinField)>> {
+    let has_named_fields = info
+        .struct_field_names
+        .keys()
+        .any(|(named_type_index, _)| *named_type_index == type_index);
+    fields
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let field_index = if has_named_fields {
+                let field_indices = info
+                    .struct_field_names
+                    .get(&(type_index, field.name.clone()))
+                    .with_context(|| {
+                        format!(
+                            "Kotlin rewrite field {} was not found in WasmGC field names",
+                            field.name
+                        )
+                    })?;
+                ensure!(
+                    field_indices.len() == 1,
+                    "ambiguous Kotlin rewrite field name {} on type index {}: {:?}",
+                    field.name,
+                    type_index,
+                    field_indices
+                );
+                *field_indices.iter().next().unwrap()
+            } else {
+                u32::try_from(ordinal).context("Kotlin sidecar field ordinal overflow")?
+            };
+            Ok((field_index, field))
+        })
+        .collect()
 }
 
 fn validate_sidecar_field_type(
