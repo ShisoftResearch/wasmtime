@@ -12,6 +12,14 @@ inline fun transaction(block: () -> Unit) {
     block()
 }
 
+class TxRef<T> internal constructor(val value: T)
+
+fun <T> make_txn_ref(value: T): TxRef<T> =
+    TxRef(value)
+
+fun <T> TxRef<T>.get(): T =
+    value
+
 @Suppress("UNUSED_PARAMETER")
 inline fun <reified T> root(name: String): T {
     error("twasm root marker was not lowered: $name")

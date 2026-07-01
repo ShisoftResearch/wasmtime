@@ -238,8 +238,8 @@ fn kotlin_rewritten_bank_executes_and_recovers_file_backed_roots() -> Result<()>
         recovered.root_object_ids
     );
     ensure!(
-        recovered.object_winners.len() >= 3,
-        "expected recovered Bank and Account records, got {}",
+        recovered.object_winners.len() >= 4,
+        "expected recovered Bank, Account, and note records, got {}",
         recovered.object_winners.len()
     );
     let root_winner = recovered
@@ -247,10 +247,12 @@ fn kotlin_rewritten_bank_executes_and_recovers_file_backed_roots() -> Result<()>
         .iter()
         .find(|winner| winner.object_id == recovered.root_object_ids[0])
         .context("root ObjectId did not have a recovered object record")?;
-    let alice_ref = recovered_object_ref_field(&root_winner.record_bytes, 2, 0)?
+    let alice_ref = recovered_object_ref_field(&root_winner.record_bytes, 3, 0)?
         .context("recovered Bank alice field was null")?;
-    let bob_ref = recovered_object_ref_field(&root_winner.record_bytes, 2, 1)?
+    let bob_ref = recovered_object_ref_field(&root_winner.record_bytes, 3, 1)?
         .context("recovered Bank bob field was null")?;
+    let note_ref = recovered_object_ref_field(&root_winner.record_bytes, 3, 2)?
+        .context("recovered Bank note field was null")?;
     ensure!(
         alice_ref != bob_ref,
         "alice and bob should be distinct accounts"
@@ -265,6 +267,13 @@ fn kotlin_rewritten_bank_executes_and_recovers_file_backed_roots() -> Result<()>
         .iter()
         .find(|winner| winner.object_id == bob_ref)
         .context("recovered bob ObjectId did not have an Account record")?;
+    ensure!(
+        recovered
+            .object_winners
+            .iter()
+            .any(|winner| winner.object_id == note_ref),
+        "recovered note ObjectId did not have a persistent object record"
+    );
     ensure!(
         recovered_object_i64_field(&alice.record_bytes, 1, 0)? == 900,
         "alice balance was not recovered after transfer"

@@ -1,6 +1,13 @@
 {
   "version": 1,
   "module": "transaction-kotlin-bank",
+  "gcWasm": {
+    "capture": "allModuleGcTypes",
+    "denyTypes": [
+      "kotlin.coroutines.*",
+      "kotlin.Throwable"
+    ]
+  },
   "persistentTypes": [
     {
       "name": "Account",
@@ -14,7 +21,8 @@
       "kind": "struct",
       "fields": [
         { "name": "alice", "kind": "ref", "type": "Account", "nullable": true },
-        { "name": "bob", "kind": "ref", "type": "Account", "nullable": true }
+        { "name": "bob", "kind": "ref", "type": "Account", "nullable": true },
+        { "name": "note", "kind": "ref", "type": "kotlin.String", "nullable": true }
       ]
     }
   ],
