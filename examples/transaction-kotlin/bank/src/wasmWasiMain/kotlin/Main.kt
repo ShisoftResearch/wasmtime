@@ -17,7 +17,7 @@ class Bank(
 )
 
 @TxnFunc
-fun transfer(bank: Bank, fromAlice: Boolean, amount: Long) {
+fun transfer(bank: Bank, fromAlice: Boolean, amount: Long, note: String) {
     if (fromAlice) {
         bank.alice.balance -= amount
         bank.bob.balance += amount
@@ -25,6 +25,7 @@ fun transfer(bank: Bank, fromAlice: Boolean, amount: Long) {
         bank.bob.balance -= amount
         bank.alice.balance += amount
     }
+    bank.note = note
 }
 
 @TxnFunc
@@ -38,6 +39,6 @@ fun main() {
     transaction {
         installFreshBank(1_000, 200, note.get())
         val bank = root<Bank>("bank")
-        transfer(bank, true, 100)
+        transfer(bank, true, 100, note.get())
     }
 }

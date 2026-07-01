@@ -5,7 +5,8 @@
     "capture": "allModuleGcTypes",
     "denyTypes": [
       "kotlin.coroutines.*",
-      "kotlin.Throwable"
+      "kotlin.Throwable",
+      "kotlin.io.File"
     ]
   },
   "persistentTypes": [
@@ -26,6 +27,7 @@
       ]
     }
   ],
+  "copyableTypes": [],
   "transactionFunctions": [
     "transfer",
     "installFreshBank"
