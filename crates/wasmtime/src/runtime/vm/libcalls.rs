@@ -1171,22 +1171,14 @@ fn transaction_tglobal_set_impl(
         let normalized = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
         let promoted_snapshot = {
             let store = store.store_opaque_mut();
-            let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
-            match normalized {
-                ObjectValue::Ref(Some(object_id)) => {
-                    let handle = object_table.transaction_ref_handle_for_object_id_avoiding(
-                        object_id,
-                        |raw| live_ref_raw_is_registered(&*durable_refs, raw),
-                    )?;
-                    GlobalSnapshot::GcRef(handle)
-                }
-                ObjectValue::Ref(None) => GlobalSnapshot::GcRef(0),
-                ObjectValue::I31(value) => GlobalSnapshot::GcRef(
-                    u32::try_from(ObjectTable::encode_raw_i31_ref(value))
-                        .context("transactional global i31 reference does not fit u32")?,
-                ),
-                _ => bail!("transactional global GC reference did not normalize to a GC reference"),
-            }
+            let (durable_refs, object_table) =
+                store.transaction_durable_refs_and_object_table_mut();
+            GlobalSnapshot::GcRef(gc_snapshot_raw_from_object_value(
+                &*durable_refs,
+                object_table,
+                normalized,
+                "transactional global GC reference",
+            )?)
         };
         store
             .store_opaque_mut()
@@ -1790,21 +1782,43 @@ fn normalize_persistent_table_snapshot(
         u64::from(gc_ref),
         OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
     )?;
-    match object_value_from_persistent_slot_abi(store, abi)? {
-        ObjectValue::Ref(Some(object_id)) => {
-            let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
-            let handle = object_table.transaction_ref_handle_for_object_id_avoiding(
-                object_id,
-                |raw| live_ref_raw_is_registered(&*durable_refs, raw),
-            )?;
-            Ok(TableElementSnapshot::GcRef(handle))
-        }
-        ObjectValue::Ref(None) => Ok(TableElementSnapshot::GcRef(0)),
-        ObjectValue::I31(value) => Ok(TableElementSnapshot::GcRef(
-            u32::try_from(ObjectTable::encode_raw_i31_ref(value))
-                .context("transactional table i31 reference does not fit u32")?,
-        )),
-        _ => bail!("transactional table GC reference did not normalize to a GC reference"),
+    let value = object_value_from_persistent_slot_abi(store, abi)?;
+    let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
+    Ok(TableElementSnapshot::GcRef(
+        gc_snapshot_raw_from_object_value(
+            &*durable_refs,
+            object_table,
+            value,
+            "transactional table GC reference",
+        )?,
+    ))
+}
+
+fn gc_snapshot_raw_from_object_value(
+    durable_refs: &DurableReferenceRegistry,
+    object_table: &mut ObjectTable,
+    value: ObjectValue,
+    context: &str,
+) -> Result<u32> {
+    match value {
+        ObjectValue::Ref(Some(object_id)) => object_table
+            .transaction_ref_handle_for_object_id_avoiding(object_id, |raw| {
+                live_ref_raw_is_registered(durable_refs, raw)
+            }),
+        ObjectValue::Ref(None) => Ok(0),
+        ObjectValue::I31(value) => u32::try_from(ObjectTable::encode_raw_i31_ref(value))
+            .with_context(|| format!("{context} i31 reference does not fit u32")),
+        ObjectValue::ExternRef(identity) => durable_refs
+            .resolve_extern_identity(identity)
+            .with_context(|| {
+                format!(
+                    "{context} durable external identity is not registered in this store: namespace={} handle={:#x} layout={}",
+                    identity.namespace,
+                    identity.handle,
+                    identity.type_layout_id.get()
+                )
+            }),
+        _ => bail!("{context} did not normalize to a GC reference"),
     }
 }
 
@@ -3147,15 +3161,26 @@ fn object_value_from_persistent_slot_abi(
     }
 
     let promoted = {
-        let mut adapter = StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
-        state.promote_gc_ref_for_live_transaction_ref_with_adapter(object_table, gc_ref, &mut adapter)?
+        let mut adapter =
+            StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
+        state.promote_gc_ref_for_live_transaction_ref_with_adapter(
+            object_table,
+            gc_ref,
+            &mut adapter,
+        )?
     };
 
-    promoted
-        .map(|object_id| ObjectValue::Ref(Some(object_id)))
-        .with_context(|| {
-            format!("ordinary live GC reference {gc_ref:#x} did not promote to a persistent object")
-        })
+    if let Some(object_id) = promoted {
+        return Ok(ObjectValue::Ref(Some(object_id)));
+    }
+    if let Some(value) =
+        live_object_ref_value_from_ambiguous_raw(durable_refs, object_table, gc_ref, false)?
+    {
+        return Ok(value);
+    }
+    bail!(
+        "ordinary live GC reference {gc_ref:#x} did not promote to a persistent object or durable leaf"
+    )
 }
 
 fn live_transaction_abi_from_object_value(
@@ -5355,6 +5380,56 @@ mod tests {
                 0x6200,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
             )
+        );
+    }
+
+    #[test]
+    fn persistent_slot_gc_snapshot_preserves_registered_extern_ref() {
+        let extern_identity = crate::runtime::transaction::DurableExternIdentity {
+            namespace: 0x4558,
+            handle: 0x4558_5445_5854_0002,
+            type_layout_id: crate::runtime::transaction::type_layout::TypeLayoutId::BUILTIN_EXTERN,
+        };
+        let mut durable_refs = DurableReferenceRegistry::default();
+        durable_refs
+            .register_extern_ref(0x5202, extern_identity)
+            .unwrap();
+        let mut objects = ObjectTable::default();
+
+        assert_eq!(
+            gc_snapshot_raw_from_object_value(
+                &durable_refs,
+                &mut objects,
+                ObjectValue::ExternRef(extern_identity),
+                "test GC reference"
+            )
+            .unwrap(),
+            0x5202
+        );
+    }
+
+    #[test]
+    fn persistent_slot_gc_snapshot_rejects_unregistered_extern_ref() {
+        let extern_identity = crate::runtime::transaction::DurableExternIdentity {
+            namespace: 0x4558,
+            handle: 0x4558_5445_5854_0003,
+            type_layout_id: crate::runtime::transaction::type_layout::TypeLayoutId::BUILTIN_EXTERN,
+        };
+        let durable_refs = DurableReferenceRegistry::default();
+        let mut objects = ObjectTable::default();
+
+        let error = gc_snapshot_raw_from_object_value(
+            &durable_refs,
+            &mut objects,
+            ObjectValue::ExternRef(extern_identity),
+            "test GC reference",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durable external identity is not registered"),
+            "{error:?}"
         );
     }
 
