@@ -19,11 +19,11 @@ types usable inside transactions.
   struct field, or persistent array element.
 - Preserve usability by allowing values to be prepared outside a transaction and
   consumed inside a transaction.
-- Keep the real graph copy deferred to the existing commit-time promotion path.
+- Keep the real graph copy deferred until a persistent write or commit boundary.
 - Give Kotlin code a distinct outside-transaction type for persistent-bound
   ordinary references.
 - Give the rewriter a copyability capability so only safe value graphs can be
-  copied into persistent storage at commit.
+  copied into persistent storage.
 - Reject accidental ordinary WasmGC captures during the `twasm-kotlin rewrite`
   step before execution.
 - Allow the same explicit reference to be used multiple times, preserving aliasing
@@ -39,7 +39,7 @@ types usable inside transactions.
   transactions.
 - Do not treat Java `java.io.Serializable` or kotlinx serialization as the
   source of truth. The transaction system defines its own copyability capability
-  because Kotlin/Wasm persistence is about commit-time graph copying, not byte
+  because Kotlin/Wasm persistence is about persistent graph copying, not byte
   serialization.
 
 ## Kotlin API
@@ -67,10 +67,10 @@ persistent state later. It does not clone immediately. `TxRef.get()` is the
 explicit boundary operation used inside a transaction.
 
 `@TxCopyable` marks user-defined DTO classes that do not have persistent
-identity but whose reachable value graph may be copied into persistent storage
-during commit. `@Persistent` implies `TxCopyable`: persistent classes are
-identity-bearing persistent types, but their values are also valid copyable
-payloads when they cross an explicit `TxRef` boundary.
+identity but whose reachable value graph may be copied into persistent storage.
+`@Persistent` implies `TxCopyable`: persistent classes are identity-bearing
+persistent types, but their values are also valid copyable payloads when they
+cross an explicit `TxRef` boundary.
 
 `TxRef<T>` is reusable. Multiple calls to `get()` from the same `TxRef` are valid.
 If the same underlying ordinary object graph enters a transaction more than once,
@@ -183,15 +183,39 @@ type-checking boundary.
 ## Runtime Behavior
 
 The runtime promotion path remains responsible for the actual graph copy. The
-main semantic change is that runtime promotion is no longer a user-visible
-implicit conversion. It is only reachable through code the rewriter accepted as
-explicitly marked by `TxRef.get()` or already-persistent values, and whose type
-graph is copyable.
+runtime does not check whether a live GC reference came from `TxRef.get()`;
+explicitness is enforced only by the rewriter. Once a live GC reference reaches a
+persistent runtime boundary, the runtime handles it according to its normal
+promotion rules.
 
-No immediate clone occurs at `make_txn_ref` or `TxRef.get()`. The existing
-promotion maps continue to preserve repeated-source aliasing within a transaction.
+No immediate clone occurs at `make_txn_ref` or `TxRef.get()`. Copying happens
+when an accepted value actually crosses into persistent storage. This can happen
+at commit for ordinary object graphs that are reachable from a persistent root,
+or earlier inside a transaction when assigning into an existing persistent
+object through `tstruct.set` or `tarray.set`.
+
+For ref-typed persistent field and array writes, `tstruct.set` and `tarray.set`
+must treat an ordinary live WasmGC reference as a promotion source:
+
+```text
+tstruct.set/tarray.set persistent_ref_slot = live_ref
+  null or i31              -> store directly as the current ref leaf
+  transaction object handle -> store the referenced ObjectId
+  existing live bridge     -> store or promote the bridged ObjectId as needed
+  ordinary WasmGC ref      -> promote the ordinary graph, then store the promoted ObjectId
+```
+
+Promotion must reuse the existing transaction promotion maps. In particular,
+before promoting an ordinary WasmGC reference, the runtime must check whether the
+same raw WasmGC reference already appears in `TransactionState.promoted_gc_refs`.
+If it does, the write stores the existing promoted `ObjectId`. If it does not,
+the runtime promotes the graph, records the raw WasmGC reference in
+`promoted_gc_refs`, and stores the new promoted `ObjectId`. This preserves
+aliasing when the same `TxRef` or transaction-local object graph is written into
+multiple persistent fields or array elements.
+
 For a `@TxCopyable` DTO, the DTO graph is copied as value data. For references to
-`@Persistent` objects inside that DTO graph, commit records references to the
+`@Persistent` objects inside that DTO graph, promotion records references to the
 persistent identity rather than inventing DTO identity for the referenced object.
 
 ## Reference Kotlin Example
@@ -275,8 +299,8 @@ fun publishNote(bank: Bank, alice: Account) {
 }
 ```
 
-`TransferNote` is copied at commit. `TransferNote.source` remains a reference to
-the persistent `Account` identity.
+`TransferNote` is copied when promoted. `TransferNote.source` remains a
+reference to the persistent `Account` identity.
 
 The sidecar for this example must include the `Bank.note` field and enable
 `gcWasm.capture = "allModuleGcTypes"` so `kotlin.String` and its reachable Kotlin
@@ -292,6 +316,12 @@ Add focused tests for the rewriter and runtime path:
   references inside it.
 - Accept using the same `TxRef` twice in one persistent graph and verify recovered
   references alias the same promoted object.
+- Accept assigning the same `TxRef.get()` result into two persistent fields or
+  array elements through `tstruct.set` or `tarray.set`, and verify both slots
+  store the same promoted `ObjectId`.
+- Verify runtime promotion for persistent writes reuses
+  `TransactionState.promoted_gc_refs` instead of repeatedly promoting the same
+  raw WasmGC reference.
 - Reject a direct outside string passed into a persistent field.
 - Reject a direct ordinary list or map passed into a persistent field.
 - Reject `TxRef.get()` into persistent state when the wrapped DTO reaches a
