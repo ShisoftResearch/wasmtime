@@ -132,6 +132,7 @@ impl RefProvenance {
 struct StackValue {
     type_index: Option<u32>,
     provenance: RefProvenance,
+    param_source: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,11 +148,19 @@ struct ProvenanceControlFrame {
     then_locals: Option<Vec<StackValue>>,
 }
 
+enum BoundaryValidation<'a> {
+    Enforce,
+    Infer {
+        required_params: &'a mut BTreeSet<u32>,
+    },
+}
+
 impl StackValue {
     fn non_ref() -> Self {
         Self {
             type_index: None,
             provenance: RefProvenance::NonRef,
+            param_source: None,
         }
     }
 
@@ -159,7 +168,15 @@ impl StackValue {
         Self {
             type_index,
             provenance,
+            param_source: None,
         }
+    }
+
+    fn with_param_source(mut self, param_index: u32) -> Self {
+        if self.provenance != RefProvenance::NonRef {
+            self.param_source = Some(param_index);
+        }
+        self
     }
 }
 
@@ -368,6 +385,7 @@ pub fn rewrite_kotlin_module(
     let mut object_rewrite_function_indices = transaction_call_closure_function_indices.clone();
     object_rewrite_function_indices.extend(persistent_accessor_function_indices.iter().copied());
     let txref_get_function_indices = txref_get_function_indices(input)?;
+    let constructor_function_indices = kotlin_constructor_function_indices(input)?;
     for index in &txref_get_function_indices {
         object_rewrite_function_indices.remove(index);
     }
@@ -412,6 +430,19 @@ pub fn rewrite_kotlin_module(
             .map(|index| index_remapper.remap_function_index(*index))
             .collect::<Result<Vec<_>>>()?,
     );
+    let txref_param_requirements = infer_txref_param_requirements(
+        input,
+        imported_function_count,
+        &defined_function_types,
+        &func_type_params,
+        &object_rewrite_function_indices,
+        &function_signatures,
+        &gc_type_info,
+        &root_lowering,
+        &txref_get_function_indices,
+        &constructor_function_indices,
+        &marker_literals,
+    )?;
 
     let mut report = KotlinRewriteReport {
         transaction_functions: sidecar.transaction_functions.clone(),
@@ -425,6 +456,7 @@ pub fn rewrite_kotlin_module(
     let mut module = Module::new();
     let mut next_defined_func = 0u32;
     let mut emitted_global_section = false;
+    let empty_param_requirements = BTreeSet::new();
 
     for payload in Parser::new(0).parse_all(input) {
         let payload = payload.context("failed to parse Kotlin rewrite wasm payload")?;
@@ -555,6 +587,11 @@ pub fn rewrite_kotlin_module(
                         &params,
                         &function_signatures,
                         &txref_get_function_indices,
+                        &constructor_function_indices,
+                        txref_param_requirements
+                            .get(&function_index)
+                            .unwrap_or(&empty_param_requirements),
+                        &txref_param_requirements,
                         &marker_literals,
                         &mut report,
                     )?;
@@ -605,6 +642,9 @@ fn rewrite_function_body(
     params: &[ParserValType],
     function_signatures: &BTreeMap<u32, FunctionSignature>,
     txref_get_function_indices: &BTreeSet<u32>,
+    constructor_function_indices: &BTreeSet<u32>,
+    current_param_requirements: &BTreeSet<u32>,
+    txref_param_requirements: &BTreeMap<u32, BTreeSet<u32>>,
     marker_literals: &KotlinMarkerLiterals,
     report: &mut KotlinRewriteReport,
 ) -> Result<Function> {
@@ -615,11 +655,13 @@ fn rewrite_function_body(
         local_decls_with_temps(&mut type_reencoder, body, &local_types, required_temps)?;
     let mut function = Function::new(local_decls);
     let mut value_stack = Vec::new();
-    let mut local_values = local_types
-        .iter()
-        .copied()
-        .map(|ty| stack_value_for_type(ty, gc_type_info))
-        .collect::<Vec<_>>();
+    let mut local_values = initial_local_values(
+        &local_types,
+        params.len(),
+        gc_type_info,
+        current_param_requirements,
+        false,
+    );
     let mut control_frames = Vec::new();
     let mut reader = body.get_operators_reader()?;
     let mut operators = Vec::new();
@@ -638,7 +680,8 @@ fn rewrite_function_body(
                     .get(marker.value_local as usize)
                     .copied()
                     .unwrap_or_else(StackValue::non_ref);
-                validate_root_value_boundary(root, value, gc_type_info)?;
+                let mut validation = BoundaryValidation::Enforce;
+                validate_root_value_boundary(root, value, gc_type_info, &mut validation)?;
                 let unit_getter = root_lowering
                     .unit_getter_func
                     .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
@@ -683,7 +726,8 @@ fn rewrite_function_body(
             }
             if let Some(root) = root_lowering.set_imports.get(&function_index) {
                 let value = value_stack.pop().unwrap_or_else(StackValue::non_ref);
-                validate_root_value_boundary(root, value, gc_type_info)?;
+                let mut validation = BoundaryValidation::Enforce;
+                validate_root_value_boundary(root, value, gc_type_info, &mut validation)?;
                 if let Some(type_index) = value.type_index
                     && type_index != root.type_index
                 {
@@ -711,6 +755,8 @@ fn rewrite_function_body(
                     gc_type_info,
                     &mut value_stack,
                     RefProvenance::TxnRefAllowed,
+                    None,
+                    constructor_function_indices,
                 );
                 function
                     .instruction(&index_remapper.instruction(Operator::Call { function_index })?);
@@ -723,7 +769,21 @@ fn rewrite_function_body(
             value_stack.pop().and_then(|value| value.type_index)
         } else {
             if rewrite_object_ops {
-                validate_persistent_boundaries_for_operator(&op, gc_type_info, &value_stack)?;
+                let mut validation = BoundaryValidation::Enforce;
+                validate_call_param_requirements(
+                    &op,
+                    gc_type_info,
+                    &value_stack,
+                    function_signatures,
+                    txref_param_requirements,
+                    &mut validation,
+                )?;
+                validate_persistent_boundaries_for_operator(
+                    &op,
+                    gc_type_info,
+                    &value_stack,
+                    &mut validation,
+                )?;
             }
             update_value_stack_for_operator(
                 &op,
@@ -731,6 +791,7 @@ fn rewrite_function_body(
                 &mut local_values,
                 &mut control_frames,
                 function_signatures,
+                constructor_function_indices,
                 gc_type_info,
                 &mut value_stack,
             );
@@ -883,6 +944,35 @@ fn local_types(
         }
     }
     Ok(locals)
+}
+
+fn initial_local_values(
+    local_types: &[ParserValType],
+    param_count: usize,
+    gc_type_info: &GcTypeInfo,
+    required_params: &BTreeSet<u32>,
+    track_param_sources: bool,
+) -> Vec<StackValue> {
+    local_types
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, ty)| {
+            let mut value = stack_value_for_type(ty, gc_type_info);
+            if index < param_count {
+                let param_index = u32::try_from(index).unwrap_or(u32::MAX);
+                if required_params.contains(&param_index)
+                    && value.provenance != RefProvenance::NonRef
+                {
+                    value.provenance = RefProvenance::TxnRefAllowed;
+                }
+                if track_param_sources {
+                    value = value.with_param_source(param_index);
+                }
+            }
+            value
+        })
+        .collect()
 }
 
 fn required_temps(
@@ -1204,11 +1294,15 @@ fn validate_persistent_boundaries_for_operator(
     op: &Operator<'_>,
     gc_type_info: &GcTypeInfo,
     value_stack: &[StackValue],
+    validation: &mut BoundaryValidation<'_>,
 ) -> Result<()> {
     match op {
-        Operator::StructNew { struct_type_index } => {
-            validate_struct_constructor_boundary(*struct_type_index, gc_type_info, value_stack)
-        }
+        Operator::StructNew { struct_type_index } => validate_struct_constructor_boundary(
+            *struct_type_index,
+            gc_type_info,
+            value_stack,
+            validation,
+        ),
         Operator::StructSet {
             struct_type_index,
             field_index,
@@ -1220,6 +1314,7 @@ fn validate_persistent_boundaries_for_operator(
                 .copied()
                 .unwrap_or_else(StackValue::non_ref),
             gc_type_info,
+            validation,
         ),
         Operator::ArrayNew { array_type_index } => {
             let value = value_stack
@@ -1228,7 +1323,12 @@ fn validate_persistent_boundaries_for_operator(
                 .nth(1)
                 .copied()
                 .unwrap_or_else(StackValue::non_ref);
-            validate_array_element_value_boundary(*array_type_index, value, gc_type_info)
+            validate_array_element_value_boundary(
+                *array_type_index,
+                value,
+                gc_type_info,
+                validation,
+            )
         }
         Operator::ArrayNewFixed {
             array_type_index,
@@ -1240,7 +1340,12 @@ fn validate_persistent_boundaries_for_operator(
             let array_size =
                 usize::try_from(*array_size).context("Kotlin rewrite array size overflow")?;
             for value in value_stack.iter().rev().take(array_size).copied() {
-                validate_array_element_value_boundary(*array_type_index, value, gc_type_info)?;
+                validate_array_element_value_boundary(
+                    *array_type_index,
+                    value,
+                    gc_type_info,
+                    validation,
+                )?;
             }
             Ok(())
         }
@@ -1249,7 +1354,12 @@ fn validate_persistent_boundaries_for_operator(
                 .last()
                 .copied()
                 .unwrap_or_else(StackValue::non_ref);
-            validate_array_element_value_boundary(*array_type_index, value, gc_type_info)
+            validate_array_element_value_boundary(
+                *array_type_index,
+                value,
+                gc_type_info,
+                validation,
+            )
         }
         Operator::ArrayFill { array_type_index } => {
             let value = value_stack
@@ -1258,10 +1368,62 @@ fn validate_persistent_boundaries_for_operator(
                 .nth(1)
                 .copied()
                 .unwrap_or_else(StackValue::non_ref);
-            validate_array_element_value_boundary(*array_type_index, value, gc_type_info)
+            validate_array_element_value_boundary(
+                *array_type_index,
+                value,
+                gc_type_info,
+                validation,
+            )
         }
         _ => Ok(()),
     }
+}
+
+fn validate_call_param_requirements(
+    op: &Operator<'_>,
+    gc_type_info: &GcTypeInfo,
+    value_stack: &[StackValue],
+    function_signatures: &BTreeMap<u32, FunctionSignature>,
+    txref_param_requirements: &BTreeMap<u32, BTreeSet<u32>>,
+    validation: &mut BoundaryValidation<'_>,
+) -> Result<()> {
+    let Operator::Call { function_index } = op else {
+        return Ok(());
+    };
+    let Some(required_params) = txref_param_requirements.get(function_index) else {
+        return Ok(());
+    };
+    if required_params.is_empty() {
+        return Ok(());
+    }
+    let signature = function_signatures
+        .get(function_index)
+        .with_context(|| format!("missing Kotlin rewrite function signature {function_index}"))?;
+    let arg_start = value_stack
+        .len()
+        .checked_sub(signature.params.len())
+        .context("Kotlin rewrite call stack underflow")?;
+    for param_index in required_params {
+        let param_index =
+            usize::try_from(*param_index).context("Kotlin rewrite parameter index overflow")?;
+        let value = value_stack
+            .get(arg_start + param_index)
+            .copied()
+            .unwrap_or_else(StackValue::non_ref);
+        let expected_type_index = signature
+            .params
+            .get(param_index)
+            .copied()
+            .and_then(module_ref_type_index);
+        validate_ref_value_boundary(
+            &format!("call to function {function_index} parameter {param_index}"),
+            value,
+            expected_type_index,
+            gc_type_info,
+            validation,
+        )?;
+    }
+    Ok(())
 }
 
 fn update_value_stack_for_operator(
@@ -1270,6 +1432,7 @@ fn update_value_stack_for_operator(
     local_values: &mut Vec<StackValue>,
     control_frames: &mut Vec<ProvenanceControlFrame>,
     function_signatures: &BTreeMap<u32, FunctionSignature>,
+    constructor_function_indices: &BTreeSet<u32>,
     gc_type_info: &GcTypeInfo,
     value_stack: &mut Vec<StackValue>,
 ) {
@@ -1481,19 +1644,21 @@ fn update_value_stack_for_operator(
                 gc_type_info,
                 value_stack,
                 RefProvenance::UnknownRef,
+                Some(*function_index),
+                constructor_function_indices,
             );
         }
-        Operator::Br { .. }
-        | Operator::BrIf { .. }
-        | Operator::BrTable { .. }
-        | Operator::Return
+        Operator::Br { .. } | Operator::BrIf { .. } | Operator::BrTable { .. } => {
+            invalidate_ref_locals(local_values, local_types, gc_type_info);
+            value_stack.clear();
+        }
+        Operator::Return
         | Operator::ReturnCall { .. }
         | Operator::ReturnCallIndirect { .. }
         | Operator::Unreachable
         | Operator::Throw { .. }
         | Operator::Rethrow { .. }
         | Operator::ThrowRef => {
-            invalidate_ref_locals(local_values, local_types, gc_type_info);
             value_stack.clear();
         }
         _ => {
@@ -1584,16 +1749,48 @@ fn update_stack_for_call(
     gc_type_info: &GcTypeInfo,
     value_stack: &mut Vec<StackValue>,
     ref_result_provenance: RefProvenance,
+    function_index: Option<u32>,
+    constructor_function_indices: &BTreeSet<u32>,
 ) {
     let Some(signature) = signature else {
         value_stack.clear();
         return;
     };
+    let args = value_stack
+        .len()
+        .checked_sub(signature.params.len())
+        .map(|start| value_stack[start..].to_vec())
+        .unwrap_or_default();
     pop_n(value_stack, signature.params.len());
     for result in &signature.results {
         let mut value = stack_value_for_type(*result, gc_type_info);
         if value.provenance != RefProvenance::NonRef {
             value.provenance = ref_result_provenance;
+            if function_index.is_some_and(|index| constructor_function_indices.contains(&index)) {
+                if let Some(type_index) = value.type_index {
+                    if let Some((receiver_index, _)) = signature
+                        .params
+                        .iter()
+                        .enumerate()
+                        .find(|(_, param)| module_ref_type_index(**param) == Some(type_index))
+                    {
+                        if let Some(receiver) = args.get(receiver_index) {
+                            if matches!(
+                                receiver.provenance,
+                                RefProvenance::PersistentRef
+                                    | RefProvenance::TxnRefAllowed
+                                    | RefProvenance::TxnLocalCopyable
+                            ) {
+                                value.provenance = receiver.provenance;
+                            } else if receiver.provenance == RefProvenance::NullRef
+                                && is_declared_copyable_constructor_type(gc_type_info, type_index)
+                            {
+                                value.provenance = RefProvenance::TxnLocalCopyable;
+                            }
+                        }
+                    }
+                }
+            }
         }
         value_stack.push(value);
     }
@@ -1603,12 +1800,14 @@ fn validate_root_value_boundary(
     root: &RootGlobal,
     value: StackValue,
     gc_type_info: &GcTypeInfo,
+    validation: &mut BoundaryValidation<'_>,
 ) -> Result<()> {
     validate_ref_value_boundary(
         &format!("persistent root {}", root.name),
         value,
         Some(root.type_index),
         gc_type_info,
+        validation,
     )
 }
 
@@ -1616,6 +1815,7 @@ fn validate_struct_constructor_boundary(
     struct_type_index: u32,
     gc_type_info: &GcTypeInfo,
     value_stack: &[StackValue],
+    validation: &mut BoundaryValidation<'_>,
 ) -> Result<()> {
     if !struct_requires_source_boundary(struct_type_index, gc_type_info) {
         return Ok(());
@@ -1644,6 +1844,7 @@ fn validate_struct_constructor_boundary(
                 value,
                 expected_type_index_for_field(field, gc_type_info),
                 gc_type_info,
+                validation,
             )?;
         }
     }
@@ -1655,6 +1856,7 @@ fn validate_struct_field_value_boundary(
     field_index: u32,
     value: StackValue,
     gc_type_info: &GcTypeInfo,
+    validation: &mut BoundaryValidation<'_>,
 ) -> Result<()> {
     let Some(field) =
         sidecar_struct_field_for_boundary(struct_type_index, field_index, gc_type_info)
@@ -1669,6 +1871,7 @@ fn validate_struct_field_value_boundary(
         value,
         expected_type_index_for_field(field, gc_type_info),
         gc_type_info,
+        validation,
     )
 }
 
@@ -1676,6 +1879,7 @@ fn validate_array_element_value_boundary(
     array_type_index: u32,
     value: StackValue,
     gc_type_info: &GcTypeInfo,
+    validation: &mut BoundaryValidation<'_>,
 ) -> Result<()> {
     let Some(element) = sidecar_array_element_for_boundary(array_type_index, gc_type_info) else {
         return Ok(());
@@ -1692,6 +1896,7 @@ fn validate_array_element_value_boundary(
         value,
         expected_type_index_for_field(element, gc_type_info),
         gc_type_info,
+        validation,
     )
 }
 
@@ -1700,8 +1905,13 @@ fn validate_ref_value_boundary(
     value: StackValue,
     expected_type_index: Option<u32>,
     gc_type_info: &GcTypeInfo,
+    validation: &mut BoundaryValidation<'_>,
 ) -> Result<()> {
+    let inference = matches!(validation, BoundaryValidation::Infer { .. });
     if value.provenance == RefProvenance::NonRef {
+        if inference {
+            return Ok(());
+        }
         if expected_type_index.is_some() {
             bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
         }
@@ -1711,16 +1921,33 @@ fn validate_ref_value_boundary(
         return Ok(());
     }
     let Some(type_index) = value.type_index.or(expected_type_index) else {
+        if inference {
+            return Ok(());
+        }
         bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
     };
     if value.provenance == RefProvenance::UnknownRef {
+        if inference {
+            return Ok(());
+        }
         bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
     }
-    ensure!(
-        is_copyable_type(gc_type_info, type_index),
-        "{context} references non-copyable GC type index {type_index}"
-    );
+    if !is_copyable_type(gc_type_info, type_index) {
+        if inference {
+            return Ok(());
+        }
+        bail!("{context} references non-copyable GC type index {type_index}");
+    }
     if !value.provenance.can_enter_persistent_value() {
+        if let BoundaryValidation::Infer { required_params } = validation
+            && let Some(param_index) = value.param_source
+        {
+            required_params.insert(param_index);
+            return Ok(());
+        }
+        if inference {
+            return Ok(());
+        }
         bail!("ordinary WasmGC reference enters {context} without make_txn_ref");
     }
     Ok(())
@@ -2350,6 +2577,215 @@ fn direct_local_call_edges(
     Ok(edges)
 }
 
+fn infer_txref_param_requirements(
+    input: &[u8],
+    imported_function_count: u32,
+    defined_function_types: &[u32],
+    func_type_params: &BTreeMap<u32, Vec<ParserValType>>,
+    object_rewrite_function_indices: &BTreeSet<u32>,
+    function_signatures: &BTreeMap<u32, FunctionSignature>,
+    gc_type_info: &GcTypeInfo,
+    root_lowering: &RootLowering,
+    txref_get_function_indices: &BTreeSet<u32>,
+    constructor_function_indices: &BTreeSet<u32>,
+    marker_literals: &KotlinMarkerLiterals,
+) -> Result<BTreeMap<u32, BTreeSet<u32>>> {
+    let mut requirements = BTreeMap::<u32, BTreeSet<u32>>::new();
+
+    loop {
+        let mut changed = false;
+        let mut next_defined_func = 0u32;
+
+        for payload in Parser::new(0).parse_all(input) {
+            match payload.context("failed to parse Kotlin TxRef requirement payload")? {
+                Payload::CodeSectionStart { range, .. } => {
+                    let body_bytes = input
+                        .get(range.start..range.end)
+                        .context("invalid Kotlin TxRef requirement code section range")?;
+                    let reader = BinaryReader::new(body_bytes, range.start);
+                    let section = CodeSectionReader::new(reader)?;
+
+                    for body in section {
+                        let body = body?;
+                        let function_index = imported_function_count
+                            .checked_add(next_defined_func)
+                            .context("Kotlin TxRef requirement function index overflow")?;
+                        if object_rewrite_function_indices.contains(&function_index) {
+                            let type_index = *defined_function_types
+                                .get(next_defined_func as usize)
+                                .context("missing Kotlin TxRef requirement function type index")?;
+                            let params = func_type_params
+                                .get(&type_index)
+                                .cloned()
+                                .context("missing Kotlin TxRef requirement function parameters")?;
+                            let current_requirements = requirements
+                                .get(&function_index)
+                                .cloned()
+                                .unwrap_or_default();
+                            let inferred = infer_function_body_txref_param_requirements(
+                                &body,
+                                &params,
+                                &current_requirements,
+                                &requirements,
+                                function_signatures,
+                                gc_type_info,
+                                root_lowering,
+                                txref_get_function_indices,
+                                constructor_function_indices,
+                                marker_literals,
+                            )?;
+                            let entry = requirements.entry(function_index).or_default();
+                            for param_index in inferred {
+                                changed |= entry.insert(param_index);
+                            }
+                        }
+                        next_defined_func += 1;
+                    }
+                }
+                Payload::CodeSectionEntry(_) => {}
+                _ => {}
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    Ok(requirements)
+}
+
+fn infer_function_body_txref_param_requirements(
+    body: &wasmparser::FunctionBody<'_>,
+    params: &[ParserValType],
+    current_param_requirements: &BTreeSet<u32>,
+    txref_param_requirements: &BTreeMap<u32, BTreeSet<u32>>,
+    function_signatures: &BTreeMap<u32, FunctionSignature>,
+    gc_type_info: &GcTypeInfo,
+    root_lowering: &RootLowering,
+    txref_get_function_indices: &BTreeSet<u32>,
+    constructor_function_indices: &BTreeSet<u32>,
+    marker_literals: &KotlinMarkerLiterals,
+) -> Result<BTreeSet<u32>> {
+    let local_types = local_types(body, params)?;
+    let mut local_values = initial_local_values(
+        &local_types,
+        params.len(),
+        gc_type_info,
+        current_param_requirements,
+        true,
+    );
+    let mut control_frames = Vec::new();
+    let mut value_stack = Vec::new();
+    let mut inferred = BTreeSet::new();
+    let mut reader = body.get_operators_reader()?;
+    let mut operators = Vec::new();
+    while !reader.eof() {
+        operators.push(reader.read()?);
+    }
+
+    let mut index = 0usize;
+    while index < operators.len() {
+        if let Some(marker) =
+            match_inline_set_root_marker(&operators, index, &local_types, marker_literals)?
+        {
+            if let Some(root) = root_for_marker_type(root_lowering, marker.type_index)? {
+                let value = local_values
+                    .get(marker.value_local as usize)
+                    .copied()
+                    .unwrap_or_else(StackValue::non_ref);
+                let mut validation = BoundaryValidation::Infer {
+                    required_params: &mut inferred,
+                };
+                validate_root_value_boundary(root, value, gc_type_info, &mut validation)?;
+                index = marker.next_index;
+                continue;
+            }
+        }
+
+        if let Some(marker) = match_inline_get_root_marker(&operators, index, marker_literals)?
+            && let Some(root) = root_for_marker_type(root_lowering, marker.type_index)?
+        {
+            value_stack.push(StackValue::ref_value(
+                Some(root.type_index),
+                RefProvenance::PersistentRef,
+            ));
+            index = marker.next_index;
+            continue;
+        }
+
+        let op = operators[index].clone();
+        if let Operator::Call { function_index } = op {
+            if let Some(root) = root_lowering.get_imports.get(&function_index) {
+                value_stack.push(StackValue::ref_value(
+                    Some(root.type_index),
+                    RefProvenance::PersistentRef,
+                ));
+                index += 1;
+                continue;
+            }
+            if let Some(root) = root_lowering.set_imports.get(&function_index) {
+                let value = value_stack.pop().unwrap_or_else(StackValue::non_ref);
+                let mut validation = BoundaryValidation::Infer {
+                    required_params: &mut inferred,
+                };
+                validate_root_value_boundary(root, value, gc_type_info, &mut validation)?;
+                value_stack.push(StackValue::non_ref());
+                index += 1;
+                continue;
+            }
+            if txref_get_function_indices.contains(&function_index) {
+                update_stack_for_call(
+                    function_signatures.get(&function_index),
+                    gc_type_info,
+                    &mut value_stack,
+                    RefProvenance::TxnRefAllowed,
+                    None,
+                    constructor_function_indices,
+                );
+                index += 1;
+                continue;
+            }
+        }
+
+        let is_array_len = matches!(op, Operator::ArrayLen);
+        if is_array_len {
+            value_stack.pop();
+        } else {
+            let mut validation = BoundaryValidation::Infer {
+                required_params: &mut inferred,
+            };
+            validate_call_param_requirements(
+                &op,
+                gc_type_info,
+                &value_stack,
+                function_signatures,
+                txref_param_requirements,
+                &mut validation,
+            )?;
+            validate_persistent_boundaries_for_operator(
+                &op,
+                gc_type_info,
+                &value_stack,
+                &mut validation,
+            )?;
+            update_value_stack_for_operator(
+                &op,
+                &local_types,
+                &mut local_values,
+                &mut control_frames,
+                function_signatures,
+                constructor_function_indices,
+                gc_type_info,
+                &mut value_stack,
+            );
+        }
+        index += 1;
+    }
+
+    Ok(inferred)
+}
+
 fn persistent_accessor_function_indices(
     input: &[u8],
     sidecar: &KotlinSidecar,
@@ -2492,6 +2928,10 @@ fn txref_get_function_indices(input: &[u8]) -> Result<BTreeSet<u32>> {
             || name.ends_with("TxRef.<get-value>")
             || (name.contains("TxRef") && name.ends_with(".get"))
     })
+}
+
+fn kotlin_constructor_function_indices(input: &[u8]) -> Result<BTreeSet<u32>> {
+    function_indices_by_name(input, |name| name.contains(".<init>"))
 }
 
 fn function_indices_by_name(

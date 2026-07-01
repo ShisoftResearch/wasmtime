@@ -482,6 +482,59 @@ fn rewrite_lowers_inline_root_markers_for_distinct_root_types() {
 }
 
 #[test]
+fn rewrite_preserves_persistent_constructor_result_for_inline_root_marker() {
+    let input = wat::parse_str(
+        r#"
+            (module
+              (type $Unit (struct))
+              (type $Bank (struct))
+              (tag $error)
+              (func (export "kotlin.Unit_getInstance") (result (ref null $Unit))
+                ref.null $Unit)
+              (func $"Bank.<init>" (param $this (ref null $Bank)) (result (ref null $Bank))
+                local.get $this
+                ref.is_null
+                if
+                  struct.new $Bank
+                  local.set $this
+                end
+                local.get $this)
+              (func (export "install") (result (ref null $Unit))
+                (local $bank (ref null $Bank))
+                ref.null none
+                call $"Bank.<init>"
+                local.set $bank
+                block (result (ref null $Unit))
+                  local.get $bank
+                  local.set $bank
+                  i32.const 658
+                  drop
+                  block
+                    throw $error
+                  end
+                  unreachable
+                end))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields("Bank", vec![])],
+        &["install"],
+        vec![KotlinRoot {
+            name: "bank".into(),
+            r#type: "Bank".into(),
+            nullable: true,
+        }],
+    );
+
+    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+    assert_valid_module(&output);
+
+    assert!(printed.contains("tglobal.set 0"), "{printed}");
+}
+
+#[test]
 fn rewrite_does_not_lower_non_marker_throw_blocks_with_shifted_literals() {
     let input = wat::parse_str(
         r#"
@@ -1274,6 +1327,91 @@ fn rewrite_accepts_txref_get_into_persistent_field_without_rewriting_constructor
     assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
     assert!(printed.contains("struct.new"), "{printed}");
     assert!(!printed.contains("tstruct.new"), "{printed}");
+}
+
+#[test]
+fn rewrite_accepts_txref_get_passed_to_helper_persistent_field() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $TxRefString (struct (field (mut (ref null $kotlin.String)))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (func $"twasm.TxRef.get"
+                (param $txref (ref $TxRefString))
+                (result (ref null $kotlin.String))
+            local.get $txref
+            struct.get $TxRefString 0)
+          (func $install
+                (param $note (ref null $kotlin.String))
+                (result (ref null $Bank))
+            local.get $note
+            struct.new $Bank)
+          (func (export "publish")
+                (param $txref (ref $TxRefString))
+                (result (ref null $Bank))
+            local.get $txref
+            call $"twasm.TxRef.get"
+            call $install))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_valid_module(&output);
+    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
+    assert!(printed.contains("call $install"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_ordinary_ref_passed_to_helper_persistent_field() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (global $source (ref null $kotlin.String)
+            ref.null $kotlin.String)
+          (func $install
+                (param $note (ref null $kotlin.String))
+                (result (ref null $Bank))
+            local.get $note
+            struct.new $Bank)
+          (func (export "publish") (result (ref null $Bank))
+            global.get $source
+            call $install))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("ordinary WasmGC reference enters call to function"),
+        "{err}"
+    );
 }
 
 #[test]
