@@ -1387,17 +1387,20 @@ fn validate_call_param_requirements(
     txref_param_requirements: &BTreeMap<u32, BTreeSet<u32>>,
     validation: &mut BoundaryValidation<'_>,
 ) -> Result<()> {
-    let Operator::Call { function_index } = op else {
-        return Ok(());
+    let function_index = match op {
+        Operator::Call { function_index } | Operator::ReturnCall { function_index } => {
+            *function_index
+        }
+        _ => return Ok(()),
     };
-    let Some(required_params) = txref_param_requirements.get(function_index) else {
+    let Some(required_params) = txref_param_requirements.get(&function_index) else {
         return Ok(());
     };
     if required_params.is_empty() {
         return Ok(());
     }
     let signature = function_signatures
-        .get(function_index)
+        .get(&function_index)
         .with_context(|| format!("missing Kotlin rewrite function signature {function_index}"))?;
     let arg_start = value_stack
         .len()
@@ -2025,10 +2028,11 @@ fn stack_value_for_read_field(
     };
     let mut value = stack_value_for_type(ty, gc_type_info);
     if value.provenance != RefProvenance::NonRef {
-        value.provenance = if receiver.provenance == RefProvenance::PersistentRef {
-            RefProvenance::PersistentRef
-        } else {
-            RefProvenance::OrdinaryRef
+        value.provenance = match receiver.provenance {
+            RefProvenance::PersistentRef => RefProvenance::PersistentRef,
+            RefProvenance::TxnRefAllowed => RefProvenance::TxnRefAllowed,
+            RefProvenance::TxnLocalCopyable => RefProvenance::TxnLocalCopyable,
+            _ => RefProvenance::OrdinaryRef,
         };
     }
     value
@@ -2094,10 +2098,7 @@ fn is_explicit_persistent_type(gc_type_info: &GcTypeInfo, type_index: u32) -> bo
 
 fn is_declared_copyable_constructor_type(gc_type_info: &GcTypeInfo, type_index: u32) -> bool {
     is_explicit_persistent_type(gc_type_info, type_index)
-        || gc_type_info
-            .copyable_type_indices
-            .values()
-            .any(|copyable_index| *copyable_index == type_index)
+        || is_copyable_type(gc_type_info, type_index)
 }
 
 fn type_name_for_index(type_index: u32, gc_type_info: &GcTypeInfo) -> Option<String> {
@@ -2560,9 +2561,12 @@ fn direct_local_call_edges(
                         .context("Kotlin rewrite function index overflow")?;
                     let mut reader = body.get_operators_reader()?;
                     while !reader.eof() {
-                        if let Operator::Call { function_index } = reader.read()?
-                            && function_index >= imported_function_count
-                        {
+                        let function_index = match reader.read()? {
+                            Operator::Call { function_index }
+                            | Operator::ReturnCall { function_index } => function_index,
+                            _ => continue,
+                        };
+                        if function_index >= imported_function_count {
                             edges.entry(caller).or_default().insert(function_index);
                         }
                     }
@@ -2610,7 +2614,9 @@ fn infer_txref_param_requirements(
                         let function_index = imported_function_count
                             .checked_add(next_defined_func)
                             .context("Kotlin TxRef requirement function index overflow")?;
-                        if object_rewrite_function_indices.contains(&function_index) {
+                        if object_rewrite_function_indices.contains(&function_index)
+                            || constructor_function_indices.contains(&function_index)
+                        {
                             let type_index = *defined_function_types
                                 .get(next_defined_func as usize)
                                 .context("missing Kotlin TxRef requirement function type index")?;
@@ -3436,6 +3442,8 @@ fn gc_type_info(input: &[u8], sidecar: &KotlinSidecar) -> Result<GcTypeInfo> {
     }
     for copyable_type in &sidecar.copyable_types {
         let type_index = info.copyable_type_indices[&copyable_type.name];
+        let persistent_like = copyable_as_persistent_type(copyable_type);
+        validate_persistent_type_shape(type_index, &persistent_like, &info)?;
         record_copyable_boundary_fields(type_index, copyable_type, &mut info)?;
     }
 
@@ -3807,13 +3815,17 @@ fn record_copyable_boundary_fields(
     copyable_type: &KotlinCopyableType,
     info: &mut GcTypeInfo,
 ) -> Result<()> {
-    let persistent_like = KotlinPersistentType {
+    let persistent_like = copyable_as_persistent_type(copyable_type);
+    record_sidecar_boundary_fields(type_index, &persistent_like, false, info)
+}
+
+fn copyable_as_persistent_type(copyable_type: &KotlinCopyableType) -> KotlinPersistentType {
+    KotlinPersistentType {
         name: copyable_type.name.clone(),
         kind: copyable_type.kind,
         fields: copyable_type.fields.clone(),
         element: copyable_type.element.clone(),
-    };
-    record_sidecar_boundary_fields(type_index, &persistent_like, false, info)
+    }
 }
 
 fn sidecar_struct_field_indices<'a>(

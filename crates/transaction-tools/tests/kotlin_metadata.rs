@@ -141,6 +141,62 @@ fn parses_copyable_types_and_sources() {
 }
 
 #[test]
+fn default_sidecar_accepts_builtin_copyable_ref_targets() {
+    let json = br#"{
+        "version": 1,
+        "module": "builtin-copyable-targets",
+        "persistentTypes": [
+            {
+                "name": "Bank",
+                "kind": "struct",
+                "fields": [
+                    {
+                        "name": "note",
+                        "kind": "ref",
+                        "type": "kotlin.String",
+                        "nullable": true
+                    }
+                ]
+            }
+        ],
+        "copyableTypes": [
+            {
+                "name": "Receipt",
+                "kind": "struct",
+                "fields": [
+                    {
+                        "name": "memo",
+                        "kind": "ref",
+                        "type": "kotlin.String",
+                        "nullable": true
+                    }
+                ]
+            }
+        ],
+        "transactionFunctions": ["transfer"],
+        "roots": [
+            {
+                "name": "bank",
+                "type": "Bank",
+                "nullable": true
+            }
+        ]
+    }"#;
+
+    let sidecar = parse_kotlin_sidecar(&json[..]).unwrap();
+
+    assert_eq!(sidecar.gc_wasm.capture, KotlinGcWasmCapture::SidecarTypes);
+    assert_eq!(
+        sidecar.persistent_types[0].fields[0].r#type.as_deref(),
+        Some("kotlin.String")
+    );
+    assert_eq!(
+        sidecar.copyable_types[0].fields[0].r#type.as_deref(),
+        Some("kotlin.String")
+    );
+}
+
+#[test]
 fn old_sidecars_default_to_sidecar_only_capture() {
     let json = br#"{
         "version": 1,

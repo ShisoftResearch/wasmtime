@@ -382,7 +382,10 @@ fn validate_field(
                 bail!("{context} is a ref but is missing a target type");
             };
 
-            if !allow_unknown_gc_types && !type_names.contains(target) {
+            if !allow_unknown_gc_types
+                && !type_names.contains(target)
+                && !is_builtin_copyable_type_name(target)
+            {
                 bail!("{context} references unknown {target_kind}: {target}");
             }
         }
@@ -394,4 +397,21 @@ fn validate_field(
     }
 
     Ok(())
+}
+
+fn is_builtin_copyable_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "kotlin.String"
+            | "String"
+            | "kotlin.Boolean"
+            | "kotlin.Byte"
+            | "kotlin.Short"
+            | "kotlin.Int"
+            | "kotlin.Long"
+            | "kotlin.Float"
+            | "kotlin.Double"
+            | "kotlin.Char"
+            | "kotlin.Unit"
+    )
 }
