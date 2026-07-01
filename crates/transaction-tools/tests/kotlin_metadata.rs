@@ -1,5 +1,6 @@
 use wasmtime_transaction_tools::kotlin_metadata::{
-    KotlinFieldKind, KotlinGcWasmCapture, KotlinPersistentKind, parse_kotlin_sidecar,
+    KotlinCopyableSource, KotlinFieldKind, KotlinGcWasmCapture, KotlinPersistentKind,
+    parse_kotlin_sidecar,
 };
 
 #[test]
@@ -71,6 +72,62 @@ fn parses_generic_wasmgc_capture_policy() {
 }
 
 #[test]
+fn parses_copyable_types_and_sources() {
+    let json = br#"{
+        "version": 1,
+        "module": "transaction-kotlin-bank",
+        "gcWasm": {
+            "capture": "allModuleGcTypes",
+            "denyTypes": []
+        },
+        "persistentTypes": [
+            {
+                "name": "Account",
+                "kind": "struct",
+                "fields": []
+            }
+        ],
+        "copyableTypes": [
+            {
+                "name": "TransferNote",
+                "kind": "struct",
+                "fields": [
+                    {
+                        "name": "text",
+                        "kind": "ref",
+                        "type": "kotlin.String",
+                        "nullable": false
+                    },
+                    {
+                        "name": "source",
+                        "kind": "ref",
+                        "type": "Account",
+                        "nullable": false
+                    }
+                ],
+                "source": "serializable"
+            }
+        ],
+        "transactionFunctions": ["transfer"],
+        "roots": [
+            {
+                "name": "bank",
+                "type": "Account",
+                "nullable": false
+            }
+        ]
+    }"#;
+
+    let sidecar = parse_kotlin_sidecar(&json[..]).unwrap();
+    assert_eq!(sidecar.persistent_types.len(), 1);
+    assert_eq!(sidecar.copyable_types.len(), 1);
+    assert_eq!(
+        sidecar.copyable_types[0].source,
+        KotlinCopyableSource::Serializable
+    );
+}
+
+#[test]
 fn old_sidecars_default_to_sidecar_only_capture() {
     let json = br#"{
         "version": 1,
@@ -127,6 +184,33 @@ fn rejects_duplicate_persistent_type_names() {
 
     let err = parse_kotlin_sidecar(&json[..]).unwrap_err().to_string();
     assert!(err.contains("duplicate persistent type name"));
+}
+
+#[test]
+fn rejects_copyable_types_that_are_already_persistent() {
+    let json = br#"{
+        "version": 1,
+        "module": "transaction-kotlin-bank",
+        "persistentTypes": [
+            {
+                "name": "Account",
+                "kind": "struct",
+                "fields": []
+            }
+        ],
+        "copyableTypes": [
+            {
+                "name": "Account",
+                "kind": "struct",
+                "fields": []
+            }
+        ],
+        "transactionFunctions": ["transfer"],
+        "roots": []
+    }"#;
+
+    let err = parse_kotlin_sidecar(&json[..]).unwrap_err().to_string();
+    assert!(err.contains("@Persistent already implies TxCopyable"));
 }
 
 #[test]

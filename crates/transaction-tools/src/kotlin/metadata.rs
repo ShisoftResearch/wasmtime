@@ -14,6 +14,8 @@ pub struct KotlinSidecar {
     #[serde(default)]
     pub gc_wasm: KotlinGcWasmPolicy,
     pub persistent_types: Vec<KotlinPersistentType>,
+    #[serde(default)]
+    pub copyable_types: Vec<KotlinCopyableType>,
     pub transaction_functions: Vec<String>,
     pub roots: Vec<KotlinRoot>,
 }
@@ -30,6 +32,7 @@ impl KotlinSidecar {
             module: module.into(),
             gc_wasm: KotlinGcWasmPolicy::default(),
             persistent_types,
+            copyable_types: Vec::new(),
             transaction_functions,
             roots,
         }
@@ -78,6 +81,34 @@ pub struct KotlinPersistentType {
     pub fields: Vec<KotlinField>,
     #[serde(default)]
     pub element: Option<KotlinField>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct KotlinCopyableType {
+    pub name: String,
+    pub kind: KotlinPersistentKind,
+    #[serde(default)]
+    pub fields: Vec<KotlinField>,
+    #[serde(default)]
+    pub element: Option<KotlinField>,
+    #[serde(default)]
+    pub source: KotlinCopyableSource,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KotlinCopyableSource {
+    TxCopyable,
+    Serializable,
+    Builtin,
+}
+
+impl Default for KotlinCopyableSource {
+    fn default() -> Self {
+        Self::TxCopyable
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,15 +171,33 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
         );
     }
 
-    let mut type_names = HashSet::with_capacity(sidecar.persistent_types.len());
+    let mut persistent_type_names = HashSet::with_capacity(sidecar.persistent_types.len());
     let allow_unknown_gc_types = sidecar.gc_wasm.capture == KotlinGcWasmCapture::AllModuleGcTypes;
     for persistent_type in &sidecar.persistent_types {
         if persistent_type.name.is_empty() {
             bail!("persistent type name must not be empty");
         }
 
-        if !type_names.insert(persistent_type.name.as_str()) {
+        if !persistent_type_names.insert(persistent_type.name.as_str()) {
             bail!("duplicate persistent type name: {}", persistent_type.name);
+        }
+    }
+
+    let mut copyable_type_names = HashSet::with_capacity(sidecar.copyable_types.len());
+    for copyable_type in &sidecar.copyable_types {
+        if copyable_type.name.is_empty() {
+            bail!("copyable type name must not be empty");
+        }
+
+        if persistent_type_names.contains(copyable_type.name.as_str()) {
+            bail!(
+                "copyable type {} is redundant: @Persistent already implies TxCopyable",
+                copyable_type.name
+            );
+        }
+
+        if !copyable_type_names.insert(copyable_type.name.as_str()) {
+            bail!("duplicate copyable type name: {}", copyable_type.name);
         }
     }
 
@@ -190,12 +239,13 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
                     }
                     validate_field(
                         field,
-                        &type_names,
+                        &persistent_type_names,
                         allow_unknown_gc_types,
                         format_args!(
                             "persistent type {} field {}",
                             persistent_type.name, field.name
                         ),
+                        "persistent type",
                     )?;
                 }
             }
@@ -222,9 +272,82 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
                 }
                 validate_field(
                     element,
-                    &type_names,
+                    &persistent_type_names,
                     allow_unknown_gc_types,
                     format_args!("persistent type {} element", persistent_type.name),
+                    "persistent type",
+                )?;
+            }
+        }
+    }
+
+    let copyable_ref_targets: HashSet<&str> = persistent_type_names
+        .iter()
+        .copied()
+        .chain(copyable_type_names.iter().copied())
+        .collect();
+
+    for copyable_type in &sidecar.copyable_types {
+        match copyable_type.kind {
+            KotlinPersistentKind::Struct => {
+                if copyable_type.element.is_some() {
+                    bail!(
+                        "struct copyable type {} must not define an element",
+                        copyable_type.name
+                    );
+                }
+
+                let mut field_names = HashSet::with_capacity(copyable_type.fields.len());
+                for field in &copyable_type.fields {
+                    if field.name.is_empty() {
+                        bail!(
+                            "field name in copyable type {} must not be empty",
+                            copyable_type.name
+                        );
+                    }
+                    if !field_names.insert(field.name.as_str()) {
+                        bail!(
+                            "duplicate field name {} in copyable type {}",
+                            field.name,
+                            copyable_type.name
+                        );
+                    }
+                    validate_field(
+                        field,
+                        &copyable_ref_targets,
+                        allow_unknown_gc_types,
+                        format_args!("copyable type {} field {}", copyable_type.name, field.name),
+                        "persistent or copyable type",
+                    )?;
+                }
+            }
+            KotlinPersistentKind::Array => {
+                if !copyable_type.fields.is_empty() {
+                    bail!(
+                        "array copyable type {} must not define fields",
+                        copyable_type.name
+                    );
+                }
+
+                let Some(element) = copyable_type.element.as_ref() else {
+                    bail!(
+                        "array copyable type {} must define an element",
+                        copyable_type.name
+                    );
+                };
+
+                if element.name.is_empty() {
+                    bail!(
+                        "array element name in copyable type {} must not be empty",
+                        copyable_type.name
+                    );
+                }
+                validate_field(
+                    element,
+                    &copyable_ref_targets,
+                    allow_unknown_gc_types,
+                    format_args!("copyable type {} element", copyable_type.name),
+                    "persistent or copyable type",
                 )?;
             }
         }
@@ -238,7 +361,7 @@ pub fn validate_kotlin_sidecar(sidecar: &KotlinSidecar) -> Result<()> {
         if !root_names.insert(root.name.as_str()) {
             bail!("duplicate root name: {}", root.name);
         }
-        if !allow_unknown_gc_types && !type_names.contains(root.r#type.as_str()) {
+        if !allow_unknown_gc_types && !persistent_type_names.contains(root.r#type.as_str()) {
             bail!("unknown root type {} for root {}", root.r#type, root.name);
         }
     }
@@ -251,6 +374,7 @@ fn validate_field(
     type_names: &HashSet<&str>,
     allow_unknown_gc_types: bool,
     context: impl std::fmt::Display,
+    target_kind: &str,
 ) -> Result<()> {
     match field.kind {
         KotlinFieldKind::Ref => {
@@ -259,7 +383,7 @@ fn validate_field(
             };
 
             if !allow_unknown_gc_types && !type_names.contains(target) {
-                bail!("{context} references unknown persistent type: {target}");
+                bail!("{context} references unknown {target_kind}: {target}");
             }
         }
         _ => {
