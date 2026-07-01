@@ -2034,6 +2034,7 @@ fn stack_value_for_read_field(
             RefProvenance::TxnLocalCopyable => RefProvenance::TxnLocalCopyable,
             _ => RefProvenance::OrdinaryRef,
         };
+        value.param_source = receiver.param_source;
     }
     value
 }
@@ -3941,11 +3942,9 @@ fn validate_ref_field(
         bail!("{context} references unknown persistent type: {target_name}");
     };
 
-    if !info.persistent.structs.contains(&actual_type_index)
-        && !info.persistent.arrays.contains(&actual_type_index)
-    {
+    if !is_copyable_type(info, actual_type_index) {
         bail!(
-            "{context} points at non-persistent GC type index {}",
+            "{context} points at non-copyable GC type index {}",
             actual_type_index
         );
     }

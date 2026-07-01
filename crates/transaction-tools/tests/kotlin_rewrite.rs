@@ -1426,6 +1426,63 @@ fn rewrite_rejects_ordinary_ref_passed_to_persistent_constructor_field() {
 }
 
 #[test]
+fn rewrite_rejects_constructor_field_read_from_ordinary_param() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $Wrapper (struct (field (mut (ref null $kotlin.String)))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (global $source (ref null $Wrapper)
+            ref.null $Wrapper)
+          (func $"Bank.<init>"
+                (param $this (ref null $Bank))
+                (param $wrapper (ref null $Wrapper))
+                (result (ref null $Bank))
+            local.get $this
+            ref.is_null
+            if
+              ref.null $kotlin.String
+              struct.new $Bank
+              local.set $this
+            end
+            local.get $this
+            local.get $wrapper
+            struct.get $Wrapper 0
+            struct.set $Bank 0
+            local.get $this)
+          (func (export "publish") (result (ref null $Bank))
+            ref.null none
+            global.get $source
+            call $"Bank.<init>"))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+    sidecar.copyable_types = vec![copyable_struct(
+        "Wrapper",
+        vec![nullable_ref_field("note", "kotlin.String")],
+    )];
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("ordinary WasmGC reference enters call to function"),
+        "{err}"
+    );
+}
+
+#[test]
 fn rewrite_rejects_ordinary_ref_passed_to_helper_persistent_field() {
     let input = wat::parse_str(
         r#"
@@ -1539,6 +1596,37 @@ fn rewrite_accepts_transaction_local_builtin_copyable_ref_into_persistent_field(
 }
 
 #[test]
+fn rewrite_accepts_default_sidecar_builtin_copyable_ref_target() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (func (export "publish") (result (ref null $Bank))
+            i32.const 7
+            struct.new $kotlin.String
+            struct.new $Bank))
+        "#,
+    )
+    .unwrap();
+    let sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_valid_module(&output);
+    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
+    assert!(printed.contains("struct.new $Bank"), "{printed}");
+}
+
+#[test]
 fn rewrite_rejects_transaction_local_noncopyable_ref_into_persistent_field() {
     let input = wat::parse_str(
         r#"
@@ -1567,7 +1655,7 @@ fn rewrite_rejects_transaction_local_noncopyable_ref_into_persistent_field() {
         .to_string();
 
     assert!(
-        err.contains("persistent field Bank.socket references non-copyable GC type index"),
+        err.contains("points at non-copyable GC type index"),
         "{err}"
     );
 }
@@ -2217,7 +2305,7 @@ fn rewrite_rejects_persistent_ref_to_non_persistent_gc_type() {
         .unwrap_err()
         .to_string();
 
-    assert!(err.contains("points at non-persistent GC type"), "{err}");
+    assert!(err.contains("points at non-copyable GC type"), "{err}");
 }
 
 #[test]
