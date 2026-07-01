@@ -1162,6 +1162,38 @@ fn transaction_tglobal_set_impl(
     let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = global_snapshot_from_tag(tag, value)?;
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
+    if let GlobalSnapshot::GcRef(gc_ref) = snapshot {
+        let abi = ObjectValueAbi::from_live_parts(
+            OBJECT_VALUE_ABI_TAG_REF,
+            u64::from(gc_ref),
+            OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
+        )?;
+        let normalized = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
+        let promoted_snapshot = {
+            let store = store.store_opaque_mut();
+            let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
+            match normalized {
+                ObjectValue::Ref(Some(object_id)) => {
+                    let handle = object_table.transaction_ref_handle_for_object_id_avoiding(
+                        object_id,
+                        |raw| live_ref_raw_is_registered(&*durable_refs, raw),
+                    )?;
+                    GlobalSnapshot::GcRef(handle)
+                }
+                ObjectValue::Ref(None) => GlobalSnapshot::GcRef(0),
+                ObjectValue::I31(value) => GlobalSnapshot::GcRef(
+                    u32::try_from(ObjectTable::encode_raw_i31_ref(value))
+                        .context("transactional global i31 reference does not fit u32")?,
+                ),
+                _ => bail!("transactional global GC reference did not normalize to a GC reference"),
+            }
+        };
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .stage_global_owned(Some(instance), global_index.as_u32(), promoted_snapshot)?;
+        return Ok(());
+    }
     store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -1746,6 +1778,36 @@ fn table_element_snapshot_from_raw(
     })
 }
 
+fn normalize_persistent_table_snapshot(
+    store: &mut StoreOpaque,
+    snapshot: TableElementSnapshot,
+) -> Result<TableElementSnapshot> {
+    let TableElementSnapshot::GcRef(gc_ref) = snapshot else {
+        return Ok(snapshot);
+    };
+    let abi = ObjectValueAbi::from_live_parts(
+        OBJECT_VALUE_ABI_TAG_REF,
+        u64::from(gc_ref),
+        OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
+    )?;
+    match object_value_from_persistent_slot_abi(store, abi)? {
+        ObjectValue::Ref(Some(object_id)) => {
+            let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
+            let handle = object_table.transaction_ref_handle_for_object_id_avoiding(
+                object_id,
+                |raw| live_ref_raw_is_registered(&*durable_refs, raw),
+            )?;
+            Ok(TableElementSnapshot::GcRef(handle))
+        }
+        ObjectValue::Ref(None) => Ok(TableElementSnapshot::GcRef(0)),
+        ObjectValue::I31(value) => Ok(TableElementSnapshot::GcRef(
+            u32::try_from(ObjectTable::encode_raw_i31_ref(value))
+                .context("transactional table i31 reference does not fit u32")?,
+        )),
+        _ => bail!("transactional table GC reference did not normalize to a GC reference"),
+    }
+}
+
 fn table_element_snapshot_to_raw(value: TableElementSnapshot) -> *mut u8 {
     match value {
         TableElementSnapshot::FuncRef(value) => core::ptr::with_exposed_provenance_mut(value),
@@ -1859,6 +1921,7 @@ fn transaction_ttable_set_impl(
         let table_ref = instance_ref.get_defined_table(table_index);
         table_element_snapshot_from_raw(table_ref.element_type(), value)?
     };
+    let snapshot = normalize_persistent_table_snapshot(store.store_opaque_mut(), snapshot)?;
 
     store
         .store_opaque_mut()
@@ -1990,6 +2053,7 @@ fn transaction_ttable_grow_impl(
         )
     };
     let init = table_element_snapshot_from_raw(element_type, init)?;
+    let init = normalize_persistent_table_snapshot(store.store_opaque_mut(), init)?;
     let current_size = store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -2173,11 +2237,10 @@ fn transaction_tstruct_set_impl(
     ensure_active_transaction(store)?;
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let field = usize::try_from(field).context("transactional struct field index overflow")?;
+    let value = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
     let store = store.store_opaque_mut();
-    let (durable_refs, state, object_table) =
-        store.transaction_durable_refs_state_and_object_table_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
     let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
-    let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
     state.stage_struct_field(object_table, object_id, field, value)
 }
 
@@ -2720,11 +2783,10 @@ fn transaction_tarray_set_impl(
     ensure!(gc_ref != 0, "null tarray reference");
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let index = usize::try_from(index).context("transactional array index overflow")?;
+    let value = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
     let store = store.store_opaque_mut();
-    let (durable_refs, state, object_table) =
-        store.transaction_durable_refs_state_and_object_table_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
     let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
-    let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
     state.stage_array_element(object_table, object_id, index, value)
 }
 
@@ -2758,12 +2820,11 @@ fn transaction_tarray_fill_impl(
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let index = usize::try_from(index).context("transactional array index overflow")?;
     let len = usize::try_from(len).context("transactional array length overflow")?;
+    let value = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
     let store = store.store_opaque_mut();
-    let (durable_refs, state, object_table) =
-        store.transaction_durable_refs_state_and_object_table_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
     ensure!(gc_ref != 0, "null tarray reference");
     let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
-    let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
     state.fill_array_range(object_table, object_id, index, len, value)
 }
 
@@ -3053,6 +3114,48 @@ fn object_value_from_transaction_abi(
         return abi.to_object_value();
     }
     live_ref_value_from_raw(durable_refs, object_table, high, low)
+}
+
+fn object_value_from_persistent_slot_abi(
+    store: &mut StoreOpaque,
+    abi: ObjectValueAbi,
+) -> Result<ObjectValue> {
+    let (tag, low, high) = abi.as_parts();
+    if tag != OBJECT_VALUE_ABI_TAG_REF {
+        return abi.to_object_value();
+    }
+
+    let (engine, gc_store, durable_refs, state, object_table) =
+        store.transaction_promotion_context_mut();
+
+    if high != OBJECT_VALUE_ABI_LIVE_REF_KIND_GC {
+        return live_ref_value_from_raw(durable_refs, object_table, high, low);
+    }
+
+    if low == 0 {
+        return Ok(ObjectValue::Ref(None));
+    }
+    if ObjectTable::is_raw_i31_ref(low) {
+        return Ok(ObjectValue::I31(ObjectTable::decode_raw_i31_ref(low)?));
+    }
+
+    let gc_ref = u32::try_from(low).context("live GC reference does not fit u32")?;
+    if let Some(value) =
+        live_object_ref_value_from_ambiguous_raw(durable_refs, object_table, gc_ref, false)?
+    {
+        return Ok(value);
+    }
+
+    let promoted = {
+        let mut adapter = StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
+        state.promote_gc_ref_for_live_transaction_ref_with_adapter(object_table, gc_ref, &mut adapter)?
+    };
+
+    promoted
+        .map(|object_id| ObjectValue::Ref(Some(object_id)))
+        .with_context(|| {
+            format!("ordinary live GC reference {gc_ref:#x} did not promote to a persistent object")
+        })
 }
 
 fn live_transaction_abi_from_object_value(

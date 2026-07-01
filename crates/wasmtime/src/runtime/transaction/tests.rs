@@ -14076,6 +14076,62 @@ mod persistent_promotion_commit {
     }
 
     #[test]
+    fn persistent_write_promotion_reuses_promoted_gc_ref() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let mut adapter = FakeOrdinaryGcPromotionAdapter::default().with_source(
+            0x950,
+            OrdinaryGcPromotionSource::Struct {
+                type_layout_id: type_layout::TypeLayoutId::DEFAULT_STRUCT,
+                fields: vec![OrdinaryGcPromotionValue::I64(950)],
+            },
+        );
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(950));
+
+        let first = state
+            .promote_gc_ref_for_live_transaction_ref_with_adapter(&mut objects, 0x950, &mut adapter)
+            .unwrap()
+            .unwrap();
+        let second = state
+            .promote_gc_ref_for_live_transaction_ref_with_adapter(&mut objects, 0x950, &mut adapter)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(state.promoted_gc_ref_for_test(0x950), Some(first));
+        assert!(objects.is_persistent(first).unwrap());
+        assert_eq!(
+            state.staged_object_payload_for_test(first).unwrap(),
+            &ObjectPayload::Struct(vec![ObjectValue::I64(950)])
+        );
+    }
+
+    #[test]
+    fn global_write_promotion_reuses_promoted_gc_ref() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let mut adapter = FakeOrdinaryGcPromotionAdapter::default().with_source(
+            0x952,
+            OrdinaryGcPromotionSource::Struct {
+                type_layout_id: type_layout::TypeLayoutId::DEFAULT_STRUCT,
+                fields: vec![OrdinaryGcPromotionValue::I64(952)],
+            },
+        );
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(952));
+
+        let promoted = state
+            .promote_gc_ref_for_live_transaction_ref_with_adapter(&mut objects, 0x952, &mut adapter)
+            .unwrap()
+            .unwrap();
+        state.stage_global(0, GlobalSnapshot::GcRef(0x952)).unwrap();
+        state
+            .promote_persistent_references_before_commit_with_adapter(&mut objects, &mut adapter)
+            .unwrap();
+
+        assert_eq!(state.promoted_gc_ref_for_test(0x952), Some(promoted));
+    }
+
+    #[test]
     fn adapter_promotion_rewrites_nested_refs_and_inline_i31_leaves() {
         clear_current_thread_transaction_for_test();
         let mut objects = ObjectTable::default();
