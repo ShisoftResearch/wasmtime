@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use wasmparser::{BinaryReader, ElementItems, ExternalKind, Parser, Payload, Validator};
 use wasmtime_transaction_tools::kotlin_metadata::{
-    KotlinField, KotlinFieldKind, KotlinPersistentKind, KotlinPersistentType, KotlinRoot,
-    KotlinSidecar, parse_kotlin_sidecar,
+    KotlinCopyableSource, KotlinCopyableType, KotlinField, KotlinFieldKind, KotlinGcWasmCapture,
+    KotlinPersistentKind, KotlinPersistentType, KotlinRoot, KotlinSidecar, parse_kotlin_sidecar,
 };
 use wasmtime_transaction_tools::kotlin_rewrite::rewrite_kotlin_module;
 
@@ -89,6 +89,20 @@ fn ref_field(name: &str, target: &str, nullable: bool) -> KotlinField {
         kind: KotlinFieldKind::Ref,
         r#type: Some(target.into()),
         nullable,
+    }
+}
+
+fn nullable_ref_field(name: &str, target: &str) -> KotlinField {
+    ref_field(name, target, true)
+}
+
+fn copyable_struct(name: &str, fields: Vec<KotlinField>) -> KotlinCopyableType {
+    KotlinCopyableType {
+        name: name.into(),
+        kind: KotlinPersistentKind::Struct,
+        fields,
+        element: None,
+        source: KotlinCopyableSource::TxCopyable,
     }
 }
 
@@ -1219,6 +1233,184 @@ fn rewrite_keeps_persistent_constructors_ordinary_until_promotion_boundary() {
     assert!(printed.contains("array.new"), "{printed}");
     assert!(!printed.contains("tstruct.new"), "{printed}");
     assert!(!printed.contains("tarray.new"), "{printed}");
+}
+
+#[test]
+fn rewrite_accepts_txref_get_into_persistent_field_without_rewriting_constructor() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $TxRefString (struct (field (mut (ref null $kotlin.String)))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (func $"twasm.TxRef.get"
+                (param $txref (ref $TxRefString))
+                (result (ref null $kotlin.String))
+            local.get $txref
+            struct.get $TxRefString 0)
+          (func (export "publish")
+                (param $txref (ref $TxRefString))
+                (result (ref null $Bank))
+            local.get $txref
+            call $"twasm.TxRef.get"
+            struct.new $Bank))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_valid_module(&output);
+    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
+    assert!(printed.contains("struct.new"), "{printed}");
+    assert!(!printed.contains("tstruct.new"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_direct_ordinary_ref_into_persistent_field_without_txref() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $Bank (struct (field (mut (ref null $kotlin.String)))))
+          (func (export "publish") (result (ref null $Bank))
+            i32.const 7
+            struct.new $kotlin.String
+            struct.new $Bank))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "kotlin.String")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains(
+            "ordinary WasmGC reference enters persistent field Bank.note without make_txn_ref"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn rewrite_accepts_copyable_txref_get_into_persistent_field_without_rewriting_constructor() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.String (struct (field (mut i32))))
+          (type $Account (struct (field (mut i64))))
+          (type $TransferNote
+            (struct
+              (field (mut (ref null $kotlin.String)))
+              (field (mut (ref null $Account)))))
+          (type $Bank (struct (field (mut (ref null $TransferNote)))))
+          (type $TxRefTransferNote (struct (field (mut (ref null $TransferNote)))))
+          (func $"twasm.TxRef.get"
+                (param $txref (ref $TxRefTransferNote))
+                (result (ref null $TransferNote))
+            local.get $txref
+            struct.get $TxRefTransferNote 0)
+          (func (export "publish")
+                (param $txref (ref $TxRefTransferNote))
+                (result (ref null $Bank))
+            local.get $txref
+            call $"twasm.TxRef.get"
+            struct.new $Bank))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![
+            struct_type("Account"),
+            struct_type_with_fields("Bank", vec![nullable_ref_field("note", "TransferNote")]),
+        ],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+    sidecar.copyable_types = vec![copyable_struct(
+        "TransferNote",
+        vec![
+            nullable_ref_field("text", "kotlin.String"),
+            nullable_ref_field("source", "Account"),
+        ],
+    )];
+
+    let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
+    let printed = wasmprinter::print_bytes(&output).unwrap();
+
+    assert_valid_module(&output);
+    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
+    assert!(printed.contains("struct.new"), "{printed}");
+    assert!(!printed.contains("tstruct.new"), "{printed}");
+}
+
+#[test]
+fn rewrite_rejects_copyable_type_with_denied_field_type() {
+    let input = wat::parse_str(
+        r#"
+        (module
+          (type $kotlin.io.File (struct (field (mut i32))))
+          (type $TransferNote (struct (field (mut (ref null $kotlin.io.File)))))
+          (type $Bank (struct (field (mut (ref null $TransferNote)))))
+          (type $TxRefTransferNote (struct (field (mut (ref null $TransferNote)))))
+          (func $"twasm.TxRef.get"
+                (param $txref (ref $TxRefTransferNote))
+                (result (ref null $TransferNote))
+            local.get $txref
+            struct.get $TxRefTransferNote 0)
+          (func (export "publish")
+                (param $txref (ref $TxRefTransferNote))
+                (result (ref null $Bank))
+            local.get $txref
+            call $"twasm.TxRef.get"
+            struct.new $Bank))
+        "#,
+    )
+    .unwrap();
+    let mut sidecar = sidecar(
+        vec![struct_type_with_fields(
+            "Bank",
+            vec![nullable_ref_field("note", "TransferNote")],
+        )],
+        &["publish"],
+        vec![],
+    );
+    sidecar.gc_wasm.capture = KotlinGcWasmCapture::AllModuleGcTypes;
+    sidecar.gc_wasm.deny_types = vec!["kotlin.io.File".into()];
+    sidecar.copyable_types = vec![copyable_struct(
+        "TransferNote",
+        vec![nullable_ref_field("file", "kotlin.io.File")],
+    )];
+
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("copyable type TransferNote field file references denied type kotlin.io.File"),
+        "{err}"
+    );
 }
 
 #[test]
