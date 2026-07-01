@@ -215,7 +215,12 @@ fn shared_runtime_rejects_duplicate_persistent_object_reservation() {
             TypeLayoutId::DEFAULT_STRUCT.get(),
         )
         .unwrap();
-    assert!(runtime.persistent_object_directory_entry(object).unwrap().is_none());
+    assert!(
+        runtime
+            .persistent_object_directory_entry(object)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         runtime
             .reserve_persistent_object_metadata(
@@ -1398,9 +1403,15 @@ fn linear_memory_commit_logs_only_touched_shared_file_backed_granules() {
     let granule0_addr = 8usize;
     let granule1_addr = TMEMORY_GRANULE_SIZE + 8;
     let granule2_addr = TMEMORY_GRANULE_SIZE * 2 + 8;
-    tmemory.commit_range(granule0_addr, &[0x10, 0x11, 0x12, 0x13]).unwrap();
-    tmemory.commit_range(granule1_addr, &[0x20, 0x21, 0x22, 0x23]).unwrap();
-    tmemory.commit_range(granule2_addr, &[0x30, 0x31, 0x32, 0x33]).unwrap();
+    tmemory
+        .commit_range(granule0_addr, &[0x10, 0x11, 0x12, 0x13])
+        .unwrap();
+    tmemory
+        .commit_range(granule1_addr, &[0x20, 0x21, 0x22, 0x23])
+        .unwrap();
+    tmemory
+        .commit_range(granule2_addr, &[0x30, 0x31, 0x32, 0x33])
+        .unwrap();
 
     let mut state = TransactionState::default();
     let shared = runtime
@@ -1436,9 +1447,11 @@ fn linear_memory_commit_logs_only_touched_shared_file_backed_granules() {
 
     let entries = state.durable_log_entries_for_test(stream_id);
     assert_eq!(entries.len(), 2);
-    assert!(entries.iter().all(|entry| {
-        entry.role().unwrap() == crate::runtime::vm::TxLogEntryRole::TMemoryUndo
-    }));
+    assert!(
+        entries.iter().all(|entry| {
+            entry.role().unwrap() == crate::runtime::vm::TxLogEntryRole::TMemoryUndo
+        })
+    );
     let staged_granule = vec![0; TMEMORY_GRANULE_SIZE];
     let expected_undo_logical_ids = BTreeSet::from([
         tmemory
@@ -1457,15 +1470,21 @@ fn linear_memory_commit_logs_only_touched_shared_file_backed_granules() {
     assert_eq!(undo_logical_ids, expected_undo_logical_ids);
 
     assert_eq!(
-        tmemory.read_committed(granule0_addr..granule0_addr + 4).unwrap(),
+        tmemory
+            .read_committed(granule0_addr..granule0_addr + 4)
+            .unwrap(),
         vec![0xa0, 0xa1, 0xa2, 0xa3]
     );
     assert_eq!(
-        tmemory.read_committed(granule1_addr..granule1_addr + 4).unwrap(),
+        tmemory
+            .read_committed(granule1_addr..granule1_addr + 4)
+            .unwrap(),
         vec![0x20, 0x21, 0x22, 0x23]
     );
     assert_eq!(
-        tmemory.read_committed(granule2_addr..granule2_addr + 4).unwrap(),
+        tmemory
+            .read_committed(granule2_addr..granule2_addr + 4)
+            .unwrap(),
         vec![0xc0, 0xc1, 0xc2, 0xc3]
     );
 
@@ -7869,10 +7888,11 @@ mod file_backed_object_layout_recovery {
             &[7],
         )?;
 
-        let runtime = crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
-            &tmemory_path,
-            &tx_log_path,
-        )?;
+        let runtime =
+            crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+                &tmemory_path,
+                &tx_log_path,
+            )?;
         let mut objects = ObjectTable::default();
         objects.set_shared_region_runtime(Some(runtime));
 
@@ -7884,8 +7904,8 @@ mod file_backed_object_layout_recovery {
 
     #[cfg(unix)]
     #[test]
-    fn recovered_shared_runtime_allows_fresh_store_to_materialize_object_without_recopy(
-    ) -> Result<()> {
+    fn recovered_shared_runtime_allows_fresh_store_to_materialize_object_without_recopy()
+    -> Result<()> {
         use crate::runtime::vm::TMemory;
         use crate::runtime::vm::block_region::{
             create_file_backed_region_image, publish_committed_global_object_root,
@@ -7901,22 +7921,12 @@ mod file_backed_object_layout_recovery {
             TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
         drop(TMemory::new(tmemory_config, 1, Some(1))?);
         create_file_backed_region_image(&tx_log_path, 64)?;
-        publish_committed_struct_object(
-            &tx_log_path,
-            1,
-            object.object_index,
-            1,
-            101,
-            &[7, 9],
-        )?;
+        publish_committed_struct_object(&tx_log_path, 1, object.object_index, 1, 101, &[7, 9])?;
         publish_committed_global_object_root(&tx_log_path, 2, object.object_index)?;
 
         let engine = crate::Engine::default();
         let mut recovered_store = crate::Store::new(&engine, ());
-        recovered_store.transaction_open_file_backed_storage_for_test(
-            tmemory_path,
-            tx_log_path,
-        )?;
+        recovered_store.transaction_open_file_backed_storage_for_test(tmemory_path, tx_log_path)?;
         let recovered_runtime = recovered_store
             .as_store_opaque()
             .transaction_region_runtime()
@@ -7969,20 +7979,14 @@ mod file_backed_object_layout_recovery {
         drop(TMemory::new(tmemory_config, 1, Some(1))?);
         create_file_backed_region_image(&tx_log_path, 64)?;
         publish_committed_struct_object(&tx_log_path, 1, root.object_index, 1, 101, &[7, 9])?;
-        publish_committed_struct_object(
-            &tx_log_path,
-            2,
-            garbage.object_index,
-            1,
-            101,
-            &[1, 3],
-        )?;
+        publish_committed_struct_object(&tx_log_path, 2, garbage.object_index, 1, 101, &[1, 3])?;
         publish_committed_global_object_root(&tx_log_path, 3, root.object_index)?;
 
-        let runtime = crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
-            &tmemory_path,
-            &tx_log_path,
-        )?;
+        let runtime =
+            crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+                &tmemory_path,
+                &tx_log_path,
+            )?;
         let mut objects = ObjectTable::default();
         objects.set_shared_region_runtime(Some(runtime));
 
@@ -8014,20 +8018,14 @@ mod file_backed_object_layout_recovery {
             TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
         drop(TMemory::new(tmemory_config, 1, Some(1))?);
         create_file_backed_region_image(&tx_log_path, 64)?;
-        publish_committed_struct_object(
-            &tx_log_path,
-            1,
-            object.object_index,
-            1,
-            101,
-            &[7, 9],
-        )?;
+        publish_committed_struct_object(&tx_log_path, 1, object.object_index, 1, 101, &[7, 9])?;
         publish_committed_global_object_root(&tx_log_path, 2, object.object_index)?;
 
-        let runtime = crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
-            &tmemory_path,
-            &tx_log_path,
-        )?;
+        let runtime =
+            crate::runtime::transaction::TransactionRegionRuntime::open_file_backed_for_test(
+                &tmemory_path,
+                &tx_log_path,
+            )?;
         let mut objects = ObjectTable::default();
         objects.set_shared_region_runtime(Some(runtime));
         objects.register_type_layout(type_layout::PersistentTypeLayout::Struct {
@@ -12377,7 +12375,9 @@ fn shared_runtime_deref_rejects_refreshed_payload_under_stale_read_authority() -
 #[test]
 fn two_stores_conflict_on_same_persistent_object_write() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let tx_log_path = dir.path().join("two-store-persistent-object-write-conflict.bin");
+    let tx_log_path = dir
+        .path()
+        .join("two-store-persistent-object-write-conflict.bin");
     let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
     let runtime = TransactionRegionRuntime::new_for_test();
     let _cleanup = clear_current_thread_transaction_on_drop_for_test();
@@ -12521,7 +12521,10 @@ fn two_stores_conflict_on_same_persistent_object_write_with_older_requester() ->
         return Ok(());
     }
 
-    #[cfg(all(not(feature = "transaction-cc-wait-die"), feature = "transaction-cc-wound-wait"))]
+    #[cfg(all(
+        not(feature = "transaction-cc-wait-die"),
+        feature = "transaction-cc-wound-wait"
+    ))]
     {
         requester_state.acquire_object_write(&mut requester_objects, object)?;
         assert!(requester_state.owns_object_write(object));

@@ -1871,12 +1871,13 @@ impl StoreOpaque {
             .cloned_mapped_region_source()
             .context("recovered file-backed region does not expose a mapped region source")?;
         let mut recovered_object_table = ObjectTable::default();
-        let report = recovered_object_table.rebuild_reachable_from_mapped_recovered_object_winners(
-            &recovered.type_layouts,
-            &object_winners,
-            &recovered.root_object_ids,
-            mapped_source.clone(),
-        )?;
+        let report = recovered_object_table
+            .rebuild_reachable_from_mapped_recovered_object_winners(
+                &recovered.type_layouts,
+                &object_winners,
+                &recovered.root_object_ids,
+                mapped_source.clone(),
+            )?;
         let reachable_winners = object_winners
             .iter()
             .filter(|winner| {
@@ -3580,7 +3581,10 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            fresh_store.transaction_object_table().payload(root).unwrap(),
+            fresh_store
+                .transaction_object_table()
+                .payload(root)
+                .unwrap(),
             ObjectPayload::Struct(vec![ObjectValue::I32(7), ObjectValue::I32(9)])
         );
         assert!(
@@ -3589,7 +3593,12 @@ mod tests {
                 .refresh_persistent_object_from_shared_directory(garbage)
                 .unwrap()
         );
-        assert!(fresh_store.transaction_object_table().payload(garbage).is_err());
+        assert!(
+            fresh_store
+                .transaction_object_table()
+                .payload(garbage)
+                .is_err()
+        );
     }
 
     #[cfg(all(feature = "transaction", unix, has_virtual_memory))]

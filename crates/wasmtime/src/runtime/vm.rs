@@ -120,12 +120,12 @@ pub(crate) use crate::runtime::vm::memory::tmemory::TxLogEntry;
 pub(crate) use crate::runtime::vm::memory::tmemory::TxLogEntryRole;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::block_region;
+#[cfg(test)]
+pub(crate) use crate::runtime::vm::memory::tmemory::numa::cpus_for_node;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::numa::{
     CpuSet, NumaNode, current_cpu, node_for_cpu, pin_current_thread,
 };
-#[cfg(test)]
-pub(crate) use crate::runtime::vm::memory::tmemory::numa::cpus_for_node;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::pack_tmemory_size_logical_id;
 #[cfg(has_virtual_memory)]

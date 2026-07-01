@@ -483,7 +483,11 @@ impl TransactionRegionRuntime {
         &self,
         object_id: ObjectId,
     ) -> Result<Option<PersistentObjectDirectoryEntry>> {
-        Ok(self.lock_object_directory()?.entries.get(&object_id).cloned())
+        Ok(self
+            .lock_object_directory()?
+            .entries
+            .get(&object_id)
+            .cloned())
     }
 
     pub(crate) fn persistent_object_directory_version(&self, object_id: ObjectId) -> Result<u64> {

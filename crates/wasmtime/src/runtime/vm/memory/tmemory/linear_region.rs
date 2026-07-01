@@ -670,8 +670,9 @@ impl BlockRegionBackend for CompositeLinearRegion {
                 .checked_add(chunk.block_count())
                 .context("transactional linear multi-region payload block range overflow")?;
             if self.exposed_payload_blocks < chunk_end {
-                let offset_in_chunk =
-                    self.exposed_payload_blocks.saturating_sub(logical_block_base);
+                let offset_in_chunk = self
+                    .exposed_payload_blocks
+                    .saturating_sub(logical_block_base);
                 let remaining_in_chunk = chunk.block_count() - offset_in_chunk;
                 let needed_blocks = new_payload_block_count - self.exposed_payload_blocks;
                 let grow_blocks = remaining_in_chunk.min(needed_blocks);
@@ -1090,10 +1091,7 @@ mod tests {
         assert_eq!(region.logical_len(), 2 * BLOCK_SIZE);
 
         region.write(BLOCK_SIZE + 8, &[5, 6, 7, 8]).unwrap();
-        assert_eq!(
-            region.read(BLOCK_SIZE + 8, 4).unwrap(),
-            vec![5, 6, 7, 8]
-        );
+        assert_eq!(region.read(BLOCK_SIZE + 8, 4).unwrap(), vec![5, 6, 7, 8]);
     }
 
     #[test]
@@ -1116,10 +1114,7 @@ mod tests {
         region.write(BLOCK_SIZE + 8, &[5, 6, 7, 8]).unwrap();
 
         assert_eq!(region.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
-        assert_eq!(
-            region.read(BLOCK_SIZE + 8, 4).unwrap(),
-            vec![5, 6, 7, 8]
-        );
+        assert_eq!(region.read(BLOCK_SIZE + 8, 4).unwrap(), vec![5, 6, 7, 8]);
     }
 
     #[test]

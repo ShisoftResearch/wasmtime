@@ -793,7 +793,11 @@ impl ObjectTable {
         let kind = payload.kind();
         if persistent {
             if let Some(runtime) = &self.shared_region_runtime {
-                runtime.reserve_persistent_object_metadata(object_id, kind, type_layout_id.get())?;
+                runtime.reserve_persistent_object_metadata(
+                    object_id,
+                    kind,
+                    type_layout_id.get(),
+                )?;
             }
         }
         let record_version = self.bump_record_version()?;
