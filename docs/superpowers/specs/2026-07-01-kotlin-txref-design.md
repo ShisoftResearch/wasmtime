@@ -191,14 +191,17 @@ promotion rules.
 No immediate clone occurs at `make_txn_ref` or `TxRef.get()`. Copying happens
 when an accepted value actually crosses into persistent storage. This can happen
 at commit for ordinary object graphs that are reachable from a persistent root,
-or earlier inside a transaction when assigning into an existing persistent
-object through `tstruct.set` or `tarray.set`.
+or earlier inside a transaction when a persistent reference slot is written or
+staged.
 
-For ref-typed persistent field and array writes, `tstruct.set` and `tarray.set`
-must treat an ordinary live WasmGC reference as a promotion source:
+All runtime persistent-reference write boundaries must treat an ordinary live
+WasmGC reference as a promotion source. This includes `tstruct.set`,
+`tarray.set`, `tglobal.set`, root publication, table writes if persistent tables
+are supported, and any other path that stores or stages a tref into persistent
+state.
 
 ```text
-tstruct.set/tarray.set persistent_ref_slot = live_ref
+persistent_ref_slot = live_ref
   null or i31              -> store directly as the current ref leaf
   transaction object handle -> store the referenced ObjectId
   existing live bridge     -> store or promote the bridged ObjectId as needed
@@ -212,7 +215,8 @@ If it does, the write stores the existing promoted `ObjectId`. If it does not,
 the runtime promotes the graph, records the raw WasmGC reference in
 `promoted_gc_refs`, and stores the new promoted `ObjectId`. This preserves
 aliasing when the same `TxRef` or transaction-local object graph is written into
-multiple persistent fields or array elements.
+multiple persistent fields, array elements, globals, roots, tables, or other
+persistent reference slots.
 
 For a `@TxCopyable` DTO, the DTO graph is copied as value data. For references to
 `@Persistent` objects inside that DTO graph, promotion records references to the
@@ -316,9 +320,9 @@ Add focused tests for the rewriter and runtime path:
   references inside it.
 - Accept using the same `TxRef` twice in one persistent graph and verify recovered
   references alias the same promoted object.
-- Accept assigning the same `TxRef.get()` result into two persistent fields or
-  array elements through `tstruct.set` or `tarray.set`, and verify both slots
-  store the same promoted `ObjectId`.
+- Accept assigning the same `TxRef.get()` result into two persistent reference
+  slots through field, array, global, root, or table write paths, and verify both
+  slots store the same promoted `ObjectId`.
 - Verify runtime promotion for persistent writes reuses
   `TransactionState.promoted_gc_refs` instead of repeatedly promoting the same
   raw WasmGC reference.
