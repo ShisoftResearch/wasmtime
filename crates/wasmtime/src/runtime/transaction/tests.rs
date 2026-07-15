@@ -12208,6 +12208,37 @@ fn transaction_local_object_abort_discards_without_shared_object_cleanup() {
 }
 
 #[test]
+fn transaction_local_handles_are_not_reused_after_abort() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+
+    state.begin().unwrap();
+    let first = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    let first_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, first, |_| false)
+        .unwrap();
+    state.abort().unwrap();
+
+    state.begin().unwrap();
+    let second = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(2)], None)
+        .unwrap();
+    let second_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, second, |_| false)
+        .unwrap();
+
+    assert_ne!(first_handle, second_handle);
+    assert_eq!(
+        state.known_object_id_for_transaction_ref_handle(&objects, first_handle),
+        None
+    );
+
+    state.abort().unwrap();
+}
+
+#[test]
 fn transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges() {
     let mut objects = ObjectTable::default();
     let object = objects

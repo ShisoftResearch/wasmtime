@@ -2,9 +2,6 @@ use crate::runtime::transaction::concurrency::TransactionConflictAction;
 use wasmtime_environ::VMSharedTypeIndex;
 
 use super::object_table::default_type_layout_id_for_kind;
-use super::object_value::{
-    FIRST_TRANSACTION_OBJECT_REF_HANDLE, TRANSACTION_OBJECT_REF_HANDLE_STEP,
-};
 use super::*;
 
 const TRANSACTION_LOCAL_OBJECT_ID_BASE: u64 = 1u64 << 63;
@@ -126,7 +123,6 @@ pub(crate) struct TransactionLocalObjectTable {
     slots: BTreeMap<ObjectId, TransactionLocalObjectSlot>,
     transaction_ref_handles_to_objects: BTreeMap<u32, ObjectId>,
     objects_to_transaction_ref_handles: BTreeMap<ObjectId, u32>,
-    next_transaction_ref_handle: u32,
     next_object_index: u64,
 }
 
@@ -136,7 +132,6 @@ impl Default for TransactionLocalObjectTable {
             slots: BTreeMap::new(),
             transaction_ref_handles_to_objects: BTreeMap::new(),
             objects_to_transaction_ref_handles: BTreeMap::new(),
-            next_transaction_ref_handle: FIRST_TRANSACTION_OBJECT_REF_HANDLE,
             next_object_index: TRANSACTION_LOCAL_OBJECT_ID_BASE,
         }
     }
@@ -235,56 +230,49 @@ impl TransactionLocalObjectTable {
             })
     }
 
-    fn transaction_ref_handle_for_object_id_avoiding<F>(
-        &mut self,
+    fn known_transaction_ref_handle_for_object_id(
+        &self,
         object_id: ObjectId,
-        is_reserved_live_ref_raw: F,
-    ) -> Result<u32>
-    where
-        F: Fn(u32) -> bool,
-    {
+    ) -> Result<Option<u32>> {
         self.kind(object_id)?;
-        if let Some(handle) = self
+        Ok(self
+            .objects_to_transaction_ref_handles
+            .get(&object_id)
+            .copied())
+    }
+
+    fn associate_transaction_ref_handle_for_object_id(
+        &mut self,
+        handle: u32,
+        object_id: ObjectId,
+    ) -> Result<()> {
+        let handle = TransactionObjectRefRaw::from_handle(handle)?.as_raw();
+        self.kind(object_id)?;
+        if let Some(existing) = self
+            .transaction_ref_handles_to_objects
+            .get(&handle)
+            .copied()
+        {
+            ensure!(
+                existing == object_id,
+                "transaction object ref handle is already associated"
+            );
+        }
+        if let Some(existing) = self
             .objects_to_transaction_ref_handles
             .get(&object_id)
             .copied()
         {
             ensure!(
-                !is_reserved_live_ref_raw(handle),
-                "transaction object ref handle collides with registered live ref"
-            );
-            return Ok(handle);
-        }
-
-        let start = if self.next_transaction_ref_handle == 0 {
-            FIRST_TRANSACTION_OBJECT_REF_HANDLE
-        } else {
-            self.next_transaction_ref_handle
-        };
-        let mut candidate = start;
-        loop {
-            if !self
-                .transaction_ref_handles_to_objects
-                .contains_key(&candidate)
-                && !is_reserved_live_ref_raw(candidate)
-            {
-                self.transaction_ref_handles_to_objects
-                    .insert(candidate, object_id);
-                self.objects_to_transaction_ref_handles
-                    .insert(object_id, candidate);
-                self.next_transaction_ref_handle = candidate
-                    .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
-                    .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
-                return Ok(candidate);
-            }
-            candidate = candidate
-                .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
-                .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
-            ensure!(
-                candidate != start,
-                "transaction object ref handle space is exhausted"
+                existing == handle,
+                "transaction object id is already associated with another ref handle"
             );
         }
+        self.transaction_ref_handles_to_objects
+            .insert(handle, object_id);
+        self.objects_to_transaction_ref_handles
+            .insert(object_id, handle);
+        Ok(())
     }
 
     fn known_object_id_for_transaction_ref_handle(&self, handle: u32) -> Option<ObjectId> {
@@ -1343,17 +1331,39 @@ impl TransactionState {
         F: Fn(u32) -> bool,
     {
         if self.local_object_table.contains(object_id) {
-            return self
+            if let Some(handle) = self
                 .local_object_table
-                .transaction_ref_handle_for_object_id_avoiding(object_id, |raw| {
-                    is_reserved_live_ref_raw(raw)
-                        || object_table
-                            .known_object_id_for_transaction_ref_handle(raw)
-                            .is_some()
-                        || object_table
-                            .known_object_id_for_live_gc_ref_bridge(raw)
-                            .is_some()
-                });
+                .known_transaction_ref_handle_for_object_id(object_id)?
+            {
+                ensure!(
+                    !is_reserved_live_ref_raw(handle),
+                    "transaction object ref handle collides with registered live ref"
+                );
+                ensure!(
+                    object_table
+                        .known_object_id_for_transaction_ref_handle(handle)
+                        .is_none(),
+                    "transaction object ref handle collides with registered live ref"
+                );
+                ensure!(
+                    object_table
+                        .known_object_id_for_live_gc_ref_bridge(handle)
+                        .is_none(),
+                    "transaction object ref handle collides with registered live ref"
+                );
+                return Ok(handle);
+            }
+
+            let handle = object_table.reserve_transaction_ref_handle_avoiding(|raw| {
+                is_reserved_live_ref_raw(raw)
+                    || self
+                        .local_object_table
+                        .known_object_id_for_transaction_ref_handle(raw)
+                        .is_some()
+            })?;
+            self.local_object_table
+                .associate_transaction_ref_handle_for_object_id(handle, object_id)?;
+            return Ok(handle);
         }
         object_table
             .transaction_ref_handle_for_object_id_avoiding(object_id, is_reserved_live_ref_raw)

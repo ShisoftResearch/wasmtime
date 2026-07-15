@@ -988,6 +988,41 @@ impl ObjectTable {
         self.transaction_ref_handle_for_object_id_avoiding(object_id, |_| false)
     }
 
+    pub(crate) fn reserve_transaction_ref_handle_avoiding<F>(
+        &mut self,
+        is_reserved_live_ref_raw: F,
+    ) -> Result<u32>
+    where
+        F: Fn(u32) -> bool,
+    {
+        let start = if self.next_transaction_ref_handle == 0 {
+            FIRST_TRANSACTION_OBJECT_REF_HANDLE
+        } else {
+            self.next_transaction_ref_handle
+        };
+        let mut candidate = start;
+        loop {
+            if !self
+                .transaction_ref_handles_to_objects
+                .contains_key(&candidate)
+                && !self.live_bridge_gc_refs_to_objects.contains_key(&candidate)
+                && !is_reserved_live_ref_raw(candidate)
+            {
+                self.next_transaction_ref_handle = candidate
+                    .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
+                    .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
+                return Ok(candidate);
+            }
+            candidate = candidate
+                .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
+                .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
+            ensure!(
+                candidate != start,
+                "transaction object ref handle space is exhausted"
+            );
+        }
+    }
+
     pub(crate) fn transaction_ref_handle_for_object_id_avoiding<F>(
         &mut self,
         object_id: ObjectId,
@@ -1009,36 +1044,9 @@ impl ObjectTable {
             return Ok(handle);
         }
 
-        let start = if self.next_transaction_ref_handle == 0 {
-            FIRST_TRANSACTION_OBJECT_REF_HANDLE
-        } else {
-            self.next_transaction_ref_handle
-        };
-        let mut candidate = start;
-        loop {
-            if !self
-                .transaction_ref_handles_to_objects
-                .contains_key(&candidate)
-                && !self.live_bridge_gc_refs_to_objects.contains_key(&candidate)
-                && !is_reserved_live_ref_raw(candidate)
-            {
-                self.transaction_ref_handles_to_objects
-                    .insert(candidate, object_id);
-                self.objects_to_transaction_ref_handles
-                    .insert(object_id, candidate);
-                self.next_transaction_ref_handle = candidate
-                    .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
-                    .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
-                return Ok(candidate);
-            }
-            candidate = candidate
-                .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
-                .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
-            ensure!(
-                candidate != start,
-                "transaction object ref handle space is exhausted"
-            );
-        }
+        let handle = self.reserve_transaction_ref_handle_avoiding(is_reserved_live_ref_raw)?;
+        self.associate_transaction_ref_handle_for_object_id(handle, object_id)?;
+        Ok(handle)
     }
 
     pub(crate) fn associate_transaction_ref_handle_for_object_id(
