@@ -944,11 +944,14 @@ fn transaction_helper_i31_for_ref(
     _instance: InstanceId,
     gc_ref: u32,
 ) -> u32 {
-    let object_table = store.store_opaque_mut().transaction_object_table_mut();
-    let Ok(object_id) = object_table.object_id_for_live_bridge_transaction_ref_raw(gc_ref) else {
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    let Ok(object_id) = state.object_id_for_live_bridge_transaction_ref_raw(object_table, gc_ref)
+    else {
         return 0;
     };
-    let Ok(ObjectPayload::Struct(fields)) = object_table.payload(object_id) else {
+    let Ok(ObjectPayload::Struct(fields)) = state.read_object_payload(object_table, object_id)
+    else {
         return 0;
     };
     let Some(value) = fields.get(1) else {
@@ -1006,11 +1009,14 @@ fn transaction_tref_test(
         return u32::from(nullable != 0);
     }
 
-    let object_table = store.store_opaque().transaction_object_table();
-    let Some(object_id) = object_table.known_object_id_for_transaction_ref_handle(raw_ref) else {
+    let store = store.store_opaque();
+    let state = store.transaction_state();
+    let object_table = store.transaction_object_table();
+    let Some(object_id) = state.known_object_id_for_transaction_ref_handle(object_table, raw_ref)
+    else {
         return TRANSACTION_TREF_TEST_NOT_TRANSACTION;
     };
-    let Ok(kind) = object_table.kind(object_id) else {
+    let Ok(kind) = state.object_kind(object_table, object_id) else {
         return TRANSACTION_TREF_TEST_NOT_TRANSACTION;
     };
 
@@ -1033,7 +1039,7 @@ fn transaction_tref_test(
         return 1;
     }
 
-    let Ok(Some(actual)) = object_table.runtime_type_index(object_id) else {
+    let Ok(Some(actual)) = state.runtime_type_index(object_table, object_id) else {
         return 0;
     };
     let expected = VMSharedTypeIndex::from_u32(expected_engine_type);
@@ -1171,10 +1177,11 @@ fn transaction_tglobal_set_impl(
         let normalized = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
         let promoted_snapshot = {
             let store = store.store_opaque_mut();
-            let (durable_refs, object_table) =
-                store.transaction_durable_refs_and_object_table_mut();
+            let (durable_refs, state, object_table) =
+                store.transaction_durable_refs_state_and_object_table_mut();
             GlobalSnapshot::GcRef(gc_snapshot_raw_from_object_value(
                 &*durable_refs,
+                state,
                 object_table,
                 normalized,
                 "transactional global GC reference",
@@ -1265,9 +1272,10 @@ fn live_transaction_global_snapshot_for_read(
     let Some(object_id) = promoted else {
         return Ok(snapshot);
     };
-    let handle = object_table.transaction_ref_handle_for_object_id_avoiding(object_id, |raw| {
-        live_ref_raw_is_registered(&*durable_refs, raw)
-    })?;
+    let handle =
+        state.transaction_ref_handle_for_object_id_avoiding(object_table, object_id, |raw| {
+            live_ref_raw_is_registered(&*durable_refs, raw)
+        })?;
     Ok(GlobalSnapshot::GcRef(handle))
 }
 
@@ -1783,10 +1791,12 @@ fn normalize_persistent_table_snapshot(
         OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
     )?;
     let value = object_value_from_persistent_slot_abi(store, abi)?;
-    let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
+    let (durable_refs, state, object_table) =
+        store.transaction_durable_refs_state_and_object_table_mut();
     Ok(TableElementSnapshot::GcRef(
         gc_snapshot_raw_from_object_value(
             &*durable_refs,
+            state,
             object_table,
             value,
             "transactional table GC reference",
@@ -1796,13 +1806,14 @@ fn normalize_persistent_table_snapshot(
 
 fn gc_snapshot_raw_from_object_value(
     durable_refs: &DurableReferenceRegistry,
+    state: &mut TransactionState,
     object_table: &mut ObjectTable,
     value: ObjectValue,
     context: &str,
 ) -> Result<u32> {
     match value {
-        ObjectValue::Ref(Some(object_id)) => object_table
-            .transaction_ref_handle_for_object_id_avoiding(object_id, |raw| {
+        ObjectValue::Ref(Some(object_id)) => state
+            .transaction_ref_handle_for_object_id_avoiding(object_table, object_id, |raw| {
                 live_ref_raw_is_registered(durable_refs, raw)
             }),
         ObjectValue::Ref(None) => Ok(0),
@@ -2135,14 +2146,13 @@ fn transaction_tstruct_new_impl(
     for abi in fields {
         values.push(object_value_from_transaction_abi(
             durable_refs,
+            Some(&*state),
             object_table,
             *abi,
         )?);
     }
-    let object_id = object_table.allocate_struct(values)?;
-    object_table.set_runtime_type_index(object_id, runtime_type_index)?;
-    state.record_allocated_object(object_id)?;
-    transaction_object_ref_handle_for_object_id(durable_refs, object_table, object_id)
+    let object_id = state.allocate_transaction_local_struct(values, Some(runtime_type_index))?;
+    transaction_object_ref_handle_for_object_id(durable_refs, state, object_table, object_id)
 }
 
 fn transaction_tstruct_static_new(
@@ -2206,6 +2216,7 @@ fn transaction_tstruct_static_new_impl(
     for abi in fields {
         values.push(object_value_from_transaction_abi(
             durable_refs,
+            None,
             object_table,
             *abi,
         )?);
@@ -2221,7 +2232,7 @@ fn transaction_tstruct_static_new_impl(
         values,
     )?;
     object_table.set_runtime_type_index(object_id, runtime_type_index)?;
-    transaction_object_ref_handle_for_object_id(durable_refs, object_table, object_id)
+    transaction_object_ref_handle_for_shared_object_id(durable_refs, object_table, object_id)
 }
 
 fn transaction_tstruct_set(
@@ -2254,7 +2265,7 @@ fn transaction_tstruct_set_impl(
     let value = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+    let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
     state.stage_struct_field(object_table, object_id, field, value)
 }
 
@@ -2287,13 +2298,14 @@ fn transaction_tstruct_get_bytes_impl(
     let value = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+        let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
         state.read_struct_field(object_table, object_id, field)?
     };
     let abi = {
         let store = store.store_opaque_mut();
-        let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
-        live_transaction_abi_from_object_value(durable_refs, object_table, &value)?
+        let (durable_refs, state, object_table) =
+            store.transaction_durable_refs_state_and_object_table_mut();
+        live_transaction_abi_from_object_value(durable_refs, state, object_table, &value)?
     };
     Ok(object_value_abi_bytes(abi))
 }
@@ -2332,7 +2344,7 @@ fn transaction_tarray_new_impl(
     let store = store.store_opaque_mut();
     let (durable_refs, state, object_table) =
         store.transaction_durable_refs_state_and_object_table_mut();
-    let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
+    let value = object_value_from_transaction_abi(durable_refs, Some(&*state), object_table, abi)?;
     allocate_transaction_array_record(
         durable_refs,
         state,
@@ -2388,7 +2400,7 @@ fn transaction_tarray_static_new_impl(
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let store = store.store_opaque_mut();
     let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
-    let value = object_value_from_transaction_abi(durable_refs, object_table, abi)?;
+    let value = object_value_from_transaction_abi(durable_refs, None, object_table, abi)?;
     let object_id = object_table
         .allocate_persistent_array_with_wasmtime_element_layout_and_initializer(
             Some(instance),
@@ -2399,7 +2411,7 @@ fn transaction_tarray_static_new_impl(
             len,
         )?;
     object_table.set_runtime_type_index(object_id, runtime_type_index)?;
-    transaction_object_ref_handle_for_object_id(durable_refs, object_table, object_id)
+    transaction_object_ref_handle_for_shared_object_id(durable_refs, object_table, object_id)
 }
 
 fn transaction_tarray_new_fixed(
@@ -2447,6 +2459,7 @@ fn transaction_tarray_new_fixed_impl(
     for abi in elements {
         values.push(object_value_from_transaction_abi(
             durable_refs,
+            Some(&*state),
             object_table,
             *abi,
         )?);
@@ -2514,6 +2527,7 @@ fn transaction_tarray_static_new_fixed_impl(
     for abi in elements {
         values.push(object_value_from_transaction_abi(
             durable_refs,
+            None,
             object_table,
             *abi,
         )?);
@@ -2530,7 +2544,7 @@ fn transaction_tarray_static_new_fixed_impl(
         values,
     )?;
     object_table.set_runtime_type_index(object_id, runtime_type_index)?;
-    transaction_object_ref_handle_for_object_id(durable_refs, object_table, object_id)
+    transaction_object_ref_handle_for_shared_object_id(durable_refs, object_table, object_id)
 }
 
 fn transaction_tarray_new_data(
@@ -2670,7 +2684,7 @@ fn transaction_tarray_new_elem_impl(
     let store = store.store_opaque_mut();
     let (durable_refs, state, object_table) =
         store.transaction_durable_refs_state_and_object_table_mut();
-    let values = decode_transaction_array_elem_values(durable_refs, object_table, bytes)?;
+    let values = decode_transaction_array_elem_values(durable_refs, &*state, object_table, bytes)?;
     allocate_transaction_array_record(
         durable_refs,
         state,
@@ -2722,6 +2736,7 @@ fn decode_transaction_array_data_values(
 
 fn decode_transaction_array_elem_values(
     durable_refs: &mut DurableReferenceRegistry,
+    state: &TransactionState,
     object_table: &mut ObjectTable,
     bytes: &[u8],
 ) -> Result<Vec<ObjectValue>> {
@@ -2735,6 +2750,7 @@ fn decode_transaction_array_elem_values(
             let raw = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             live_ref_value_from_raw(
                 durable_refs,
+                Some(state),
                 object_table,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
                 raw,
@@ -2750,15 +2766,24 @@ fn allocate_transaction_array_record(
     values: Vec<ObjectValue>,
     runtime_type_index: Option<VMSharedTypeIndex>,
 ) -> Result<core::num::NonZeroU32> {
-    let object_id = object_table.allocate_array(values)?;
-    if let Some(runtime_type_index) = runtime_type_index {
-        object_table.set_runtime_type_index(object_id, runtime_type_index)?;
-    }
-    state.record_allocated_object(object_id)?;
-    transaction_object_ref_handle_for_object_id(durable_refs, object_table, object_id)
+    let object_id = state.allocate_transaction_local_array(values, runtime_type_index)?;
+    transaction_object_ref_handle_for_object_id(durable_refs, state, object_table, object_id)
 }
 
 fn transaction_object_ref_handle_for_object_id(
+    durable_refs: &DurableReferenceRegistry,
+    state: &mut TransactionState,
+    object_table: &mut ObjectTable,
+    object_id: crate::runtime::transaction::ObjectId,
+) -> Result<core::num::NonZeroU32> {
+    let handle =
+        state.transaction_ref_handle_for_object_id_avoiding(object_table, object_id, |raw| {
+            live_ref_raw_is_registered(durable_refs, raw)
+        })?;
+    core::num::NonZeroU32::new(handle).context("transaction object ref handle cannot be zero")
+}
+
+fn transaction_object_ref_handle_for_shared_object_id(
     durable_refs: &DurableReferenceRegistry,
     object_table: &mut ObjectTable,
     object_id: crate::runtime::transaction::ObjectId,
@@ -2800,7 +2825,7 @@ fn transaction_tarray_set_impl(
     let value = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+    let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
     state.stage_array_element(object_table, object_id, index, value)
 }
 
@@ -2838,7 +2863,7 @@ fn transaction_tarray_fill_impl(
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     ensure!(gc_ref != 0, "null tarray reference");
-    let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+    let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
     state.fill_array_range(object_table, object_id, index, len, value)
 }
 
@@ -2876,8 +2901,8 @@ fn transaction_tarray_copy_impl(
     let len = usize::try_from(len).context("transactional array length overflow")?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let dst_object_id = object_table.object_id_for_transaction_ref_handle(dst_gc_ref)?;
-    let src_object_id = object_table.object_id_for_transaction_ref_handle(src_gc_ref)?;
+    let dst_object_id = state.object_id_for_transaction_ref_handle(object_table, dst_gc_ref)?;
+    let src_object_id = state.object_id_for_transaction_ref_handle(object_table, src_gc_ref)?;
     state.copy_array_range(
         object_table,
         dst_object_id,
@@ -2941,7 +2966,7 @@ fn transaction_tarray_init_data_impl(
     ensure!(element_size > 0, "transactional array element size is zero");
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+    let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
     let dst_end = dst
         .checked_add(len)
         .context("transactional array destination range overflow")?;
@@ -3011,7 +3036,7 @@ fn transaction_tarray_init_elem_impl(
     let store = store.store_opaque_mut();
     let (durable_refs, state, object_table) =
         store.transaction_durable_refs_state_and_object_table_mut();
-    let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+    let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
     let dst_end = dst
         .checked_add(len)
         .context("transactional array destination range overflow")?;
@@ -3038,7 +3063,7 @@ fn transaction_tarray_init_elem_impl(
     } else {
         unsafe { core::slice::from_raw_parts(elem.add(byte_start).cast_const(), byte_len) }
     };
-    let values = decode_transaction_array_elem_values(durable_refs, object_table, bytes)?;
+    let values = decode_transaction_array_elem_values(durable_refs, &*state, object_table, bytes)?;
     state.write_array_range(object_table, object_id, dst, values)
 }
 
@@ -3071,13 +3096,14 @@ fn transaction_tarray_get_bytes_impl(
     let value = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+        let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
         state.read_array_element(object_table, object_id, index)?
     };
     let abi = {
         let store = store.store_opaque_mut();
-        let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
-        live_transaction_abi_from_object_value(durable_refs, object_table, &value)?
+        let (durable_refs, state, object_table) =
+            store.transaction_durable_refs_state_and_object_table_mut();
+        live_transaction_abi_from_object_value(durable_refs, state, object_table, &value)?
     };
     Ok(object_value_abi_bytes(abi))
 }
@@ -3108,7 +3134,7 @@ fn transaction_tarray_len_bytes_impl(
     let len = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
-        let object_id = object_table.object_id_for_transaction_ref_handle(gc_ref)?;
+        let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
         state.read_array_len(object_table, object_id)?
     };
     let len = u32::try_from(len).context("transactional array length does not fit i32")?;
@@ -3120,6 +3146,7 @@ fn transaction_tarray_len_bytes_impl(
 
 fn object_value_from_transaction_abi(
     durable_refs: &mut DurableReferenceRegistry,
+    state: Option<&TransactionState>,
     object_table: &mut ObjectTable,
     abi: ObjectValueAbi,
 ) -> Result<ObjectValue> {
@@ -3127,7 +3154,7 @@ fn object_value_from_transaction_abi(
     if tag != OBJECT_VALUE_ABI_TAG_REF {
         return abi.to_object_value();
     }
-    live_ref_value_from_raw(durable_refs, object_table, high, low)
+    live_ref_value_from_raw(durable_refs, state, object_table, high, low)
 }
 
 fn object_value_from_persistent_slot_abi(
@@ -3143,7 +3170,7 @@ fn object_value_from_persistent_slot_abi(
         store.transaction_promotion_context_mut();
 
     if high != OBJECT_VALUE_ABI_LIVE_REF_KIND_GC {
-        return live_ref_value_from_raw(durable_refs, object_table, high, low);
+        return live_ref_value_from_raw(durable_refs, Some(&*state), object_table, high, low);
     }
 
     if low == 0 {
@@ -3154,9 +3181,13 @@ fn object_value_from_persistent_slot_abi(
     }
 
     let gc_ref = u32::try_from(low).context("live GC reference does not fit u32")?;
-    if let Some(value) =
-        live_object_ref_value_from_ambiguous_raw(durable_refs, object_table, gc_ref, false)?
-    {
+    if let Some(value) = live_object_ref_value_from_ambiguous_raw(
+        durable_refs,
+        Some(&*state),
+        object_table,
+        gc_ref,
+        false,
+    )? {
         return Ok(value);
     }
 
@@ -3173,9 +3204,13 @@ fn object_value_from_persistent_slot_abi(
     if let Some(object_id) = promoted {
         return Ok(ObjectValue::Ref(Some(object_id)));
     }
-    if let Some(value) =
-        live_object_ref_value_from_ambiguous_raw(durable_refs, object_table, gc_ref, false)?
-    {
+    if let Some(value) = live_object_ref_value_from_ambiguous_raw(
+        durable_refs,
+        Some(&*state),
+        object_table,
+        gc_ref,
+        false,
+    )? {
         return Ok(value);
     }
     bail!(
@@ -3185,6 +3220,7 @@ fn object_value_from_persistent_slot_abi(
 
 fn live_transaction_abi_from_object_value(
     durable_refs: &DurableReferenceRegistry,
+    state: &mut TransactionState,
     object_table: &mut ObjectTable,
     value: &ObjectValue,
 ) -> Result<ObjectValueAbi> {
@@ -3197,10 +3233,12 @@ fn live_transaction_abi_from_object_value(
     }
     let (raw, kind) = match value {
         ObjectValue::Ref(Some(object_id)) => {
-            let handle = object_table.transaction_ref_handle_for_object_id_avoiding(
-                *object_id,
-                |raw| live_ref_raw_is_registered(durable_refs, raw),
-            )?;
+            let handle =
+                state.transaction_ref_handle_for_object_id_avoiding(
+                    object_table,
+                    *object_id,
+                    |raw| live_ref_raw_is_registered(durable_refs, raw),
+                )?;
             (
                 u64::from(handle),
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
@@ -3246,10 +3284,17 @@ fn live_ref_raw_is_registered(durable_refs: &DurableReferenceRegistry, raw: u32)
 }
 
 fn ensure_live_ref_raw_does_not_collide_with_transaction_handle(
+    state: Option<&TransactionState>,
     object_table: &ObjectTable,
     raw: u32,
     live_ref_kind: &str,
 ) -> Result<()> {
+    ensure!(
+        state
+            .and_then(|state| state.known_object_id_for_transaction_ref_handle(object_table, raw))
+            .is_none(),
+        "live {live_ref_kind} reference raw collides with transaction object handle"
+    );
     ensure!(
         object_table
             .known_object_id_for_transaction_ref_handle(raw)
@@ -3261,6 +3306,7 @@ fn ensure_live_ref_raw_does_not_collide_with_transaction_handle(
 
 fn live_object_ref_value_from_ambiguous_raw(
     durable_refs: &DurableReferenceRegistry,
+    state: Option<&TransactionState>,
     object_table: &ObjectTable,
     raw: u32,
     include_func_refs: bool,
@@ -3270,7 +3316,9 @@ fn live_object_ref_value_from_ambiguous_raw(
         .flatten();
     let extern_ = durable_refs.resolve_extern_ref(raw);
     let bridge_object = object_table.known_object_id_for_live_gc_ref_bridge(raw);
-    let handle_object = object_table.known_object_id_for_transaction_ref_handle(raw);
+    let handle_object = state
+        .and_then(|state| state.known_object_id_for_transaction_ref_handle(object_table, raw))
+        .or_else(|| object_table.known_object_id_for_transaction_ref_handle(raw));
     let matches = usize::from(func.is_some())
         + usize::from(extern_.is_some())
         + usize::from(bridge_object.is_some())
@@ -3293,6 +3341,7 @@ fn live_object_ref_value_from_ambiguous_raw(
 
 fn live_ref_value_from_raw(
     durable_refs: &mut DurableReferenceRegistry,
+    state: Option<&TransactionState>,
     object_table: &mut ObjectTable,
     live_ref_kind: u64,
     raw: u64,
@@ -3300,7 +3349,10 @@ fn live_ref_value_from_raw(
     if live_ref_kind == OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT {
         let handle =
             u32::try_from(raw).context("live persistent object reference does not fit u32")?;
-        let object_id = object_table.object_id_for_transaction_ref_handle(handle)?;
+        let object_id = match state {
+            Some(state) => state.object_id_for_transaction_ref_handle(object_table, handle)?,
+            None => object_table.object_id_for_transaction_ref_handle(handle)?,
+        };
         return Ok(ObjectValue::Ref(Some(object_id)));
     }
     if raw == 0 {
@@ -3315,6 +3367,7 @@ fn live_ref_value_from_raw(
                 usize::try_from(raw).context("live function reference does not fit usize")?;
             if let Ok(raw) = u32::try_from(raw) {
                 ensure_live_ref_raw_does_not_collide_with_transaction_handle(
+                    state,
                     object_table,
                     raw,
                     "function",
@@ -3327,6 +3380,7 @@ fn live_ref_value_from_raw(
             if let Ok(gc_ref) = u32::try_from(raw)
                 && let Some(value) = live_object_ref_value_from_ambiguous_raw(
                     durable_refs,
+                    state,
                     object_table,
                     gc_ref,
                     false,
@@ -3342,6 +3396,7 @@ fn live_ref_value_from_raw(
             let raw_gc_ref =
                 u32::try_from(raw).context("live external reference does not fit u32")?;
             ensure_live_ref_raw_does_not_collide_with_transaction_handle(
+                state,
                 object_table,
                 raw_gc_ref,
                 "external",
@@ -3353,6 +3408,7 @@ fn live_ref_value_from_raw(
             if let Ok(gc_ref) = u32::try_from(raw)
                 && let Some(value) = live_object_ref_value_from_ambiguous_raw(
                     durable_refs,
+                    state,
                     object_table,
                     gc_ref,
                     true,
@@ -4884,9 +4940,11 @@ mod tests {
             .unwrap();
         let expected_handle = objects.transaction_ref_handle_for_object_id(child).unwrap();
         let mut durable_refs = DurableReferenceRegistry::default();
+        let mut state = TransactionState::default();
 
         let abi = live_transaction_abi_from_object_value(
             &mut durable_refs,
+            &mut state,
             &mut objects,
             &ObjectValue::Ref(Some(child)),
         )
@@ -4902,7 +4960,8 @@ mod tests {
             child
         );
         assert_eq!(
-            object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi).unwrap(),
+            object_value_from_transaction_abi(&mut durable_refs, Some(&state), &mut objects, abi)
+                .unwrap(),
             ObjectValue::Ref(Some(child))
         );
     }
@@ -4941,9 +5000,11 @@ mod tests {
             .unwrap();
         let mut durable_refs = DurableReferenceRegistry::default();
         let expected_handle = objects.transaction_ref_handle_for_object_id(child).unwrap();
+        let mut state = TransactionState::default();
 
         let abi = live_transaction_abi_from_object_value(
             &mut durable_refs,
+            &mut state,
             &mut objects,
             &ObjectValue::Ref(Some(child)),
         )
@@ -4959,7 +5020,8 @@ mod tests {
             child
         );
         assert_eq!(
-            object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi).unwrap(),
+            object_value_from_transaction_abi(&mut durable_refs, Some(&state), &mut objects, abi)
+                .unwrap(),
             ObjectValue::Ref(Some(child))
         );
     }
@@ -5012,7 +5074,7 @@ mod tests {
         let mut durable_refs = DurableReferenceRegistry::default();
         let mut objects = ObjectTable::default();
 
-        let error = object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi)
+        let error = object_value_from_transaction_abi(&mut durable_refs, None, &mut objects, abi)
             .expect_err("explicit persistent object refs must not fall back to i31");
         assert!(
             error
@@ -5032,7 +5094,7 @@ mod tests {
         let mut durable_refs = DurableReferenceRegistry::default();
         let mut objects = ObjectTable::default();
 
-        let error = object_value_from_transaction_abi(&mut durable_refs, &mut objects, abi)
+        let error = object_value_from_transaction_abi(&mut durable_refs, None, &mut objects, abi)
             .expect_err("explicit persistent object refs must not decode null raw refs");
         assert!(
             error
@@ -5074,6 +5136,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
                 raw,
@@ -5084,6 +5147,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
                 raw,
@@ -5094,6 +5158,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
                 raw,
@@ -5122,6 +5187,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
                 u64::from(gc_raw),
@@ -5132,6 +5198,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
                 u64::from(handle),
@@ -5157,9 +5224,11 @@ mod tests {
         let object = objects
             .allocate_persistent_struct_for_gc_ref(0x718, vec![ObjectValue::I32(2)])
             .unwrap();
+        let mut state = TransactionState::default();
 
         let abi = live_transaction_abi_from_object_value(
             &durable_refs,
+            &mut state,
             &mut objects,
             &ObjectValue::Ref(Some(object)),
         )
@@ -5214,11 +5283,12 @@ mod tests {
         assert_ne!(handle, reserved_extern_raw);
         assert_ne!(usize::try_from(handle).unwrap(), reserved_func_raw);
         assert_eq!(
-            objects
-                .object_id_for_transaction_ref_handle(handle)
-                .unwrap(),
-            ObjectId { object_index: 0 }
+            state.known_object_id_for_transaction_ref_handle(&objects, handle),
+            Some(ObjectId {
+                object_index: 1u64 << 63
+            })
         );
+        assert_eq!(objects.live_count(), 0);
     }
 
     #[test]
@@ -5242,6 +5312,7 @@ mod tests {
 
         let error = live_ref_value_from_raw(
             &mut durable_refs,
+            None,
             &mut objects,
             OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
             u64::from(handle),
@@ -5253,6 +5324,7 @@ mod tests {
 
         let error = live_ref_value_from_raw(
             &mut durable_refs,
+            None,
             &mut objects,
             OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
             u64::from(handle),
@@ -5288,6 +5360,7 @@ mod tests {
 
         let func_value = object_value_from_transaction_abi(
             &mut writer_refs,
+            None,
             &mut objects,
             ObjectValueAbi::from_live_parts(
                 OBJECT_VALUE_ABI_TAG_REF,
@@ -5299,6 +5372,7 @@ mod tests {
         .unwrap();
         let extern_value = object_value_from_transaction_abi(
             &mut writer_refs,
+            None,
             &mut objects,
             ObjectValueAbi::from_live_parts(
                 OBJECT_VALUE_ABI_TAG_REF,
@@ -5321,8 +5395,10 @@ mod tests {
             .unwrap();
         let mut recovered_objects = ObjectTable::default();
         let empty_refs = DurableReferenceRegistry::default();
+        let mut state = TransactionState::default();
         let error = live_transaction_abi_from_object_value(
             &empty_refs,
+            &mut state,
             &mut recovered_objects,
             &recovered_func,
         )
@@ -5335,6 +5411,7 @@ mod tests {
         );
         let error = live_transaction_abi_from_object_value(
             &empty_refs,
+            &mut state,
             &mut recovered_objects,
             &recovered_extern,
         )
@@ -5356,6 +5433,7 @@ mod tests {
         assert_eq!(
             live_transaction_abi_from_object_value(
                 &rebound_refs,
+                &mut state,
                 &mut recovered_objects,
                 &recovered_func,
             )
@@ -5370,6 +5448,7 @@ mod tests {
         assert_eq!(
             live_transaction_abi_from_object_value(
                 &rebound_refs,
+                &mut state,
                 &mut recovered_objects,
                 &recovered_extern,
             )
@@ -5395,10 +5474,12 @@ mod tests {
             .register_extern_ref(0x5202, extern_identity)
             .unwrap();
         let mut objects = ObjectTable::default();
+        let mut state = TransactionState::default();
 
         assert_eq!(
             gc_snapshot_raw_from_object_value(
                 &durable_refs,
+                &mut state,
                 &mut objects,
                 ObjectValue::ExternRef(extern_identity),
                 "test GC reference"
@@ -5417,9 +5498,11 @@ mod tests {
         };
         let durable_refs = DurableReferenceRegistry::default();
         let mut objects = ObjectTable::default();
+        let mut state = TransactionState::default();
 
         let error = gc_snapshot_raw_from_object_value(
             &durable_refs,
+            &mut state,
             &mut objects,
             ObjectValue::ExternRef(extern_identity),
             "test GC reference",
@@ -5466,6 +5549,7 @@ mod tests {
 
         let err = live_ref_value_from_raw(
             &mut durable_refs,
+            None,
             &mut objects,
             OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
             gc_raw,
@@ -5480,6 +5564,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
                 u64::from(handle),
@@ -5501,6 +5586,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED,
                 raw,
@@ -5511,6 +5597,7 @@ mod tests {
         assert_eq!(
             live_ref_value_from_raw(
                 &mut durable_refs,
+                None,
                 &mut objects,
                 OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
                 raw,

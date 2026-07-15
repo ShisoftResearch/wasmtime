@@ -135,34 +135,52 @@ impl TransactionState {
         attempt: &mut PromotionAttempt,
     ) -> Result<ObjectId> {
         self.ensure_active()?;
-        if object_table.is_persistent(source)? {
-            return Ok(source);
-        }
         if let Some(promoted) = self.promoted_objects.get(&source).copied() {
             return Ok(promoted);
         }
 
-        let kind = object_table.kind(source)?;
+        let (kind, type_layout_id, source_payload) = if let Some(slot) =
+            self.local_object_table.slot(source)
+        {
+            let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
+                .context("promoted transaction-local object source layout id cannot be zero")?;
+            let payload = self
+                .staged_objects
+                .get(&source)
+                .map(|record| record.payload().clone())
+                .unwrap_or_else(|| slot.payload.clone());
+            (slot.kind, type_layout_id, payload)
+        } else {
+            if object_table.is_persistent(source)? {
+                return Ok(source);
+            }
+            let kind = object_table.kind(source)?;
+            ensure!(
+                matches!(kind, ObjectKind::Struct | ObjectKind::Array),
+                "transactional promotion currently supports struct and array object payloads"
+            );
+            if matches!(kind, ObjectKind::Struct | ObjectKind::Array) {
+                self.acquire_object_read(object_table, source)?;
+            }
+            let type_layout_id = TypeLayoutId::new(object_table.live_slot(source)?.type_layout_id)
+                .context("promoted object source layout id cannot be zero")?;
+            let payload = self
+                .staged_objects
+                .get(&source)
+                .map(|record| record.payload().clone())
+                .unwrap_or(object_table.payload(source)?);
+            (kind, type_layout_id, payload)
+        };
         ensure!(
             matches!(kind, ObjectKind::Struct | ObjectKind::Array),
             "transactional promotion currently supports struct and array object payloads"
         );
-        if matches!(kind, ObjectKind::Struct | ObjectKind::Array) {
-            self.acquire_object_read(object_table, source)?;
-        }
-        let type_layout_id = TypeLayoutId::new(object_table.live_slot(source)?.type_layout_id)
-            .context("promoted object source layout id cannot be zero")?;
         let promoted =
             object_table.reserve_persistent_object_id_for_promotion(kind, type_layout_id)?;
         self.record_allocated_object(promoted)?;
         self.promoted_objects.insert(source, promoted);
         attempt.record_promoted_object(source, promoted);
 
-        let source_payload = self
-            .staged_objects
-            .get(&source)
-            .map(|record| record.payload().clone())
-            .unwrap_or(object_table.payload(source)?);
         let promoted_payload = self.rewrite_payload_refs_for_promotion_in_attempt(
             object_table,
             source_payload,
@@ -217,6 +235,11 @@ impl TransactionState {
         let ObjectValue::Ref(Some(object_id)) = value else {
             return Ok(value);
         };
+        if self.local_object_table.contains(object_id) {
+            return Ok(ObjectValue::Ref(Some(
+                self.promote_transaction_object_graph_in_attempt(object_table, object_id, attempt)?,
+            )));
+        }
         if object_table.is_persistent(object_id)? {
             return Ok(ObjectValue::Ref(Some(object_id)));
         }
@@ -274,8 +297,12 @@ impl TransactionState {
         if gc_ref == 0 {
             return Ok(None);
         }
-        if let Some(object_id) = object_table.known_object_id_for_transaction_ref_handle(gc_ref) {
-            if object_table.is_persistent(object_id)? {
+        if let Some(object_id) =
+            self.known_object_id_for_transaction_ref_handle(object_table, gc_ref)
+        {
+            if !self.local_object_table.contains(object_id)
+                && object_table.is_persistent(object_id)?
+            {
                 return Ok(Some(object_id));
             }
             return self

@@ -12041,6 +12041,173 @@ fn transaction_object_commit_keeps_objects_allocated_by_active_transaction() {
 }
 
 #[test]
+fn transaction_local_object_allocation_is_isolated_until_commit() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+
+    state.begin().unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+
+    assert!(local.object_index >= (1u64 << 63));
+    assert_eq!(objects.live_count(), 0);
+    assert!(objects.kind(local).is_err());
+    assert_eq!(
+        state.known_object_id_for_transaction_ref_handle(&objects, handle),
+        Some(local)
+    );
+    assert!(
+        objects
+            .known_object_id_for_transaction_ref_handle(handle)
+            .is_none()
+    );
+
+    state
+        .stage_struct_field(&mut objects, local, 0, ObjectValue::I32(9))
+        .unwrap();
+    assert_eq!(
+        state.read_struct_field(&mut objects, local, 0).unwrap(),
+        ObjectValue::I32(9)
+    );
+    assert_eq!(objects.live_count(), 0);
+
+    assert!(state.commit_object_payloads(&mut objects).unwrap());
+    let committed = objects
+        .object_id_for_transaction_ref_handle(handle)
+        .unwrap();
+    assert_ne!(committed, local);
+    assert_eq!(committed, ObjectId { object_index: 0 });
+    assert_eq!(
+        objects.payload(committed).unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::I32(9)])
+    );
+    assert_eq!(
+        state.known_object_id_for_transaction_ref_handle(&objects, handle),
+        Some(committed)
+    );
+    state.complete_commit().unwrap();
+}
+
+#[test]
+fn transaction_local_object_commit_remaps_local_references() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+
+    state.begin().unwrap();
+    let child = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(7)], None)
+        .unwrap();
+    let owner = state
+        .allocate_transaction_local_struct(vec![ObjectValue::Ref(Some(child))], None)
+        .unwrap();
+    let child_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, child, |_| false)
+        .unwrap();
+    let owner_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, owner, |_| false)
+        .unwrap();
+
+    assert_eq!(objects.live_count(), 0);
+    assert!(state.commit_object_payloads(&mut objects).unwrap());
+
+    let committed_child = objects
+        .object_id_for_transaction_ref_handle(child_handle)
+        .unwrap();
+    let committed_owner = objects
+        .object_id_for_transaction_ref_handle(owner_handle)
+        .unwrap();
+    assert_eq!(
+        objects.payload(committed_child).unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::I32(7)])
+    );
+    assert_eq!(
+        objects.payload(committed_owner).unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(committed_child))])
+    );
+    state.complete_commit().unwrap();
+}
+
+#[test]
+fn transaction_local_object_promotion_survives_commit_id_remap() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+
+    state.begin().unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(7)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    state
+        .stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))
+        .unwrap();
+
+    let promoted = state
+        .promote_transaction_object_graph_for_test(&mut objects, local)
+        .unwrap();
+    let mut publications = Vec::new();
+    assert!(
+        state
+            .commit_object_payloads_into(&mut objects, &mut publications)
+            .unwrap()
+    );
+    let committed_local = objects
+        .object_id_for_transaction_ref_handle(handle)
+        .unwrap();
+    assert_ne!(committed_local, local);
+    assert_eq!(
+        state.promoted_object_for_test(committed_local),
+        Some(promoted)
+    );
+
+    let root_delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    assert!(
+        root_delta
+            .roots
+            .values()
+            .any(|roots| roots.contains(&promoted))
+    );
+    state
+        .complete_commit_with_persistent_root_delta_for_test(root_delta)
+        .unwrap();
+}
+
+#[test]
+fn transaction_local_object_abort_discards_without_shared_object_cleanup() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+
+    state.begin().unwrap();
+    let local = state
+        .allocate_transaction_local_array(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+
+    assert_eq!(objects.live_count(), 0);
+    assert_eq!(state.allocated_object_count_for_test(), 1);
+
+    state.abort().unwrap();
+
+    assert!(state.active_transaction().is_none());
+    assert_eq!(objects.live_count(), 0);
+    assert!(
+        objects
+            .object_id_for_transaction_ref_handle(handle)
+            .is_err()
+    );
+    assert_eq!(state.allocated_object_count_for_test(), 0);
+}
+
+#[test]
 fn transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges() {
     let mut objects = ObjectTable::default();
     let object = objects

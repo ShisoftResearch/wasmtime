@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement explicit Kotlin `TxRef` boundaries, `TxCopyable` copyability checks, and runtime live-GC promotion at all persistent-reference write boundaries.
+**Goal:** Implement explicit Kotlin `TxRef` boundaries, `TxCopyable` copyability checks, universal transactional-Wasm transaction-local object allocation, and runtime live-GC promotion at all persistent-reference write boundaries.
 
-**Architecture:** The Kotlin SDK exposes `TxRef`, `make_txn_ref`, `TxRef.get`, and `TxCopyable`. The Kotlin rewriter enforces source-level explicitness and copyability, while the runtime remains permission-blind and promotes any ordinary live WasmGC ref that reaches a persistent-reference slot. Constructors for copyable/persistent objects remain ordinary WasmGC constructors unless the source already uses transactional constructors; promotion happens at persistent writes, root/global/table staging, or commit.
+**Architecture:** The Kotlin SDK exposes `TxRef`, `make_txn_ref`, `TxRef.get`, and `TxCopyable`. The Kotlin rewriter enforces source-level explicitness and copyability. The runtime behavior is language-neutral: ordinary transactional Wasm constructors allocate through a transaction-local object table, publish into the shared object table only at commit, and discard local objects on abort. The runtime remains permission-blind and promotes any ordinary live WasmGC ref that reaches a persistent-reference slot. Constructors for copyable/persistent objects remain ordinary WasmGC constructors unless the source already uses transactional constructors; promotion happens at persistent writes, root/global/table staging, or commit.
 
 **Tech Stack:** Rust (`wasmtime-transaction-tools`, Wasmtime runtime/libcalls, transaction runtime tests), Kotlin Multiplatform Wasm/WASI SDK examples, Wasm parser/encoder tests, existing transaction promotion machinery.
 
@@ -13,6 +13,7 @@
 ## Conflict Resolution Locked By This Plan
 
 - Do not rewrite accepted ordinary constructors to `tstruct.new` or `tarray.new` just because a type is `@Persistent` or `TxCopyable`.
+- Do make transaction-local allocation universal for transactional Wasm runtime constructors, not a Kotlin-only behavior. Any frontend emitting `tstruct.new` or `tarray.new*` gets the same transaction-local object table semantics.
 - Do not make runtime check whether a live GC ref came from `TxRef.get()`. Explicitness is compile-time-only.
 - Do promote ordinary live WasmGC refs at every persistent-reference write/staging boundary, including `tstruct.set`, `tarray.set`, `tarray.fill`, `tglobal.set`, root publication, and persistent table writes.
 - Do reuse `TransactionState.promoted_gc_refs`; do not add a second promotion cache.
@@ -29,6 +30,7 @@
 - Modify `crates/transaction-tools/src/kotlin/rewrite.rs`: track explicit persistent types separately from generic captured GC types, detect `TxRef.get`, enforce provenance and copyability at source-level persistent boundaries, and keep constructors ordinary.
 - Modify `crates/transaction-tools/tests/kotlin_rewrite.rs`: add failing/passing rewriter tests for TxRef, TxCopyable, Serializable-as-copyable metadata, generic captured types, and constructor behavior.
 - Modify `crates/wasmtime/src/runtime/vm/libcalls.rs`: add a shared persistent-slot ABI conversion helper that promotes ordinary live GC refs through the existing promotion adapter and map; route struct, array, global, table/root write paths through it.
+- Modify `crates/wasmtime/src/runtime/transaction/state.rs` and `crates/wasmtime/src/runtime/transaction/object_table.rs`: add the transaction-local object table, handle resolution, commit publication, and local-to-shared object-id remapping used by all transactional Wasm constructors.
 - Modify `crates/wasmtime/src/runtime/transaction/tests.rs`: add focused runtime tests for repeated live GC ref promotion through persistent write/staging boundaries.
 - Modify `tests/transaction_kotlin_toolset.rs`: update Kotlin bank recovery assertions for persisted `String` note and aliasing.
 
@@ -1038,9 +1040,10 @@ Run:
 
 ```bash
 cargo test -p wasmtime --lib persistent_promotion_commit --features transaction -- --nocapture
+cargo test -p wasmtime --lib transaction_local_object --features transaction -- --nocapture
 ```
 
-Expected: PASS.
+Expected: both PASS.
 
 - [ ] **Step 4: Run Kotlin toolset tests**
 

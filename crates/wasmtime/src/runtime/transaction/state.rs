@@ -1,6 +1,13 @@
 use crate::runtime::transaction::concurrency::TransactionConflictAction;
+use wasmtime_environ::VMSharedTypeIndex;
 
+use super::object_table::default_type_layout_id_for_kind;
+use super::object_value::{
+    FIRST_TRANSACTION_OBJECT_REF_HANDLE, TRANSACTION_OBJECT_REF_HANDLE_STEP,
+};
 use super::*;
+
+const TRANSACTION_LOCAL_OBJECT_ID_BASE: u64 = 1u64 << 63;
 
 #[derive(Debug)]
 pub(crate) struct TransactionState {
@@ -27,6 +34,7 @@ pub(crate) struct TransactionState {
     pub(super) promoted_objects: BTreeMap<ObjectId, ObjectId>,
     pub(super) promoted_gc_refs: BTreeMap<u32, ObjectId>,
     pub(super) durable_leaf_gc_refs: BTreeSet<u32>,
+    pub(super) local_object_table: TransactionLocalObjectTable,
     pub(super) allocated_objects: Vec<ObjectId>,
     pub(super) pending_conflict_aborted_allocated_objects: Vec<ObjectId>,
     pub(super) granule_versions: BTreeMap<GranuleId, u64>,
@@ -52,6 +60,7 @@ pub(super) struct TransactionWorkspace {
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
     promoted_gc_refs: BTreeMap<u32, ObjectId>,
     durable_leaf_gc_refs: BTreeSet<u32>,
+    local_object_table: TransactionLocalObjectTable,
     allocated_objects: Vec<ObjectId>,
     conflict_aborted: bool,
     read_granules: BTreeSet<GranuleId>,
@@ -88,6 +97,7 @@ impl Default for TransactionState {
             promoted_objects: BTreeMap::new(),
             promoted_gc_refs: BTreeMap::new(),
             durable_leaf_gc_refs: BTreeSet::new(),
+            local_object_table: TransactionLocalObjectTable::default(),
             allocated_objects: Vec::new(),
             pending_conflict_aborted_allocated_objects: Vec::new(),
             granule_versions: BTreeMap::new(),
@@ -100,6 +110,190 @@ impl Default for TransactionState {
             pending_memory_store: None,
             durable_log: TxDurableLog::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransactionLocalObjectSlot {
+    pub(super) kind: ObjectKind,
+    pub(super) type_layout_id: u32,
+    pub(super) runtime_type_index: Option<VMSharedTypeIndex>,
+    pub(super) payload: ObjectPayload,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransactionLocalObjectTable {
+    slots: BTreeMap<ObjectId, TransactionLocalObjectSlot>,
+    transaction_ref_handles_to_objects: BTreeMap<u32, ObjectId>,
+    objects_to_transaction_ref_handles: BTreeMap<ObjectId, u32>,
+    next_transaction_ref_handle: u32,
+    next_object_index: u64,
+}
+
+impl Default for TransactionLocalObjectTable {
+    fn default() -> Self {
+        Self {
+            slots: BTreeMap::new(),
+            transaction_ref_handles_to_objects: BTreeMap::new(),
+            objects_to_transaction_ref_handles: BTreeMap::new(),
+            next_transaction_ref_handle: FIRST_TRANSACTION_OBJECT_REF_HANDLE,
+            next_object_index: TRANSACTION_LOCAL_OBJECT_ID_BASE,
+        }
+    }
+}
+
+impl TransactionLocalObjectTable {
+    fn is_local_object_id(object_id: ObjectId) -> bool {
+        object_id.object_index >= TRANSACTION_LOCAL_OBJECT_ID_BASE
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn allocate_payload(
+        &mut self,
+        payload: ObjectPayload,
+        runtime_type_index: Option<VMSharedTypeIndex>,
+    ) -> Result<ObjectId> {
+        let object_id = ObjectId {
+            object_index: self.next_object_index,
+        };
+        self.next_object_index = self
+            .next_object_index
+            .checked_add(1)
+            .context("transaction-local object id overflow")?;
+        ensure!(
+            Self::is_local_object_id(object_id),
+            "transaction-local object id namespace overflow"
+        );
+        let kind = payload.kind();
+        let type_layout_id = default_type_layout_id_for_kind(kind).get();
+        let previous = self.slots.insert(
+            object_id,
+            TransactionLocalObjectSlot {
+                kind,
+                type_layout_id,
+                runtime_type_index,
+                payload,
+            },
+        );
+        ensure!(
+            previous.is_none(),
+            "transaction-local object id was allocated twice"
+        );
+        Ok(object_id)
+    }
+
+    fn allocate_struct(
+        &mut self,
+        fields: Vec<ObjectValue>,
+        runtime_type_index: Option<VMSharedTypeIndex>,
+    ) -> Result<ObjectId> {
+        self.allocate_payload(ObjectPayload::Struct(fields), runtime_type_index)
+    }
+
+    fn allocate_array(
+        &mut self,
+        elements: Vec<ObjectValue>,
+        runtime_type_index: Option<VMSharedTypeIndex>,
+    ) -> Result<ObjectId> {
+        self.allocate_payload(ObjectPayload::Array(elements), runtime_type_index)
+    }
+
+    pub(super) fn slot(&self, object_id: ObjectId) -> Option<&TransactionLocalObjectSlot> {
+        self.slots.get(&object_id)
+    }
+
+    pub(super) fn contains(&self, object_id: ObjectId) -> bool {
+        self.slots.contains_key(&object_id)
+    }
+
+    fn kind(&self, object_id: ObjectId) -> Result<ObjectKind> {
+        self.slot(object_id).map(|slot| slot.kind).with_context(|| {
+            format!("transaction-local object table slot is not live: {object_id:?}")
+        })
+    }
+
+    fn payload(&self, object_id: ObjectId) -> Result<ObjectPayload> {
+        self.slot(object_id)
+            .map(|slot| slot.payload.clone())
+            .with_context(|| {
+                format!("transaction-local object table slot is not live: {object_id:?}")
+            })
+    }
+
+    fn runtime_type_index(&self, object_id: ObjectId) -> Result<Option<VMSharedTypeIndex>> {
+        self.slot(object_id)
+            .map(|slot| slot.runtime_type_index)
+            .with_context(|| {
+                format!("transaction-local object table slot is not live: {object_id:?}")
+            })
+    }
+
+    fn transaction_ref_handle_for_object_id_avoiding<F>(
+        &mut self,
+        object_id: ObjectId,
+        is_reserved_live_ref_raw: F,
+    ) -> Result<u32>
+    where
+        F: Fn(u32) -> bool,
+    {
+        self.kind(object_id)?;
+        if let Some(handle) = self
+            .objects_to_transaction_ref_handles
+            .get(&object_id)
+            .copied()
+        {
+            ensure!(
+                !is_reserved_live_ref_raw(handle),
+                "transaction object ref handle collides with registered live ref"
+            );
+            return Ok(handle);
+        }
+
+        let start = if self.next_transaction_ref_handle == 0 {
+            FIRST_TRANSACTION_OBJECT_REF_HANDLE
+        } else {
+            self.next_transaction_ref_handle
+        };
+        let mut candidate = start;
+        loop {
+            if !self
+                .transaction_ref_handles_to_objects
+                .contains_key(&candidate)
+                && !is_reserved_live_ref_raw(candidate)
+            {
+                self.transaction_ref_handles_to_objects
+                    .insert(candidate, object_id);
+                self.objects_to_transaction_ref_handles
+                    .insert(object_id, candidate);
+                self.next_transaction_ref_handle = candidate
+                    .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
+                    .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
+                return Ok(candidate);
+            }
+            candidate = candidate
+                .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
+                .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
+            ensure!(
+                candidate != start,
+                "transaction object ref handle space is exhausted"
+            );
+        }
+    }
+
+    fn known_object_id_for_transaction_ref_handle(&self, handle: u32) -> Option<ObjectId> {
+        let handle = TransactionObjectRefRaw::from_raw(handle).decode()?;
+        let object_id = self
+            .transaction_ref_handles_to_objects
+            .get(&handle)
+            .copied()?;
+        self.contains(object_id).then_some(object_id)
     }
 }
 
@@ -1119,6 +1313,206 @@ impl TransactionState {
         Ok(true)
     }
 
+    pub(crate) fn allocate_transaction_local_struct(
+        &mut self,
+        fields: Vec<ObjectValue>,
+        runtime_type_index: Option<VMSharedTypeIndex>,
+    ) -> Result<ObjectId> {
+        self.ensure_active()?;
+        self.local_object_table
+            .allocate_struct(fields, runtime_type_index)
+    }
+
+    pub(crate) fn allocate_transaction_local_array(
+        &mut self,
+        elements: Vec<ObjectValue>,
+        runtime_type_index: Option<VMSharedTypeIndex>,
+    ) -> Result<ObjectId> {
+        self.ensure_active()?;
+        self.local_object_table
+            .allocate_array(elements, runtime_type_index)
+    }
+
+    pub(crate) fn transaction_ref_handle_for_object_id_avoiding<F>(
+        &mut self,
+        object_table: &mut ObjectTable,
+        object_id: ObjectId,
+        is_reserved_live_ref_raw: F,
+    ) -> Result<u32>
+    where
+        F: Fn(u32) -> bool,
+    {
+        if self.local_object_table.contains(object_id) {
+            return self
+                .local_object_table
+                .transaction_ref_handle_for_object_id_avoiding(object_id, |raw| {
+                    is_reserved_live_ref_raw(raw)
+                        || object_table
+                            .known_object_id_for_transaction_ref_handle(raw)
+                            .is_some()
+                        || object_table
+                            .known_object_id_for_live_gc_ref_bridge(raw)
+                            .is_some()
+                });
+        }
+        object_table
+            .transaction_ref_handle_for_object_id_avoiding(object_id, is_reserved_live_ref_raw)
+    }
+
+    pub(crate) fn known_object_id_for_transaction_ref_handle(
+        &self,
+        object_table: &ObjectTable,
+        handle: u32,
+    ) -> Option<ObjectId> {
+        self.local_object_table
+            .known_object_id_for_transaction_ref_handle(handle)
+            .or_else(|| object_table.known_object_id_for_transaction_ref_handle(handle))
+    }
+
+    pub(crate) fn object_id_for_transaction_ref_handle(
+        &self,
+        object_table: &ObjectTable,
+        handle: u32,
+    ) -> Result<ObjectId> {
+        if let Some(object_id) = self
+            .local_object_table
+            .known_object_id_for_transaction_ref_handle(handle)
+        {
+            return Ok(object_id);
+        }
+        object_table.object_id_for_transaction_ref_handle(handle)
+    }
+
+    pub(crate) fn object_id_for_live_bridge_transaction_ref_raw(
+        &self,
+        object_table: &ObjectTable,
+        raw_ref: u32,
+    ) -> Result<ObjectId> {
+        ensure!(raw_ref != 0, "transactional object cannot use null ref");
+        if let Some(object_id) =
+            self.known_object_id_for_transaction_ref_handle(object_table, raw_ref)
+        {
+            return Ok(object_id);
+        }
+        object_table.object_id_for_live_bridge_transaction_ref_raw(raw_ref)
+    }
+
+    pub(crate) fn known_persistent_object_id_for_transaction_ref_handle(
+        &self,
+        object_table: &ObjectTable,
+        handle: u32,
+    ) -> Result<Option<ObjectId>> {
+        if self
+            .local_object_table
+            .known_object_id_for_transaction_ref_handle(handle)
+            .is_some()
+        {
+            return Ok(None);
+        }
+        object_table.known_persistent_object_id_for_transaction_ref_handle(handle)
+    }
+
+    pub(crate) fn object_kind(
+        &self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+    ) -> Result<ObjectKind> {
+        if self.local_object_table.contains(object_id) {
+            return self.local_object_table.kind(object_id);
+        }
+        object_table.kind(object_id)
+    }
+
+    pub(crate) fn runtime_type_index(
+        &self,
+        object_table: &ObjectTable,
+        object_id: ObjectId,
+    ) -> Result<Option<VMSharedTypeIndex>> {
+        if self.local_object_table.contains(object_id) {
+            return self.local_object_table.runtime_type_index(object_id);
+        }
+        object_table.runtime_type_index(object_id)
+    }
+
+    pub(crate) fn commit_transaction_local_objects(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<bool> {
+        self.ensure_active()?;
+        if self.local_object_table.is_empty() {
+            return Ok(false);
+        }
+
+        let local_slots = self
+            .local_object_table
+            .slots
+            .iter()
+            .map(|(&object_id, slot)| (object_id, slot.clone()))
+            .collect::<Vec<_>>();
+        let local_handles = self
+            .local_object_table
+            .transaction_ref_handles_to_objects
+            .clone();
+        let mut remap = BTreeMap::new();
+
+        for (local_id, slot) in &local_slots {
+            let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
+                .context("transaction-local object type layout id cannot be zero")?;
+            let object_id = object_table.allocate_payload_with_type_layout_id(
+                ObjectPayload::default_for_kind(slot.kind)?,
+                type_layout_id,
+                false,
+            )?;
+            if let Some(runtime_type_index) = slot.runtime_type_index {
+                object_table.set_runtime_type_index(object_id, runtime_type_index)?;
+            }
+            remap.insert(*local_id, object_id);
+        }
+
+        for (handle, local_id) in local_handles {
+            let object_id = remap
+                .get(&local_id)
+                .copied()
+                .context("transaction-local handle referred to missing local object")?;
+            object_table.associate_transaction_ref_handle_for_object_id(handle, object_id)?;
+        }
+
+        for (local_id, slot) in &local_slots {
+            let object_id = remap
+                .get(local_id)
+                .copied()
+                .context("transaction-local object was not installed")?;
+            let mut payload = self
+                .staged_objects
+                .get(local_id)
+                .map(|record| record.payload().clone())
+                .unwrap_or_else(|| slot.payload.clone());
+            remap_object_payload_refs(&mut payload, &remap);
+            object_table.update_payload(object_id, payload)?;
+        }
+
+        for local_id in self.local_object_table.slots.keys() {
+            self.staged_objects.remove(local_id);
+        }
+        for record in self.staged_objects.values_mut() {
+            remap_object_payload_refs(&mut record.payload, &remap);
+        }
+        let promoted_remaps = remap
+            .iter()
+            .filter_map(|(local_id, committed_id)| {
+                self.promoted_objects
+                    .get(local_id)
+                    .copied()
+                    .map(|promoted| (*committed_id, promoted))
+            })
+            .collect::<Vec<_>>();
+        for (committed_id, promoted) in promoted_remaps {
+            self.promoted_objects.insert(committed_id, promoted);
+        }
+        self.local_object_table = TransactionLocalObjectTable::default();
+        Ok(true)
+    }
+
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
         self.ensure_active()?;
         self.active_conflict_aborted = false;
@@ -1886,7 +2280,7 @@ impl TransactionState {
         handle: u32,
     ) -> Result<bool> {
         let Some(object_id) =
-            object_table.known_persistent_object_id_for_transaction_ref_handle(handle)?
+            self.known_persistent_object_id_for_transaction_ref_handle(object_table, handle)?
         else {
             return Ok(false);
         };
@@ -1899,7 +2293,7 @@ impl TransactionState {
         handle: u32,
     ) -> Result<bool> {
         let Some(object_id) =
-            object_table.known_persistent_object_id_for_transaction_ref_handle(handle)?
+            self.known_persistent_object_id_for_transaction_ref_handle(object_table, handle)?
         else {
             return Ok(false);
         };
@@ -1911,6 +2305,12 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         object_id: ObjectId,
     ) -> Result<ObjectPayload> {
+        if let Some(record) = self.staged_objects.get(&object_id) {
+            return Ok(record.payload().clone());
+        }
+        if self.local_object_table.contains(object_id) {
+            return self.local_object_table.payload(object_id);
+        }
         object_table.refresh_persistent_object_from_shared_directory(object_id)?;
         if object_table.is_persistent(object_id)? {
             let granule = object_table.granule_id(object_id)?;
@@ -1921,9 +2321,6 @@ impl TransactionState {
             let version = self.current_object_version_for_granule(granule, object_table)?;
             self.validate_active_read(granule, version)?;
         }
-        if let Some(record) = self.staged_objects.get(&object_id) {
-            return Ok(record.payload().clone());
-        }
         object_table.payload(object_id)
     }
 
@@ -1933,6 +2330,16 @@ impl TransactionState {
         object_id: ObjectId,
         payload: ObjectPayload,
     ) -> Result<bool> {
+        if self.local_object_table.contains(object_id) {
+            ensure!(
+                self.local_object_table.kind(object_id)? == payload.kind(),
+                "object payload kind does not match transaction-local object slot kind"
+            );
+            return Ok(self
+                .staged_objects
+                .insert(object_id, StagedObjectRecord::new(payload))
+                .is_none());
+        }
         ensure!(
             object_table.kind(object_id)? == payload.kind(),
             "object payload kind does not match object table slot kind"
@@ -2855,8 +3262,9 @@ impl TransactionState {
         self.ensure_active()?;
         self.drain_conflict_aborted_allocated_objects(object_table)?;
         self.validate_active_object_reads(object_table)?;
+        let committed_local_objects = self.commit_transaction_local_objects(object_table)?;
         if self.staged_objects.is_empty() {
-            return Ok(false);
+            return Ok(committed_local_objects);
         }
         let updates = self
             .staged_objects
@@ -3326,6 +3734,7 @@ impl TransactionState {
             promoted_objects: mem::take(&mut self.promoted_objects),
             promoted_gc_refs: mem::take(&mut self.promoted_gc_refs),
             durable_leaf_gc_refs: mem::take(&mut self.durable_leaf_gc_refs),
+            local_object_table: mem::take(&mut self.local_object_table),
             allocated_objects: mem::take(&mut self.allocated_objects),
             conflict_aborted: mem::take(&mut self.active_conflict_aborted),
             read_granules: mem::take(&mut self.read_granules),
@@ -3348,6 +3757,7 @@ impl TransactionState {
         self.promoted_objects = workspace.promoted_objects;
         self.promoted_gc_refs = workspace.promoted_gc_refs;
         self.durable_leaf_gc_refs = workspace.durable_leaf_gc_refs;
+        self.local_object_table = workspace.local_object_table;
         self.allocated_objects = workspace.allocated_objects;
         self.active_conflict_aborted = workspace.conflict_aborted;
         self.read_granules = workspace.read_granules;
@@ -3445,6 +3855,21 @@ fn persistent_root_object_id_for_table_element_snapshot(
             object_table.persistent_object_id_for_live_bridge_or_promotion_required(gc_ref)
         }
         TableElementSnapshot::FuncRef(_) => Ok(None),
+    }
+}
+
+fn remap_object_payload_refs(payload: &mut ObjectPayload, remap: &BTreeMap<ObjectId, ObjectId>) {
+    let values = match payload {
+        ObjectPayload::Struct(fields) => fields,
+        ObjectPayload::Array(elements) => elements,
+    };
+    for value in values {
+        let ObjectValue::Ref(Some(object_id)) = value else {
+            continue;
+        };
+        if let Some(mapped) = remap.get(object_id).copied() {
+            *object_id = mapped;
+        }
     }
 }
 
@@ -3559,7 +3984,7 @@ impl TransactionState {
     }
 
     pub(super) fn allocated_object_count_for_test(&self) -> usize {
-        self.allocated_objects.len()
+        self.allocated_objects.len() + self.local_object_table.len()
     }
 
     pub(super) fn read_tmemory_range_for_test(

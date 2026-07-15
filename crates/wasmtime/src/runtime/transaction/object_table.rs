@@ -1041,6 +1041,44 @@ impl ObjectTable {
         }
     }
 
+    pub(crate) fn associate_transaction_ref_handle_for_object_id(
+        &mut self,
+        handle: u32,
+        object_id: ObjectId,
+    ) -> Result<()> {
+        let handle = TransactionObjectRefRaw::from_handle(handle)?.as_raw();
+        self.live_slot(object_id)?;
+        ensure!(
+            !self.live_bridge_gc_refs_to_objects.contains_key(&handle),
+            "transaction object ref handle collides with live GC ref bridge"
+        );
+        if let Some(existing) = self
+            .transaction_ref_handles_to_objects
+            .get(&handle)
+            .copied()
+        {
+            ensure!(
+                existing == object_id,
+                "transaction object ref handle is already associated"
+            );
+        }
+        if let Some(existing) = self
+            .objects_to_transaction_ref_handles
+            .get(&object_id)
+            .copied()
+        {
+            ensure!(
+                existing == handle,
+                "transaction object id is already associated with another ref handle"
+            );
+        }
+        self.transaction_ref_handles_to_objects
+            .insert(handle, object_id);
+        self.objects_to_transaction_ref_handles
+            .insert(object_id, handle);
+        Ok(())
+    }
+
     pub(crate) fn object_id_for_transaction_ref_handle(&self, handle: u32) -> Result<ObjectId> {
         let handle = TransactionObjectRefRaw::from_handle(handle)?.as_raw();
         let object_id = self
@@ -2785,7 +2823,7 @@ pub fn retire_unreachable_object_chunks_for_test(
     Ok(retired)
 }
 
-fn default_type_layout_id_for_kind(kind: ObjectKind) -> TypeLayoutId {
+pub(super) fn default_type_layout_id_for_kind(kind: ObjectKind) -> TypeLayoutId {
     match kind {
         ObjectKind::Struct => TypeLayoutId::DEFAULT_STRUCT,
         ObjectKind::Array => TypeLayoutId::DEFAULT_ARRAY,
