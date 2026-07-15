@@ -20395,6 +20395,118 @@ fn transaction_object_static_initializers_return_transaction_ref_handles() {
 }
 
 #[test]
+fn transaction_object_static_initializers_follow_active_transaction_local_lifetime() {
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (type $a (tarray (mut (tref null $s))))
+              (type $f32a (tarray (mut f32)))
+              (global $sref (mut (tref null $s))
+                (tstruct.new $s (i32.const 7)))
+              (global $adef (mut (tref null $f32a))
+                (tarray.new_default $f32a (i32.const 2)))
+              (global $afixed (mut (tref null $a))
+                (tarray.new_fixed $a 2
+                  (tstruct.new $s (i32.const 41))
+                  (tref.null $s)))
+              (tfunc (export "read_struct") (result i32)
+                (tstruct.get $s 0 (tref.cast_read (global.get $sref))))
+              (tfunc (export "read_default_len") (result i32)
+                (tarray.len (global.get $adef)))
+              (tfunc (export "read_fixed") (result i32)
+                (local $roundtrip (tref null $s))
+                (local.set $roundtrip
+                  (tarray.get $a (tref.cast_read (global.get $afixed)) (i32.const 0)))
+                (i32.add
+                  (tstruct.get $s 0 (tref.cast_read (local.get $roundtrip)))
+                  (tarray.len (global.get $afixed)))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let transaction = store.transaction_state_mut().begin().unwrap();
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let read_struct = instance
+        .get_typed_func::<(), i32>(&mut store, "read_struct")
+        .unwrap();
+    let read_default_len = instance
+        .get_typed_func::<(), i32>(&mut store, "read_default_len")
+        .unwrap();
+    let read_fixed = instance
+        .get_typed_func::<(), i32>(&mut store, "read_fixed")
+        .unwrap();
+
+    assert_eq!(current_thread_transaction_for_test(), Some(transaction));
+    assert_eq!(
+        store.transaction_state().active_transaction(),
+        Some(transaction)
+    );
+    assert_eq!(read_struct.call(&mut store, ()).unwrap(), 7);
+    assert_eq!(read_default_len.call(&mut store, ()).unwrap(), 2);
+    assert_eq!(read_fixed.call(&mut store, ()).unwrap(), 43);
+    assert_eq!(
+        store.transaction_state().active_transaction(),
+        Some(transaction)
+    );
+
+    let objects = store.transaction_object_table();
+    assert_eq!(objects.live_count(), 0);
+    assert!(objects.live_object_ids_for_test().is_empty());
+    assert!(objects.live_bridge_gc_refs_to_objects.is_empty());
+    assert!(objects.object_to_live_bridge_gc_ref.is_empty());
+    assert!(objects.transaction_ref_handles_to_objects.is_empty());
+    assert!(objects.objects_to_transaction_ref_handles.is_empty());
+    assert_eq!(
+        store.transaction_state().allocated_object_count_for_test(),
+        4
+    );
+
+    store.transaction_state_mut().abort().unwrap();
+
+    assert_eq!(current_thread_transaction_for_test(), None);
+    assert_eq!(store.transaction_state().active_transaction(), None);
+    assert_eq!(
+        store.transaction_state().allocated_object_count_for_test(),
+        0
+    );
+    let objects = store.transaction_object_table();
+    assert_eq!(objects.live_count(), 0);
+    assert!(objects.live_object_ids_for_test().is_empty());
+    assert!(objects.transaction_ref_handles_to_objects.is_empty());
+    assert!(objects.objects_to_transaction_ref_handles.is_empty());
+
+    let err = read_struct.call(&mut store, ()).unwrap_err();
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("unknown transaction object ref handle"),
+        "{debug}"
+    );
+    assert_eq!(current_thread_transaction_for_test(), None);
+
+    let err = read_default_len.call(&mut store, ()).unwrap_err();
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("unknown transaction object ref handle"),
+        "{debug}"
+    );
+    assert_eq!(current_thread_transaction_for_test(), None);
+
+    let err = read_fixed.call(&mut store, ()).unwrap_err();
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("unknown transaction object ref handle"),
+        "{debug}"
+    );
+    assert_eq!(current_thread_transaction_for_test(), None);
+    assert_eq!(store.transaction_object_table().live_count(), 0);
+}
+
+#[test]
 fn exported_tfunc_publishing_tarray_to_tglobal_persists_it() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);

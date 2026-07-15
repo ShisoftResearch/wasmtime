@@ -2210,6 +2210,37 @@ fn transaction_tstruct_static_new_impl(
         }
     };
 
+    let active_transaction = store
+        .store_opaque()
+        .transaction_state()
+        .active_transaction()
+        .is_some();
+    if active_transaction {
+        let store = store.store_opaque_mut();
+        let (durable_refs, state, object_table) =
+            store.transaction_durable_refs_state_and_object_table_mut();
+        let mut values = Vec::with_capacity(field_count);
+        for abi in fields {
+            values.push(object_value_from_transaction_abi(
+                durable_refs,
+                Some(&*state),
+                object_table,
+                *abi,
+            )?);
+        }
+        for abi in layout_fields {
+            abi.to_field_layout()?;
+        }
+        let object_id =
+            state.allocate_transaction_local_struct(values, Some(runtime_type_index))?;
+        return transaction_object_ref_handle_for_object_id(
+            durable_refs,
+            state,
+            object_table,
+            object_id,
+        );
+    }
+
     let store = store.store_opaque_mut();
     let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
     let mut values = Vec::with_capacity(field_count);
@@ -2398,6 +2429,26 @@ fn transaction_tarray_static_new_impl(
     );
     let len = usize::try_from(len).context("transactional array length overflow")?;
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
+    let active_transaction = store
+        .store_opaque()
+        .transaction_state()
+        .active_transaction()
+        .is_some();
+    if active_transaction {
+        let store = store.store_opaque_mut();
+        let (durable_refs, state, object_table) =
+            store.transaction_durable_refs_state_and_object_table_mut();
+        let value =
+            object_value_from_transaction_abi(durable_refs, Some(&*state), object_table, abi)?;
+        return allocate_transaction_array_record(
+            durable_refs,
+            state,
+            object_table,
+            vec![value; len],
+            Some(runtime_type_index),
+        );
+    }
+
     let store = store.store_opaque_mut();
     let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
     let value = object_value_from_transaction_abi(durable_refs, None, object_table, abi)?;
@@ -2520,6 +2571,33 @@ fn transaction_tarray_static_new_fixed_impl(
     } else {
         unsafe { core::slice::from_raw_parts(elements.cast::<ObjectValueAbi>(), element_count) }
     };
+
+    let active_transaction = store
+        .store_opaque()
+        .transaction_state()
+        .active_transaction()
+        .is_some();
+    if active_transaction {
+        let store = store.store_opaque_mut();
+        let (durable_refs, state, object_table) =
+            store.transaction_durable_refs_state_and_object_table_mut();
+        let mut values = Vec::with_capacity(element_count);
+        for abi in elements {
+            values.push(object_value_from_transaction_abi(
+                durable_refs,
+                Some(&*state),
+                object_table,
+                *abi,
+            )?);
+        }
+        return allocate_transaction_array_record(
+            durable_refs,
+            state,
+            object_table,
+            values,
+            Some(runtime_type_index),
+        );
+    }
 
     let store = store.store_opaque_mut();
     let (durable_refs, object_table) = store.transaction_durable_refs_and_object_table_mut();
