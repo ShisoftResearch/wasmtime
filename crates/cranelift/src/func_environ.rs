@@ -5265,6 +5265,9 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<()> {
         self.ensure_transaction_global(global)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
+        if wasm_ty.is_vmgcref_type() {
+            self.needs_gc_heap = true;
+        }
         let expected_ty = self.transaction_global_value_type(wasm_ty)?;
         debug_assert_eq!(expected_ty, builder.func.dfg.value_type(val));
 
