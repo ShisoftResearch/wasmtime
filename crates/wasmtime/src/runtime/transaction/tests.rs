@@ -19750,14 +19750,7 @@ fn transaction_object_tstruct_executes_through_object_table() {
     assert_eq!(create_set_get.call(&mut store, ()).unwrap(), 42);
     assert_eq!(i31s.call(&mut store, ()).unwrap(), -1);
     assert_eq!(i31u.call(&mut store, ()).unwrap(), 0x7fffffff);
-    assert_eq!(store.transaction_object_table().live_count(), 1);
-    assert_eq!(
-        store
-            .transaction_object_table()
-            .payload(ObjectId { object_index: 0 })
-            .unwrap(),
-        ObjectPayload::Struct(vec![ObjectValue::I32(42)])
-    );
+    assert_eq!(store.transaction_object_table().live_count(), 0);
 }
 
 #[test]
@@ -19800,7 +19793,7 @@ fn transaction_object_tstruct_get_ref_roundtrips_into_object_operation() {
         .unwrap();
 
     assert_eq!(read_child.call(&mut store, ()).unwrap(), 7);
-    assert_eq!(store.transaction_object_table().live_count(), 3);
+    assert_eq!(store.transaction_object_table().live_count(), 0);
 }
 
 #[test]
@@ -19864,7 +19857,7 @@ fn transaction_object_tstruct_trap_frees_new_object_record() {
 
     assert_eq!(create_ok.call(&mut store, ()).unwrap(), 7);
     assert_eq!(current_thread_transaction_for_test(), None);
-    assert_eq!(store.transaction_object_table().live_count(), 1);
+    assert_eq!(store.transaction_object_table().live_count(), 0);
 }
 
 #[test]
@@ -19877,21 +19870,33 @@ fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
         &engine,
         r#"
             (module
-              (type $s (struct (field (mut i32))))
-              (global $slot (mut (ref null $s)) (ref.null $s))
+              (type $s (tstruct (field (mut i32))))
+              (tglobal $slot (mut (ref null $s)) (ref.null $s))
               (tfunc (export "new") (result i32)
-                (global.set $slot (tstruct.new $s (i32.const 1)))
-                (tstruct.get $s 0 (tref.cast_read (global.get $slot))))
+                (local $root (tref $s))
+                (local $value i32)
+                (local.set $root (tstruct.new $s (i32.const 1)))
+                (local.set $value
+                  (tstruct.get $s 0 (tref.cast_read (local.get $root))))
+                (tglobal.set $slot (local.get $root))
+                (local.get $value))
               (tfunc (export "read") (result i32)
-                (tstruct.get $s 0 (tref.cast_read (global.get $slot))))
+                (tstruct.get $s 0
+                  (tref.cast_read (ref.as_non_null (tglobal.get $slot)))))
               (tfunc (export "write_fail")
-                (tstruct.set $s 0 (tref.cast_write (global.get $slot)) (i32.const 99))
+                (tstruct.set $s 0
+                  (tref.cast_write (ref.as_non_null (tglobal.get $slot)))
+                  (i32.const 99))
                 (tfail))
               (tfunc (export "write_trap")
-                (tstruct.set $s 0 (tref.cast_write (global.get $slot)) (i32.const 77))
+                (tstruct.set $s 0
+                  (tref.cast_write (ref.as_non_null (tglobal.get $slot)))
+                  (i32.const 77))
                 (unreachable))
               (tfunc (export "write_ok") (param i32)
-                (tstruct.set $s 0 (tref.cast_write (global.get $slot)) (local.get 0))))
+                (tstruct.set $s 0
+                  (tref.cast_write (ref.as_non_null (tglobal.get $slot)))
+                  (local.get 0))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -19913,7 +19918,11 @@ fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
         .unwrap();
 
     assert_eq!(new.call(&mut store, ()).unwrap(), 1);
-    assert_eq!(store.transaction_object_table().live_count(), 1);
+    let objects = store.transaction_object_table();
+    assert_eq!(objects.live_count(), 1);
+    let live_ids = objects.live_object_ids_for_test();
+    assert_eq!(live_ids.len(), 1);
+    assert!(objects.is_persistent(live_ids[0]).unwrap());
 
     assert_eq!(read.call(&mut store, ()).unwrap(), 1);
 
@@ -19928,7 +19937,11 @@ fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
     write_ok.call(&mut store, 5).unwrap();
     assert_eq!(current_thread_transaction_for_test(), None);
     assert_eq!(read.call(&mut store, ()).unwrap(), 5);
-    assert_eq!(store.transaction_object_table().live_count(), 1);
+    let objects = store.transaction_object_table();
+    assert_eq!(objects.live_count(), 1);
+    let live_ids = objects.live_object_ids_for_test();
+    assert_eq!(live_ids.len(), 1);
+    assert!(objects.is_persistent(live_ids[0]).unwrap());
 }
 
 #[test]
@@ -19986,9 +19999,7 @@ fn transaction_object_tarray_executes_through_object_table() {
                 (local.set $aref
                   (tarray.new $a (i32.const 7) (i32.const 3)))
                 (tarray.set $a (tref.cast_write (local.get $aref)) (i32.const 1) (i32.const 42))
-                (i32.add
-                  (tarray.len (local.get $aref))
-                  (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 1)))))
+                (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 1))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -19997,23 +20008,12 @@ fn transaction_object_tarray_executes_through_object_table() {
         .get_typed_func::<(), i32>(&mut store, "create_set_get")
         .unwrap();
 
-    assert_eq!(create_set_get.call(&mut store, ()).unwrap(), 45);
-    assert_eq!(store.transaction_object_table().live_count(), 1);
-    assert_eq!(
-        store
-            .transaction_object_table()
-            .payload(ObjectId { object_index: 0 })
-            .unwrap(),
-        ObjectPayload::Array(vec![
-            ObjectValue::I32(7),
-            ObjectValue::I32(42),
-            ObjectValue::I32(7)
-        ])
-    );
+    assert_eq!(create_set_get.call(&mut store, ()).unwrap(), 42);
+    assert_eq!(store.transaction_object_table().live_count(), 0);
 }
 
 #[test]
-fn transaction_object_constructors_return_transaction_ref_handles() {
+fn transaction_object_constructors_use_local_handles_without_publishing() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);
     let engine = crate::Engine::new(&config).unwrap();
@@ -20053,71 +20053,13 @@ fn transaction_object_constructors_return_transaction_ref_handles() {
 
     let objects = store.transaction_object_table();
     let live_ids = objects.live_object_ids_for_test();
-    let struct_id = live_ids
-        .iter()
-        .copied()
-        .find(|object_id| {
-            objects.payload(*object_id).unwrap()
-                == ObjectPayload::Struct(vec![ObjectValue::I32(42)])
-        })
-        .unwrap();
-    let array_id = live_ids
-        .iter()
-        .copied()
-        .find(|object_id| {
-            objects.payload(*object_id).unwrap()
-                == ObjectPayload::Array(vec![
-                    ObjectValue::Ref(Some(struct_id)),
-                    ObjectValue::Ref(None),
-                ])
-        })
-        .unwrap();
-    let struct_handle = *objects
-        .objects_to_transaction_ref_handles
-        .get(&struct_id)
-        .unwrap();
-    let array_handle = *objects
-        .objects_to_transaction_ref_handles
-        .get(&array_id)
-        .unwrap();
 
-    assert_eq!(objects.live_count(), 2);
-    assert_eq!(live_ids.len(), 2);
+    assert_eq!(objects.live_count(), 0);
+    assert!(live_ids.is_empty());
     assert!(objects.live_bridge_gc_refs_to_objects.is_empty());
     assert!(objects.object_to_live_bridge_gc_ref.is_empty());
-    assert_eq!(objects.transaction_ref_handles_to_objects.len(), 2);
-    assert_eq!(objects.objects_to_transaction_ref_handles.len(), 2);
-    assert_eq!(
-        objects
-            .transaction_ref_handles_to_objects
-            .get(&struct_handle),
-        Some(&struct_id)
-    );
-    assert_eq!(
-        objects
-            .transaction_ref_handles_to_objects
-            .get(&array_handle),
-        Some(&array_id)
-    );
-    assert_eq!(
-        objects.known_object_id_for_live_gc_ref_bridge(struct_handle),
-        None
-    );
-    assert_eq!(
-        objects.known_object_id_for_live_gc_ref_bridge(array_handle),
-        None
-    );
-    assert_eq!(
-        objects.payload(struct_id).unwrap(),
-        ObjectPayload::Struct(vec![ObjectValue::I32(42)])
-    );
-    assert_eq!(
-        objects.payload(array_id).unwrap(),
-        ObjectPayload::Array(vec![
-            ObjectValue::Ref(Some(struct_id)),
-            ObjectValue::Ref(None)
-        ])
-    );
+    assert!(objects.transaction_ref_handles_to_objects.is_empty());
+    assert!(objects.objects_to_transaction_ref_handles.is_empty());
 }
 
 #[test]
@@ -20158,25 +20100,7 @@ fn transaction_object_tarray_default_and_fixed_constructors_create_object_record
         fixed_get.call(&mut store, ()).unwrap().to_bits(),
         3.0f32.to_bits()
     );
-    assert_eq!(store.transaction_object_table().live_count(), 2);
-    assert_eq!(
-        store
-            .transaction_object_table()
-            .payload(ObjectId { object_index: 0 })
-            .unwrap(),
-        ObjectPayload::Array(vec![ObjectValue::F32(0), ObjectValue::F32(0)])
-    );
-    assert_eq!(
-        store
-            .transaction_object_table()
-            .payload(ObjectId { object_index: 1 })
-            .unwrap(),
-        ObjectPayload::Array(vec![
-            ObjectValue::F32(1.0f32.to_bits()),
-            ObjectValue::F32(2.0f32.to_bits()),
-            ObjectValue::F32(3.0f32.to_bits())
-        ])
-    );
+    assert_eq!(store.transaction_object_table().live_count(), 0);
 }
 
 #[test]
@@ -20257,13 +20181,19 @@ fn exported_tfunc_returning_tarray_ref_enters_transaction() {
         &engine,
         r#"
             (module
-              (type $a (array (mut f32)))
-              (global $slot (mut (ref null $a)) (ref.null $a))
+              (type $a (tarray (mut f32)))
+              (tglobal $slot (mut (ref null $a)) (ref.null $a))
               (tfunc (export "new") (result i32)
-                (global.set $slot (tarray.new_default $a (i32.const 2)))
-                (tarray.len (global.get $slot)))
+                (local $root (tref $a))
+                (local $len i32)
+                (local.set $root (tarray.new_default $a (i32.const 2)))
+                (local.set $len (tarray.len (local.get $root)))
+                (tglobal.set $slot (local.get $root))
+                (local.get $len))
               (tfunc (export "read") (result f32)
-                (tarray.get $a (tref.cast_read (global.get $slot)) (i32.const 1))))
+                (tarray.get $a
+                  (tref.cast_read (ref.as_non_null (tglobal.get $slot)))
+                  (i32.const 1))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -20277,5 +20207,9 @@ fn exported_tfunc_returning_tarray_ref_enters_transaction() {
 
     assert_eq!(new.call(&mut store, ()).unwrap(), 2);
     assert_eq!(read.call(&mut store, ()).unwrap().to_bits(), 0);
-    assert_eq!(store.transaction_object_table().live_count(), 1);
+    let objects = store.transaction_object_table();
+    assert_eq!(objects.live_count(), 1);
+    let live_ids = objects.live_object_ids_for_test();
+    assert_eq!(live_ids.len(), 1);
+    assert!(objects.is_persistent(live_ids[0]).unwrap());
 }
