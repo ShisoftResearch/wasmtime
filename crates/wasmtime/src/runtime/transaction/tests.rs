@@ -12220,6 +12220,7 @@ fn transaction_local_handles_are_not_reused_after_abort() {
         .transaction_ref_handle_for_object_id_avoiding(&mut objects, first, |_| false)
         .unwrap();
     state.abort().unwrap();
+    objects.next_transaction_ref_handle = first_handle;
 
     state.begin().unwrap();
     let second = state
@@ -12231,11 +12232,72 @@ fn transaction_local_handles_are_not_reused_after_abort() {
 
     assert_ne!(first_handle, second_handle);
     assert_eq!(
+        second_handle,
+        first_handle
+            .checked_add(super::object_value::TRANSACTION_OBJECT_REF_HANDLE_STEP)
+            .unwrap_or(super::object_value::TRANSACTION_OBJECT_REF_HANDLE_STEP)
+    );
+    assert_eq!(
         state.known_object_id_for_transaction_ref_handle(&objects, first_handle),
         None
     );
 
     state.abort().unwrap();
+}
+
+#[test]
+fn transaction_local_reserved_handles_block_live_gc_bridge_registration() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+
+    state.begin().unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    let bridge_target = objects.allocate_struct(vec![ObjectValue::I32(2)]).unwrap();
+
+    let error = objects
+        .ensure_live_gc_ref_bridge_available(handle, "struct")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "transactional object GC ref collides with reserved transaction object handle"
+        )
+    );
+    let error = objects
+        .associate_live_gc_ref_for_transaction_bridge(handle, bridge_target)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "transactional object GC ref collides with reserved transaction object handle"
+        )
+    );
+    assert!(objects.live_bridge_gc_refs_to_objects.is_empty());
+    assert!(objects.object_to_live_bridge_gc_ref.is_empty());
+
+    state.abort().unwrap();
+
+    let error = objects
+        .ensure_live_gc_ref_bridge_available(handle, "struct")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "transactional object GC ref collides with reserved transaction object handle"
+        )
+    );
+    let error = objects
+        .associate_live_gc_ref_for_transaction_bridge(handle, bridge_target)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "transactional object GC ref collides with reserved transaction object handle"
+        )
+    );
+    assert!(objects.live_bridge_gc_refs_to_objects.is_empty());
+    assert!(objects.object_to_live_bridge_gc_ref.is_empty());
 }
 
 #[test]

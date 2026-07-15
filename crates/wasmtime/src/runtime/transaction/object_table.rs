@@ -66,6 +66,7 @@ pub(crate) struct ObjectTable {
     pub(crate) free_list: Vec<ObjectId>,
     pub(crate) transaction_ref_handles_to_objects: BTreeMap<u32, ObjectId>,
     pub(crate) objects_to_transaction_ref_handles: BTreeMap<ObjectId, u32>,
+    pub(crate) reserved_transaction_ref_handles: BTreeSet<u32>,
     pub(crate) next_transaction_ref_handle: u32,
     // SHISOFT-TWASM-MOCK: live transaction ref bridge; persistent object records
     // must use ObjectId and must not call this helper.
@@ -88,6 +89,7 @@ impl Default for ObjectTable {
             free_list: Vec::new(),
             transaction_ref_handles_to_objects: BTreeMap::new(),
             objects_to_transaction_ref_handles: BTreeMap::new(),
+            reserved_transaction_ref_handles: BTreeSet::new(),
             next_transaction_ref_handle: FIRST_TRANSACTION_OBJECT_REF_HANDLE,
             live_bridge_gc_refs_to_objects: BTreeMap::new(),
             object_to_live_bridge_gc_ref: BTreeMap::new(),
@@ -110,6 +112,14 @@ impl Default for ObjectTable {
 }
 
 impl ObjectTable {
+    fn ensure_transaction_ref_handle_not_reserved_for_gc_ref(&self, gc_ref: u32) -> Result<()> {
+        ensure!(
+            !self.reserved_transaction_ref_handles.contains(&gc_ref),
+            "transactional object GC ref collides with reserved transaction object handle"
+        );
+        Ok(())
+    }
+
     pub(crate) fn is_raw_i31_ref(raw_ref: u64) -> bool {
         raw_ref <= u64::from(u32::MAX) && (raw_ref & 1) == 1
     }
@@ -939,6 +949,7 @@ impl ObjectTable {
                 .contains_key(&gc_ref),
             "transactional object GC ref collides with transaction object handle"
         );
+        self.ensure_transaction_ref_handle_not_reserved_for_gc_ref(gc_ref)?;
         Ok(())
     }
 
@@ -955,6 +966,7 @@ impl ObjectTable {
                 .contains_key(&gc_ref),
             "transactional object GC ref collides with transaction object handle"
         );
+        self.ensure_transaction_ref_handle_not_reserved_for_gc_ref(gc_ref)?;
         if let Some(existing) = self.live_bridge_gc_refs_to_objects.get(&gc_ref).copied() {
             ensure!(
                 existing == object_id,
@@ -1005,9 +1017,11 @@ impl ObjectTable {
             if !self
                 .transaction_ref_handles_to_objects
                 .contains_key(&candidate)
+                && !self.reserved_transaction_ref_handles.contains(&candidate)
                 && !self.live_bridge_gc_refs_to_objects.contains_key(&candidate)
                 && !is_reserved_live_ref_raw(candidate)
             {
+                self.reserved_transaction_ref_handles.insert(candidate);
                 self.next_transaction_ref_handle = candidate
                     .checked_add(TRANSACTION_OBJECT_REF_HANDLE_STEP)
                     .unwrap_or(TRANSACTION_OBJECT_REF_HANDLE_STEP);
@@ -1084,6 +1098,7 @@ impl ObjectTable {
             .insert(handle, object_id);
         self.objects_to_transaction_ref_handles
             .insert(object_id, handle);
+        self.reserved_transaction_ref_handles.remove(&handle);
         Ok(())
     }
 
@@ -2003,6 +2018,7 @@ impl ObjectTable {
         self.free_list.clear();
         self.transaction_ref_handles_to_objects.clear();
         self.objects_to_transaction_ref_handles.clear();
+        self.reserved_transaction_ref_handles.clear();
         self.next_transaction_ref_handle = FIRST_TRANSACTION_OBJECT_REF_HANDLE;
         self.live_bridge_gc_refs_to_objects.clear();
         self.object_to_live_bridge_gc_ref.clear();
