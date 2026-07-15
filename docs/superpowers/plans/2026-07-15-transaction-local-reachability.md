@@ -4,7 +4,7 @@
 
 **Goal:** Make transactional Wasm object allocation bypass WasmGC while persisting only transaction-local objects reachable from committed persistent roots and discarding every unreachable local object.
 
-**Architecture:** Transactional constructors allocate into `TransactionLocalObjectTable` and receive store-wide monotonic transaction handles. Existing promotion tracing remains the only graph-copy mechanism: persistent roots and persistent-object writes promote reachable local graphs into persistent `ObjectId`s. Commit rebinds handles only for promoted objects, drops unpromoted handles and all local slots, and never publishes local objects into the shared volatile object table.
+**Architecture:** Transactional constructors allocate into `TransactionLocalObjectTable` and receive store-wide monotonic transaction handles. Transaction handle allocation exclusion is monotonic for an `ObjectTable` lifetime: an unpromoted or expired handle remains in `reserved_transaction_ref_handles` as a tombstone until full `ObjectTable` reset, while a promoted handle leaves that set only when installed in the permanent handle mapping, which still prevents reuse. Neither case makes a handle a persistence root. Existing promotion tracing remains the only graph-copy mechanism: persistent roots and persistent-object writes promote reachable local graphs into persistent `ObjectId`s. Commit rebinds handles only for promoted objects, drops unpromoted handles and all local slots, never publishes local objects into the shared volatile object table, and leaves pre-LP durable atomicity unchanged.
 
 **Tech Stack:** Rust, Wasmtime transaction runtime, transactional Wasm/WAT integration tests, existing persistent promotion and mark/sweep machinery.
 
@@ -18,13 +18,13 @@
 - Promotion recursively copies only root-reachable local objects and preserves cycles and aliasing through `promoted_objects`.
 - Commit never creates a non-persistent shared object slot for a transaction-local object.
 - A handle for a promoted local object is rebound to the promoted persistent `ObjectId`; an unpromoted handle expires.
-- Expired handles are not immediately reused by the next transaction.
+- Transaction handle allocation exclusion remains monotonic for the `ObjectTable` lifetime: unpromoted or expired handles stay in `reserved_transaction_ref_handles` as tombstones until full `ObjectTable` reset, while promoted handles leave that set only when installed in the permanent handle mapping, which still prevents reuse.
 - Abort discards all local slots and local handle mappings.
 - Static initialization outside an active transaction remains separate and is not changed by this plan.
 
 ## File Structure
 
-- Modify `crates/wasmtime/src/runtime/transaction/object_table.rs`: centralize store-wide transaction-handle reservation so local handles do not restart from the same value each transaction.
+- Modify `crates/wasmtime/src/runtime/transaction/object_table.rs`: centralize store-wide transaction-handle reservation and `reserved_transaction_ref_handles` tombstones so local handles do not restart from the same value each transaction.
 - Modify `crates/wasmtime/src/runtime/transaction/state.rs`: remove the local handle counter, finalize local objects by rebinding promoted handles and discarding local slots, and stop allocating shared volatile slots at commit.
 - Modify `crates/wasmtime/src/runtime/transaction/promotion.rs`: resolve local handles through `TransactionState` until finalization and require a promotion mapping before a local object can become a persistent root.
 - Modify `crates/wasmtime/src/runtime/transaction/tests.rs`: add state-level red/green tests and update Wasm execution tests to distinguish persistent roots from ordinary globals/results.
@@ -517,7 +517,7 @@ Replace the sentence saying all local handles are discarded with:
 After root publication, the runtime discards the transaction-local table and all
 unpromoted handle mappings. If a local object was promoted, any handle associated
 with that object may be rebound to the promoted persistent ObjectId so committed
-tglobal and persistent-table values remain immediately usable. The handle
+tglobal, persistent-root, and persistent-table values remain immediately usable. The handle
 survives because the object is persistently reachable, never because the handle
 itself is a root.
 ```
@@ -528,10 +528,18 @@ Change its architecture and conflict-resolution sections to say:
 
 ```text
 Transactional constructors allocate into a transaction-local table. Commit
-promotes only persistent-root-reachable graphs, rebinds promoted handles, and
-discards all other local slots and handles. No local object is published into the
-shared volatile object table merely because the transaction commits. Detailed
-execution is in 2026-07-15-transaction-local-reachability.md.
+promotes only persistent-root-reachable graphs, rebinds promoted handles to
+promoted persistent ObjectIds, and discards all other local slots and unpromoted
+handle mappings. No local object is published into the shared volatile object
+table merely because the transaction commits. Transaction handle allocation
+exclusion is monotonic for an ObjectTable lifetime: unpromoted or expired
+handles remain in reserved_transaction_ref_handles as tombstones until full
+ObjectTable reset, while promoted handles leave that set only when installed in
+the permanent handle mapping, which still prevents reuse. Neither case makes a
+handle a persistence root. Preserve the universal runtime scope, the Kotlin-only
+TxRef/TxCopyable boundary, the static initializer exception, and pre-LP
+atomicity. Detailed execution is in
+2026-07-15-transaction-local-reachability.md.
 ```
 
 Remove references to local-to-shared object-id remapping and replace them with local-to-promoted handle rebinding.

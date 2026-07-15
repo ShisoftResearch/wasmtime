@@ -218,12 +218,24 @@ implementation details. Reads, writes, casts, array operations, globals, roots,
 tables, and promotion must resolve handles through the active transaction state
 first and then fall back to the shared object table.
 
+Transaction handle allocation exclusion is monotonic for an `ObjectTable`
+lifetime. An unpromoted or expired handle remains in
+`reserved_transaction_ref_handles` as a tombstone until full `ObjectTable`
+reset. A promoted handle leaves that set only when it is installed in the
+permanent handle mapping, and that permanent mapping continues to prevent
+reuse. Neither case makes a handle a persistence root.
+
 At commit, promotion copies only the reachable transaction-local graph into
 persistent object records. The promotion map preserves cycles and repeated
 references, so multiple paths to one local object become multiple paths to one
-persistent `ObjectId`. After root publication, the runtime discards the complete
-transaction-local table and its handles. It must not first publish every local
-slot into the shared volatile object table.
+persistent `ObjectId`. After root publication, the runtime discards the
+transaction-local table and all unpromoted handle mappings. If a local object
+was promoted, any handle associated with that object may be rebound to the
+promoted persistent `ObjectId` so committed `tglobal`, persistent-root, and
+persistent-table values remain immediately usable. The handle survives because
+the object is persistently reachable, never because the handle itself is a
+root. This pre-LP finalization step does not change durable commit atomicity. It
+must not first publish every local slot into the shared volatile object table.
 
 The runtime promotion path remains responsible for the actual graph copy. The
 runtime does not check whether a live GC reference came from `TxRef.get()`;
