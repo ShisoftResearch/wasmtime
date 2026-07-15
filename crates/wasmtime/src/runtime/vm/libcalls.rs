@@ -1167,6 +1167,43 @@ fn transaction_tglobal_set_impl(
 
     let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = global_snapshot_from_tag(tag, value)?;
+    ensure_active_transaction(store)?;
+    stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
+}
+
+fn transaction_tglobal_startup_set(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    tag: u32,
+    value: u64,
+) -> Result<()> {
+    let result = transaction_tglobal_startup_set_impl(store, instance, global, tag, value);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tglobal_startup_set_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    tag: u32,
+    value: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+
+    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    let snapshot = global_snapshot_from_tag(tag, value)?;
+    write_or_stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
+}
+
+fn stage_transaction_global_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global_index: GlobalIndex,
+    wasm_ty: WasmValType,
+    snapshot: GlobalSnapshot,
+) -> Result<()> {
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
     if let GlobalSnapshot::GcRef(gc_ref) = snapshot {
         let abi = ObjectValueAbi::from_live_parts(
@@ -1200,6 +1237,40 @@ fn transaction_tglobal_set_impl(
     Ok(())
 }
 
+fn write_or_stage_transaction_global_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global_index: GlobalIndex,
+    wasm_ty: WasmValType,
+    snapshot: GlobalSnapshot,
+) -> Result<()> {
+    if store
+        .store_opaque()
+        .transaction_state()
+        .active_transaction()
+        .is_some()
+    {
+        return stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot);
+    }
+    write_transaction_global_snapshot_direct(store, instance, global_index, wasm_ty, snapshot)
+}
+
+fn write_transaction_global_snapshot_direct(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global_index: GlobalIndex,
+    wasm_ty: WasmValType,
+    snapshot: GlobalSnapshot,
+) -> Result<()> {
+    ensure_global_snapshot_type(snapshot, wasm_ty)?;
+    let mut global = global_definition_ptr(store, instance, global_index)?;
+    write_global_snapshot(
+        store.store_opaque_mut(),
+        unsafe { global.as_mut() },
+        snapshot,
+    )
+}
+
 fn transaction_tglobal_set_v128_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -1209,16 +1280,33 @@ fn transaction_tglobal_set_v128_impl(
     flush_pending_tmemory_store(store, instance)?;
 
     let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
-    ensure!(
-        matches!(wasm_ty, WasmValType::V128),
-        "transactional global value tag does not match global type"
-    );
     let snapshot = GlobalSnapshot::V128(unsafe { *value.cast::<[u8; 16]>() });
-    store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .stage_global_owned(Some(instance), global_index.as_u32(), snapshot)?;
-    Ok(())
+    ensure_active_transaction(store)?;
+    stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
+}
+
+fn transaction_tglobal_startup_set_v128(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    value: *mut u8,
+) -> Result<()> {
+    let result = transaction_tglobal_startup_set_v128_impl(store, instance, global, value);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_tglobal_startup_set_v128_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: u32,
+    value: *mut u8,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+
+    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    let snapshot = GlobalSnapshot::V128(unsafe { *value.cast::<[u8; 16]>() });
+    write_or_stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
 }
 
 fn transaction_global(
@@ -1260,6 +1348,12 @@ fn live_transaction_global_snapshot_for_read(
     let store = store.store_opaque_mut();
     let (engine, gc_store, durable_refs, state, object_table) =
         store.transaction_promotion_context_mut();
+    if state
+        .known_object_id_for_transaction_ref_handle(object_table, gc_ref)
+        .is_some()
+    {
+        return Ok(snapshot);
+    }
     let promoted = {
         let mut adapter =
             StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
@@ -1778,6 +1872,20 @@ fn table_element_snapshot_from_raw(
     })
 }
 
+fn transaction_table_snapshot_from_raw(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    value: *mut u8,
+) -> Result<TableElementSnapshot> {
+    let table_index = DefinedTableIndex::from_u32(table);
+    let mut store_no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
+    let (_gc_store, _registry, instance_ref) =
+        store_no_gc.optional_gc_store_and_registry_and_instance_mut(instance);
+    let table_ref = instance_ref.get_defined_table(table_index);
+    table_element_snapshot_from_raw(table_ref.element_type(), value)
+}
+
 fn normalize_persistent_table_snapshot(
     store: &mut StoreOpaque,
     snapshot: TableElementSnapshot,
@@ -1840,6 +1948,40 @@ fn table_element_snapshot_to_raw(value: TableElementSnapshot) -> *mut u8 {
             core::ptr::with_exposed_provenance_mut(usize::try_from(value).unwrap())
         }
     }
+}
+
+fn stage_transaction_table_element_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+    snapshot: TableElementSnapshot,
+) -> Result<()> {
+    ensure_transaction_table_index_in_bounds(store, instance, table, index)?;
+    let snapshot = normalize_persistent_table_snapshot(store.store_opaque_mut(), snapshot)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_table_element_owned(Some(instance), table, index, snapshot)?;
+    Ok(())
+}
+
+fn write_or_stage_transaction_table_element_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+    snapshot: TableElementSnapshot,
+) -> Result<()> {
+    if store
+        .store_opaque()
+        .transaction_state()
+        .active_transaction()
+        .is_some()
+    {
+        return stage_transaction_table_element_snapshot(store, instance, table, index, snapshot);
+    }
+    write_table_element_snapshot(store, instance, table, index, snapshot)
 }
 
 fn write_table_element_snapshot(
@@ -1936,22 +2078,76 @@ fn transaction_ttable_set_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
-    ensure_transaction_table_index_in_bounds(store, instance, table, index)?;
+    let snapshot = transaction_table_snapshot_from_raw(store, instance, table, value)?;
+    stage_transaction_table_element_snapshot(store, instance, table, index, snapshot)
+}
 
-    let snapshot = {
-        let table_index = DefinedTableIndex::from_u32(table);
-        let mut store_no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
-        let (_gc_store, _registry, instance_ref) =
-            store_no_gc.optional_gc_store_and_registry_and_instance_mut(instance);
-        let table_ref = instance_ref.get_defined_table(table_index);
-        table_element_snapshot_from_raw(table_ref.element_type(), value)?
-    };
-    let snapshot = normalize_persistent_table_snapshot(store.store_opaque_mut(), snapshot)?;
+fn transaction_ttable_startup_set(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+    value: *mut u8,
+) -> Result<()> {
+    let result = transaction_ttable_startup_set_impl(store, instance, table, index, value);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
 
-    store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .stage_table_element_owned(Some(instance), table, index, snapshot)?;
+fn transaction_ttable_startup_set_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    index: u64,
+    value: *mut u8,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    let snapshot = transaction_table_snapshot_from_raw(store, instance, table, value)?;
+    write_or_stage_transaction_table_element_snapshot(store, instance, table, index, snapshot)
+}
+
+fn transaction_ttable_startup_fill(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+    value: *mut u8,
+) -> Result<()> {
+    let result = transaction_ttable_startup_fill_impl(store, instance, table, start, len, value);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_startup_fill_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+    value: *mut u8,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_transaction_table_range_in_bounds(store, instance, table, start, len)?;
+    let snapshot = transaction_table_snapshot_from_raw(store, instance, table, value)?;
+    if store
+        .store_opaque()
+        .transaction_state()
+        .active_transaction()
+        .is_some()
+    {
+        let snapshot = normalize_persistent_table_snapshot(store.store_opaque_mut(), snapshot)?;
+        for element_index in start..start + len {
+            store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .stage_table_element_owned(Some(instance), table, element_index, snapshot)?;
+        }
+        return Ok(());
+    }
+    for element_index in start..start + len {
+        write_table_element_snapshot(store, instance, table, element_index, snapshot)?;
+    }
     Ok(())
 }
 

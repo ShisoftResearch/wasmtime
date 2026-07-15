@@ -203,6 +203,10 @@ macro_rules! foreach_builtin_function {
             transaction_tglobal_set(vmctx: vmctx, global: u32, tag: u32, value: u64) -> bool;
             // Stages a transactional v128 global write from a 16-byte value pointer.
             transaction_tglobal_set_v128(vmctx: vmctx, global: u32, value: pointer) -> bool;
+            // Initializes a transactional global during module startup, staging while active and writing directly while inactive.
+            transaction_tglobal_startup_set(vmctx: vmctx, global: u32, tag: u32, value: u64) -> bool;
+            // Initializes a transactional v128 global during module startup, staging while active and writing directly while inactive.
+            transaction_tglobal_startup_set_v128(vmctx: vmctx, global: u32, value: pointer) -> bool;
             // Returns a pointer to readable transactional memory bytes.
             transaction_tmemory_load(vmctx: vmctx, memory: u32, addr: u64, offset: u64, len: u32) -> pointer;
             // Returns a pointer to writable staged transactional memory bytes.
@@ -225,6 +229,10 @@ macro_rules! foreach_builtin_function {
             transaction_ttable_get(vmctx: vmctx, table: u32, index: u64) -> pointer;
             // Stages a transactional table element write.
             transaction_ttable_set(vmctx: vmctx, table: u32, index: u64, value: pointer) -> bool;
+            // Initializes a transactional table element during module startup, staging while active and writing directly while inactive.
+            transaction_ttable_startup_set(vmctx: vmctx, table: u32, index: u64, value: pointer) -> bool;
+            // Initializes a transactional table range during module startup, staging while active and writing directly while inactive.
+            transaction_ttable_startup_fill(vmctx: vmctx, table: u32, start: u64, len: u64, value: pointer) -> bool;
             // Acquires a readable transactional table range.
             transaction_ttable_read_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
             // Acquires a writable transactional table range.
@@ -553,7 +561,11 @@ mod tests {
         for builtin in [
             BuiltinFunctionIndex::transaction_tglobal_set(),
             BuiltinFunctionIndex::transaction_tglobal_set_v128(),
+            BuiltinFunctionIndex::transaction_tglobal_startup_set(),
+            BuiltinFunctionIndex::transaction_tglobal_startup_set_v128(),
             BuiltinFunctionIndex::transaction_ttable_set(),
+            BuiltinFunctionIndex::transaction_ttable_startup_set(),
+            BuiltinFunctionIndex::transaction_ttable_startup_fill(),
             BuiltinFunctionIndex::transaction_ttable_read_range(),
             BuiltinFunctionIndex::transaction_ttable_write_range(),
             BuiltinFunctionIndex::transaction_tstruct_new(),

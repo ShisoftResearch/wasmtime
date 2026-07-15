@@ -5231,16 +5231,47 @@ impl FuncEnvironment<'_> {
         global: GlobalIndex,
         val: ir::Value,
     ) -> WasmResult<()> {
+        self.translate_transaction_tglobal_set_with_builtins(
+            builder,
+            global,
+            val,
+            BuiltinFunctionIndex::transaction_tglobal_set(),
+            BuiltinFunctionIndex::transaction_tglobal_set_v128(),
+        )
+    }
+
+    fn translate_transaction_tglobal_startup_set(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        global: GlobalIndex,
+        val: ir::Value,
+    ) -> WasmResult<()> {
+        self.translate_transaction_tglobal_set_with_builtins(
+            builder,
+            global,
+            val,
+            BuiltinFunctionIndex::transaction_tglobal_startup_set(),
+            BuiltinFunctionIndex::transaction_tglobal_startup_set_v128(),
+        )
+    }
+
+    fn translate_transaction_tglobal_set_with_builtins(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        global: GlobalIndex,
+        val: ir::Value,
+        scalar_builtin: BuiltinFunctionIndex,
+        v128_builtin: BuiltinFunctionIndex,
+    ) -> WasmResult<()> {
         self.ensure_transaction_global(global)?;
         let wasm_ty = self.module.globals[global].wasm_ty;
         let expected_ty = self.transaction_global_value_type(wasm_ty)?;
         debug_assert_eq!(expected_ty, builder.func.dfg.value_type(val));
 
         if matches!(wasm_ty, WasmValType::V128) {
-            let callee = self.builtin_functions.load_builtin(
-                builder.func,
-                BuiltinFunctionIndex::transaction_tglobal_set_v128(),
-            );
+            let callee = self
+                .builtin_functions
+                .load_builtin(builder.func, v128_builtin);
             let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
                 ir::StackSlotKind::ExplicitSlot,
                 16,
@@ -5258,10 +5289,9 @@ impl FuncEnvironment<'_> {
             return Ok(());
         }
 
-        let callee = self.builtin_functions.load_builtin(
-            builder.func,
-            BuiltinFunctionIndex::transaction_tglobal_set(),
-        );
+        let callee = self
+            .builtin_functions
+            .load_builtin(builder.func, scalar_builtin);
         let (tag, value) = self.transaction_global_value_payload(builder, wasm_ty, val)?;
 
         let mut pos = builder.cursor();
@@ -5721,11 +5751,42 @@ impl FuncEnvironment<'_> {
         value: ir::Value,
         index: ir::Value,
     ) -> WasmResult<()> {
+        self.translate_transaction_ttable_set_with_builtin(
+            builder,
+            table_index,
+            value,
+            index,
+            BuiltinFunctionIndex::transaction_ttable_set(),
+        )
+    }
+
+    fn translate_transaction_ttable_startup_set(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        value: ir::Value,
+        index: ir::Value,
+    ) -> WasmResult<()> {
+        self.translate_transaction_ttable_set_with_builtin(
+            builder,
+            table_index,
+            value,
+            index,
+            BuiltinFunctionIndex::transaction_ttable_startup_set(),
+        )
+    }
+
+    fn translate_transaction_ttable_set_with_builtin(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        value: ir::Value,
+        index: ir::Value,
+        builtin: BuiltinFunctionIndex,
+    ) -> WasmResult<()> {
         self.ensure_transaction_table(table_index)?;
         let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
-        let callee = self
-            .builtin_functions
-            .load_builtin(builder.func, BuiltinFunctionIndex::transaction_ttable_set());
+        let callee = self.builtin_functions.load_builtin(builder.func, builtin);
         let index_type = self.table(table_index).idx_type;
 
         let mut pos = builder.cursor();
@@ -5749,6 +5810,49 @@ impl FuncEnvironment<'_> {
         };
         pos.ins()
             .call(callee, &[table_vmctx, defined_table_index, index, value]);
+        Ok(())
+    }
+
+    fn translate_transaction_ttable_startup_fill(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        dest: ir::Value,
+        value: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_table(table_index)?;
+        let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_ttable_startup_fill(),
+        );
+        let index_type = self.table(table_index).idx_type;
+
+        let mut pos = builder.cursor();
+        let (table_vmctx, defined_table_index) =
+            self.table_vmctx_and_defined_index(&mut pos, table_index);
+        let dest = self.cast_index_to_i64(&mut pos, dest, index_type);
+        let len = self.cast_index_to_i64(&mut pos, len, index_type);
+        let value = match ref_top {
+            WasmHeapTopType::Func => value,
+            WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
+                if self.pointer_type() == I32 {
+                    value
+                } else {
+                    pos.ins().uextend(self.pointer_type(), value)
+                }
+            }
+            WasmHeapTopType::Cont => {
+                return Err(wasmtime_environ::WasmError::Unsupported(
+                    "transactional contref table is not implemented yet".into(),
+                ));
+            }
+        };
+        pos.ins().call(
+            callee,
+            &[table_vmctx, defined_table_index, dest, len, value],
+        );
         Ok(())
     }
 
@@ -8364,6 +8468,9 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<()> {
         let index = self.module.global_index(global);
         let val = self.translate_const_expr(builder, expr)?;
+        if self.module.transaction_objects.is_tglobal(index) {
+            return self.translate_transaction_tglobal_startup_set(builder, index, val);
+        }
         self.emit_global_set(builder, index, val, false)
     }
 
@@ -8449,6 +8556,9 @@ impl FuncEnvironment<'_> {
             index_type_to_ir_type(ty.idx_type),
             ty.limits.min.cast_signed(),
         );
+        if self.module.transaction_objects.is_ttable(table) {
+            return self.translate_transaction_ttable_startup_fill(builder, table, dst, val, len);
+        }
         self.translate_entity_fill(
             builder,
             CheckedEntity::Table {
@@ -8497,14 +8607,40 @@ impl FuncEnvironment<'_> {
                 for (i, func) in indices.iter().enumerate() {
                     let func = self.translate_ref_func(builder.cursor(), *func)?;
                     let index = builder.ins().iadd_imm_s(offset, i64::try_from(i).unwrap());
-                    self.translate_table_set(builder, segment.table_index, func, index)?;
+                    if self
+                        .module
+                        .transaction_objects
+                        .is_ttable(segment.table_index)
+                    {
+                        self.translate_transaction_ttable_startup_set(
+                            builder,
+                            segment.table_index,
+                            func,
+                            index,
+                        )?;
+                    } else {
+                        self.translate_table_set(builder, segment.table_index, func, index)?;
+                    }
                 }
             }
             TableSegmentElements::Expressions { exprs, ty: _ } => {
                 for (i, expr) in exprs.iter().enumerate() {
                     let val = self.translate_const_expr(builder, expr)?;
                     let index = builder.ins().iadd_imm_s(offset, i64::try_from(i).unwrap());
-                    self.translate_table_set(builder, segment.table_index, val, index)?;
+                    if self
+                        .module
+                        .transaction_objects
+                        .is_ttable(segment.table_index)
+                    {
+                        self.translate_transaction_ttable_startup_set(
+                            builder,
+                            segment.table_index,
+                            val,
+                            index,
+                        )?;
+                    } else {
+                        self.translate_table_set(builder, segment.table_index, val, index)?;
+                    }
                 }
             }
         }

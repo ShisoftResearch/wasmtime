@@ -37,6 +37,131 @@ fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
     crate::Module::new(engine, wat::parse_str(wat).unwrap()).unwrap()
 }
 
+fn transaction_object_active_startup_root_module(engine: &crate::Engine) -> crate::Module {
+    transaction_test_module(
+        engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (tglobal $g (export "g") (mut (ref null $s))
+                (tstruct.new $s (i32.const 7)))
+              (ttable $t (export "t") 3 (ref null $s)
+                (tstruct.new $s (i32.const 11)))
+              (elem (table $t) (i32.const 1) (ref null $s)
+                (tstruct.new $s (i32.const 21)))
+              (func (export "committed_global_is_null") (result i32)
+                (ref.is_null (global.get $g)))
+              (func (export "committed_table_is_null") (param i32) (result i32)
+                (ref.is_null (table.get $t (local.get 0))))
+              (tfunc (export "read_global") (result i32)
+                (tstruct.get $s 0
+                  (tref.cast_read (ref.as_non_null (tglobal.get $g)))))
+              (tfunc (export "read_table") (param i32) (result i32)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (ref.as_non_null (ttable.get $t (local.get 0)))))))
+        "#,
+    )
+}
+
+fn active_startup_root_reentrant_harness(
+    engine: &crate::Engine,
+) -> (crate::Store<Option<crate::Instance>>, crate::Instance) {
+    let root_module = transaction_object_active_startup_root_module(engine);
+    let driver_module = transaction_test_module(
+        engine,
+        r#"
+            (module
+              (import "" "instantiate" (func $instantiate))
+              (tfunc (export "commit")
+                (call $instantiate))
+              (tfunc (export "abort")
+                (call $instantiate)
+                (tfail)))
+        "#,
+    );
+    let mut store = crate::Store::new(engine, None);
+    let mut linker = crate::Linker::new(engine);
+    linker
+        .func_wrap(
+            "",
+            "instantiate",
+            move |mut caller: crate::Caller<'_, Option<crate::Instance>>| -> Result<()> {
+                let transaction = caller
+                    .store
+                    .0
+                    .transaction_state()
+                    .active_transaction()
+                    .unwrap();
+                assert_eq!(current_thread_transaction_for_test(), Some(transaction));
+
+                let instance = crate::Instance::new(&mut caller, &root_module, &[])?;
+                let instance_id = instance.id();
+                let committed_global_is_null =
+                    instance.get_typed_func::<(), i32>(&mut caller, "committed_global_is_null")?;
+                let committed_table_is_null =
+                    instance.get_typed_func::<i32, i32>(&mut caller, "committed_table_is_null")?;
+                let read_global = instance.get_typed_func::<(), i32>(&mut caller, "read_global")?;
+                let read_table = instance.get_typed_func::<i32, i32>(&mut caller, "read_table")?;
+
+                assert_eq!(committed_global_is_null.call(&mut caller, ())?, 1);
+                assert_eq!(committed_table_is_null.call(&mut caller, 0)?, 1);
+                assert_eq!(committed_table_is_null.call(&mut caller, 1)?, 1);
+                assert_eq!(committed_table_is_null.call(&mut caller, 2)?, 1);
+                assert_eq!(read_global.call(&mut caller, ())?, 7);
+                assert_eq!(read_table.call(&mut caller, 0)?, 11);
+                assert_eq!(read_table.call(&mut caller, 1)?, 21);
+                assert_eq!(read_table.call(&mut caller, 2)?, 11);
+                assert!(matches!(
+                    caller
+                        .store
+                        .0
+                        .transaction_state()
+                        .staged_global_owned(Some(instance_id), 0),
+                    Some(GlobalSnapshot::GcRef(handle)) if handle != 0
+                ));
+                for element_index in [0_u64, 1, 2] {
+                    assert!(matches!(
+                        caller.store.0.transaction_state().staged_table_element_owned(
+                            Some(instance_id),
+                            0,
+                            element_index,
+                        ),
+                        Some(TableElementSnapshot::GcRef(handle)) if handle != 0
+                    ));
+                }
+                assert!(
+                    caller
+                        .store
+                        .0
+                        .transaction_state()
+                        .persistent_root_ids_for_test()
+                        .is_empty(),
+                    "startup staging must not publish persistent roots before commit"
+                );
+                let objects = caller.store.0.transaction_object_table();
+                for expected in [
+                    ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+                    ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+                    ObjectPayload::Struct(vec![ObjectValue::I32(21)]),
+                ] {
+                    assert!(
+                        !objects
+                            .live_object_ids_for_test()
+                            .into_iter()
+                            .any(|object_id| objects.payload(object_id).unwrap() == expected),
+                        "startup root objects must not be published before commit"
+                    );
+                }
+                *caller.data_mut() = Some(instance);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let driver = linker.instantiate(&mut store, &driver_module).unwrap();
+    (store, driver)
+}
+
 fn count_retire_committed_linear_undo_attempts(
     events: &[persist::RecordingBackendEvent],
     chunk_start_block: u32,
@@ -20532,6 +20657,121 @@ fn transaction_object_static_initializers_follow_active_transaction_local_lifeti
     );
     assert_eq!(current_thread_transaction_for_test(), None);
     assert_eq!(store.transaction_object_table().live_count(), 0);
+}
+
+#[test]
+fn active_startup_transaction_roots_stage_until_commit() {
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let (mut store, driver) = active_startup_root_reentrant_harness(&engine);
+    let commit = driver
+        .get_typed_func::<(), ()>(&mut store, "commit")
+        .unwrap();
+
+    commit.call(&mut store, ()).unwrap();
+
+    let instance = store.data().as_ref().copied().unwrap();
+    let committed_global_is_null = instance
+        .get_typed_func::<(), i32>(&mut store, "committed_global_is_null")
+        .unwrap();
+    let committed_table_is_null = instance
+        .get_typed_func::<i32, i32>(&mut store, "committed_table_is_null")
+        .unwrap();
+    let read_global = instance
+        .get_typed_func::<(), i32>(&mut store, "read_global")
+        .unwrap();
+    let read_table = instance
+        .get_typed_func::<i32, i32>(&mut store, "read_table")
+        .unwrap();
+
+    assert_eq!(current_thread_transaction_for_test(), None);
+    assert_eq!(store.transaction_state().active_transaction(), None);
+    assert_eq!(
+        store
+            .transaction_state()
+            .persistent_root_ids_for_test()
+            .len(),
+        3
+    );
+    assert_eq!(committed_global_is_null.call(&mut store, ()).unwrap(), 0);
+    assert_eq!(committed_table_is_null.call(&mut store, 0).unwrap(), 0);
+    assert_eq!(committed_table_is_null.call(&mut store, 1).unwrap(), 0);
+    assert_eq!(committed_table_is_null.call(&mut store, 2).unwrap(), 0);
+    assert_eq!(read_global.call(&mut store, ()).unwrap(), 7);
+    assert_eq!(read_table.call(&mut store, 0).unwrap(), 11);
+    assert_eq!(read_table.call(&mut store, 1).unwrap(), 21);
+    assert_eq!(read_table.call(&mut store, 2).unwrap(), 11);
+    assert_eq!(
+        store
+            .transaction_state()
+            .persistent_root_ids_for_test()
+            .len(),
+        3
+    );
+    let objects = store.transaction_object_table();
+    for expected in [
+        ObjectPayload::Struct(vec![ObjectValue::I32(7)]),
+        ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+        ObjectPayload::Struct(vec![ObjectValue::I32(21)]),
+    ] {
+        let object_id = objects
+            .live_object_ids_for_test()
+            .into_iter()
+            .find(|object_id| objects.payload(*object_id).unwrap() == expected)
+            .unwrap();
+        assert!(objects.is_persistent(object_id).unwrap());
+    }
+}
+
+#[test]
+fn active_startup_transaction_roots_abort_without_publication() {
+    let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let (mut store, driver) = active_startup_root_reentrant_harness(&engine);
+    let abort = driver
+        .get_typed_func::<(), ()>(&mut store, "abort")
+        .unwrap();
+
+    abort.call(&mut store, ()).unwrap();
+
+    let instance = store.data().as_ref().copied().unwrap();
+    let committed_global_is_null = instance
+        .get_typed_func::<(), i32>(&mut store, "committed_global_is_null")
+        .unwrap();
+    let committed_table_is_null = instance
+        .get_typed_func::<i32, i32>(&mut store, "committed_table_is_null")
+        .unwrap();
+    let read_global = instance
+        .get_typed_func::<(), i32>(&mut store, "read_global")
+        .unwrap();
+    let read_table = instance
+        .get_typed_func::<i32, i32>(&mut store, "read_table")
+        .unwrap();
+
+    assert_eq!(current_thread_transaction_for_test(), None);
+    assert_eq!(store.transaction_state().active_transaction(), None);
+    assert_eq!(committed_global_is_null.call(&mut store, ()).unwrap(), 1);
+    assert_eq!(committed_table_is_null.call(&mut store, 0).unwrap(), 1);
+    assert_eq!(committed_table_is_null.call(&mut store, 1).unwrap(), 1);
+    assert_eq!(committed_table_is_null.call(&mut store, 2).unwrap(), 1);
+    assert!(
+        store
+            .transaction_state()
+            .persistent_root_ids_for_test()
+            .is_empty()
+    );
+    assert_eq!(store.transaction_object_table().live_count(), 0);
+
+    let err = read_global.call(&mut store, ()).unwrap_err();
+    assert!(format!("{err:?}").contains("null reference"), "{err:?}");
+    let err = read_table.call(&mut store, 0).unwrap_err();
+    assert!(format!("{err:?}").contains("null reference"), "{err:?}");
+    let err = read_table.call(&mut store, 1).unwrap_err();
+    assert!(format!("{err:?}").contains("null reference"), "{err:?}");
 }
 
 #[test]
