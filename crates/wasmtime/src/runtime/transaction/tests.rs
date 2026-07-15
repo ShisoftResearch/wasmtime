@@ -19714,7 +19714,7 @@ fn transaction_i31_reference_fields_round_trip_as_scalars() {
 }
 
 #[test]
-fn transaction_object_tstruct_executes_through_object_table() {
+fn transaction_object_tstruct_does_not_persist_without_publication() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);
     let engine = crate::Engine::new(&config).unwrap();
@@ -19985,7 +19985,7 @@ fn ordinary_global_does_not_keep_transaction_object_alive() {
 }
 
 #[test]
-fn transaction_object_tarray_executes_through_object_table() {
+fn transaction_object_tarray_does_not_persist_without_publication() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);
     let engine = crate::Engine::new(&config).unwrap();
@@ -20065,7 +20065,7 @@ fn transaction_object_constructors_use_local_handles_without_publishing() {
 }
 
 #[test]
-fn transaction_object_tarray_default_and_fixed_constructors_create_object_records() {
+fn transaction_object_tarray_default_and_fixed_constructors_do_not_persist_without_publication() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);
     let engine = crate::Engine::new(&config).unwrap();
@@ -20161,6 +20161,8 @@ fn transaction_object_static_initializers_return_transaction_ref_handles() {
                 ])
         })
         .unwrap();
+    assert!(objects.is_persistent(struct_id).unwrap());
+    assert!(objects.is_persistent(array_id).unwrap());
     assert_eq!(
         objects.payload(struct_id).unwrap(),
         ObjectPayload::Struct(vec![ObjectValue::I32(41)])
@@ -20175,7 +20177,7 @@ fn transaction_object_static_initializers_return_transaction_ref_handles() {
 }
 
 #[test]
-fn exported_tfunc_returning_tarray_ref_enters_transaction() {
+fn exported_tfunc_publishing_tarray_to_tglobal_persists_it() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);
     let engine = crate::Engine::new(&config).unwrap();
