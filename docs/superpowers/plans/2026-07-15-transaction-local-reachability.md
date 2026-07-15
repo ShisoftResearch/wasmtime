@@ -366,7 +366,13 @@ fn finalize_transaction_local_objects_after_promotion(
 
 In `commit_object_payloads_with`, call the finalizer before collecting updates, return `false` when no persistent/shared staged update remains, and remove `remap_object_payload_refs` plus all local-to-shared remapping code.
 
-- [ ] **Step 4: Make completed-promotion lookup local-aware**
+- [ ] **Step 4: Make promotion scans and completed lookup local-aware**
+
+In `promote_persistent_references_before_commit_with_adapter`, skip
+transaction-local `staged_objects` entries before calling
+`object_table.is_persistent(object_id)`. Local staged payloads are promotion
+sources, not shared persistent owners; reachable local sources are traversed from
+roots by `promote_transaction_object_graph_in_attempt`.
 
 In `persistent_object_id_for_live_bridge_after_completed_promotion`, resolve transaction handles with `self.known_object_id_for_transaction_ref_handle(object_table, gc_ref)`. If the result is transaction-local, require and return `self.promoted_objects[&object_id]`; otherwise retain the existing persistent/shared logic. This keeps root-delta construction valid both before and after finalization.
 
