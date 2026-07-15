@@ -1444,83 +1444,46 @@ impl TransactionState {
         object_table.runtime_type_index(object_id)
     }
 
-    pub(crate) fn commit_transaction_local_objects(
+    pub(crate) fn finalize_transaction_local_objects_after_promotion(
         &mut self,
         object_table: &mut ObjectTable,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         self.ensure_active()?;
         if self.local_object_table.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
 
-        let local_slots = self
-            .local_object_table
-            .slots
-            .iter()
-            .map(|(&object_id, slot)| (object_id, slot.clone()))
-            .collect::<Vec<_>>();
         let local_handles = self
             .local_object_table
             .transaction_ref_handles_to_objects
             .clone();
-        let mut remap = BTreeMap::new();
-
-        for (local_id, slot) in &local_slots {
-            let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
-                .context("transaction-local object type layout id cannot be zero")?;
-            let object_id = object_table.allocate_payload_with_type_layout_id(
-                ObjectPayload::default_for_kind(slot.kind)?,
-                type_layout_id,
-                false,
-            )?;
-            if let Some(runtime_type_index) = slot.runtime_type_index {
-                object_table.set_runtime_type_index(object_id, runtime_type_index)?;
-            }
-            remap.insert(*local_id, object_id);
-        }
+        let local_object_ids = self
+            .local_object_table
+            .slots
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
 
         for (handle, local_id) in local_handles {
-            let object_id = remap
-                .get(&local_id)
-                .copied()
-                .context("transaction-local handle referred to missing local object")?;
-            object_table.associate_transaction_ref_handle_for_object_id(handle, object_id)?;
+            let Some(promoted) = self.promoted_objects.get(&local_id).copied() else {
+                continue;
+            };
+            ensure!(
+                self.allocated_objects.contains(&promoted),
+                "promoted transaction-local handle target was not recorded as allocated"
+            );
+            ensure!(
+                object_table.is_persistent(promoted)?,
+                "promoted transaction-local handle target must be persistent"
+            );
+            object_table.associate_transaction_ref_handle_for_object_id(handle, promoted)?;
         }
 
-        for (local_id, slot) in &local_slots {
-            let object_id = remap
-                .get(local_id)
-                .copied()
-                .context("transaction-local object was not installed")?;
-            let mut payload = self
-                .staged_objects
-                .get(local_id)
-                .map(|record| record.payload().clone())
-                .unwrap_or_else(|| slot.payload.clone());
-            remap_object_payload_refs(&mut payload, &remap);
-            object_table.update_payload(object_id, payload)?;
-        }
-
-        for local_id in self.local_object_table.slots.keys() {
-            self.staged_objects.remove(local_id);
-        }
-        for record in self.staged_objects.values_mut() {
-            remap_object_payload_refs(&mut record.payload, &remap);
-        }
-        let promoted_remaps = remap
-            .iter()
-            .filter_map(|(local_id, committed_id)| {
-                self.promoted_objects
-                    .get(local_id)
-                    .copied()
-                    .map(|promoted| (*committed_id, promoted))
-            })
-            .collect::<Vec<_>>();
-        for (committed_id, promoted) in promoted_remaps {
-            self.promoted_objects.insert(committed_id, promoted);
+        for local_id in local_object_ids {
+            self.staged_objects.remove(&local_id);
         }
         self.local_object_table = TransactionLocalObjectTable::default();
-        Ok(true)
+        Ok(())
     }
 
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
@@ -3272,9 +3235,9 @@ impl TransactionState {
         self.ensure_active()?;
         self.drain_conflict_aborted_allocated_objects(object_table)?;
         self.validate_active_object_reads(object_table)?;
-        let committed_local_objects = self.commit_transaction_local_objects(object_table)?;
+        self.finalize_transaction_local_objects_after_promotion(object_table)?;
         if self.staged_objects.is_empty() {
-            return Ok(committed_local_objects);
+            return Ok(false);
         }
         let updates = self
             .staged_objects
@@ -3865,21 +3828,6 @@ fn persistent_root_object_id_for_table_element_snapshot(
             object_table.persistent_object_id_for_live_bridge_or_promotion_required(gc_ref)
         }
         TableElementSnapshot::FuncRef(_) => Ok(None),
-    }
-}
-
-fn remap_object_payload_refs(payload: &mut ObjectPayload, remap: &BTreeMap<ObjectId, ObjectId>) {
-    let values = match payload {
-        ObjectPayload::Struct(fields) => fields,
-        ObjectPayload::Array(elements) => elements,
-    };
-    for value in values {
-        let ObjectValue::Ref(Some(object_id)) = value else {
-            continue;
-        };
-        if let Some(mapped) = remap.get(object_id).copied() {
-            *object_id = mapped;
-        }
     }
 }
 

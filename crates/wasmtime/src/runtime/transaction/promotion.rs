@@ -459,7 +459,22 @@ impl TransactionState {
         if gc_ref == 0 {
             return Ok(None);
         }
-        if let Some(object_id) = object_table.known_object_id_for_transaction_ref_handle(gc_ref) {
+        if let Some(object_id) =
+            self.known_object_id_for_transaction_ref_handle(object_table, gc_ref)
+        {
+            if self.local_object_table.contains(object_id) {
+                let promoted = self
+                    .promoted_objects
+                    .get(&object_id)
+                    .copied()
+                    .with_context(|| {
+                        format!(
+                            "transaction object ref handle {gc_ref:#x} backing local object {object_id:?} was not promoted before commit"
+                        )
+                    })
+                    .context(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED)?;
+                return Ok(Some(promoted));
+            }
             if object_table.is_persistent(object_id)? {
                 return Ok(Some(object_id));
             }
@@ -584,6 +599,9 @@ impl TransactionState {
             .map(|(&object_id, record)| (object_id, record.payload().clone()))
             .collect::<Vec<_>>();
         for (object_id, payload) in staged_objects {
+            if self.local_object_table.contains(object_id) {
+                continue;
+            }
             if !object_table.is_persistent(object_id)? {
                 continue;
             }
