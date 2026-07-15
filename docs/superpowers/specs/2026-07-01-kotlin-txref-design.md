@@ -14,6 +14,12 @@ types usable inside transactions.
 
 ## Goals
 
+- Make reachability the primary persistence invariant: committing a transaction
+  persists only objects reachable from committed persistent roots, and discards
+  every unreachable transaction-local allocation.
+- Define transaction-local object allocation as a universal transactional Wasm
+  runtime behavior, independent of Kotlin. Any frontend that emits transactional
+  object constructors gets the same isolation and commit behavior.
 - Require an explicit Kotlin API before any ordinary WasmGC reference that
   originates outside the transaction can enter a persistent root, persistent
   struct field, or persistent array element.
@@ -182,6 +188,43 @@ type-checking boundary.
 
 ## Runtime Behavior
 
+Runtime allocation semantics are not Kotlin-specific. Ordinary transactional
+Wasm object constructors such as `tstruct.new`, `tstruct.new_default`,
+`tarray.new`, `tarray.new_default`, `tarray.new_fixed`, `tarray.new_data`, and
+`tarray.new_elem` allocate into a transaction-local object table while a
+transaction is active. These allocations do not enter the WasmGC heap or the
+shared object table merely because they were constructed.
+
+Reachability is the primary persistence rule. Before commit, the runtime traces
+from the transaction's committed persistent roots, including `tglobal`,
+persistent table/root entries, and references written into already-persistent
+objects. A reachable transaction-local graph is promoted once into persistent
+storage. Every transaction-local object outside that graph is discarded. An
+abort discards the entire transaction-local table.
+
+Ordinary Wasm globals, tables, locals, and function results are not persistence
+roots. A transaction object reference that must escape the transaction must be
+published through a persistent root before commit. Committing must not preserve
+an object solely because a transaction handle still exists or because the
+transaction completed successfully.
+
+The static persistent constructor path is reserved for initialization and static
+storage outside active transaction allocation. It does not override
+reachability. If such a constructor is used while a transaction is active, its
+object must follow the same transaction-local allocation and reachability rules.
+
+Transaction-local object ids and transaction object handles are runtime
+implementation details. Reads, writes, casts, array operations, globals, roots,
+tables, and promotion must resolve handles through the active transaction state
+first and then fall back to the shared object table.
+
+At commit, promotion copies only the reachable transaction-local graph into
+persistent object records. The promotion map preserves cycles and repeated
+references, so multiple paths to one local object become multiple paths to one
+persistent `ObjectId`. After root publication, the runtime discards the complete
+transaction-local table and its handles. It must not first publish every local
+slot into the shared volatile object table.
+
 The runtime promotion path remains responsible for the actual graph copy. The
 runtime does not check whether a live GC reference came from `TxRef.get()`;
 explicitness is enforced only by the rewriter. Once a live GC reference reaches a
@@ -314,6 +357,15 @@ runtime object shapes are known to the persistent layout system.
 
 Add focused tests for the rewriter and runtime path:
 
+- Verify a transaction-local object reachable from a committed persistent root
+  is promoted and remains recoverable after commit.
+- Verify nested reachable transaction-local objects are promoted once and retain
+  aliasing and cycles.
+- Verify an unrooted transaction-local object is absent from both shared and
+  persistent object storage after commit.
+- Verify transaction-local objects referenced only by ordinary globals, tables,
+  locals, results, or raw transaction handles do not survive commit.
+- Verify abort discards all transaction-local objects without publishing them.
 - Accept `make_txn_ref("note")` followed by `note.get()` into `Bank.note`.
 - Recover the persistent bank example and verify the string graph is persisted.
 - Accept a user-defined `@TxCopyable` DTO with `String`, list, and `@Persistent`
