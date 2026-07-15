@@ -12221,6 +12221,7 @@ fn transaction_local_object_promotion_rebinds_handle_to_promoted_object() {
         state.known_object_id_for_transaction_ref_handle(&objects, handle),
         Some(promoted)
     );
+    assert_eq!(objects.runtime_type_index(promoted).unwrap(), None);
 
     let root_delta = state
         .staged_persistent_root_delta_for_test(&objects)
@@ -14300,7 +14301,7 @@ mod persistent_promotion_graph {
     }
 
     #[test]
-    fn promotion_preserves_shared_volatile_source_runtime_type() {
+    fn promotion_preserves_shared_volatile_array_source_runtime_type() {
         clear_current_thread_transaction_for_test();
         let mut objects = ObjectTable::default();
         let runtime_type_index = wasmtime_environ::VMSharedTypeIndex::new(0x721);
@@ -14323,6 +14324,33 @@ mod persistent_promotion_graph {
         assert_eq!(
             state.staged_object_payload_for_test(promoted).unwrap(),
             &ObjectPayload::Array(vec![ObjectValue::I32(6)])
+        );
+    }
+
+    #[test]
+    fn promotion_preserves_shared_volatile_struct_source_runtime_type() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let runtime_type_index = wasmtime_environ::VMSharedTypeIndex::new(0x722);
+        let source = objects
+            .allocate_struct_for_gc_ref(0x727, vec![ObjectValue::I32(7)])
+            .unwrap();
+        objects
+            .set_runtime_type_index(source, runtime_type_index)
+            .unwrap();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(727));
+
+        let promoted = state
+            .promote_transaction_object_graph_for_test(&mut objects, source)
+            .unwrap();
+
+        assert_eq!(
+            objects.runtime_type_index(promoted).unwrap(),
+            Some(runtime_type_index)
+        );
+        assert_eq!(
+            state.staged_object_payload_for_test(promoted).unwrap(),
+            &ObjectPayload::Struct(vec![ObjectValue::I32(7)])
         );
     }
 
