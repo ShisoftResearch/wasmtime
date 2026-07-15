@@ -139,38 +139,38 @@ impl TransactionState {
             return Ok(promoted);
         }
 
-        let (kind, type_layout_id, source_payload) = if let Some(slot) =
-            self.local_object_table.slot(source)
-        {
-            let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
-                .context("promoted transaction-local object source layout id cannot be zero")?;
-            let payload = self
-                .staged_objects
-                .get(&source)
-                .map(|record| record.payload().clone())
-                .unwrap_or_else(|| slot.payload.clone());
-            (slot.kind, type_layout_id, payload)
-        } else {
-            if object_table.is_persistent(source)? {
-                return Ok(source);
-            }
-            let kind = object_table.kind(source)?;
-            ensure!(
-                matches!(kind, ObjectKind::Struct | ObjectKind::Array),
-                "transactional promotion currently supports struct and array object payloads"
-            );
-            if matches!(kind, ObjectKind::Struct | ObjectKind::Array) {
-                self.acquire_object_read(object_table, source)?;
-            }
-            let type_layout_id = TypeLayoutId::new(object_table.live_slot(source)?.type_layout_id)
-                .context("promoted object source layout id cannot be zero")?;
-            let payload = self
-                .staged_objects
-                .get(&source)
-                .map(|record| record.payload().clone())
-                .unwrap_or(object_table.payload(source)?);
-            (kind, type_layout_id, payload)
-        };
+        let (kind, type_layout_id, runtime_type_index, source_payload) =
+            if let Some(slot) = self.local_object_table.slot(source) {
+                let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
+                    .context("promoted transaction-local object source layout id cannot be zero")?;
+                let payload = self
+                    .staged_objects
+                    .get(&source)
+                    .map(|record| record.payload().clone())
+                    .unwrap_or_else(|| slot.payload.clone());
+                (slot.kind, type_layout_id, slot.runtime_type_index, payload)
+            } else {
+                if object_table.is_persistent(source)? {
+                    return Ok(source);
+                }
+                let kind = object_table.kind(source)?;
+                ensure!(
+                    matches!(kind, ObjectKind::Struct | ObjectKind::Array),
+                    "transactional promotion currently supports struct and array object payloads"
+                );
+                if matches!(kind, ObjectKind::Struct | ObjectKind::Array) {
+                    self.acquire_object_read(object_table, source)?;
+                }
+                let slot = object_table.live_slot(source)?;
+                let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
+                    .context("promoted object source layout id cannot be zero")?;
+                let payload = self
+                    .staged_objects
+                    .get(&source)
+                    .map(|record| record.payload().clone())
+                    .unwrap_or(object_table.payload(source)?);
+                (kind, type_layout_id, slot.runtime_type_index, payload)
+            };
         ensure!(
             matches!(kind, ObjectKind::Struct | ObjectKind::Array),
             "transactional promotion currently supports struct and array object payloads"
@@ -180,6 +180,9 @@ impl TransactionState {
         self.record_allocated_object(promoted)?;
         self.promoted_objects.insert(source, promoted);
         attempt.record_promoted_object(source, promoted);
+        if let Some(runtime_type_index) = runtime_type_index {
+            object_table.set_runtime_type_index(promoted, runtime_type_index)?;
+        }
 
         let promoted_payload = self.rewrite_payload_refs_for_promotion_in_attempt(
             object_table,

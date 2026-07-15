@@ -12237,6 +12237,105 @@ fn transaction_local_object_promotion_rebinds_handle_to_promoted_object() {
 }
 
 #[test]
+fn transaction_local_struct_commit_preserves_runtime_type_and_rebinds_handle() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+    let runtime_type_index = wasmtime_environ::VMSharedTypeIndex::new(0x7a1);
+
+    state.begin().unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(7)], Some(runtime_type_index))
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    state
+        .stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))
+        .unwrap();
+
+    assert!(
+        state
+            .promote_persistent_references_before_commit(&mut objects)
+            .unwrap()
+    );
+    let promoted = state.promoted_object_for_test(local).unwrap();
+    assert!(state.commit_object_payloads(&mut objects).unwrap());
+
+    let root_delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    state
+        .complete_commit_with_persistent_root_delta_for_test(root_delta)
+        .unwrap();
+
+    assert_eq!(
+        objects
+            .object_id_for_transaction_ref_handle(handle)
+            .unwrap(),
+        promoted
+    );
+    assert_eq!(
+        state.known_object_id_for_transaction_ref_handle(&objects, handle),
+        Some(promoted)
+    );
+    assert_eq!(
+        objects.runtime_type_index(promoted).unwrap(),
+        Some(runtime_type_index)
+    );
+}
+
+#[test]
+fn transaction_local_array_commit_preserves_runtime_type_and_rebinds_handle() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+    let runtime_type_index = wasmtime_environ::VMSharedTypeIndex::new(0x7a2);
+
+    state.begin().unwrap();
+    let local = state
+        .allocate_transaction_local_array(
+            vec![ObjectValue::I32(9), ObjectValue::I32(11)],
+            Some(runtime_type_index),
+        )
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    state
+        .stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))
+        .unwrap();
+
+    assert!(
+        state
+            .promote_persistent_references_before_commit(&mut objects)
+            .unwrap()
+    );
+    let promoted = state.promoted_object_for_test(local).unwrap();
+    assert!(state.commit_object_payloads(&mut objects).unwrap());
+
+    let root_delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    state
+        .complete_commit_with_persistent_root_delta_for_test(root_delta)
+        .unwrap();
+
+    assert_eq!(
+        objects
+            .object_id_for_transaction_ref_handle(handle)
+            .unwrap(),
+        promoted
+    );
+    assert_eq!(
+        state.known_object_id_for_transaction_ref_handle(&objects, handle),
+        Some(promoted)
+    );
+    assert_eq!(
+        objects.runtime_type_index(promoted).unwrap(),
+        Some(runtime_type_index)
+    );
+}
+
+#[test]
 fn transaction_local_object_promotion_preserves_cycles() {
     let mut objects = ObjectTable::default();
     let mut state = TransactionState::default();
@@ -14197,6 +14296,33 @@ mod persistent_promotion_graph {
         assert_eq!(
             state.staged_object_payload_for_test(promoted).unwrap(),
             &ObjectPayload::Struct(vec![ObjectValue::I32(7)])
+        );
+    }
+
+    #[test]
+    fn promotion_preserves_shared_volatile_source_runtime_type() {
+        clear_current_thread_transaction_for_test();
+        let mut objects = ObjectTable::default();
+        let runtime_type_index = wasmtime_environ::VMSharedTypeIndex::new(0x721);
+        let source = objects
+            .allocate_array_for_gc_ref(0x726, vec![ObjectValue::I32(6)])
+            .unwrap();
+        objects
+            .set_runtime_type_index(source, runtime_type_index)
+            .unwrap();
+        let mut state = TransactionState::new_for_test(TransactionId::from_raw(726));
+
+        let promoted = state
+            .promote_transaction_object_graph_for_test(&mut objects, source)
+            .unwrap();
+
+        assert_eq!(
+            objects.runtime_type_index(promoted).unwrap(),
+            Some(runtime_type_index)
+        );
+        assert_eq!(
+            state.staged_object_payload_for_test(promoted).unwrap(),
+            &ObjectPayload::Array(vec![ObjectValue::I32(6)])
         );
     }
 
