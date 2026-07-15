@@ -20775,6 +20775,94 @@ fn active_startup_transaction_roots_abort_without_publication() {
 }
 
 #[test]
+fn active_startup_element_segment_uses_staged_imported_ttable_size() {
+    use crate::{Linker, Ref};
+
+    let engine = crate::Engine::default();
+    let owner_module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable $t (export "t") 1 2 funcref))
+        "#,
+    );
+    let nested_module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "" "t" (ttable $t 1 2 funcref))
+              (func $target)
+              (elem (table $t) (i32.const 1) func $target))
+        "#,
+    );
+    let driver_module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "" "t" (ttable $t 1 2 funcref))
+              (import "" "instantiate" (func $instantiate))
+              (export "t" (table $t))
+              (tfunc (export "grow_and_instantiate")
+                (ref.null func)
+                (i32.const 1)
+                (ttable.grow $t)
+                (drop)
+                (call $instantiate)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let owner = crate::Instance::new(&mut store, &owner_module, &[]).unwrap();
+    let table = owner.get_table(&mut store, "t").unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define(&mut store, "", "t", table).unwrap();
+    linker
+        .func_wrap(
+            "",
+            "instantiate",
+            move |mut caller: crate::Caller<'_, ()>| -> Result<()> {
+                let table = caller.get_export("t").unwrap();
+                crate::Instance::new(&mut caller, &nested_module, &[table])?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let driver = linker.instantiate(&mut store, &driver_module).unwrap();
+    let grow_and_instantiate = driver
+        .get_typed_func::<(), ()>(&mut store, "grow_and_instantiate")
+        .unwrap();
+
+    grow_and_instantiate.call(&mut store, ()).unwrap();
+
+    assert_eq!(table.size(&mut store), 2);
+    assert!(matches!(
+        table.get(&mut store, 1).unwrap(),
+        Ref::Func(Some(_))
+    ));
+}
+
+#[test]
+fn transaction_ttable_startup_fill_accounts_for_fuel() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true).consume_fuel(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (ttable 4096 (ref null $s)
+                (tstruct.new $s (i32.const 7))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    store.set_fuel(1024).unwrap();
+
+    let err = crate::Instance::new(&mut store, &module, &[]).unwrap_err();
+
+    assert!(format!("{err:?}").contains("fuel"), "{err:?}");
+}
+
+#[test]
 fn exported_tfunc_publishing_tarray_to_tglobal_persists_it() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);

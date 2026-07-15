@@ -231,8 +231,10 @@ macro_rules! foreach_builtin_function {
             transaction_ttable_set(vmctx: vmctx, table: u32, index: u64, value: pointer) -> bool;
             // Initializes a transactional table element during module startup, staging while active and writing directly while inactive.
             transaction_ttable_startup_set(vmctx: vmctx, table: u32, index: u64, value: pointer) -> bool;
-            // Initializes a transactional table range during module startup, staging while active and writing directly while inactive.
+            // Initializes a transactional table range during module startup when interruption accounting is disabled.
             transaction_ttable_startup_fill(vmctx: vmctx, table: u32, start: u64, len: u64, value: pointer) -> bool;
+            // Checks a transactional table range during module startup against staged or committed size as appropriate.
+            transaction_ttable_startup_check_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
             // Acquires a readable transactional table range.
             transaction_ttable_read_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
             // Acquires a writable transactional table range.
@@ -566,6 +568,7 @@ mod tests {
             BuiltinFunctionIndex::transaction_ttable_set(),
             BuiltinFunctionIndex::transaction_ttable_startup_set(),
             BuiltinFunctionIndex::transaction_ttable_startup_fill(),
+            BuiltinFunctionIndex::transaction_ttable_startup_check_range(),
             BuiltinFunctionIndex::transaction_ttable_read_range(),
             BuiltinFunctionIndex::transaction_ttable_write_range(),
             BuiltinFunctionIndex::transaction_tstruct_new(),

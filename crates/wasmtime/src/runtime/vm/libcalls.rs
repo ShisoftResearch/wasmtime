@@ -2151,6 +2151,29 @@ fn transaction_ttable_startup_fill_impl(
     Ok(())
 }
 
+fn transaction_ttable_startup_check_range(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    let result = transaction_ttable_startup_check_range_impl(store, instance, table, start, len);
+    abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_startup_check_range_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_transaction_table_range_in_bounds(store, instance, table, start, len)
+}
+
 fn transaction_ttable_read_range(
     store: &mut dyn VMStore,
     instance: InstanceId,

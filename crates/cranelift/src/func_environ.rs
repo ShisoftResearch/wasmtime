@@ -5816,7 +5816,96 @@ impl FuncEnvironment<'_> {
         Ok(())
     }
 
+    fn translate_transaction_ttable_startup_check_range(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        start: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        self.ensure_transaction_table(table_index)?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_ttable_startup_check_range(),
+        );
+        let index_type = self.table(table_index).idx_type;
+
+        let mut pos = builder.cursor();
+        let (table_vmctx, defined_table_index) =
+            self.table_vmctx_and_defined_index(&mut pos, table_index);
+        let start = self.cast_index_to_i64(&mut pos, start, index_type);
+        let len = self.cast_index_to_i64(&mut pos, len, index_type);
+        pos.ins()
+            .call(callee, &[table_vmctx, defined_table_index, start, len]);
+        Ok(())
+    }
+
     fn translate_transaction_ttable_startup_fill(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        table_index: TableIndex,
+        dest: ir::Value,
+        value: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        if !self.tunables.epoch_interruption && !self.tunables.consume_fuel {
+            return self.translate_transaction_ttable_startup_fill_uninterruptible(
+                builder,
+                table_index,
+                dest,
+                value,
+                len,
+            );
+        }
+        self.translate_transaction_ttable_startup_check_range(builder, table_index, dest, len)?;
+
+        let current_block = builder.current_block().unwrap();
+        let loop_block = builder.create_block();
+        let continue_block = builder.create_block();
+        builder.ensure_inserted_block();
+        builder.insert_block_after(loop_block, current_block);
+        builder.insert_block_after(continue_block, loop_block);
+
+        if self.tunables.consume_fuel {
+            self.fuel_increment_var(builder);
+        }
+
+        builder.ins().brif(
+            len,
+            loop_block,
+            &[dest.into(), len.into()],
+            continue_block,
+            &[],
+        );
+
+        builder.switch_to_block(loop_block);
+        let index_type = builder.func.dfg.value_type(dest);
+        let len_type = builder.func.dfg.value_type(len);
+        let current = builder.append_block_param(loop_block, index_type);
+        let remaining = builder.append_block_param(loop_block, len_type);
+        if self.tunables.consume_fuel {
+            self.fuel_consumed += 1;
+        }
+        self.translate_loop_header(builder)?;
+        self.translate_transaction_ttable_startup_set(builder, table_index, value, current)?;
+        let next = builder.ins().iadd_imm_s(current, 1);
+        let remaining = builder.ins().iadd_imm_s(remaining, -1);
+        let done = builder.ins().icmp_imm_s(IntCC::Equal, remaining, 0);
+        builder.ins().brif(
+            done,
+            continue_block,
+            &[],
+            loop_block,
+            &[next.into(), remaining.into()],
+        );
+
+        builder.switch_to_block(continue_block);
+        builder.seal_block(loop_block);
+        builder.seal_block(continue_block);
+        Ok(())
+    }
+
+    fn translate_transaction_ttable_startup_fill_uninterruptible(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         table_index: TableIndex,
@@ -8591,16 +8680,31 @@ impl FuncEnvironment<'_> {
             i64::try_from(segment.elements.len()).unwrap(),
         );
 
-        // Check the bounds first before mutating anything.
-        self.translate_entity_bounds_check(
-            builder,
-            CheckedEntity::Table {
-                table: segment.table_index,
-                initialized: true,
-            },
-            offset,
-            segment_len,
-        )?;
+        // Check the bounds first before mutating anything. Transactional
+        // tables may have a staged size that is not visible in their backing
+        // table yet.
+        if self
+            .module
+            .transaction_objects
+            .is_ttable(segment.table_index)
+        {
+            self.translate_transaction_ttable_startup_check_range(
+                builder,
+                segment.table_index,
+                offset,
+                segment_len,
+            )?;
+        } else {
+            self.translate_entity_bounds_check(
+                builder,
+                CheckedEntity::Table {
+                    table: segment.table_index,
+                    initialized: true,
+                },
+                offset,
+                segment_len,
+            )?;
+        }
 
         // Re-use the `table.set` translation for making this a simple function
         // to define. That re-executes the bounds check which is a bit
