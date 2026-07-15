@@ -19999,7 +19999,9 @@ fn transaction_object_tarray_executes_through_object_table() {
                 (local.set $aref
                   (tarray.new $a (i32.const 7) (i32.const 3)))
                 (tarray.set $a (tref.cast_write (local.get $aref)) (i32.const 1) (i32.const 42))
-                (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 1))))
+                (i32.add
+                  (tarray.len (local.get $aref))
+                  (tarray.get $a (tref.cast_read (local.get $aref)) (i32.const 1)))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -20008,7 +20010,7 @@ fn transaction_object_tarray_executes_through_object_table() {
         .get_typed_func::<(), i32>(&mut store, "create_set_get")
         .unwrap();
 
-    assert_eq!(create_set_get.call(&mut store, ()).unwrap(), 42);
+    assert_eq!(create_set_get.call(&mut store, ()).unwrap(), 45);
     assert_eq!(store.transaction_object_table().live_count(), 0);
 }
 
