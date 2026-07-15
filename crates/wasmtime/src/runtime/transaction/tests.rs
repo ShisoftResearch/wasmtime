@@ -12371,6 +12371,98 @@ fn transaction_local_handles_are_not_reused_after_abort() {
 }
 
 #[test]
+fn transaction_local_promoted_handles_are_not_reused_after_pre_lp_abort() {
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+
+    state.begin().unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    state
+        .stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))
+        .unwrap();
+
+    let promoted = state
+        .promote_transaction_object_graph_for_test(&mut objects, local)
+        .unwrap();
+    let mut publications = Vec::new();
+    assert!(
+        state
+            .commit_object_payloads_into(&mut objects, &mut publications)
+            .unwrap()
+    );
+    assert_eq!(
+        objects
+            .object_id_for_transaction_ref_handle(handle)
+            .unwrap(),
+        promoted
+    );
+    let root_delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    assert!(
+        root_delta
+            .roots
+            .values()
+            .any(|roots| roots.contains(&promoted))
+    );
+
+    state.abort_allocated_objects(&mut objects).unwrap();
+
+    assert_eq!(
+        state.known_object_id_for_transaction_ref_handle(&objects, handle),
+        None
+    );
+    assert!(
+        objects
+            .object_id_for_transaction_ref_handle(handle)
+            .is_err()
+    );
+
+    let bridge_target = objects.allocate_struct(vec![ObjectValue::I32(2)]).unwrap();
+    let error = objects
+        .ensure_live_gc_ref_bridge_available(handle, "struct")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "transactional object GC ref collides with reserved transaction object handle"
+        )
+    );
+    let error = objects
+        .associate_live_gc_ref_for_transaction_bridge(handle, bridge_target)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "transactional object GC ref collides with reserved transaction object handle"
+        )
+    );
+
+    objects.next_transaction_ref_handle = handle;
+
+    state.begin().unwrap();
+    let second = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(3)], None)
+        .unwrap();
+    let second_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, second, |_| false)
+        .unwrap();
+
+    assert_ne!(second_handle, handle);
+    assert_eq!(
+        second_handle,
+        handle
+            .checked_add(super::object_value::TRANSACTION_OBJECT_REF_HANDLE_STEP)
+            .unwrap_or(super::object_value::TRANSACTION_OBJECT_REF_HANDLE_STEP)
+    );
+
+    state.abort().unwrap();
+}
+
+#[test]
 fn transaction_local_reserved_handles_block_live_gc_bridge_registration() {
     let mut objects = ObjectTable::default();
     let mut state = TransactionState::default();

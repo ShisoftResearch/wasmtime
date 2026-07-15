@@ -1984,7 +1984,18 @@ impl ObjectTable {
             return Ok(false);
         }
         self.slots[index] = None;
-        if let Some(handle) = self.objects_to_transaction_ref_handles.remove(&object_id) {
+        let handle = self
+            .objects_to_transaction_ref_handles
+            .remove(&object_id)
+            .or_else(|| {
+                self.transaction_ref_handles_to_objects.iter().find_map(
+                    |(&handle, &mapped_object_id)| {
+                        (mapped_object_id == object_id).then_some(handle)
+                    },
+                )
+            });
+        if let Some(handle) = handle {
+            self.reserved_transaction_ref_handles.insert(handle);
             self.transaction_ref_handles_to_objects.remove(&handle);
         }
         if let Some(gc_ref) = self.object_to_live_bridge_gc_ref.remove(&object_id) {
