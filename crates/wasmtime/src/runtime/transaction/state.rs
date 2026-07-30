@@ -151,6 +151,50 @@ impl Default for TransactionLocalObjectTable {
     }
 }
 
+impl VisibilityReadContext {
+    pub(crate) fn read_memory(
+        &self,
+        granule: GranuleId,
+        current: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        self.visibility.read_memory(self.snapshot, granule, current)
+    }
+
+    pub(crate) fn read_memory_size(
+        &self,
+        granule: GranuleId,
+        current: impl FnOnce() -> Result<u64>,
+    ) -> Result<u64> {
+        self.visibility
+            .read_memory_size(self.snapshot, granule, current)
+    }
+
+    pub(crate) fn read_global(
+        &self,
+        granule: GranuleId,
+        current: impl FnOnce() -> Result<GlobalSnapshot>,
+    ) -> Result<GlobalSnapshot> {
+        self.visibility.read_global(self.snapshot, granule, current)
+    }
+
+    pub(crate) fn read_table(
+        &self,
+        granule: GranuleId,
+        current: impl FnOnce() -> Result<TableGranuleSnapshot>,
+    ) -> Result<TableGranuleSnapshot> {
+        self.visibility.read_table(self.snapshot, granule, current)
+    }
+
+    pub(crate) fn read_table_size(
+        &self,
+        granule: GranuleId,
+        current: impl FnOnce() -> Result<u64>,
+    ) -> Result<u64> {
+        self.visibility
+            .read_table_size(self.snapshot, granule, current)
+    }
+}
+
 impl TransactionLocalObjectTable {
     fn is_local_object_id(object_id: ObjectId) -> bool {
         object_id.object_index >= TRANSACTION_LOCAL_OBJECT_ID_BASE
@@ -2253,10 +2297,13 @@ impl TransactionState {
         Ok(self.scratch.as_mut_ptr())
     }
 
-    pub(crate) fn pending_memory_store(&self) -> Option<(InstanceId, u32, u64, usize)> {
+    pub(crate) fn pending_memory_store(
+        &self,
+    ) -> Option<(InstanceId, Option<InstanceId>, u32, u64, usize)> {
         self.pending_memory_store.map(|pending| {
             (
                 pending.instance,
+                pending.owner_instance_key,
                 pending.memory_index,
                 pending.addr,
                 pending.len,

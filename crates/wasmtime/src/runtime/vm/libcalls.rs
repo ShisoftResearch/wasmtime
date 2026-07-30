@@ -59,6 +59,8 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 #[cfg(feature = "gc")]
 use crate::runtime::transaction::DurableExternRefHostData;
+#[cfg(feature = "transaction-mvcc")]
+use crate::runtime::transaction::TMemoryGranuleSnapshot;
 use crate::runtime::transaction::{
     DurableReferenceRegistry, GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
@@ -67,9 +69,9 @@ use crate::runtime::transaction::{
     ObjectTable, ObjectValue, ObjectValueAbi, OrdinaryGcPromotionAdapter,
     OrdinaryGcPromotionSource, OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE,
     PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend,
-    TableElementSnapshot, TransactionId, TransactionState, WasmtimePersistentFieldLayout,
-    WasmtimePersistentFieldLayoutAbi, collect_tmemory_access_snapshot,
-    combine_operation_and_cleanup_results,
+    TableElementSnapshot, TableGranuleSnapshot, TransactionId, TransactionState,
+    WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
+    collect_tmemory_access_snapshot, combine_operation_and_cleanup_results,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -1134,18 +1136,27 @@ fn transaction_tglobal_get_impl(
     flush_pending_tmemory_store(store, instance)?;
 
     let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
-    let staged = {
+    let (staged, visibility) = {
         let state = store.store_opaque_mut().transaction_state_mut();
         ensure!(
             state.active_transaction().is_some(),
             "transaction operation requires an active transaction"
         );
         state.acquire_global_read_owned(Some(instance), global_index.as_u32())?;
-        state.staged_global_owned(Some(instance), global_index.as_u32())
+        (
+            state.staged_global_owned(Some(instance), global_index.as_u32()),
+            state.active_visibility_read_context()?,
+        )
     };
     let snapshot = match staged {
         Some(snapshot) => snapshot,
-        None => read_global_snapshot(store, instance, global_index, wasm_ty)?,
+        None => visibility.read_global(
+            GranuleId::TGlobal {
+                instance: Some(instance.as_u32()),
+                global_index: global_index.as_u32(),
+            },
+            || read_global_snapshot(store, instance, global_index, wasm_ty),
+        )?,
     };
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
 
@@ -1578,26 +1589,8 @@ fn transaction_tmemory_size_impl(
     ensure_active_transaction(store)?;
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
     let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
-    {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        state.acquire_memory_size_read_owned(owner_instance_key, memory_index.as_u32())?;
-        if let Some(pages) =
-            state.staged_memory_size_owned(owner_instance_key, memory_index.as_u32())
-        {
-            return Ok(
-                usize::try_from(pages).context("transactional memory size overflow")? as *mut u8,
-            );
-        }
-    }
-    let pages = {
-        let instance_ref = store.instance_mut(instance);
-        let instance_ref = instance_ref.as_ref();
-        let tmemory = instance_ref
-            .get_tmemory(memory_index)
-            .context("transactional memory operation targeted non-transactional memory")?;
-        tmemory.byte_len() / crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE
-    };
-    Ok(pages as *mut u8)
+    let pages = visible_tmemory_pages(store, instance, owner_instance_key, memory_index)?;
+    Ok(usize::try_from(pages).context("transactional memory size overflow")? as *mut u8)
 }
 
 fn transaction_tmemory_grow(
@@ -1621,20 +1614,7 @@ fn transaction_tmemory_grow_impl(
     ensure_active_transaction(store)?;
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
     let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
-    let committed_pages = {
-        let instance_ref = store.instance_mut(instance);
-        let instance_ref = instance_ref.as_ref();
-        let tmemory = instance_ref
-            .get_tmemory(memory_index)
-            .context("transactional memory operation targeted non-transactional memory")?;
-        u64::try_from(tmemory.byte_len() / crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE)
-            .context("tmemory previous size overflow")?
-    };
-    let previous_pages = store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .staged_memory_size_owned(owner_instance_key, memory_index.as_u32())
-        .unwrap_or(committed_pages);
+    let previous_pages = visible_tmemory_pages(store, instance, owner_instance_key, memory_index)?;
     let Some(new_pages) = previous_pages.checked_add(delta) else {
         return Ok(None);
     };
@@ -2021,41 +2001,58 @@ fn transaction_ttable_get_impl(
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
-    ensure_transaction_table_index_in_bounds(store, instance, table, index)?;
-    {
+    let visible_size = transaction_table_size_for_bounds(store, instance, table)?;
+    if index >= visible_size {
+        bail!(Trap::TableOutOfBounds);
+    }
+    let (staged, visibility) = {
         let state = store.store_opaque_mut().transaction_state_mut();
         state.acquire_table_granule_read_owned(Some(instance), table, index, 0)?;
-        if let Some(value) = state.staged_table_element_owned(Some(instance), table, index) {
-            return Ok(table_element_snapshot_to_raw(value));
-        }
+        (
+            state.staged_table_element_owned(Some(instance), table, index),
+            state.active_visibility_read_context()?,
+        )
+    };
+    if let Some(value) = staged {
+        return Ok(table_element_snapshot_to_raw(value));
     }
-    let committed_size = u64::try_from(defined_table_size(store, instance, table)?)
-        .context("defined table size does not fit u64")?;
+    let snapshot_visible_size = snapshot_visible_ttable_size(store, instance, table)?;
     ensure!(
-        index < committed_size,
+        index < snapshot_visible_size,
         "transactional table overlay is missing staged element {index} in grown table"
     );
-
-    let table_index = DefinedTableIndex::from_u32(table);
-    let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
-    let (_gc_store, registry, instance_ref) =
-        store.optional_gc_store_and_registry_and_instance_mut(instance);
-    let table_ref = instance_ref.get_defined_table_with_lazy_init(
-        registry,
-        table_index,
-        core::iter::once(index),
-    );
-    Ok(match table_ref.element_type() {
-        TableElementType::Func => match table_ref.get_func(index)? {
-            Some(ptr) => ptr.as_ptr().cast(),
-            None => core::ptr::null_mut(),
-        },
-        TableElementType::GcRef => {
-            let raw = table_ref.get_gc_ref(index)?.map_or(0, VMGcRef::as_raw_u32);
-            core::ptr::with_exposed_provenance_mut(usize::try_from(raw).unwrap())
+    let granule_index = index / TableGranuleSnapshot::ELEMENT_CAPACITY;
+    let granule = GranuleId::TTable {
+        instance: Some(instance.as_u32()),
+        table_index: table,
+        granule_index,
+    };
+    let visible = visibility.read_table(granule, || {
+        collect_current_table_granule(store, instance, table, granule_index, snapshot_visible_size)
+    })?;
+    let mut elements = visible.into_elements();
+    let granule_start = granule_index
+        .checked_mul(TableGranuleSnapshot::ELEMENT_CAPACITY)
+        .context("ttable granule start overflow")?;
+    {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        for (offset, element) in elements.iter_mut().enumerate() {
+            let element_index = granule_start
+                .checked_add(u64::try_from(offset).unwrap())
+                .context("ttable element index overflow")?;
+            if let Some(staged) =
+                state.staged_table_element_owned(Some(instance), table, element_index)
+            {
+                *element = staged;
+            }
         }
-        TableElementType::Cont => bail!("transactional contref table is not implemented yet"),
-    })
+    }
+    let offset = usize::try_from(index - granule_start).unwrap();
+    let value = elements
+        .get(offset)
+        .copied()
+        .context("snapshot-visible table granule is missing an in-bounds element")?;
+    Ok(table_element_snapshot_to_raw(value))
 }
 
 fn transaction_ttable_set(
@@ -2250,17 +2247,8 @@ fn transaction_ttable_size_impl(
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store)?;
-    {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        state.acquire_table_size_read_owned(Some(instance), table, 0)?;
-        if let Some(size) = state.staged_table_size_owned(Some(instance), table) {
-            return Ok(
-                usize::try_from(size).context("transactional table size overflow")? as *mut u8,
-            );
-        }
-    }
-    let size = defined_table_size(store, instance, table)?;
-    Ok(size as *mut u8)
+    let size = visible_ttable_size(store, instance, table)?;
+    Ok(usize::try_from(size).context("transactional table size overflow")? as *mut u8)
 }
 
 fn transaction_ttable_grow(
@@ -2286,24 +2274,19 @@ fn transaction_ttable_grow_impl(
     ensure_active_transaction(store)?;
 
     let table_index = DefinedTableIndex::from_u32(table);
-    let (committed_size, maximum, element_type) = {
+    let (maximum, element_type) = {
         let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
         let (_gc_store, _registry, instance_ref) =
             store.optional_gc_store_and_registry_and_instance_mut(instance);
         let table_ref = instance_ref.get_defined_table(table_index);
         (
-            u64::try_from(table_ref.size())?,
             table_ref.maximum().map(u64::try_from).transpose()?,
             table_ref.element_type(),
         )
     };
     let init = table_element_snapshot_from_raw(element_type, init)?;
     let init = normalize_persistent_table_snapshot(store.store_opaque_mut(), init)?;
-    let current_size = store
-        .store_opaque_mut()
-        .transaction_state_mut()
-        .staged_table_size_owned(Some(instance), table)
-        .unwrap_or(committed_size);
+    let current_size = visible_ttable_size(store, instance, table)?;
     let new_size = current_size
         .checked_add(delta)
         .context("transactional table grow size overflow")?;
@@ -3767,7 +3750,7 @@ fn checked_tmemory_effective_address(addr: u64, offset: u64) -> Result<u64> {
 }
 
 fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
-    let Some((owner, memory, addr, len)) = store
+    let Some((owner, owner_instance_key, memory, addr, len)) = store
         .store_opaque_mut()
         .transaction_state_mut()
         .pending_memory_store()
@@ -3775,7 +3758,8 @@ fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -
         return Ok(());
     };
     let memory_index = MemoryIndex::from_u32(memory);
-    let snapshot = collect_tmemory_snapshot(store, owner, memory_index, addr, len)?;
+    let snapshot =
+        collect_tmemory_snapshot(store, owner, owner_instance_key, memory_index, addr, len)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -4179,15 +4163,97 @@ fn transaction_table_size_for_bounds(
     instance: InstanceId,
     table: u32,
 ) -> Result<u64> {
-    if let Some(size) = store
+    if store
         .store_opaque_mut()
         .transaction_state_mut()
-        .staged_table_size_owned(Some(instance), table)
+        .active_transaction()
+        .is_none()
     {
+        return u64::try_from(defined_table_size(store, instance, table)?)
+            .context("defined table size does not fit u64");
+    }
+    visible_ttable_size(store, instance, table)
+}
+
+fn visible_ttable_size(store: &mut dyn VMStore, instance: InstanceId, table: u32) -> Result<u64> {
+    let staged = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .staged_table_size_owned(Some(instance), table);
+    if let Some(size) = staged {
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .acquire_table_size_read_owned(Some(instance), table, 0)?;
         return Ok(size);
     }
-    u64::try_from(defined_table_size(store, instance, table)?)
-        .context("defined table size does not fit u64")
+    snapshot_visible_ttable_size(store, instance, table)
+}
+
+fn snapshot_visible_ttable_size(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+) -> Result<u64> {
+    let visibility = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        state.acquire_table_size_read_owned(Some(instance), table, 0)?;
+        state.active_visibility_read_context()?
+    };
+    visibility.read_table_size(
+        GranuleId::TTableSize {
+            instance: Some(instance.as_u32()),
+            table_index: table,
+        },
+        || {
+            u64::try_from(defined_table_size(store, instance, table)?)
+                .context("defined table size does not fit u64")
+        },
+    )
+}
+
+fn collect_current_table_granule(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    granule_index: u64,
+    visible_size: u64,
+) -> Result<TableGranuleSnapshot> {
+    let granule_start = granule_index
+        .checked_mul(TableGranuleSnapshot::ELEMENT_CAPACITY)
+        .context("ttable granule start overflow")?;
+    let granule_end = granule_start
+        .checked_add(TableGranuleSnapshot::ELEMENT_CAPACITY)
+        .context("ttable granule end overflow")?
+        .min(visible_size);
+    let table_index = DefinedTableIndex::from_u32(table);
+    let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
+    let (_gc_store, registry, instance_ref) =
+        store.optional_gc_store_and_registry_and_instance_mut(instance);
+    let table_ref = instance_ref.get_defined_table_with_lazy_init(
+        registry,
+        table_index,
+        granule_start..granule_end,
+    );
+    let mut elements = Vec::with_capacity(usize::try_from(granule_end - granule_start).unwrap());
+    for element_index in granule_start..granule_end {
+        elements.push(match table_ref.element_type() {
+            TableElementType::Func => TableElementSnapshot::FuncRef(
+                table_ref
+                    .get_func(element_index)?
+                    .map_or(0, |ptr| ptr.as_ptr().addr()),
+            ),
+            TableElementType::GcRef => TableElementSnapshot::GcRef(
+                table_ref
+                    .get_gc_ref(element_index)?
+                    .map_or(0, VMGcRef::as_raw_u32),
+            ),
+            TableElementType::Cont => {
+                bail!("transactional contref table is not implemented yet")
+            }
+        });
+    }
+    TableGranuleSnapshot::new(elements)
 }
 
 fn ensure_transaction_table_index_in_bounds(
@@ -4226,23 +4292,183 @@ fn collect_defined_tmemory_snapshot(
     len: usize,
 ) -> Result<(MemoryIndex, TMemoryAccessSnapshot)> {
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
-    let snapshot = collect_tmemory_snapshot(store, instance, memory_index, addr, len)?;
+    let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
+    let snapshot =
+        collect_tmemory_snapshot(store, instance, owner_instance_key, memory_index, addr, len)?;
     Ok((memory_index, snapshot))
 }
 
-fn collect_tmemory_snapshot(
+fn current_tmemory_pages(
     store: &mut dyn VMStore,
     instance: InstanceId,
     memory_index: MemoryIndex,
-    addr: u64,
-    len: usize,
-) -> Result<TMemoryAccessSnapshot> {
+) -> Result<u64> {
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
     let tmemory = instance_ref
         .get_tmemory(memory_index)
         .context("transactional memory operation targeted non-transactional memory")?;
-    collect_tmemory_access_snapshot(tmemory, addr, len)
+    u64::try_from(tmemory.byte_len() / crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE)
+        .context("tmemory size overflow")
+}
+
+fn snapshot_visible_tmemory_pages(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    owner_instance_key: Option<InstanceId>,
+    memory_index: MemoryIndex,
+) -> Result<u64> {
+    let (visibility, granule) = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        state.acquire_memory_size_read_owned(owner_instance_key, memory_index.as_u32())?;
+        (
+            state.active_visibility_read_context()?,
+            GranuleId::TMemorySize {
+                instance: owner_instance_key.map(InstanceId::as_u32),
+                memory_index: memory_index.as_u32(),
+            },
+        )
+    };
+    visibility.read_memory_size(granule, || {
+        current_tmemory_pages(store, instance, memory_index)
+    })
+}
+
+fn visible_tmemory_pages(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    owner_instance_key: Option<InstanceId>,
+    memory_index: MemoryIndex,
+) -> Result<u64> {
+    let staged = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .staged_memory_size_owned(owner_instance_key, memory_index.as_u32());
+    match staged {
+        Some(pages) => {
+            store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .acquire_memory_size_read_owned(owner_instance_key, memory_index.as_u32())?;
+            Ok(pages)
+        }
+        None => snapshot_visible_tmemory_pages(store, instance, owner_instance_key, memory_index),
+    }
+}
+
+fn collect_tmemory_snapshot(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    _owner_instance_key: Option<InstanceId>,
+    memory_index: MemoryIndex,
+    addr: u64,
+    len: usize,
+) -> Result<TMemoryAccessSnapshot> {
+    #[cfg(not(feature = "transaction-mvcc"))]
+    {
+        let instance_ref = store.instance_mut(instance);
+        let instance_ref = instance_ref.as_ref();
+        let tmemory = instance_ref
+            .get_tmemory(memory_index)
+            .context("transactional memory operation targeted non-transactional memory")?;
+        return collect_tmemory_access_snapshot(tmemory, addr, len);
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    {
+        let snapshot_pages =
+            snapshot_visible_tmemory_pages(store, instance, _owner_instance_key, memory_index)?;
+        let access_pages = store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .staged_memory_size_owned(_owner_instance_key, memory_index.as_u32())
+            .unwrap_or(snapshot_pages);
+        let page_size = crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE;
+        let snapshot_byte_len = usize::try_from(snapshot_pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(page_size))
+            .context("snapshot-visible tmemory size overflow")?;
+        let access_byte_len = usize::try_from(access_pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(page_size))
+            .context("transactional tmemory size overflow")?;
+        let range_start =
+            usize::try_from(addr).context("tmemory address does not fit host usize")?;
+        let range_end = range_start
+            .checked_add(len)
+            .context("tmemory address overflow")?;
+        ensure!(
+            range_end <= access_byte_len,
+            "out of bounds tmemory access: range {range_start}..{range_end} exceeds backing length {access_byte_len}"
+        );
+        let range = range_start..range_end;
+        let visibility = store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .active_visibility_read_context()?;
+        let mut granules = Vec::new();
+        let mut bytes = Vec::with_capacity(len);
+        let mut current = range.start;
+
+        while current < range.end {
+            let granule_index = current / crate::runtime::transaction::TMEMORY_GRANULE_SIZE;
+            let granule_start = granule_index
+                .checked_mul(crate::runtime::transaction::TMEMORY_GRANULE_SIZE)
+                .context("tmemory granule start overflow")?;
+            let granule_end = granule_start
+                .checked_add(crate::runtime::transaction::TMEMORY_GRANULE_SIZE)
+                .context("tmemory granule end overflow")?
+                .min(access_byte_len);
+            let granule_range = granule_start..granule_end;
+            let visible_bytes = if granule_start < snapshot_byte_len {
+                let visible_end = granule_end.min(snapshot_byte_len);
+                let current_len = visible_end - granule_start;
+                let granule = GranuleId::TMemory {
+                    instance: _owner_instance_key.map(InstanceId::as_u32),
+                    memory_index: memory_index.as_u32(),
+                    granule_index: u64::try_from(granule_index)
+                        .context("tmemory granule index does not fit u64")?,
+                };
+                visibility.read_memory(granule, || {
+                    let instance_ref = store.instance_mut(instance);
+                    let instance_ref = instance_ref.as_ref();
+                    let tmemory = instance_ref.get_tmemory(memory_index).context(
+                        "transactional memory operation targeted non-transactional memory",
+                    )?;
+                    let snapshot = collect_tmemory_access_snapshot(
+                        tmemory,
+                        u64::try_from(granule_start)
+                            .context("tmemory granule address does not fit u64")?,
+                        current_len,
+                    )?;
+                    Ok(snapshot
+                        .into_granules()
+                        .into_iter()
+                        .next()
+                        .context("current tmemory snapshot is missing its granule")?
+                        .into_bytes())
+                })?
+            } else {
+                vec![0; granule_range.len()]
+            };
+            ensure!(
+                visible_bytes.len() == granule_range.len(),
+                "visible tmemory granule length mismatch"
+            );
+            let overlap_start = current - granule_start;
+            let overlap_end = (range.end.min(granule_end)) - granule_start;
+            bytes.extend_from_slice(&visible_bytes[overlap_start..overlap_end]);
+            granules.push(TMemoryGranuleSnapshot::new(
+                granule_index,
+                granule_range,
+                0,
+                visible_bytes,
+            )?);
+            current = range.end.min(granule_end);
+        }
+
+        TMemoryAccessSnapshot::new(addr, bytes, access_byte_len, granules)
+    }
 }
 
 fn current_granule_version(

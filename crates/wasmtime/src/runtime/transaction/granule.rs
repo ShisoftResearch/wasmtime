@@ -150,6 +150,8 @@ pub(super) struct TableElementKey {
 pub(crate) struct TableGranuleSnapshot(Vec<TableElementSnapshot>);
 
 impl TableGranuleSnapshot {
+    pub(crate) const ELEMENT_CAPACITY: u64 = TTABLE_GRANULE_SIZE;
+
     pub(crate) fn new(elements: Vec<TableElementSnapshot>) -> Result<Self> {
         ensure!(
             elements.len() <= usize::try_from(TTABLE_GRANULE_SIZE).unwrap(),
@@ -185,12 +187,70 @@ pub(crate) struct TMemoryGranuleSnapshot {
     pub(super) bytes: Vec<u8>,
 }
 
+impl TMemoryGranuleSnapshot {
+    pub(crate) fn new(
+        granule_index: usize,
+        range: Range<usize>,
+        version: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Self> {
+        ensure!(
+            bytes.len() <= TMEMORY_GRANULE_SIZE,
+            "tmemory granule snapshot exceeds {} bytes",
+            TMEMORY_GRANULE_SIZE
+        );
+        ensure!(
+            range.len() == bytes.len(),
+            "tmemory granule snapshot range length mismatch"
+        );
+        Ok(Self {
+            granule_index,
+            range,
+            version,
+            bytes,
+        })
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TMemoryAccessSnapshot {
     pub(super) base: u64,
     pub(super) bytes: Vec<u8>,
     pub(super) byte_len: usize,
     pub(super) granules: Vec<TMemoryGranuleSnapshot>,
+}
+
+impl TMemoryAccessSnapshot {
+    pub(crate) fn new(
+        base: u64,
+        bytes: Vec<u8>,
+        byte_len: usize,
+        granules: Vec<TMemoryGranuleSnapshot>,
+    ) -> Result<Self> {
+        let start =
+            usize::try_from(base).context("tmemory snapshot base does not fit host usize")?;
+        let end = start
+            .checked_add(bytes.len())
+            .context("tmemory snapshot range overflow")?;
+        ensure!(
+            end <= byte_len,
+            "tmemory snapshot range exceeds visible memory size"
+        );
+        Ok(Self {
+            base,
+            bytes,
+            byte_len,
+            granules,
+        })
+    }
+
+    pub(crate) fn into_granules(self) -> Vec<TMemoryGranuleSnapshot> {
+        self.granules
+    }
 }
 
 pub(crate) const TMEMORY_GRANULE_SHIFT: usize = 6;
