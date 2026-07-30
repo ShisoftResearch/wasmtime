@@ -177,6 +177,13 @@ pub(crate) type SelectedTransactionVisibility = super::mvcc::MvccVisibility;
 pub(crate) type SelectedVisibilitySnapshot =
     <SelectedTransactionVisibility as TransactionVisibility>::Snapshot;
 
+/// Cloneable facade and copied timestamp for reads in the active workspace.
+#[derive(Clone, Debug)]
+pub(crate) struct VisibilityReadContext {
+    pub(crate) visibility: SelectedTransactionVisibility,
+    pub(crate) snapshot: CommitTimestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

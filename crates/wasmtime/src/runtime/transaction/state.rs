@@ -2,6 +2,10 @@ use crate::runtime::transaction::concurrency::TransactionConflictAction;
 use wasmtime_environ::VMSharedTypeIndex;
 
 use super::object_table::default_type_layout_id_for_kind;
+use super::visibility::{
+    SelectedTransactionVisibility, SelectedVisibilitySnapshot, TransactionVisibility,
+    VisibilityReadContext,
+};
 use super::*;
 
 const TRANSACTION_LOCAL_OBJECT_ID_BASE: u64 = 1u64 << 63;
@@ -20,6 +24,8 @@ pub(crate) struct TransactionState {
     pub(super) terminal_commit_active: bool,
     pub(super) active_conflict_aborted: bool,
     pub(super) concurrency: ConcurrencyControlState,
+    pub(super) visibility: SelectedTransactionVisibility,
+    pub(super) visibility_snapshot: Option<SelectedVisibilitySnapshot>,
     pub(super) suspended: BTreeMap<TransactionId, TransactionWorkspace>,
     pub(super) staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
     pub(super) staged_granules: BTreeMap<GranuleId, Vec<u8>>,
@@ -47,6 +53,8 @@ pub(crate) struct TransactionState {
 
 #[derive(Debug, Default)]
 pub(super) struct TransactionWorkspace {
+    visibility: SelectedTransactionVisibility,
+    visibility_snapshot: Option<SelectedVisibilitySnapshot>,
     staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
     staged_granules: BTreeMap<GranuleId, Vec<u8>>,
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
@@ -83,6 +91,8 @@ impl Default for TransactionState {
             terminal_commit_active: false,
             active_conflict_aborted: false,
             concurrency: ConcurrencyControlState::default(),
+            visibility: SelectedTransactionVisibility::default(),
+            visibility_snapshot: None,
             suspended: BTreeMap::new(),
             staged_globals: BTreeMap::new(),
             staged_granules: BTreeMap::new(),
@@ -383,7 +393,15 @@ impl PersistentRootDelta {
 impl TransactionState {
     pub(crate) fn begin(&mut self) -> Result<TransactionId> {
         self.prepare_to_begin_transaction()?;
-        let id = self.allocate_local_transaction_id()?;
+        let visibility = self.visibility.clone();
+        let snapshot = visibility.begin_snapshot()?;
+        let id = match self.allocate_local_transaction_id() {
+            Ok(id) => id,
+            Err(error) => {
+                return Self::finish_snapshot_after_error(&visibility, snapshot, error);
+            }
+        };
+        self.visibility_snapshot = Some(snapshot);
         self.activate_transaction(id);
         Ok(id)
     }
@@ -393,10 +411,32 @@ impl TransactionState {
         region: &TransactionRegionRuntime,
     ) -> Result<TransactionId> {
         self.prepare_to_begin_transaction()?;
-        let id = region.allocate_transaction_id()?;
+        let visibility = region.visibility();
+        let snapshot = visibility.begin_snapshot()?;
+        let id = match region.allocate_transaction_id() {
+            Ok(id) => id,
+            Err(error) => {
+                return Self::finish_snapshot_after_error(&visibility, snapshot, error);
+            }
+        };
         self.shared_region_runtime = Some(region.clone());
+        self.visibility = visibility;
+        self.visibility_snapshot = Some(snapshot);
         self.activate_transaction(id);
         Ok(id)
+    }
+
+    fn finish_snapshot_after_error<T>(
+        visibility: &SelectedTransactionVisibility,
+        snapshot: SelectedVisibilitySnapshot,
+        error: crate::Error,
+    ) -> Result<T> {
+        match visibility.finish_snapshot(snapshot) {
+            Ok(()) => Err(error),
+            Err(finish_error) => Err(finish_error.context(format!(
+                "failed to finish transaction visibility snapshot after: {error:#}"
+            ))),
+        }
     }
 
     fn prepare_to_begin_transaction(&mut self) -> Result<()> {
@@ -440,11 +480,47 @@ impl TransactionState {
             "transaction id is already current"
         );
         let previous = self.suspend_active_workspace()?;
-        let workspace = self.suspended.remove(&transaction).unwrap_or_default();
+        let workspace = match self.suspended.remove(&transaction) {
+            Some(workspace) => workspace,
+            None => {
+                let visibility = self.visibility_for_new_workspace();
+                let snapshot = match visibility.begin_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.restore_after_failed_enter(previous)?;
+                        return Err(error);
+                    }
+                };
+                TransactionWorkspace {
+                    visibility,
+                    visibility_snapshot: Some(snapshot),
+                    ..TransactionWorkspace::default()
+                }
+            }
+        };
         self.install_workspace(workspace);
         self.active = Some(transaction);
         replace_current_thread_transaction(Some(transaction));
         Ok(previous)
+    }
+
+    fn restore_after_failed_enter(&mut self, previous: Option<TransactionId>) -> Result<()> {
+        match previous {
+            Some(transaction) => {
+                let workspace = self
+                    .suspended
+                    .remove(&transaction)
+                    .expect("just-suspended transaction workspace must remain installed");
+                self.install_workspace(workspace);
+                self.active = Some(transaction);
+            }
+            None => {
+                self.install_workspace(TransactionWorkspace::default());
+                self.active = None;
+            }
+        }
+        replace_current_thread_transaction(previous);
+        Ok(())
     }
 
     pub(crate) fn restore_transaction(&mut self, previous: Option<TransactionId>) -> Result<()> {
@@ -486,9 +562,14 @@ impl TransactionState {
             );
         }
         if let Some(workspace) = self.suspended.remove(&transaction) {
-            self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
-            self.release_transaction_authority(transaction)?;
-            return Ok(true);
+            let mut workspace = workspace;
+            let mut result = self.bump_versioned_granules(workspace.write_granules.iter().copied());
+            if let Err(error) = self.release_transaction_authority(transaction)
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+            return Self::finish_workspace_snapshot(&mut workspace, result).map(|()| true);
         }
         Ok(false)
     }
@@ -504,15 +585,64 @@ impl TransactionState {
             return Ok(true);
         }
         self.retry_post_commit_linear_undo_retirement();
-        let Some(workspace) = self.suspended.remove(&transaction) else {
+        let Some(mut workspace) = self.suspended.remove(&transaction) else {
             return Ok(false);
         };
+        let mut result = Ok(());
         for object_id in workspace.allocated_objects.iter().rev().copied() {
-            object_table.free(object_id)?;
+            if let Err(error) = object_table.free(object_id) {
+                result = Err(error);
+                break;
+            }
         }
-        self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
-        self.release_transaction_authority(transaction)?;
-        Ok(true)
+        if let Err(error) = self.bump_versioned_granules(workspace.write_granules.iter().copied())
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        if let Err(error) = self.release_transaction_authority(transaction)
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        Self::finish_workspace_snapshot(&mut workspace, result).map(|()| true)
+    }
+
+    pub(crate) fn active_visibility_read_context(&self) -> Result<VisibilityReadContext> {
+        self.ensure_active()?;
+        let snapshot = self
+            .visibility_snapshot
+            .as_ref()
+            .context("active transaction is missing a visibility snapshot")?;
+        Ok(VisibilityReadContext {
+            visibility: self.visibility.clone(),
+            snapshot: SelectedTransactionVisibility::snapshot_timestamp(snapshot),
+        })
+    }
+
+    fn visibility_for_new_workspace(&self) -> SelectedTransactionVisibility {
+        self.shared_region_runtime
+            .as_ref()
+            .map(TransactionRegionRuntime::visibility)
+            .unwrap_or_else(|| self.visibility.clone())
+    }
+
+    fn finish_workspace_snapshot(
+        workspace: &mut TransactionWorkspace,
+        result: Result<()>,
+    ) -> Result<()> {
+        let visibility = workspace.visibility.clone();
+        let finish = match workspace.visibility_snapshot.take() {
+            Some(snapshot) => visibility.finish_snapshot(snapshot),
+            None => Ok(()),
+        };
+        match (result, finish) {
+            (Ok(()), finish) => finish,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(finish_error)) => Err(finish_error.context(format!(
+                "failed to finish transaction visibility snapshot after: {error:#}"
+            ))),
+        }
     }
 
     pub(crate) fn active_transaction(&self) -> Option<TransactionId> {
@@ -748,17 +878,27 @@ impl TransactionState {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<bool> {
-        self.ensure_active()?;
-        let transaction = self.active_transaction_required()?;
-        let current_version = self.current_version_for_granule(granule, current_version)?;
-        let action = self.acquire_granule_read_authority(transaction, granule, current_version)?;
-        let refresh_after_abort = action.aborted_transaction().is_some();
-        self.handle_conflict_action(action)?;
-        if refresh_after_abort {
-            let current_version = self.current_version_for_granule(granule, current_version)?;
-            self.refresh_read_version_authority(transaction, granule, current_version)?;
+        #[cfg(feature = "transaction-mvcc")]
+        {
+            let _ = current_version;
+            self.ensure_active()?;
+            return Ok(self.read_granules.insert(granule));
         }
-        Ok(self.read_granules.insert(granule))
+        #[cfg(not(feature = "transaction-mvcc"))]
+        {
+            self.ensure_active()?;
+            let transaction = self.active_transaction_required()?;
+            let current_version = self.current_version_for_granule(granule, current_version)?;
+            let action =
+                self.acquire_granule_read_authority(transaction, granule, current_version)?;
+            let refresh_after_abort = action.aborted_transaction().is_some();
+            self.handle_conflict_action(action)?;
+            if refresh_after_abort {
+                let current_version = self.current_version_for_granule(granule, current_version)?;
+                self.refresh_read_version_authority(transaction, granule, current_version)?;
+            }
+            Ok(self.read_granules.insert(granule))
+        }
     }
 
     pub(crate) fn acquire_granule_write(
@@ -766,18 +906,29 @@ impl TransactionState {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<bool> {
-        self.ensure_active()?;
-        let transaction = self.active_transaction_required()?;
-        let current_version = self.current_version_for_granule(granule, current_version)?;
-        let action = self.acquire_granule_write_authority(transaction, granule, current_version)?;
-        let refresh_after_abort = action.aborted_transaction().is_some();
-        self.handle_conflict_action(action)?;
-        if refresh_after_abort {
-            let current_version = self.current_version_for_granule(granule, current_version)?;
-            self.refresh_read_version_authority(transaction, granule, current_version)?;
+        #[cfg(feature = "transaction-mvcc")]
+        {
+            let _ = current_version;
+            self.ensure_active()?;
+            self.read_granules.insert(granule);
+            return Ok(self.write_granules.insert(granule));
         }
-        self.read_granules.insert(granule);
-        Ok(self.write_granules.insert(granule))
+        #[cfg(not(feature = "transaction-mvcc"))]
+        {
+            self.ensure_active()?;
+            let transaction = self.active_transaction_required()?;
+            let current_version = self.current_version_for_granule(granule, current_version)?;
+            let action =
+                self.acquire_granule_write_authority(transaction, granule, current_version)?;
+            let refresh_after_abort = action.aborted_transaction().is_some();
+            self.handle_conflict_action(action)?;
+            if refresh_after_abort {
+                let current_version = self.current_version_for_granule(granule, current_version)?;
+                self.refresh_read_version_authority(transaction, granule, current_version)?;
+            }
+            self.read_granules.insert(granule);
+            Ok(self.write_granules.insert(granule))
+        }
     }
 
     pub(crate) fn owns_granule_read(&self, granule: GranuleId) -> bool {
@@ -809,8 +960,13 @@ impl TransactionState {
         F: FnMut(&StagedRecord) -> Result<()>,
     {
         self.ensure_active()?;
+        #[cfg(feature = "transaction-mvcc")]
+        let _ = current_version_fn;
+        #[cfg(not(feature = "transaction-mvcc"))]
         let mut current_version_fn = current_version_fn;
+        #[cfg(not(feature = "transaction-mvcc"))]
         self.validate_active_read_granules_with(&mut current_version_fn)?;
+        #[cfg(not(feature = "transaction-mvcc"))]
         self.validate_active_writes_with(&mut current_version_fn)?;
         let records = self.staged_records()?;
         self.begin_terminal_commit()?;
@@ -824,16 +980,33 @@ impl TransactionState {
     where
         F: FnMut(GranuleId) -> Result<u64>,
     {
-        let mut current_version_fn = current_version_fn;
-        self.validate_active_read_granules_with(&mut current_version_fn)
+        #[cfg(feature = "transaction-mvcc")]
+        {
+            let _ = current_version_fn;
+            self.ensure_active()?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "transaction-mvcc"))]
+        {
+            let mut current_version_fn = current_version_fn;
+            self.validate_active_read_granules_with(&mut current_version_fn)
+        }
     }
 
     pub(crate) fn active_read_granules(&self) -> Result<Vec<GranuleId>> {
         let transaction = self.active_transaction_required()?;
-        if self.shared_region_runtime.is_some() {
+        #[cfg(feature = "transaction-mvcc")]
+        {
+            let _ = transaction;
             return Ok(self.read_granules.iter().copied().collect());
         }
-        Ok(self.concurrency.read_granules_for_transaction(transaction))
+        #[cfg(not(feature = "transaction-mvcc"))]
+        {
+            if self.shared_region_runtime.is_some() {
+                return Ok(self.read_granules.iter().copied().collect());
+            }
+            Ok(self.concurrency.read_granules_for_transaction(transaction))
+        }
     }
 
     pub(crate) fn active_write_granules(&self) -> Result<Vec<GranuleId>> {
@@ -846,9 +1019,18 @@ impl TransactionState {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        let transaction = self.active_transaction_required()?;
-        let current_version = self.current_version_for_granule(granule, current_version)?;
-        self.validate_granule_read_authority(transaction, granule, current_version)
+        #[cfg(feature = "transaction-mvcc")]
+        {
+            let _ = (granule, current_version);
+            self.ensure_active()?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "transaction-mvcc"))]
+        {
+            let transaction = self.active_transaction_required()?;
+            let current_version = self.current_version_for_granule(granule, current_version)?;
+            self.validate_granule_read_authority(transaction, granule, current_version)
+        }
     }
 
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> u64 {
@@ -1102,11 +1284,19 @@ impl TransactionState {
         let Some(transaction) = transaction else {
             return Ok(());
         };
-        if let Some(workspace) = self.suspended.remove(&transaction) {
-            let _ = self.take_shared_conflict_aborted_transaction(transaction)?;
+        if let Some(mut workspace) = self.suspended.remove(&transaction) {
+            let mut result = self
+                .take_shared_conflict_aborted_transaction(transaction)
+                .map(|_| ());
             self.pending_conflict_aborted_allocated_objects
                 .extend(workspace.allocated_objects.iter().rev().copied());
-            self.bump_versioned_granules(workspace.write_granules.iter().copied())?;
+            if let Err(error) =
+                self.bump_versioned_granules(workspace.write_granules.iter().copied())
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+            Self::finish_workspace_snapshot(&mut workspace, result)?;
         }
         Ok(())
     }
@@ -3697,6 +3887,8 @@ impl TransactionState {
 
     pub(super) fn take_workspace(&mut self) -> TransactionWorkspace {
         TransactionWorkspace {
+            visibility: mem::take(&mut self.visibility),
+            visibility_snapshot: self.visibility_snapshot.take(),
             staged_globals: mem::take(&mut self.staged_globals),
             staged_granules: mem::take(&mut self.staged_granules),
             staged_memory_sizes: mem::take(&mut self.staged_memory_sizes),
@@ -3720,6 +3912,8 @@ impl TransactionState {
     }
 
     pub(super) fn install_workspace(&mut self, workspace: TransactionWorkspace) {
+        self.visibility = workspace.visibility;
+        self.visibility_snapshot = workspace.visibility_snapshot;
         self.staged_globals = workspace.staged_globals;
         self.staged_granules = workspace.staged_granules;
         self.staged_memory_sizes = workspace.staged_memory_sizes;
@@ -3742,6 +3936,8 @@ impl TransactionState {
     }
 
     pub(super) fn clear_active(&mut self) -> Result<()> {
+        let visibility = self.visibility.clone();
+        let snapshot = self.visibility_snapshot.take();
         let mut error = None;
         if let Some(transaction) = self.active {
             if self.terminal_commit_active {
@@ -3774,6 +3970,12 @@ impl TransactionState {
         self.active = None;
         self.terminal_commit_active = false;
         replace_current_thread_transaction(None);
+        if let Some(snapshot) = snapshot
+            && let Err(err) = visibility.finish_snapshot(snapshot)
+            && error.is_none()
+        {
+            error = Some(err);
+        }
         self.install_workspace(TransactionWorkspace::default());
         match error {
             Some(error) => Err(error),
@@ -3835,11 +4037,18 @@ fn persistent_root_object_id_for_table_element_snapshot(
 impl TransactionState {
     pub(super) fn new_for_test(transaction: TransactionId) -> Self {
         replace_current_thread_transaction(Some(transaction));
-        Self {
-            active: Some(transaction),
-            next_id: transaction.as_raw().saturating_add(1),
-            ..Self::default()
-        }
+        let mut state = Self::default();
+        state.active = Some(transaction);
+        state.next_id = transaction.as_raw().saturating_add(1);
+        state.visibility_snapshot = Some(state.visibility.begin_snapshot().unwrap());
+        state
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(super) fn begin_visibility_gc_barrier_for_test(
+        &self,
+    ) -> Result<super::mvcc::MvccGcBarrierPermit> {
+        self.visibility.begin_gc_barrier_for_test()
     }
 
     pub(super) fn new_for_test_with_durable_log(

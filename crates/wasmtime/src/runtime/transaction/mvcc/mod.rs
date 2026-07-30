@@ -43,6 +43,18 @@ impl MvccVisibility {
     pub(crate) const fn is_multiversion(&self) -> bool {
         true
     }
+
+    #[cfg(test)]
+    pub(crate) fn begin_gc_barrier_for_test(&self) -> Result<MvccGcBarrierPermit> {
+        self.0.coordinator.begin_gc_barrier()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_lifecycle_counts_for_test(
+        &self,
+    ) -> Result<(usize, usize, usize, usize)> {
+        self.0.coordinator.snapshot_lifecycle_counts_for_test()
+    }
 }
 
 impl Default for MvccVisibility {

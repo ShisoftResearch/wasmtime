@@ -4159,6 +4159,327 @@ fn begin_commit_and_abort_clear_active_transaction() {
     assert_eq!(current_thread_transaction_for_test(), None);
 }
 
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_begin_paths_register_one_snapshot() {
+    clear_current_thread_transaction_for_test();
+
+    let mut local = TransactionState::default();
+    let local_visibility = local.visibility.clone();
+    local.begin().unwrap();
+    assert_eq!(
+        local_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (1, 1, 0, 0)
+    );
+    assert!(local.visibility_snapshot.is_some());
+    let local_context = local.active_visibility_read_context().unwrap();
+    assert_eq!(local_context.snapshot, 0);
+    assert!(local.begin_visibility_gc_barrier_for_test().is_err());
+    local.abort().unwrap();
+    assert_eq!(
+        local_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 1, 1, 0)
+    );
+    assert!(local.visibility_snapshot.is_none());
+    drop(local.begin_visibility_gc_barrier_for_test().unwrap());
+
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let shared_visibility = runtime.visibility_for_test();
+    let mut shared = TransactionState::default();
+    shared.begin_with_region_runtime(&runtime).unwrap();
+    assert_eq!(
+        shared_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (1, 1, 0, 0)
+    );
+    assert!(shared.visibility_snapshot.is_some());
+    let shared_context = shared.active_visibility_read_context().unwrap();
+    assert!(Arc::ptr_eq(
+        shared_context.visibility.runtime(),
+        runtime.visibility_for_test().runtime()
+    ));
+    shared.abort().unwrap();
+    assert_eq!(
+        shared_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 1, 1, 0)
+    );
+    assert!(shared.visibility_snapshot.is_none());
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_unknown_enter_and_restore_preserve_registration() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.set_shared_region_runtime(Some(runtime));
+
+    let first = TransactionId::from_raw(71);
+    assert_eq!(state.enter_transaction(first).unwrap(), None);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (1, 1, 0, 0)
+    );
+    let first_timestamp = state.active_visibility_read_context().unwrap().snapshot;
+    assert!(state.visibility_snapshot.is_some());
+
+    let second = TransactionId::from_raw(72);
+    assert_eq!(state.enter_transaction(second).unwrap(), Some(first));
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (2, 2, 0, 0)
+    );
+    let second_timestamp = state.active_visibility_read_context().unwrap().snapshot;
+    assert!(state.visibility_snapshot.is_some());
+
+    state.restore_transaction(Some(first)).unwrap();
+    assert_eq!(
+        state.active_visibility_read_context().unwrap().snapshot,
+        first_timestamp
+    );
+    state.restore_transaction(Some(second)).unwrap();
+    assert_eq!(
+        state.active_visibility_read_context().unwrap().snapshot,
+        second_timestamp
+    );
+
+    state.abort().unwrap();
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (1, 2, 1, 0)
+    );
+    assert!(visibility.begin_gc_barrier_for_test().is_err());
+    assert!(state.abort_transaction(first).unwrap());
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 2, 2, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_restore_uses_original_visibility() {
+    clear_current_thread_transaction_for_test();
+    let first_runtime = TransactionRegionRuntime::new_for_test();
+    let second_runtime = TransactionRegionRuntime::new_for_test();
+    let mut state = TransactionState::default();
+
+    let first = state.begin_with_region_runtime(&first_runtime).unwrap();
+    state.restore_transaction(None).unwrap();
+    state.begin_with_region_runtime(&second_runtime).unwrap();
+    state.abort().unwrap();
+    state.restore_transaction(Some(first)).unwrap();
+
+    let context = state.active_visibility_read_context().unwrap();
+    assert!(Arc::ptr_eq(
+        context.visibility.runtime(),
+        first_runtime.visibility_for_test().runtime()
+    ));
+    assert!(!Arc::ptr_eq(
+        context.visibility.runtime(),
+        second_runtime.visibility_for_test().runtime()
+    ));
+
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_terminal_paths_unregister_snapshots() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+
+    state.begin_with_region_runtime(&runtime).unwrap();
+    assert!(visibility.begin_gc_barrier_for_test().is_err());
+    state.complete_commit().unwrap();
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+
+    let active = state.begin_with_region_runtime(&runtime).unwrap();
+    state.abort_transaction(active).unwrap();
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 2, 2, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+
+    let suspended = state.begin_with_region_runtime(&runtime).unwrap();
+    state.restore_transaction(None).unwrap();
+    assert!(visibility.begin_gc_barrier_for_test().is_err());
+    state.abort_transaction(suspended).unwrap();
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 3, 3, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+
+    let mut objects = ObjectTable::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state.abort_allocated_objects(&mut objects).unwrap();
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 4, 4, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_conflict_discard_unregisters_snapshot() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.set_shared_region_runtime(Some(runtime));
+
+    let discarded = TransactionId::from_raw(81);
+    state.enter_transaction(discarded).unwrap();
+    state.restore_transaction(None).unwrap();
+    assert!(visibility.begin_gc_barrier_for_test().is_err());
+
+    state
+        .discard_conflict_aborted_transaction(Some(discarded))
+        .unwrap();
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_gc_barrier_prevents_begin() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let barrier = runtime
+        .visibility_for_test()
+        .begin_gc_barrier_for_test()
+        .unwrap();
+    let mut state = TransactionState::default();
+
+    let error = state.begin_with_region_runtime(&runtime).unwrap_err();
+    assert!(
+        error.to_string().contains("persistent GC is active"),
+        "{error:?}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert!(state.visibility_snapshot.is_none());
+    assert_eq!(
+        runtime
+            .visibility_for_test()
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 0, 0, 0)
+    );
+
+    drop(barrier);
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state.abort().unwrap();
+    assert_eq!(
+        runtime
+            .visibility_for_test()
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_constructor_failure_unregisters_snapshot() {
+    clear_current_thread_transaction_for_test();
+    let mut state = TransactionState {
+        next_id: u64::MAX,
+        ..TransactionState::default()
+    };
+    let visibility = state.visibility.clone();
+
+    let error = state.begin().unwrap_err();
+    assert!(
+        error.to_string().contains("transaction id overflow"),
+        "{error:?}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert!(state.visibility_snapshot.is_none());
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    drop(state.begin_visibility_gc_barrier_for_test().unwrap());
+
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_acquisition_records_sets_without_cc_access() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    runtime.poison_lock_authority_for_test();
+    let read = global_granule_id(None, 1);
+    let write = global_granule_id(None, 2);
+
+    assert!(state.acquire_granule_read(read, u64::MAX).unwrap());
+    assert!(state.acquire_granule_write(write, u64::MAX).unwrap());
+    assert!(state.owns_granule_read(read));
+    assert!(state.owns_granule_read(write));
+    assert!(state.owns_granule_write(write));
+
+    let error = state.clear_active().unwrap_err();
+    assert!(error.to_string().contains("lock poisoned"), "{error:?}");
+    assert!(state.visibility_snapshot.is_none());
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(not(feature = "transaction-mvcc"))]
+#[test]
+fn single_version_workspace_acquisition_retains_execution_time_cc_access() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    runtime.poison_lock_authority_for_test();
+
+    let error = state
+        .acquire_granule_read(global_granule_id(None, 1), 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("lock poisoned"), "{error:?}");
+
+    let _ = state.clear_active();
+    clear_current_thread_transaction_for_test();
+}
+
 #[test]
 fn commit_success_policy_hook_preserves_default_commit_behavior() {
     let mut state = TransactionState::default();

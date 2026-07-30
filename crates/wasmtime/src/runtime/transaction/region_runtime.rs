@@ -27,6 +27,7 @@ use super::type_layout::TypeLayoutRegistry;
     feature = "transaction-cc-optimistic-validation"
 ))]
 use super::visibility::CommitTimestamp;
+use super::visibility::SelectedTransactionVisibility;
 use super::{
     ConcurrencyControlState, GranuleId, ObjectId, ObjectKind, ObjectTable,
     PersistentObjectDirectoryEntry, PersistentObjectRecordLocation, PersistentObjectRecordSource,
@@ -152,6 +153,7 @@ impl SharedFileBackedStorageConfig {
 #[derive(Debug)]
 struct TransactionRegionRuntimeInner {
     next_transaction_id: AtomicU64,
+    visibility: SelectedTransactionVisibility,
     log_segments: Mutex<DurableLogSegmentRegistry>,
     lock_authority: Mutex<LockAuthorityState>,
     persistent_metadata: Mutex<PersistentMetadataState>,
@@ -222,6 +224,7 @@ impl Default for TransactionRegionRuntimeInner {
     fn default() -> Self {
         Self {
             next_transaction_id: AtomicU64::new(10_001),
+            visibility: SelectedTransactionVisibility::default(),
             log_segments: Mutex::new(DurableLogSegmentRegistry::default()),
             lock_authority: Mutex::new(LockAuthorityState::default()),
             persistent_metadata: Mutex::new(PersistentMetadataState::default()),
@@ -254,6 +257,10 @@ fn ensure_matching_persistent_object_metadata(
 }
 
 impl TransactionRegionRuntime {
+    pub(crate) fn visibility(&self) -> SelectedTransactionVisibility {
+        self.0.visibility.clone()
+    }
+
     fn lock_log_segments(&self) -> Result<MutexGuard<'_, DurableLogSegmentRegistry>> {
         self.0
             .log_segments
@@ -1160,6 +1167,11 @@ impl TransactionRegionRuntime {
     #[cfg(test)]
     pub(crate) fn allocate_transaction_id_for_test(&self) -> Result<TransactionId> {
         self.allocate_transaction_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visibility_for_test(&self) -> SelectedTransactionVisibility {
+        self.visibility()
     }
 
     #[cfg(test)]

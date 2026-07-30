@@ -11,6 +11,12 @@ struct CoordinatorState {
     visible_timestamp: CommitTimestamp,
     baseline_timestamp: CommitTimestamp,
     active_snapshots: BTreeMap<CommitTimestamp, usize>,
+    #[cfg(test)]
+    snapshots_begun: usize,
+    #[cfg(test)]
+    snapshots_finished: usize,
+    #[cfg(test)]
+    snapshots_dropped: usize,
     pending_commits: usize,
     gc_active: bool,
 }
@@ -39,6 +45,10 @@ impl MvccCoordinator {
 
         let timestamp = state.visible_timestamp;
         *state.active_snapshots.entry(timestamp).or_default() += 1;
+        #[cfg(test)]
+        {
+            state.snapshots_begun += 1;
+        }
         Ok(SnapshotRegistration {
             timestamp,
             state: Some(self.state.clone()),
@@ -73,6 +83,19 @@ impl MvccCoordinator {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn snapshot_lifecycle_counts_for_test(
+        &self,
+    ) -> Result<(usize, usize, usize, usize)> {
+        let state = self.lock()?;
+        Ok((
+            state.active_snapshots.values().sum(),
+            state.snapshots_begun,
+            state.snapshots_finished,
+            state.snapshots_dropped,
+        ))
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, CoordinatorState>> {
         self.state
             .lock()
@@ -95,10 +118,10 @@ impl SnapshotRegistration {
 
     /// Explicitly unregisters this snapshot.
     pub(crate) fn finish(mut self) -> Result<()> {
-        self.unregister()
+        self.unregister(true)
     }
 
-    fn unregister(&mut self) -> Result<()> {
+    fn unregister(&mut self, _explicit: bool) -> Result<()> {
         let Some(state) = self.state.take() else {
             return Ok(());
         };
@@ -114,13 +137,19 @@ impl SnapshotRegistration {
         } else {
             *count -= 1;
         }
+        #[cfg(test)]
+        if _explicit {
+            state.snapshots_finished += 1;
+        } else {
+            state.snapshots_dropped += 1;
+        }
         Ok(())
     }
 }
 
 impl Drop for SnapshotRegistration {
     fn drop(&mut self) {
-        let _ = self.unregister();
+        let _ = self.unregister(false);
     }
 }
 
