@@ -270,11 +270,12 @@ fn mvcc_certification_reserves_complete_sorted_set_without_partial_deadlock() {
     let authority = Arc::new(MvccCertificationAuthority::default());
     let a = mvcc_certification_granule(0);
     let b = mvcc_certification_granule(1);
-    let first = authority
+    assert!(a < b);
+    let later = authority
         .acquire(
             TransactionId::from_raw(1),
             &BTreeSet::new(),
-            &BTreeSet::from([a]),
+            &BTreeSet::from([b]),
         )
         .unwrap();
     let (finished_tx, finished_rx) = mpsc::channel();
@@ -288,31 +289,29 @@ fn mvcc_certification_reserves_complete_sorted_set_without_partial_deadlock() {
         finished_tx.send(permit).unwrap();
     });
 
-    assert!(matches!(
-        finished_rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
+    assert!(
+        authority
+            .wait_until_blocked_for_test(TransactionId::from_raw(2), Duration::from_secs(5))
+            .unwrap(),
+        "whole-set waiter did not reach its blocked compatibility check"
+    );
     let (probe_tx, probe_rx) = mpsc::channel();
     let probe_authority = authority.clone();
     let probe = std::thread::spawn(move || {
         let permit = probe_authority.acquire(
             TransactionId::from_raw(3),
             &BTreeSet::new(),
-            &BTreeSet::from([b]),
+            &BTreeSet::from([a]),
         );
         probe_tx.send(permit).unwrap();
     });
-    let disjoint_from_first = probe_rx
+    let earlier = probe_rx
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        finished_rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
 
-    drop(first);
-    drop(disjoint_from_first);
+    drop(later);
+    drop(earlier);
     let complete = finished_rx
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
@@ -445,15 +444,25 @@ fn mvcc_certification_validates_read_and_blind_write_union_after_reservation() {
         "{write_error:?}"
     );
 
-    runtime
-        .acquire_mvcc_certification(
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_runtime = runtime.clone();
+    let release_visibility = visibility.clone();
+    let release = std::thread::spawn(move || {
+        let result = release_runtime.acquire_mvcc_certification(
             TransactionId::from_raw(4),
             &BTreeSet::new(),
             &BTreeSet::from([read, blind_write]),
             2,
-            &visibility,
-        )
+            &release_visibility,
+        );
+        release_tx.send(result).unwrap();
+    });
+    let released = release_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
         .unwrap();
+    drop(released);
+    release.join().unwrap();
 }
 
 fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {

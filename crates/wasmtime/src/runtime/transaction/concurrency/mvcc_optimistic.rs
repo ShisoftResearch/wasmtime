@@ -60,6 +60,8 @@ impl LatchState {
 #[derive(Debug, Default)]
 struct CertificationState {
     granules: BTreeMap<GranuleId, LatchState>,
+    #[cfg(test)]
+    blocked_transactions: BTreeSet<TransactionId>,
 }
 
 #[derive(Debug, Default)]
@@ -83,10 +85,17 @@ impl MvccCertificationAuthority {
                 .get(granule)
                 .is_none_or(|latch| latch.is_compatible(*mode))
         }) {
+            #[cfg(test)]
+            {
+                state.blocked_transactions.insert(transaction);
+                self.changed.notify_all();
+            }
             state = self
                 .changed
                 .wait(state)
                 .map_err(|_| crate::format_err!("MVCC certification authority lock is poisoned"))?;
+            #[cfg(test)]
+            state.blocked_transactions.remove(&transaction);
         }
 
         for (granule, mode) in reservations.iter().copied() {
@@ -102,6 +111,22 @@ impl MvccCertificationAuthority {
             transaction,
             reservations,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_until_blocked_for_test(
+        &self,
+        transaction: TransactionId,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        let state = self.lock()?;
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.blocked_transactions.contains(&transaction)
+            })
+            .map_err(|_| crate::format_err!("MVCC certification authority lock is poisoned"))?;
+        Ok(state.blocked_transactions.contains(&transaction))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CertificationState>> {
