@@ -18,6 +18,7 @@ target
 .z3-trace
 foo
 .cargo
+.worktrees/
 publish
 vendor
 examples/build
