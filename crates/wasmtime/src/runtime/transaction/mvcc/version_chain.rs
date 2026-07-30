@@ -100,10 +100,14 @@ pub(crate) struct VersionChain<T> {
 }
 
 impl<T> VersionChain<T> {
-    pub(crate) fn new_baseline(commit: Arc<CommitRecord>, value: T) -> Self {
+    pub(crate) fn new_baseline(commit: Arc<CommitRecord>, value: T) -> Result<Self> {
+        if !matches!(commit.state(), CommitState::Committed(_)) {
+            bail!("baseline version requires a committed commit record");
+        }
+
         let mut chain = Self::new_pending();
         chain.push_newest(commit, value);
-        chain
+        Ok(chain)
     }
 
     pub(crate) fn new_pending() -> Self {
@@ -182,7 +186,7 @@ mod tests {
         let baseline = Arc::new(CommitRecord::committed_for_baseline(0).unwrap());
         let pending = Arc::new(CommitRecord::pending());
         let aborted = Arc::new(CommitRecord::pending());
-        let mut chain = VersionChain::new_baseline(baseline, 10_u64);
+        let mut chain = VersionChain::new_baseline(baseline, 10_u64).unwrap();
         chain.push_newest(pending, 20);
         chain.push_newest(aborted.clone(), 30);
         aborted.abort().unwrap();
@@ -191,11 +195,21 @@ mod tests {
     }
 
     #[test]
+    fn baseline_requires_a_committed_record() {
+        let pending = Arc::new(CommitRecord::pending());
+        let aborted = Arc::new(CommitRecord::pending());
+        aborted.abort().unwrap();
+
+        assert!(VersionChain::new_baseline(pending, 1_u64).is_err());
+        assert!(VersionChain::new_baseline(aborted, 2_u64).is_err());
+    }
+
+    #[test]
     fn one_commit_record_exposes_multiple_chains_atomically() {
         let baseline = Arc::new(CommitRecord::committed_for_baseline(0).unwrap());
         let commit = Arc::new(CommitRecord::pending());
-        let mut left = VersionChain::new_baseline(baseline.clone(), 1_u64);
-        let mut right = VersionChain::new_baseline(baseline, 2_u64);
+        let mut left = VersionChain::new_baseline(baseline.clone(), 1_u64).unwrap();
+        let mut right = VersionChain::new_baseline(baseline, 2_u64).unwrap();
         left.push_newest(commit.clone(), 11);
         right.push_newest(commit.clone(), 22);
 
@@ -211,7 +225,8 @@ mod tests {
         let mut chain = VersionChain::new_baseline(
             Arc::new(CommitRecord::committed_for_baseline(0).unwrap()),
             0_u64,
-        );
+        )
+        .unwrap();
         for timestamp in 1..=5 {
             chain.push_newest(
                 Arc::new(CommitRecord::committed_for_baseline(timestamp).unwrap()),
@@ -269,7 +284,7 @@ mod tests {
         let baseline = Arc::new(CommitRecord::committed_for_baseline(1).unwrap());
         let pending = Arc::new(CommitRecord::pending());
         let aborted = Arc::new(CommitRecord::pending());
-        let mut chain = VersionChain::new_baseline(baseline, 10_u64);
+        let mut chain = VersionChain::new_baseline(baseline, 10_u64).unwrap();
         chain.push_newest(aborted.clone(), 20);
         chain.push_newest(pending.clone(), 30);
         aborted.abort().unwrap();
@@ -286,7 +301,8 @@ mod tests {
         let mut chain = VersionChain::new_baseline(
             Arc::new(CommitRecord::committed_for_baseline(0).unwrap()),
             0_u64,
-        );
+        )
+        .unwrap();
         for timestamp in 1..=2 {
             chain.push_newest(
                 Arc::new(CommitRecord::committed_for_baseline(timestamp).unwrap()),
