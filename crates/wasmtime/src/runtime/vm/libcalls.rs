@@ -327,7 +327,7 @@ fn transaction_ttry_end(store: &mut dyn VMStore, instance: InstanceId) -> Result
 
 fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     let result = transaction_commit_impl(store, instance);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -349,7 +349,7 @@ pub(crate) fn transaction_commit_selected_for_host(
     };
 
     let result = transaction_commit_impl(store, instance);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     let restore_result = store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -1053,7 +1053,7 @@ fn transaction_tref_cast_read(
     ref_handle: u32,
 ) -> Result<()> {
     let result = transaction_tref_cast_read_impl(store, instance, ref_handle);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1076,7 +1076,7 @@ fn transaction_tref_cast_write(
     ref_handle: u32,
 ) -> Result<()> {
     let result = transaction_tref_cast_write_impl(store, instance, ref_handle);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1099,7 +1099,7 @@ fn transaction_tglobal_get(
     global: u32,
 ) -> Result<*mut u8> {
     let result = transaction_tglobal_get_impl(store, instance, global);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1111,7 +1111,7 @@ fn transaction_tglobal_set(
     value: u64,
 ) -> Result<()> {
     let result = transaction_tglobal_set_impl(store, instance, global, tag, value);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1122,7 +1122,7 @@ fn transaction_tglobal_set_v128(
     value: *mut u8,
 ) -> Result<()> {
     let result = transaction_tglobal_set_v128_impl(store, instance, global, value);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1180,7 +1180,7 @@ fn transaction_tglobal_startup_set(
     value: u64,
 ) -> Result<()> {
     let result = transaction_tglobal_startup_set_impl(store, instance, global, tag, value);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1293,7 +1293,7 @@ fn transaction_tglobal_startup_set_v128(
     value: *mut u8,
 ) -> Result<()> {
     let result = transaction_tglobal_startup_set_v128_impl(store, instance, global, value);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1484,7 +1484,7 @@ fn transaction_tmemory_load(
     len: u32,
 ) -> Result<*mut u8> {
     let result = transaction_tmemory_load_impl(store, instance, memory, addr, offset, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1523,7 +1523,7 @@ fn transaction_tmemory_store(
     len: u32,
 ) -> Result<*mut u8> {
     let result = transaction_tmemory_store_impl(store, instance, memory, addr, offset, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1565,7 +1565,7 @@ fn transaction_tmemory_size(
     memory: u32,
 ) -> Result<*mut u8> {
     let result = transaction_tmemory_size_impl(store, instance, memory);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1607,7 +1607,7 @@ fn transaction_tmemory_grow(
     delta: u64,
 ) -> Result<Option<AllocationSize>> {
     let result = transaction_tmemory_grow_impl(store, instance, memory, delta);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1667,7 +1667,7 @@ fn transaction_tmemory_fill(
     len: u64,
 ) -> Result<()> {
     let result = transaction_tmemory_fill_impl(store, instance, memory, dst, val, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1709,7 +1709,7 @@ fn transaction_tmemory_copy(
 ) -> Result<()> {
     let result =
         transaction_tmemory_copy_impl(store, instance, dst_memory, src_memory, dst, src, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1765,7 +1765,7 @@ fn transaction_tmemory_init(
 ) -> Result<()> {
     let result =
         transaction_tmemory_init_impl(store, instance, memory, dst, src, len, data, data_len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1839,7 +1839,7 @@ fn transaction_tmemory_static_init(
 
 fn transaction_tdata_drop(store: &mut dyn VMStore, instance: InstanceId, _data: u32) -> Result<()> {
     let result = transaction_tdata_drop_impl(store, instance);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -1855,7 +1855,7 @@ fn transaction_ttable_get(
     index: u64,
 ) -> Result<*mut u8> {
     let result = transaction_ttable_get_impl(store, instance, table, index);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2066,7 +2066,7 @@ fn transaction_ttable_set(
     value: *mut u8,
 ) -> Result<()> {
     let result = transaction_ttable_set_impl(store, instance, table, index, value);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2091,7 +2091,7 @@ fn transaction_ttable_startup_set(
     value: *mut u8,
 ) -> Result<()> {
     let result = transaction_ttable_startup_set_impl(store, instance, table, index, value);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2116,7 +2116,7 @@ fn transaction_ttable_startup_fill(
     value: *mut u8,
 ) -> Result<()> {
     let result = transaction_ttable_startup_fill_impl(store, instance, table, start, len, value);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2160,7 +2160,7 @@ fn transaction_ttable_startup_check_range(
     len: u64,
 ) -> Result<()> {
     let result = transaction_ttable_startup_check_range_impl(store, instance, table, start, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2183,7 +2183,7 @@ fn transaction_ttable_read_range(
     len: u64,
 ) -> Result<()> {
     let result = transaction_ttable_read_range_impl(store, instance, table, start, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2212,7 +2212,7 @@ fn transaction_ttable_write_range(
     len: u64,
 ) -> Result<()> {
     let result = transaction_ttable_write_range_impl(store, instance, table, start, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2239,7 +2239,7 @@ fn transaction_ttable_size(
     table: u32,
 ) -> Result<*mut u8> {
     let result = transaction_ttable_size_impl(store, instance, table);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2271,7 +2271,7 @@ fn transaction_ttable_grow(
     init: *mut u8,
 ) -> Result<Option<AllocationSize>> {
     let result = transaction_ttable_grow_impl(store, instance, table, delta, init);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2393,7 +2393,7 @@ fn transaction_tstruct_static_new(
         fields,
         layout_fields,
     );
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2498,7 +2498,7 @@ fn transaction_tstruct_set(
     high: u64,
 ) -> Result<()> {
     let result = transaction_tstruct_set_impl(store, instance, gc_ref, field, tag, low, high);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2634,7 +2634,7 @@ fn transaction_tarray_static_new(
         low,
         high,
     );
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -2771,7 +2771,7 @@ fn transaction_tarray_static_new_fixed(
         element_count,
         elements,
     );
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -3115,7 +3115,7 @@ fn transaction_tarray_set(
     high: u64,
 ) -> Result<()> {
     let result = transaction_tarray_set_impl(store, instance, gc_ref, index, tag, low, high);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -3151,7 +3151,7 @@ fn transaction_tarray_fill(
     len: u32,
 ) -> Result<()> {
     let result = transaction_tarray_fill_impl(store, instance, gc_ref, index, tag, low, high, len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -3190,7 +3190,7 @@ fn transaction_tarray_copy(
     let result = transaction_tarray_copy_impl(
         store, instance, dst_gc_ref, dst_index, src_gc_ref, src_index, len,
     );
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -3248,7 +3248,7 @@ fn transaction_tarray_init_data(
         tag,
         element_size,
     );
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -3317,7 +3317,7 @@ fn transaction_tarray_init_elem(
 ) -> Result<()> {
     let result =
         transaction_tarray_init_elem_impl(store, instance, gc_ref, dst, src, len, elem, elem_len);
-    abort_active_transaction_on_error(store, &result);
+    let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
@@ -3783,16 +3783,17 @@ fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -
     Ok(())
 }
 
-fn abort_active_transaction_on_error<T>(store: &mut dyn VMStore, result: &Result<T>) {
+fn abort_active_transaction_on_error<T>(store: &mut dyn VMStore, result: &Result<T>) -> Result<()> {
     if result.is_ok() {
-        return;
+        return Ok(());
     }
 
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     if state.active_transaction().is_some() {
-        let _ = state.abort_allocated_objects(object_table);
+        return state.abort_allocated_objects(object_table);
     }
+    Ok(())
 }
 
 fn begin_transaction_constructor_boundary(store: &mut dyn VMStore) -> Result<bool> {
@@ -3812,19 +3813,25 @@ fn finish_transaction_constructor_boundary<T>(
     result: &Result<T>,
 ) -> Result<()> {
     if !began {
-        abort_active_transaction_on_error(store, result);
-        return Ok(());
+        return abort_active_transaction_on_error(store, result);
     }
 
     if result.is_ok() {
-        let store = store.store_opaque_mut();
-        let (state, object_table) = store.transaction_state_and_object_table_mut();
-        state.begin_terminal_commit_with_object_cleanup(object_table)?;
-        state.complete_commit()
+        let commit = {
+            let store = store.store_opaque_mut();
+            let (state, object_table) = store.transaction_state_and_object_table_mut();
+            state
+                .begin_terminal_commit_with_object_cleanup(object_table)
+                .and_then(|()| state.complete_commit())
+        };
+        let cleanup = abort_active_transaction_on_error(store, &commit);
+        combine_operation_and_cleanup_results(
+            commit,
+            cleanup,
+            "failed to abort transaction after constructor commit failure",
+        )
     } else {
-        let store = store.store_opaque_mut();
-        let (state, object_table) = store.transaction_state_and_object_table_mut();
-        state.abort_allocated_objects(object_table)
+        abort_active_transaction_on_error(store, result)
     }
 }
 
@@ -5167,6 +5174,85 @@ mod tests {
         OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, ObjectId, ObjectKind,
         encode_object_record_for_recovery, type_layout::TypeLayoutRegistry,
     };
+
+    #[cfg(feature = "transaction-mvcc")]
+    #[test]
+    fn transaction_constructor_boundary_existing_operation_and_abort_errors_are_combined() {
+        let engine = crate::Engine::default();
+        let mut store = crate::Store::new(&engine, ());
+        let context = store.as_context_mut();
+        let vm_store = context.0;
+        let runtime = vm_store.store_opaque().transaction_region_runtime().clone();
+        let visibility = runtime.visibility_for_test();
+
+        assert!(begin_transaction_constructor_boundary(vm_store).unwrap());
+        runtime.fail_release_transaction_once_for_test();
+        let began = begin_transaction_constructor_boundary(vm_store).unwrap();
+        assert!(!began);
+        let operation = Err::<u32, _>(crate::format_err!("injected constructor operation failure"));
+        let finish = finish_transaction_constructor_boundary(vm_store, began, &operation);
+        let error = combine_operation_and_cleanup_results(
+            operation,
+            finish,
+            "failed to finish transaction constructor boundary",
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("injected constructor operation failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("injected release transaction failure"),
+            "{message}"
+        );
+        assert_eq!(
+            vm_store
+                .store_opaque()
+                .transaction_state()
+                .active_transaction(),
+            None
+        );
+        assert_eq!(
+            visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+            (0, 1, 1, 0)
+        );
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    #[test]
+    fn transaction_constructor_boundary_commit_start_failure_aborts_auto_started_transaction() {
+        let engine = crate::Engine::default();
+        let mut store = crate::Store::new(&engine, ());
+        let context = store.as_context_mut();
+        let vm_store = context.0;
+        let runtime = vm_store.store_opaque().transaction_region_runtime().clone();
+        let visibility = runtime.visibility_for_test();
+
+        let began = begin_transaction_constructor_boundary(vm_store).unwrap();
+        assert!(began);
+        runtime.poison_lock_authority_for_test();
+        let operation = Ok(7u32);
+        let finish = finish_transaction_constructor_boundary(vm_store, began, &operation);
+        let error = combine_operation_and_cleanup_results(
+            operation,
+            finish,
+            "failed to finish transaction constructor boundary",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("lock poisoned"), "{error:?}");
+        assert_eq!(
+            vm_store
+                .store_opaque()
+                .transaction_state()
+                .active_transaction(),
+            None
+        );
+        assert_eq!(
+            visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+            (0, 1, 1, 0)
+        );
+    }
 
     fn recovered_struct_winner(
         source: &crate::runtime::vm::block_region::SyntheticRecoveredWinnerSourceHandle,

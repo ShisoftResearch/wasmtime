@@ -4298,6 +4298,80 @@ fn mvcc_snapshot_workspace_restore_uses_original_visibility() {
 
 #[cfg(feature = "transaction-mvcc")]
 #[test]
+fn mvcc_snapshot_workspace_overlapping_local_workspaces_share_stable_visibility() {
+    clear_current_thread_transaction_for_test();
+    let mut state = TransactionState::default();
+    let local_visibility = state.visibility.clone();
+    assert!(state.selected_visibility.is_none());
+
+    let first = state.begin().unwrap();
+    assert!(Arc::ptr_eq(
+        state
+            .active_visibility_read_context()
+            .unwrap()
+            .visibility
+            .runtime(),
+        local_visibility.runtime()
+    ));
+
+    let second = TransactionId::from_raw(first.as_raw() + 100);
+    assert_eq!(state.enter_transaction(second).unwrap(), Some(first));
+    assert!(Arc::ptr_eq(
+        state
+            .active_visibility_read_context()
+            .unwrap()
+            .visibility
+            .runtime(),
+        local_visibility.runtime()
+    ));
+    assert_eq!(
+        local_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (2, 2, 0, 0)
+    );
+
+    state.restore_transaction(Some(first)).unwrap();
+    assert!(Arc::ptr_eq(
+        state
+            .active_visibility_read_context()
+            .unwrap()
+            .visibility
+            .runtime(),
+        local_visibility.runtime()
+    ));
+    state.restore_transaction(Some(second)).unwrap();
+    assert!(Arc::ptr_eq(
+        state
+            .active_visibility_read_context()
+            .unwrap()
+            .visibility
+            .runtime(),
+        local_visibility.runtime()
+    ));
+
+    state.abort().unwrap();
+    assert!(state.selected_visibility.is_none());
+    assert_eq!(
+        local_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (1, 2, 1, 0)
+    );
+    state.restore_transaction(Some(first)).unwrap();
+    state.abort().unwrap();
+    assert!(state.selected_visibility.is_none());
+    assert_eq!(
+        local_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 2, 2, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
 fn mvcc_snapshot_workspace_terminal_paths_unregister_snapshots() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -4354,6 +4428,47 @@ fn mvcc_snapshot_workspace_terminal_paths_unregister_snapshots() {
     );
     drop(visibility.begin_gc_barrier_for_test().unwrap());
 
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_suspended_object_abort_finishes_after_initial_drain_failure() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    let pending = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
+    let target = objects.allocate_struct(vec![ObjectValue::I32(2)]).unwrap();
+    state
+        .pending_conflict_aborted_allocated_objects
+        .push(pending);
+
+    let transaction = state.begin_with_region_runtime(&runtime).unwrap();
+    state.record_allocated_object(target).unwrap();
+    state.restore_transaction(None).unwrap();
+    assert!(state.selected_visibility.is_none());
+    objects.next_version = u64::MAX;
+
+    let error = state
+        .abort_transaction_allocated_objects(&mut objects, transaction)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("object table version overflow"),
+        "{error:?}"
+    );
+    assert!(!state.transaction_is_open(transaction));
+    assert_eq!(
+        state.pending_conflict_aborted_allocated_objects,
+        vec![pending, target]
+    );
+    assert!(objects.kind(pending).is_err());
+    assert!(objects.kind(target).is_err());
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
     clear_current_thread_transaction_for_test();
 }
 

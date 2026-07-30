@@ -24,7 +24,10 @@ pub(crate) struct TransactionState {
     pub(super) terminal_commit_active: bool,
     pub(super) active_conflict_aborted: bool,
     pub(super) concurrency: ConcurrencyControlState,
+    /// Stable visibility runtime for local transactions owned by this state.
     pub(super) visibility: SelectedTransactionVisibility,
+    /// Visibility runtime paired with the active workspace snapshot.
+    pub(super) selected_visibility: Option<SelectedTransactionVisibility>,
     pub(super) visibility_snapshot: Option<SelectedVisibilitySnapshot>,
     pub(super) suspended: BTreeMap<TransactionId, TransactionWorkspace>,
     pub(super) staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
@@ -53,7 +56,7 @@ pub(crate) struct TransactionState {
 
 #[derive(Debug, Default)]
 pub(super) struct TransactionWorkspace {
-    visibility: SelectedTransactionVisibility,
+    visibility: Option<SelectedTransactionVisibility>,
     visibility_snapshot: Option<SelectedVisibilitySnapshot>,
     staged_globals: BTreeMap<GranuleId, GlobalSnapshot>,
     staged_granules: BTreeMap<GranuleId, Vec<u8>>,
@@ -92,6 +95,7 @@ impl Default for TransactionState {
             active_conflict_aborted: false,
             concurrency: ConcurrencyControlState::default(),
             visibility: SelectedTransactionVisibility::default(),
+            selected_visibility: None,
             visibility_snapshot: None,
             suspended: BTreeMap::new(),
             staged_globals: BTreeMap::new(),
@@ -401,6 +405,7 @@ impl TransactionState {
                 return Self::finish_snapshot_after_error(&visibility, snapshot, error);
             }
         };
+        self.selected_visibility = Some(visibility);
         self.visibility_snapshot = Some(snapshot);
         self.activate_transaction(id);
         Ok(id)
@@ -420,7 +425,7 @@ impl TransactionState {
             }
         };
         self.shared_region_runtime = Some(region.clone());
-        self.visibility = visibility;
+        self.selected_visibility = Some(visibility);
         self.visibility_snapshot = Some(snapshot);
         self.activate_transaction(id);
         Ok(id)
@@ -499,7 +504,7 @@ impl TransactionState {
                     }
                 };
                 TransactionWorkspace {
-                    visibility,
+                    visibility: Some(visibility),
                     visibility_snapshot: Some(snapshot),
                     ..TransactionWorkspace::default()
                 }
@@ -586,18 +591,26 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         transaction: TransactionId,
     ) -> Result<bool> {
-        self.drain_conflict_aborted_allocated_objects(object_table)?;
         if self.active == Some(transaction) {
-            self.abort_allocated_objects(object_table)?;
-            return Ok(true);
+            return self.abort_allocated_objects(object_table).map(|()| true);
         }
         self.retry_post_commit_linear_undo_retirement();
+        let mut result = self
+            .drain_conflict_aborted_allocated_objects(object_table)
+            .map(|_| ());
         let Some(mut workspace) = self.suspended.remove(&transaction) else {
-            return Ok(false);
+            return result.map(|()| false);
         };
-        let mut result = Ok(());
-        for object_id in workspace.allocated_objects.iter().rev().copied() {
+        let allocated = workspace
+            .allocated_objects
+            .iter()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
+        for (index, object_id) in allocated.iter().copied().enumerate() {
             if let Err(error) = object_table.free(object_id) {
+                self.pending_conflict_aborted_allocated_objects
+                    .extend(allocated[index..].iter().copied());
                 result = Self::combine_results(
                     result,
                     Err(error),
@@ -625,8 +638,12 @@ impl TransactionState {
             .visibility_snapshot
             .as_ref()
             .context("active transaction is missing a visibility snapshot")?;
+        let visibility = self
+            .selected_visibility
+            .as_ref()
+            .context("active transaction is missing its selected visibility runtime")?;
         Ok(VisibilityReadContext {
-            visibility: self.visibility.clone(),
+            visibility: visibility.clone(),
             snapshot: SelectedTransactionVisibility::snapshot_timestamp(snapshot),
         })
     }
@@ -642,10 +659,17 @@ impl TransactionState {
         workspace: &mut TransactionWorkspace,
         result: Result<()>,
     ) -> Result<()> {
-        let visibility = workspace.visibility.clone();
-        let finish = match workspace.visibility_snapshot.take() {
-            Some(snapshot) => visibility.finish_snapshot(snapshot),
-            None => Ok(()),
+        let visibility = workspace.visibility.take();
+        let snapshot = workspace.visibility_snapshot.take();
+        let finish = match (visibility, snapshot) {
+            (Some(visibility), Some(snapshot)) => visibility.finish_snapshot(snapshot),
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(crate::format_err!(
+                "transaction workspace visibility runtime is missing its snapshot"
+            )),
+            (None, Some(_)) => Err(crate::format_err!(
+                "transaction workspace snapshot is missing its visibility runtime"
+            )),
         };
         Self::combine_results(
             result,
@@ -3921,7 +3945,7 @@ impl TransactionState {
 
     pub(super) fn take_workspace(&mut self) -> TransactionWorkspace {
         TransactionWorkspace {
-            visibility: mem::take(&mut self.visibility),
+            visibility: self.selected_visibility.take(),
             visibility_snapshot: self.visibility_snapshot.take(),
             staged_globals: mem::take(&mut self.staged_globals),
             staged_granules: mem::take(&mut self.staged_granules),
@@ -3946,7 +3970,7 @@ impl TransactionState {
     }
 
     pub(super) fn install_workspace(&mut self, workspace: TransactionWorkspace) {
-        self.visibility = workspace.visibility;
+        self.selected_visibility = workspace.visibility;
         self.visibility_snapshot = workspace.visibility_snapshot;
         self.staged_globals = workspace.staged_globals;
         self.staged_granules = workspace.staged_granules;
@@ -3970,7 +3994,7 @@ impl TransactionState {
     }
 
     pub(super) fn clear_active(&mut self) -> Result<()> {
-        let visibility = self.visibility.clone();
+        let visibility = self.selected_visibility.take();
         let snapshot = self.visibility_snapshot.take();
         let mut result = Ok(());
         if let Some(transaction) = self.active {
@@ -4004,9 +4028,15 @@ impl TransactionState {
         self.active = None;
         self.terminal_commit_active = false;
         replace_current_thread_transaction(None);
-        let finish_snapshot = match snapshot {
-            Some(snapshot) => visibility.finish_snapshot(snapshot),
-            None => Ok(()),
+        let finish_snapshot = match (visibility, snapshot) {
+            (Some(visibility), Some(snapshot)) => visibility.finish_snapshot(snapshot),
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(crate::format_err!(
+                "active transaction visibility runtime is missing its snapshot"
+            )),
+            (None, Some(_)) => Err(crate::format_err!(
+                "active transaction snapshot is missing its visibility runtime"
+            )),
         };
         result = Self::combine_results(
             result,
@@ -4074,6 +4104,7 @@ impl TransactionState {
         let mut state = Self::default();
         state.active = Some(transaction);
         state.next_id = transaction.as_raw().saturating_add(1);
+        state.selected_visibility = Some(state.visibility.clone());
         state.visibility_snapshot = Some(state.visibility.begin_snapshot().unwrap());
         state
     }
