@@ -22,6 +22,11 @@ pub(crate) struct MvccCoordinator {
 }
 
 impl MvccCoordinator {
+    /// Returns the timestamp assigned to values without an allocated chain.
+    pub(crate) fn baseline_timestamp(&self) -> Result<CommitTimestamp> {
+        Ok(self.lock()?.baseline_timestamp)
+    }
+
     /// Returns the timestamp of the latest commit made visible to new snapshots.
     pub(crate) fn visible_timestamp(&self) -> Result<CommitTimestamp> {
         Ok(self.lock()?.visible_timestamp)

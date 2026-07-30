@@ -1,8 +1,9 @@
+use crate::prelude::*;
 use crate::runtime::store::InstanceId;
 use alloc::vec::Vec;
 use core::{cmp::Ordering, ops::Range};
 
-use super::ObjectId;
+use super::{ObjectId, TableElementSnapshot};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum GranuleId {
@@ -142,6 +143,29 @@ pub(super) struct TableElementKey {
     pub(super) instance: Option<u32>,
     pub(super) table_index: u32,
     pub(super) element_index: u64,
+}
+
+/// A validated snapshot of one transactional table granule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TableGranuleSnapshot(Vec<TableElementSnapshot>);
+
+impl TableGranuleSnapshot {
+    pub(crate) fn new(elements: Vec<TableElementSnapshot>) -> Result<Self> {
+        ensure!(
+            elements.len() <= usize::try_from(TTABLE_GRANULE_SIZE).unwrap(),
+            "table granule snapshot exceeds {} elements",
+            TTABLE_GRANULE_SIZE
+        );
+        Ok(Self(elements))
+    }
+
+    pub(crate) fn elements(&self) -> &[TableElementSnapshot] {
+        &self.0
+    }
+
+    pub(crate) fn into_elements(self) -> Vec<TableElementSnapshot> {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

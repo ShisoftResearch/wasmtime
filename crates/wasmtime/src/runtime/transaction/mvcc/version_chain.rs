@@ -147,6 +147,16 @@ impl<T> VersionChain<T> {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn newest_commit_record(&self) -> Option<&Arc<CommitRecord>> {
+        self.versions.front().map(|version| &version.commit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn version_count(&self) -> usize {
+        self.versions.len()
+    }
+
     pub(crate) fn prune_for_oldest_snapshot(&mut self, oldest_snapshot: Option<CommitTimestamp>) {
         let mut retained_predecessor = false;
         self.versions

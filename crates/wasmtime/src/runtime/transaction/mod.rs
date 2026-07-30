@@ -60,7 +60,7 @@ pub(crate) use config::{
 };
 pub(crate) use granule::{
     GranuleId, TMEMORY_GRANULE_SHIFT, TMEMORY_GRANULE_SIZE, TMemoryAccessSnapshot,
-    TMemoryGranuleSnapshot,
+    TMemoryGranuleSnapshot, TableGranuleSnapshot,
 };
 use granule::{PendingMemoryStore, TTABLE_GRANULE_SHIFT, TableElementKey};
 pub(crate) use ids::{ObjectId, TransactionId};
