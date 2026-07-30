@@ -55,6 +55,11 @@ impl MvccVisibility {
     ) -> Result<(usize, usize, usize, usize)> {
         self.0.coordinator.snapshot_lifecycle_counts_for_test()
     }
+
+    #[cfg(test)]
+    pub(crate) fn fail_finish_snapshot_once_for_test(&self) -> Result<()> {
+        self.0.coordinator.fail_finish_snapshot_once_for_test()
+    }
 }
 
 impl Default for MvccVisibility {

@@ -69,6 +69,7 @@ use crate::runtime::transaction::{
     PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend,
     TableElementSnapshot, TransactionId, TransactionState, WasmtimePersistentFieldLayout,
     WasmtimePersistentFieldLayoutAbi, collect_tmemory_access_snapshot,
+    combine_operation_and_cleanup_results,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -2331,9 +2332,11 @@ fn transaction_tstruct_new(
     let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tstruct_new_impl(store, instance, struct_type, field_count, fields);
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let handle = result?;
-    finish?;
-    Ok(handle)
+    combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )
 }
 
 fn transaction_tstruct_new_impl(
@@ -2528,8 +2531,11 @@ fn transaction_tstruct_get(
     let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tstruct_get_bytes_impl(store, instance, gc_ref, field);
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let bytes = result?;
-    finish?;
+    let bytes = combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )?;
     Ok(store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -2572,9 +2578,11 @@ fn transaction_tarray_new(
     let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tarray_new_impl(store, instance, array_type, len, tag, low, high);
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let handle = result?;
-    finish?;
-    Ok(handle)
+    combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )
 }
 
 fn transaction_tarray_new_impl(
@@ -2695,9 +2703,11 @@ fn transaction_tarray_new_fixed(
     let result =
         transaction_tarray_new_fixed_impl(store, instance, array_type, element_count, elements);
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let handle = result?;
-    finish?;
-    Ok(handle)
+    combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )
 }
 
 fn transaction_tarray_new_fixed_impl(
@@ -2868,9 +2878,11 @@ fn transaction_tarray_new_data(
         element_size,
     );
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let handle = result?;
-    finish?;
-    Ok(handle)
+    combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )
 }
 
 fn transaction_tarray_new_data_impl(
@@ -2934,9 +2946,11 @@ fn transaction_tarray_new_elem(
     let result =
         transaction_tarray_new_elem_impl(store, instance, array_type, src, len, elem, elem_len);
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let handle = result?;
-    finish?;
-    Ok(handle)
+    combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )
 }
 
 fn transaction_tarray_new_elem_impl(
@@ -3373,8 +3387,11 @@ fn transaction_tarray_get(
     let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tarray_get_bytes_impl(store, instance, gc_ref, index);
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let bytes = result?;
-    finish?;
+    let bytes = combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )?;
     Ok(store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -3413,8 +3430,11 @@ fn transaction_tarray_len(
     let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tarray_len_bytes_impl(store, instance, gc_ref);
     let finish = finish_transaction_constructor_boundary(store, began, &result);
-    let bytes = result?;
-    finish?;
+    let bytes = combine_operation_and_cleanup_results(
+        result,
+        finish,
+        "failed to finish transaction constructor boundary",
+    )?;
     Ok(store
         .store_opaque_mut()
         .transaction_state_mut()

@@ -153,6 +153,8 @@ impl SharedFileBackedStorageConfig {
 #[derive(Debug)]
 struct TransactionRegionRuntimeInner {
     next_transaction_id: AtomicU64,
+    #[cfg(test)]
+    fail_allocate_transaction_id_once_for_test: std::sync::atomic::AtomicBool,
     visibility: SelectedTransactionVisibility,
     log_segments: Mutex<DurableLogSegmentRegistry>,
     lock_authority: Mutex<LockAuthorityState>,
@@ -177,6 +179,8 @@ struct LockAuthorityState {
     granule_versions: BTreeMap<GranuleId, u64>,
     #[cfg(test)]
     fail_release_transaction_once_for_test: bool,
+    #[cfg(test)]
+    fail_commit_transaction_once_for_test: bool,
 }
 
 #[derive(Debug, Default)]
@@ -224,6 +228,8 @@ impl Default for TransactionRegionRuntimeInner {
     fn default() -> Self {
         Self {
             next_transaction_id: AtomicU64::new(10_001),
+            #[cfg(test)]
+            fail_allocate_transaction_id_once_for_test: std::sync::atomic::AtomicBool::new(false),
             visibility: SelectedTransactionVisibility::default(),
             log_segments: Mutex::new(DurableLogSegmentRegistry::default()),
             lock_authority: Mutex::new(LockAuthorityState::default()),
@@ -306,6 +312,14 @@ impl TransactionRegionRuntime {
     }
 
     pub(crate) fn allocate_transaction_id(&self) -> Result<TransactionId> {
+        #[cfg(test)]
+        if self
+            .0
+            .fail_allocate_transaction_id_once_for_test
+            .swap(false, Ordering::Relaxed)
+        {
+            bail!("injected transaction id allocation failure");
+        }
         let id = self
             .0
             .next_transaction_id
@@ -796,9 +810,12 @@ impl TransactionRegionRuntime {
     }
 
     pub(crate) fn commit_transaction_result(&self, transaction: TransactionId) -> Result<()> {
-        self.lock_authority()?
-            .concurrency
-            .commit_transaction_result(transaction)
+        let mut runtime = self.lock_authority()?;
+        #[cfg(test)]
+        if core::mem::take(&mut runtime.fail_commit_transaction_once_for_test) {
+            bail!("injected commit transaction failure");
+        }
+        runtime.concurrency.commit_transaction_result(transaction)
     }
 
     #[cfg(all(
@@ -1170,6 +1187,18 @@ impl TransactionRegionRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn next_transaction_id_for_test(&self) -> u64 {
+        self.0.next_transaction_id.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_allocate_transaction_id_once_for_test(&self) {
+        self.0
+            .fail_allocate_transaction_id_once_for_test
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     pub(crate) fn visibility_for_test(&self) -> SelectedTransactionVisibility {
         self.visibility()
     }
@@ -1303,6 +1332,13 @@ impl TransactionRegionRuntime {
         self.lock_authority()
             .unwrap()
             .fail_release_transaction_once_for_test = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_commit_transaction_once_for_test(&self) {
+        self.lock_authority()
+            .unwrap()
+            .fail_commit_transaction_once_for_test = true;
     }
 
     #[cfg(test)]

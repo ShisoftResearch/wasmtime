@@ -17,6 +17,8 @@ struct CoordinatorState {
     snapshots_finished: usize,
     #[cfg(test)]
     snapshots_dropped: usize,
+    #[cfg(test)]
+    fail_finish_snapshot_once: bool,
     pending_commits: usize,
     gc_active: bool,
 }
@@ -96,6 +98,12 @@ impl MvccCoordinator {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_finish_snapshot_once_for_test(&self) -> Result<()> {
+        self.lock()?.fail_finish_snapshot_once = true;
+        Ok(())
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, CoordinatorState>> {
         self.state
             .lock()
@@ -122,12 +130,17 @@ impl SnapshotRegistration {
     }
 
     fn unregister(&mut self, _explicit: bool) -> Result<()> {
-        let Some(state) = self.state.take() else {
+        let Some(state) = self.state.clone() else {
             return Ok(());
         };
         let mut state = state
             .lock()
             .map_err(|_| crate::format_err!("MVCC coordinator lock is poisoned"))?;
+        #[cfg(test)]
+        if _explicit && core::mem::take(&mut state.fail_finish_snapshot_once) {
+            bail!("injected snapshot finish failure");
+        }
+        self.state = None;
         let count = state
             .active_snapshots
             .get_mut(&self.timestamp)

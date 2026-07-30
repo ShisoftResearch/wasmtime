@@ -4340,6 +4340,20 @@ fn mvcc_snapshot_workspace_terminal_paths_unregister_snapshots() {
     );
     drop(visibility.begin_gc_barrier_for_test().unwrap());
 
+    let suspended_object_abort = state.begin_with_region_runtime(&runtime).unwrap();
+    let allocated = objects.allocate_struct(vec![ObjectValue::I32(7)]).unwrap();
+    state.record_allocated_object(allocated).unwrap();
+    state.restore_transaction(None).unwrap();
+    state
+        .abort_transaction_allocated_objects(&mut objects, suspended_object_abort)
+        .unwrap();
+    assert!(objects.kind(allocated).is_err());
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 5, 5, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+
     clear_current_thread_transaction_for_test();
 }
 
@@ -4379,6 +4393,7 @@ fn mvcc_snapshot_workspace_gc_barrier_prevents_begin() {
         .begin_gc_barrier_for_test()
         .unwrap();
     let mut state = TransactionState::default();
+    let next_id = runtime.next_transaction_id_for_test();
 
     let error = state.begin_with_region_runtime(&runtime).unwrap_err();
     assert!(
@@ -4387,6 +4402,7 @@ fn mvcc_snapshot_workspace_gc_barrier_prevents_begin() {
     );
     assert_eq!(state.active_transaction(), None);
     assert!(state.visibility_snapshot.is_none());
+    assert_eq!(runtime.next_transaction_id_for_test(), next_id);
     assert_eq!(
         runtime
             .visibility_for_test()
@@ -4396,7 +4412,10 @@ fn mvcc_snapshot_workspace_gc_barrier_prevents_begin() {
     );
 
     drop(barrier);
-    state.begin_with_region_runtime(&runtime).unwrap();
+    assert_eq!(
+        state.begin_with_region_runtime(&runtime).unwrap().as_raw(),
+        next_id
+    );
     state.abort().unwrap();
     assert_eq!(
         runtime
@@ -4436,6 +4455,80 @@ fn mvcc_snapshot_workspace_constructor_failure_unregisters_snapshot() {
 
 #[cfg(feature = "transaction-mvcc")]
 #[test]
+fn mvcc_snapshot_workspace_region_constructor_failure_finishes_snapshot() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    runtime.fail_allocate_transaction_id_once_for_test();
+    let mut state = TransactionState::default();
+
+    let error = state.begin_with_region_runtime(&runtime).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected transaction id allocation failure"),
+        "{error:?}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_constructor_combines_operation_and_finish_errors() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    runtime.fail_allocate_transaction_id_once_for_test();
+    visibility.fail_finish_snapshot_once_for_test().unwrap();
+    let mut state = TransactionState::default();
+
+    let error = state.begin_with_region_runtime(&runtime).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("injected transaction id allocation failure"),
+        "{message}"
+    );
+    assert!(
+        message.contains("injected snapshot finish failure"),
+        "{message}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 0, 1)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn transaction_constructor_boundary_result_composition_preserves_both_errors() {
+    let operation = Err::<u32, _>(crate::format_err!("injected constructor operation failure"));
+    let cleanup = Err(crate::format_err!("injected constructor cleanup failure"));
+
+    let error = combine_operation_and_cleanup_results(
+        operation,
+        cleanup,
+        "failed to finish transaction constructor boundary",
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("injected constructor operation failure"),
+        "{message}"
+    );
+    assert!(
+        message.contains("injected constructor cleanup failure"),
+        "{message}"
+    );
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
 fn mvcc_snapshot_workspace_acquisition_records_sets_without_cc_access() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -4451,6 +4544,10 @@ fn mvcc_snapshot_workspace_acquisition_records_sets_without_cc_access() {
     assert!(state.owns_granule_read(read));
     assert!(state.owns_granule_read(write));
     assert!(state.owns_granule_write(write));
+    state
+        .validate_active_reads_with(|_| panic!("MVCC validation called current-version closure"))
+        .unwrap();
+    state.validate_active_read(read, u64::MAX).unwrap();
 
     let error = state.clear_active().unwrap_err();
     assert!(error.to_string().contains("lock poisoned"), "{error:?}");
@@ -4458,6 +4555,131 @@ fn mvcc_snapshot_workspace_acquisition_records_sets_without_cc_access() {
     assert_eq!(
         visibility.snapshot_lifecycle_counts_for_test().unwrap(),
         (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_active_abort_cleans_up_after_authority_failure() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    runtime.poison_lock_authority_for_test();
+
+    let error = state.abort().unwrap_err();
+    assert!(error.to_string().contains("lock poisoned"), "{error:?}");
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_active_object_abort_cleans_up_after_authority_failure() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut objects = ObjectTable::default();
+    let allocated = objects.allocate_struct(vec![ObjectValue::I32(9)]).unwrap();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state.record_allocated_object(allocated).unwrap();
+    runtime.poison_lock_authority_for_test();
+
+    let error = state.abort_allocated_objects(&mut objects).unwrap_err();
+    assert!(error.to_string().contains("lock poisoned"), "{error:?}");
+    assert_eq!(state.active_transaction(), None);
+    assert!(objects.kind(allocated).is_err());
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_active_conflict_cleanup_finishes_after_authority_failure() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state.active_conflict_aborted = true;
+    runtime.poison_lock_authority_for_test();
+
+    let error = state.begin_terminal_commit().unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("conflict-aborted"), "{message}");
+    assert!(message.contains("lock poisoned"), "{message}");
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_commit_combines_policy_and_cleanup_errors() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    runtime.fail_commit_transaction_once_for_test();
+    runtime.fail_release_transaction_once_for_test();
+
+    let error = state.complete_commit().unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("injected commit transaction failure"),
+        "{message}"
+    );
+    assert!(
+        message.contains("injected release transaction failure"),
+        "{message}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_snapshot_workspace_clear_combines_authority_and_snapshot_finish_errors() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    runtime.fail_release_transaction_once_for_test();
+    visibility.fail_finish_snapshot_once_for_test().unwrap();
+
+    let error = state.clear_active().unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("injected release transaction failure"),
+        "{message}"
+    );
+    assert!(
+        message.contains("injected snapshot finish failure"),
+        "{message}"
+    );
+    assert_eq!(state.active_transaction(), None);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 0, 1)
     );
     clear_current_thread_transaction_for_test();
 }

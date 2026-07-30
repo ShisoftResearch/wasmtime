@@ -135,6 +135,21 @@ pub(crate) use state::{
     GlobalSnapshot, StagedObjectRecord, StagedRecord, TableElementSnapshot, TransactionState,
 };
 
+pub(crate) fn combine_operation_and_cleanup_results<T>(
+    operation: Result<T>,
+    cleanup: Result<()>,
+    cleanup_context: &str,
+) -> Result<T> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(crate::format_err!(
+            "{error:#}; {cleanup_context}: {cleanup_error:#}"
+        )),
+    }
+}
+
 pub(crate) fn collect_tmemory_access_snapshot(
     tmemory: &TMemory,
     addr: u64,

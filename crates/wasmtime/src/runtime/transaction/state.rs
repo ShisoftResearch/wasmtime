@@ -431,12 +431,19 @@ impl TransactionState {
         snapshot: SelectedVisibilitySnapshot,
         error: crate::Error,
     ) -> Result<T> {
-        match visibility.finish_snapshot(snapshot) {
-            Ok(()) => Err(error),
-            Err(finish_error) => Err(finish_error.context(format!(
-                "failed to finish transaction visibility snapshot after: {error:#}"
-            ))),
-        }
+        Self::combine_results(
+            Err(error),
+            visibility.finish_snapshot(snapshot),
+            "failed to finish transaction visibility snapshot",
+        )
+    }
+
+    fn combine_results<T>(
+        primary: Result<T>,
+        cleanup: Result<()>,
+        cleanup_context: &str,
+    ) -> Result<T> {
+        combine_operation_and_cleanup_results(primary, cleanup, cleanup_context)
     }
 
     fn prepare_to_begin_transaction(&mut self) -> Result<()> {
@@ -564,11 +571,11 @@ impl TransactionState {
         if let Some(workspace) = self.suspended.remove(&transaction) {
             let mut workspace = workspace;
             let mut result = self.bump_versioned_granules(workspace.write_granules.iter().copied());
-            if let Err(error) = self.release_transaction_authority(transaction)
-                && result.is_ok()
-            {
-                result = Err(error);
-            }
+            result = Self::combine_results(
+                result,
+                self.release_transaction_authority(transaction),
+                "failed to release suspended transaction authority",
+            );
             return Self::finish_workspace_snapshot(&mut workspace, result).map(|()| true);
         }
         Ok(false)
@@ -591,20 +598,24 @@ impl TransactionState {
         let mut result = Ok(());
         for object_id in workspace.allocated_objects.iter().rev().copied() {
             if let Err(error) = object_table.free(object_id) {
-                result = Err(error);
+                result = Self::combine_results(
+                    result,
+                    Err(error),
+                    "failed to free a suspended transaction object",
+                );
                 break;
             }
         }
-        if let Err(error) = self.bump_versioned_granules(workspace.write_granules.iter().copied())
-            && result.is_ok()
-        {
-            result = Err(error);
-        }
-        if let Err(error) = self.release_transaction_authority(transaction)
-            && result.is_ok()
-        {
-            result = Err(error);
-        }
+        result = Self::combine_results(
+            result,
+            self.bump_versioned_granules(workspace.write_granules.iter().copied()),
+            "failed to bump suspended transaction granule versions",
+        );
+        result = Self::combine_results(
+            result,
+            self.release_transaction_authority(transaction),
+            "failed to release suspended transaction authority",
+        );
         Self::finish_workspace_snapshot(&mut workspace, result).map(|()| true)
     }
 
@@ -636,13 +647,11 @@ impl TransactionState {
             Some(snapshot) => visibility.finish_snapshot(snapshot),
             None => Ok(()),
         };
-        match (result, finish) {
-            (Ok(()), finish) => finish,
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(finish_error)) => Err(finish_error.context(format!(
-                "failed to finish transaction visibility snapshot after: {error:#}"
-            ))),
-        }
+        Self::combine_results(
+            result,
+            finish,
+            "failed to finish transaction visibility snapshot",
+        )
     }
 
     pub(crate) fn active_transaction(&self) -> Option<TransactionId> {
@@ -1238,8 +1247,13 @@ impl TransactionState {
         if self.allocated_objects.is_empty()
             && self.pending_conflict_aborted_allocated_objects.is_empty()
         {
-            self.finish_active_conflict_aborted_without_object_cleanup()?;
-            bail!("transaction was conflict-aborted by another transaction");
+            return Self::combine_results(
+                Err(crate::format_err!(
+                    "transaction was conflict-aborted by another transaction"
+                )),
+                self.finish_active_conflict_aborted_without_object_cleanup(),
+                "failed to clean up conflict-aborted transaction",
+            );
         }
         bail!(
             "transaction was conflict-aborted by another transaction and requires object-aware cleanup for allocated objects"
@@ -1250,15 +1264,23 @@ impl TransactionState {
         &mut self,
         object_table: &mut ObjectTable,
     ) -> Result<()> {
-        self.abort_allocated_objects(object_table)?;
-        bail!("transaction was conflict-aborted by another transaction");
+        Self::combine_results(
+            Err(crate::format_err!(
+                "transaction was conflict-aborted by another transaction"
+            )),
+            self.abort_allocated_objects(object_table),
+            "failed to clean up conflict-aborted transaction",
+        )
     }
 
     fn finish_active_conflict_aborted_without_object_cleanup(&mut self) -> Result<()> {
         self.retry_post_commit_linear_undo_retirement();
-        self.bump_active_versioned_write_granules()?;
-        self.clear_active()?;
-        Ok(())
+        let result = self.bump_active_versioned_write_granules();
+        Self::combine_results(
+            result,
+            self.clear_active(),
+            "failed to clear conflict-aborted transaction",
+        )
     }
 
     fn is_conflict_aborted_error(error: &impl core::fmt::Display) -> bool {
@@ -1290,12 +1312,11 @@ impl TransactionState {
                 .map(|_| ());
             self.pending_conflict_aborted_allocated_objects
                 .extend(workspace.allocated_objects.iter().rev().copied());
-            if let Err(error) =
-                self.bump_versioned_granules(workspace.write_granules.iter().copied())
-                && result.is_ok()
-            {
-                result = Err(error);
-            }
+            result = Self::combine_results(
+                result,
+                self.bump_versioned_granules(workspace.write_granules.iter().copied()),
+                "failed to bump conflict-aborted transaction granule versions",
+            );
             Self::finish_workspace_snapshot(&mut workspace, result)?;
         }
         Ok(())
@@ -1388,13 +1409,12 @@ impl TransactionState {
     }
 
     fn finish_commit_after_policy_hook(&mut self, transaction: TransactionId) -> Result<()> {
-        let mut result = self.commit_transaction_authority(transaction);
-        if let Err(error) = self.clear_active()
-            && result.is_ok()
-        {
-            result = Err(error);
-        }
-        result
+        let result = self.commit_transaction_authority(transaction);
+        Self::combine_results(
+            result,
+            self.clear_active(),
+            "failed to clear committed transaction",
+        )
     }
 
     pub(crate) fn staged_records(&self) -> Result<Vec<StagedRecord>> {
@@ -1471,15 +1491,24 @@ impl TransactionState {
 
     pub(crate) fn abort(&mut self) -> Result<()> {
         self.ensure_active()?;
-        self.active_conflict_aborted = false;
-        let _ =
-            self.take_shared_conflict_aborted_transaction(self.active_transaction_required()?)?;
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.ensure_no_active_allocated_objects_for_generic_abort()?;
+        self.active_conflict_aborted = false;
+        let transaction = self.active_transaction_required()?;
         self.retry_post_commit_linear_undo_retirement();
-        self.bump_active_versioned_write_granules()?;
-        self.clear_active()?;
-        Ok(())
+        let mut result = self
+            .take_shared_conflict_aborted_transaction(transaction)
+            .map(|_| ());
+        result = Self::combine_results(
+            result,
+            self.bump_active_versioned_write_granules(),
+            "failed to bump aborted transaction granule versions",
+        );
+        Self::combine_results(
+            result,
+            self.clear_active(),
+            "failed to clear aborted transaction",
+        )
     }
 
     pub(crate) fn record_allocated_object(&mut self, object_id: ObjectId) -> Result<bool> {
@@ -1679,12 +1708,17 @@ impl TransactionState {
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
         self.ensure_active()?;
         self.active_conflict_aborted = false;
-        let _ =
-            self.take_shared_conflict_aborted_transaction(self.active_transaction_required()?)?;
+        let transaction = self.active_transaction_required()?;
         self.retry_post_commit_linear_undo_retirement();
         let mut result = self
-            .drain_conflict_aborted_allocated_objects(object_table)
+            .take_shared_conflict_aborted_transaction(transaction)
             .map(|_| ());
+        result = Self::combine_results(
+            result,
+            self.drain_conflict_aborted_allocated_objects(object_table)
+                .map(|_| ()),
+            "failed to drain conflict-aborted transaction objects",
+        );
         let allocated = self
             .allocated_objects
             .iter()
@@ -1695,23 +1729,24 @@ impl TransactionState {
             if let Err(error) = object_table.free(object_id) {
                 self.pending_conflict_aborted_allocated_objects
                     .extend(allocated[index..].iter().copied());
-                if result.is_ok() {
-                    result = Err(error);
-                }
+                result = Self::combine_results(
+                    result,
+                    Err(error),
+                    "failed to free an aborted transaction object",
+                );
                 break;
             }
         }
-        if let Err(error) = self.bump_active_versioned_write_granules() {
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
-        if let Err(error) = self.clear_active() {
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
-        result
+        result = Self::combine_results(
+            result,
+            self.bump_active_versioned_write_granules(),
+            "failed to bump aborted transaction granule versions",
+        );
+        Self::combine_results(
+            result,
+            self.clear_active(),
+            "failed to clear aborted transaction",
+        )
     }
 
     pub(crate) fn fail_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
@@ -3036,13 +3071,12 @@ impl TransactionState {
         );
         self.ensure_no_pending_conflict_aborted_allocated_objects()?;
         self.retry_post_commit_linear_undo_retirement();
-        let mut result = self.bump_active_versioned_write_granules();
-        if let Err(error) = self.clear_active()
-            && result.is_ok()
-        {
-            result = Err(error);
-        }
-        result
+        let result = self.bump_active_versioned_write_granules();
+        Self::combine_results(
+            result,
+            self.clear_active(),
+            "failed to clear transaction after durable commit error",
+        )
     }
 
     pub(crate) fn persistent_root_ids(&self) -> Result<BTreeSet<ObjectId>> {
@@ -3938,49 +3972,49 @@ impl TransactionState {
     pub(super) fn clear_active(&mut self) -> Result<()> {
         let visibility = self.visibility.clone();
         let snapshot = self.visibility_snapshot.take();
-        let mut error = None;
+        let mut result = Ok(());
         if let Some(transaction) = self.active {
             if self.terminal_commit_active {
                 if let Some(runtime) = &self.shared_region_runtime {
-                    if let Err(err) = runtime.end_terminal_commit(transaction) {
-                        if error.is_none() {
-                            error = Some(err);
-                        }
-                    }
+                    result = Self::combine_results(
+                        result,
+                        runtime.end_terminal_commit(transaction),
+                        "failed to end terminal commit",
+                    );
                 }
             }
-            if let Err(err) = self.release_transaction_authority(transaction) {
-                if error.is_none() {
-                    error = Some(err);
-                }
-            }
+            result = Self::combine_results(
+                result,
+                self.release_transaction_authority(transaction),
+                "failed to release transaction authority",
+            );
             if let Some(runtime) = &self.shared_region_runtime {
                 let release_result = if self.uncommitted_publication_streams.is_empty() {
                     runtime.release_current_thread_log_segment_reusable()
                 } else {
                     runtime.retire_current_thread_log_segment()
                 };
-                if let Err(err) = release_result {
-                    if error.is_none() {
-                        error = Some(err);
-                    }
-                }
+                result = Self::combine_results(
+                    result,
+                    release_result,
+                    "failed to release transaction log segment",
+                );
             }
         }
         self.active = None;
         self.terminal_commit_active = false;
         replace_current_thread_transaction(None);
-        if let Some(snapshot) = snapshot
-            && let Err(err) = visibility.finish_snapshot(snapshot)
-            && error.is_none()
-        {
-            error = Some(err);
-        }
-        self.install_workspace(TransactionWorkspace::default());
-        match error {
-            Some(error) => Err(error),
+        let finish_snapshot = match snapshot {
+            Some(snapshot) => visibility.finish_snapshot(snapshot),
             None => Ok(()),
-        }
+        };
+        result = Self::combine_results(
+            result,
+            finish_snapshot,
+            "failed to finish transaction visibility snapshot",
+        );
+        self.install_workspace(TransactionWorkspace::default());
+        result
     }
 
     pub(super) fn retry_post_commit_linear_undo_retirement(&mut self) {
