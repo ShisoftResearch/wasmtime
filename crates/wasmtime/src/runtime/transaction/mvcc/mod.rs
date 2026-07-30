@@ -1,7 +1,15 @@
 use super::visibility::TransactionVisibility;
 
+mod coordinator;
 mod version_chain;
 
+#[allow(
+    unused_imports,
+    reason = "reserved for the next MVCC implementation stages"
+)]
+pub(crate) use coordinator::{
+    MvccCoordinator, MvccGcBarrierPermit, PendingCommitRegistration, SnapshotRegistration,
+};
 #[allow(
     unused_imports,
     reason = "reserved for the next MVCC implementation stages"
