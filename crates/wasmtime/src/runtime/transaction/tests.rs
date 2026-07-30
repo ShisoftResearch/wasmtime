@@ -1,6 +1,19 @@
 use super::config::TMemoryRegionConfig;
+#[cfg(feature = "transaction-mvcc")]
+use super::visibility::SelectedTransactionVisibility;
 use super::*;
 use crate::runtime::store::AsStoreOpaque;
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_is_visibility_not_concurrency_control() {
+    assert_eq!(
+        ConcurrencyControl::default_for_build(),
+        ConcurrencyControl::OptimisticValidation
+    );
+    let visibility = SelectedTransactionVisibility::default();
+    assert!(visibility.is_multiversion());
+}
 
 fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
     with_transaction_object_metadata(wasm, &[1, 1, 0, 0])

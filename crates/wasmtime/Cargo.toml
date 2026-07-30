@@ -175,6 +175,7 @@ transaction = [
   "wasmtime-environ/transaction",
   "wasmtime-cranelift?/transaction",
 ]
+transaction-mvcc = ["transaction"]
 transaction-cc-lockbased = ["transaction"]
 transaction-cc-nowait-abort = ["transaction"]
 transaction-cc-optimistic-validation = ["transaction"]

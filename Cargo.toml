@@ -617,6 +617,7 @@ transaction = [
   "wasmtime-cranelift?/transaction",
   "wasmtime-wast?/transaction",
 ]
+transaction-mvcc = ["wasmtime/transaction-mvcc"]
 transaction-cc-lockbased = ["wasmtime/transaction-cc-lockbased"]
 transaction-cc-nowait-abort = ["wasmtime/transaction-cc-nowait-abort"]
 transaction-cc-optimistic-validation = ["wasmtime/transaction-cc-optimistic-validation"]

@@ -13,6 +13,8 @@ mod config;
 mod durable_ref;
 mod granule;
 mod ids;
+#[cfg(feature = "transaction-mvcc")]
+mod mvcc;
 mod object_directory;
 mod object_gc;
 mod object_heap;
@@ -24,6 +26,7 @@ mod promotion;
 mod region_runtime;
 mod state;
 pub(crate) mod type_layout;
+mod visibility;
 mod wasmtime_layout;
 use concurrency::ConcurrencyControlState;
 #[cfg(all(
