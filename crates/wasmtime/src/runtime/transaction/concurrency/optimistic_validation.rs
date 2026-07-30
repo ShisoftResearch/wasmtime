@@ -1,13 +1,33 @@
 use crate::prelude::*;
 use alloc::collections::BTreeMap;
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use alloc::collections::BTreeSet;
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use alloc::sync::Arc;
 
 use super::super::{GranuleId, TransactionId};
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use super::{MvccCertificationAuthority, MvccCertificationPermit};
 use super::{TransactionConcurrencyControl, TransactionConflictAction};
 
 #[derive(Debug, Default)]
 pub(crate) struct OptimisticValidation {
     pub(crate) read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
     pub(crate) write_versions: BTreeMap<(TransactionId, GranuleId), u64>,
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    mvcc_certification: Arc<MvccCertificationAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +53,27 @@ impl OptimisticValidationConflictKind {
 pub(crate) use self::OptimisticValidationConflictKind as OptimisticValidationConflictKindForTest;
 
 impl OptimisticValidation {
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn acquire_mvcc_certification(
+        &self,
+        transaction: TransactionId,
+        reads: &BTreeSet<GranuleId>,
+        writes: &BTreeSet<GranuleId>,
+    ) -> Result<MvccCertificationPermit> {
+        self.mvcc_certification.acquire(transaction, reads, writes)
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn mvcc_certification_authority(&self) -> Arc<MvccCertificationAuthority> {
+        self.mvcc_certification.clone()
+    }
+
     pub(crate) fn record_read(
         &mut self,
         transaction: TransactionId,

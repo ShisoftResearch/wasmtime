@@ -9,9 +9,24 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
 use super::concurrency::TransactionConflictAction;
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use super::concurrency::{MvccCertificationAuthority, MvccCertificationPermit};
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use super::mvcc::MvccRuntime;
 use super::object_value::object_kind_from_u16;
 use super::state::PersistentRootDelta;
 use super::type_layout::TypeLayoutRegistry;
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use super::visibility::CommitTimestamp;
 use super::{
     ConcurrencyControlState, GranuleId, ObjectId, ObjectKind, ObjectTable,
     PersistentObjectDirectoryEntry, PersistentObjectRecordLocation, PersistentObjectRecordSource,
@@ -777,6 +792,40 @@ impl TransactionRegionRuntime {
         self.lock_authority()?
             .concurrency
             .commit_transaction_result(transaction)
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn acquire_mvcc_certification(
+        &self,
+        transaction: TransactionId,
+        reads: &BTreeSet<GranuleId>,
+        writes: &BTreeSet<GranuleId>,
+        snapshot: CommitTimestamp,
+        visibility: &MvccRuntime,
+    ) -> Result<MvccCertificationPermit> {
+        let authority = self.mvcc_certification_authority()?;
+        let permit = authority.acquire(transaction, reads, writes)?;
+        for granule in reads.union(writes).copied() {
+            ensure!(
+                visibility.latest_committed_timestamp(granule)? <= snapshot,
+                "transaction MVCC certification conflict on {granule:?}"
+            );
+        }
+        Ok(permit)
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn mvcc_certification_authority(&self) -> Result<Arc<MvccCertificationAuthority>> {
+        Ok(self
+            .lock_authority()?
+            .concurrency
+            .mvcc_certification_authority())
     }
 
     pub(crate) fn take_conflict_aborted_transaction(

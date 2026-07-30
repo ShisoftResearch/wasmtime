@@ -1,8 +1,23 @@
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use super::concurrency::{CertificationMode, MvccCertificationAuthority};
 use super::config::TMemoryRegionConfig;
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use super::mvcc::{CommitRecord, MvccRuntime};
 #[cfg(feature = "transaction-mvcc")]
 use super::visibility::SelectedTransactionVisibility;
 use super::*;
 use crate::runtime::store::AsStoreOpaque;
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use alloc::sync::Arc;
 
 #[cfg(feature = "transaction-mvcc")]
 #[test]
@@ -44,6 +59,401 @@ fn transaction_cc_read_version_conflict_message() -> &'static str {
     } else {
         "optimistic read version changed"
     }
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_granule(granule_index: u64) -> GranuleId {
+    GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index,
+    }
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_install_committed_memory_version(
+    visibility: &MvccRuntime,
+    granule: GranuleId,
+    timestamp: u64,
+) {
+    let commit = Arc::new(CommitRecord::pending());
+    let mut prepare = visibility.begin_prepare(commit.clone()).unwrap();
+    prepare
+        .prepare_memory(granule, || Ok(vec![0]), vec![1])
+        .unwrap();
+    drop(prepare);
+    commit.commit(timestamp).unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_assigns_shared_reads_and_exclusive_writes() {
+    let policy = ConcurrencyControlState::default();
+    let transaction = TransactionId::from_raw(1);
+    let read_only = mvcc_certification_granule(0);
+    let read_and_write = mvcc_certification_granule(1);
+    let blind_write = mvcc_certification_granule(2);
+    let reads = BTreeSet::from([read_only, read_and_write]);
+    let writes = BTreeSet::from([read_and_write, blind_write]);
+
+    let permit = policy
+        .acquire_mvcc_certification(transaction, &reads, &writes)
+        .unwrap();
+
+    assert_eq!(
+        permit.reservations_for_test(),
+        &[
+            (read_only, CertificationMode::Shared),
+            (read_and_write, CertificationMode::Exclusive),
+            (blind_write, CertificationMode::Exclusive),
+        ]
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_shared_and_disjoint_reservations_coexist() {
+    let authority = Arc::new(MvccCertificationAuthority::default());
+    let shared = mvcc_certification_granule(0);
+    let disjoint = mvcc_certification_granule(1);
+
+    let first_shared = authority
+        .acquire(
+            TransactionId::from_raw(1),
+            &BTreeSet::from([shared]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    let second_shared = authority
+        .acquire(
+            TransactionId::from_raw(2),
+            &BTreeSet::from([shared]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    let disjoint_writer = authority
+        .acquire(
+            TransactionId::from_raw(3),
+            &BTreeSet::new(),
+            &BTreeSet::from([disjoint]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        first_shared.reservations_for_test(),
+        &[(shared, CertificationMode::Shared)]
+    );
+    assert_eq!(
+        second_shared.reservations_for_test(),
+        &[(shared, CertificationMode::Shared)]
+    );
+    assert_eq!(
+        disjoint_writer.reservations_for_test(),
+        &[(disjoint, CertificationMode::Exclusive)]
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_shared_exclusive_waits_until_shared_drops() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let authority = Arc::new(MvccCertificationAuthority::default());
+    let granule = mvcc_certification_granule(0);
+    let shared = authority
+        .acquire(
+            TransactionId::from_raw(1),
+            &BTreeSet::from([granule]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let waiting_authority = authority.clone();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let permit = waiting_authority.acquire(
+            TransactionId::from_raw(2),
+            &BTreeSet::new(),
+            &BTreeSet::from([granule]),
+        );
+        finished_tx.send(permit).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(shared);
+
+    let permit = finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        permit.reservations_for_test(),
+        &[(granule, CertificationMode::Exclusive)]
+    );
+    drop(permit);
+    waiter.join().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_exclusive_exclusive_waits_until_permit_drops() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let authority = Arc::new(MvccCertificationAuthority::default());
+    let granule = mvcc_certification_granule(0);
+    let first = authority
+        .acquire(
+            TransactionId::from_raw(1),
+            &BTreeSet::new(),
+            &BTreeSet::from([granule]),
+        )
+        .unwrap();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let waiting_authority = authority.clone();
+    let waiter = std::thread::spawn(move || {
+        let permit = waiting_authority.acquire(
+            TransactionId::from_raw(2),
+            &BTreeSet::new(),
+            &BTreeSet::from([granule]),
+        );
+        finished_tx.send(permit).unwrap();
+    });
+
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(first);
+
+    let second = finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    drop(second);
+    waiter.join().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_reserves_complete_sorted_set_without_partial_deadlock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let authority = Arc::new(MvccCertificationAuthority::default());
+    let a = mvcc_certification_granule(0);
+    let b = mvcc_certification_granule(1);
+    let first = authority
+        .acquire(
+            TransactionId::from_raw(1),
+            &BTreeSet::new(),
+            &BTreeSet::from([a]),
+        )
+        .unwrap();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let waiting_authority = authority.clone();
+    let waiter = std::thread::spawn(move || {
+        let permit = waiting_authority.acquire(
+            TransactionId::from_raw(2),
+            &BTreeSet::new(),
+            &BTreeSet::from([b, a]),
+        );
+        finished_tx.send(permit).unwrap();
+    });
+
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let probe_authority = authority.clone();
+    let probe = std::thread::spawn(move || {
+        let permit = probe_authority.acquire(
+            TransactionId::from_raw(3),
+            &BTreeSet::new(),
+            &BTreeSet::from([b]),
+        );
+        probe_tx.send(permit).unwrap();
+    });
+    let disjoint_from_first = probe_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    drop(first);
+    drop(disjoint_from_first);
+    let complete = finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        complete.reservations_for_test(),
+        &[
+            (a, CertificationMode::Exclusive),
+            (b, CertificationMode::Exclusive),
+        ]
+    );
+    drop(complete);
+    waiter.join().unwrap();
+    probe.join().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_write_skew_access_sets_do_not_overlap() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let authority = Arc::new(MvccCertificationAuthority::default());
+    let a = mvcc_certification_granule(0);
+    let b = mvcc_certification_granule(1);
+    let first_reads = BTreeSet::from([a, b]);
+    let first_writes = BTreeSet::from([a]);
+    let second_reads = BTreeSet::from([a, b]);
+    let second_writes = BTreeSet::from([b]);
+    let first = authority
+        .acquire(TransactionId::from_raw(1), &first_reads, &first_writes)
+        .unwrap();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let waiting_authority = authority.clone();
+    let waiter = std::thread::spawn(move || {
+        let permit =
+            waiting_authority.acquire(TransactionId::from_raw(2), &second_reads, &second_writes);
+        finished_tx.send(permit).unwrap();
+    });
+
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(first);
+
+    let second = finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    drop(second);
+    waiter.join().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_certification_validates_read_and_blind_write_union_after_reservation() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = Arc::new(MvccRuntime::default());
+    let read = mvcc_certification_granule(0);
+    let blind_write = mvcc_certification_granule(1);
+    let blocker = runtime
+        .acquire_mvcc_certification(
+            TransactionId::from_raw(1),
+            &BTreeSet::new(),
+            &BTreeSet::from([read]),
+            0,
+            &visibility,
+        )
+        .unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let waiting_runtime = runtime.clone();
+    let waiting_visibility = visibility.clone();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = waiting_runtime.acquire_mvcc_certification(
+            TransactionId::from_raw(2),
+            &BTreeSet::from([read]),
+            &BTreeSet::new(),
+            0,
+            &waiting_visibility,
+        );
+        finished_tx.send(result).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    mvcc_certification_install_committed_memory_version(&visibility, read, 1);
+    drop(blocker);
+
+    let read_error = finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        read_error
+            .to_string()
+            .contains("transaction MVCC certification conflict"),
+        "{read_error:?}"
+    );
+    waiter.join().unwrap();
+
+    mvcc_certification_install_committed_memory_version(&visibility, blind_write, 2);
+    let write_error = runtime
+        .acquire_mvcc_certification(
+            TransactionId::from_raw(3),
+            &BTreeSet::new(),
+            &BTreeSet::from([blind_write]),
+            1,
+            &visibility,
+        )
+        .unwrap_err();
+    assert!(
+        write_error
+            .to_string()
+            .contains("transaction MVCC certification conflict"),
+        "{write_error:?}"
+    );
+
+    runtime
+        .acquire_mvcc_certification(
+            TransactionId::from_raw(4),
+            &BTreeSet::new(),
+            &BTreeSet::from([read, blind_write]),
+            2,
+            &visibility,
+        )
+        .unwrap();
 }
 
 fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
@@ -19418,6 +19828,56 @@ fn optimistic_validation_rejects_changed_write_version() {
         error,
         OptimisticValidationConflictKindForTest::WriteVersionMismatch
     );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn optimistic_validation_single_version_keeps_execution_time_version_checks() {
+    let transaction = TransactionId::from_raw(1);
+    let read_granule = mvcc_certification_granule_for_single_version_test(0);
+    let write_granule = mvcc_certification_granule_for_single_version_test(1);
+    let mut read_policy = OptimisticValidation::default();
+    read_policy
+        .record_read(transaction, read_granule, 5)
+        .unwrap();
+    let read_error = read_policy
+        .record_read(transaction, read_granule, 6)
+        .unwrap_err();
+    assert!(
+        read_error
+            .to_string()
+            .contains("optimistic read version changed"),
+        "{read_error:?}"
+    );
+
+    let mut write_policy = OptimisticValidation::default();
+    write_policy
+        .acquire_write(transaction, write_granule, 7)
+        .unwrap();
+    let write_error = write_policy
+        .acquire_write(transaction, write_granule, 8)
+        .unwrap_err();
+    assert!(
+        write_error
+            .to_string()
+            .contains("optimistic write version changed"),
+        "{write_error:?}"
+    );
+}
+
+#[cfg(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn mvcc_certification_granule_for_single_version_test(granule_index: u64) -> GranuleId {
+    GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index,
+    }
 }
 
 #[test]
