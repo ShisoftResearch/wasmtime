@@ -2763,7 +2763,7 @@ impl ObjectTable {
     }
 
     #[cfg(test)]
-    pub(crate) fn persistent_mark_sweep_from_roots_uncoordinated_for_test<I>(
+    pub(super) fn persistent_mark_sweep_from_roots_uncoordinated_for_test<I>(
         &mut self,
         roots: I,
     ) -> Result<PersistentMarkSweepReport>

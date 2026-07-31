@@ -3450,19 +3450,28 @@ impl TransactionState {
         ) -> Result<T>,
     ) -> Result<T> {
         let shared_runtime = self.shared_region_runtime.clone();
-        let (policy, visibility) = if let Some(runtime) = &shared_runtime {
-            (runtime.persistent_gc_policy()?, runtime.visibility())
+        let visibility = if let Some(runtime) = &shared_runtime {
+            runtime.visibility()
         } else {
-            (self.persistent_gc_policy.clone(), self.visibility.clone())
+            self.visibility.clone()
         };
 
-        // Declaration order is intentional: locals drop in reverse order, so
-        // the shared-region permit leaves before the MVCC barrier.
+        // Shared admission and policy selection happen together only after the
+        // MVCC barrier. Declaration order ensures the shared admission leaves
+        // before the MVCC permit on every path.
         let mvcc_permit = visibility.begin_gc_barrier()?;
-        let _shared_gc_region_permit = shared_runtime
+        let shared_admission = shared_runtime
             .as_ref()
-            .map(TransactionRegionRuntime::begin_persistent_gc)
+            .map(TransactionRegionRuntime::begin_persistent_gc_with_policy)
             .transpose()?;
+        let local_policy = shared_runtime
+            .is_none()
+            .then(|| self.persistent_gc_policy.clone());
+        let policy = match (&shared_admission, &local_policy) {
+            (Some(admission), None) => admission.policy(),
+            (None, Some(policy)) => policy.as_ref(),
+            _ => unreachable!("persistent GC policy authority must be selected exactly once"),
+        };
         let rebase = visibility.runtime().prepare_full_rebase(&mvcc_permit)?;
         let validated = rebase.validate_current_objects(objects)?;
         let metadata = visibility
@@ -3472,7 +3481,7 @@ impl TransactionState {
             GcMvccMode::CurrentStateOnly => None,
             GcMvccMode::MvccCompliant => Some(&metadata),
         };
-        operation(policy.as_ref(), mvcc, self, objects)
+        operation(policy, mvcc, self, objects)
     }
 
     #[cfg(not(feature = "transaction-mvcc"))]
@@ -3487,16 +3496,19 @@ impl TransactionState {
         ) -> Result<T>,
     ) -> Result<T> {
         let shared_runtime = self.shared_region_runtime.clone();
-        let policy = if let Some(runtime) = &shared_runtime {
-            runtime.persistent_gc_policy()?
-        } else {
-            self.persistent_gc_policy.clone()
-        };
-        let _shared_gc_region_permit = shared_runtime
+        let shared_admission = shared_runtime
             .as_ref()
-            .map(TransactionRegionRuntime::begin_persistent_gc)
+            .map(TransactionRegionRuntime::begin_persistent_gc_with_policy)
             .transpose()?;
-        operation(policy.as_ref(), None, self, objects)
+        let local_policy = shared_runtime
+            .is_none()
+            .then(|| self.persistent_gc_policy.clone());
+        let policy = match (&shared_admission, &local_policy) {
+            (Some(admission), None) => admission.policy(),
+            (None, Some(policy)) => policy.as_ref(),
+            _ => unreachable!("persistent GC policy authority must be selected exactly once"),
+        };
+        operation(policy, None, self, objects)
     }
 
     pub(crate) fn persistent_mark_sweep_collect(
@@ -4502,6 +4514,10 @@ fn persistent_root_object_id_for_table_element_snapshot(
 
 #[cfg(test)]
 impl TransactionState {
+    pub(super) fn persistent_gc_policy_identity_for_test(&self) -> usize {
+        Arc::as_ptr(&self.persistent_gc_policy) as *const () as usize
+    }
+
     pub(super) fn set_persistent_gc_policy_for_test(
         &mut self,
         policy: Arc<dyn TransactionPersistentGc>,

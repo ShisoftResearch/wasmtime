@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GcMvccMode {
+pub(super) enum GcMvccMode {
     CurrentStateOnly,
     MvccCompliant,
 }
@@ -15,14 +15,14 @@ pub(crate) enum GcMvccMode {
 /// historical version has been rebased into the current object state.
 ///
 /// This deliberately exposes no object payloads, version chains, or roots.
-pub(crate) trait TransactionMvccGcView {
+pub(super) trait TransactionMvccGcView {
     fn oldest_active_snapshot(&self) -> Option<CommitTimestamp>;
     fn visible_timestamp(&self) -> CommitTimestamp;
     fn baseline_timestamp(&self) -> CommitTimestamp;
     fn is_quiescent(&self) -> bool;
 }
 
-pub(crate) trait TransactionPersistentGc: Debug + Send + Sync + 'static {
+pub(super) trait TransactionPersistentGc: Debug + Send + Sync + 'static {
     fn mvcc_mode(&self) -> GcMvccMode;
 
     fn persistent_mark_sweep_collect(
@@ -57,7 +57,7 @@ pub(crate) trait TransactionPersistentGc: Debug + Send + Sync + 'static {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct CurrentStatePersistentGc;
+pub(super) struct CurrentStatePersistentGc;
 
 impl CurrentStatePersistentGc {
     fn ensure_current_state_view(mvcc: Option<&dyn TransactionMvccGcView>) -> Result<()> {
@@ -413,10 +413,10 @@ fn ensure_marker_inactive() -> Result<()> {
     Ok(())
 }
 
-pub(crate) struct PersistentObjectMarker;
+pub(super) struct PersistentObjectMarker;
 
 impl PersistentObjectMarker {
-    pub(crate) fn mark<I>(objects: &mut ObjectTable, roots: I) -> Result<PersistentObjectMarkReport>
+    pub(super) fn mark<I>(objects: &mut ObjectTable, roots: I) -> Result<PersistentObjectMarkReport>
     where
         I: IntoIterator<Item = ObjectId>,
     {

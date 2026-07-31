@@ -319,3 +319,120 @@ non-MVCC closure passed as shown above.
 
 No backend, durable format, commit linearization point, copy-on-write, or
 transaction configuration behavior changed in Task 12B.
+
+## Task 12B Review Fix: Atomic Shared Policy Admission and Replacement
+
+Review identified a race between shared policy selection and persistent-GC
+region admission. The adapter could clone the old policy, then replacement
+could install a new policy and advance the shared epoch before the old callback
+entered its uncoordinated maintenance body. That old body would stamp its
+incremental state with the new epoch, allowing the new policy to continue old
+policy work instead of restarting.
+
+Shared admission now returns one structural
+`PersistentGcRegionAdmission` containing both the live region permit and the
+policy selected while admitting it. Admission locks `gc_state` and then the
+policy, checks exclusion, clones the policy, and marks GC active before
+releasing either lock. In MVCC builds this combined shared admission occurs
+only after the MVCC barrier. The non-MVCC adapter uses the same combined
+admission without touching visibility or querying `mvcc_mode`.
+
+Test replacement uses the same `gc_state -> policy` order. It rejects an active
+GC or user commit, checked-adds the next epoch before mutation, acquires the
+policy lock, and then changes policy and epoch while both locks are held. No
+fallible work remains after the first mutation. Other epoch changes continue
+to serialize on `gc_state`.
+
+### Review-fix TDD evidence
+
+A deterministic channel-gated test paused an admitted old-policy maintenance
+callback before it read the shared epoch. Against the reviewed implementation:
+
+```text
+mvcc_gc_policy_shared_replacement_cannot_interleave_with_admitted_old_policy
+FAILED: set_persistent_gc_policy_for_test(...).unwrap_err() received Ok(())
+```
+
+The active-user-commit case failed for the same reason:
+
+```text
+mvcc_gc_policy_shared_replacement_rejects_active_user_commit_without_mutation
+FAILED: set_persistent_gc_policy_for_test(...).unwrap_err() received Ok(())
+```
+
+After combined admission and atomic replacement:
+
+```text
+mvcc_gc_policy_shared_replacement_ filter
+3 passed; 0 failed
+```
+
+The gated test proves that failed replacement does not advance the epoch, the
+admitted old callback finishes with its original epoch, replacement succeeds
+after permit release, and the new policy restarts that Store's stale
+incremental state. The existing two-Store replacement test proves both Stores
+restart at the replacement epoch.
+
+The configuration-independence test first failed to compile on the missing
+identity-only test observation:
+
+```text
+E0599: no method persistent_gc_policy_identity_for_test on TransactionState
+```
+
+After adding that non-bypass test helper, the same state retains one policy
+identity while constructing VMemory, file-backed-memory, and research-DAX
+runtime backends. Each configuration also asserts the compile-selected CC:
+
+```text
+MVCC/OCC configuration-independence proof: 1 passed; 0 failed
+default compiled-CC configuration-independence proof: 1 passed; 0 failed
+```
+
+The policy contract, default collector, and low-level marker are now
+transaction-module-only. Destructive raw state/ObjectTable methods and the raw
+test wrapper are `pub(super)` and explicitly named `*_uncoordinated`. The
+feature-scoped enum import removes the non-MVCC `GcMvccMode` warning without
+changing the non-MVCC no-`mvcc_mode`-query path.
+
+### Review-fix verification
+
+Fresh results:
+
+```text
+MVCC mvcc_gc_policy_ filter
+16 passed; 0 failed
+
+non-MVCC OCC mvcc_gc_policy_ filter
+11 passed; 0 failed
+
+MVCC runtime::transaction::tests::mvcc_gc_ filter
+35 passed; 0 failed
+
+MVCC runtime::transaction::mvcc:: filter
+33 passed; 0 failed
+
+MVCC persistent_gc filter
+48 passed; 0 failed
+
+non-MVCC OCC persistent_gc filter
+48 passed; 0 failed
+
+MVCC runtime::transaction::tests::mvcc_serializable_ filter
+8 passed; 0 failed
+
+MVCC runtime::transaction::tests::mvcc_commit_ filter
+19 passed; 0 failed
+
+complete MVCC feature-closure cargo check
+exit 0
+
+default non-MVCC cargo check
+exit 0
+
+non-MVCC OCC cargo check
+exit 0
+```
+
+No normal transaction admission, commit, backend, durable format, COW, or
+configuration-selection path changed in this review fix.

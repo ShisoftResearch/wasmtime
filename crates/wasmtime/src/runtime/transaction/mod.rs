@@ -75,13 +75,18 @@ use ids::{current_thread_transaction, replace_current_thread_transaction};
 pub(crate) use object_directory::{
     PersistentObjectDirectoryEntry, PersistentObjectRecordLocation, PersistentObjectRecordSource,
 };
+#[cfg(any(test, feature = "transaction-mvcc"))]
+use object_gc::GcMvccMode;
 #[cfg(test)]
 use object_gc::PersistentObjectEdge;
+use object_gc::{
+    CurrentStatePersistentGc, PersistentObjectMarker, TransactionMvccGcView,
+    TransactionPersistentGc,
+};
 pub(crate) use object_gc::{
-    CurrentStatePersistentGc, DanglingObjectRef, DanglingObjectRefKind, GcMvccMode,
-    PersistentGcBudget, PersistentGcCommitDelta, PersistentGcState, PersistentGcStepReport,
-    PersistentObjectMarker, PersistentRecoveredRecordLocation, PersistentRecoveryGcReport,
-    PersistentRootError, PersistentRootErrorKind, TransactionMvccGcView, TransactionPersistentGc,
+    DanglingObjectRef, DanglingObjectRefKind, PersistentGcBudget, PersistentGcCommitDelta,
+    PersistentGcState, PersistentGcStepReport, PersistentRecoveredRecordLocation,
+    PersistentRecoveryGcReport, PersistentRootError, PersistentRootErrorKind,
 };
 #[cfg(test)]
 use object_value::OBJECT_VALUE_ABI_TAG_I31;

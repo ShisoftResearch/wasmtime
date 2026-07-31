@@ -69,6 +69,18 @@ pub(crate) struct PersistentGcRegionPermit {
     runtime: TransactionRegionRuntime,
 }
 
+#[derive(Debug)]
+pub(super) struct PersistentGcRegionAdmission {
+    _permit: PersistentGcRegionPermit,
+    policy: Arc<dyn TransactionPersistentGc>,
+}
+
+impl PersistentGcRegionAdmission {
+    pub(super) fn policy(&self) -> &dyn TransactionPersistentGc {
+        self.policy.as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SharedFileBackedStorageConfig {
     tmemory_file_backing: TMemoryFileBacking,
@@ -276,12 +288,13 @@ impl TransactionRegionRuntime {
         self.0.visibility.clone()
     }
 
-    pub(super) fn persistent_gc_policy(&self) -> Result<Arc<dyn TransactionPersistentGc>> {
+    fn lock_persistent_gc_policy(
+        &self,
+    ) -> Result<MutexGuard<'_, Arc<dyn TransactionPersistentGc>>> {
         self.0
             .persistent_gc_policy
             .lock()
             .map_err(|_| crate::format_err!("persistent GC policy lock poisoned"))
-            .map(|policy| policy.clone())
     }
 
     #[cfg(test)]
@@ -289,12 +302,19 @@ impl TransactionRegionRuntime {
         &self,
         policy: Arc<dyn TransactionPersistentGc>,
     ) -> Result<()> {
-        *self
-            .0
-            .persistent_gc_policy
-            .lock()
-            .map_err(|_| crate::format_err!("persistent GC policy lock poisoned"))? = policy;
-        self.bump_persistent_gc_epoch()?;
+        let mut gc_state = self.lock_gc_state()?;
+        ensure!(!gc_state.gc_active, "persistent GC is already active");
+        ensure!(
+            gc_state.active_user_commits == 0,
+            "user transaction commit is active"
+        );
+        let next_epoch = gc_state
+            .persistent_gc_epoch
+            .checked_add(1)
+            .context("persistent GC epoch overflow")?;
+        let mut selected_policy = self.lock_persistent_gc_policy()?;
+        *selected_policy = policy;
+        gc_state.persistent_gc_epoch = next_epoch;
         Ok(())
     }
 
@@ -601,6 +621,23 @@ impl TransactionRegionRuntime {
         inner.gc_active = true;
         Ok(PersistentGcRegionPermit {
             runtime: self.clone(),
+        })
+    }
+
+    pub(super) fn begin_persistent_gc_with_policy(&self) -> Result<PersistentGcRegionAdmission> {
+        let mut gc_state = self.lock_gc_state()?;
+        ensure!(!gc_state.gc_active, "persistent GC is already active");
+        ensure!(
+            gc_state.active_user_commits == 0,
+            "user transaction commit is active"
+        );
+        let policy = self.lock_persistent_gc_policy()?.clone();
+        gc_state.gc_active = true;
+        Ok(PersistentGcRegionAdmission {
+            _permit: PersistentGcRegionPermit {
+                runtime: self.clone(),
+            },
+            policy,
         })
     }
 
