@@ -15,14 +15,16 @@ new reference model under `cfg(test)`.
 The `mvcc_serializable_` suite covers:
 
 - two blind writers staging the same shared file-backed granule before a
-  barrier releases both commits;
+  timeout-aware parent-controlled gate releases both commits;
 - two lost-update increments reading and staging from the same snapshot;
 - classic two-record write skew with `A = 1`, `B = 1`, where both transactions
   read both values and stage disjoint zero writes before release;
 - a transaction that reads `A` and stages a disjoint write to `B`, held until
   another transaction commits a change to `A`;
 - a read-only transaction held between two reads while a writer commits;
-- two disjoint writers held together inside terminal installation;
+- two disjoint granule writers in the same shared file-backed memory held
+  together inside terminal installation, with two active certification permits
+  and both final values checked from a fresh Store;
 - conflicting and disjoint schedules across multiple Stores sharing one
   `TransactionRegionRuntime`;
 - a memory/global/table commit observed by one old snapshot on both sides of
@@ -30,10 +32,13 @@ The `mvcc_serializable_` suite covers:
   old/new commit.
 
 Every concurrent worker reports through a bounded channel before its handle is
-joined. Host barriers and `MvccCommitTestHook` gates provide deterministic
-ordering without sleeps. Tests assert zero active certification permits and
-snapshots, balanced commit/snapshot lifecycle counts, and admission through
-both MVCC and persistent-GC barriers.
+joined. Parent-released `MvccCommitTestHook` gates have bounded arrival waits
+and release on timeout; writes are staged before those gates. Tests assert that
+target raw `InstanceId`s deliberately differ across Stores, so shared
+file-backed conflict/disjointness results cannot pass through accidentally
+equal store-local identities. They also assert zero active certification
+permits and snapshots, balanced commit/snapshot lifecycle counts, and admission
+through both MVCC and persistent-GC barriers.
 
 ## Reference model
 
@@ -52,14 +57,21 @@ Two fixed seeds generate 24 bounded schedules apiece. Each transaction owns a
 queue containing Begin, reads, optional writes, and Commit; a fixed xorshift
 generator interleaves eligible queues while preserving transaction-local
 order. Cases use 2–4 transactions and 2–4 granules and include read-only
-transactions.
+transactions. Every generated write is followed by a read of the just-written
+granule, deliberately exercising read-your-own-write.
 
 The real side executes the same operations through the production snapshot
 facade, shared certification authority, MVCC reads, one pending commit record,
 one prepare guard for every write, and `PendingCommitRegistration::publish`.
-It compares every read, commit/conflict outcome, assigned timestamp, final
-visible value, and a replay in committed timestamp order. Failures print the
-seed, case, and complete operation list.
+It records each transaction's snapshot, ordered observed reads and writes,
+read-your-own-write classification, commit position, and outcome. A separate
+fresh model then replays only accepted transactions at valid serialization
+points: writers in assigned-timestamp order and read-only transactions at
+their original snapshot. The replay checks every external and
+read-your-own-write observation, exact commit outcome/timestamp, and final
+visible state. Aggregate assertions require nonzero conflicts, overlapping
+disjoint committed writers, read-only transactions, and read-your-own-write
+reads. Failures print the seed, case, and complete operation list.
 
 ## TDD evidence
 
@@ -72,6 +84,14 @@ seed, case, and complete operation list.
   unresolved `ModelCommitOutcome`, `ModelOperation`, `ModelTransaction`,
   `SerializableMvccModel`, and `generate_model_schedules` symbols. Implementing
   only that test-only API made the exact model test pass.
+- The review-strengthening test for deliberate read-your-own-write coverage was
+  run before changing the generator and failed with
+  `assertion failed: read_your_own_write > 0`. Adding a read of each
+  just-written granule made it pass.
+- The multi-Store write-skew test first asserted unequal target raw
+  `InstanceId`s without dummy instances and failed because both were `1`.
+  Deliberately instantiating a dummy only in the second Store made the target
+  IDs differ while the shared file-backed granules continued to conflict.
 
 ## Verification
 
@@ -89,6 +109,15 @@ Fresh verification:
 
 ```text
 exact fully-qualified write-skew test
+1 passed; 0 failed
+
+exact disjoint-terminal-publication test
+1 passed; 0 failed
+
+exact fixed-seed transcript/replay test
+1 passed; 0 failed
+
+exact deliberate read-your-own-write generator test
 1 passed; 0 failed
 
 mvcc_serializable_ filter, repeated five times

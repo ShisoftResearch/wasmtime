@@ -195,16 +195,26 @@ pub(crate) fn generate_model_schedules(seed: u64, count: usize) -> Vec<Vec<Model
             });
             let read_only = (case + transaction) % 4 == 0;
             if !read_only {
+                let write_granule = model_granule(rng.index(granule_count));
                 queue.push_back(ModelOperation::Write {
                     transaction,
-                    granule: model_granule(rng.index(granule_count)),
+                    granule: write_granule,
                     value: i64::try_from(case * 16 + transaction + 1).unwrap(),
                 });
+                queue.push_back(ModelOperation::Read {
+                    transaction,
+                    granule: write_granule,
+                });
                 if rng.index(2) == 0 {
+                    let write_granule = model_granule(rng.index(granule_count));
                     queue.push_back(ModelOperation::Write {
                         transaction,
-                        granule: model_granule(rng.index(granule_count)),
+                        granule: write_granule,
                         value: i64::try_from(case * 32 + transaction + 101).unwrap(),
+                    });
+                    queue.push_back(ModelOperation::Read {
+                        transaction,
+                        granule: write_granule,
                     });
                 }
             }
@@ -250,5 +260,38 @@ mod tests {
         assert_eq!(model.commit(writer), ModelCommitOutcome::Committed(Some(1)));
         assert_eq!(model.commit(dependent), ModelCommitOutcome::Conflict);
         assert_eq!(model.visible_value(granule(1)), 1);
+    }
+
+    #[test]
+    fn generated_schedules_deliberately_cover_read_your_own_write() {
+        let schedules = generate_model_schedules(0x5eed_cafe_d00d_f00d, 24);
+        let mut read_your_own_write = 0;
+        for operations in schedules {
+            let mut writes = BTreeMap::<usize, BTreeSet<GranuleId>>::new();
+            for operation in operations {
+                match operation {
+                    ModelOperation::Write {
+                        transaction,
+                        granule,
+                        ..
+                    } => {
+                        writes.entry(transaction).or_default().insert(granule);
+                    }
+                    ModelOperation::Read {
+                        transaction,
+                        granule,
+                    } if writes
+                        .get(&transaction)
+                        .is_some_and(|writes| writes.contains(&granule)) =>
+                    {
+                        read_your_own_write += 1;
+                    }
+                    ModelOperation::Begin { .. }
+                    | ModelOperation::Read { .. }
+                    | ModelOperation::Commit { .. } => {}
+                }
+            }
+        }
+        assert!(read_your_own_write > 0);
     }
 }

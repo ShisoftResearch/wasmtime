@@ -2250,10 +2250,30 @@ fn mvcc_serializable_shared_memory_store(
     runtime: &TransactionRegionRuntime,
     sync: Arc<dyn Fn() -> Result<()> + Send + Sync>,
 ) -> (crate::Store<()>, crate::Instance) {
+    mvcc_serializable_shared_memory_store_after_dummies(engine, module, runtime, sync, 0)
+}
+
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_serializable_shared_memory_store_after_dummies(
+    engine: &crate::Engine,
+    module: &crate::Module,
+    runtime: &TransactionRegionRuntime,
+    sync: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    dummy_instances: usize,
+) -> (crate::Store<()>, crate::Instance) {
     let mut linker = crate::Linker::new(engine);
     linker.func_wrap("host", "sync", move || sync()).unwrap();
     let mut store = crate::Store::new(engine, ());
     store.set_transaction_region_runtime_for_test(runtime.clone());
+    let dummy = transaction_test_module(engine, "(module)");
+    for _ in 0..dummy_instances {
+        crate::Instance::new(&mut store, &dummy, &[]).unwrap();
+    }
     let instance = linker.instantiate(&mut store, module).unwrap();
     (store, instance)
 }
@@ -2296,6 +2316,25 @@ fn mvcc_serializable_assert_runtime_quiescent(runtime: &TransactionRegionRuntime
     drop(runtime.begin_persistent_gc_for_test().unwrap());
 }
 
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_serializable_release_gate_after_reached(
+    gate: &MvccCommitTestHook,
+    participants: usize,
+    description: &str,
+) {
+    use std::time::Duration;
+
+    let reached = gate.wait_until_reached(Duration::from_secs(5));
+    gate.release();
+    assert!(
+        reached,
+        "{description} did not reach all {participants} participants"
+    );
+}
+
 #[test]
 #[cfg(all(
     unix,
@@ -2304,8 +2343,8 @@ fn mvcc_serializable_assert_runtime_quiescent(runtime: &TransactionRegionRuntime
     feature = "transaction-cc-optimistic-validation"
 ))]
 fn mvcc_serializable_write_skew_aborts_one_writer() {
+    use std::sync::Arc;
     use std::sync::mpsc;
-    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     clear_current_thread_transaction_for_test();
@@ -2327,21 +2366,19 @@ fn mvcc_serializable_write_skew_aborts_one_writer() {
         .unwrap();
     drop(init_store);
 
-    let commit_barrier = Arc::new(Barrier::new(2));
-    let a_barrier = commit_barrier.clone();
+    let commit_gate = Arc::new(MvccCommitTestHook::new(2));
+    let a_gate = commit_gate.clone();
     let (mut a_store, a_instance) = mvcc_serializable_shared_memory_store(
         &engine,
         &module,
         &runtime,
-        Arc::new(move || {
-            a_barrier.wait();
-            Ok(())
-        }),
+        Arc::new(move || a_gate.wait()),
     );
+    let a_owner = a_instance.id().as_u32();
     let write_a = a_instance
         .get_typed_func::<(), ()>(&mut a_store, "write_skew_a")
         .unwrap();
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(2);
     let a_outcome_tx = outcome_tx.clone();
     let a_writer = std::thread::spawn(move || {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
@@ -2350,14 +2387,20 @@ fn mvcc_serializable_write_skew_aborts_one_writer() {
             .map_err(|error| format!("{error:#}"));
         a_outcome_tx.send(result).unwrap();
     });
-    let (mut b_store, b_instance) = mvcc_serializable_shared_memory_store(
+    let (mut b_store, b_instance) = mvcc_serializable_shared_memory_store_after_dummies(
         &engine,
         &module,
         &runtime,
-        Arc::new(move || {
-            commit_barrier.wait();
-            Ok(())
+        Arc::new({
+            let commit_gate = commit_gate.clone();
+            move || commit_gate.wait()
         }),
+        1,
+    );
+    let b_owner = b_instance.id().as_u32();
+    assert_ne!(
+        a_owner, b_owner,
+        "shared file-backed conflicts must not depend on equal store-local instance ids"
     );
     let write_b = b_instance
         .get_typed_func::<(), ()>(&mut b_store, "write_skew_b")
@@ -2371,6 +2414,7 @@ fn mvcc_serializable_write_skew_aborts_one_writer() {
         b_outcome_tx.send(result).unwrap();
     });
 
+    mvcc_serializable_release_gate_after_reached(&commit_gate, 2, "write-skew staging gate");
     let outcomes = [
         outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -2399,8 +2443,8 @@ fn mvcc_serializable_write_skew_aborts_one_writer() {
     feature = "transaction-cc-optimistic-validation"
 ))]
 fn mvcc_serializable_blind_write_write_aborts_one_writer() {
+    use std::sync::Arc;
     use std::sync::mpsc;
-    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     clear_current_thread_transaction_for_test();
@@ -2422,20 +2466,20 @@ fn mvcc_serializable_blind_write_write_aborts_one_writer() {
         .unwrap();
     drop(init_store);
 
-    let ready = Arc::new(Barrier::new(2));
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let ready = Arc::new(MvccCommitTestHook::new(2));
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(2);
     let mut writers = Vec::new();
-    for value in [2, 3] {
+    let mut owners = Vec::new();
+    for (dummy_instances, value) in [2, 3].into_iter().enumerate() {
         let thread_ready = ready.clone();
-        let (mut store, instance) = mvcc_serializable_shared_memory_store(
+        let (mut store, instance) = mvcc_serializable_shared_memory_store_after_dummies(
             &engine,
             &module,
             &runtime,
-            Arc::new(move || {
-                thread_ready.wait();
-                Ok(())
-            }),
+            Arc::new(move || thread_ready.wait()),
+            dummy_instances,
         );
+        owners.push(instance.id().as_u32());
         let write = instance
             .get_typed_func::<i32, ()>(&mut store, "blind_a")
             .unwrap();
@@ -2451,7 +2495,12 @@ fn mvcc_serializable_blind_write_write_aborts_one_writer() {
                 .unwrap();
         }));
     }
+    assert_ne!(
+        owners[0], owners[1],
+        "shared file-backed conflicts must not depend on equal store-local instance ids"
+    );
     drop(outcome_tx);
+    mvcc_serializable_release_gate_after_reached(&ready, 2, "blind-write staging gate");
     let outcomes = [
         outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -2481,8 +2530,8 @@ fn mvcc_serializable_blind_write_write_aborts_one_writer() {
     feature = "transaction-cc-optimistic-validation"
 ))]
 fn mvcc_serializable_lost_update_aborts_one_increment() {
+    use std::sync::Arc;
     use std::sync::mpsc;
-    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     clear_current_thread_transaction_for_test();
@@ -2504,20 +2553,20 @@ fn mvcc_serializable_lost_update_aborts_one_increment() {
         .unwrap();
     drop(init_store);
 
-    let ready = Arc::new(Barrier::new(2));
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let ready = Arc::new(MvccCommitTestHook::new(2));
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(2);
     let mut writers = Vec::new();
-    for _ in 0..2 {
+    let mut owners = Vec::new();
+    for dummy_instances in 0..2 {
         let thread_ready = ready.clone();
-        let (mut store, instance) = mvcc_serializable_shared_memory_store(
+        let (mut store, instance) = mvcc_serializable_shared_memory_store_after_dummies(
             &engine,
             &module,
             &runtime,
-            Arc::new(move || {
-                thread_ready.wait();
-                Ok(())
-            }),
+            Arc::new(move || thread_ready.wait()),
+            dummy_instances,
         );
+        owners.push(instance.id().as_u32());
         let increment = instance
             .get_typed_func::<(), ()>(&mut store, "increment_a")
             .unwrap();
@@ -2533,7 +2582,12 @@ fn mvcc_serializable_lost_update_aborts_one_increment() {
                 .unwrap();
         }));
     }
+    assert_ne!(
+        owners[0], owners[1],
+        "shared file-backed conflicts must not depend on equal store-local instance ids"
+    );
     drop(outcome_tx);
+    mvcc_serializable_release_gate_after_reached(&ready, 2, "lost-update staging gate");
     let outcomes = [
         outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -2596,7 +2650,7 @@ fn mvcc_serializable_changed_dependency_aborts_transaction_with_disjoint_write()
     let dependent = dependent_instance
         .get_typed_func::<i32, ()>(&mut dependent_store, "read_a_write_b")
         .unwrap();
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
     let dependent_writer = std::thread::spawn(move || {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
         outcome_tx
@@ -2612,8 +2666,18 @@ fn mvcc_serializable_changed_dependency_aborts_transaction_with_disjoint_write()
         panic!("dependent writer did not reach its deterministic commit gate");
     }
 
-    let (mut writer_store, writer_instance) =
-        mvcc_serializable_shared_memory_store(&engine, &module, &runtime, Arc::new(|| Ok(())));
+    let (mut writer_store, writer_instance) = mvcc_serializable_shared_memory_store_after_dummies(
+        &engine,
+        &module,
+        &runtime,
+        Arc::new(|| Ok(())),
+        1,
+    );
+    assert_ne!(
+        dependent_instance.id().as_u32(),
+        writer_instance.id().as_u32(),
+        "shared file-backed conflicts must not depend on equal store-local instance ids"
+    );
     writer_instance
         .get_typed_func::<i32, ()>(&mut writer_store, "write_a")
         .unwrap()
@@ -2683,7 +2747,7 @@ fn mvcc_serializable_read_only_snapshot_stays_stable_during_writer() {
     let read_twice = reader_instance
         .get_typed_func::<(), (i32, i32)>(&mut reader_store, "read_a_twice")
         .unwrap();
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
         outcome_tx
@@ -2740,6 +2804,8 @@ fn mvcc_serializable_read_only_snapshot_stays_stable_during_writer() {
 
 #[test]
 #[cfg(all(
+    unix,
+    has_virtual_memory,
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
@@ -2748,33 +2814,28 @@ fn mvcc_serializable_disjoint_writers_overlap_terminal_publication() {
     use std::time::Duration;
 
     clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = TransactionRegionRuntime::create_file_backed_for_test(
+        &dir.path().join("tmemory.bin"),
+        &dir.path().join("tx-log.bin"),
+        64,
+    )
+    .unwrap();
     let engine = crate::Engine::default();
-    let module = transaction_test_module(
-        &engine,
-        r#"
-            (module
-              (tmemory $left 1)
-              (tmemory $right 1)
-              (tfunc (export "write_left")
-                (i32.tstore $left (i32.const 0) (i32.const 1)))
-              (tfunc (export "write_right")
-                (i32.tstore $right (i32.const 0) (i32.const 2))))
-        "#,
-    );
-    let runtime = TransactionRegionRuntime::new_for_test();
+    let module = mvcc_serializable_shared_memory_module(&engine);
     let visibility = runtime.visibility_for_test();
     let inside_install = Arc::new(MvccCommitTestHook::new(2));
     visibility
         .runtime()
         .set_commit_hooks_for_test(None, None, Some(inside_install.clone()))
         .unwrap();
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(2);
 
-    let mut left_store = crate::Store::new(&engine, ());
-    left_store.set_transaction_region_runtime_for_test(runtime.clone());
-    let left_instance = crate::Instance::new(&mut left_store, &module, &[]).unwrap();
+    let (mut left_store, left_instance) =
+        mvcc_serializable_shared_memory_store(&engine, &module, &runtime, Arc::new(|| Ok(())));
+    let left_owner = left_instance.id().as_u32();
     let write_left = left_instance
-        .get_typed_func::<(), ()>(&mut left_store, "write_left")
+        .get_typed_func::<i32, ()>(&mut left_store, "write_a")
         .unwrap();
     let left_tx = outcome_tx.clone();
     let left = std::thread::spawn(move || {
@@ -2782,24 +2843,33 @@ fn mvcc_serializable_disjoint_writers_overlap_terminal_publication() {
         left_tx
             .send(
                 write_left
-                    .call(&mut left_store, ())
+                    .call(&mut left_store, 11)
                     .map_err(|error| format!("{error:#}")),
             )
             .unwrap();
     });
 
-    let mut right_store = crate::Store::new(&engine, ());
-    right_store.set_transaction_region_runtime_for_test(runtime.clone());
-    let right_instance = crate::Instance::new(&mut right_store, &module, &[]).unwrap();
+    let (mut right_store, right_instance) = mvcc_serializable_shared_memory_store_after_dummies(
+        &engine,
+        &module,
+        &runtime,
+        Arc::new(|| Ok(())),
+        1,
+    );
+    let right_owner = right_instance.id().as_u32();
+    assert_ne!(
+        left_owner, right_owner,
+        "shared file-backed disjointness must not depend on store-local instance ids"
+    );
     let write_right = right_instance
-        .get_typed_func::<(), ()>(&mut right_store, "write_right")
+        .get_typed_func::<i32, ()>(&mut right_store, "write_b")
         .unwrap();
     let right = std::thread::spawn(move || {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
         outcome_tx
             .send(
                 write_right
-                    .call(&mut right_store, ())
+                    .call(&mut right_store, 22)
                     .map_err(|error| format!("{error:#}")),
             )
             .unwrap();
@@ -2828,6 +2898,15 @@ fn mvcc_serializable_disjoint_writers_overlap_terminal_publication() {
         .runtime()
         .set_commit_hooks_for_test(None, None, None)
         .unwrap();
+
+    let (mut read_store, read_instance) =
+        mvcc_serializable_shared_memory_store(&engine, &module, &runtime, Arc::new(|| Ok(())));
+    let (a, b, _) = read_instance
+        .get_typed_func::<(), (i32, i32, i32)>(&mut read_store, "read")
+        .unwrap()
+        .call(&mut read_store, ())
+        .unwrap();
+    assert_eq!((a, b), (11, 22));
     mvcc_serializable_assert_runtime_quiescent(&runtime);
     clear_current_thread_transaction_for_test();
 }
@@ -2892,7 +2971,7 @@ fn mvcc_serializable_reader_never_mixes_pending_commit_domains() {
     let write = instance
         .get_typed_func::<(), ()>(&mut store, "write")
         .unwrap();
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
     let writer = std::thread::spawn(move || {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
         outcome_tx
@@ -3007,9 +3086,66 @@ fn mvcc_serializable_reader_never_mixes_pending_commit_domains() {
 struct RealModelTransaction {
     id: TransactionId,
     snapshot: u64,
+    begin_order: usize,
     registration: SnapshotRegistration,
     reads: BTreeSet<GranuleId>,
     writes: BTreeMap<GranuleId, i64>,
+    operations: Vec<ObservedModelOperation>,
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[derive(Clone, Debug)]
+enum ObservedModelOperation {
+    Read {
+        granule: GranuleId,
+        value: i64,
+        read_your_own_write: bool,
+    },
+    Write {
+        granule: GranuleId,
+        value: i64,
+    },
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[derive(Clone, Debug)]
+struct ObservedModelTransaction {
+    snapshot: u64,
+    begin_order: usize,
+    commit_order: usize,
+    operations: Vec<ObservedModelOperation>,
+    outcome: ModelCommitOutcome,
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[derive(Clone, Copy, Debug, Default)]
+struct ModelScheduleCoverage {
+    conflicts: usize,
+    overlapping_disjoint_writers: usize,
+    read_only_transactions: usize,
+    read_your_own_write_reads: usize,
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+impl ModelScheduleCoverage {
+    fn add(&mut self, other: Self) {
+        self.conflicts += other.conflicts;
+        self.overlapping_disjoint_writers += other.overlapping_disjoint_writers;
+        self.read_only_transactions += other.read_only_transactions;
+        self.read_your_own_write_reads += other.read_your_own_write_reads;
+    }
 }
 
 #[cfg(all(
@@ -3040,7 +3176,55 @@ fn mvcc_serializable_model_value(bytes: &[u8]) -> Result<i64> {
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Result<()> {
+fn mvcc_serializable_replay_accepted_transaction(
+    model: &mut SerializableMvccModel,
+    observed: &ObservedModelTransaction,
+) -> Result<()> {
+    ensure!(
+        matches!(observed.outcome, ModelCommitOutcome::Committed(_)),
+        "serial replay received a rejected transaction"
+    );
+    let mut transaction = model.begin();
+    let mut writes = BTreeSet::new();
+    for operation in &observed.operations {
+        match *operation {
+            ObservedModelOperation::Read {
+                granule,
+                value,
+                read_your_own_write,
+            } => {
+                ensure!(
+                    writes.contains(&granule) == read_your_own_write,
+                    "recorded RYOW classification changed for {granule:?}"
+                );
+                let replayed = model.read(&mut transaction, granule);
+                ensure!(
+                    replayed == value,
+                    "serial replay read mismatch for {granule:?}: observed={value}, replayed={replayed}"
+                );
+            }
+            ObservedModelOperation::Write { granule, value } => {
+                model.write(&mut transaction, granule, value);
+                writes.insert(granule);
+            }
+        }
+    }
+    let replayed = model.commit(transaction);
+    ensure!(
+        replayed == observed.outcome,
+        "serial replay outcome mismatch: observed={:?}, replayed={replayed:?}",
+        observed.outcome
+    );
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_serializable_compare_model_schedule(
+    operations: &[ModelOperation],
+) -> Result<ModelScheduleCoverage> {
     let transaction_count = operations
         .iter()
         .map(|operation| match operation {
@@ -3081,9 +3265,11 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
     let mut real_transactions = (0..transaction_count)
         .map(|_| None)
         .collect::<Vec<Option<RealModelTransaction>>>();
-    let mut serial_commits = Vec::new();
+    let mut observed_transactions = (0..transaction_count)
+        .map(|_| None)
+        .collect::<Vec<Option<ObservedModelTransaction>>>();
 
-    for operation in operations {
+    for (operation_order, operation) in operations.iter().enumerate() {
         match *operation {
             ModelOperation::Begin { transaction } => {
                 ensure!(model_transactions[transaction].is_none());
@@ -3096,9 +3282,11 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
                 real_transactions[transaction] = Some(RealModelTransaction {
                     id: runtime.allocate_transaction_id_for_test()?,
                     snapshot,
+                    begin_order: operation_order,
                     registration,
                     reads: BTreeSet::new(),
                     writes: BTreeMap::new(),
+                    operations: Vec::new(),
                 });
             }
             ModelOperation::Read {
@@ -3113,6 +3301,7 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
                     .as_mut()
                     .context("real read transaction is not active")?;
                 real_transaction.reads.insert(granule);
+                let read_your_own_write = real_transaction.writes.contains_key(&granule);
                 let real_value = match real_transaction.writes.get(&granule).copied() {
                     Some(value) => value,
                     None => mvcc_serializable_model_value(&mvcc.read_memory(
@@ -3125,6 +3314,13 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
                     model_value == real_value,
                     "read mismatch for transaction {transaction} and {granule:?}: model={model_value}, real={real_value}"
                 );
+                real_transaction
+                    .operations
+                    .push(ObservedModelOperation::Read {
+                        granule,
+                        value: real_value,
+                        read_your_own_write,
+                    });
             }
             ModelOperation::Write {
                 transaction,
@@ -3135,11 +3331,13 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
                     .as_mut()
                     .context("model write transaction is not active")?;
                 model.write(model_transaction, granule, value);
-                real_transactions[transaction]
+                let real_transaction = real_transactions[transaction]
                     .as_mut()
-                    .context("real write transaction is not active")?
-                    .writes
-                    .insert(granule, value);
+                    .context("real write transaction is not active")?;
+                real_transaction.writes.insert(granule, value);
+                real_transaction
+                    .operations
+                    .push(ObservedModelOperation::Write { granule, value });
             }
             ModelOperation::Commit { transaction } => {
                 let model_transaction = model_transactions[transaction]
@@ -3205,14 +3403,22 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
                     model_outcome == real_outcome,
                     "commit mismatch for transaction {transaction}: model={model_outcome:?}, real={real_outcome:?}"
                 );
-                if let ModelCommitOutcome::Committed(Some(timestamp)) = real_outcome {
-                    serial_commits.push((timestamp, expected_writes));
-                }
+                observed_transactions[transaction] = Some(ObservedModelTransaction {
+                    snapshot: real_transaction.snapshot,
+                    begin_order: real_transaction.begin_order,
+                    commit_order: operation_order,
+                    operations: real_transaction.operations,
+                    outcome: real_outcome,
+                });
             }
         }
     }
     ensure!(model_transactions.iter().all(Option::is_none));
     ensure!(real_transactions.iter().all(Option::is_none));
+    let observed_transactions = observed_transactions
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .context("generated transaction did not reach commit")?;
 
     let final_snapshot = visibility.begin_snapshot()?;
     let real_visible = SelectedTransactionVisibility::snapshot_timestamp(&final_snapshot);
@@ -3228,17 +3434,102 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
         real_final.insert(granule, value);
     }
 
-    serial_commits.sort_by_key(|(timestamp, _)| *timestamp);
-    ensure!(
-        serial_commits
-            .windows(2)
-            .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0))
-    );
-    let mut serial_final = baseline;
-    for (_, writes) in serial_commits {
-        serial_final.extend(writes);
+    let mut coverage = ModelScheduleCoverage::default();
+    coverage.conflicts = observed_transactions
+        .iter()
+        .filter(|transaction| transaction.outcome == ModelCommitOutcome::Conflict)
+        .count();
+    coverage.read_only_transactions = observed_transactions
+        .iter()
+        .filter(|transaction| transaction.outcome == ModelCommitOutcome::Committed(None))
+        .count();
+    coverage.read_your_own_write_reads = observed_transactions
+        .iter()
+        .flat_map(|transaction| transaction.operations.iter())
+        .filter(|operation| {
+            matches!(
+                operation,
+                ObservedModelOperation::Read {
+                    read_your_own_write: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    let committed_writers = observed_transactions
+        .iter()
+        .filter(|transaction| matches!(transaction.outcome, ModelCommitOutcome::Committed(Some(_))))
+        .collect::<Vec<_>>();
+    for (index, left) in committed_writers.iter().enumerate() {
+        let left_writes = left
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                ObservedModelOperation::Write { granule, .. } => Some(*granule),
+                ObservedModelOperation::Read { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for right in &committed_writers[index + 1..] {
+            let right_writes = right
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    ObservedModelOperation::Write { granule, .. } => Some(*granule),
+                    ObservedModelOperation::Read { .. } => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let overlap =
+                left.begin_order < right.commit_order && right.begin_order < left.commit_order;
+            if overlap && left_writes.is_disjoint(&right_writes) {
+                coverage.overlapping_disjoint_writers += 1;
+            }
+        }
     }
-    ensure!(serial_final == real_final);
+
+    let mut writers = BTreeMap::new();
+    let mut read_only = BTreeMap::<u64, Vec<&ObservedModelTransaction>>::new();
+    for transaction in &observed_transactions {
+        match transaction.outcome {
+            ModelCommitOutcome::Committed(Some(timestamp)) => {
+                ensure!(writers.insert(timestamp, transaction).is_none());
+            }
+            ModelCommitOutcome::Committed(None) => {
+                read_only
+                    .entry(transaction.snapshot)
+                    .or_default()
+                    .push(transaction);
+            }
+            ModelCommitOutcome::Conflict => {}
+        }
+    }
+    let mut serial_model = SerializableMvccModel::with_values(
+        baseline.iter().map(|(granule, value)| (*granule, *value)),
+    );
+    if let Some(transactions) = read_only.remove(&0) {
+        for transaction in transactions {
+            ensure!(transaction.snapshot == serial_model.visible_timestamp());
+            mvcc_serializable_replay_accepted_transaction(&mut serial_model, transaction)?;
+        }
+    }
+    for timestamp in 1..=real_visible {
+        let transaction = writers
+            .remove(&timestamp)
+            .context("serial history is missing an assigned writer timestamp")?;
+        ensure!(serial_model.visible_timestamp() + 1 == timestamp);
+        mvcc_serializable_replay_accepted_transaction(&mut serial_model, transaction)?;
+        if let Some(transactions) = read_only.remove(&timestamp) {
+            for transaction in transactions {
+                ensure!(transaction.snapshot == serial_model.visible_timestamp());
+                mvcc_serializable_replay_accepted_transaction(&mut serial_model, transaction)?;
+            }
+        }
+    }
+    ensure!(writers.is_empty());
+    ensure!(read_only.is_empty());
+    ensure!(serial_model.visible_timestamp() == real_visible);
+    for (granule, value) in &real_final {
+        ensure!(serial_model.visible_value(*granule) == *value);
+    }
 
     let (active, begun, finished, dropped) = visibility.snapshot_lifecycle_counts_for_test()?;
     ensure!(active == 0);
@@ -3248,7 +3539,7 @@ fn mvcc_serializable_compare_model_schedule(operations: &[ModelOperation]) -> Re
     ensure!(registered == published + aborted);
     drop(visibility.begin_gc_barrier_for_test()?);
     drop(runtime.begin_persistent_gc_for_test()?);
-    Ok(())
+    Ok(coverage)
 }
 
 #[test]
@@ -3260,18 +3551,29 @@ fn mvcc_serializable_fixed_seed_model_matches_runtime() {
     const CASES_PER_SEED: usize = 24;
     const SEEDS: [u64; 2] = [0x5eed_cafe_d00d_f00d, 0xc001_d00d_1234_5678];
 
+    let mut coverage = ModelScheduleCoverage::default();
     for seed in SEEDS {
         for (case, operations) in generate_model_schedules(seed, CASES_PER_SEED)
             .into_iter()
             .enumerate()
         {
-            if let Err(error) = mvcc_serializable_compare_model_schedule(&operations) {
-                panic!(
-                    "serializable MVCC model comparison failed\nseed={seed:#x}\ncase={case}\noperations={operations:#?}\nerror={error:#}"
-                );
+            match mvcc_serializable_compare_model_schedule(&operations) {
+                Ok(schedule_coverage) => coverage.add(schedule_coverage),
+                Err(error) => {
+                    panic!(
+                        "serializable MVCC model comparison failed\nseed={seed:#x}\ncase={case}\noperations={operations:#?}\nerror={error:#}"
+                    );
+                }
             }
         }
     }
+    assert!(
+        coverage.conflicts > 0
+            && coverage.overlapping_disjoint_writers > 0
+            && coverage.read_only_transactions > 0
+            && coverage.read_your_own_write_reads > 0,
+        "fixed schedules missed required coverage: {coverage:?}"
+    );
 }
 
 #[cfg(all(
