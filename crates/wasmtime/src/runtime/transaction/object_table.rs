@@ -1335,6 +1335,26 @@ impl ObjectTable {
         self.payload(object_id)
     }
 
+    pub(crate) fn current_payload_snapshot(
+        &mut self,
+        object_id: ObjectId,
+    ) -> Result<Option<ObjectPayload>> {
+        self.refresh_persistent_object_from_shared_directory(object_id)?;
+        let index = object_slot_index(object_id)?;
+        let Some(slot) = self.slots.get(index).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        self.heap.payload(slot.current_record).map(Some)
+    }
+
+    pub(crate) fn install_current_payload_snapshot(
+        &mut self,
+        object_id: ObjectId,
+        payload: &ObjectPayload,
+    ) -> Result<()> {
+        self.update_payload(object_id, payload.clone())
+    }
+
     pub(crate) fn trace_object_ids(&self, object_id: ObjectId) -> Result<Vec<ObjectId>> {
         let slot = self.live_slot(object_id)?;
         if !slot.persistent {

@@ -469,6 +469,428 @@ fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
     crate::Module::new(engine, wat::parse_str(wat).unwrap()).unwrap()
 }
 
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_install_committed_payload(
+    runtime: &MvccRuntime,
+    objects: &mut ObjectTable,
+    object_id: ObjectId,
+    predecessor: Option<ObjectPayload>,
+    payload: ObjectPayload,
+    timestamp: u64,
+) {
+    let commit = Arc::new(CommitRecord::pending());
+    let mut prepare = runtime.begin_prepare(commit.clone()).unwrap();
+    prepare
+        .prepare_object(object_id, || Ok(predecessor), payload.clone())
+        .unwrap();
+    drop(prepare);
+    commit.commit(timestamp).unwrap();
+    objects
+        .install_current_payload_snapshot(object_id, &payload)
+        .unwrap();
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_prepare_promoted_payload(
+    runtime: &MvccRuntime,
+    object_id: ObjectId,
+    payload: ObjectPayload,
+) -> Arc<CommitRecord> {
+    let commit = Arc::new(CommitRecord::pending());
+    let mut prepare = runtime.begin_prepare(commit.clone()).unwrap();
+    prepare
+        .prepare_object(object_id, || Ok(None), payload)
+        .unwrap();
+    drop(prepare);
+    commit
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_struct_payload_remains_stable_after_newer_commit() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    let baseline = ObjectPayload::Struct(vec![ObjectValue::I32(11)]);
+    let current = ObjectPayload::Struct(vec![ObjectValue::I32(22)]);
+    let object_id = objects
+        .allocate_payload_with_persistence(baseline.clone(), true)
+        .unwrap();
+
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state.acquire_object_write(&mut objects, object_id).unwrap();
+
+    mvcc_object_install_committed_payload(
+        visibility.runtime(),
+        &mut objects,
+        object_id,
+        Some(baseline),
+        current,
+        1,
+    );
+
+    assert_eq!(
+        state.read_struct_field(&mut objects, object_id, 0).unwrap(),
+        ObjectValue::I32(11)
+    );
+    assert!(
+        state
+            .active_read_granules()
+            .unwrap()
+            .contains(&GranuleId::Object { object_id })
+    );
+    state
+        .stage_struct_field(&mut objects, object_id, 0, ObjectValue::I32(99))
+        .unwrap();
+    assert_eq!(
+        state.read_struct_field(&mut objects, object_id, 0).unwrap(),
+        ObjectValue::I32(99)
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_array_payload_remains_stable_and_staged_element_is_first() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    let baseline = ObjectPayload::Array(vec![ObjectValue::I32(11), ObjectValue::I32(12)]);
+    let current = ObjectPayload::Array(vec![ObjectValue::I32(21), ObjectValue::I32(22)]);
+    let object_id = objects
+        .allocate_payload_with_persistence(baseline.clone(), true)
+        .unwrap();
+
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state.acquire_object_write(&mut objects, object_id).unwrap();
+    mvcc_object_install_committed_payload(
+        visibility.runtime(),
+        &mut objects,
+        object_id,
+        Some(baseline),
+        current,
+        1,
+    );
+
+    assert_eq!(
+        state
+            .read_array_element(&mut objects, object_id, 1)
+            .unwrap(),
+        ObjectValue::I32(12)
+    );
+    state
+        .stage_array_element(&mut objects, object_id, 1, ObjectValue::I32(99))
+        .unwrap();
+    assert_eq!(
+        state
+            .read_array_element(&mut objects, object_id, 1)
+            .unwrap(),
+        ObjectValue::I32(99)
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_history_keeps_one_current_slot_and_live_object() {
+    let runtime = MvccRuntime::default();
+    let mut objects = ObjectTable::default();
+    let first = ObjectPayload::Struct(vec![ObjectValue::I32(1)]);
+    let second = ObjectPayload::Struct(vec![ObjectValue::I32(2)]);
+    let third = ObjectPayload::Struct(vec![ObjectValue::I32(3)]);
+    let object_id = objects
+        .allocate_payload_with_persistence(first.clone(), true)
+        .unwrap();
+    let runtime_type_index = wasmtime_environ::VMSharedTypeIndex::new(0x711);
+    objects
+        .set_runtime_type_index(object_id, runtime_type_index)
+        .unwrap();
+    let metadata = objects.live_slot(object_id).unwrap().clone();
+    let slots = objects.slot_count();
+    let live = objects.live_count();
+
+    mvcc_object_install_committed_payload(
+        &runtime,
+        &mut objects,
+        object_id,
+        Some(first),
+        second.clone(),
+        1,
+    );
+    mvcc_object_install_committed_payload(
+        &runtime,
+        &mut objects,
+        object_id,
+        Some(second),
+        third.clone(),
+        2,
+    );
+
+    assert_eq!(runtime.object_chain_count_for_test().unwrap(), 1);
+    assert_eq!(runtime.object_version_count_for_test(object_id).unwrap(), 3);
+    assert_eq!(objects.slot_count(), slots);
+    assert_eq!(objects.live_count(), live);
+    assert_eq!(objects.payload(object_id).unwrap(), third);
+    let installed = objects.live_slot(object_id).unwrap();
+    assert_eq!(installed.kind, metadata.kind);
+    assert_eq!(installed.type_layout_id, metadata.type_layout_id);
+    assert_eq!(installed.runtime_type_index, Some(runtime_type_index));
+    assert_eq!(installed.persistent, metadata.persistent);
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_created_after_snapshot_is_missing() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+
+    let payload = ObjectPayload::Struct(vec![ObjectValue::I32(7)]);
+    let object_id = objects
+        .allocate_payload_with_persistence(payload.clone(), true)
+        .unwrap();
+    mvcc_object_install_committed_payload(
+        visibility.runtime(),
+        &mut objects,
+        object_id,
+        None,
+        payload,
+        1,
+    );
+    state.acquire_object_read(&mut objects, object_id).unwrap();
+
+    let error = state
+        .read_object_payload(&mut objects, object_id)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not visible at transaction snapshot"),
+        "{error:?}"
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_commit_prepare_for_transaction_local_promotion_is_pending_only() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(7)], None)
+        .unwrap();
+
+    let promoted = state
+        .promote_transaction_object_graph_for_test(&mut objects, local)
+        .unwrap();
+    let payload = state
+        .staged_object_payload_for_test(promoted)
+        .unwrap()
+        .clone();
+    let commit = mvcc_object_prepare_promoted_payload(visibility.runtime(), promoted, payload);
+
+    assert_eq!(
+        visibility.runtime().object_chain_count_for_test().unwrap(),
+        1
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .object_version_count_for_test(promoted)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .read_object(100, promoted, || panic!("promotion chain must exist"))
+            .unwrap(),
+        None
+    );
+    visibility
+        .runtime()
+        .abort_prepared_object_promotion_for_test(promoted, &commit)
+        .unwrap();
+    state.abort_allocated_objects(&mut objects).unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_aborting_promotion_removes_pending_version_and_allocation() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    let local = state
+        .allocate_transaction_local_array(vec![ObjectValue::I32(7)], None)
+        .unwrap();
+    let promoted = state
+        .promote_transaction_object_graph_for_test(&mut objects, local)
+        .unwrap();
+    let payload = state
+        .staged_object_payload_for_test(promoted)
+        .unwrap()
+        .clone();
+    let commit = mvcc_object_prepare_promoted_payload(visibility.runtime(), promoted, payload);
+
+    visibility
+        .runtime()
+        .abort_prepared_object_promotion_for_test(promoted, &commit)
+        .unwrap();
+    state.abort_allocated_objects(&mut objects).unwrap();
+
+    assert_eq!(
+        visibility.runtime().object_chain_count_for_test().unwrap(),
+        0
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .object_version_count_for_test(promoted)
+            .unwrap(),
+        0
+    );
+    assert!(objects.live_slot(promoted).is_err());
+    assert_eq!(objects.live_count(), 0);
+    assert_eq!(state.allocated_object_count_for_test(), 0);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_gc_traces_only_current_object_table_payloads() {
+    let runtime = MvccRuntime::default();
+    let mut objects = ObjectTable::default();
+    let historical_child = objects
+        .allocate_payload_with_persistence(ObjectPayload::Struct(vec![ObjectValue::I32(1)]), true)
+        .unwrap();
+    let baseline = ObjectPayload::Struct(vec![ObjectValue::Ref(Some(historical_child))]);
+    let current = ObjectPayload::Struct(vec![ObjectValue::Ref(None)]);
+    let root = objects
+        .allocate_payload_with_persistence(baseline.clone(), true)
+        .unwrap();
+
+    mvcc_object_install_committed_payload(&runtime, &mut objects, root, Some(baseline), current, 1);
+    let report = objects
+        .persistent_mark_sweep_from_roots_for_test([root])
+        .unwrap();
+
+    assert_eq!(runtime.object_chain_count_for_test().unwrap(), 1);
+    assert_eq!(runtime.object_version_count_for_test(root).unwrap(), 2);
+    assert!(report.mark.reachable.contains(&root));
+    assert!(
+        report
+            .mark
+            .unreachable_persistent
+            .contains(&historical_child)
+    );
+    assert!(objects.live_slot(historical_child).is_err());
+}
+
+#[test]
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_current_snapshot_refreshes_shared_directory() -> Result<()> {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("region.bin");
+    let mut region =
+        crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(&path, 8)?;
+    let object_id = ObjectId { object_index: 41 };
+    crate::runtime::vm::block_region::publish_committed_struct_object(
+        &path,
+        7,
+        object_id.object_index,
+        1,
+        TypeLayoutId::DEFAULT_STRUCT.get(),
+        &[7],
+    )?;
+    region.refresh_from_image()?;
+    let recovered =
+        crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(&path)?;
+    let winner = recovered
+        .committed_object_winners()?
+        .into_iter()
+        .find(|winner| winner.object_id == object_id.object_index)
+        .context("missing shared-directory object winner")?;
+    runtime.install_persistent_object_directory_entries([PersistentObjectDirectoryEntry {
+        object_id,
+        kind: ObjectKind::Struct,
+        directory_version: 0,
+        record_version: winner.version,
+        type_layout_id: winner.type_layout_id,
+        runtime_type_index: None,
+        record_source: Some(PersistentObjectRecordSource {
+            mapped_source: recovered_mapped_source_for_test(&recovered),
+            location: PersistentObjectRecordLocation {
+                data_block: winner.data_block,
+                data_offset: winner.data_offset,
+                data_record_offset: u64::try_from(winner.data_record_offset)?,
+                record_len: winner.record_len,
+            },
+        }),
+    }])?;
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime));
+
+    assert!(objects.live_slot(object_id).is_err());
+    assert_eq!(
+        objects.current_payload_snapshot(object_id)?,
+        Some(ObjectPayload::Struct(vec![ObjectValue::I32(7)]))
+    );
+    assert_eq!(objects.live_count(), 1);
+    assert!(objects.current_record_is_persistent_mapped_for_test(object_id)?);
+    Ok(())
+}
+
 #[test]
 #[cfg(all(
     feature = "transaction-mvcc",

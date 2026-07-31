@@ -193,6 +193,15 @@ impl VisibilityReadContext {
         self.visibility
             .read_table_size(self.snapshot, granule, current)
     }
+
+    pub(crate) fn read_object(
+        &self,
+        object_id: ObjectId,
+        current: impl FnOnce() -> Result<Option<ObjectPayload>>,
+    ) -> Result<Option<ObjectPayload>> {
+        self.visibility
+            .read_object(self.snapshot, object_id, current)
+    }
 }
 
 impl TransactionLocalObjectTable {
@@ -2580,9 +2589,10 @@ impl TransactionState {
         if self.local_object_table.contains(object_id) {
             return self.local_object_table.payload(object_id);
         }
+        #[cfg(not(feature = "transaction-mvcc"))]
         object_table.refresh_persistent_object_from_shared_directory(object_id)?;
+        let granule = object_table.granule_id(object_id)?;
         if object_table.is_persistent(object_id)? {
-            let granule = object_table.granule_id(object_id)?;
             ensure!(
                 self.owns_granule_read(granule),
                 "transactional object read permission was not acquired"
@@ -2590,7 +2600,13 @@ impl TransactionState {
             let version = self.current_object_version_for_granule(granule, object_table)?;
             self.validate_active_read(granule, version)?;
         }
-        object_table.payload(object_id)
+        self.active_visibility_read_context()?
+            .read_object(object_id, || {
+                object_table.current_payload_snapshot(object_id)
+            })?
+            .with_context(|| {
+                format!("object is not visible at transaction snapshot: {object_id:?}")
+            })
     }
 
     pub(crate) fn stage_object_payload(

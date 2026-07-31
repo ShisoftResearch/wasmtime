@@ -163,6 +163,53 @@ impl MvccRuntime {
         let baseline = self.coordinator.baseline_timestamp()?;
         self.domains.latest_committed_timestamp(granule, baseline)
     }
+
+    #[cfg(test)]
+    pub(crate) fn abort_prepared_object_promotion_for_test(
+        &self,
+        object: ObjectId,
+        commit: &Arc<CommitRecord>,
+    ) -> Result<()> {
+        let mut state = self.domains.lock()?;
+        let chain = state
+            .objects
+            .chains
+            .get(&object)
+            .context("prepared promoted object is missing its MVCC chain")?;
+        ensure!(
+            chain.version_count() == 1,
+            "prepared promoted object chain is not pending-only"
+        );
+        ensure!(
+            chain
+                .newest_commit_record()
+                .is_some_and(|pending| Arc::ptr_eq(pending, commit)),
+            "prepared promoted object chain uses a different commit record"
+        );
+        commit.abort()?;
+        ensure!(
+            state.objects.chains.remove(&object).is_some(),
+            "prepared promoted object chain disappeared"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn object_chain_count_for_test(&self) -> Result<usize> {
+        Ok(self.domains.lock()?.objects.chains.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn object_version_count_for_test(&self, object: ObjectId) -> Result<usize> {
+        Ok(self
+            .domains
+            .lock()?
+            .objects
+            .chains
+            .get(&object)
+            .map(VersionChain::version_count)
+            .unwrap_or_default())
+    }
 }
 
 impl MvccDomains {
