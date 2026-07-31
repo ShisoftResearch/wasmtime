@@ -1880,11 +1880,13 @@ fn publish_mvcc_record_and_cleanup(
         terminal.before_publish_hook_ran = true;
         visibility.run_before_publish_hook_for_test()?;
     }
-    if terminal.final_marker.is_none() {
-        terminal.decision = MvccTerminalDecision::ForceCommit;
-    }
     if let Some(pending) = terminal.pending.as_mut() {
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::BeforeRecordPublication)?;
         let _timestamp = pending.publish()?;
+        if terminal.final_marker.is_none() {
+            terminal.decision = MvccTerminalDecision::ForceCommit;
+        }
         terminal.pending = None;
     }
     #[cfg(test)]

@@ -408,6 +408,122 @@ fn mvcc_commit_fault_markerless_cleanup_reports_irrevocable_not_durable() {
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
+fn mvcc_commit_fault_markerless_vmemory_record_publication_failure_rolls_back() {
+    clear_current_thread_transaction_for_test();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory $m 1)
+              (tfunc (export "write")
+                (i32.tstore $m (i32.const 0) (i32.const 7)))
+              (tfunc (export "read") (result i32)
+                (i32.tload $m (i32.const 0))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    visibility
+        .runtime()
+        .fail_commit_once_for_test(MvccCommitFaultPoint::BeforeRecordPublication)
+        .unwrap();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    let error = format!(
+        "{:#}",
+        instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap_err()
+    );
+    assert!(
+        error.contains("injected MVCC commit fault at BeforeRecordPublication"),
+        "{error}"
+    );
+    assert!(!error.contains("committed irrevocably"), "{error}");
+
+    let record = visibility
+        .runtime()
+        .last_commit_for_test()
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state(), CommitState::Aborted);
+    let certification = runtime.mvcc_last_certification_for_test().unwrap();
+    let memory = certification
+        .iter()
+        .find_map(|(granule, mode)| {
+            (*mode == CertificationMode::Exclusive && matches!(granule, GranuleId::TMemory { .. }))
+                .then_some(*granule)
+        })
+        .unwrap();
+    assert_eq!(
+        visibility
+            .runtime()
+            .granule_version_count_for_test(memory)
+            .unwrap(),
+        1
+    );
+    assert!(
+        visibility
+            .runtime()
+            .newest_commit_record_for_granule_for_test(memory)
+            .unwrap()
+            .is_some_and(|newest| !Arc::ptr_eq(&newest, &record)),
+        "aborted record remained newest for {memory:?}"
+    );
+
+    let physical_memory = {
+        use crate::AsContextMut;
+
+        let context = store.as_context_mut();
+        let instance_ref = context.0.instance_mut(instance.id());
+        let instance_ref = instance_ref.as_ref();
+        instance_ref
+            .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+            .unwrap()
+            .read_committed(0..4)
+            .unwrap()
+    };
+    assert_eq!(physical_memory, 0_i32.to_le_bytes());
+    assert!(!store.transaction_state().has_mvcc_terminal_commit());
+    assert_eq!(
+        visibility
+            .runtime()
+            .commit_lifecycle_counts_for_test()
+            .unwrap(),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 0)
+    );
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+    drop(runtime.begin_persistent_gc_for_test().unwrap());
+
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        0
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
 fn mvcc_commit_fault_retained_terminal_freezes_staging_until_retry() {
     clear_current_thread_transaction_for_test();
     let mut config = crate::Config::new();

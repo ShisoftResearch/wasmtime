@@ -32,6 +32,10 @@ No co-author annotation was added.
   boundary, as a one-way decision. Force completion idempotently installs
   sizes, remaining memory/global/table values, volatile and mapped objects,
   persistent roots, version bumps, the shared commit record, and cleanup.
+- Keeps a reversible markerless commit abortable through the fallible atomic
+  shared-record publication. Successful publication immediately changes the
+  terminal decision to force-commit before any post-transition hook or other
+  fallible cleanup, so a committed record can never be rolled back.
 - Separates persistent-root progress from object-version progress and
   prevalidates version updates before applying them, so retries cannot
   duplicate a partial update.
@@ -69,6 +73,7 @@ The deterministic `mvcc_commit_fault_` tests cover:
 - after memory-size and table-size install;
 - before and after mapped-object installation;
 - during persistent-root apply;
+- immediately before shared-record publication;
 - after commit-record transition;
 - during cleanup;
 - during a partially completed rollback;
@@ -80,6 +85,12 @@ released certification and snapshot registrations, GC-barrier admission, and
 fresh predecessor reads. Post-LP tests assert a committed shared record, all
 typed physical finals, mapped/root object state, no retained terminal or
 permits, and fresh all-domain final reads.
+
+The markerless pre-record-publication regression uses a same-size VMemory
+memory write. Scalar-global and funcref-table writes currently produce empty
+persistent-root publications, so including either would create a durable marker
+and LP rather than exercise the markerless path. Their reversible physical and
+sidecar rollback remains covered by the mixed-domain pre-LP cut-point test.
 
 ## Persistence and compatibility coverage
 
@@ -111,7 +122,7 @@ exit 0
 cargo test -p wasmtime --no-default-features \
   --features "<complete closure>,transaction-mvcc,transaction-cc-optimistic-validation" \
   mvcc_commit_ --lib -- --format terse
-21 passed; 0 failed
+22 passed; 0 failed
 
 cargo test -p wasmtime --no-default-features \
   --features "<complete closure>,transaction-mvcc,transaction-cc-optimistic-validation" \

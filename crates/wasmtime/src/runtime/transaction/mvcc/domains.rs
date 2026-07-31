@@ -495,6 +495,7 @@ pub(crate) enum MvccCommitFaultPoint {
     AfterDurableLp,
     BeforeMappedObjectInstall,
     DuringRootApply,
+    BeforeRecordPublication,
     AfterRecordTransition,
     DuringCleanup,
     DuringRollback,
