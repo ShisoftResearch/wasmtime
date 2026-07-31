@@ -147,6 +147,23 @@ impl<T> VersionChain<T> {
             })
     }
 
+    pub(crate) fn remove_newest_for_commit(&mut self, commit: &Arc<CommitRecord>) -> bool {
+        if self
+            .versions
+            .front()
+            .is_some_and(|version| Arc::ptr_eq(&version.commit, commit))
+        {
+            self.versions.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.versions.is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) fn newest_commit_record(&self) -> Option<&Arc<CommitRecord>> {
         self.versions.front().map(|version| &version.commit)

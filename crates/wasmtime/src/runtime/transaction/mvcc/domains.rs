@@ -4,7 +4,9 @@ use crate::prelude::*;
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, ObjectId, ObjectPayload, TMEMORY_GRANULE_SIZE, TableGranuleSnapshot,
 };
-use alloc::collections::BTreeMap;
+#[cfg(test)]
+use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 #[cfg(test)]
 use std::sync::Condvar;
@@ -32,6 +34,16 @@ pub(crate) struct PreparedDomainValues {
     pub(crate) tables: BTreeMap<GranuleId, PreparedValue<TableGranuleSnapshot>>,
     pub(crate) table_sizes: BTreeMap<GranuleId, PreparedValue<u64>>,
     pub(crate) objects: BTreeMap<ObjectId, PreparedObjectValue>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InstalledDomainKeys {
+    pub(crate) memories: BTreeSet<GranuleId>,
+    pub(crate) memory_sizes: BTreeSet<GranuleId>,
+    pub(crate) globals: BTreeSet<GranuleId>,
+    pub(crate) tables: BTreeSet<GranuleId>,
+    pub(crate) table_sizes: BTreeSet<GranuleId>,
+    pub(crate) objects: BTreeSet<ObjectId>,
 }
 
 #[derive(Debug)]
@@ -77,6 +89,10 @@ pub(crate) struct MvccRuntime {
     domains: MvccDomains,
     #[cfg(test)]
     commit_hooks: Mutex<MvccCommitHooks>,
+    #[cfg(test)]
+    last_commit: Mutex<Option<Arc<CommitRecord>>>,
+    #[cfg(test)]
+    commit_fault: Mutex<VecDeque<MvccCommitFaultPoint>>,
 }
 
 impl MvccRuntime {
@@ -85,7 +101,64 @@ impl MvccRuntime {
     ) -> Result<(Arc<CommitRecord>, PendingCommitRegistration)> {
         let commit = Arc::new(CommitRecord::pending());
         let pending = self.coordinator.register_pending_commit(commit.clone())?;
+        #[cfg(test)]
+        {
+            *self
+                .last_commit
+                .lock()
+                .map_err(|_| crate::format_err!("MVCC last-commit test lock is poisoned"))? =
+                Some(commit.clone());
+        }
         Ok((commit, pending))
+    }
+
+    pub(crate) fn remove_aborted_commit_versions(&self, commit: &Arc<CommitRecord>) -> Result<()> {
+        ensure!(
+            matches!(commit.state(), CommitState::Aborted),
+            "MVCC version removal requires an aborted commit record"
+        );
+        let mut state = self.domains.lock()?;
+        remove_commit_from_typed_table(&mut state.memories, commit);
+        remove_commit_from_typed_table(&mut state.memory_sizes, commit);
+        remove_commit_from_typed_table(&mut state.globals, commit);
+        remove_commit_from_typed_table(&mut state.tables, commit);
+        remove_commit_from_typed_table(&mut state.table_sizes, commit);
+        state.objects.chains.retain(|_, chain| {
+            chain.remove_newest_for_commit(commit);
+            !chain.is_empty()
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_commit_for_test(&self) -> Result<Option<Arc<CommitRecord>>> {
+        Ok(self
+            .last_commit
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC last-commit test lock is poisoned"))?
+            .clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_commit_once_for_test(&self, point: MvccCommitFaultPoint) -> Result<()> {
+        self.commit_fault
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC commit fault lock is poisoned"))?
+            .push_back(point);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_commit_fault_for_test(&self, point: MvccCommitFaultPoint) -> Result<()> {
+        let mut fault = self
+            .commit_fault
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC commit fault lock is poisoned"))?;
+        if fault.front().copied() == Some(point) {
+            fault.pop_front();
+            bail!("injected MVCC commit fault at {point:?}");
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_prepare(&self, commit: Arc<CommitRecord>) -> Result<MvccPrepareGuard<'_>> {
@@ -288,6 +361,41 @@ impl MvccRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn granule_version_count_for_test(&self, granule: GranuleId) -> Result<usize> {
+        let state = self.domains.lock()?;
+        let count = match granule {
+            GranuleId::TMemory { .. } => state
+                .memories
+                .chains
+                .get(&granule)
+                .map(VersionChain::version_count),
+            GranuleId::TMemorySize { .. } => state
+                .memory_sizes
+                .chains
+                .get(&granule)
+                .map(VersionChain::version_count),
+            GranuleId::TGlobal { .. } => state
+                .globals
+                .chains
+                .get(&granule)
+                .map(VersionChain::version_count),
+            GranuleId::TTable { .. } => state
+                .tables
+                .chains
+                .get(&granule)
+                .map(VersionChain::version_count),
+            GranuleId::TTableSize { .. } => state
+                .table_sizes
+                .chains
+                .get(&granule)
+                .map(VersionChain::version_count),
+            GranuleId::Object { .. } => None,
+        }
+        .unwrap_or_default();
+        Ok(count)
+    }
+
+    #[cfg(test)]
     pub(crate) fn abort_prepared_object_promotions_for_test(
         &self,
         commit: &Arc<CommitRecord>,
@@ -356,6 +464,13 @@ impl MvccRuntime {
     }
 }
 
+fn remove_commit_from_typed_table<T>(table: &mut VersionTable<T>, commit: &Arc<CommitRecord>) {
+    table.chains.retain(|_, chain| {
+        chain.remove_newest_for_commit(commit);
+        !chain.is_empty()
+    });
+}
+
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct MvccCommitHooks {
@@ -363,6 +478,26 @@ struct MvccCommitHooks {
     after_publish: Option<Arc<MvccCommitTestHook>>,
     inside_install: Option<Arc<MvccCommitTestHook>>,
     predecessor_collected: Option<Arc<MvccCommitTestHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvccCommitFaultPoint {
+    AfterCertification,
+    AfterPreparation,
+    AfterMemoryInstall,
+    AfterMemorySizeInstall,
+    AfterGlobalInstall,
+    AfterTableInstall,
+    AfterTableSizeInstall,
+    AfterObjectInstall,
+    AfterDurablePublication,
+    AfterDurableLp,
+    BeforeMappedObjectInstall,
+    DuringRootApply,
+    AfterRecordTransition,
+    DuringCleanup,
+    DuringRollback,
 }
 
 #[cfg(test)]
@@ -508,6 +643,15 @@ impl MvccPrepareGuard<'_> {
     /// MVCC domain metadata lock. Every fallback closure below moves an owned
     /// predecessor and therefore cannot perform storage or mapping I/O.
     pub(crate) fn append_prepared_values(&mut self, values: PreparedDomainValues) -> Result<()> {
+        ensure!(
+            self.values.memories.is_empty()
+                && self.values.memory_sizes.is_empty()
+                && self.values.globals.is_empty()
+                && self.values.tables.is_empty()
+                && self.values.table_sizes.is_empty()
+                && self.values.objects.is_empty(),
+            "MVCC prepared batch was appended more than once"
+        );
         let PreparedDomainValues {
             memories,
             memory_sizes,
@@ -517,25 +661,40 @@ impl MvccPrepareGuard<'_> {
             objects,
         } = values;
 
-        for (granule, PreparedValue { predecessor, value }) in memories {
-            self.prepare_memory(granule, move || Ok(predecessor), value)?;
+        let result = (|| {
+            for (granule, PreparedValue { predecessor, value }) in memories {
+                self.prepare_memory(granule, move || Ok(predecessor), value)?;
+            }
+            for (granule, PreparedValue { predecessor, value }) in memory_sizes {
+                self.prepare_memory_size(granule, move || Ok(predecessor), value)?;
+            }
+            for (granule, PreparedValue { predecessor, value }) in globals {
+                self.prepare_global(granule, move || Ok(predecessor), value)?;
+            }
+            for (granule, PreparedValue { predecessor, value }) in tables {
+                self.prepare_table(granule, move || Ok(predecessor), value)?;
+            }
+            for (granule, PreparedValue { predecessor, value }) in table_sizes {
+                self.prepare_table_size(granule, move || Ok(predecessor), value)?;
+            }
+            for (object, PreparedObjectValue { predecessor, value }) in objects {
+                self.prepare_object(object, move || Ok(predecessor), value)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            remove_commit_from_typed_table(&mut self.state.memories, &self.commit);
+            remove_commit_from_typed_table(&mut self.state.memory_sizes, &self.commit);
+            remove_commit_from_typed_table(&mut self.state.globals, &self.commit);
+            remove_commit_from_typed_table(&mut self.state.tables, &self.commit);
+            remove_commit_from_typed_table(&mut self.state.table_sizes, &self.commit);
+            self.state.objects.chains.retain(|_, chain| {
+                chain.remove_newest_for_commit(&self.commit);
+                !chain.is_empty()
+            });
+            self.values = PreparedDomainValues::default();
         }
-        for (granule, PreparedValue { predecessor, value }) in memory_sizes {
-            self.prepare_memory_size(granule, move || Ok(predecessor), value)?;
-        }
-        for (granule, PreparedValue { predecessor, value }) in globals {
-            self.prepare_global(granule, move || Ok(predecessor), value)?;
-        }
-        for (granule, PreparedValue { predecessor, value }) in tables {
-            self.prepare_table(granule, move || Ok(predecessor), value)?;
-        }
-        for (granule, PreparedValue { predecessor, value }) in table_sizes {
-            self.prepare_table_size(granule, move || Ok(predecessor), value)?;
-        }
-        for (object, PreparedObjectValue { predecessor, value }) in objects {
-            self.prepare_object(object, move || Ok(predecessor), value)?;
-        }
-        Ok(())
+        result
     }
 
     pub(crate) fn prepare_memory(
@@ -992,6 +1151,46 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_commit_prepare_late_failure_removes_earlier_appended_heads() {
+        let runtime = MvccRuntime::default();
+        let commit = Arc::new(CommitRecord::pending());
+        let mut values = PreparedDomainValues::default();
+        values.memories.insert(
+            memory_granule(),
+            PreparedValue {
+                predecessor: vec![1],
+                value: vec![2],
+            },
+        );
+        values.memory_sizes.insert(
+            global_granule(),
+            PreparedValue {
+                predecessor: 3,
+                value: 4,
+            },
+        );
+        let mut prepare = runtime.begin_prepare(commit.clone()).unwrap();
+
+        let error = prepare.append_prepared_values(values).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected a tmemory-size granule"),
+            "{error:?}"
+        );
+        assert!(prepare.values().memories.is_empty());
+        let chain = prepare
+            .state
+            .memories
+            .chains
+            .get(&memory_granule())
+            .unwrap();
+        assert_eq!(chain.version_count(), 1);
+        assert!(!Arc::ptr_eq(chain.newest_commit_record().unwrap(), &commit));
+    }
+
+    #[test]
     fn baseline_fallback_and_prepare_are_one_mutex_operation() {
         let runtime = Arc::new(MvccRuntime::default());
         let entered_fallback = Arc::new(Barrier::new(2));
@@ -1201,7 +1400,7 @@ mod tests {
     #[test]
     fn mvcc_commit_prepare_mixed_domains_stay_invisible_until_one_publication() {
         let runtime = MvccRuntime::default();
-        let (commit, pending) = runtime.begin_pending_commit().unwrap();
+        let (commit, mut pending) = runtime.begin_pending_commit().unwrap();
         let table_before =
             TableGranuleSnapshot::new(vec![TableElementSnapshot::FuncRef(5)]).unwrap();
         let table_after =

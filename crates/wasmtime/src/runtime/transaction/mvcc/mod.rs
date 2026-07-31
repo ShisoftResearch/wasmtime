@@ -14,15 +14,16 @@ mod version_chain;
 pub(crate) use coordinator::{
     MvccCoordinator, MvccGcBarrierPermit, PendingCommitRegistration, SnapshotRegistration,
 };
-#[cfg(test)]
-pub(crate) use domains::MvccCommitTestHook;
 #[allow(
     unused_imports,
     reason = "reserved for the next MVCC implementation stages"
 )]
 pub(crate) use domains::{
-    MvccPrepareGuard, MvccRuntime, PreparedDomainValues, PreparedObjectValue, PreparedValue,
+    InstalledDomainKeys, MvccPrepareGuard, MvccRuntime, PreparedDomainValues, PreparedObjectValue,
+    PreparedValue,
 };
+#[cfg(test)]
+pub(crate) use domains::{MvccCommitFaultPoint, MvccCommitTestHook};
 #[allow(
     unused_imports,
     reason = "reserved for the next MVCC implementation stages"

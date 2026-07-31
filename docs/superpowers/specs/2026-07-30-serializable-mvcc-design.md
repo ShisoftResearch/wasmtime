@@ -24,9 +24,16 @@ transactions validate their complete read and write sets while holding ordered
 commit latches. This prevents write skew without a global commit mutex or an SSI
 dependency graph. Read-only transactions remain lock-free.
 
-MVCC history is volatile. Existing durability, recovery, and storage-backend
-selection remain unchanged. A recovered runtime treats the latest durable state
-as a new timestamp-zero baseline.
+MVCC history is volatile. Existing durable record formats, recovery decisions,
+and storage-backend selection remain unchanged. Commit-time publication may use
+narrow capacity-only tmemory helpers to durably prepare bytes in a staged growth
+tail before publishing the logical size and commit LP. Those helpers are
+feature-gated where they create or publish hidden writes. The underlying
+capacity-bounded restore primitive remains available without MVCC so recovery
+can undo a tail written by a different build. Ordinary logical APIs remain
+bounded by the committed length, and non-MVCC workloads retain their existing
+semantics. A recovered runtime treats the latest durable state as a new
+timestamp-zero baseline.
 
 Persistent object GC is independently pluggable. A current-state-only collector
 uses a quiescent MVCC compatibility barrier; a future snapshot-aware collector
@@ -51,7 +58,9 @@ persistent object reachability.
   file-backed memory, and DAX PMEM.
 - Keep GC implementation selection independent from MVCC, concurrency control,
   and storage backend selection.
-- Reuse existing durable publication, commit-LP, recovery, and backend code.
+- Reuse existing durable publication, commit-LP, recovery formats, and backend
+  selection, with only the capacity-only MVCC publication/recovery helpers
+  described above.
 - Confine MVCC-specific code to feature-gated modules and existing transaction
   helper boundaries.
 
@@ -146,9 +155,15 @@ co-located behind one runtime lock. Their interfaces permit later independent
 sharding. They do not use a cross-domain value enum.
 
 The MVCC layer sits above storage backends. Tmemory sidecars contain logical
-granule snapshots, and current values are installed through existing backend
-operations. Nothing in the MVCC algorithm branches on VMemory versus
-file-backed memory versus DAX PMEM.
+granule snapshots, and current values are installed through backend-neutral
+operations. A growth-tail publication can reserve backing capacity and
+read/write/restore within that capacity while the logical length remains
+unchanged; only the MVCC publication path can create such hidden writes.
+Recovery may restore their existing undo records across MVCC and non-MVCC
+builds. Ordinary reads, writes, metadata access, and non-MVCC commits remain
+logical-length bounded. No durable record or recovery format is added, and
+nothing in the MVCC algorithm branches on VMemory versus file-backed memory
+versus DAX PMEM.
 
 ### Chosen concurrency-control policy
 
@@ -493,12 +508,19 @@ Focused integration changes are expected in:
 Do not change:
 
 - parser, validator, or Cranelift lowering;
-- VMemory, file-backed memory, or DAX PMEM backend implementations;
 - durable log formats;
-- recovery formats or algorithms;
+- recovery formats or decision rules;
 - non-OCC concrete concurrency-control implementations;
 - existing single-version optimistic-validation behavior when
   `transaction-mvcc` is disabled.
+
+Backend code may expose the narrow capacity-only primitives required for
+commit-time MVCC growth-tail publication and cross-build undo application.
+Creation/publication entry points remain MVCC-feature-gated; the
+capacity-bounded restore primitive must compile without MVCC so recovery can
+apply existing undo bytes behind the logical length. This narrow recovery
+execution change must not alter recovery decisions, relax ordinary logical
+bounds, or change non-MVCC publication behavior.
 
 ## Verification
 

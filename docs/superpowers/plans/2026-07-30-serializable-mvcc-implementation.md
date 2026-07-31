@@ -4,7 +4,7 @@
 
 **Goal:** Add feature-gated, volatile MVCC visibility to every transaction domain and pair it with commit-time optimistic certification so transactions are serializable and opaque, including prevention of write skew.
 
-**Architecture:** Keep MVCC, concurrency control, persistent GC, and storage selection as independent policy axes. `transaction-mvcc` selects a typed sidecar visibility facade; the first supported concurrency adapter is the existing `transaction-cc-optimistic-validation` policy, extended with short commit-time shared/exclusive certification latches. Existing copy-on-write durability, commit-LP publication, recovery formats, and backend implementations remain the current-state publication layer beneath MVCC.
+**Architecture:** Keep MVCC, concurrency control, persistent GC, and storage selection as independent policy axes. `transaction-mvcc` selects a typed sidecar visibility facade; the first supported concurrency adapter is the existing `transaction-cc-optimistic-validation` policy, extended with short commit-time shared/exclusive certification latches. Existing copy-on-write durability, commit-LP publication, recovery formats/decision rules, and backend selection remain the current-state publication layer beneath MVCC. The user-approved exception is a narrow set of capacity-only tmemory primitives used by MVCC commit-time growth-tail publication and cross-build undo application; creation/publication entry points are MVCC-feature-gated, while the capacity restore primitive compiles without MVCC. Ordinary logical APIs and non-MVCC publication behavior remain unchanged.
 
 **Tech Stack:** Rust, Cargo feature gates, `Arc`, `Mutex`, `Condvar`, atomic commit records, existing `TransactionState`/`TransactionWorkspace`, existing `TransactionRegionRuntime`, existing `GranuleId` domains, VMemory/file-backed/DAX PMEM tmemory backends, transaction unit and persistence integration tests.
 
@@ -18,7 +18,7 @@
 - Keep the default build single-version and `transaction-cc-lockbased`.
 - Keep exactly one `transaction-cc-*` feature mandatory. `transaction-mvcc` is independent and must not be added to that exactly-one group.
 - Initially accept only `transaction-mvcc` plus `transaction-cc-optimistic-validation`; reject every other MVCC/CC pairing with a clear compile-time diagnostic.
-- Do not modify the parser, validator, Cranelift lowering, durable record formats, recovery formats, tmemory backend implementations, or non-OCC concurrency policies.
+- Do not modify the parser, validator, Cranelift lowering, durable record formats, recovery formats or decision rules, or non-OCC concurrency policies. Tmemory backends may expose capacity-only MVCC creation/publication helpers and a cross-build recovery restore primitive. Only creation/publication is MVCC-feature-gated; ordinary logical bounds and non-MVCC publication semantics must remain unchanged.
 - Do not store MVCC history as `ObjectTable` slots or assign historical payloads an `ObjectId`.
 - Do not make persistent object GC trace historical MVCC versions. Version pruning belongs to MVCC.
 - Do not put durable I/O or current-state installation under a global publication mutex.
@@ -259,6 +259,9 @@ fn mvcc_is_visibility_not_concurrency_control() {
 - [ ] **Step 2: Run the supported build and observe failure**
 
 ```bash
+cargo check -p wasmtime
+cargo check -p wasmtime --no-default-features \
+  --features "anyhow,async,backtrace,cache,gc,gc-copying,gc-drc,gc-null,wat,profiling,parallel-compilation,cranelift,pooling-allocator,demangle,addr2line,coredump,debug-builtins,runtime,component-model,component-model-async,threads,stack-switching,std,debug,compile-time-builtins,wit-parser,transaction-cc-optimistic-validation"
 cargo test -p wasmtime --no-default-features \
   --features "runtime,std,gc,cranelift,wat,transaction-mvcc,transaction-cc-optimistic-validation" \
   mvcc_is_visibility_not_concurrency_control --lib -- --exact
@@ -1346,9 +1349,12 @@ git commit -m "Publish mixed-domain MVCC commits atomically"
 
 **Files:**
 - Modify: `crates/wasmtime/src/runtime/vm/libcalls.rs`
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory.rs`
+- Modify: `crates/wasmtime/src/runtime/vm/memory/tmemory/block_region.rs`
 - Modify: `crates/wasmtime/src/runtime/transaction/state.rs`
 - Modify: `crates/wasmtime/src/runtime/transaction/object_table.rs`
 - Modify: `crates/wasmtime/src/runtime/transaction/mvcc/domains.rs`
+- Modify: `crates/wasmtime/src/runtime/transaction/persist.rs`
 - Test: `crates/wasmtime/src/runtime/transaction/tests.rs`
 - Test: `crates/wasmtime/tests/transaction_persistence.rs`
 
@@ -1448,9 +1454,21 @@ cargo test -p wasmtime --no-default-features \
 cargo test -p wasmtime --no-default-features \
   --features "runtime,std,gc,cranelift,wat,transaction-mvcc,transaction-cc-optimistic-validation" \
   --test transaction_persistence mvcc_file_backed_lp_
+cargo test -p wasmtime --no-default-features \
+  --features "runtime,std,gc,cranelift,wat,transaction-mvcc,transaction-cc-optimistic-validation" \
+  ordinary_logical_bounds_reject_reserved_capacity_addresses --lib
+cargo test -p wasmtime --no-default-features \
+  --features "runtime,std,gc,cranelift,wat,transaction-cc-optimistic-validation" \
+  ordinary_logical_bounds_reject_reserved_capacity_addresses --lib
+cargo test -p wasmtime --no-default-features \
+  --features "runtime,std,gc,cranelift,wat,transaction-cc-optimistic-validation" \
+  file_backed_recovery_restores_hidden_growth_tail_without_mvcc_feature --lib
 ```
 
-Expected: all pre/post-LP and restart assertions pass.
+Expected: all pre/post-LP and restart assertions pass. Both MVCC and non-MVCC
+builds reject ordinary access beyond the committed logical length, and the
+non-MVCC recovery build can restore a loose growth-tail undo produced by an
+MVCC build. No durable record-format change is involved.
 
 - [ ] **Step 8: Commit**
 
@@ -1788,7 +1806,10 @@ git diff ca6090dca -- \
   crates/wasmtime/src/runtime/vm/memory/tmemory
 ```
 
-Expected: no diff in durable record/recovery formats or backend implementation files. If a non-format helper change is unavoidable, stop for design review before proceeding.
+Expected: no diff in durable record or recovery formats. The approved
+capacity-only helper diff may appear in tmemory/backend files, provided it is
+used only by MVCC publication or cross-build undo recovery and ordinary
+logical-length APIs remain unchanged.
 
 - [ ] **Step 6: Commit tests**
 

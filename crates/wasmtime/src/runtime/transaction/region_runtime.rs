@@ -919,14 +919,22 @@ impl TransactionRegionRuntime {
         I: IntoIterator<Item = GranuleId>,
     {
         let mut runtime = self.lock_authority()?;
-        for granule in granules {
-            if !granule_uses_transaction_state_version(granule) {
-                continue;
-            }
-            let version = runtime.granule_versions.entry(granule).or_insert(0);
-            *version = version
-                .checked_add(1)
-                .context("transaction granule version overflow")?;
+        let updates = granules
+            .into_iter()
+            .filter(|granule| granule_uses_transaction_state_version(*granule))
+            .map(|granule| {
+                let version = runtime
+                    .granule_versions
+                    .get(&granule)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .context("transaction granule version overflow")?;
+                Ok((granule, version))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (granule, version) in updates {
+            runtime.granule_versions.insert(granule, version);
         }
         Ok(())
     }

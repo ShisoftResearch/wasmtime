@@ -5632,6 +5632,8 @@ pub struct TransactionPersistenceRecoveredRegion {
     pub root_object_ids: Vec<u64>,
     /// TMemory undo records from transactions that did not publish LP.
     pub tmemory_undo_rollbacks: Vec<TransactionPersistenceRecoveredTMemoryUndoRollback>,
+    /// Largest committed file-backed tmemory size recovered from size publications.
+    pub committed_tmemory_pages: Option<u64>,
 }
 
 /// Creates a file-backed durable region image for restart smoke tests.
@@ -5923,6 +5925,7 @@ pub fn reopen_and_recover_file_backed_region(
     path: &Path,
 ) -> Result<TransactionPersistenceRecoveredRegion> {
     let recovered = reopen_and_recover_file_backed_region_for_runtime(path)?;
+    let committed_tmemory_pages = recovered.committed_file_backed_tmemory_pages()?;
     let mapped_source = recovered
         .cloned_mapped_region_source()
         .context("recovered file-backed region does not expose a mapped region source")?;
@@ -5963,6 +5966,7 @@ pub fn reopen_and_recover_file_backed_region(
                 },
             )
             .collect(),
+        committed_tmemory_pages,
     })
 }
 

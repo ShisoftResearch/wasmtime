@@ -195,7 +195,7 @@ pub(crate) struct PendingCommitRegistration {
 
 impl PendingCommitRegistration {
     /// Makes the pending record visible at the next consecutive timestamp.
-    pub(crate) fn publish(mut self) -> Result<CommitTimestamp> {
+    pub(crate) fn publish(&mut self) -> Result<CommitTimestamp> {
         let state = self
             .state
             .as_ref()
@@ -225,7 +225,7 @@ impl PendingCommitRegistration {
     }
 
     /// Aborts the pending record and unregisters this pending commit.
-    pub(crate) fn abort(mut self) -> Result<()> {
+    pub(crate) fn abort(&mut self) -> Result<()> {
         let state = self
             .state
             .as_ref()
@@ -233,7 +233,7 @@ impl PendingCommitRegistration {
         let mut state = state
             .lock()
             .map_err(|_| crate::format_err!("MVCC coordinator lock is poisoned"))?;
-        let result = self.commit.abort();
+        self.commit.abort()?;
         state.pending_commits -= 1;
         #[cfg(test)]
         {
@@ -241,7 +241,7 @@ impl PendingCommitRegistration {
         }
         drop(state);
         self.state = None;
-        result
+        Ok(())
     }
 }
 
@@ -356,7 +356,7 @@ mod tests {
     fn coordinator_assigns_timestamp_at_visibility_transition() {
         let coordinator = MvccCoordinator::default();
         let commit = Arc::new(CommitRecord::pending());
-        let prepared = coordinator.register_pending_commit(commit.clone()).unwrap();
+        let mut prepared = coordinator.register_pending_commit(commit.clone()).unwrap();
 
         assert_eq!(coordinator.visible_timestamp().unwrap(), 0);
         assert_eq!(commit.state(), CommitState::Pending);
@@ -369,10 +369,10 @@ mod tests {
     #[test]
     fn publication_allocates_consecutive_timestamps() {
         let coordinator = MvccCoordinator::default();
-        let first = coordinator
+        let mut first = coordinator
             .register_pending_commit(Arc::new(CommitRecord::pending()))
             .unwrap();
-        let second = coordinator
+        let mut second = coordinator
             .register_pending_commit(Arc::new(CommitRecord::pending()))
             .unwrap();
 
@@ -392,7 +392,7 @@ mod tests {
         );
         snapshot.finish().unwrap();
 
-        let pending = coordinator
+        let mut pending = coordinator
             .register_pending_commit(Arc::new(CommitRecord::pending()))
             .unwrap();
         assert_eq!(
@@ -416,17 +416,24 @@ mod tests {
     }
 
     #[test]
-    fn prepared_commit_cannot_abort_after_record_is_committed() {
+    fn failed_registration_abort_retains_registration_until_explicit_drop() {
         let coordinator = MvccCoordinator::default();
         let commit = Arc::new(CommitRecord::pending());
-        let prepared = coordinator.register_pending_commit(commit.clone()).unwrap();
+        let mut prepared = coordinator.register_pending_commit(commit.clone()).unwrap();
         commit.commit(1).unwrap();
 
         assert_eq!(
             prepared.abort().unwrap_err().to_string(),
             "commit record is no longer pending"
         );
+        assert!(prepared.state.is_some());
         assert_eq!(commit.state(), CommitState::Committed(1));
+        drop(prepared);
+        coordinator.begin_gc_barrier().unwrap();
+        assert_eq!(
+            coordinator.commit_lifecycle_counts_for_test().unwrap(),
+            (1, 0, 0)
+        );
     }
 
     #[test]

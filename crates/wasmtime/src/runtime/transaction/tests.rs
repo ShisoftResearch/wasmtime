@@ -8,7 +8,7 @@ use super::config::TMemoryRegionConfig;
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-use super::mvcc::{CommitRecord, MvccCommitTestHook, MvccRuntime};
+use super::mvcc::{CommitRecord, CommitState, MvccCommitTestHook, MvccRuntime};
 #[cfg(feature = "transaction-mvcc")]
 use super::visibility::SelectedTransactionVisibility;
 use super::*;
@@ -128,6 +128,1155 @@ fn mvcc_commit_prepare_read_only_skips_certification_and_pending_record() {
         runtime.mvcc_certification_counts_for_test().unwrap(),
         (0, 0)
     );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_pre_lp_memory_install_restores_predecessor_and_aborts_record() {
+    use std::time::Duration;
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 7)))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let fail_after_memory_install = Arc::new(MvccCommitTestHook::new_with_timeout_for_test(
+        1,
+        Duration::from_millis(10),
+    ));
+    visibility
+        .runtime()
+        .set_commit_hooks_for_test(None, None, Some(fail_after_memory_install))
+        .unwrap();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = GranuleId::TMemory {
+        instance: Some(instance.id().as_u32()),
+        memory_index: 0,
+        granule_index: 0,
+    };
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    let error = write.call(&mut store, ()).unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("timed out waiting for MVCC commit test hook release"),
+        "{error}"
+    );
+    let record = visibility
+        .runtime()
+        .last_commit_for_test()
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state(), CommitState::Aborted);
+    assert_eq!(
+        visibility
+            .runtime()
+            .granule_version_count_for_test(memory)
+            .unwrap(),
+        1
+    );
+    let physical = {
+        use crate::AsContextMut;
+
+        let context = store.as_context_mut();
+        let instance_ref = context.0.instance_mut(instance.id());
+        let instance_ref = instance_ref.as_ref();
+        let tmemory = instance_ref
+            .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+            .unwrap();
+        tmemory.read_committed(0..4).unwrap()
+    };
+    assert_eq!(physical, 0_i32.to_le_bytes());
+    assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 0)
+    );
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 2, 2, 0)
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_post_lp_cleanup_error_force_completes_and_reports_durable_commit() {
+    use std::time::Duration;
+
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 9)))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let fail_after_record_transition = Arc::new(MvccCommitTestHook::new_with_timeout_for_test(
+        1,
+        Duration::from_millis(10),
+    ));
+    visibility
+        .runtime()
+        .set_commit_hooks_for_test(None, Some(fail_after_record_transition), None)
+        .unwrap();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    store
+        .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 64)
+        .unwrap();
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = GranuleId::TMemory {
+        instance: None,
+        memory_index: 0,
+        granule_index: 0,
+    };
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    let error = write.call(&mut store, ()).unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("transaction committed durably but completion/cleanup failed"),
+        "{error}"
+    );
+    let record = visibility
+        .runtime()
+        .newest_commit_record_for_granule_for_test(memory)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(record.state(), CommitState::Committed(_)));
+    assert_eq!(read.call(&mut store, ()).unwrap(), 9);
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 0)
+    );
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 2, 2, 0)
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_genuine_cleanup_failure_does_not_retain_inactive_terminal_state() {
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("tmemory.bin");
+    let tx_log_path = dir.path().join("tx-log.bin");
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 13)))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    visibility.fail_finish_snapshot_once_for_test().unwrap();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime);
+    store
+        .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 64)
+        .unwrap();
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    let error = format!("{:#}", write.call(&mut store, ()).unwrap_err());
+    assert!(error.contains("transaction committed durably"), "{error}");
+    assert!(
+        error.contains("injected snapshot finish failure"),
+        "{error}"
+    );
+    assert_eq!(store.transaction_state().active_transaction(), None);
+    assert!(!store.transaction_state().has_mvcc_terminal_commit());
+    assert_eq!(read.call(&mut store, ()).unwrap(), 13);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_markerless_cleanup_reports_irrevocable_not_durable() {
+    use std::time::Duration;
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 17)))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    visibility
+        .runtime()
+        .set_commit_hooks_for_test(
+            None,
+            Some(Arc::new(MvccCommitTestHook::new_with_timeout_for_test(
+                1,
+                Duration::from_millis(10),
+            ))),
+            None,
+        )
+        .unwrap();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime);
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    let error = format!(
+        "{:#}",
+        instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap_err()
+    );
+    assert!(
+        error.contains("transaction committed irrevocably"),
+        "{error}"
+    );
+    assert!(!error.contains("committed durably"), "{error}");
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        17
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_retained_terminal_freezes_staging_until_retry() {
+    clear_current_thread_transaction_for_test();
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field (mut i32))))
+              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tfunc (export "publish")
+                (tglobal.set $root (tstruct.new $s (i32.const 23))))
+              (tfunc (export "noop")
+                (drop (tglobal.get $root))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    visibility
+        .runtime()
+        .fail_commit_once_for_test(MvccCommitFaultPoint::AfterDurableLp)
+        .unwrap();
+    runtime.fail_apply_persistent_root_delta_once_for_test();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    let error = format!(
+        "{:#}",
+        instance
+            .get_typed_func::<(), ()>(&mut store, "publish")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap_err()
+    );
+    assert!(error.contains("force-completion also failed"), "{error}");
+    assert!(store.transaction_state().has_mvcc_terminal_commit());
+    assert!(runtime.begin_persistent_gc_for_test().is_err());
+    let staging_error = store
+        .transaction_state_mut()
+        .stage_global(99, GlobalSnapshot::I32(1))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        staging_error.contains("MVCC terminal commit retry is pending"),
+        "{staging_error}"
+    );
+
+    instance
+        .get_typed_func::<(), ()>(&mut store, "noop")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    assert!(!store.transaction_state().has_mvcc_terminal_commit());
+    assert!(runtime.begin_persistent_gc_for_test().is_ok());
+    assert!(matches!(
+        visibility
+            .runtime()
+            .last_commit_for_test()
+            .unwrap()
+            .unwrap()
+            .state(),
+        CommitState::Committed(_)
+    ));
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_rollback_failure_retains_progress_for_explicit_retry() {
+    use crate::Ref;
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory $m 1)
+              (tglobal $g (export "g") (mut i32) (i32.const 3))
+              (func $target)
+              (elem declare func $target)
+              (ttable $t (export "t") 1 funcref)
+              (tfunc (export "write")
+                (i32.tstore $m (i32.const 0) (i32.const 7))
+                (tglobal.set $g (i32.const 9))
+                (ttable.set $t (i32.const 0) (ref.func $target)))
+              (tfunc (export "read") (result i32 i32 i32)
+                (i32.tload $m (i32.const 0))
+                (tglobal.get $g)
+                (ref.is_null (ttable.get $t (i32.const 0)))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    visibility
+        .runtime()
+        .fail_commit_once_for_test(MvccCommitFaultPoint::AfterTableInstall)
+        .unwrap();
+    visibility
+        .runtime()
+        .fail_commit_once_for_test(MvccCommitFaultPoint::DuringRollback)
+        .unwrap();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let read = instance
+        .get_typed_func::<(), (i32, i32, i32)>(&mut store, "read")
+        .unwrap();
+
+    let error = format!(
+        "{:#}",
+        instance
+            .get_typed_func::<(), ()>(&mut store, "write")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap_err()
+    );
+    assert!(
+        error.contains("MVCC rollback requires an explicit retry"),
+        "{error}"
+    );
+    assert!(
+        error.contains("injected MVCC commit fault at DuringRollback"),
+        "{error}"
+    );
+    assert!(store.transaction_state().has_mvcc_terminal_commit());
+    assert!(runtime.begin_persistent_gc_for_test().is_err());
+    assert_eq!(
+        visibility
+            .runtime()
+            .last_commit_for_test()
+            .unwrap()
+            .unwrap()
+            .state(),
+        CommitState::Aborted
+    );
+    assert!(
+        matches!(
+            instance
+                .get_table(&mut store, "t")
+                .unwrap()
+                .get(&mut store, 0)
+                .unwrap(),
+            Ref::Func(None)
+        ),
+        "the first rollback step was not retained"
+    );
+    let physical_memory = {
+        use crate::AsContextMut;
+
+        let context = store.as_context_mut();
+        let instance_ref = context.0.instance_mut(instance.id());
+        let instance_ref = instance_ref.as_ref();
+        instance_ref
+            .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+            .unwrap()
+            .read_committed(0..4)
+            .unwrap()
+    };
+    assert_eq!(physical_memory, 7_i32.to_le_bytes());
+    assert!(matches!(
+        instance
+            .get_global(&mut store, "g")
+            .unwrap()
+            .get(&mut store),
+        crate::Val::I32(9)
+    ));
+
+    let retry_error = format!("{:#}", read.call(&mut store, ()).unwrap_err());
+    assert!(
+        retry_error.contains("injected MVCC commit fault at AfterTableInstall"),
+        "{retry_error}"
+    );
+    assert!(!store.transaction_state().has_mvcc_terminal_commit());
+    assert_eq!(
+        read.call(&mut store, ()).unwrap(),
+        (0, 3, 1),
+        "explicit retry did not restore every predecessor"
+    );
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 0)
+    );
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 2, 2, 0)
+    );
+    drop(visibility.begin_gc_barrier_for_test().unwrap());
+    drop(runtime.begin_persistent_gc_for_test().unwrap());
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_host_selected_commit_drives_retained_retry() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "" "commit_selected" (func $commit_selected))
+              (tglobal $g (export "g") (mut i32) (i32.const 3))
+              (func (export "drive") (call $commit_selected)))
+        "#,
+    );
+    let transaction = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let host_transaction = Arc::clone(&transaction);
+    let host_errors = Arc::clone(&errors);
+    let mut linker = crate::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "",
+            "commit_selected",
+            move |mut caller: crate::Caller<'_, ()>| -> Result<()> {
+                let transaction = host_transaction.load(Ordering::SeqCst);
+                match caller.transaction_spectest_commit_tid(transaction) {
+                    Ok(true) => {}
+                    Ok(false) => host_errors
+                        .lock()
+                        .unwrap()
+                        .push("selected transaction was not open".to_string()),
+                    Err(error) => host_errors.lock().unwrap().push(format!("{error:#}")),
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let selected = store
+        .transaction_state_mut()
+        .begin_with_region_runtime(&runtime)
+        .unwrap();
+    transaction.store(selected.as_raw(), Ordering::SeqCst);
+    store
+        .transaction_state_mut()
+        .stage_global_owned(
+            Some(InstanceId::from_u32(instance.id().as_u32())),
+            0,
+            GlobalSnapshot::I32(9),
+        )
+        .unwrap();
+    store
+        .transaction_state_mut()
+        .restore_transaction(None)
+        .unwrap();
+    visibility
+        .runtime()
+        .fail_commit_once_for_test(MvccCommitFaultPoint::AfterGlobalInstall)
+        .unwrap();
+    visibility
+        .runtime()
+        .fail_commit_once_for_test(MvccCommitFaultPoint::DuringRollback)
+        .unwrap();
+    let drive = instance
+        .get_typed_func::<(), ()>(&mut store, "drive")
+        .unwrap();
+
+    drive.call(&mut store, ()).unwrap();
+    assert!(errors.lock().unwrap()[0].contains("MVCC rollback requires an explicit retry"));
+    assert!(store.transaction_state().transaction_is_open(selected));
+
+    drive.call(&mut store, ()).unwrap();
+    let errors = errors.lock().unwrap();
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors[1].contains("injected MVCC commit fault at AfterGlobalInstall"),
+        "{errors:?}"
+    );
+    drop(errors);
+    assert!(!store.transaction_state().transaction_is_open(selected));
+    assert!(matches!(
+        instance
+            .get_global(&mut store, "g")
+            .unwrap()
+            .get(&mut store),
+        crate::Val::I32(3)
+    ));
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 0)
+    );
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 1, 1, 0)
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_abortable_cut_points_restore_mixed_domain_predecessors() {
+    use crate::Ref;
+
+    for point in [
+        MvccCommitFaultPoint::AfterCertification,
+        MvccCommitFaultPoint::AfterPreparation,
+        MvccCommitFaultPoint::AfterMemoryInstall,
+        MvccCommitFaultPoint::AfterGlobalInstall,
+        MvccCommitFaultPoint::AfterTableInstall,
+    ] {
+        clear_current_thread_transaction_for_test();
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+                (module
+                  (type $s (tstruct (field (mut i32))))
+                  (tmemory $m 1)
+                  (tglobal $g (export "g") (mut i32) (i32.const 3))
+                  (tglobal $root (mut (ref null $s)) (ref.null $s))
+                  (func $target)
+                  (elem declare func $target)
+                  (ttable $t (export "t") 1 funcref)
+                  (tfunc (export "write")
+                    (i32.tstore $m (i32.const 0) (i32.const 7))
+                    (tglobal.set $g (i32.const 9))
+                    (ttable.set $t (i32.const 0) (ref.func $target))
+                    (tglobal.set $root (tstruct.new $s (i32.const 11))))
+                  (tfunc (export "read") (result i32 i32 i32 i32)
+                    (i32.tload $m (i32.const 0))
+                    (tglobal.get $g)
+                    (ref.is_null (ttable.get $t (i32.const 0)))
+                    (ref.is_null (tglobal.get $root))))
+            "#,
+        );
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let visibility = runtime.visibility_for_test();
+        visibility
+            .runtime()
+            .fail_commit_once_for_test(point)
+            .unwrap();
+        let mut store = crate::Store::new(&engine, ());
+        store.set_transaction_region_runtime_for_test(runtime.clone());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+        let error = format!(
+            "{:#}",
+            instance
+                .get_typed_func::<(), ()>(&mut store, "write")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap_err()
+        );
+        assert!(
+            error.contains(&format!("injected MVCC commit fault at {point:?}")),
+            "{point:?}: {error}"
+        );
+        let certification = runtime.mvcc_last_certification_for_test().unwrap();
+        let memory = certification
+            .iter()
+            .find_map(|(granule, mode)| {
+                (*mode == CertificationMode::Exclusive
+                    && matches!(granule, GranuleId::TMemory { .. }))
+                .then_some(*granule)
+            })
+            .unwrap();
+        let global = certification
+            .iter()
+            .find_map(|(granule, mode)| {
+                (*mode == CertificationMode::Exclusive
+                    && matches!(
+                        granule,
+                        GranuleId::TGlobal {
+                            global_index: 0,
+                            ..
+                        }
+                    ))
+                .then_some(*granule)
+            })
+            .unwrap();
+        let table = certification
+            .iter()
+            .find_map(|(granule, mode)| {
+                (*mode == CertificationMode::Exclusive
+                    && matches!(granule, GranuleId::TTable { .. }))
+                .then_some(*granule)
+            })
+            .unwrap();
+        let record = visibility
+            .runtime()
+            .last_commit_for_test()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state(), CommitState::Aborted, "{point:?}");
+        for granule in [memory, global, table] {
+            let version_count = visibility
+                .runtime()
+                .granule_version_count_for_test(granule)
+                .unwrap();
+            assert_eq!(
+                version_count,
+                usize::from(point != MvccCommitFaultPoint::AfterCertification),
+                "{point:?}: {granule:?}"
+            );
+            assert!(
+                visibility
+                    .runtime()
+                    .newest_commit_record_for_granule_for_test(granule)
+                    .unwrap()
+                    .is_none_or(|newest| !Arc::ptr_eq(&newest, &record)),
+                "{point:?}: aborted head remained for {granule:?}"
+            );
+        }
+        let physical_memory = {
+            use crate::AsContextMut;
+
+            let context = store.as_context_mut();
+            let instance_ref = context.0.instance_mut(instance.id());
+            let instance_ref = instance_ref.as_ref();
+            instance_ref
+                .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+                .unwrap()
+                .read_committed(0..4)
+                .unwrap()
+        };
+        assert_eq!(physical_memory, 0_i32.to_le_bytes(), "{point:?}");
+        assert!(
+            matches!(
+                instance
+                    .get_global(&mut store, "g")
+                    .unwrap()
+                    .get(&mut store),
+                crate::Val::I32(3)
+            ),
+            "{point:?}"
+        );
+        assert!(
+            matches!(
+                instance
+                    .get_table(&mut store, "t")
+                    .unwrap()
+                    .get(&mut store, 0)
+                    .unwrap(),
+                Ref::Func(None)
+            ),
+            "{point:?}"
+        );
+        assert_eq!(
+            store.transaction_object_table().live_count(),
+            0,
+            "{point:?}"
+        );
+        assert_eq!(
+            visibility.runtime().object_chain_count_for_test().unwrap(),
+            0,
+            "{point:?}"
+        );
+        assert!(
+            runtime.persistent_root_ids_for_test().unwrap().is_empty(),
+            "{point:?}"
+        );
+        assert_eq!(
+            store.transaction_state().allocated_object_count_for_test(),
+            0,
+            "{point:?}"
+        );
+        assert_eq!(
+            runtime.mvcc_certification_counts_for_test().unwrap(),
+            (1, 0),
+            "{point:?}"
+        );
+        assert_eq!(
+            visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+            (0, 1, 1, 0),
+            "{point:?}"
+        );
+        drop(visibility.begin_gc_barrier_for_test().unwrap());
+        drop(runtime.begin_persistent_gc_for_test().unwrap());
+        assert_eq!(
+            instance
+                .get_typed_func::<(), (i32, i32, i32, i32)>(&mut store, "read")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap(),
+            (0, 3, 1, 1),
+            "{point:?}"
+        );
+        for granule in [memory, global, table] {
+            assert!(
+                visibility
+                    .runtime()
+                    .newest_commit_record_for_granule_for_test(granule)
+                    .unwrap()
+                    .is_none_or(|newest| !Arc::ptr_eq(&newest, &record)),
+                "{point:?}: later barrier/read adopted failed value for {granule:?}"
+            );
+        }
+        clear_current_thread_transaction_for_test();
+    }
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_durable_pre_lp_cut_points_abort_without_leaking_publications() {
+    for point in [Some(MvccCommitFaultPoint::AfterDurablePublication), None] {
+        clear_current_thread_transaction_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("tmemory.bin");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+                (module
+                  (type $s (tstruct (field (mut i32))))
+                  (tmemory $m 1)
+                  (tglobal $root (export "root") (mut (ref null $s)) (ref.null $s))
+                  (tfunc (export "write")
+                    (i32.tstore $m (i32.const 0) (i32.const 29))
+                    (tglobal.set $root (tstruct.new $s (i32.const 31))))
+                  (tfunc (export "read") (result i32 i32)
+                    (i32.tload $m (i32.const 0))
+                    (ref.is_null (tglobal.get $root))))
+            "#,
+        );
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let visibility = runtime.visibility_for_test();
+        let mut store = crate::Store::new(&engine, ());
+        store.set_transaction_region_runtime_for_test(runtime.clone());
+        store
+            .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 64)
+            .unwrap();
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        if let Some(point) = point {
+            visibility
+                .runtime()
+                .fail_commit_once_for_test(point)
+                .unwrap();
+        } else {
+            store
+                .transaction_state_mut()
+                .fail_next_commit_before_lp_for_test();
+        }
+
+        let error = format!(
+            "{:#}",
+            instance
+                .get_typed_func::<(), ()>(&mut store, "write")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap_err()
+        );
+        match point {
+            Some(point) => assert!(
+                error.contains(&format!("injected MVCC commit fault at {point:?}")),
+                "{error}"
+            ),
+            None => assert!(
+                error.contains("transaction test failure before commit LP"),
+                "{error}"
+            ),
+        }
+        let record = visibility
+            .runtime()
+            .last_commit_for_test()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state(), CommitState::Aborted, "{point:?}");
+        let memory = runtime
+            .mvcc_last_certification_for_test()
+            .unwrap()
+            .into_iter()
+            .find_map(|(granule, _)| {
+                matches!(granule, GranuleId::TMemory { .. }).then_some(granule)
+            })
+            .unwrap();
+        assert_eq!(
+            visibility
+                .runtime()
+                .granule_version_count_for_test(memory)
+                .unwrap(),
+            1,
+            "{point:?}"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &visibility
+                    .runtime()
+                    .newest_commit_record_for_granule_for_test(memory)
+                    .unwrap()
+                    .unwrap(),
+                &record
+            ),
+            "{point:?}: aborted memory head remained"
+        );
+        assert_eq!(
+            visibility.runtime().object_chain_count_for_test().unwrap(),
+            0,
+            "{point:?}"
+        );
+        let physical_memory = {
+            use crate::AsContextMut;
+
+            let context = store.as_context_mut();
+            let instance_ref = context.0.instance_mut(instance.id());
+            let instance_ref = instance_ref.as_ref();
+            instance_ref
+                .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+                .unwrap()
+                .read_committed(0..4)
+                .unwrap()
+        };
+        assert_eq!(physical_memory, 0_i32.to_le_bytes(), "{point:?}");
+        assert!(
+            matches!(
+                instance
+                    .get_global(&mut store, "root")
+                    .unwrap()
+                    .get(&mut store),
+                crate::Val::AnyRef(None)
+            ),
+            "{point:?}"
+        );
+        assert_eq!(
+            store.transaction_object_table().live_count(),
+            0,
+            "{point:?}"
+        );
+        assert!(
+            runtime.persistent_root_ids_for_test().unwrap().is_empty(),
+            "{point:?}"
+        );
+        assert_eq!(
+            store.transaction_state().allocated_object_count_for_test(),
+            0,
+            "{point:?}"
+        );
+        assert_eq!(
+            runtime.mvcc_certification_counts_for_test().unwrap(),
+            (1, 0),
+            "{point:?}"
+        );
+        assert_eq!(
+            visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+            (0, 1, 1, 0),
+            "{point:?}"
+        );
+        drop(visibility.begin_gc_barrier_for_test().unwrap());
+        drop(runtime.begin_persistent_gc_for_test().unwrap());
+        assert_eq!(
+            instance
+                .get_typed_func::<(), (i32, i32)>(&mut store, "read")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap(),
+            (0, 1),
+            "{point:?}"
+        );
+        clear_current_thread_transaction_for_test();
+    }
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_fault_post_lp_cut_points_force_complete_all_domains() {
+    use crate::Ref;
+
+    for point in [
+        MvccCommitFaultPoint::AfterDurableLp,
+        MvccCommitFaultPoint::AfterMemorySizeInstall,
+        MvccCommitFaultPoint::AfterTableSizeInstall,
+        MvccCommitFaultPoint::BeforeMappedObjectInstall,
+        MvccCommitFaultPoint::AfterObjectInstall,
+        MvccCommitFaultPoint::DuringRootApply,
+        MvccCommitFaultPoint::AfterRecordTransition,
+        MvccCommitFaultPoint::DuringCleanup,
+    ] {
+        clear_current_thread_transaction_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("tmemory.bin");
+        let tx_log_path = dir.path().join("tx-log.bin");
+        let mut config = crate::Config::new();
+        config.wasm_gc(true);
+        let engine = crate::Engine::new(&config).unwrap();
+        let module = transaction_test_module(
+            &engine,
+            r#"
+                (module
+                  (type $s (tstruct (field (mut i32))))
+                  (tmemory $m 1 2)
+                  (tglobal $g (export "g") (mut i32) (i32.const 3))
+                  (tglobal $root (export "root") (mut (ref null $s)) (ref.null $s))
+                  (func $target)
+                  (elem declare func $target)
+                  (ttable $fixed (export "fixed") 1 funcref)
+                  (ttable $grow (export "grow") 1 2 funcref)
+                  (tfunc (export "write")
+                    (i32.tstore $m (i32.const 0) (i32.const 41))
+                    (drop (tmemory.grow $m (i32.const 1)))
+                    (i32.tstore $m (i32.const 65536) (i32.const 43))
+                    (tglobal.set $g (i32.const 47))
+                    (ttable.set $fixed (i32.const 0) (ref.func $target))
+                    (drop (ttable.grow $grow (ref.null func) (i32.const 1)))
+                    (ttable.set $grow (i32.const 1) (ref.func $target))
+                    (tglobal.set $root (tstruct.new $s (i32.const 53))))
+                  (tfunc (export "read_memory") (result i32 i32 i32 i32)
+                    (i32.tload $m (i32.const 0))
+                    (i32.tload $m (i32.const 65536))
+                    (tmemory.size $m)
+                    (tglobal.get $g))
+                  (tfunc (export "read_tables") (result i32 i32 i32 i32)
+                    (ref.is_null (ttable.get $fixed (i32.const 0)))
+                    (ttable.size $grow)
+                    (ref.is_null (ttable.get $grow (i32.const 1)))
+                    (ref.is_null (tglobal.get $root))))
+            "#,
+        );
+        let runtime = TransactionRegionRuntime::new_for_test();
+        let visibility = runtime.visibility_for_test();
+        visibility
+            .runtime()
+            .fail_commit_once_for_test(point)
+            .unwrap();
+        let mut store = crate::Store::new(&engine, ());
+        store.set_transaction_region_runtime_for_test(runtime.clone());
+        store
+            .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 64)
+            .unwrap();
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+        let error = format!(
+            "{:#}",
+            instance
+                .get_typed_func::<(), ()>(&mut store, "write")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap_err()
+        );
+        assert!(
+            error.contains(&format!("injected MVCC commit fault at {point:?}")),
+            "{point:?}: {error}"
+        );
+        assert!(
+            error.contains("transaction committed durably but completion/cleanup failed"),
+            "{point:?}: {error}"
+        );
+        let record = visibility
+            .runtime()
+            .last_commit_for_test()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(record.state(), CommitState::Committed(_)),
+            "{point:?}"
+        );
+        for (granule, mode) in runtime.mvcc_last_certification_for_test().unwrap() {
+            if mode != CertificationMode::Exclusive || matches!(granule, GranuleId::Object { .. }) {
+                continue;
+            }
+            let newest = visibility
+                .runtime()
+                .newest_commit_record_for_granule_for_test(granule)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{point:?}: no prepared chain for {granule:?}"));
+            assert!(
+                Arc::ptr_eq(&newest, &record),
+                "{point:?}: typed domain did not publish {granule:?}"
+            );
+        }
+        assert_eq!(
+            instance
+                .get_typed_func::<(), (i32, i32, i32, i32)>(&mut store, "read_memory")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap(),
+            (41, 43, 2, 47),
+            "{point:?}"
+        );
+        assert_eq!(
+            instance
+                .get_typed_func::<(), (i32, i32, i32, i32)>(&mut store, "read_tables")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap(),
+            (0, 2, 0, 0),
+            "{point:?}"
+        );
+        let physical_memory = {
+            use crate::AsContextMut;
+
+            let context = store.as_context_mut();
+            let instance_ref = context.0.instance_mut(instance.id());
+            let instance_ref = instance_ref.as_ref();
+            let tmemory = instance_ref
+                .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+                .unwrap();
+            (
+                tmemory.read_committed(0..4).unwrap(),
+                tmemory.read_committed(65536..65540).unwrap(),
+            )
+        };
+        assert_eq!(physical_memory.0, 41_i32.to_le_bytes(), "{point:?}");
+        assert_eq!(physical_memory.1, 43_i32.to_le_bytes(), "{point:?}");
+        assert!(
+            matches!(
+                instance
+                    .get_global(&mut store, "g")
+                    .unwrap()
+                    .get(&mut store),
+                crate::Val::I32(47)
+            ),
+            "{point:?}"
+        );
+        let fixed = instance.get_table(&mut store, "fixed").unwrap();
+        let grow = instance.get_table(&mut store, "grow").unwrap();
+        assert!(
+            matches!(fixed.get(&mut store, 0).unwrap(), Ref::Func(Some(_))),
+            "{point:?}"
+        );
+        assert_eq!(grow.size(&store), 2, "{point:?}");
+        assert!(
+            matches!(grow.get(&mut store, 1).unwrap(), Ref::Func(Some(_))),
+            "{point:?}"
+        );
+        assert_eq!(
+            visibility.runtime().object_chain_count_for_test().unwrap(),
+            1,
+            "{point:?}"
+        );
+        assert_eq!(
+            runtime.persistent_root_ids_for_test().unwrap().len(),
+            1,
+            "{point:?}"
+        );
+        assert!(
+            store.transaction_object_table().live_count() >= 1,
+            "{point:?}"
+        );
+        assert!(!store.transaction_state().has_mvcc_terminal_commit());
+        assert_eq!(
+            runtime.mvcc_certification_counts_for_test().unwrap(),
+            (1, 0),
+            "{point:?}"
+        );
+        assert_eq!(
+            visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+            (0, 3, 3, 0),
+            "{point:?}"
+        );
+        drop(visibility.begin_gc_barrier_for_test().unwrap());
+        drop(runtime.begin_persistent_gc_for_test().unwrap());
+        clear_current_thread_transaction_for_test();
+    }
 }
 
 #[test]

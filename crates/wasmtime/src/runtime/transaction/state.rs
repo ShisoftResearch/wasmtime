@@ -56,6 +56,8 @@ pub(crate) struct TransactionState {
     pub(super) scratch: Vec<u8>,
     pub(super) pending_memory_store: Option<PendingMemoryStore>,
     pub(super) durable_log: TxDurableLog,
+    #[cfg(feature = "transaction-mvcc")]
+    pub(super) mvcc_terminal_commit: Option<MvccTerminalCommitState>,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +83,8 @@ pub(super) struct TransactionWorkspace {
     pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
+    #[cfg(feature = "transaction-mvcc")]
+    mvcc_terminal_commit: Option<MvccTerminalCommitState>,
 }
 
 impl Default for TransactionState {
@@ -124,8 +128,51 @@ impl Default for TransactionState {
             scratch: Vec::new(),
             pending_memory_store: None,
             durable_log: TxDurableLog::default(),
+            #[cfg(feature = "transaction-mvcc")]
+            mvcc_terminal_commit: None,
         }
     }
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvccTerminalDecision {
+    Abortable,
+    Rollback,
+    ForceCommit,
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[derive(Debug)]
+pub(crate) struct MvccTerminalCommitState {
+    pub(crate) instance: InstanceId,
+    pub(crate) stream_id: u32,
+    pub(crate) txid: u32,
+    pub(crate) commit: Arc<mvcc::CommitRecord>,
+    pub(crate) pending: Option<mvcc::PendingCommitRegistration>,
+    pub(crate) certification: Option<concurrency::MvccCertificationPermit>,
+    pub(crate) user_region_permit: Option<region_runtime::UserTransactionRegionPermit>,
+    pub(crate) prepared: PreparedDomainValues,
+    pub(crate) installed: InstalledDomainKeys,
+    pub(crate) undo_published: BTreeSet<GranuleId>,
+    pub(crate) durable_publications: Vec<persist::PendingPublication>,
+    pub(crate) durable_publication_markers: Vec<PendingCommitLogEntry>,
+    pub(crate) durable_publications_installed: BTreeSet<usize>,
+    pub(crate) root_delta: PersistentRootDelta,
+    pub(crate) persistent_gc_delta: PersistentGcCommitDelta,
+    pub(crate) volatile_objects: Vec<(ObjectId, ObjectPayload)>,
+    pub(crate) final_marker: Option<PendingCommitLogEntry>,
+    pub(crate) lp_published: bool,
+    pub(crate) decision: MvccTerminalDecision,
+    pub(crate) root_applied: bool,
+    pub(crate) version_bumps_applied: bool,
+    pub(crate) completion_error: Option<String>,
+    #[cfg(test)]
+    pub(crate) inside_install_hook_ran: bool,
+    #[cfg(test)]
+    pub(crate) before_publish_hook_ran: bool,
+    #[cfg(test)]
+    pub(crate) after_publish_hook_ran: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -802,6 +849,29 @@ impl TransactionState {
 
     pub(crate) fn take_fail_next_commit_before_lp_for_test(&mut self) -> bool {
         mem::take(&mut self.fail_next_commit_before_lp_for_test)
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn install_mvcc_terminal_commit(
+        &mut self,
+        terminal: MvccTerminalCommitState,
+    ) -> Result<()> {
+        self.ensure_active()?;
+        ensure!(
+            self.mvcc_terminal_commit.replace(terminal).is_none(),
+            "MVCC terminal commit state is already installed"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn take_mvcc_terminal_commit(&mut self) -> Option<MvccTerminalCommitState> {
+        self.mvcc_terminal_commit.take()
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn has_mvcc_terminal_commit(&self) -> bool {
+        self.mvcc_terminal_commit.is_some()
     }
 
     pub(crate) fn active_transaction_required_raw(&self) -> Result<u64> {
@@ -1505,14 +1575,22 @@ impl TransactionState {
         if let Some(runtime) = &self.shared_region_runtime {
             return runtime.bump_versioned_granules(granules);
         }
-        for granule in granules {
-            if !granule_uses_transaction_state_version(granule) {
-                continue;
-            }
-            let version = self.granule_versions.entry(granule).or_insert(0);
-            *version = version
-                .checked_add(1)
-                .context("transaction granule version overflow")?;
+        let updates = granules
+            .into_iter()
+            .filter(|granule| granule_uses_transaction_state_version(*granule))
+            .map(|granule| {
+                let version = self
+                    .granule_versions
+                    .get(&granule)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .context("transaction granule version overflow")?;
+                Ok((granule, version))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (granule, version) in updates {
+            self.granule_versions.insert(granule, version);
         }
         Ok(())
     }
@@ -1547,7 +1625,7 @@ impl TransactionState {
     }
 
     #[cfg(feature = "transaction-mvcc")]
-    pub(crate) fn prepare_mvcc_commit_completion(
+    pub(crate) fn prepare_mvcc_root_commit_completion(
         &mut self,
         delta: PersistentRootDelta,
     ) -> Result<()> {
@@ -1556,12 +1634,17 @@ impl TransactionState {
         self.retry_post_commit_linear_undo_retirement();
         if self.shared_region_runtime.is_some() {
             self.commit_shared_persistent_root_delta_before_complete_commit(delta)?;
-            self.bump_active_versioned_write_granules()?;
         } else {
-            self.bump_active_versioned_write_granules()?;
             self.apply_committed_persistent_root_delta(delta)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn prepare_mvcc_version_commit_completion(&mut self) -> Result<()> {
+        self.begin_terminal_commit()?;
+        self.ensure_no_pending_conflict_aborted_allocated_objects()?;
+        self.bump_active_versioned_write_granules()
     }
 
     #[cfg(feature = "transaction-mvcc")]
@@ -2929,6 +3012,58 @@ impl TransactionState {
     }
 
     #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn prepare_mvcc_object_payload_publications(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<(
+        Vec<persist::PendingPublication>,
+        Vec<(ObjectId, ObjectPayload)>,
+    )> {
+        self.ensure_active()?;
+        let updates = self
+            .staged_objects
+            .iter()
+            .map(|(&object_id, record)| {
+                let payload = record.payload().clone();
+                ensure!(
+                    object_table.kind(object_id)? == payload.kind(),
+                    "object payload kind does not match object table slot kind"
+                );
+                Ok((object_id, payload, object_table.is_persistent(object_id)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let reserved_object_versions = if let Some(runtime) = &self.shared_region_runtime {
+            runtime.reserve_persistent_object_record_versions(
+                updates
+                    .iter()
+                    .filter_map(|(object_id, _, persistent)| persistent.then_some(*object_id)),
+            )?
+        } else {
+            BTreeMap::new()
+        };
+        let mut publications = Vec::new();
+        let mut volatile = Vec::new();
+        for (object_id, payload, persistent) in updates {
+            if !persistent {
+                volatile.push((object_id, payload));
+                continue;
+            }
+            let publication =
+                if let Some(version) = reserved_object_versions.get(&object_id).copied() {
+                    object_table
+                        .persistent_object_pending_publication_from_payload_with_record_version(
+                            object_id, &payload, version,
+                        )?
+                } else {
+                    object_table
+                        .persistent_object_pending_publication_from_payload(object_id, &payload)?
+                };
+            publications.push(publication);
+        }
+        Ok((publications, volatile))
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn object_is_newly_allocated_for_commit(&self, object: ObjectId) -> Result<bool> {
         self.ensure_active()?;
         Ok(self.allocated_objects.contains(&object))
@@ -4106,6 +4241,11 @@ impl TransactionState {
             current_thread_transaction() == self.active,
             "thread transaction state does not match active transaction"
         );
+        #[cfg(feature = "transaction-mvcc")]
+        ensure!(
+            self.mvcc_terminal_commit.is_none(),
+            "MVCC terminal commit retry is pending"
+        );
         Ok(())
     }
 
@@ -4144,6 +4284,8 @@ impl TransactionState {
             pending_linear_undo_chunks: mem::take(&mut self.pending_linear_undo_chunks),
             scratch: mem::take(&mut self.scratch),
             pending_memory_store: self.pending_memory_store.take(),
+            #[cfg(feature = "transaction-mvcc")]
+            mvcc_terminal_commit: self.mvcc_terminal_commit.take(),
         }
     }
 
@@ -4169,6 +4311,10 @@ impl TransactionState {
         self.pending_linear_undo_chunks = workspace.pending_linear_undo_chunks;
         self.scratch = workspace.scratch;
         self.pending_memory_store = workspace.pending_memory_store;
+        #[cfg(feature = "transaction-mvcc")]
+        {
+            self.mvcc_terminal_commit = workspace.mvcc_terminal_commit;
+        }
     }
 
     pub(super) fn clear_active(&mut self) -> Result<()> {

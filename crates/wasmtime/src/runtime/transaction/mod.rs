@@ -27,6 +27,8 @@ mod region_runtime;
 mod state;
 pub(crate) mod type_layout;
 mod visibility;
+#[cfg(feature = "transaction-mvcc")]
+pub(crate) use visibility::SelectedTransactionVisibility;
 mod wasmtime_layout;
 use concurrency::ConcurrencyControlState;
 #[cfg(all(
@@ -112,8 +114,12 @@ pub(crate) use durable_ref::DurableExternRefHostData;
 pub(crate) use durable_ref::{
     DurableExternIdentity, DurableFuncIdentity, DurableReferenceRegistry,
 };
+#[cfg(all(test, feature = "transaction-mvcc"))]
+pub(crate) use mvcc::MvccCommitFaultPoint;
 #[cfg(feature = "transaction-mvcc")]
-pub(crate) use mvcc::{PreparedDomainValues, PreparedObjectValue, PreparedValue};
+pub(crate) use mvcc::{
+    InstalledDomainKeys, MvccRuntime, PreparedDomainValues, PreparedObjectValue, PreparedValue,
+};
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]
@@ -121,6 +127,8 @@ pub(crate) use object_heap::encode_object_record_for_test;
 pub(crate) use object_table::ObjectTable;
 use object_table::recovered_record_location_from_winner;
 pub use object_table::retire_unreachable_object_chunks_for_test;
+#[cfg(all(test, feature = "transaction-mvcc"))]
+pub(crate) use persist::PendingPublication;
 pub(crate) use persist::{
     PendingCommitLogEntry, PendingGranuleUndo, StreamPublisher, TxDurableLog,
 };
@@ -136,6 +144,8 @@ use state::PersistentRootKey;
 pub(crate) use state::{
     GlobalSnapshot, StagedObjectRecord, StagedRecord, TableElementSnapshot, TransactionState,
 };
+#[cfg(feature = "transaction-mvcc")]
+pub(crate) use state::{MvccTerminalCommitState, MvccTerminalDecision};
 
 pub(crate) fn combine_operation_and_cleanup_results<T>(
     operation: Result<T>,

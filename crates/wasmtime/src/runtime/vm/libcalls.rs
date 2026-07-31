@@ -59,6 +59,8 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 #[cfg(feature = "gc")]
 use crate::runtime::transaction::DurableExternRefHostData;
+#[cfg(all(test, feature = "transaction-mvcc"))]
+use crate::runtime::transaction::MvccCommitFaultPoint;
 use crate::runtime::transaction::{
     DurableReferenceRegistry, GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
@@ -73,7 +75,9 @@ use crate::runtime::transaction::{
 };
 #[cfg(feature = "transaction-mvcc")]
 use crate::runtime::transaction::{
-    PreparedDomainValues, PreparedObjectValue, PreparedValue, TMemoryGranuleSnapshot,
+    InstalledDomainKeys, MvccRuntime, MvccTerminalCommitState, MvccTerminalDecision,
+    PreparedDomainValues, PreparedObjectValue, PreparedValue, TMEMORY_GRANULE_SIZE,
+    TMemoryGranuleSnapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -86,6 +90,8 @@ use crate::{Engine, HeapType, StorageType, ValType};
 use alloc::collections::BTreeMap;
 #[cfg(feature = "transaction-mvcc")]
 use alloc::collections::BTreeSet;
+#[cfg(feature = "transaction-mvcc")]
+use alloc::sync::Arc;
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
@@ -297,7 +303,18 @@ fn memory_grow(
 // `SHISOFT-TWASM-MOCK` tags mark explicit research boundaries such as live-only
 // reference bridge fallbacks; committed object/root and linear-memory paths use
 // the durable transaction machinery.
-fn transaction_enter_tfunc(store: &mut dyn VMStore, _instance: InstanceId) -> Result<u32> {
+fn transaction_enter_tfunc(store: &mut dyn VMStore, instance: InstanceId) -> Result<u32> {
+    #[cfg(feature = "transaction-mvcc")]
+    if store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .has_mvcc_terminal_commit()
+    {
+        transaction_commit_mvcc_impl(store, instance)?;
+    }
+    #[cfg(not(feature = "transaction-mvcc"))]
+    let _ = instance;
+
     let store = store.store_opaque_mut();
     let region = store.transaction_region_runtime().clone();
     let state = store.transaction_state_mut();
@@ -311,7 +328,18 @@ fn transaction_enter_tfunc(store: &mut dyn VMStore, _instance: InstanceId) -> Re
     Ok(1)
 }
 
-fn transaction_begin(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+fn transaction_begin(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    #[cfg(feature = "transaction-mvcc")]
+    if store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .has_mvcc_terminal_commit()
+    {
+        transaction_commit_mvcc_impl(store, instance)?;
+    }
+    #[cfg(not(feature = "transaction-mvcc"))]
+    let _ = instance;
+
     let store = store.store_opaque_mut();
     let region = store.transaction_region_runtime().clone();
     let state = store.transaction_state_mut();
@@ -931,6 +959,14 @@ fn transaction_commit_single_version_impl(
 
 #[cfg(feature = "transaction-mvcc")]
 fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    if store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .has_mvcc_terminal_commit()
+    {
+        return drive_mvcc_terminal_commit(store);
+    }
+
     {
         let store = store.store_opaque_mut();
         let (engine, gc_store, durable_refs, state, object_table) =
@@ -961,7 +997,7 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
         state.staged_object_payloads_for_commit(&*object_table)?
     };
 
-    let _user_transaction_region_permit = {
+    let user_transaction_region_permit = {
         let state = store.store_opaque_mut().transaction_state_mut();
         if let Some(runtime) = state.shared_region_runtime_for_publication() {
             Some(runtime.begin_user_transaction_region()?)
@@ -983,6 +1019,8 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
         .acquire_active_mvcc_certification(&visibility, snapshot, transaction, &reads, &writes)?;
 
     let (commit, pending) = visibility.begin_pending_commit()?;
+    #[cfg(test)]
+    visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterCertification)?;
     let mut physical_values = PreparedDomainValues::default();
     let mut table_granules = BTreeSet::new();
     for record in &records {
@@ -1217,9 +1255,6 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
     }
     #[cfg(test)]
     visibility.run_predecessor_collected_hook_for_test()?;
-    let mut prepare = visibility.begin_prepare(commit)?;
-    prepare.append_prepared_values(physical_values)?;
-    let prepared_values = prepare.into_values();
 
     let (stream_id, txid) = {
         let state = store.store_opaque_mut().transaction_state_mut();
@@ -1241,19 +1276,11 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
         state.begin_terminal_commit_with_object_cleanup(object_table)?;
     }
 
-    let mut final_marker =
-        commit_staged_tmemory_records(store, instance, &records, stream_id, txid)?;
-    #[cfg(test)]
-    visibility.run_inside_install_hook_for_test()?;
-    for record in &records {
-        apply_staged_transaction_record(store, instance, record)?;
-    }
-
-    let (durable_publications, root_delta, persistent_gc_delta) = {
+    let (durable_publications, root_delta, persistent_gc_delta, volatile_objects) = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
-        let mut object_publications = Vec::new();
-        state.commit_object_payloads_into(object_table, &mut object_publications)?;
+        let (mut object_publications, volatile_objects) =
+            state.prepare_mvcc_object_payload_publications(object_table)?;
         let root_delta = state.staged_persistent_root_delta(&*object_table)?;
         let root_publications = state.persistent_root_publications(&root_delta)?;
         let tmemory_size_publications = state.tmemory_size_publications()?;
@@ -1261,66 +1288,939 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
             state.persistent_gc_commit_delta(&*object_table, &object_publications)?;
         object_publications.extend(root_publications);
         object_publications.extend(tmemory_size_publications);
-        (object_publications, root_delta, persistent_gc_delta)
+        (
+            object_publications,
+            root_delta,
+            persistent_gc_delta,
+            volatile_objects,
+        )
     };
-    let mut durable_publication_markers = Vec::new();
-    if !durable_publications.is_empty() {
-        let store = store.store_opaque_mut();
-        let (state, object_table) = store.transaction_state_and_object_table_mut();
-        durable_publication_markers = state
-            .publish_object_publications_before_commit_with_markers(
-                stream_id,
-                txid,
-                &*object_table,
-                &durable_publications,
-            )?;
-        final_marker = durable_publication_markers.last().copied().or(final_marker);
-    }
-    if let Some(marker) = final_marker {
-        if store
-            .store_opaque_mut()
-            .transaction_state_mut()
-            .take_fail_next_commit_before_lp_for_test()
-        {
-            bail!("transaction test failure before commit LP");
-        }
-        store
-            .store_opaque_mut()
-            .transaction_state_mut()
-            .publish_commit_lp(stream_id, txid, marker)?;
-    }
-
+    let mut prepare = visibility.begin_prepare(commit.clone())?;
+    prepare.append_prepared_values(physical_values)?;
+    let prepared_values = prepare.into_values();
     store
         .store_opaque_mut()
         .transaction_state_mut()
-        .prepare_mvcc_commit_completion(root_delta)?;
+        .install_mvcc_terminal_commit(MvccTerminalCommitState {
+            instance,
+            stream_id,
+            txid,
+            commit,
+            pending: Some(pending),
+            certification: Some(certification),
+            user_region_permit: user_transaction_region_permit,
+            prepared: prepared_values,
+            installed: InstalledDomainKeys::default(),
+            undo_published: BTreeSet::new(),
+            durable_publications,
+            durable_publication_markers: Vec::new(),
+            durable_publications_installed: BTreeSet::new(),
+            root_delta,
+            persistent_gc_delta,
+            volatile_objects,
+            final_marker: None,
+            lp_published: false,
+            decision: MvccTerminalDecision::Abortable,
+            root_applied: false,
+            version_bumps_applied: false,
+            completion_error: None,
+            #[cfg(test)]
+            inside_install_hook_ran: false,
+            #[cfg(test)]
+            before_publish_hook_ran: false,
+            #[cfg(test)]
+            after_publish_hook_ran: false,
+        })?;
+    drive_mvcc_terminal_commit(store)
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn drive_mvcc_terminal_commit(store: &mut dyn VMStore) -> Result<()> {
+    let mut terminal = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .take_mvcc_terminal_commit()
+        .context("MVCC terminal commit state is missing")?;
+    let visibility = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .active_mvcc_commit_context()?
+        .0;
+
+    if terminal.decision == MvccTerminalDecision::Rollback {
+        let original = terminal
+            .completion_error
+            .clone()
+            .unwrap_or_else(|| "MVCC commit rollback retry".to_string());
+        return finish_mvcc_pre_decision_failure(store, &visibility, terminal, original);
+    }
+
+    let attempt = (|| -> Result<()> {
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterPreparation)?;
+        install_mvcc_abortable_current_values(store, &visibility, &mut terminal)?;
+        publish_mvcc_durable_values(store, &mut terminal)?;
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterDurablePublication)?;
+
+        if let Some(marker) = terminal.final_marker {
+            if store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .take_fail_next_commit_before_lp_for_test()
+            {
+                bail!("transaction test failure before commit LP");
+            }
+            store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .publish_commit_lp(terminal.stream_id, terminal.txid, marker)?;
+            terminal.lp_published = true;
+            terminal.decision = MvccTerminalDecision::ForceCommit;
+            #[cfg(test)]
+            visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterDurableLp)?;
+        } else if mvcc_has_irreversible_current_work(&terminal) {
+            // Markerless commits have no durable LP. Crossing this internal
+            // decision keeps the record pending and the certification permit
+            // held while synchronous force-completion installs values that
+            // cannot be rolled back (notably monotonic size growth).
+            terminal.decision = MvccTerminalDecision::ForceCommit;
+        }
+
+        if terminal.decision == MvccTerminalDecision::ForceCommit {
+            force_complete_mvcc_commit(store, &visibility, &mut terminal)?;
+        } else {
+            publish_mvcc_record_and_cleanup(store, &visibility, &mut terminal)?;
+        }
+        Ok(())
+    })();
+
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(error) if terminal.decision == MvccTerminalDecision::Abortable => {
+            finish_mvcc_pre_decision_failure(store, &visibility, terminal, format!("{error:#}"))
+        }
+        Err(error) => {
+            let original = format!("{error:#}");
+            terminal.completion_error = Some(original.clone());
+            let outcome = if terminal.lp_published {
+                "committed durably"
+            } else {
+                "committed irrevocably"
+            };
+            if store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .active_transaction()
+                .is_none()
+            {
+                return Err(crate::format_err!(
+                    "transaction {outcome} but completion/cleanup failed: {original}"
+                ));
+            }
+            match force_complete_mvcc_commit(store, &visibility, &mut terminal) {
+                Ok(()) => Err(crate::format_err!(
+                    "transaction {outcome} but completion/cleanup failed: {original}"
+                )),
+                Err(completion_error) => {
+                    let combined = crate::format_err!(
+                        "transaction {outcome} but completion/cleanup failed: {original}; force-completion also failed: {completion_error:#}"
+                    );
+                    if store
+                        .store_opaque_mut()
+                        .transaction_state_mut()
+                        .active_transaction()
+                        .is_some()
+                    {
+                        store
+                            .store_opaque_mut()
+                            .transaction_state_mut()
+                            .install_mvcc_terminal_commit(terminal)?;
+                    }
+                    Err(combined)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn finish_mvcc_pre_decision_failure(
+    store: &mut dyn VMStore,
+    visibility: &Arc<MvccRuntime>,
+    mut terminal: MvccTerminalCommitState,
+    original: String,
+) -> Result<()> {
+    terminal.decision = MvccTerminalDecision::Rollback;
+    terminal.completion_error = Some(original.clone());
+    let abort_record = match terminal.pending.as_mut() {
+        Some(pending) => pending.abort(),
+        None => Ok(()),
+    };
+    if abort_record.is_ok() {
+        terminal.pending = None;
+    }
+    let rollback = rollback_mvcc_current_values(store, visibility, &mut terminal);
+    let remove_versions = if abort_record.is_ok() && rollback.is_ok() {
+        visibility.remove_aborted_commit_versions(&terminal.commit)
+    } else {
+        Ok(())
+    };
+    let typed_retry_required =
+        abort_record.is_err() || rollback.is_err() || remove_versions.is_err();
+    let cleanup = if !typed_retry_required {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.abort_allocated_objects(object_table)
+    } else {
+        Ok(())
+    };
+
+    let rollback_result = combine_operation_and_cleanup_results(
+        abort_record,
+        rollback,
+        "failed to restore MVCC current values",
+    );
+    let rollback_result = combine_operation_and_cleanup_results(
+        rollback_result,
+        remove_versions,
+        "failed to remove aborted MVCC versions",
+    );
+    let rollback_result = combine_operation_and_cleanup_results(
+        rollback_result,
+        cleanup,
+        "failed to clean up aborted MVCC transaction",
+    );
+    match rollback_result {
+        Ok(()) => Err(crate::format_err!("{original}")),
+        Err(rollback_error) => {
+            let active = store
+                .store_opaque_mut()
+                .transaction_state_mut()
+                .active_transaction()
+                .is_some();
+            if typed_retry_required && active {
+                store
+                    .store_opaque_mut()
+                    .transaction_state_mut()
+                    .install_mvcc_terminal_commit(terminal)?;
+                Err(crate::format_err!(
+                    "{original}; MVCC rollback requires an explicit retry: {rollback_error:#}"
+                ))
+            } else {
+                Err(crate::format_err!(
+                    "{original}; MVCC rollback/cleanup also failed: {rollback_error:#}"
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn install_mvcc_abortable_current_values(
+    store: &mut dyn VMStore,
+    visibility: &Arc<MvccRuntime>,
+    terminal: &mut MvccTerminalCommitState,
+) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = visibility;
+
+    let memories = terminal
+        .prepared
+        .memories
+        .iter()
+        .map(|(&key, value)| (key, value.clone()))
+        .collect::<Vec<_>>();
+    for (granule, prepared) in memories {
+        if terminal.installed.memories.contains(&granule) {
+            continue;
+        }
+        let requires_growth = mvcc_memory_install_requires_growth(terminal, granule)?;
+        if requires_growth {
+            if mvcc_memory_backend(store, terminal.instance, granule)? == TMemoryBackend::VMemory {
+                continue;
+            }
+            reserve_mvcc_memory_capacity(store, terminal, granule)?;
+            publish_mvcc_memory_undo_if_needed(store, terminal, granule, &prepared.value, true)?;
+            install_mvcc_memory_value_within_capacity(
+                store,
+                terminal.instance,
+                granule,
+                &prepared.value,
+            )?;
+        } else {
+            publish_mvcc_memory_undo_if_needed(store, terminal, granule, &prepared.value, false)?;
+            install_mvcc_memory_value(store, terminal.instance, granule, &prepared.value)?;
+        }
+        terminal.installed.memories.insert(granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterMemoryInstall)?;
+        #[cfg(test)]
+        if !terminal.inside_install_hook_ran {
+            terminal.inside_install_hook_ran = true;
+            visibility.run_inside_install_hook_for_test()?;
+        }
+    }
+
+    let globals = terminal
+        .prepared
+        .globals
+        .iter()
+        .map(|(&key, value)| (key, value.value))
+        .collect::<Vec<_>>();
+    for (granule, value) in globals {
+        if terminal.installed.globals.contains(&granule) {
+            continue;
+        }
+        install_mvcc_global_value(store, terminal.instance, granule, value)?;
+        terminal.installed.globals.insert(granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterGlobalInstall)?;
+    }
+
+    let tables = terminal
+        .prepared
+        .tables
+        .iter()
+        .map(|(&key, value)| (key, value.clone()))
+        .collect::<Vec<_>>();
+    for (granule, prepared) in tables {
+        if terminal.installed.tables.contains(&granule)
+            || prepared.predecessor.elements().len() != prepared.value.elements().len()
+        {
+            continue;
+        }
+        install_mvcc_table_value(store, terminal.instance, granule, &prepared.value)?;
+        terminal.installed.tables.insert(granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterTableInstall)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn publish_mvcc_memory_undo_if_needed(
+    store: &mut dyn VMStore,
+    terminal: &mut MvccTerminalCommitState,
+    granule: GranuleId,
+    value: &[u8],
+    within_capacity: bool,
+) -> Result<()> {
+    if terminal.undo_published.contains(&granule) {
+        return Ok(());
+    }
+    let GranuleId::TMemory {
+        instance,
+        memory_index,
+        granule_index,
+    } = granule
+    else {
+        bail!("MVCC memory installer received a non-memory granule");
+    };
+    let owner = instance
+        .map(InstanceId::from_u32)
+        .unwrap_or(terminal.instance);
+    let memory = MemoryIndex::from_u32(memory_index);
+    let undo = {
+        let instance_ref = store.instance_mut(owner);
+        let instance_ref = instance_ref.as_ref();
+        let tmemory = instance_ref
+            .get_tmemory(memory)
+            .context("transactional memory operation targeted non-transactional memory")?;
+        if tmemory.backend() == TMemoryBackend::VMemory {
+            terminal.undo_published.insert(granule);
+            return Ok(());
+        }
+        if within_capacity {
+            tmemory.prepare_tmemory_undo_record_within_capacity_for_mvcc(
+                instance,
+                memory_index,
+                granule_index,
+                value,
+            )?
+        } else {
+            tmemory.prepare_tmemory_undo_record(instance, memory_index, granule_index, value)?
+        }
+    };
+    let marker = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .publish_tmemory_undo_before_in_place_write(terminal.stream_id, terminal.txid, &undo)?;
+    terminal.final_marker = Some(marker);
+    terminal.undo_published.insert(granule);
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn publish_mvcc_durable_values(
+    store: &mut dyn VMStore,
+    terminal: &mut MvccTerminalCommitState,
+) -> Result<()> {
+    while terminal.durable_publication_markers.len() < terminal.durable_publications.len() {
+        let index = terminal.durable_publication_markers.len();
+        let publication = terminal.durable_publications[index].clone();
+        let markers = {
+            let store = store.store_opaque_mut();
+            let (state, object_table) = store.transaction_state_and_object_table_mut();
+            state.publish_object_publications_before_commit_with_markers(
+                terminal.stream_id,
+                terminal.txid,
+                &*object_table,
+                core::slice::from_ref(&publication),
+            )?
+        };
+        let marker = *markers
+            .first()
+            .context("durable MVCC publication produced no marker")?;
+        terminal.durable_publication_markers.push(marker);
+        terminal.final_marker = Some(marker);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn mvcc_has_irreversible_current_work(terminal: &MvccTerminalCommitState) -> bool {
+    !terminal.prepared.memory_sizes.is_empty()
+        || !terminal.prepared.table_sizes.is_empty()
+        || !terminal.volatile_objects.is_empty()
+        || terminal
+            .prepared
+            .memories
+            .keys()
+            .any(|key| !terminal.installed.memories.contains(key))
+        || terminal
+            .prepared
+            .tables
+            .keys()
+            .any(|key| !terminal.installed.tables.contains(key))
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn force_complete_mvcc_commit(
+    store: &mut dyn VMStore,
+    visibility: &Arc<MvccRuntime>,
+    terminal: &mut MvccTerminalCommitState,
+) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = visibility;
+
+    terminal.decision = MvccTerminalDecision::ForceCommit;
+
+    let memory_sizes = terminal
+        .prepared
+        .memory_sizes
+        .iter()
+        .map(|(&key, value)| (key, value.value))
+        .collect::<Vec<_>>();
+    for (granule, value) in memory_sizes {
+        if terminal.installed.memory_sizes.contains(&granule) {
+            continue;
+        }
+        let GranuleId::TMemorySize {
+            instance,
+            memory_index,
+        } = granule
+        else {
+            bail!("MVCC memory-size installer received a non-size granule");
+        };
+        grow_tmemory_to_pages(
+            store,
+            instance
+                .map(InstanceId::from_u32)
+                .unwrap_or(terminal.instance),
+            memory_index,
+            value,
+        )?;
+        terminal.installed.memory_sizes.insert(granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterMemorySizeInstall)?;
+    }
+
+    let table_sizes = terminal
+        .prepared
+        .table_sizes
+        .iter()
+        .map(|(&key, value)| (key, value.value))
+        .collect::<Vec<_>>();
+    for (granule, value) in table_sizes {
+        if terminal.installed.table_sizes.contains(&granule) {
+            continue;
+        }
+        let GranuleId::TTableSize {
+            instance,
+            table_index,
+        } = granule
+        else {
+            bail!("MVCC table-size installer received a non-size granule");
+        };
+        grow_defined_table_to(
+            store,
+            instance
+                .map(InstanceId::from_u32)
+                .unwrap_or(terminal.instance),
+            table_index,
+            value,
+        )?;
+        terminal.installed.table_sizes.insert(granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterTableSizeInstall)?;
+    }
+
+    let memories = terminal
+        .prepared
+        .memories
+        .iter()
+        .map(|(&key, value)| (key, value.value.clone()))
+        .collect::<Vec<_>>();
+    for (granule, value) in memories {
+        if terminal.installed.memories.contains(&granule) {
+            continue;
+        }
+        install_mvcc_memory_value(store, terminal.instance, granule, &value)?;
+        terminal.installed.memories.insert(granule);
+    }
+    let globals = terminal
+        .prepared
+        .globals
+        .iter()
+        .map(|(&key, value)| (key, value.value))
+        .collect::<Vec<_>>();
+    for (granule, value) in globals {
+        if terminal.installed.globals.contains(&granule) {
+            continue;
+        }
+        install_mvcc_global_value(store, terminal.instance, granule, value)?;
+        terminal.installed.globals.insert(granule);
+    }
+    let tables = terminal
+        .prepared
+        .tables
+        .iter()
+        .map(|(&key, value)| (key, value.value.clone()))
+        .collect::<Vec<_>>();
+    for (granule, value) in tables {
+        if terminal.installed.tables.contains(&granule) {
+            continue;
+        }
+        install_mvcc_table_value(store, terminal.instance, granule, &value)?;
+        terminal.installed.tables.insert(granule);
+    }
+
+    let volatile = terminal.volatile_objects.clone();
+    for (object, payload) in volatile {
+        if terminal.installed.objects.contains(&object) {
+            continue;
+        }
+        store
+            .store_opaque_mut()
+            .transaction_object_table_mut()
+            .install_current_payload_snapshot(object, &payload)?;
+        terminal.installed.objects.insert(object);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterObjectInstall)?;
+    }
+
+    #[cfg(test)]
+    visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::BeforeMappedObjectInstall)?;
+    for (index, publication) in terminal.durable_publications.iter().enumerate() {
+        if terminal.durable_publications_installed.contains(&index) {
+            continue;
+        }
+        let marker = terminal
+            .durable_publication_markers
+            .get(index)
+            .copied()
+            .context("durable MVCC publication marker is missing")?;
+        let installed = {
+            let store = store.store_opaque_mut();
+            let (state, object_table) = store.transaction_state_and_object_table_mut();
+            state.install_committed_mapped_object_publications(
+                object_table,
+                core::slice::from_ref(publication),
+                core::slice::from_ref(&marker),
+            )?
+        };
+        terminal.installed.objects.extend(installed);
+        terminal.durable_publications_installed.insert(index);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterObjectInstall)?;
+    }
+
+    if !terminal.root_applied {
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::DuringRootApply)?;
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .prepare_mvcc_root_commit_completion(terminal.root_delta.clone())?;
+        terminal.root_applied = true;
+    }
+    if !terminal.version_bumps_applied {
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .prepare_mvcc_version_commit_completion()?;
+        terminal.version_bumps_applied = true;
+    }
+
+    publish_mvcc_record_and_cleanup(store, visibility, terminal)
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn publish_mvcc_record_and_cleanup(
+    store: &mut dyn VMStore,
+    visibility: &Arc<MvccRuntime>,
+    terminal: &mut MvccTerminalCommitState,
+) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = visibility;
+
+    #[cfg(test)]
+    if !terminal.before_publish_hook_ran {
+        terminal.before_publish_hook_ran = true;
+        visibility.run_before_publish_hook_for_test()?;
+    }
+    if terminal.final_marker.is_none() {
+        terminal.decision = MvccTerminalDecision::ForceCommit;
+    }
+    if let Some(pending) = terminal.pending.as_mut() {
+        let _timestamp = pending.publish()?;
+        terminal.pending = None;
+    }
+    #[cfg(test)]
+    visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::AfterRecordTransition)?;
+    #[cfg(test)]
+    if !terminal.after_publish_hook_ran {
+        terminal.after_publish_hook_ran = true;
+        visibility.run_after_publish_hook_for_test()?;
+    }
+    let persistent_gc_delta = terminal.persistent_gc_delta.clone();
     {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
-        if !durable_publication_markers.is_empty() {
-            state.install_committed_mapped_object_publications(
-                object_table,
-                &durable_publications,
-                &durable_publication_markers,
-            )?;
-        }
         let _ = state.observe_persistent_gc_commit_delta_after_commit_best_effort(
             object_table,
             &persistent_gc_delta,
         );
     }
-
     #[cfg(test)]
-    visibility.run_before_publish_hook_for_test()?;
-    let _timestamp = pending.publish()?;
-    #[cfg(test)]
-    visibility.run_after_publish_hook_for_test()?;
+    visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::DuringCleanup)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
         .finish_mvcc_commit_cleanup()?;
-    drop(certification);
-    drop(prepared_values);
+    terminal.certification.take();
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn rollback_mvcc_current_values(
+    store: &mut dyn VMStore,
+    visibility: &Arc<MvccRuntime>,
+    terminal: &mut MvccTerminalCommitState,
+) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = visibility;
+
+    let objects = terminal
+        .installed
+        .objects
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    for object in objects {
+        let prepared = terminal
+            .prepared
+            .objects
+            .get(&object)
+            .context("installed MVCC object has no prepared value")?
+            .clone();
+        let object_table = store.store_opaque_mut().transaction_object_table_mut();
+        match prepared.predecessor {
+            Some(predecessor) => {
+                object_table.install_current_payload_snapshot(object, &predecessor)?
+            }
+            None => {
+                object_table.free(object)?;
+            }
+        }
+        terminal.installed.objects.remove(&object);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::DuringRollback)?;
+    }
+
+    ensure!(
+        terminal.installed.table_sizes.is_empty(),
+        "MVCC rollback cannot shrink an installed table size"
+    );
+    let tables = terminal
+        .installed
+        .tables
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    for granule in tables {
+        let predecessor = terminal
+            .prepared
+            .tables
+            .get(&granule)
+            .context("installed MVCC table has no predecessor")?
+            .predecessor
+            .clone();
+        install_mvcc_table_value(store, terminal.instance, granule, &predecessor)?;
+        terminal.installed.tables.remove(&granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::DuringRollback)?;
+    }
+
+    let globals = terminal
+        .installed
+        .globals
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    for granule in globals {
+        let predecessor = terminal
+            .prepared
+            .globals
+            .get(&granule)
+            .context("installed MVCC global has no predecessor")?
+            .predecessor;
+        install_mvcc_global_value(store, terminal.instance, granule, predecessor)?;
+        terminal.installed.globals.remove(&granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::DuringRollback)?;
+    }
+
+    ensure!(
+        terminal.installed.memory_sizes.is_empty(),
+        "MVCC rollback cannot shrink an installed memory size"
+    );
+    let memories = terminal
+        .installed
+        .memories
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    for granule in memories {
+        let predecessor = terminal
+            .prepared
+            .memories
+            .get(&granule)
+            .context("installed MVCC memory has no predecessor")?
+            .predecessor
+            .clone();
+        if mvcc_memory_install_requires_growth(terminal, granule)? {
+            install_mvcc_memory_value_within_capacity(
+                store,
+                terminal.instance,
+                granule,
+                &predecessor,
+            )?;
+        } else {
+            install_mvcc_memory_value(store, terminal.instance, granule, &predecessor)?;
+        }
+        terminal.installed.memories.remove(&granule);
+        #[cfg(test)]
+        visibility.inject_commit_fault_for_test(MvccCommitFaultPoint::DuringRollback)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn mvcc_memory_install_requires_growth(
+    terminal: &MvccTerminalCommitState,
+    granule: GranuleId,
+) -> Result<bool> {
+    let GranuleId::TMemory {
+        instance,
+        memory_index,
+        granule_index,
+    } = granule
+    else {
+        bail!("MVCC memory growth check received a non-memory granule");
+    };
+    let size_key = GranuleId::TMemorySize {
+        instance,
+        memory_index,
+    };
+    let Some(size) = terminal.prepared.memory_sizes.get(&size_key) else {
+        return Ok(false);
+    };
+    let granule_start = granule_index
+        .checked_mul(u64::try_from(TMEMORY_GRANULE_SIZE).unwrap())
+        .context("MVCC memory granule offset overflow")?;
+    let old_bytes = size
+        .predecessor
+        .checked_mul(u64::try_from(crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE).unwrap())
+        .context("MVCC predecessor memory size overflow")?;
+    Ok(granule_start >= old_bytes)
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn mvcc_memory_backend(
+    store: &mut dyn VMStore,
+    default_instance: InstanceId,
+    granule: GranuleId,
+) -> Result<TMemoryBackend> {
+    let GranuleId::TMemory {
+        instance,
+        memory_index,
+        ..
+    } = granule
+    else {
+        bail!("MVCC memory backend query received a non-memory granule");
+    };
+    let owner = instance
+        .map(InstanceId::from_u32)
+        .unwrap_or(default_instance);
+    let instance_ref = store.instance_mut(owner);
+    let instance_ref = instance_ref.as_ref();
+    let tmemory = instance_ref
+        .get_tmemory(MemoryIndex::from_u32(memory_index))
+        .context("transactional memory operation targeted non-transactional memory")?;
+    Ok(tmemory.backend())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn reserve_mvcc_memory_capacity(
+    store: &mut dyn VMStore,
+    terminal: &MvccTerminalCommitState,
+    granule: GranuleId,
+) -> Result<()> {
+    let GranuleId::TMemory {
+        instance,
+        memory_index,
+        ..
+    } = granule
+    else {
+        bail!("MVCC memory capacity reservation received a non-memory granule");
+    };
+    let size_key = GranuleId::TMemorySize {
+        instance,
+        memory_index,
+    };
+    let target_pages = terminal
+        .prepared
+        .memory_sizes
+        .get(&size_key)
+        .context("MVCC hidden-capacity install is missing its prepared memory size")?
+        .value;
+    let owner = instance
+        .map(InstanceId::from_u32)
+        .unwrap_or(terminal.instance);
+    let mut instance_ref = store.instance_mut(owner);
+    let tmemory = instance_ref
+        .as_mut()
+        .get_tmemory_mut(MemoryIndex::from_u32(memory_index))
+        .context("transactional memory operation targeted non-transactional memory")?;
+    tmemory.reserve_backing_capacity_to_pages_for_mvcc(target_pages)
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn install_mvcc_memory_value(
+    store: &mut dyn VMStore,
+    default_instance: InstanceId,
+    granule: GranuleId,
+    value: &[u8],
+) -> Result<()> {
+    let GranuleId::TMemory {
+        instance,
+        memory_index,
+        granule_index,
+    } = granule
+    else {
+        bail!("MVCC memory installer received a non-memory granule");
+    };
+    let owner = instance
+        .map(InstanceId::from_u32)
+        .unwrap_or(default_instance);
+    let mut instance_ref = store.instance_mut(owner);
+    let tmemory = instance_ref
+        .as_mut()
+        .get_tmemory_mut(MemoryIndex::from_u32(memory_index))
+        .context("transactional memory operation targeted non-transactional memory")?;
+    tmemory.commit_staged_tmemory_granules_direct(&[(granule_index, value.to_vec())])
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn install_mvcc_memory_value_within_capacity(
+    store: &mut dyn VMStore,
+    default_instance: InstanceId,
+    granule: GranuleId,
+    value: &[u8],
+) -> Result<()> {
+    let GranuleId::TMemory {
+        instance,
+        memory_index,
+        granule_index,
+    } = granule
+    else {
+        bail!("MVCC memory capacity installer received a non-memory granule");
+    };
+    let owner = instance
+        .map(InstanceId::from_u32)
+        .unwrap_or(default_instance);
+    let mut instance_ref = store.instance_mut(owner);
+    let tmemory = instance_ref
+        .as_mut()
+        .get_tmemory_mut(MemoryIndex::from_u32(memory_index))
+        .context("transactional memory operation targeted non-transactional memory")?;
+    tmemory.commit_staged_tmemory_granule_within_capacity_for_mvcc(granule_index, value)
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn install_mvcc_global_value(
+    store: &mut dyn VMStore,
+    default_instance: InstanceId,
+    granule: GranuleId,
+    value: GlobalSnapshot,
+) -> Result<()> {
+    let GranuleId::TGlobal {
+        instance,
+        global_index,
+    } = granule
+    else {
+        bail!("MVCC global installer received a non-global granule");
+    };
+    let owner = instance
+        .map(InstanceId::from_u32)
+        .unwrap_or(default_instance);
+    let mut global = global_definition_ptr(store, owner, GlobalIndex::from_u32(global_index))?;
+    write_global_snapshot(store.store_opaque_mut(), unsafe { global.as_mut() }, value)
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn install_mvcc_table_value(
+    store: &mut dyn VMStore,
+    default_instance: InstanceId,
+    granule: GranuleId,
+    value: &TableGranuleSnapshot,
+) -> Result<()> {
+    let GranuleId::TTable {
+        instance,
+        table_index,
+        granule_index,
+    } = granule
+    else {
+        bail!("MVCC table installer received a non-table granule");
+    };
+    let owner = instance
+        .map(InstanceId::from_u32)
+        .unwrap_or(default_instance);
+    let start = granule_index
+        .checked_mul(TableGranuleSnapshot::ELEMENT_CAPACITY)
+        .context("MVCC table granule offset overflow")?;
+    for (offset, element) in value.elements().iter().copied().enumerate() {
+        let element_index = start
+            .checked_add(u64::try_from(offset).context("MVCC table offset overflow")?)
+            .context("MVCC table element index overflow")?;
+        write_table_element_snapshot(store, owner, table_index, element_index, element)?;
+    }
     Ok(())
 }
 
@@ -1535,7 +2435,7 @@ fn transaction_tref_cast_read_impl(
     ref_handle: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     state.acquire_tref_read_for_transaction_ref_handle(object_table, ref_handle)?;
@@ -1558,7 +2458,7 @@ fn transaction_tref_cast_write_impl(
     ref_handle: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     state.acquire_tref_write_for_transaction_ref_handle(object_table, ref_handle)?;
@@ -1604,6 +2504,7 @@ fn transaction_tglobal_get_impl(
     global: u32,
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store, instance)?;
 
     let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let (staged, visibility) = {
@@ -1649,7 +2550,7 @@ fn transaction_tglobal_set_impl(
 
     let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = global_snapshot_from_tag(tag, value)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
 }
 
@@ -1763,7 +2664,7 @@ fn transaction_tglobal_set_v128_impl(
 
     let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = GlobalSnapshot::V128(unsafe { *value.cast::<[u8; 16]>() });
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
 }
 
@@ -2060,7 +2961,7 @@ fn transaction_tmemory_size_impl(
     memory: u32,
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
     let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     let pages = visible_tmemory_pages(store, instance, owner_instance_key, memory_index)?;
@@ -2085,7 +2986,7 @@ fn transaction_tmemory_grow_impl(
     delta: u64,
 ) -> Result<Option<AllocationSize>> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
     let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     let previous_pages = visible_tmemory_pages(store, instance, owner_instance_key, memory_index)?;
@@ -2134,7 +3035,7 @@ fn transaction_tmemory_fill_impl(
     len: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let len = usize::try_from(len).context("tmemory fill length overflow")?;
     let (memory_index, snapshot) =
         collect_defined_tmemory_snapshot(store, instance, memory, dst, len)?;
@@ -2177,7 +3078,7 @@ fn transaction_tmemory_copy_impl(
     len: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let len = usize::try_from(len).context("tmemory copy length overflow")?;
     let (src_memory_index, src_snapshot) =
         collect_defined_tmemory_snapshot(store, instance, src_memory, src, len)?;
@@ -2234,7 +3135,7 @@ fn transaction_tmemory_init_impl(
     data_len: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let len = usize::try_from(len).context("tmemory init length overflow")?;
     let data_len = usize::try_from(data_len).context("tmemory init data length overflow")?;
     let src = usize::try_from(src).context("tmemory init source offset overflow")?;
@@ -2299,7 +3200,7 @@ fn transaction_tdata_drop(store: &mut dyn VMStore, instance: InstanceId, _data: 
 
 fn transaction_tdata_drop_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)
+    ensure_active_transaction(store, instance)
 }
 
 fn transaction_ttable_get(
@@ -2486,7 +3387,7 @@ fn transaction_ttable_get_impl(
     index: u64,
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let visible_size = transaction_table_size_for_bounds(store, instance, table)?;
     if index >= visible_size {
         bail!(Trap::TableOutOfBounds);
@@ -2573,7 +3474,7 @@ fn transaction_ttable_set_impl(
     value: *mut u8,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let snapshot = transaction_table_snapshot_from_raw(store, instance, table, value)?;
     stage_transaction_table_element_snapshot(store, instance, table, index, snapshot)
 }
@@ -2690,7 +3591,7 @@ fn transaction_ttable_read_range_impl(
     len: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     ensure_transaction_table_range_in_bounds(store, instance, table, start, len)?;
     store
         .store_opaque_mut()
@@ -2719,7 +3620,7 @@ fn transaction_ttable_write_range_impl(
     len: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     ensure_transaction_table_range_in_bounds(store, instance, table, start, len)?;
     store
         .store_opaque_mut()
@@ -2744,7 +3645,7 @@ fn transaction_ttable_size_impl(
     table: u32,
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let size = visible_ttable_size(store, instance, table)?;
     Ok(usize::try_from(size).context("transactional table size overflow")? as *mut u8)
 }
@@ -2769,7 +3670,7 @@ fn transaction_ttable_grow_impl(
     init: *mut u8,
 ) -> Result<Option<AllocationSize>> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
 
     let table_index = DefinedTableIndex::from_u32(table);
     let (maximum, element_type) = {
@@ -2829,7 +3730,7 @@ fn transaction_tstruct_new_impl(
 ) -> Result<core::num::NonZeroU32> {
     let runtime_type_index = transaction_module_type_index_to_shared(store, instance, struct_type)?;
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let field_count =
         usize::try_from(field_count).context("transactional struct field count overflow")?;
     ensure!(
@@ -2993,7 +3894,7 @@ fn transaction_tstruct_set_impl(
     high: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let field = usize::try_from(field).context("transactional struct field index overflow")?;
     let value = object_value_from_persistent_slot_abi(store.store_opaque_mut(), abi)?;
@@ -3030,7 +3931,7 @@ fn transaction_tstruct_get_bytes_impl(
     field: u32,
 ) -> Result<Vec<u8>> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let field = usize::try_from(field).context("transactional struct field index overflow")?;
     let value = {
         let store = store.store_opaque_mut();
@@ -3077,7 +3978,7 @@ fn transaction_tarray_new_impl(
 ) -> Result<core::num::NonZeroU32> {
     let runtime_type_index = transaction_module_type_index_to_shared(store, instance, array_type)?;
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let len = usize::try_from(len).context("transactional array length overflow")?;
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let store = store.store_opaque_mut();
@@ -3200,7 +4101,7 @@ fn transaction_tarray_new_fixed_impl(
 ) -> Result<core::num::NonZeroU32> {
     let runtime_type_index = transaction_module_type_index_to_shared(store, instance, array_type)?;
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let element_count =
         usize::try_from(element_count).context("transactional array element count overflow")?;
     ensure!(
@@ -3379,7 +4280,7 @@ fn transaction_tarray_new_data_impl(
 ) -> Result<core::num::NonZeroU32> {
     let runtime_type_index = transaction_module_type_index_to_shared(store, instance, array_type)?;
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let src = usize::try_from(src).context("transactional array data source offset overflow")?;
     let len = usize::try_from(len).context("transactional array data length overflow")?;
     let data_len =
@@ -3445,7 +4346,7 @@ fn transaction_tarray_new_elem_impl(
 ) -> Result<core::num::NonZeroU32> {
     let runtime_type_index = transaction_module_type_index_to_shared(store, instance, array_type)?;
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let src = usize::try_from(src).context("transactional array elem source offset overflow")?;
     let len = usize::try_from(len).context("transactional array elem length overflow")?;
     let elem_len =
@@ -3610,7 +4511,7 @@ fn transaction_tarray_set_impl(
     high: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     ensure!(gc_ref != 0, "null tarray reference");
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let index = usize::try_from(index).context("transactional array index overflow")?;
@@ -3647,7 +4548,7 @@ fn transaction_tarray_fill_impl(
     len: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let abi = ObjectValueAbi::from_live_parts(tag, low, high)?;
     let index = usize::try_from(index).context("transactional array index overflow")?;
     let len = usize::try_from(len).context("transactional array length overflow")?;
@@ -3685,7 +4586,7 @@ fn transaction_tarray_copy_impl(
     len: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     ensure!(dst_gc_ref != 0, "null tarray reference");
     ensure!(src_gc_ref != 0, "null tarray reference");
     let dst_index = usize::try_from(dst_index).context("transactional array index overflow")?;
@@ -3746,7 +4647,7 @@ fn transaction_tarray_init_data_impl(
     element_size: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     ensure!(gc_ref != 0, "null tarray reference");
     let dst = usize::try_from(dst).context("transactional array destination offset overflow")?;
     let src = usize::try_from(src).context("transactional array data source offset overflow")?;
@@ -3813,7 +4714,7 @@ fn transaction_tarray_init_elem_impl(
     elem_len: u64,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     ensure!(gc_ref != 0, "null tarray reference");
     let dst = usize::try_from(dst).context("transactional array destination offset overflow")?;
     let src = usize::try_from(src).context("transactional array elem source offset overflow")?;
@@ -3886,7 +4787,7 @@ fn transaction_tarray_get_bytes_impl(
     index: u32,
 ) -> Result<Vec<u8>> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let index = usize::try_from(index).context("transactional array index overflow")?;
     let value = {
         let store = store.store_opaque_mut();
@@ -3928,7 +4829,7 @@ fn transaction_tarray_len_bytes_impl(
     gc_ref: u32,
 ) -> Result<Vec<u8>> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store)?;
+    ensure_active_transaction(store, instance)?;
     let len = {
         let store = store.store_opaque_mut();
         let (state, object_table) = store.transaction_state_and_object_table_mut();
@@ -4270,6 +5171,15 @@ fn abort_active_transaction_on_error<T>(store: &mut dyn VMStore, result: &Result
         return Ok(());
     }
 
+    #[cfg(feature = "transaction-mvcc")]
+    if store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .has_mvcc_terminal_commit()
+    {
+        return Ok(());
+    }
+
     let store = store.store_opaque_mut();
     let (state, object_table) = store.transaction_state_and_object_table_mut();
     if state.active_transaction().is_some() {
@@ -4536,7 +5446,23 @@ fn apply_staged_transaction_record(
     Ok(())
 }
 
-fn ensure_active_transaction(store: &mut dyn VMStore) -> Result<()> {
+fn ensure_active_transaction(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    #[cfg(feature = "transaction-mvcc")]
+    if store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .has_mvcc_terminal_commit()
+    {
+        transaction_commit_mvcc_impl(store, instance)?;
+        let store = store.store_opaque_mut();
+        let region = store.transaction_region_runtime().clone();
+        store
+            .transaction_state_mut()
+            .begin_with_region_runtime(&region)?;
+    }
+    #[cfg(not(feature = "transaction-mvcc"))]
+    let _ = instance;
+
     ensure!(
         store
             .store_opaque_mut()

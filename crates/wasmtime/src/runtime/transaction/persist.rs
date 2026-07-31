@@ -5159,6 +5159,7 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
                     object_winners: Vec::new(),
                     root_object_ids: Vec::new(),
                     tmemory_undo_rollbacks: vec![rollback_a],
+                    committed_tmemory_pages: None,
                 };
             let recovered_b =
                 crate::runtime::vm::block_region::TransactionPersistenceRecoveredRegion {
@@ -5166,6 +5167,7 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
                     object_winners: Vec::new(),
                     root_object_ids: Vec::new(),
                     tmemory_undo_rollbacks: vec![rollback_b],
+                    committed_tmemory_pages: None,
                 };
 
             assert_ne!(

@@ -57,10 +57,19 @@ pub(crate) trait TMemoryBackendStorage: core::fmt::Debug + Send + Sync {
     fn granule_count(&self) -> usize;
     fn read_committed(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>>;
     fn commit_range(&mut self, addr: usize, bytes: &[u8]) -> Result<()>;
+    fn read_within_capacity(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>>;
+    fn commit_range_within_capacity(&mut self, addr: usize, bytes: &[u8]) -> Result<()>;
+    fn reserve_backing_capacity_to_pages(&mut self, new_pages: u64) -> Result<()>;
     fn can_grow_to_pages(&self, new_pages: u64) -> bool;
     fn grow_to_pages(&mut self, new_pages: u64) -> Result<()>;
     fn granule_info(&self, granule: usize) -> Result<TMemoryGranuleInfo>;
     fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()>;
+    fn granule_info_within_capacity(&self, granule: usize) -> Result<TMemoryGranuleInfo>;
+    fn set_granule_info_within_capacity(
+        &mut self,
+        granule: usize,
+        info: TMemoryGranuleInfo,
+    ) -> Result<()>;
     #[cfg(test)]
     fn block_region_block_size_for_test(&self) -> usize;
     #[cfg(test)]
@@ -331,6 +340,66 @@ impl TMemory {
         Ok(())
     }
 
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn reserve_backing_capacity_to_pages_for_mvcc(
+        &mut self,
+        new_pages: u64,
+    ) -> Result<()> {
+        self.storage.reserve_backing_capacity_to_pages(new_pages)
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn prepare_tmemory_undo_record_within_capacity_for_mvcc(
+        &self,
+        owner_instance: Option<u32>,
+        memory_index: u32,
+        granule_index: u64,
+        bytes: &[u8],
+    ) -> Result<PendingGranuleUndo> {
+        let granule = usize::try_from(granule_index)
+            .context("tmemory granule index does not fit host usize")?;
+        let range = tmemory_granule_range(granule, self.byte_capacity())?;
+        ensure!(
+            bytes.len() == range.end - range.start,
+            "persistent tmemory staged capacity granule length mismatch"
+        );
+
+        let old_bytes = self.storage.read_within_capacity(range)?;
+        let current_version = self.storage.granule_info_within_capacity(granule)?.version;
+        let version = u32::try_from(
+            current_version
+                .checked_add(1)
+                .context("tmemory granule version overflow")?,
+        )
+        .context("tmemory granule version does not fit durable log")?;
+        let logical_id = pack_tmemory_granule_id(owner_instance, memory_index, granule_index)?;
+        Ok(PendingGranuleUndo::tmemory(logical_id, version, old_bytes))
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn commit_staged_tmemory_granule_within_capacity_for_mvcc(
+        &mut self,
+        granule_index: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let granule = usize::try_from(granule_index)
+            .context("tmemory granule index does not fit host usize")?;
+        let range = tmemory_granule_range(granule, self.byte_capacity())?;
+        ensure!(
+            bytes.len() == range.end - range.start,
+            "tmemory staged capacity granule length mismatch"
+        );
+        self.storage
+            .commit_range_within_capacity(range.start, bytes)?;
+        let mut info = self.storage.granule_info_within_capacity(granule)?;
+        info.owner = 0;
+        info.version = info
+            .version
+            .checked_add(1)
+            .context("tmemory granule version overflow")?;
+        self.storage.set_granule_info_within_capacity(granule, info)
+    }
+
     pub(crate) fn apply_recovered_tmemory_undo_rollbacks<I>(&mut self, rollbacks: I) -> Result<()>
     where
         I: IntoIterator<Item = recovery::RecoveredTMemoryUndoRollback>,
@@ -355,13 +424,13 @@ impl TMemory {
             let (_, _, granule_index) = unpack_tmemory_granule_id(rollback.logical_id)?;
             let granule = usize::try_from(granule_index)
                 .context("tmemory rollback granule index does not fit host usize")?;
-            let range = tmemory_granule_range(granule, self.byte_len())?;
+            let range = tmemory_granule_range(granule, self.byte_capacity())?;
             ensure!(
                 rollback.old_granule_bytes.len() == range.end - range.start,
                 "tmemory rollback granule length mismatch"
             );
             self.storage
-                .commit_range(range.start, &rollback.old_granule_bytes)?;
+                .commit_range_within_capacity(range.start, &rollback.old_granule_bytes)?;
         }
 
         Ok(())
@@ -686,6 +755,40 @@ impl TMemoryBackendStorage for VMemory {
         self.region.write(addr, bytes)
     }
 
+    fn read_within_capacity(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        ensure!(range.start <= range.end, "tmemory read invalid range");
+        ensure!(
+            range.end <= self.byte_capacity,
+            "tmemory capacity read out of bounds"
+        );
+        self.region.read(range.start, range.end - range.start)
+    }
+
+    fn commit_range_within_capacity(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
+        let end = addr
+            .checked_add(bytes.len())
+            .context("tmemory write address overflow")?;
+        ensure!(
+            end <= self.byte_capacity,
+            "tmemory capacity write out of bounds"
+        );
+        self.region.write(addr, bytes)
+    }
+
+    fn reserve_backing_capacity_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        ensure!(
+            new_pages <= self.max_pages,
+            "tmemory capacity growth exceeds maximum size"
+        );
+        let new_byte_capacity = pages_to_bytes(new_pages)?;
+        ensure!(
+            new_byte_capacity >= self.byte_len,
+            "tmemory capacity cannot shrink below live size"
+        );
+        self.reserve_capacity_to_pages(new_pages)?;
+        self.region.fence()
+    }
+
     fn can_grow_to_pages(&self, new_pages: u64) -> bool {
         VMemory::can_grow_to_pages(self, new_pages)
     }
@@ -700,6 +803,27 @@ impl TMemoryBackendStorage for VMemory {
 
     fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
         self.set_txn_info(granule, info)
+    }
+
+    fn granule_info_within_capacity(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        ensure!(
+            granule < self.granules.len(),
+            "tmemory capacity granule out of bounds"
+        );
+        Ok(self.granules[granule])
+    }
+
+    fn set_granule_info_within_capacity(
+        &mut self,
+        granule: usize,
+        info: TMemoryGranuleInfo,
+    ) -> Result<()> {
+        ensure!(
+            granule < self.granules.len(),
+            "tmemory capacity granule out of bounds"
+        );
+        self.granules[granule] = info;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -938,6 +1062,42 @@ impl TMemoryBackendStorage for DaxPmemMemory {
         self.region.fence()
     }
 
+    fn read_within_capacity(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        ensure!(range.start <= range.end, "tmemory read invalid range");
+        ensure!(
+            range.end <= self.byte_capacity,
+            "tmemory capacity read out of bounds"
+        );
+        self.region.read(range.start, range.end - range.start)
+    }
+
+    fn commit_range_within_capacity(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
+        let end = addr
+            .checked_add(bytes.len())
+            .context("tmemory write address overflow")?;
+        ensure!(
+            end <= self.byte_capacity,
+            "tmemory capacity write out of bounds"
+        );
+        self.region.write(addr, bytes)?;
+        self.region.flush(addr, bytes.len())?;
+        self.region.fence()
+    }
+
+    fn reserve_backing_capacity_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        ensure!(
+            new_pages <= self.max_pages,
+            "tmemory capacity growth exceeds maximum size"
+        );
+        let new_byte_capacity = pages_to_bytes(new_pages)?;
+        ensure!(
+            new_byte_capacity >= self.byte_len,
+            "tmemory capacity cannot shrink below live size"
+        );
+        self.reserve_capacity_to_pages(new_pages)?;
+        self.region.fence()
+    }
+
     fn can_grow_to_pages(&self, new_pages: u64) -> bool {
         DaxPmemMemory::can_grow_to_pages(self, new_pages)
     }
@@ -952,6 +1112,27 @@ impl TMemoryBackendStorage for DaxPmemMemory {
 
     fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
         self.set_txn_info(granule, info)
+    }
+
+    fn granule_info_within_capacity(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        ensure!(
+            granule < self.granules.len(),
+            "tmemory capacity granule out of bounds"
+        );
+        Ok(self.granules[granule])
+    }
+
+    fn set_granule_info_within_capacity(
+        &mut self,
+        granule: usize,
+        info: TMemoryGranuleInfo,
+    ) -> Result<()> {
+        ensure!(
+            granule < self.granules.len(),
+            "tmemory capacity granule out of bounds"
+        );
+        self.granules[granule] = info;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1201,6 +1382,45 @@ impl TMemoryBackendStorage for FileBackedMemory {
         self.region.fence()
     }
 
+    fn read_within_capacity(&self, range: core::ops::Range<usize>) -> Result<Vec<u8>> {
+        ensure!(range.start <= range.end, "tmemory read invalid range");
+        ensure!(
+            range.end <= self.byte_capacity,
+            "tmemory capacity read out of bounds"
+        );
+        self.region.read(range.start, range.end - range.start)
+    }
+
+    fn commit_range_within_capacity(&mut self, addr: usize, bytes: &[u8]) -> Result<()> {
+        let end = addr
+            .checked_add(bytes.len())
+            .context("tmemory write address overflow")?;
+        ensure!(
+            end <= self.byte_capacity,
+            "tmemory capacity write out of bounds"
+        );
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.region.write(addr, bytes)?;
+        self.region.flush(addr, bytes.len())?;
+        self.region.fence()
+    }
+
+    fn reserve_backing_capacity_to_pages(&mut self, new_pages: u64) -> Result<()> {
+        ensure!(
+            new_pages <= self.max_pages,
+            "tmemory capacity growth exceeds maximum size"
+        );
+        let new_byte_capacity = pages_to_bytes(new_pages)?;
+        ensure!(
+            new_byte_capacity >= self.byte_len,
+            "tmemory capacity cannot shrink below live size"
+        );
+        self.reserve_capacity_to_pages(new_pages)?;
+        self.region.fence()
+    }
+
     fn can_grow_to_pages(&self, new_pages: u64) -> bool {
         FileBackedMemory::can_grow_to_pages(self, new_pages)
     }
@@ -1215,6 +1435,27 @@ impl TMemoryBackendStorage for FileBackedMemory {
 
     fn set_granule_info(&mut self, granule: usize, info: TMemoryGranuleInfo) -> Result<()> {
         self.set_txn_info(granule, info)
+    }
+
+    fn granule_info_within_capacity(&self, granule: usize) -> Result<TMemoryGranuleInfo> {
+        ensure!(
+            granule < self.granules.len(),
+            "tmemory capacity granule out of bounds"
+        );
+        Ok(self.granules[granule])
+    }
+
+    fn set_granule_info_within_capacity(
+        &mut self,
+        granule: usize,
+        info: TMemoryGranuleInfo,
+    ) -> Result<()> {
+        ensure!(
+            granule < self.granules.len(),
+            "tmemory capacity granule out of bounds"
+        );
+        self.granules[granule] = info;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1910,6 +2151,242 @@ mod tests {
                 .unwrap(),
             vec![0xaa, 0xaa, 0xaa, 0xaa]
         );
+    }
+
+    #[cfg(all(feature = "transaction", unix))]
+    #[test]
+    fn file_backed_recovery_restores_hidden_growth_tail_without_mvcc_feature() {
+        use crate::runtime::transaction::{StreamPublisher, TxDurableLog};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("recover-hidden-tail.tmemory");
+        let tx_log_path = dir.path().join("recover-hidden-tail-log.bin");
+        let tail_granule = u64::try_from(WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE).unwrap();
+        let tail = usize::try_from(tail_granule).unwrap();
+        let range = tmemory_granule_range(tail, 2 * WASM_PAGE_SIZE).unwrap();
+        let aborted_tail = vec![0xa5; TMEMORY_GRANULE_SIZE];
+        let mut memory = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+            1,
+            None,
+        )
+        .unwrap();
+        memory.storage.reserve_backing_capacity_to_pages(2).unwrap();
+        let old_tail = memory.storage.read_within_capacity(range.clone()).unwrap();
+        let logical_id = pack_tmemory_granule_id(Some(0), 0, tail_granule).unwrap();
+        let undo = PendingGranuleUndo::tmemory(logical_id, 1, old_tail);
+        memory
+            .storage
+            .commit_range_within_capacity(range.start, &aborted_tail)
+            .unwrap();
+        let mut info = memory.storage.granule_info_within_capacity(tail).unwrap();
+        info.version = 1;
+        memory
+            .storage
+            .set_granule_info_within_capacity(tail, info)
+            .unwrap();
+        drop(memory);
+
+        let mut log = TxDurableLog::create_file_backed(&tx_log_path, 32).unwrap();
+        {
+            let mut sink = log.stream_sink(42);
+            let mut publisher = StreamPublisher::new(&mut sink, 42, 42);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap();
+        }
+        drop(log);
+
+        crate::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+            &tx_log_path,
+            &tmemory_path,
+            1,
+            None,
+        )
+        .unwrap();
+
+        let mut reopened = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path).unwrap(),
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.byte_len(), WASM_PAGE_SIZE);
+        reopened.grow_to_pages(2).unwrap();
+        assert_eq!(
+            reopened
+                .read_committed(WASM_PAGE_SIZE..WASM_PAGE_SIZE + TMEMORY_GRANULE_SIZE)
+                .unwrap(),
+            vec![0; TMEMORY_GRANULE_SIZE]
+        );
+    }
+
+    #[cfg(all(feature = "transaction-mvcc", unix))]
+    #[test]
+    fn mvcc_file_backed_lp_committed_growth_tail_recovers() {
+        use crate::runtime::transaction::{StreamPublisher, TxDurableLog};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("committed-growth.tmemory");
+        let tx_log_path = dir.path().join("committed-growth.txlog");
+        let tail_granule = u64::try_from(WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE).unwrap();
+        let committed_tail = vec![0x5a; TMEMORY_GRANULE_SIZE];
+        let mut memory = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+            1,
+            None,
+        )
+        .unwrap();
+        memory
+            .reserve_backing_capacity_to_pages_for_mvcc(2)
+            .unwrap();
+        let undo = memory
+            .prepare_tmemory_undo_record_within_capacity_for_mvcc(
+                Some(0),
+                0,
+                tail_granule,
+                &committed_tail,
+            )
+            .unwrap();
+
+        let mut log = TxDurableLog::create_file_backed(&tx_log_path, 32).unwrap();
+        {
+            let mut sink = log.stream_sink(51);
+            let mut publisher = StreamPublisher::new(&mut sink, 51, 51);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap()
+        };
+        memory
+            .commit_staged_tmemory_granule_within_capacity_for_mvcc(tail_granule, &committed_tail)
+            .unwrap();
+        let size =
+            crate::runtime::transaction::PendingPublication::tmemory_size(None, 0, 1, 2).unwrap();
+        let final_marker = {
+            let mut sink = log.stream_sink(51);
+            let mut publisher = StreamPublisher::new(&mut sink, 51, 51);
+            publisher
+                .publish_object_publication_before_commit(&size)
+                .unwrap()
+        };
+        {
+            let mut sink = log.stream_sink(51);
+            let mut publisher = StreamPublisher::new(&mut sink, 51, 51);
+            publisher.publish_commit_lp(final_marker).unwrap();
+        }
+        drop(log);
+        drop(memory);
+
+        let recovered =
+            block_region::reopen_and_recover_file_backed_region_for_test(&tx_log_path).unwrap();
+        assert_eq!(
+            recovered.committed_file_backed_tmemory_pages().unwrap(),
+            Some(2)
+        );
+        assert!(recovered.tmemory_undo_rollbacks.is_empty());
+        crate::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+            &tx_log_path,
+            &tmemory_path,
+            1,
+            None,
+        )
+        .unwrap();
+        let reopened = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path).unwrap(),
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .read_committed(WASM_PAGE_SIZE..WASM_PAGE_SIZE + TMEMORY_GRANULE_SIZE)
+                .unwrap(),
+            committed_tail
+        );
+    }
+
+    #[cfg(all(feature = "transaction-mvcc", unix))]
+    #[test]
+    fn mvcc_file_backed_lp_loose_growth_tail_undo_recovers() {
+        use crate::runtime::transaction::{StreamPublisher, TxDurableLog};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmemory_path = dir.path().join("loose-growth.tmemory");
+        let tx_log_path = dir.path().join("loose-growth.txlog");
+        let tail_granule = u64::try_from(WASM_PAGE_SIZE / TMEMORY_GRANULE_SIZE).unwrap();
+        let aborted_tail = vec![0xa5; TMEMORY_GRANULE_SIZE];
+        let mut memory = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone()).unwrap(),
+            1,
+            None,
+        )
+        .unwrap();
+        memory
+            .reserve_backing_capacity_to_pages_for_mvcc(2)
+            .unwrap();
+        let undo = memory
+            .prepare_tmemory_undo_record_within_capacity_for_mvcc(
+                Some(0),
+                0,
+                tail_granule,
+                &aborted_tail,
+            )
+            .unwrap();
+
+        let mut log = TxDurableLog::create_file_backed(&tx_log_path, 32).unwrap();
+        {
+            let mut sink = log.stream_sink(52);
+            let mut publisher = StreamPublisher::new(&mut sink, 52, 52);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap();
+        }
+        memory
+            .commit_staged_tmemory_granule_within_capacity_for_mvcc(tail_granule, &aborted_tail)
+            .unwrap();
+        drop(log);
+        drop(memory);
+
+        let recovered =
+            block_region::reopen_and_recover_file_backed_region_for_test(&tx_log_path).unwrap();
+        assert_eq!(
+            recovered.committed_file_backed_tmemory_pages().unwrap(),
+            None
+        );
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+        crate::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+            &tx_log_path,
+            &tmemory_path,
+            1,
+            None,
+        )
+        .unwrap();
+        let mut reopened = TMemory::new(
+            TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path).unwrap(),
+            1,
+            None,
+        )
+        .unwrap();
+        reopened.grow_to_pages(2).unwrap();
+        assert_eq!(
+            reopened
+                .read_committed(WASM_PAGE_SIZE..WASM_PAGE_SIZE + TMEMORY_GRANULE_SIZE)
+                .unwrap(),
+            vec![0; TMEMORY_GRANULE_SIZE]
+        );
+    }
+
+    #[test]
+    fn ordinary_logical_bounds_reject_reserved_capacity_addresses() {
+        let mut memory = TMemory::new_vmemory_with_limits(1, Some(2)).unwrap();
+
+        assert!(
+            memory
+                .read_committed(WASM_PAGE_SIZE..WASM_PAGE_SIZE + 1)
+                .is_err()
+        );
+        assert!(memory.commit_range(WASM_PAGE_SIZE, &[1]).is_err());
+        assert_eq!(memory.byte_len(), WASM_PAGE_SIZE);
     }
 
     #[cfg(target_os = "linux")]

@@ -1086,6 +1086,99 @@ fn shared_runtime_threaded_tmemory_commits_recover_together() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_file_backed_lp_pre_lp_growth_tail_failure_does_not_leak() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("mvcc-growth-failure.tmemory");
+    let tx_log_path = dir.path().join("mvcc-growth-failure.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (tmemory $m 1 2)
+              (tfunc (export "grow-write")
+                (drop (tmemory.grow $m (i32.const 1)))
+                (i32.tstore $m (i32.const 65536) (i32.const 1144201745)))
+              (tfunc (export "grow-read") (result i32)
+                (drop (tmemory.grow $m (i32.const 1)))
+                (i32.tload $m (i32.const 65536))))
+            "#,
+        )?,
+    )?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+    let mut store = shared_store(&engine, &runtime)?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let grow_write = instance.get_typed_func::<(), ()>(&mut store, "grow-write")?;
+    let grow_read = instance.get_typed_func::<(), i32>(&mut store, "grow-read")?;
+
+    wasmtime::_internal::transaction_persistence::fail_next_commit_before_lp_for_test(&mut store);
+    let error = grow_write.call(&mut store, ()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("transaction test failure before commit LP"),
+        "{error:#}"
+    );
+    assert_eq!(grow_read.call(&mut store, ())?, 0);
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.committed_tmemory_pages, Some(2));
+    assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+    wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        2,
+        Some(2),
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 65536, &[0, 0, 0, 0])?;
+
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_file_backed_lp_post_lp_growth_tail_recovers() -> Result<()> {
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("mvcc-growth-committed.tmemory");
+    let tx_log_path = dir.path().join("mvcc-growth-committed.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (tmemory $m 1 2)
+              (tfunc (export "grow-write")
+                (drop (tmemory.grow $m (i32.const 1)))
+                (i32.tstore $m (i32.const 65536) (i32.const 1144201745))))
+            "#,
+        )?,
+    )?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+    let mut store = shared_store(&engine, &runtime)?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    instance
+        .get_typed_func::<(), ()>(&mut store, "grow-write")?
+        .call(&mut store, ())?;
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert_eq!(recovered.committed_tmemory_pages, Some(2));
+    assert!(recovered.tmemory_undo_rollbacks.is_empty());
+    wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
+        &tx_log_path,
+        &tmemory_path,
+        2,
+        Some(2),
+    )?;
+    assert_tmemory_file_bytes(&tmemory_path, 65536, &0x4433_2211u32.to_le_bytes())?;
+
+    Ok(())
+}
+
 #[test]
 fn shared_runtime_threaded_object_graphs_recover_both_roots() -> Result<()> {
     use std::sync::{Arc, Barrier};
