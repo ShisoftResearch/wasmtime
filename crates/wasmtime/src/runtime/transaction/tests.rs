@@ -763,6 +763,83 @@ fn mvcc_visibility_tmemory_size_controls_bounds_and_staged_growth() {
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
+fn mvcc_visibility_tmemory_staged_growth_reads_zero_then_staged_overlay() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "host" "advance" (func $advance))
+              (tmemory $m 1 2)
+              (func (export "grow_read_write") (result i32 i32)
+                (local $zero i32)
+                (call $advance)
+                (drop (tmemory.grow $m (i32.const 1)))
+                (local.set $zero (i32.tload $m (i32.const 65536)))
+                (i32.tstore $m (i32.const 65536) (i32.const 77))
+                (local.get $zero)
+                (i32.tload $m (i32.const 65536))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let instance_id = Arc::new(AtomicU32::new(u32::MAX));
+    let host_instance_id = Arc::clone(&instance_id);
+    let host_visibility = visibility.clone();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let mut linker = crate::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "host",
+            "advance",
+            move |caller: crate::Caller<'_, ()>| -> Result<()> {
+                let owner = host_instance_id.load(Ordering::SeqCst);
+                let commit = Arc::new(CommitRecord::pending());
+                let mut prepare = host_visibility.runtime().begin_prepare(commit.clone())?;
+                prepare.prepare_memory_size(
+                    GranuleId::TMemorySize {
+                        instance: Some(owner),
+                        memory_index: 0,
+                    },
+                    || Ok(1),
+                    2,
+                )?;
+                drop(prepare);
+                commit.commit(1)?;
+
+                let mut instance = caller.store.0.instance_mut(InstanceId::from_u32(owner));
+                let tmemory = instance
+                    .as_mut()
+                    .get_tmemory_mut(wasmtime_environ::MemoryIndex::from_u32(0))
+                    .context("missing transactional memory sidecar")?;
+                tmemory.grow_to_pages(2)?;
+                tmemory.commit_range(65536, &99_i32.to_le_bytes())?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    instance_id.store(instance.id().as_u32(), Ordering::SeqCst);
+    let grow_read_write = instance
+        .get_typed_func::<(), (i32, i32)>(&mut store, "grow_read_write")
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .begin_with_region_runtime(&runtime)
+        .unwrap();
+    assert_eq!(grow_read_write.call(&mut store, ()).unwrap(), (0, 77));
+    store.transaction_state_mut().abort().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
 fn mvcc_visibility_tglobal_reads_snapshot_and_staged_value_first() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -1004,6 +1081,212 @@ fn mvcc_visibility_ttable_reads_complete_granule_and_snapshot_size_for_growth() 
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
+fn mvcc_visibility_ttable_nonzero_granule_offset_selects_requested_element() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "host" "advance" (func $advance))
+              (func $target)
+              (export "target" (func $target))
+              (ttable $t (export "table") 32 funcref)
+              (func (export "read_offset_one") (result i32)
+                (call $advance)
+                (ref.is_null (ttable.get $t (i32.const 17)))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let instance_id = Arc::new(AtomicU32::new(u32::MAX));
+    let host_instance_id = Arc::clone(&instance_id);
+    let host_visibility = visibility.clone();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let mut linker = crate::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "host",
+            "advance",
+            move |mut caller: crate::Caller<'_, ()>| -> Result<()> {
+                let owner = host_instance_id.load(Ordering::SeqCst);
+                let mut old = vec![TableElementSnapshot::FuncRef(1); 16];
+                old[1] = TableElementSnapshot::FuncRef(0);
+                let mut current = vec![TableElementSnapshot::FuncRef(0); 16];
+                current[1] = TableElementSnapshot::FuncRef(1);
+                let commit = Arc::new(CommitRecord::pending());
+                let mut prepare = host_visibility.runtime().begin_prepare(commit.clone())?;
+                prepare.prepare_table(
+                    GranuleId::TTable {
+                        instance: Some(owner),
+                        table_index: 0,
+                        granule_index: 1,
+                    },
+                    || TableGranuleSnapshot::new(old),
+                    TableGranuleSnapshot::new(current)?,
+                )?;
+                drop(prepare);
+                commit.commit(1)?;
+
+                let target = caller
+                    .get_export("target")
+                    .and_then(|export| export.into_func())
+                    .context("missing exported function")?;
+                caller
+                    .get_export("table")
+                    .and_then(|export| export.into_table())
+                    .context("missing exported ttable")?
+                    .set(&mut caller, 17, crate::Ref::Func(Some(target)))?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    instance_id.store(instance.id().as_u32(), Ordering::SeqCst);
+    let read_offset_one = instance
+        .get_typed_func::<(), i32>(&mut store, "read_offset_one")
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .begin_with_region_runtime(&runtime)
+        .unwrap();
+    assert_eq!(read_offset_one.call(&mut store, ()).unwrap(), 1);
+    store.transaction_state_mut().abort().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_visibility_ttable_historical_gc_ref_becomes_usable_transaction_handle() {
+    use crate::AsContextMut;
+    use crate::runtime::vm::VMStore;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (struct (field i32)))
+              (import "host" "advance" (func $advance))
+              (ttable $t (export "table") 2 (ref null $s))
+              (func (export "initialize")
+                (table.set $t
+                  (i32.const 0)
+                  (struct.new $s (i32.const 11)))
+                (table.set $t
+                  (i32.const 1)
+                  (struct.new $s (i32.const 22))))
+              (tfunc (export "read_after_advance") (result i32)
+                (call $advance)
+                (drop
+                  (tref.cast_read
+                    (ref.as_non_null (ttable.get $t (i32.const 0)))))
+                (i32.const 11)))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let instance_id = Arc::new(AtomicU32::new(u32::MAX));
+    let host_instance_id = Arc::clone(&instance_id);
+    let host_visibility = visibility.clone();
+    let old_raw = Arc::new(AtomicU32::new(0));
+    let host_old_raw = Arc::clone(&old_raw);
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let mut linker = crate::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "host",
+            "advance",
+            move |mut caller: crate::Caller<'_, ()>| -> Result<()> {
+                let owner = host_instance_id.load(Ordering::SeqCst);
+                let table = caller
+                    .get_export("table")
+                    .and_then(|export| export.into_table())
+                    .context("missing exported ttable")?;
+                let old = table.get(&mut caller, 0).context("missing old element")?;
+                let replacement = table
+                    .get(&mut caller, 1)
+                    .context("missing replacement element")?;
+                let old_raw = match &old {
+                    crate::Ref::Any(Some(value)) => value.to_raw(&mut caller)?,
+                    _ => bail!("old table element is not a non-null GC reference"),
+                };
+                host_old_raw.store(old_raw, Ordering::SeqCst);
+                let replacement_raw = match &replacement {
+                    crate::Ref::Any(Some(value)) => value.to_raw(&mut caller)?,
+                    _ => bail!("replacement table element is not a non-null GC reference"),
+                };
+                let commit = Arc::new(CommitRecord::pending());
+                let mut prepare = host_visibility.runtime().begin_prepare(commit.clone())?;
+                prepare.prepare_table(
+                    GranuleId::TTable {
+                        instance: Some(owner),
+                        table_index: 0,
+                        granule_index: 0,
+                    },
+                    || {
+                        TableGranuleSnapshot::new(vec![
+                            TableElementSnapshot::GcRef(old_raw),
+                            TableElementSnapshot::GcRef(replacement_raw),
+                        ])
+                    },
+                    TableGranuleSnapshot::new(vec![
+                        TableElementSnapshot::GcRef(replacement_raw),
+                        TableElementSnapshot::GcRef(replacement_raw),
+                    ])?,
+                )?;
+                drop(prepare);
+                commit.commit(1)?;
+                table.set(&mut caller, 0, replacement)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    instance_id.store(instance.id().as_u32(), Ordering::SeqCst);
+    instance
+        .get_typed_func::<(), ()>(&mut store, "initialize")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    let read_after_advance = instance
+        .get_typed_func::<(), i32>(&mut store, "read_after_advance")
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .begin_with_region_runtime(&runtime)
+        .unwrap();
+    assert_eq!(read_after_advance.call(&mut store, ()).unwrap(), 11);
+    let promoted = store
+        .transaction_state()
+        .promoted_gc_ref_for_test(old_raw.load(Ordering::SeqCst))
+        .unwrap();
+    assert_eq!(
+        store
+            .transaction_state()
+            .staged_object_payload_for_test(promoted)
+            .unwrap(),
+        &ObjectPayload::Struct(vec![ObjectValue::I32(11)])
+    );
+    let context = store.as_context_mut();
+    let store = context.0.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    state.abort_allocated_objects(object_table).unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
 fn mvcc_visibility_ttable_staged_growth_keeps_snapshot_granule_truncation() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -1032,6 +1315,103 @@ fn mvcc_visibility_ttable_staged_growth_keeps_snapshot_granule_truncation() {
     store.transaction_state_mut().abort().unwrap();
 }
 
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_visibility_assert_malformed_table_history_is_rejected(
+    table_size: u64,
+    index: u64,
+    granule_index: u64,
+    payload_len: usize,
+    expected_len: usize,
+) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        &format!(
+            r#"
+                (module
+                  (import "host" "advance" (func $advance))
+                  (ttable $t {table_size} funcref)
+                  (func (export "read") (result i32)
+                    (call $advance)
+                    (ref.is_null (ttable.get $t (i32.const {index})))))
+            "#
+        ),
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let instance_id = Arc::new(AtomicU32::new(u32::MAX));
+    let host_instance_id = Arc::clone(&instance_id);
+    let host_visibility = visibility.clone();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let mut linker = crate::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "host",
+            "advance",
+            move |_caller: crate::Caller<'_, ()>| -> Result<()> {
+                let owner = host_instance_id.load(Ordering::SeqCst);
+                let malformed = vec![TableElementSnapshot::FuncRef(0); payload_len];
+                let commit = Arc::new(CommitRecord::pending());
+                let mut prepare = host_visibility.runtime().begin_prepare(commit.clone())?;
+                prepare.prepare_table(
+                    GranuleId::TTable {
+                        instance: Some(owner),
+                        table_index: 0,
+                        granule_index,
+                    },
+                    || TableGranuleSnapshot::new(malformed.clone()),
+                    TableGranuleSnapshot::new(malformed.clone())?,
+                )?;
+                drop(prepare);
+                commit.commit(1)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    instance_id.store(instance.id().as_u32(), Ordering::SeqCst);
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .begin_with_region_runtime(&runtime)
+        .unwrap();
+    let error = read.call(&mut store, ()).unwrap_err();
+    let error = format!("{error:?}");
+    assert!(
+        error.contains(&format!(
+            "snapshot-visible table granule length mismatch: expected {expected_len} elements, got {payload_len}"
+        )),
+        "{error}"
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_visibility_ttable_rejects_hole_in_full_granule_payload() {
+    mvcc_visibility_assert_malformed_table_history_is_rejected(17, 0, 0, 15, 16);
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_visibility_ttable_rejects_oversized_edge_granule_payload() {
+    mvcc_visibility_assert_malformed_table_history_is_rejected(17, 16, 1, 2, 1);
+}
+
 #[test]
 #[cfg(all(
     feature = "transaction-mvcc",
@@ -1046,15 +1426,23 @@ fn mvcc_visibility_ttable_fill_copy_and_ranges_record_data_and_size_granules() {
         r#"
             (module
               (import "host" "check" (func $check))
-              (table $t 48 tfuncref)
+              (table $t 96 tfuncref)
               (func (export "operate")
-                (i32.const 15)
+                (i32.const 64)
                 (ref.null func)
-                (i32.const 18)
+                (i32.const 17)
                 (ttable.fill $t)
+                (i32.const 32)
+                (i32.const 0)
                 (i32.const 16)
-                (i32.const 8)
-                (i32.const 25)
+                (ttable.copy $t $t)
+                (i32.const 96)
+                (ref.null func)
+                (i32.const 0)
+                (ttable.fill $t)
+                (i32.const 96)
+                (i32.const 96)
+                (i32.const 0)
                 (ttable.copy $t $t)
                 (call $check)))
         "#,
@@ -1073,14 +1461,21 @@ fn mvcc_visibility_ttable_fill_copy_and_ranges_record_data_and_size_granules() {
             "check",
             move |caller: crate::Caller<'_, ()>| -> Result<()> {
                 let owner = host_instance_id.load(Ordering::SeqCst);
-                let actual = caller
+                let actual_reads = caller
                     .store
                     .0
                     .transaction_state()
                     .active_read_granules()?
                     .into_iter()
                     .collect::<BTreeSet<_>>();
-                let expected = BTreeSet::from([
+                let actual_writes = caller
+                    .store
+                    .0
+                    .transaction_state()
+                    .active_write_granules()?
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let expected_reads = BTreeSet::from([
                     GranuleId::TTable {
                         instance: Some(owner),
                         table_index: 0,
@@ -1089,19 +1484,44 @@ fn mvcc_visibility_ttable_fill_copy_and_ranges_record_data_and_size_granules() {
                     GranuleId::TTable {
                         instance: Some(owner),
                         table_index: 0,
-                        granule_index: 1,
+                        granule_index: 2,
                     },
                     GranuleId::TTable {
                         instance: Some(owner),
                         table_index: 0,
-                        granule_index: 2,
+                        granule_index: 4,
+                    },
+                    GranuleId::TTable {
+                        instance: Some(owner),
+                        table_index: 0,
+                        granule_index: 5,
                     },
                     GranuleId::TTableSize {
                         instance: Some(owner),
                         table_index: 0,
                     },
                 ]);
-                host_recorded.store(actual == expected, Ordering::SeqCst);
+                let expected_writes = BTreeSet::from([
+                    GranuleId::TTable {
+                        instance: Some(owner),
+                        table_index: 0,
+                        granule_index: 2,
+                    },
+                    GranuleId::TTable {
+                        instance: Some(owner),
+                        table_index: 0,
+                        granule_index: 4,
+                    },
+                    GranuleId::TTable {
+                        instance: Some(owner),
+                        table_index: 0,
+                        granule_index: 5,
+                    },
+                ]);
+                host_recorded.store(
+                    actual_reads == expected_reads && actual_writes == expected_writes,
+                    Ordering::SeqCst,
+                );
                 Ok(())
             },
         )
@@ -1116,6 +1536,113 @@ fn mvcc_visibility_ttable_fill_copy_and_ranges_record_data_and_size_granules() {
     operate.call(&mut store, ()).unwrap();
     assert!(recorded.load(Ordering::SeqCst));
     store.transaction_state_mut().abort().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_visibility_ttable_ranges_handle_zero_exact_boundary_and_overflow() {
+    let mut state = TransactionState::new_for_test(TransactionId::from_raw(9001));
+    state.acquire_table_size_read_owned(None, 7, 0).unwrap();
+    assert!(
+        !state
+            .acquire_table_granule_read_range_owned(None, 7, 16, 0, 0)
+            .unwrap()
+    );
+    assert!(
+        !state
+            .acquire_table_granule_write_range_owned(None, 7, 48, 0, 0)
+            .unwrap()
+    );
+    state
+        .acquire_table_granule_read_range_owned(None, 7, 16, 16, 0)
+        .unwrap();
+    state
+        .acquire_table_granule_write_range_owned(None, 7, 48, 16, 0)
+        .unwrap();
+
+    let read_error = state
+        .acquire_table_granule_read_range_owned(None, 7, u64::MAX, 2, 0)
+        .unwrap_err();
+    assert!(
+        read_error
+            .to_string()
+            .contains("ttable read range overflow")
+    );
+    let write_error = state
+        .acquire_table_granule_write_range_owned(None, 7, u64::MAX, 2, 0)
+        .unwrap_err();
+    assert!(
+        write_error
+            .to_string()
+            .contains("ttable write range overflow")
+    );
+    assert_eq!(
+        state.active_read_granules().unwrap(),
+        vec![
+            GranuleId::TTable {
+                instance: None,
+                table_index: 7,
+                granule_index: 1,
+            },
+            GranuleId::TTable {
+                instance: None,
+                table_index: 7,
+                granule_index: 3,
+            },
+            GranuleId::TTableSize {
+                instance: None,
+                table_index: 7,
+            },
+        ]
+    );
+    assert_eq!(
+        state.active_write_granules().unwrap(),
+        vec![GranuleId::TTable {
+            instance: None,
+            table_index: 7,
+            granule_index: 3,
+        }]
+    );
+    state.abort().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_visibility_ttable_oob_range_traps_before_data_granules() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable $t 16 funcref)
+              (func (export "fill_oob")
+                (i32.const 15)
+                (ref.null func)
+                (i32.const 2)
+                (ttable.fill $t)))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let fill_oob = instance
+        .get_typed_func::<(), ()>(&mut store, "fill_oob")
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .begin_with_region_runtime(&runtime)
+        .unwrap();
+    assert!(fill_oob.call(&mut store, ()).is_err());
+    assert!(store.transaction_state().read_granules.is_empty());
+    assert!(store.transaction_state().write_granules.is_empty());
 }
 
 fn transaction_object_active_startup_root_module(engine: &crate::Engine) -> crate::Module {

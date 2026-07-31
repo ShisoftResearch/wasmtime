@@ -1353,8 +1353,14 @@ fn live_transaction_global_snapshot_for_read(
     let GlobalSnapshot::GcRef(gc_ref) = snapshot else {
         return Ok(snapshot);
     };
+    Ok(GlobalSnapshot::GcRef(live_transaction_gc_ref_for_read(
+        store, gc_ref,
+    )?))
+}
+
+fn live_transaction_gc_ref_for_read(store: &mut dyn VMStore, gc_ref: u32) -> Result<u32> {
     if gc_ref == 0 || ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
-        return Ok(snapshot);
+        return Ok(gc_ref);
     }
 
     let store = store.store_opaque_mut();
@@ -1364,7 +1370,7 @@ fn live_transaction_global_snapshot_for_read(
         .known_object_id_for_transaction_ref_handle(object_table, gc_ref)
         .is_some()
     {
-        return Ok(snapshot);
+        return Ok(gc_ref);
     }
     let promoted = {
         let mut adapter =
@@ -1376,13 +1382,11 @@ fn live_transaction_global_snapshot_for_read(
         )?
     };
     let Some(object_id) = promoted else {
-        return Ok(snapshot);
+        return Ok(gc_ref);
     };
-    let handle =
-        state.transaction_ref_handle_for_object_id_avoiding(object_table, object_id, |raw| {
-            live_ref_raw_is_registered(&*durable_refs, raw)
-        })?;
-    Ok(GlobalSnapshot::GcRef(handle))
+    state.transaction_ref_handle_for_object_id_avoiding(object_table, object_id, |raw| {
+        live_ref_raw_is_registered(&*durable_refs, raw)
+    })
 }
 
 fn read_global_snapshot(
@@ -1931,6 +1935,18 @@ fn table_element_snapshot_to_raw(value: TableElementSnapshot) -> *mut u8 {
     }
 }
 
+fn live_transaction_table_snapshot_for_read(
+    store: &mut dyn VMStore,
+    snapshot: TableElementSnapshot,
+) -> Result<TableElementSnapshot> {
+    let TableElementSnapshot::GcRef(gc_ref) = snapshot else {
+        return Ok(snapshot);
+    };
+    Ok(TableElementSnapshot::GcRef(
+        live_transaction_gc_ref_for_read(store, gc_ref)?,
+    ))
+}
+
 fn stage_transaction_table_element_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -2014,6 +2030,7 @@ fn transaction_ttable_get_impl(
         )
     };
     if let Some(value) = staged {
+        let value = live_transaction_table_snapshot_for_read(store, value)?;
         return Ok(table_element_snapshot_to_raw(value));
     }
     let snapshot_visible_size = snapshot_visible_ttable_size(store, instance, table)?;
@@ -2034,6 +2051,16 @@ fn transaction_ttable_get_impl(
     let granule_start = granule_index
         .checked_mul(TableGranuleSnapshot::ELEMENT_CAPACITY)
         .context("ttable granule start overflow")?;
+    let remaining = snapshot_visible_size
+        .checked_sub(granule_start)
+        .context("snapshot-visible table granule starts beyond table size")?;
+    let expected_len = usize::try_from(remaining.min(TableGranuleSnapshot::ELEMENT_CAPACITY))
+        .context("snapshot-visible table granule length does not fit host usize")?;
+    ensure!(
+        elements.len() == expected_len,
+        "snapshot-visible table granule length mismatch: expected {expected_len} elements, got {}",
+        elements.len()
+    );
     {
         let state = store.store_opaque_mut().transaction_state_mut();
         for (offset, element) in elements.iter_mut().enumerate() {
@@ -2052,6 +2079,7 @@ fn transaction_ttable_get_impl(
         .get(offset)
         .copied()
         .context("snapshot-visible table granule is missing an in-bounds element")?;
+    let value = live_transaction_table_snapshot_for_read(store, value)?;
     Ok(table_element_snapshot_to_raw(value))
 }
 
