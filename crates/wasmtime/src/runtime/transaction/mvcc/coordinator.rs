@@ -29,6 +29,14 @@ struct CoordinatorState {
     gc_active: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MvccGcMetadata {
+    pub(crate) oldest_active_snapshot: Option<CommitTimestamp>,
+    pub(crate) visible_timestamp: CommitTimestamp,
+    pub(crate) baseline_timestamp: CommitTimestamp,
+    pub(crate) quiescent: bool,
+}
+
 /// Coordinates MVCC snapshots, commit publication, and persistent GC.
 #[derive(Debug, Default)]
 pub(crate) struct MvccCoordinator {
@@ -69,6 +77,7 @@ impl MvccCoordinator {
         commit: Arc<CommitRecord>,
     ) -> Result<PendingCommitRegistration> {
         let mut state = self.lock()?;
+        ensure!(!state.gc_active, "persistent GC is active");
         state.pending_commits += 1;
         #[cfg(test)]
         {
@@ -93,6 +102,43 @@ impl MvccCoordinator {
         Ok(MvccGcBarrierPermit {
             state: Some(self.state.clone()),
         })
+    }
+
+    /// Captures a horizon that remains safe if a new snapshot begins before
+    /// the domain-side pruning lock is acquired.
+    pub(crate) fn pruning_horizon(&self) -> Result<CommitTimestamp> {
+        let state = self.lock()?;
+        Ok(state
+            .active_snapshots
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(state.visible_timestamp))
+    }
+
+    pub(crate) fn metadata(&self) -> Result<MvccGcMetadata> {
+        let state = self.lock()?;
+        Ok(gc_metadata(&state))
+    }
+
+    pub(super) fn with_gc_barrier<R>(
+        &self,
+        permit: &MvccGcBarrierPermit,
+        operation: impl FnOnce(MvccGcMetadata) -> Result<R>,
+    ) -> Result<R> {
+        let state = self.lock_gc_barrier(permit)?;
+        operation(gc_metadata(&state))
+    }
+
+    pub(super) fn complete_gc_rebase<R>(
+        &self,
+        permit: &MvccGcBarrierPermit,
+        operation: impl FnOnce(MvccGcMetadata) -> Result<R>,
+    ) -> Result<(R, MvccGcMetadata)> {
+        let mut state = self.lock_gc_barrier(permit)?;
+        let value = operation(gc_metadata(&state))?;
+        state.baseline_timestamp = state.visible_timestamp;
+        Ok((value, gc_metadata(&state)))
     }
 
     #[cfg(test)]
@@ -128,6 +174,40 @@ impl MvccCoordinator {
         self.state
             .lock()
             .map_err(|_| crate::format_err!("MVCC coordinator lock is poisoned"))
+    }
+
+    fn lock_gc_barrier<'a>(
+        &'a self,
+        permit: &MvccGcBarrierPermit,
+    ) -> Result<MutexGuard<'a, CoordinatorState>> {
+        let permit_state = permit
+            .state
+            .as_ref()
+            .context("MVCC GC barrier permit is no longer active")?;
+        ensure!(
+            Arc::ptr_eq(permit_state, &self.state),
+            "MVCC GC barrier permit belongs to another coordinator"
+        );
+        let state = self.lock()?;
+        ensure!(
+            state.gc_active,
+            "MVCC GC barrier permit is no longer active"
+        );
+        ensure!(
+            state.active_snapshots.is_empty(),
+            "MVCC snapshots are active"
+        );
+        ensure!(state.pending_commits == 0, "MVCC commits are pending");
+        Ok(state)
+    }
+}
+
+fn gc_metadata(state: &CoordinatorState) -> MvccGcMetadata {
+    MvccGcMetadata {
+        oldest_active_snapshot: state.active_snapshots.keys().next().copied(),
+        visible_timestamp: state.visible_timestamp,
+        baseline_timestamp: state.baseline_timestamp,
+        quiescent: state.active_snapshots.is_empty() && state.pending_commits == 0,
     }
 }
 

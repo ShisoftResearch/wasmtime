@@ -47,9 +47,9 @@ pub(crate) struct InstalledDomainKeys {
 }
 
 #[derive(Debug)]
-struct VersionTable<T> {
-    chains: BTreeMap<GranuleId, VersionChain<T>>,
-    prune_cursor: Option<GranuleId>,
+pub(super) struct VersionTable<T> {
+    pub(super) chains: BTreeMap<GranuleId, VersionChain<T>>,
+    pub(super) prune_cursor: Option<GranuleId>,
 }
 
 impl<T> Default for VersionTable<T> {
@@ -62,23 +62,24 @@ impl<T> Default for VersionTable<T> {
 }
 
 #[derive(Debug, Default)]
-struct ObjectVersionTable {
-    chains: BTreeMap<ObjectId, VersionChain<ObjectPayload>>,
-    prune_cursor: Option<ObjectId>,
+pub(super) struct ObjectVersionTable {
+    pub(super) chains: BTreeMap<ObjectId, VersionChain<ObjectPayload>>,
+    pub(super) prune_cursor: Option<ObjectId>,
 }
 
 #[derive(Debug, Default)]
-struct MvccDomainState {
-    memories: VersionTable<Vec<u8>>,
-    memory_sizes: VersionTable<u64>,
-    globals: VersionTable<GlobalSnapshot>,
-    tables: VersionTable<TableGranuleSnapshot>,
-    table_sizes: VersionTable<u64>,
-    objects: ObjectVersionTable,
+pub(super) struct MvccDomainState {
+    pub(super) memories: VersionTable<Vec<u8>>,
+    pub(super) memory_sizes: VersionTable<u64>,
+    pub(super) globals: VersionTable<GlobalSnapshot>,
+    pub(super) tables: VersionTable<TableGranuleSnapshot>,
+    pub(super) table_sizes: VersionTable<u64>,
+    pub(super) objects: ObjectVersionTable,
+    pub(super) next_prune_table: usize,
 }
 
 #[derive(Debug, Default)]
-struct MvccDomains {
+pub(super) struct MvccDomains {
     state: Mutex<MvccDomainState>,
 }
 
@@ -86,13 +87,15 @@ struct MvccDomains {
 #[derive(Debug, Default)]
 pub(crate) struct MvccRuntime {
     pub(super) coordinator: MvccCoordinator,
-    domains: MvccDomains,
+    pub(super) domains: MvccDomains,
     #[cfg(test)]
     commit_hooks: Mutex<MvccCommitHooks>,
     #[cfg(test)]
     last_commit: Mutex<Option<Arc<CommitRecord>>>,
     #[cfg(test)]
     commit_fault: Mutex<VecDeque<MvccCommitFaultPoint>>,
+    #[cfg(test)]
+    pub(super) gc_rebase_before_domains: Mutex<Option<Arc<MvccCommitTestHook>>>,
 }
 
 impl MvccRuntime {
@@ -572,7 +575,7 @@ impl MvccCommitTestHook {
 }
 
 impl MvccDomains {
-    fn lock(&self) -> Result<MutexGuard<'_, MvccDomainState>> {
+    pub(super) fn lock(&self) -> Result<MutexGuard<'_, MvccDomainState>> {
         self.state
             .lock()
             .map_err(|_| crate::format_err!("MVCC domain lock is poisoned"))

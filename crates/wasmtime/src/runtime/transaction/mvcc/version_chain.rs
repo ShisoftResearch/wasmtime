@@ -147,6 +147,16 @@ impl<T> VersionChain<T> {
             })
     }
 
+    pub(crate) fn newest_committed_value(&self) -> Option<&T> {
+        self.committed_predecessor()
+    }
+
+    pub(crate) fn has_pending_version(&self) -> bool {
+        self.versions
+            .iter()
+            .any(|version| matches!(version.commit.state(), CommitState::Pending))
+    }
+
     pub(crate) fn remove_newest_for_commit(&mut self, commit: &Arc<CommitRecord>) -> bool {
         if self
             .versions
@@ -174,21 +184,24 @@ impl<T> VersionChain<T> {
         self.versions.len()
     }
 
-    pub(crate) fn prune_for_oldest_snapshot(&mut self, oldest_snapshot: Option<CommitTimestamp>) {
+    pub(crate) fn prune_for_horizon(&mut self, horizon: CommitTimestamp) -> usize {
+        let before = self.versions.len();
         let mut retained_predecessor = false;
         self.versions
             .retain(|version| match version.commit.state() {
-                CommitState::Aborted => false,
-                CommitState::Pending => true,
-                CommitState::Committed(timestamp) => match oldest_snapshot {
-                    Some(snapshot) if timestamp > snapshot => true,
-                    Some(_) | None if !retained_predecessor => {
+                CommitState::Aborted | CommitState::Pending => true,
+                CommitState::Committed(timestamp) => {
+                    if timestamp > horizon {
+                        true
+                    } else if !retained_predecessor {
                         retained_predecessor = true;
                         true
+                    } else {
+                        false
                     }
-                    Some(_) | None => false,
-                },
+                }
             });
+        before - self.versions.len()
     }
 
     #[cfg(test)]
@@ -261,7 +274,7 @@ mod tests {
             );
         }
 
-        chain.prune_for_oldest_snapshot(Some(3));
+        chain.prune_for_horizon(3);
         assert_eq!(chain.committed_timestamps(), vec![5, 4, 3]);
         assert_eq!(chain.read_visible(3), Some(&3));
     }
@@ -292,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_removes_aborted_versions_but_retains_pending_versions() {
+    fn pruning_retains_pending_and_aborted_versions() {
         let mut chain = VersionChain::new_pending();
         let pending = Arc::new(CommitRecord::pending());
         let aborted = Arc::new(CommitRecord::pending());
@@ -300,10 +313,15 @@ mod tests {
         chain.push_newest(aborted.clone(), 2_u64);
         aborted.abort().unwrap();
 
-        chain.prune_for_oldest_snapshot(None);
+        chain.prune_for_horizon(0);
         assert_eq!(chain.read_visible(100), None);
-        assert_eq!(chain.versions.len(), 1);
-        assert_eq!(chain.versions[0].commit.state(), CommitState::Pending);
+        assert_eq!(chain.versions.len(), 2);
+        assert!(
+            chain
+                .versions
+                .iter()
+                .any(|version| version.commit.state() == CommitState::Aborted)
+        );
     }
 
     #[test]
@@ -337,7 +355,7 @@ mod tests {
             );
         }
 
-        chain.prune_for_oldest_snapshot(None);
+        chain.prune_for_horizon(2);
         assert_eq!(chain.committed_timestamps(), vec![2]);
         assert_eq!(chain.read_visible(2), Some(&2));
     }

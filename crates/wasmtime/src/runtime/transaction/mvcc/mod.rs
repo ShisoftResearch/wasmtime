@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 
 mod coordinator;
 mod domains;
+mod gc;
 #[cfg(test)]
 mod model;
 mod version_chain;
@@ -14,7 +15,8 @@ mod version_chain;
     reason = "reserved for the next MVCC implementation stages"
 )]
 pub(crate) use coordinator::{
-    MvccCoordinator, MvccGcBarrierPermit, PendingCommitRegistration, SnapshotRegistration,
+    MvccCoordinator, MvccGcBarrierPermit, MvccGcMetadata, PendingCommitRegistration,
+    SnapshotRegistration,
 };
 #[allow(
     unused_imports,
@@ -26,6 +28,11 @@ pub(crate) use domains::{
 };
 #[cfg(test)]
 pub(crate) use domains::{MvccCommitFaultPoint, MvccCommitTestHook};
+#[allow(
+    unused_imports,
+    reason = "MVCC pruning and rebase values are consumed by the persistent-GC adapter"
+)]
+pub(crate) use gc::{MvccExpectedObjectState, MvccPruneBudget, MvccPruneReport, MvccRebasePlan};
 #[cfg(test)]
 pub(crate) use model::{
     ModelCommitOutcome, ModelOperation, ModelTransaction, SerializableMvccModel,
@@ -90,7 +97,9 @@ impl TransactionVisibility for MvccVisibility {
     }
 
     fn finish_snapshot(&self, snapshot: Self::Snapshot) -> Result<()> {
-        snapshot.finish()
+        snapshot.finish()?;
+        let _ = self.0.prune_versions(MvccPruneBudget::chains(8));
+        Ok(())
     }
 
     fn read_memory<F>(
