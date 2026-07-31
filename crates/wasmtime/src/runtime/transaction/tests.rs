@@ -833,6 +833,353 @@ fn mvcc_is_visibility_not_concurrency_control() {
     assert!(visibility.is_multiversion());
 }
 
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_backend_assert_snapshot_history(
+    config: TransactionConfig,
+    expected_backend: TMemoryBackend,
+    expected_file_backing: Option<TMemoryFileBacking>,
+    expected_dax_backing: Option<TMemoryDaxPmemBacking>,
+    expected_persistence_mode: TMemoryPersistenceMode,
+) {
+    use crate::AsContextMut;
+
+    clear_current_thread_transaction_for_test();
+    assert_eq!(config.tmemory_backend(), expected_backend);
+    assert_eq!(config.tmemory_file_backing(), expected_file_backing);
+    assert_eq!(config.tmemory_dax_pmem_backing(), expected_dax_backing);
+    assert_eq!(config.tmemory_persistence_mode(), expected_persistence_mode);
+    assert_eq!(
+        config.concurrency_control(),
+        ConcurrencyControl::OptimisticValidation
+    );
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory $m 1)
+              (func (export "read-open-snapshot") (result i32)
+                (i32.tload $m (i32.const 0)))
+              (tfunc (export "write") (param i32)
+                (i32.tstore $m (i32.const 0) (local.get 0)))
+              (tfunc (export "read-current") (result i32)
+                (i32.tload $m (i32.const 0))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut store = crate::Store::new(&engine, ());
+    store
+        .transaction_attach_region_runtime_for_test(runtime.clone(), config.clone())
+        .unwrap();
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory_index = wasmtime_environ::MemoryIndex::from_u32(0);
+    assert_eq!(
+        store
+            .as_context_mut()
+            .0
+            .instance_mut(instance.id())
+            .get_tmemory_mut(memory_index)
+            .unwrap()
+            .backend(),
+        expected_backend
+    );
+
+    let write = instance
+        .get_typed_func::<i32, ()>(&mut store, "write")
+        .unwrap();
+    let read_open_snapshot = instance
+        .get_typed_func::<(), i32>(&mut store, "read-open-snapshot")
+        .unwrap();
+    let read_current = instance
+        .get_typed_func::<(), i32>(&mut store, "read-current")
+        .unwrap();
+
+    write.call(&mut store, 11).unwrap();
+    let predecessor = store
+        .transaction_state_mut()
+        .begin_with_region_runtime(&runtime)
+        .unwrap();
+    assert_eq!(read_open_snapshot.call(&mut store, ()).unwrap(), 11);
+    store
+        .transaction_state_mut()
+        .restore_transaction(None)
+        .unwrap();
+
+    write.call(&mut store, 22).unwrap();
+    assert_eq!(read_current.call(&mut store, ()).unwrap(), 22);
+    assert_eq!(
+        store
+            .as_context_mut()
+            .0
+            .instance_mut(instance.id())
+            .get_tmemory_mut(memory_index)
+            .unwrap()
+            .read_committed(0..4)
+            .unwrap(),
+        22_i32.to_le_bytes()
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .total_version_chain_count_for_test()
+            .unwrap(),
+        1
+    );
+    let memory_granule = GranuleId::TMemory {
+        instance: match expected_backend {
+            TMemoryBackend::FileBackedMemory => None,
+            TMemoryBackend::VMemory | TMemoryBackend::DaxPmem => Some(instance.id().as_u32()),
+        },
+        memory_index: 0,
+        granule_index: 0,
+    };
+    assert_eq!(
+        visibility
+            .runtime()
+            .granule_version_count_for_test(memory_granule)
+            .unwrap(),
+        2
+    );
+
+    store
+        .transaction_state_mut()
+        .restore_transaction(Some(predecessor))
+        .unwrap();
+    assert_eq!(read_open_snapshot.call(&mut store, ()).unwrap(), 11);
+    store.transaction_state_mut().abort().unwrap();
+    drop(store);
+
+    let fresh_runtime = TransactionRegionRuntime::new_for_test();
+    let fresh_visibility = fresh_runtime.visibility_for_test();
+    let fresh_metadata = fresh_visibility
+        .runtime()
+        .coordinator_metadata_for_test()
+        .unwrap();
+    assert_eq!(fresh_metadata.visible_timestamp, 0);
+    assert_eq!(fresh_metadata.baseline_timestamp, 0);
+    assert_eq!(fresh_metadata.oldest_active_snapshot, None);
+    assert!(fresh_metadata.quiescent);
+    assert_eq!(
+        fresh_visibility
+            .snapshot_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        fresh_visibility
+            .runtime()
+            .commit_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        fresh_visibility
+            .runtime()
+            .total_version_chain_count_for_test()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fresh_runtime.mvcc_certification_counts_for_test().unwrap(),
+        (0, 0)
+    );
+
+    let mut fresh_store = crate::Store::new(&engine, ());
+    fresh_store
+        .transaction_attach_region_runtime_for_test(fresh_runtime, config)
+        .unwrap();
+    let fresh_instance = crate::Instance::new(&mut fresh_store, &module, &[]).unwrap();
+    assert_eq!(
+        fresh_store
+            .as_context_mut()
+            .0
+            .instance_mut(fresh_instance.id())
+            .get_tmemory_mut(memory_index)
+            .unwrap()
+            .backend(),
+        expected_backend
+    );
+    assert_eq!(
+        fresh_visibility
+            .runtime()
+            .total_version_chain_count_for_test()
+            .unwrap(),
+        0,
+        "cloned backend configuration must not carry MVCC sidecar history"
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[test]
+fn mvcc_backend_vmemory_keeps_history_above_current_state_storage() {
+    mvcc_backend_assert_snapshot_history(
+        TransactionConfig::with_tmemory_backend(TMemoryBackend::VMemory).unwrap(),
+        TMemoryBackend::VMemory,
+        None,
+        None,
+        TMemoryPersistenceMode::ResearchPretendDaxPmem,
+    );
+}
+
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[test]
+fn mvcc_backend_file_backed_temp_keeps_history_above_current_state_storage() {
+    mvcc_backend_assert_snapshot_history(
+        TransactionConfig::with_file_backed_tmemory_temp().unwrap(),
+        TMemoryBackend::FileBackedMemory,
+        Some(TMemoryFileBacking::Temp),
+        None,
+        TMemoryPersistenceMode::ResearchPretendDaxPmem,
+    );
+}
+
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[test]
+fn mvcc_backend_file_backed_reopen_uses_latest_state_as_zero_timestamp_baseline() {
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let tmemory_path = dir.path().join("mvcc-backend-reopen.tmemory");
+    let tx_log_path = dir.path().join("mvcc-backend-reopen.txlog");
+    let runtime =
+        TransactionRegionRuntime::create_file_backed_for_test(&tmemory_path, &tx_log_path, 64)
+            .unwrap();
+    let engine = crate::Engine::default();
+    let module = mvcc_serializable_shared_memory_module(&engine);
+    let (mut store, instance) =
+        mvcc_serializable_shared_memory_store(&engine, &module, &runtime, Arc::new(|| Ok(())));
+    instance
+        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "init")
+        .unwrap()
+        .call(&mut store, (11, 0, 0))
+        .unwrap();
+    instance
+        .get_typed_func::<i32, ()>(&mut store, "write_a")
+        .unwrap()
+        .call(&mut store, 22)
+        .unwrap();
+    assert!(
+        runtime
+            .visibility_for_test()
+            .runtime()
+            .total_version_chain_count_for_test()
+            .unwrap()
+            > 0
+    );
+    drop(store);
+    drop(runtime);
+
+    let reopened =
+        TransactionRegionRuntime::open_file_backed_for_test(&tmemory_path, &tx_log_path).unwrap();
+    let visibility = reopened.visibility_for_test();
+    let metadata = visibility
+        .runtime()
+        .coordinator_metadata_for_test()
+        .unwrap();
+    assert_eq!(metadata.visible_timestamp, 0);
+    assert_eq!(metadata.baseline_timestamp, 0);
+    assert_eq!(metadata.oldest_active_snapshot, None);
+    assert!(metadata.quiescent);
+    assert_eq!(
+        visibility.snapshot_lifecycle_counts_for_test().unwrap(),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .commit_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .total_version_chain_count_for_test()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        reopened.mvcc_certification_counts_for_test().unwrap(),
+        (0, 0)
+    );
+
+    let (mut reopened_store, reopened_instance) =
+        mvcc_serializable_shared_memory_store(&engine, &module, &reopened, Arc::new(|| Ok(())));
+    assert_eq!(
+        reopened_instance
+            .get_typed_func::<(), (i32, i32, i32)>(&mut reopened_store, "read")
+            .unwrap()
+            .call(&mut reopened_store, ())
+            .unwrap(),
+        (22, 0, 0)
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .total_version_chain_count_for_test()
+            .unwrap(),
+        0,
+        "recovered latest state must remain an unversioned timestamp-zero baseline"
+    );
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[test]
+fn mvcc_backend_dax_research_temp_keeps_history_above_current_state_storage() {
+    mvcc_backend_assert_snapshot_history(
+        TransactionConfig::with_tmemory_backend(TMemoryBackend::DaxPmem).unwrap(),
+        TMemoryBackend::DaxPmem,
+        None,
+        Some(TMemoryDaxPmemBacking::ResearchTemp),
+        TMemoryPersistenceMode::ResearchPretendDaxPmem,
+    );
+}
+
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[test]
+fn mvcc_dax_research_temp_keeps_history_in_one_runtime_and_starts_fresh_in_another() {
+    mvcc_backend_assert_snapshot_history(
+        TransactionConfig::with_tmemory_backend(TMemoryBackend::DaxPmem).unwrap(),
+        TMemoryBackend::DaxPmem,
+        None,
+        Some(TMemoryDaxPmemBacking::ResearchTemp),
+        TMemoryPersistenceMode::ResearchPretendDaxPmem,
+    );
+}
+
 fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
     with_transaction_object_metadata(wasm, &[1, 1, 0, 0])
 }

@@ -1088,7 +1088,140 @@ fn shared_runtime_threaded_tmemory_commits_recover_together() -> Result<()> {
 
 #[cfg(feature = "transaction-mvcc")]
 #[test]
-fn mvcc_file_backed_lp_pre_lp_growth_tail_failure_does_not_leak() -> Result<()> {
+fn mvcc_file_backed_restart_recovers_latest_current_state_without_history_records() -> Result<()> {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = tempdir()?;
+    let tmemory_path = dir.path().join("mvcc-latest-only.tmemory");
+    let tx_log_path = dir.path().join("mvcc-latest-only.txlog");
+    let engine = transaction_persistence_engine()?;
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"
+            (module
+              (import "" "pause" (func $pause))
+              (tmemory 1)
+              (tfunc (export "write") (param $value i32)
+                (i32.tstore (i32.const 0) (local.get $value)))
+              (tfunc (export "read-current") (result i32)
+                (i32.tload (i32.const 0)))
+              (tfunc (export "read-twice") (result i32 i32)
+                (local $first i32)
+                (local.set $first (i32.tload (i32.const 0)))
+                (call $pause)
+                (local.get $first)
+                (i32.tload (i32.const 0))))
+            "#,
+        )?,
+    )?;
+    let runtime =
+        create_shared_file_backed_runtime_for_test(tmemory_path.clone(), tx_log_path.clone(), 64)?;
+
+    let mut writer_store = shared_store(&engine, &runtime)?;
+    let writer_pause = Func::wrap(&mut writer_store, || {});
+    let writer_instance = Instance::new(&mut writer_store, &module, &[writer_pause.into()])?;
+    let write = writer_instance.get_typed_func::<i32, ()>(&mut writer_store, "write")?;
+    let read_current =
+        writer_instance.get_typed_func::<(), i32>(&mut writer_store, "read-current")?;
+    write.call(&mut writer_store, 11)?;
+
+    let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
+    let reader = {
+        let engine = engine.clone();
+        let module = module.clone();
+        let runtime = runtime.clone();
+        thread::spawn(move || {
+            let outcome = (|| -> Result<(i32, i32)> {
+                let mut store = shared_store(&engine, &runtime)?;
+                let release_rx = Arc::clone(&release_rx);
+                let pause = Func::wrap(&mut store, move || -> Result<()> {
+                    reached_tx
+                        .send(())
+                        .map_err(|_| wasmtime::Error::msg("reader gate receiver was dropped"))?;
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| {
+                            wasmtime::Error::msg(format!(
+                                "timed out waiting to release old MVCC snapshot: {error}"
+                            ))
+                        })?;
+                    Ok(())
+                });
+                let instance = Instance::new(&mut store, &module, &[pause.into()])?;
+                instance
+                    .get_typed_func::<(), (i32, i32)>(&mut store, "read-twice")?
+                    .call(&mut store, ())
+            })();
+            outcome_tx.send(outcome).unwrap();
+        })
+    };
+
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            wasmtime::Error::msg(format!(
+                "old MVCC snapshot did not reach its bounded gate: {error}"
+            ))
+        })?;
+    write.call(&mut writer_store, 22)?;
+    assert_eq!(read_current.call(&mut writer_store, ())?, 22);
+    release_tx
+        .send(())
+        .map_err(|_| wasmtime::Error::msg("old MVCC snapshot exited before release"))?;
+    assert_eq!(
+        outcome_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| {
+                wasmtime::Error::msg(format!(
+                    "old MVCC snapshot did not finish after release: {error}"
+                ))
+            })??,
+        (11, 11)
+    );
+    reader
+        .join()
+        .map_err(|_| wasmtime::Error::msg("old MVCC snapshot thread panicked"))?;
+
+    drop(read_current);
+    drop(write);
+    drop(writer_store);
+    drop(runtime);
+
+    let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
+    assert!(recovered.winners.is_empty());
+    assert!(recovered.object_winners.is_empty());
+    assert!(recovered.root_object_ids.is_empty());
+    assert!(recovered.tmemory_undo_rollbacks.is_empty());
+
+    let mut reopened_store = Store::new(&engine, ());
+    wasmtime::_internal::transaction_persistence::open_file_backed_storage_for_test(
+        &mut reopened_store,
+        tmemory_path,
+        tx_log_path,
+    )?;
+    let reopened_pause = Func::wrap(&mut reopened_store, || {});
+    let reopened_instance = Instance::new(&mut reopened_store, &module, &[reopened_pause.into()])?;
+    assert_eq!(
+        reopened_instance
+            .get_typed_func::<(), i32>(&mut reopened_store, "read-current")?
+            .call(&mut reopened_store, ())?,
+        22
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_file_backed_restart_pre_lp_growth_tail_failure_recovers_predecessor() -> Result<()> {
     let dir = tempdir()?;
     let tmemory_path = dir.path().join("mvcc-growth-failure.tmemory");
     let tx_log_path = dir.path().join("mvcc-growth-failure.txlog");
@@ -1125,6 +1258,9 @@ fn mvcc_file_backed_lp_pre_lp_growth_tail_failure_does_not_leak() -> Result<()> 
 
     let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
     assert_eq!(recovered.committed_tmemory_pages, Some(2));
+    assert_eq!(recovered.winners.len(), 1);
+    assert!(recovered.object_winners.is_empty());
+    assert!(recovered.root_object_ids.is_empty());
     assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
     wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
         &tx_log_path,
@@ -1139,7 +1275,7 @@ fn mvcc_file_backed_lp_pre_lp_growth_tail_failure_does_not_leak() -> Result<()> 
 
 #[cfg(feature = "transaction-mvcc")]
 #[test]
-fn mvcc_file_backed_lp_post_lp_growth_tail_recovers() -> Result<()> {
+fn mvcc_file_backed_restart_post_lp_growth_tail_recovers_committed_value() -> Result<()> {
     let dir = tempdir()?;
     let tmemory_path = dir.path().join("mvcc-growth-committed.tmemory");
     let tx_log_path = dir.path().join("mvcc-growth-committed.txlog");
@@ -1167,6 +1303,9 @@ fn mvcc_file_backed_lp_post_lp_growth_tail_recovers() -> Result<()> {
 
     let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
     assert_eq!(recovered.committed_tmemory_pages, Some(2));
+    assert_eq!(recovered.winners.len(), 1);
+    assert!(recovered.object_winners.is_empty());
+    assert!(recovered.root_object_ids.is_empty());
     assert!(recovered.tmemory_undo_rollbacks.is_empty());
     wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
         &tx_log_path,
