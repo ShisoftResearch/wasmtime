@@ -1015,22 +1015,36 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
     let mut second_store = shared_store(&engine, &runtime)?;
     let second_pause = Func::wrap(&mut second_store, || {});
     let second_instance = Instance::new(&mut second_store, &module, &[second_pause.into()])?;
-    let err = second_instance
+    let second_outcome = second_instance
         .get_typed_func::<i32, ()>(&mut second_store, "publish")?
-        .call(&mut second_store, 22)
-        .unwrap_err();
-    let err = format!("{err:?}");
-    assert!(err.contains("transaction write conflict"), "{err}");
+        .call(&mut second_store, 22);
+    #[cfg(not(feature = "transaction-mvcc"))]
+    {
+        let err = format!("{:?}", second_outcome.unwrap_err());
+        assert!(err.contains("transaction write conflict"), "{err}");
+    }
+    #[cfg(feature = "transaction-mvcc")]
+    second_outcome?;
 
     *released = false;
     ready.notify_one();
     drop(released);
-    first.join().unwrap()?;
+    let first_outcome = first.join().unwrap();
+    #[cfg(not(feature = "transaction-mvcc"))]
+    first_outcome?;
+    #[cfg(feature = "transaction-mvcc")]
+    {
+        let err = format!("{:?}", first_outcome.unwrap_err());
+        assert_mvcc_certification_conflict(&err);
+    }
 
     let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
     assert_eq!(recovered.root_object_ids.len(), 1);
     assert_eq!(recovered.object_winners.len(), 2);
+    #[cfg(not(feature = "transaction-mvcc"))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11]);
+    #[cfg(feature = "transaction-mvcc")]
+    assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![22]);
 
     Ok(())
 }
@@ -1423,17 +1437,28 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
     let mut second_store = shared_store(&engine, &runtime)?;
     let second_pause = Func::wrap(&mut second_store, || {});
     let second_instance = Instance::new(&mut second_store, &module, &[second_pause.into()])?;
-    let err = second_instance
+    let second_outcome = second_instance
         .get_typed_func::<i32, ()>(&mut second_store, "write")?
-        .call(&mut second_store, 0x5566_7788)
-        .unwrap_err();
-    let err = format!("{err:?}");
-    assert_transaction_conflict(&err);
+        .call(&mut second_store, 0x5566_7788);
+    #[cfg(not(feature = "transaction-mvcc"))]
+    {
+        let err = format!("{:?}", second_outcome.unwrap_err());
+        assert_transaction_conflict(&err);
+    }
+    #[cfg(feature = "transaction-mvcc")]
+    second_outcome?;
 
     *released = false;
     ready.notify_one();
     drop(released);
-    first.join().unwrap()?;
+    let first_outcome = first.join().unwrap();
+    #[cfg(not(feature = "transaction-mvcc"))]
+    first_outcome?;
+    #[cfg(feature = "transaction-mvcc")]
+    {
+        let err = format!("{:?}", first_outcome.unwrap_err());
+        assert_mvcc_certification_conflict(&err);
+    }
 
     wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
         &tx_log_path,
@@ -1441,7 +1466,10 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
         1,
         Some(1),
     )?;
+    #[cfg(not(feature = "transaction-mvcc"))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &0x1122_3344u32.to_le_bytes())?;
+    #[cfg(feature = "transaction-mvcc")]
+    assert_tmemory_file_bytes(&tmemory_path, 0, &0x5566_7788u32.to_le_bytes())?;
 
     Ok(())
 }
@@ -1570,22 +1598,36 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
     let mut second_store = shared_store(&engine, &runtime)?;
     let second_pause = Func::wrap(&mut second_store, || {});
     let second_instance = Instance::new(&mut second_store, &module, &[second_pause.into()])?;
-    let err = second_instance
+    let second_outcome = second_instance
         .get_typed_func::<i32, ()>(&mut second_store, "publish")?
-        .call(&mut second_store, 22)
-        .unwrap_err();
-    let err = format!("{err:?}");
-    assert_transaction_conflict(&err);
+        .call(&mut second_store, 22);
+    #[cfg(not(feature = "transaction-mvcc"))]
+    {
+        let err = format!("{:?}", second_outcome.unwrap_err());
+        assert_transaction_conflict(&err);
+    }
+    #[cfg(feature = "transaction-mvcc")]
+    second_outcome?;
 
     *released = false;
     ready.notify_one();
     drop(released);
-    first.join().unwrap()?;
+    let first_outcome = first.join().unwrap();
+    #[cfg(not(feature = "transaction-mvcc"))]
+    first_outcome?;
+    #[cfg(feature = "transaction-mvcc")]
+    {
+        let err = format!("{:?}", first_outcome.unwrap_err());
+        assert_mvcc_certification_conflict(&err);
+    }
 
     let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
     assert_eq!(recovered.root_object_ids.len(), 1);
     assert_eq!(recovered.object_winners.len(), 2);
+    #[cfg(not(feature = "transaction-mvcc"))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11]);
+    #[cfg(feature = "transaction-mvcc")]
+    assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![22]);
 
     wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
         &tx_log_path,
@@ -1593,7 +1635,10 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
         1,
         Some(1),
     )?;
+    #[cfg(not(feature = "transaction-mvcc"))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &11u32.to_le_bytes())?;
+    #[cfg(feature = "transaction-mvcc")]
+    assert_tmemory_file_bytes(&tmemory_path, 0, &22u32.to_le_bytes())?;
 
     Ok(())
 }
@@ -1747,9 +1792,18 @@ fn call_shared_tfunc_i32(
         .call(&mut store, value)
 }
 
+#[cfg(not(feature = "transaction-mvcc"))]
 fn assert_transaction_conflict(error: &str) {
     assert!(
         error.contains("transaction read conflict") || error.contains("transaction write conflict"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn assert_mvcc_certification_conflict(error: &str) {
+    assert!(
+        error.contains("transaction MVCC certification conflict"),
         "{error}"
     );
 }

@@ -12082,6 +12082,7 @@ fn commit_releases_lock_based_ownership_for_next_transaction() {
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn commit_rejects_changed_optimistic_read_version() {
     let mut state = TransactionState::default();
     let transaction = state.begin().unwrap();
@@ -12102,6 +12103,7 @@ fn commit_rejects_changed_optimistic_read_version() {
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn commit_validates_optimistic_read_versions_before_clearing() {
     let mut state = TransactionState::default();
     let transaction = state.begin().unwrap();
@@ -12124,6 +12126,7 @@ fn commit_validates_optimistic_read_versions_before_clearing() {
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn commit_validates_reads_before_apply_callback() {
     let mut state = TransactionState::default();
     let transaction = state.begin().unwrap();
@@ -12155,6 +12158,7 @@ fn commit_validates_reads_before_apply_callback() {
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn commit_validates_writes_before_apply_callback() {
     let transaction = TransactionId::from_raw(77);
     let mut state = TransactionState::new_for_test(transaction);
@@ -19498,6 +19502,7 @@ mod model_permissions {
                 "permission downgrade should preserve read permission for {granule:?}"
             );
             if transaction_cc_is_ownerless_multiwriter() {
+                #[cfg(not(feature = "transaction-mvcc"))]
                 ensure!(
                     state
                         .concurrency
@@ -20905,6 +20910,7 @@ fn transaction_object_unsupported_textern_promotion_aborts_transaction() {
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn object_payload_commit_validates_object_read_versions() {
     let mut objects = ObjectTable::default();
     let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
@@ -20927,6 +20933,7 @@ fn object_payload_commit_validates_object_read_versions() {
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn transaction_object_read_validation_uses_object_table_versions() {
     let mut objects = ObjectTable::default();
     let object = objects.allocate_struct(vec![ObjectValue::I32(1)]).unwrap();
@@ -20950,6 +20957,7 @@ fn transaction_object_read_validation_uses_object_table_versions() {
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn transaction_object_read_validation_uses_shared_runtime_versions() {
     let runtime = TransactionRegionRuntime::new_for_test();
     let mut objects = ObjectTable::default();
@@ -21010,6 +21018,7 @@ fn shared_runtime_object_read_validation_uses_same_version_for_unpublished_objec
 }
 
 #[test]
+#[cfg(not(feature = "transaction-mvcc"))]
 fn shared_runtime_deref_rejects_refreshed_payload_under_stale_read_authority() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let tx_log_path = dir.path().join("tx-log.bin");
@@ -21073,31 +21082,54 @@ fn shared_runtime_deref_rejects_refreshed_payload_under_stale_read_authority() -
     observer_state.restore_transaction(None)?;
 
     let second_tx = publisher_state.begin_with_region_runtime(&runtime)?;
-    publisher_state.acquire_object_write(&mut publisher_objects, object)?;
-    publisher_state.stage_struct_field(&mut publisher_objects, object, 0, ObjectValue::I32(22))?;
-    commit_active_file_backed_publications_for_test(
-        u32::try_from(second_tx.as_raw())?,
-        u32::try_from(second_tx.as_raw())?,
-        &mut publisher_objects,
-        &mut publisher_state,
-    )?;
-    install_latest_runtime_entry()?;
+    let publisher_write = publisher_state.acquire_object_write(&mut publisher_objects, object);
+    #[cfg(feature = "transaction-cc-strict-2pl")]
+    {
+        let _ = second_tx;
+        let error = publisher_write.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("granule is read-locked by another transaction"),
+            "{error:?}"
+        );
+        publisher_state.abort()?;
+        observer_state.restore_transaction(Some(observer_tx))?;
+        observer_state.abort()?;
+    }
+    #[cfg(not(feature = "transaction-cc-strict-2pl"))]
+    {
+        publisher_write?;
+        publisher_state.stage_struct_field(
+            &mut publisher_objects,
+            object,
+            0,
+            ObjectValue::I32(22),
+        )?;
+        commit_active_file_backed_publications_for_test(
+            u32::try_from(second_tx.as_raw())?,
+            u32::try_from(second_tx.as_raw())?,
+            &mut publisher_objects,
+            &mut publisher_state,
+        )?;
+        install_latest_runtime_entry()?;
 
-    observer_state.restore_transaction(Some(observer_tx))?;
-    let error = observer_state
-        .read_object_payload(&mut observer_objects, object)
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains(transaction_cc_read_version_conflict_message()),
-        "{error:?}"
-    );
-    assert_eq!(
-        observer_objects.payload(object)?,
-        ObjectPayload::Struct(vec![ObjectValue::I32(22)])
-    );
-    observer_state.abort()?;
+        observer_state.restore_transaction(Some(observer_tx))?;
+        let error = observer_state
+            .read_object_payload(&mut observer_objects, object)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(transaction_cc_read_version_conflict_message()),
+            "{error:?}"
+        );
+        assert_eq!(
+            observer_objects.payload(object)?,
+            ObjectPayload::Struct(vec![ObjectValue::I32(22)])
+        );
+        observer_state.abort()?;
+    }
     Ok(())
 }
 
@@ -23141,6 +23173,7 @@ mod persistent_promotion_commit {
     }
 
     #[test]
+    #[cfg(not(feature = "transaction-mvcc"))]
     fn promotion_registers_source_object_read_for_validation() {
         clear_current_thread_transaction_for_test();
         let mut objects = ObjectTable::default();
