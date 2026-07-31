@@ -181,3 +181,141 @@ quiescent barrier phase. This can temporarily increase peak memory, but keeping
 that stable validation snapshot is the current brief-required tradeoff.
 Chunked object validation would change adapter sequencing and is deferred
 outside this review fix.
+
+## Task 12B: Pluggable Persistent-GC Policy and Compatibility Adapter
+
+Task 12B adds an object-safe `TransactionPersistentGc` policy with four
+operations: full mark/sweep, bounded maintenance, finish/sweep, and persistent
+object compaction. `CurrentStatePersistentGc` is the default in every build.
+`GcMvccMode::{CurrentStateOnly, MvccCompliant}` controls only whether the
+callback receives a metadata-only `TransactionMvccGcView`; it never changes
+barrier or rebase safety.
+
+Local transaction state and shared region runtimes own independent
+`Arc<dyn TransactionPersistentGc>` handles. Shared selection pairs the shared
+policy with that same runtime's visibility authority. Local replacement clears
+incremental state. Shared replacement installs a cycle-stable `Arc`, then bumps
+the existing persistent-GC epoch so every Store restarts stale incremental
+work.
+
+In MVCC builds, all four state entry points now use the same sequence:
+
+```text
+active/suspended check
+select policy + visibility authority
+MVCC barrier
+shared-region GC permit (when shared)
+prepare full rebase
+validate current persistent object identity/payload or absence
+complete rebase
+optional metadata-only view
+policy callback over the current ObjectTable
+```
+
+Declaration order guarantees that the shared-region permit drops before the
+MVCC permit on every return path. The permits remain live through the callback.
+Both policy modes are quiescent and fully rebased. Historical payloads,
+sidecars, synthetic object IDs, and historical roots are not exposed.
+
+Non-MVCC builds use a separate compile-time path. It clones the same selected
+policy, takes only the shared-region permit when needed, passes `None`, and
+does not query `mvcc_mode` or touch any MVCC type. The incremental wrapper
+discards state after every error, including errors after a collector has
+consumed grey work.
+
+The original collector implementations are now transaction-module-only
+`*_uncoordinated` methods used by the default policy. Destructive ObjectTable
+sweep helpers are likewise narrowed and explicitly named
+`*_uncoordinated`; low-level tests opt into those names.
+
+### TDD evidence
+
+The first focused RED was the missing policy contract:
+
+```text
+E0405: cannot find trait TransactionPersistentGc
+E0433: cannot find CurrentStatePersistentGc
+E0433: cannot find GcMvccMode
+```
+
+After adding only the object-safe interface and default mode:
+
+```text
+mvcc_gc_policy_default_is_current_state_only_and_object_safe
+1 passed; 0 failed
+```
+
+The next RED was the policy ownership boundary:
+
+```text
+E0599: no set_persistent_gc_policy_for_test on TransactionState
+E0599: no set_persistent_gc_policy_for_test on TransactionRegionRuntime
+```
+
+After adding local/shared handles and dispatch:
+
+```text
+mvcc_gc_policy_ filter
+3 passed; 0 failed
+```
+
+The completed focused suites prove all-four local/shared dispatch, shared
+snapshot and pending-commit rejection, active/suspended rejection before the
+callback, both permits live during the callback, release after all four
+callback-error paths, metadata mode behavior, full rebase before callback for
+both modes, current ObjectTable-only visibility, maintenance rollback, and
+local/shared replacement invalidation:
+
+```text
+MVCC mvcc_gc_policy_ filter
+13 passed; 0 failed
+
+non-MVCC OCC mvcc_gc_policy_ filter
+8 passed; 0 failed
+```
+
+The non-MVCC policy's `mvcc_mode` deliberately panics if queried; all four
+direct callbacks still pass with no view.
+
+### Task 12B verification
+
+All MVCC commands used the complete Task 10 feature closure recorded above.
+Fresh results:
+
+```text
+MVCC persistent_gc filter
+48 passed; 0 failed
+
+MVCC runtime::transaction::tests::mvcc_gc_ filter
+32 passed; 0 failed
+
+MVCC runtime::transaction::mvcc:: filter
+33 passed; 0 failed
+
+MVCC runtime::transaction::tests::mvcc_serializable_ filter
+8 passed; 0 failed
+
+MVCC runtime::transaction::tests::mvcc_commit_ filter
+19 passed; 0 failed
+
+complete MVCC feature-closure cargo check
+exit 0
+
+default non-MVCC cargo check
+exit 0
+
+non-MVCC OCC cargo check
+exit 0
+
+non-MVCC OCC persistent_gc filter, using the complete non-MVCC test closure
+48 passed; 0 failed
+```
+
+A smaller non-MVCC unit-test feature list (`runtime,std,gc,cranelift,wat` plus
+OCC) is sufficient for `cargo check` but not for this crate's complete `--lib`
+test harness, whose unrelated serialization tests require cache, threads, and
+other test features. Re-running the persistent-GC filter with the complete
+non-MVCC closure passed as shown above.
+
+No backend, durable format, commit linearization point, copy-on-write, or
+transaction configuration behavior changed in Task 12B.

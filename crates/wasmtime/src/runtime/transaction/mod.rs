@@ -78,10 +78,10 @@ pub(crate) use object_directory::{
 #[cfg(test)]
 use object_gc::PersistentObjectEdge;
 pub(crate) use object_gc::{
-    DanglingObjectRef, DanglingObjectRefKind, PersistentGcBudget, PersistentGcCommitDelta,
-    PersistentGcState, PersistentGcStepReport, PersistentObjectMarker,
-    PersistentRecoveredRecordLocation, PersistentRecoveryGcReport, PersistentRootError,
-    PersistentRootErrorKind,
+    CurrentStatePersistentGc, DanglingObjectRef, DanglingObjectRefKind, GcMvccMode,
+    PersistentGcBudget, PersistentGcCommitDelta, PersistentGcState, PersistentGcStepReport,
+    PersistentObjectMarker, PersistentRecoveredRecordLocation, PersistentRecoveryGcReport,
+    PersistentRootError, PersistentRootErrorKind, TransactionMvccGcView, TransactionPersistentGc,
 };
 #[cfg(test)]
 use object_value::OBJECT_VALUE_ABI_TAG_I31;

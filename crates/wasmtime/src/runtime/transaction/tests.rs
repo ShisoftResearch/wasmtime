@@ -15,18 +15,649 @@ use super::mvcc::{
 };
 #[cfg(feature = "transaction-mvcc")]
 use super::visibility::SelectedTransactionVisibility;
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 use super::visibility::TransactionVisibility;
 use super::*;
 use crate::runtime::store::AsStoreOpaque;
+use alloc::sync::Arc;
+
+#[test]
+fn mvcc_gc_policy_default_is_current_state_only_and_object_safe() {
+    let policy = CurrentStatePersistentGc::default();
+    let policy: &dyn TransactionPersistentGc = &policy;
+
+    assert_eq!(policy.mvcc_mode(), GcMvccMode::CurrentStateOnly);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MvccGcPolicyCall {
+    MarkSweep,
+    Maintenance,
+    FinishSweep,
+    Compaction,
+}
+
+struct RecordingPersistentGc {
+    mode: GcMvccMode,
+    panic_on_mvcc_mode_query: bool,
+    calls: Arc<std::sync::Mutex<Vec<MvccGcPolicyCall>>>,
+    hook: Option<Arc<PersistentGcPolicyTestHook>>,
+}
+
+type PersistentGcPolicyTestHook = dyn Fn(
+        MvccGcPolicyCall,
+        Option<&dyn TransactionMvccGcView>,
+        &mut TransactionState,
+        &mut ObjectTable,
+    ) -> Result<()>
+    + Send
+    + Sync;
+
+impl core::fmt::Debug for RecordingPersistentGc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecordingPersistentGc")
+            .field("mode", &self.mode)
+            .field("panic_on_mvcc_mode_query", &self.panic_on_mvcc_mode_query)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecordingPersistentGc {
+    fn new(
+        mode: GcMvccMode,
+    ) -> (
+        Arc<dyn TransactionPersistentGc>,
+        Arc<std::sync::Mutex<Vec<MvccGcPolicyCall>>>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                mode,
+                panic_on_mvcc_mode_query: false,
+                calls: calls.clone(),
+                hook: None,
+            }),
+            calls,
+        )
+    }
+
+    fn with_hook(
+        mode: GcMvccMode,
+        hook: Arc<PersistentGcPolicyTestHook>,
+    ) -> (
+        Arc<dyn TransactionPersistentGc>,
+        Arc<std::sync::Mutex<Vec<MvccGcPolicyCall>>>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                mode,
+                panic_on_mvcc_mode_query: false,
+                calls: calls.clone(),
+                hook: Some(hook),
+            }),
+            calls,
+        )
+    }
+
+    fn record(
+        &self,
+        call: MvccGcPolicyCall,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+    ) -> Result<()> {
+        self.calls.lock().unwrap().push(call);
+        match &self.hook {
+            Some(hook) => hook(call, mvcc, state, objects),
+            None => Ok(()),
+        }
+    }
+}
+
+impl TransactionPersistentGc for RecordingPersistentGc {
+    fn mvcc_mode(&self) -> GcMvccMode {
+        assert!(
+            !self.panic_on_mvcc_mode_query,
+            "non-MVCC dispatch must not query the policy MVCC mode"
+        );
+        self.mode
+    }
+
+    fn persistent_mark_sweep_collect(
+        &self,
+        _mvcc: Option<&dyn TransactionMvccGcView>,
+        _state: &mut TransactionState,
+        _objects: &mut ObjectTable,
+    ) -> Result<PersistentMarkSweepReport> {
+        self.record(MvccGcPolicyCall::MarkSweep, _mvcc, _state, _objects)?;
+        Ok(PersistentMarkSweepReport::default())
+    }
+
+    fn persistent_gc_maintenance_step(
+        &self,
+        _mvcc: Option<&dyn TransactionMvccGcView>,
+        _state: &mut TransactionState,
+        _objects: &mut ObjectTable,
+        _budget: PersistentGcBudget,
+    ) -> Result<PersistentGcStepReport> {
+        self.record(MvccGcPolicyCall::Maintenance, _mvcc, _state, _objects)?;
+        Ok(PersistentGcStepReport::default())
+    }
+
+    fn finish_persistent_gc_cycle_and_sweep(
+        &self,
+        _mvcc: Option<&dyn TransactionMvccGcView>,
+        _state: &mut TransactionState,
+        _objects: &mut ObjectTable,
+    ) -> Result<Option<PersistentMarkSweepReport>> {
+        self.record(MvccGcPolicyCall::FinishSweep, _mvcc, _state, _objects)?;
+        Ok(None)
+    }
+
+    fn compact_persistent_object_chunks(
+        &self,
+        _mvcc: Option<&dyn TransactionMvccGcView>,
+        _state: &mut TransactionState,
+        _objects: &mut ObjectTable,
+        _recovery_report: &PersistentRecoveryGcReport,
+    ) -> Result<PersistentObjectCompactionReport> {
+        self.record(MvccGcPolicyCall::Compaction, _mvcc, _state, _objects)?;
+        Ok(PersistentObjectCompactionReport::default())
+    }
+}
+
+#[cfg(not(feature = "transaction-mvcc"))]
+#[test]
+fn mvcc_gc_policy_non_mvcc_dispatch_is_direct_and_never_constructs_a_view() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let policy = Arc::new(RecordingPersistentGc {
+        mode: GcMvccMode::MvccCompliant,
+        panic_on_mvcc_mode_query: true,
+        calls: calls.clone(),
+        hook: Some(Arc::new(|_call, mvcc, _state, _objects| {
+            assert!(mvcc.is_none());
+            Ok(())
+        })),
+    });
+    let mut state = TransactionState::default();
+    state.set_persistent_gc_policy_for_test(policy);
+    let mut objects = ObjectTable::default();
+
+    invoke_all_persistent_gc_policy_entries(&mut state, &mut objects);
+
+    assert_eq!(*calls.lock().unwrap(), all_persistent_gc_policy_calls());
+}
+
+fn invoke_persistent_gc_policy_entry(
+    call: MvccGcPolicyCall,
+    state: &mut TransactionState,
+    objects: &mut ObjectTable,
+) -> Result<()> {
+    match call {
+        MvccGcPolicyCall::MarkSweep => state
+            .persistent_mark_sweep_collect_for_test(objects)
+            .map(|_| ()),
+        MvccGcPolicyCall::Maintenance => state
+            .persistent_gc_maintenance_step_for_test(objects, PersistentGcBudget::objects(1))
+            .map(|_| ()),
+        MvccGcPolicyCall::FinishSweep => state
+            .finish_persistent_gc_cycle_and_sweep_for_test(objects)
+            .map(|_| ()),
+        MvccGcPolicyCall::Compaction => state
+            .compact_persistent_object_chunks_for_test(
+                objects,
+                &PersistentRecoveryGcReport::default(),
+            )
+            .map(|_| ()),
+    }
+}
+
+fn invoke_all_persistent_gc_policy_entries(
+    state: &mut TransactionState,
+    objects: &mut ObjectTable,
+) {
+    for call in all_persistent_gc_policy_calls() {
+        invoke_persistent_gc_policy_entry(call, state, objects).unwrap();
+    }
+}
+
+fn all_persistent_gc_policy_calls() -> Vec<MvccGcPolicyCall> {
+    vec![
+        MvccGcPolicyCall::MarkSweep,
+        MvccGcPolicyCall::Maintenance,
+        MvccGcPolicyCall::FinishSweep,
+        MvccGcPolicyCall::Compaction,
+    ]
+}
+
+#[test]
+fn mvcc_gc_policy_local_dispatches_all_four_entries() {
+    let (policy, calls) = RecordingPersistentGc::new(GcMvccMode::CurrentStateOnly);
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    state.set_persistent_gc_policy_for_test(policy);
+
+    invoke_all_persistent_gc_policy_entries(&mut state, &mut objects);
+
+    assert_eq!(*calls.lock().unwrap(), all_persistent_gc_policy_calls());
+}
+
+#[test]
+fn mvcc_gc_policy_shared_dispatches_all_four_entries() {
+    let (local_policy, local_calls) = RecordingPersistentGc::new(GcMvccMode::CurrentStateOnly);
+    let (shared_policy, shared_calls) = RecordingPersistentGc::new(GcMvccMode::CurrentStateOnly);
+    let runtime = TransactionRegionRuntime::default();
+    runtime
+        .set_persistent_gc_policy_for_test(shared_policy)
+        .unwrap();
+    let mut state = TransactionState::default();
+    state.set_persistent_gc_policy_for_test(local_policy);
+    state.set_shared_region_runtime(Some(runtime));
+    let mut objects = ObjectTable::default();
+
+    invoke_all_persistent_gc_policy_entries(&mut state, &mut objects);
+
+    assert!(local_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *shared_calls.lock().unwrap(),
+        all_persistent_gc_policy_calls()
+    );
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_gc_policy_modes_receive_only_the_contractual_metadata_view() {
+    for (mode, expects_view) in [
+        (GcMvccMode::CurrentStateOnly, false),
+        (GcMvccMode::MvccCompliant, true),
+    ] {
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_observations = observations.clone();
+        let (policy, _) = RecordingPersistentGc::with_hook(
+            mode,
+            Arc::new(move |_call, mvcc, _state, _objects| {
+                hook_observations.lock().unwrap().push(mvcc.map(|view| {
+                    (
+                        view.oldest_active_snapshot(),
+                        view.visible_timestamp(),
+                        view.baseline_timestamp(),
+                        view.is_quiescent(),
+                    )
+                }));
+                Ok(())
+            }),
+        );
+        let mut state = TransactionState::default();
+        state.set_persistent_gc_policy_for_test(policy);
+        let mut objects = ObjectTable::default();
+
+        invoke_all_persistent_gc_policy_entries(&mut state, &mut objects);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 4);
+        if expects_view {
+            assert!(
+                observations
+                    .iter()
+                    .all(|view| *view == Some((None, 0, 0, true)))
+            );
+        } else {
+            assert!(observations.iter().all(Option::is_none));
+        }
+    }
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_gc_policy_shared_visibility_rejects_snapshot_and_pending_for_all_entries() {
+    let (policy, calls) = RecordingPersistentGc::new(GcMvccMode::CurrentStateOnly);
+    let runtime = TransactionRegionRuntime::default();
+    runtime.set_persistent_gc_policy_for_test(policy).unwrap();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.set_shared_region_runtime(Some(runtime));
+    let mut objects = ObjectTable::default();
+
+    let snapshot = visibility.begin_snapshot().unwrap();
+    for call in all_persistent_gc_policy_calls() {
+        assert!(
+            invoke_persistent_gc_policy_entry(call, &mut state, &mut objects)
+                .unwrap_err()
+                .to_string()
+                .contains("MVCC snapshots are active")
+        );
+    }
+    drop(snapshot);
+
+    let (_, mut pending) = visibility.runtime().begin_pending_commit().unwrap();
+    for call in all_persistent_gc_policy_calls() {
+        assert!(
+            invoke_persistent_gc_policy_entry(call, &mut state, &mut objects)
+                .unwrap_err()
+                .to_string()
+                .contains("MVCC commits are pending")
+        );
+    }
+    pending.abort().unwrap();
+
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn mvcc_gc_policy_active_and_suspended_work_reject_before_callback() {
+    clear_current_thread_transaction_for_test();
+    let (active_policy, active_calls) = RecordingPersistentGc::new(GcMvccMode::CurrentStateOnly);
+    let mut active = TransactionState::default();
+    active.set_persistent_gc_policy_for_test(active_policy);
+    let mut objects = ObjectTable::default();
+    active
+        .enter_transaction(TransactionId::from_raw(0x6c20))
+        .unwrap();
+    for call in all_persistent_gc_policy_calls() {
+        assert!(invoke_persistent_gc_policy_entry(call, &mut active, &mut objects).is_err());
+    }
+    assert!(active_calls.lock().unwrap().is_empty());
+    active.abort().unwrap();
+
+    let (suspended_policy, suspended_calls) =
+        RecordingPersistentGc::new(GcMvccMode::CurrentStateOnly);
+    let mut suspended = TransactionState::default();
+    suspended.set_persistent_gc_policy_for_test(suspended_policy);
+    let transaction = TransactionId::from_raw(0x6c21);
+    suspended.enter_transaction(transaction).unwrap();
+    suspended.restore_transaction(None).unwrap();
+    for call in all_persistent_gc_policy_calls() {
+        assert!(invoke_persistent_gc_policy_entry(call, &mut suspended, &mut objects).is_err());
+    }
+    assert!(suspended_calls.lock().unwrap().is_empty());
+    assert!(suspended.abort_transaction(transaction).unwrap());
+    clear_current_thread_transaction_for_test();
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_gc_policy_callback_runs_while_both_admission_permits_are_live() {
+    let runtime = TransactionRegionRuntime::default();
+    let hook_runtime = runtime.clone();
+    let (policy, calls) = RecordingPersistentGc::with_hook(
+        GcMvccMode::MvccCompliant,
+        Arc::new(move |_call, mvcc, _state, _objects| {
+            let view = mvcc.expect("MVCC-compliant policy must receive metadata");
+            assert!(view.is_quiescent());
+            assert_eq!(
+                hook_runtime
+                    .visibility_for_test()
+                    .begin_snapshot()
+                    .unwrap_err()
+                    .to_string(),
+                "persistent GC is active"
+            );
+            assert_eq!(
+                hook_runtime
+                    .visibility_for_test()
+                    .runtime()
+                    .begin_pending_commit()
+                    .unwrap_err()
+                    .to_string(),
+                "persistent GC is active"
+            );
+            assert_eq!(
+                hook_runtime
+                    .begin_user_transaction_region()
+                    .unwrap_err()
+                    .to_string(),
+                "persistent GC is active"
+            );
+            Ok(())
+        }),
+    );
+    runtime.set_persistent_gc_policy_for_test(policy).unwrap();
+    let mut state = TransactionState::default();
+    state.set_shared_region_runtime(Some(runtime.clone()));
+    let mut objects = ObjectTable::default();
+
+    invoke_all_persistent_gc_policy_entries(&mut state, &mut objects);
+
+    assert_eq!(*calls.lock().unwrap(), all_persistent_gc_policy_calls());
+    drop(runtime.visibility_for_test().begin_snapshot().unwrap());
+    let (_, mut pending) = runtime
+        .visibility_for_test()
+        .runtime()
+        .begin_pending_commit()
+        .unwrap();
+    pending.abort().unwrap();
+    drop(runtime.begin_user_transaction_region().unwrap());
+}
+
+#[cfg(feature = "transaction-mvcc")]
+#[test]
+fn mvcc_gc_policy_callback_errors_release_both_permits_for_all_entries() {
+    let runtime = TransactionRegionRuntime::default();
+    let (policy, calls) = RecordingPersistentGc::with_hook(
+        GcMvccMode::CurrentStateOnly,
+        Arc::new(|_call, _mvcc, _state, _objects| {
+            Err(crate::format_err!(
+                "injected persistent GC callback failure"
+            ))
+        }),
+    );
+    runtime.set_persistent_gc_policy_for_test(policy).unwrap();
+    let visibility = runtime.visibility_for_test();
+    let mut state = TransactionState::default();
+    state.set_shared_region_runtime(Some(runtime.clone()));
+    let mut objects = ObjectTable::default();
+
+    for call in all_persistent_gc_policy_calls() {
+        let error = invoke_persistent_gc_policy_entry(call, &mut state, &mut objects).unwrap_err();
+        assert_eq!(error.to_string(), "injected persistent GC callback failure");
+
+        drop(visibility.begin_snapshot().unwrap());
+        let (_, mut pending) = visibility.runtime().begin_pending_commit().unwrap();
+        pending.abort().unwrap();
+        drop(runtime.begin_user_transaction_region().unwrap());
+    }
+
+    assert_eq!(*calls.lock().unwrap(), all_persistent_gc_policy_calls());
+}
+
 #[cfg(all(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-use alloc::sync::Arc;
+#[test]
+fn mvcc_gc_policy_rebases_before_callback_and_sees_only_current_object_slots() {
+    let mut state = TransactionState::default();
+    let visibility = state.visibility.clone();
+    let runtime = visibility.runtime().clone();
+    let mut objects = ObjectTable::default();
+    let (timestamp, object) = mvcc_gc_commit_six_domains(&runtime, &mut objects);
+    let volatile = objects.allocate_struct(vec![ObjectValue::I32(99)]).unwrap();
+    assert_eq!(runtime.total_version_chain_count_for_test().unwrap(), 6);
+
+    let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_count = callback_count.clone();
+    let (policy, _) = RecordingPersistentGc::with_hook(
+        GcMvccMode::MvccCompliant,
+        Arc::new(move |_call, mvcc, _state, objects| {
+            hook_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let view = mvcc.expect("MVCC-compliant policy must receive metadata");
+            assert!(view.is_quiescent());
+            assert_eq!(view.oldest_active_snapshot(), None);
+            assert_eq!(view.visible_timestamp(), timestamp);
+            assert_eq!(view.baseline_timestamp(), timestamp);
+            assert_eq!(runtime.total_version_chain_count_for_test().unwrap(), 0);
+            assert_eq!(
+                runtime
+                    .coordinator_metadata_for_test()
+                    .unwrap()
+                    .baseline_timestamp,
+                timestamp
+            );
+            assert_eq!(
+                objects.persistent_object_ids().unwrap(),
+                object_set([object])
+            );
+            assert_eq!(
+                objects.payload(object).unwrap(),
+                ObjectPayload::Struct(vec![ObjectValue::I32(2)])
+            );
+            assert!(!objects.is_persistent(volatile).unwrap());
+            Ok(())
+        }),
+    );
+    state.set_persistent_gc_policy_for_test(policy);
+
+    invoke_all_persistent_gc_policy_entries(&mut state, &mut objects);
+
+    assert_eq!(callback_count.load(std::sync::atomic::Ordering::Relaxed), 4);
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[test]
+fn mvcc_gc_policy_current_state_mode_still_rebases_before_callback() {
+    let mut state = TransactionState::default();
+    let runtime = state.visibility.runtime().clone();
+    let timestamp = mvcc_gc_commit_memory(&runtime, mvcc_certification_granule(0x6c32), 7);
+    assert_eq!(runtime.total_version_chain_count_for_test().unwrap(), 1);
+    let hook_runtime = runtime.clone();
+    let (policy, _) = RecordingPersistentGc::with_hook(
+        GcMvccMode::CurrentStateOnly,
+        Arc::new(move |_call, mvcc, _state, _objects| {
+            assert!(mvcc.is_none());
+            assert_eq!(
+                hook_runtime.total_version_chain_count_for_test().unwrap(),
+                0
+            );
+            assert_eq!(
+                hook_runtime
+                    .coordinator_metadata_for_test()
+                    .unwrap()
+                    .baseline_timestamp,
+                timestamp
+            );
+            Ok(())
+        }),
+    );
+    state.set_persistent_gc_policy_for_test(policy);
+    let mut objects = ObjectTable::default();
+
+    state
+        .persistent_mark_sweep_collect_for_test(&mut objects)
+        .unwrap();
+}
+
+#[test]
+fn mvcc_gc_policy_maintenance_error_discards_partially_advanced_state() {
+    let mut objects = ObjectTable::default();
+    let root = objects
+        .allocate_persistent_struct_for_gc_ref(0x6c30, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let mut state = TransactionState::default();
+    state.install_recovered_persistent_roots([root]).unwrap();
+    let (policy, calls) = RecordingPersistentGc::with_hook(
+        GcMvccMode::CurrentStateOnly,
+        Arc::new(|call, _mvcc, state, objects| {
+            assert_eq!(call, MvccGcPolicyCall::Maintenance);
+            let step = state.persistent_gc_maintenance_step_uncoordinated(
+                objects,
+                PersistentGcBudget::objects(1),
+            )?;
+            assert_eq!(step.scanned_objects, 1);
+            assert!(state.persistent_gc_state.is_some());
+            Err(crate::format_err!(
+                "injected failure after consuming incremental work"
+            ))
+        }),
+    );
+    state.set_persistent_gc_policy_for_test(policy);
+
+    let error = state
+        .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(1))
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "injected failure after consuming incremental work"
+    );
+    assert_eq!(*calls.lock().unwrap(), vec![MvccGcPolicyCall::Maintenance]);
+    assert!(state.persistent_gc_state.is_none());
+}
+
+#[test]
+fn mvcc_gc_policy_local_replacement_discards_incremental_state() {
+    let mut objects = ObjectTable::default();
+    let root = objects
+        .allocate_persistent_struct_for_gc_ref(0x6c31, vec![ObjectValue::I32(1)])
+        .unwrap();
+    let mut state = TransactionState::default();
+    state.install_recovered_persistent_roots([root]).unwrap();
+    state
+        .persistent_gc_maintenance_step_for_test(&mut objects, PersistentGcBudget::objects(1))
+        .unwrap();
+    assert!(state.persistent_gc_state.is_some());
+    let (replacement, _) = RecordingPersistentGc::new(GcMvccMode::CurrentStateOnly);
+
+    state.set_persistent_gc_policy_for_test(replacement);
+
+    assert!(state.persistent_gc_state.is_none());
+}
+
+#[test]
+fn mvcc_gc_policy_shared_replacement_bumps_epoch_and_restarts_each_store_cycle() {
+    let runtime = TransactionRegionRuntime::default();
+    let old_epoch = runtime.persistent_gc_epoch().unwrap();
+    let mut first = TransactionState::default();
+    first.set_shared_region_runtime(Some(runtime.clone()));
+    let mut second = TransactionState::default();
+    second.set_shared_region_runtime(Some(runtime.clone()));
+    let mut first_objects = ObjectTable::default();
+    let mut second_objects = ObjectTable::default();
+    first
+        .persistent_gc_maintenance_step_for_test(&mut first_objects, PersistentGcBudget::objects(1))
+        .unwrap();
+    second
+        .persistent_gc_maintenance_step_for_test(
+            &mut second_objects,
+            PersistentGcBudget::objects(1),
+        )
+        .unwrap();
+    assert_eq!(
+        first.persistent_gc_state.as_ref().unwrap().shared_epoch(),
+        Some(old_epoch)
+    );
+    assert_eq!(
+        second.persistent_gc_state.as_ref().unwrap().shared_epoch(),
+        Some(old_epoch)
+    );
+
+    runtime
+        .set_persistent_gc_policy_for_test(Arc::new(CurrentStatePersistentGc))
+        .unwrap();
+    let new_epoch = runtime.persistent_gc_epoch().unwrap();
+    assert_eq!(new_epoch, old_epoch + 1);
+    first
+        .persistent_gc_maintenance_step_for_test(&mut first_objects, PersistentGcBudget::objects(1))
+        .unwrap();
+    second
+        .persistent_gc_maintenance_step_for_test(
+            &mut second_objects,
+            PersistentGcBudget::objects(1),
+        )
+        .unwrap();
+
+    assert_eq!(
+        first.persistent_gc_state.as_ref().unwrap().shared_epoch(),
+        Some(new_epoch)
+    );
+    assert_eq!(
+        second.persistent_gc_state.as_ref().unwrap().shared_epoch(),
+        Some(new_epoch)
+    );
+}
 
 #[cfg(feature = "transaction-mvcc")]
 #[test]
@@ -5014,7 +5645,7 @@ fn mvcc_object_gc_traces_only_current_object_table_payloads() {
 
     mvcc_object_install_committed_payload(&runtime, &mut objects, root, Some(baseline), current, 1);
     let report = objects
-        .persistent_mark_sweep_from_roots_for_test([root])
+        .persistent_mark_sweep_from_roots_uncoordinated_for_test([root])
         .unwrap();
 
     assert_eq!(runtime.object_chain_count_for_test().unwrap(), 1);
@@ -23650,7 +24281,7 @@ fn persistent_gc_does_not_consider_aborted_transaction_local_object_persistent()
     state.abort().unwrap();
 
     let report = objects
-        .persistent_mark_sweep_from_roots_for_test([])
+        .persistent_mark_sweep_from_roots_uncoordinated_for_test([])
         .unwrap();
     assert!(report.mark.reachable.is_empty());
     assert_eq!(
@@ -24456,7 +25087,9 @@ fn persistent_gc_volatile_sweep_reports_unreachable_objects() {
         .unwrap();
 
     let mark = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
-    let report = objects.apply_volatile_persistent_sweep(&mark).unwrap();
+    let report = objects
+        .apply_volatile_persistent_sweep_uncoordinated(&mark)
+        .unwrap();
 
     assert_eq!(report.retained_objects, vec![root, child]);
     assert_eq!(report.removed_objects, vec![garbage]);
@@ -24473,7 +25106,9 @@ fn persistent_gc_volatile_sweep_removes_unreachable_slots_when_requested() {
         .unwrap();
 
     let mark = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
-    let report = objects.apply_volatile_persistent_sweep(&mark).unwrap();
+    let report = objects
+        .apply_volatile_persistent_sweep_uncoordinated(&mark)
+        .unwrap();
 
     assert_eq!(report.retained_objects, vec![root]);
     assert_eq!(report.removed_objects, vec![garbage]);
@@ -24498,7 +25133,9 @@ fn persistent_gc_volatile_sweep_does_not_persist_dead_state() {
     let garbage_bytes = objects.heap.record_bytes_for_test(garbage_handle).unwrap();
 
     let mark = PersistentObjectMarker::mark(&mut objects, [root]).unwrap();
-    objects.apply_volatile_persistent_sweep(&mark).unwrap();
+    objects
+        .apply_volatile_persistent_sweep_uncoordinated(&mark)
+        .unwrap();
 
     assert!(objects.live_slot(garbage).is_err());
     assert_eq!(
@@ -24534,7 +25171,9 @@ fn persistent_gc_volatile_sweep_rejects_invalid_mark_graph_directly() {
         ..Default::default()
     };
 
-    let err = objects.apply_volatile_persistent_sweep(&mark).unwrap_err();
+    let err = objects
+        .apply_volatile_persistent_sweep_uncoordinated(&mark)
+        .unwrap_err();
 
     assert!(
         err.to_string()
@@ -24555,7 +25194,7 @@ fn persistent_mark_sweep_rejects_invalid_root_before_sweep() {
     };
 
     let err = objects
-        .persistent_mark_sweep_from_roots_for_test([missing])
+        .persistent_mark_sweep_from_roots_uncoordinated_for_test([missing])
         .unwrap_err();
 
     assert!(
@@ -24580,7 +25219,7 @@ fn persistent_mark_sweep_rejects_dangling_ref_before_sweep() {
         .unwrap();
 
     let err = objects
-        .persistent_mark_sweep_from_roots_for_test([root])
+        .persistent_mark_sweep_from_roots_uncoordinated_for_test([root])
         .unwrap_err();
 
     assert!(

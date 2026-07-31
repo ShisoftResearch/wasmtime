@@ -1,5 +1,4 @@
 use crate::runtime::transaction::concurrency::TransactionConflictAction;
-#[cfg(feature = "transaction-mvcc")]
 use alloc::sync::Arc;
 use wasmtime_environ::VMSharedTypeIndex;
 
@@ -21,6 +20,7 @@ pub(crate) struct TransactionState {
     pub(super) failure_code: u32,
     pub(super) fail_next_commit_before_lp_for_test: bool,
     pub(super) persistent_gc_state: Option<PersistentGcState>,
+    pub(super) persistent_gc_policy: Arc<dyn TransactionPersistentGc>,
     pub(super) persistent_roots: BTreeMap<PersistentRootKey, BTreeSet<ObjectId>>,
     pub(super) persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     pub(super) next_id: u64,
@@ -95,6 +95,7 @@ impl Default for TransactionState {
             failure_code: 0,
             fail_next_commit_before_lp_for_test: false,
             persistent_gc_state: None,
+            persistent_gc_policy: Arc::new(CurrentStatePersistentGc),
             persistent_roots: BTreeMap::new(),
             persistent_root_versions: BTreeMap::new(),
             next_id: 10_001,
@@ -3427,25 +3428,95 @@ impl TransactionState {
             .collect())
     }
 
-    pub(crate) fn persistent_mark_sweep_collect(
-        &mut self,
-        objects: &mut ObjectTable,
-    ) -> Result<PersistentMarkSweepReport> {
+    fn ensure_persistent_gc_inactive(&self, message: &'static str) -> Result<()> {
         ensure!(
             self.active.is_none()
                 && self.suspended.is_empty()
                 && current_thread_transaction().is_none(),
-            "persistent object marker cannot run while a transaction is active or suspended"
+            message
         );
-        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
-            // All stores observe the shared directory, but one store coordinates a
-            // GC cycle while the permit excludes concurrent user commits.
-            Some(runtime.begin_persistent_gc()?)
+        Ok(())
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    fn with_persistent_gc_policy<T>(
+        &mut self,
+        objects: &mut ObjectTable,
+        operation: impl FnOnce(
+            &dyn TransactionPersistentGc,
+            Option<&dyn TransactionMvccGcView>,
+            &mut Self,
+            &mut ObjectTable,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let shared_runtime = self.shared_region_runtime.clone();
+        let (policy, visibility) = if let Some(runtime) = &shared_runtime {
+            (runtime.persistent_gc_policy()?, runtime.visibility())
         } else {
-            None
+            (self.persistent_gc_policy.clone(), self.visibility.clone())
         };
+
+        // Declaration order is intentional: locals drop in reverse order, so
+        // the shared-region permit leaves before the MVCC barrier.
+        let mvcc_permit = visibility.begin_gc_barrier()?;
+        let _shared_gc_region_permit = shared_runtime
+            .as_ref()
+            .map(TransactionRegionRuntime::begin_persistent_gc)
+            .transpose()?;
+        let rebase = visibility.runtime().prepare_full_rebase(&mvcc_permit)?;
+        let validated = rebase.validate_current_objects(objects)?;
+        let metadata = visibility
+            .runtime()
+            .complete_full_rebase(&mvcc_permit, validated)?;
+        let mvcc: Option<&dyn TransactionMvccGcView> = match policy.mvcc_mode() {
+            GcMvccMode::CurrentStateOnly => None,
+            GcMvccMode::MvccCompliant => Some(&metadata),
+        };
+        operation(policy.as_ref(), mvcc, self, objects)
+    }
+
+    #[cfg(not(feature = "transaction-mvcc"))]
+    fn with_persistent_gc_policy<T>(
+        &mut self,
+        objects: &mut ObjectTable,
+        operation: impl FnOnce(
+            &dyn TransactionPersistentGc,
+            Option<&dyn TransactionMvccGcView>,
+            &mut Self,
+            &mut ObjectTable,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let shared_runtime = self.shared_region_runtime.clone();
+        let policy = if let Some(runtime) = &shared_runtime {
+            runtime.persistent_gc_policy()?
+        } else {
+            self.persistent_gc_policy.clone()
+        };
+        let _shared_gc_region_permit = shared_runtime
+            .as_ref()
+            .map(TransactionRegionRuntime::begin_persistent_gc)
+            .transpose()?;
+        operation(policy.as_ref(), None, self, objects)
+    }
+
+    pub(crate) fn persistent_mark_sweep_collect(
+        &mut self,
+        objects: &mut ObjectTable,
+    ) -> Result<PersistentMarkSweepReport> {
+        self.ensure_persistent_gc_inactive(
+            "persistent object marker cannot run while a transaction is active or suspended",
+        )?;
+        self.with_persistent_gc_policy(objects, |policy, mvcc, state, objects| {
+            policy.persistent_mark_sweep_collect(mvcc, state, objects)
+        })
+    }
+
+    pub(super) fn persistent_mark_sweep_collect_uncoordinated(
+        &mut self,
+        objects: &mut ObjectTable,
+    ) -> Result<PersistentMarkSweepReport> {
         let roots = self.persistent_root_ids()?;
-        let report = objects.persistent_mark_sweep_from_roots(roots)?;
+        let report = objects.persistent_mark_sweep_from_roots_uncoordinated(roots)?;
         self.persistent_gc_state = None;
         Ok(report)
     }
@@ -3455,19 +3526,26 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         budget: PersistentGcBudget,
     ) -> Result<PersistentGcStepReport> {
-        ensure!(
-            self.active.is_none()
-                && self.suspended.is_empty()
-                && current_thread_transaction().is_none(),
-            "persistent object marker cannot run while a transaction is active or suspended"
-        );
-        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
-            // All stores observe the shared directory, but one store coordinates a
-            // GC cycle while the permit excludes concurrent user commits.
-            Some(runtime.begin_persistent_gc()?)
-        } else {
-            None
-        };
+        let result = self
+            .ensure_persistent_gc_inactive(
+                "persistent object marker cannot run while a transaction is active or suspended",
+            )
+            .and_then(|()| {
+                self.with_persistent_gc_policy(object_table, |policy, mvcc, state, object_table| {
+                    policy.persistent_gc_maintenance_step(mvcc, state, object_table, budget)
+                })
+            });
+        if result.is_err() {
+            self.persistent_gc_state = None;
+        }
+        result
+    }
+
+    pub(super) fn persistent_gc_maintenance_step_uncoordinated(
+        &mut self,
+        object_table: &mut ObjectTable,
+        budget: PersistentGcBudget,
+    ) -> Result<PersistentGcStepReport> {
         let shared_epoch = self.current_shared_persistent_gc_epoch()?;
         self.reset_stale_shared_persistent_gc_state(shared_epoch);
         let roots = if self.persistent_gc_state.is_none() {
@@ -3495,19 +3573,18 @@ impl TransactionState {
         &mut self,
         objects: &mut ObjectTable,
     ) -> Result<Option<PersistentMarkSweepReport>> {
-        ensure!(
-            self.active.is_none()
-                && self.suspended.is_empty()
-                && current_thread_transaction().is_none(),
-            "persistent object marker cannot run while a transaction is active or suspended"
-        );
-        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
-            // All stores observe the shared directory, but one store coordinates a
-            // GC cycle while the permit excludes concurrent user commits.
-            Some(runtime.begin_persistent_gc()?)
-        } else {
-            None
-        };
+        self.ensure_persistent_gc_inactive(
+            "persistent object marker cannot run while a transaction is active or suspended",
+        )?;
+        self.with_persistent_gc_policy(objects, |policy, mvcc, state, objects| {
+            policy.finish_persistent_gc_cycle_and_sweep(mvcc, state, objects)
+        })
+    }
+
+    pub(super) fn finish_persistent_gc_cycle_and_sweep_uncoordinated(
+        &mut self,
+        objects: &mut ObjectTable,
+    ) -> Result<Option<PersistentMarkSweepReport>> {
         let shared_epoch = self.current_shared_persistent_gc_epoch()?;
         let rebuild_stale_state = self.reset_stale_shared_persistent_gc_state(shared_epoch);
         let mut state = match self.persistent_gc_state.take() {
@@ -3530,7 +3607,7 @@ impl TransactionState {
         }
         let mark = state.into_report(objects)?;
         mark.ensure_sweepable()?;
-        let sweep = objects.apply_volatile_persistent_sweep(&mark)?;
+        let sweep = objects.apply_volatile_persistent_sweep_uncoordinated(&mark)?;
         Ok(Some(PersistentMarkSweepReport { mark, sweep }))
     }
 
@@ -3572,17 +3649,19 @@ impl TransactionState {
         objects: &mut ObjectTable,
         recovery_report: &PersistentRecoveryGcReport,
     ) -> Result<PersistentObjectCompactionReport> {
-        ensure!(
-            self.active.is_none()
-                && self.suspended.is_empty()
-                && current_thread_transaction().is_none(),
-            "persistent object compaction cannot run while a transaction is active or suspended"
-        );
-        let _shared_gc_region_permit = if let Some(runtime) = &self.shared_region_runtime {
-            Some(runtime.begin_persistent_gc()?)
-        } else {
-            None
-        };
+        self.ensure_persistent_gc_inactive(
+            "persistent object compaction cannot run while a transaction is active or suspended",
+        )?;
+        self.with_persistent_gc_policy(objects, |policy, mvcc, state, objects| {
+            policy.compact_persistent_object_chunks(mvcc, state, objects, recovery_report)
+        })
+    }
+
+    pub(super) fn compact_persistent_object_chunks_uncoordinated(
+        &mut self,
+        objects: &mut ObjectTable,
+        recovery_report: &PersistentRecoveryGcReport,
+    ) -> Result<PersistentObjectCompactionReport> {
         recovery_report.mark.ensure_sweepable()?;
 
         #[derive(Default)]
@@ -4423,6 +4502,14 @@ fn persistent_root_object_id_for_table_element_snapshot(
 
 #[cfg(test)]
 impl TransactionState {
+    pub(super) fn set_persistent_gc_policy_for_test(
+        &mut self,
+        policy: Arc<dyn TransactionPersistentGc>,
+    ) {
+        self.persistent_gc_policy = policy;
+        self.persistent_gc_state = None;
+    }
+
     pub(super) fn new_for_test(transaction: TransactionId) -> Self {
         replace_current_thread_transaction(Some(transaction));
         let mut state = Self::default();

@@ -61,9 +61,13 @@ impl MvccVisibility {
         true
     }
 
+    pub(super) fn begin_gc_barrier(&self) -> Result<MvccGcBarrierPermit> {
+        self.0.coordinator.begin_gc_barrier()
+    }
+
     #[cfg(test)]
     pub(crate) fn begin_gc_barrier_for_test(&self) -> Result<MvccGcBarrierPermit> {
-        self.0.coordinator.begin_gc_barrier()
+        self.begin_gc_barrier()
     }
 
     #[cfg(test)]

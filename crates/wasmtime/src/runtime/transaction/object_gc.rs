@@ -1,7 +1,140 @@
-use super::{ObjectId, ObjectTable, current_thread_transaction};
+use super::visibility::CommitTimestamp;
+use super::{ObjectId, ObjectTable, TransactionState, current_thread_transaction};
 use crate::prelude::*;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
+use core::fmt::Debug;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GcMvccMode {
+    CurrentStateOnly,
+    MvccCompliant,
+}
+
+/// Metadata made available to an MVCC-aware persistent collector after every
+/// historical version has been rebased into the current object state.
+///
+/// This deliberately exposes no object payloads, version chains, or roots.
+pub(crate) trait TransactionMvccGcView {
+    fn oldest_active_snapshot(&self) -> Option<CommitTimestamp>;
+    fn visible_timestamp(&self) -> CommitTimestamp;
+    fn baseline_timestamp(&self) -> CommitTimestamp;
+    fn is_quiescent(&self) -> bool;
+}
+
+pub(crate) trait TransactionPersistentGc: Debug + Send + Sync + 'static {
+    fn mvcc_mode(&self) -> GcMvccMode;
+
+    fn persistent_mark_sweep_collect(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+    ) -> Result<PersistentMarkSweepReport>;
+
+    fn persistent_gc_maintenance_step(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+        budget: PersistentGcBudget,
+    ) -> Result<PersistentGcStepReport>;
+
+    fn finish_persistent_gc_cycle_and_sweep(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+    ) -> Result<Option<PersistentMarkSweepReport>>;
+
+    fn compact_persistent_object_chunks(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+        recovery_report: &PersistentRecoveryGcReport,
+    ) -> Result<PersistentObjectCompactionReport>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CurrentStatePersistentGc;
+
+impl CurrentStatePersistentGc {
+    fn ensure_current_state_view(mvcc: Option<&dyn TransactionMvccGcView>) -> Result<()> {
+        ensure!(
+            mvcc.is_none(),
+            "current-state persistent GC cannot receive an MVCC metadata view"
+        );
+        Ok(())
+    }
+}
+
+impl TransactionPersistentGc for CurrentStatePersistentGc {
+    fn mvcc_mode(&self) -> GcMvccMode {
+        GcMvccMode::CurrentStateOnly
+    }
+
+    fn persistent_mark_sweep_collect(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+    ) -> Result<PersistentMarkSweepReport> {
+        Self::ensure_current_state_view(mvcc)?;
+        state.persistent_mark_sweep_collect_uncoordinated(objects)
+    }
+
+    fn persistent_gc_maintenance_step(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+        budget: PersistentGcBudget,
+    ) -> Result<PersistentGcStepReport> {
+        Self::ensure_current_state_view(mvcc)?;
+        state.persistent_gc_maintenance_step_uncoordinated(objects, budget)
+    }
+
+    fn finish_persistent_gc_cycle_and_sweep(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+    ) -> Result<Option<PersistentMarkSweepReport>> {
+        Self::ensure_current_state_view(mvcc)?;
+        state.finish_persistent_gc_cycle_and_sweep_uncoordinated(objects)
+    }
+
+    fn compact_persistent_object_chunks(
+        &self,
+        mvcc: Option<&dyn TransactionMvccGcView>,
+        state: &mut TransactionState,
+        objects: &mut ObjectTable,
+        recovery_report: &PersistentRecoveryGcReport,
+    ) -> Result<PersistentObjectCompactionReport> {
+        Self::ensure_current_state_view(mvcc)?;
+        state.compact_persistent_object_chunks_uncoordinated(objects, recovery_report)
+    }
+}
+
+#[cfg(feature = "transaction-mvcc")]
+impl TransactionMvccGcView for super::mvcc::MvccGcMetadata {
+    fn oldest_active_snapshot(&self) -> Option<CommitTimestamp> {
+        self.oldest_active_snapshot
+    }
+
+    fn visible_timestamp(&self) -> CommitTimestamp {
+        self.visible_timestamp
+    }
+
+    fn baseline_timestamp(&self) -> CommitTimestamp {
+        self.baseline_timestamp
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.quiescent
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PersistentRootErrorKind {

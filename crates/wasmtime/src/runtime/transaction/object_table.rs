@@ -2732,7 +2732,7 @@ impl ObjectTable {
         Ok(objects)
     }
 
-    pub(crate) fn apply_volatile_persistent_sweep(
+    pub(super) fn apply_volatile_persistent_sweep_uncoordinated(
         &mut self,
         mark: &PersistentObjectMarkReport,
     ) -> Result<PersistentVolatileSweepReport> {
@@ -2750,7 +2750,7 @@ impl ObjectTable {
         Ok(report)
     }
 
-    pub(crate) fn persistent_mark_sweep_from_roots<I>(
+    pub(super) fn persistent_mark_sweep_from_roots_uncoordinated<I>(
         &mut self,
         roots: I,
     ) -> Result<PersistentMarkSweepReport>
@@ -2758,19 +2758,19 @@ impl ObjectTable {
         I: IntoIterator<Item = ObjectId>,
     {
         let mark = PersistentObjectMarker::mark(self, roots)?;
-        let sweep = self.apply_volatile_persistent_sweep(&mark)?;
+        let sweep = self.apply_volatile_persistent_sweep_uncoordinated(&mark)?;
         Ok(PersistentMarkSweepReport { mark, sweep })
     }
 
     #[cfg(test)]
-    pub(crate) fn persistent_mark_sweep_from_roots_for_test<I>(
+    pub(crate) fn persistent_mark_sweep_from_roots_uncoordinated_for_test<I>(
         &mut self,
         roots: I,
     ) -> Result<PersistentMarkSweepReport>
     where
         I: IntoIterator<Item = ObjectId>,
     {
-        self.persistent_mark_sweep_from_roots(roots)
+        self.persistent_mark_sweep_from_roots_uncoordinated(roots)
     }
 
     #[cfg(test)]

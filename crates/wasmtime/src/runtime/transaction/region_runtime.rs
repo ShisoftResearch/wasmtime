@@ -35,10 +35,11 @@ use super::type_layout::TypeLayoutRegistry;
 use super::visibility::CommitTimestamp;
 use super::visibility::SelectedTransactionVisibility;
 use super::{
-    ConcurrencyControlState, GranuleId, ObjectId, ObjectKind, ObjectTable,
-    PersistentObjectDirectoryEntry, PersistentObjectRecordLocation, PersistentObjectRecordSource,
-    PersistentRootKey, TMemoryFileBacking, TransactionConfig, TransactionId, TxDurableLog,
-    granule_uses_transaction_state_version, persistent_root_key_from_logical_id,
+    ConcurrencyControlState, CurrentStatePersistentGc, GranuleId, ObjectId, ObjectKind,
+    ObjectTable, PersistentObjectDirectoryEntry, PersistentObjectRecordLocation,
+    PersistentObjectRecordSource, PersistentRootKey, TMemoryFileBacking, TransactionConfig,
+    TransactionId, TransactionPersistentGc, TxDurableLog, granule_uses_transaction_state_version,
+    persistent_root_key_from_logical_id,
 };
 
 const FIRST_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x2000_0000;
@@ -168,6 +169,7 @@ struct TransactionRegionRuntimeInner {
     object_directory: Mutex<PersistentObjectDirectoryState>,
     file_backed_storage: Mutex<Option<SharedFileBackedStorageConfig>>,
     gc_state: Mutex<GcCoordinationState>,
+    persistent_gc_policy: Mutex<Arc<dyn TransactionPersistentGc>>,
 }
 
 #[derive(Debug)]
@@ -243,6 +245,7 @@ impl Default for TransactionRegionRuntimeInner {
             object_directory: Mutex::new(PersistentObjectDirectoryState::default()),
             file_backed_storage: Mutex::new(None),
             gc_state: Mutex::new(GcCoordinationState::default()),
+            persistent_gc_policy: Mutex::new(Arc::new(CurrentStatePersistentGc)),
         }
     }
 }
@@ -271,6 +274,28 @@ fn ensure_matching_persistent_object_metadata(
 impl TransactionRegionRuntime {
     pub(crate) fn visibility(&self) -> SelectedTransactionVisibility {
         self.0.visibility.clone()
+    }
+
+    pub(super) fn persistent_gc_policy(&self) -> Result<Arc<dyn TransactionPersistentGc>> {
+        self.0
+            .persistent_gc_policy
+            .lock()
+            .map_err(|_| crate::format_err!("persistent GC policy lock poisoned"))
+            .map(|policy| policy.clone())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_persistent_gc_policy_for_test(
+        &self,
+        policy: Arc<dyn TransactionPersistentGc>,
+    ) -> Result<()> {
+        *self
+            .0
+            .persistent_gc_policy
+            .lock()
+            .map_err(|_| crate::format_err!("persistent GC policy lock poisoned"))? = policy;
+        self.bump_persistent_gc_epoch()?;
+        Ok(())
     }
 
     fn lock_log_segments(&self) -> Result<MutexGuard<'_, DurableLogSegmentRegistry>> {
