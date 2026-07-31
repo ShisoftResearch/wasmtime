@@ -165,33 +165,54 @@ impl MvccRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn abort_prepared_object_promotion_for_test(
+    pub(crate) fn abort_prepared_object_promotions_for_test(
+        &self,
+        commit: &Arc<CommitRecord>,
+    ) -> Result<usize> {
+        let mut state = self.domains.lock()?;
+        ensure!(
+            matches!(commit.state(), CommitState::Pending),
+            "prepared promoted object commit record is not pending"
+        );
+        let promoted_objects = state
+            .objects
+            .chains
+            .iter()
+            .filter_map(|(object, chain)| {
+                (chain.version_count() == 1
+                    && chain
+                        .newest_commit_record()
+                        .is_some_and(|pending| Arc::ptr_eq(pending, commit)))
+                .then_some(*object)
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            !promoted_objects.is_empty(),
+            "prepared promoted object commit record has no pending-only MVCC chains"
+        );
+        commit.abort()?;
+        for object in &promoted_objects {
+            ensure!(
+                state.objects.chains.remove(object).is_some(),
+                "prepared promoted object chain disappeared"
+            );
+        }
+        Ok(promoted_objects.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn object_newest_commit_record_for_test(
         &self,
         object: ObjectId,
-        commit: &Arc<CommitRecord>,
-    ) -> Result<()> {
-        let mut state = self.domains.lock()?;
-        let chain = state
+    ) -> Result<Option<Arc<CommitRecord>>> {
+        Ok(self
+            .domains
+            .lock()?
             .objects
             .chains
             .get(&object)
-            .context("prepared promoted object is missing its MVCC chain")?;
-        ensure!(
-            chain.version_count() == 1,
-            "prepared promoted object chain is not pending-only"
-        );
-        ensure!(
-            chain
-                .newest_commit_record()
-                .is_some_and(|pending| Arc::ptr_eq(pending, commit)),
-            "prepared promoted object chain uses a different commit record"
-        );
-        commit.abort()?;
-        ensure!(
-            state.objects.chains.remove(&object).is_some(),
-            "prepared promoted object chain disappeared"
-        );
-        Ok(())
+            .and_then(VersionChain::newest_commit_record)
+            .cloned())
     }
 
     #[cfg(test)]

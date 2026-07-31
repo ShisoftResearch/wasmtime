@@ -2589,10 +2589,16 @@ impl TransactionState {
         if self.local_object_table.contains(object_id) {
             return self.local_object_table.payload(object_id);
         }
-        #[cfg(not(feature = "transaction-mvcc"))]
         object_table.refresh_persistent_object_from_shared_directory(object_id)?;
-        let granule = object_table.granule_id(object_id)?;
-        if object_table.is_persistent(object_id)? {
+        let granule = GranuleId::Object { object_id };
+        let persistent = object_table
+            .live_slot(object_id)
+            .ok()
+            .map(|slot| slot.persistent);
+        if persistent == Some(false) {
+            return object_table.payload(object_id);
+        }
+        if persistent == Some(true) {
             ensure!(
                 self.owns_granule_read(granule),
                 "transactional object read permission was not acquired"

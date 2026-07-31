@@ -497,18 +497,67 @@ fn mvcc_object_install_committed_payload(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-fn mvcc_object_prepare_promoted_payload(
+fn mvcc_object_prepare_promoted_payloads(
     runtime: &MvccRuntime,
-    object_id: ObjectId,
-    payload: ObjectPayload,
-) -> Arc<CommitRecord> {
-    let commit = Arc::new(CommitRecord::pending());
+    commit: Arc<CommitRecord>,
+    objects: &[(ObjectId, ObjectPayload)],
+) {
     let mut prepare = runtime.begin_prepare(commit.clone()).unwrap();
-    prepare
-        .prepare_object(object_id, || Ok(None), payload)
-        .unwrap();
+    for (object_id, payload) in objects {
+        prepare
+            .prepare_object(*object_id, || Ok(None), payload.clone())
+            .unwrap();
+    }
     drop(prepare);
-    commit
+}
+
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_mapped_directory_entry(
+    path: &std::path::Path,
+    object_id: ObjectId,
+    record_version: u32,
+    value: i32,
+) -> Result<PersistentObjectDirectoryEntry> {
+    let mut region =
+        crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_for_test(path, 8)?;
+    crate::runtime::vm::block_region::publish_committed_struct_object(
+        path,
+        7,
+        object_id.object_index,
+        record_version,
+        TypeLayoutId::DEFAULT_STRUCT.get(),
+        &[u8::try_from(value)?],
+    )?;
+    region.refresh_from_image()?;
+    let recovered =
+        crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(path)?;
+    let winner = recovered
+        .committed_object_winners()?
+        .into_iter()
+        .find(|winner| winner.object_id == object_id.object_index)
+        .context("missing shared-directory object winner")?;
+    Ok(PersistentObjectDirectoryEntry {
+        object_id,
+        kind: ObjectKind::Struct,
+        directory_version: 0,
+        record_version: winner.version,
+        type_layout_id: winner.type_layout_id,
+        runtime_type_index: None,
+        record_source: Some(PersistentObjectRecordSource {
+            mapped_source: recovered_mapped_source_for_test(&recovered),
+            location: PersistentObjectRecordLocation {
+                data_block: winner.data_block,
+                data_offset: winner.data_offset,
+                data_record_offset: u64::try_from(winner.data_record_offset)?,
+                record_len: winner.record_len,
+            },
+        }),
+    })
 }
 
 #[test]
@@ -701,6 +750,153 @@ fn mvcc_object_created_after_snapshot_is_missing() {
 
 #[test]
 #[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_read_materializes_remote_shared_entry_before_metadata() -> Result<()> {
+    clear_current_thread_transaction_for_test();
+    let temp = tempfile::tempdir()?;
+    let object_id = ObjectId { object_index: 41 };
+    let entry =
+        mvcc_object_mapped_directory_entry(&temp.path().join("remote.bin"), object_id, 1, 17)?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    runtime.install_persistent_object_directory_entries([entry])?;
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime)?;
+    state.acquire_granule_read(
+        GranuleId::Object { object_id },
+        runtime.persistent_object_directory_version(object_id)?,
+    )?;
+
+    assert_eq!(
+        state.read_object_payload(&mut objects, object_id)?,
+        ObjectPayload::Struct(vec![ObjectValue::I32(17)])
+    );
+    state.abort()?;
+    clear_current_thread_transaction_for_test();
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_volatile_id_reuse_bypasses_stale_sidecar_chain() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut objects = ObjectTable::default();
+    let historical = ObjectPayload::Struct(vec![ObjectValue::I32(1)]);
+    let old_id = objects.allocate_payload(historical.clone()).unwrap();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    mvcc_object_install_committed_payload(
+        visibility.runtime(),
+        &mut objects,
+        old_id,
+        Some(historical),
+        ObjectPayload::Struct(vec![ObjectValue::I32(2)]),
+        1,
+    );
+    assert!(objects.free(old_id).unwrap());
+    let reused_id = objects.allocate_struct(vec![ObjectValue::I32(77)]).unwrap();
+    assert_eq!(reused_id, old_id);
+    state.acquire_object_read(&mut objects, reused_id).unwrap();
+
+    assert_eq!(
+        state.read_object_payload(&mut objects, reused_id).unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::I32(77)])
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_absent_logical_id_reports_snapshot_missing() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut state = TransactionState::default();
+    let mut objects = ObjectTable::default();
+    let object_id = ObjectId { object_index: 91 };
+    state.begin_with_region_runtime(&runtime).unwrap();
+    state
+        .acquire_granule_read(GranuleId::Object { object_id }, 0)
+        .unwrap();
+
+    let error = state
+        .read_object_payload(&mut objects, object_id)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not visible at transaction snapshot"),
+        "{error:?}"
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_object_shared_install_rejects_local_update_and_refreshes_newer_directory() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime.clone()));
+    let object_id = objects.allocate_payload_with_persistence(
+        ObjectPayload::Struct(vec![ObjectValue::I32(1)]),
+        true,
+    )?;
+    let first =
+        mvcc_object_mapped_directory_entry(&temp.path().join("first.bin"), object_id, 1, 11)?;
+    let first = runtime
+        .install_persistent_object_directory_entries([first])?
+        .pop()
+        .context("first shared object entry was not installed")?;
+    objects.install_persistent_object_directory_entry(first)?;
+    let stale_version = objects.version(object_id)?;
+
+    let error = objects
+        .install_current_payload_snapshot(
+            object_id,
+            &ObjectPayload::Struct(vec![ObjectValue::I32(99)]),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("shared persistent object current payload"),
+        "{error:?}"
+    );
+    assert_eq!(objects.version(object_id)?, stale_version);
+
+    let second =
+        mvcc_object_mapped_directory_entry(&temp.path().join("second.bin"), object_id, 2, 22)?;
+    runtime.install_persistent_object_directory_entries([second])?;
+    assert_eq!(
+        objects.current_payload_snapshot(object_id)?,
+        Some(ObjectPayload::Struct(vec![ObjectValue::I32(22)]))
+    );
+    assert!(objects.version(object_id)? > stale_version);
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
@@ -722,7 +918,12 @@ fn mvcc_object_commit_prepare_for_transaction_local_promotion_is_pending_only() 
         .staged_object_payload_for_test(promoted)
         .unwrap()
         .clone();
-    let commit = mvcc_object_prepare_promoted_payload(visibility.runtime(), promoted, payload);
+    let commit = Arc::new(CommitRecord::pending());
+    mvcc_object_prepare_promoted_payloads(
+        visibility.runtime(),
+        commit.clone(),
+        &[(promoted, payload)],
+    );
 
     assert_eq!(
         visibility.runtime().object_chain_count_for_test().unwrap(),
@@ -742,10 +943,13 @@ fn mvcc_object_commit_prepare_for_transaction_local_promotion_is_pending_only() 
             .unwrap(),
         None
     );
-    visibility
-        .runtime()
-        .abort_prepared_object_promotion_for_test(promoted, &commit)
-        .unwrap();
+    assert_eq!(
+        visibility
+            .runtime()
+            .abort_prepared_object_promotions_for_test(&commit)
+            .unwrap(),
+        1
+    );
     state.abort_allocated_objects(&mut objects).unwrap();
     clear_current_thread_transaction_for_test();
 }
@@ -755,29 +959,65 @@ fn mvcc_object_commit_prepare_for_transaction_local_promotion_is_pending_only() 
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-fn mvcc_object_aborting_promotion_removes_pending_version_and_allocation() {
+fn mvcc_object_aborting_shared_promotion_record_removes_all_pending_versions_and_allocations() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
     let visibility = runtime.visibility_for_test();
     let mut state = TransactionState::default();
     let mut objects = ObjectTable::default();
     state.begin_with_region_runtime(&runtime).unwrap();
-    let local = state
-        .allocate_transaction_local_array(vec![ObjectValue::I32(7)], None)
+    let local_struct = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(7)], None)
         .unwrap();
-    let promoted = state
-        .promote_transaction_object_graph_for_test(&mut objects, local)
+    let local_array = state
+        .allocate_transaction_local_array(vec![ObjectValue::I32(8)], None)
         .unwrap();
-    let payload = state
-        .staged_object_payload_for_test(promoted)
+    let promoted_struct = state
+        .promote_transaction_object_graph_for_test(&mut objects, local_struct)
+        .unwrap();
+    let promoted_array = state
+        .promote_transaction_object_graph_for_test(&mut objects, local_array)
+        .unwrap();
+    let struct_payload = state
+        .staged_object_payload_for_test(promoted_struct)
         .unwrap()
         .clone();
-    let commit = mvcc_object_prepare_promoted_payload(visibility.runtime(), promoted, payload);
+    let array_payload = state
+        .staged_object_payload_for_test(promoted_array)
+        .unwrap()
+        .clone();
+    let commit = Arc::new(CommitRecord::pending());
+    mvcc_object_prepare_promoted_payloads(
+        visibility.runtime(),
+        commit.clone(),
+        &[
+            (promoted_struct, struct_payload),
+            (promoted_array, array_payload),
+        ],
+    );
 
-    visibility
+    let struct_record = visibility
         .runtime()
-        .abort_prepared_object_promotion_for_test(promoted, &commit)
+        .object_newest_commit_record_for_test(promoted_struct)
         .unwrap();
+    let array_record = visibility
+        .runtime()
+        .object_newest_commit_record_for_test(promoted_array)
+        .unwrap();
+    assert!(Arc::ptr_eq(struct_record.as_ref().unwrap(), &commit));
+    assert!(Arc::ptr_eq(array_record.as_ref().unwrap(), &commit));
+    assert!(Arc::ptr_eq(
+        struct_record.as_ref().unwrap(),
+        array_record.as_ref().unwrap()
+    ));
+
+    assert_eq!(
+        visibility
+            .runtime()
+            .abort_prepared_object_promotions_for_test(&commit)
+            .unwrap(),
+        2
+    );
     state.abort_allocated_objects(&mut objects).unwrap();
 
     assert_eq!(
@@ -787,11 +1027,19 @@ fn mvcc_object_aborting_promotion_removes_pending_version_and_allocation() {
     assert_eq!(
         visibility
             .runtime()
-            .object_version_count_for_test(promoted)
+            .object_version_count_for_test(promoted_struct)
             .unwrap(),
         0
     );
-    assert!(objects.live_slot(promoted).is_err());
+    assert_eq!(
+        visibility
+            .runtime()
+            .object_version_count_for_test(promoted_array)
+            .unwrap(),
+        0
+    );
+    assert!(objects.live_slot(promoted_struct).is_err());
+    assert!(objects.live_slot(promoted_array).is_err());
     assert_eq!(objects.live_count(), 0);
     assert_eq!(state.allocated_object_count_for_test(), 0);
     clear_current_thread_transaction_for_test();

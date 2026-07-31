@@ -1352,6 +1352,12 @@ impl ObjectTable {
         object_id: ObjectId,
         payload: &ObjectPayload,
     ) -> Result<()> {
+        let shared_persistent =
+            self.shared_region_runtime.is_some() && self.live_slot(object_id)?.persistent;
+        ensure!(
+            !shared_persistent,
+            "shared persistent object current payload must be installed through the shared directory"
+        );
         self.update_payload(object_id, payload.clone())
     }
 
