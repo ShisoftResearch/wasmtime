@@ -5,6 +5,8 @@ use alloc::sync::Arc;
 
 mod coordinator;
 mod domains;
+#[cfg(test)]
+mod model;
 mod version_chain;
 
 #[allow(
@@ -24,6 +26,11 @@ pub(crate) use domains::{
 };
 #[cfg(test)]
 pub(crate) use domains::{MvccCommitFaultPoint, MvccCommitTestHook};
+#[cfg(test)]
+pub(crate) use model::{
+    ModelCommitOutcome, ModelOperation, ModelTransaction, SerializableMvccModel,
+    generate_model_schedules,
+};
 #[allow(
     unused_imports,
     reason = "reserved for the next MVCC implementation stages"
