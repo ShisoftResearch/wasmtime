@@ -27,6 +27,7 @@ struct CoordinatorState {
     #[cfg(test)]
     pending_commits_aborted: usize,
     gc_active: bool,
+    gc_barrier_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +36,12 @@ pub(crate) struct MvccGcMetadata {
     pub(crate) visible_timestamp: CommitTimestamp,
     pub(crate) baseline_timestamp: CommitTimestamp,
     pub(crate) quiescent: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct MvccGcBarrierEpoch {
+    state: Arc<Mutex<CoordinatorState>>,
+    generation: u64,
 }
 
 /// Coordinates MVCC snapshots, commit publication, and persistent GC.
@@ -98,9 +105,15 @@ impl MvccCoordinator {
             "MVCC snapshots are active"
         );
         ensure!(state.pending_commits == 0, "MVCC commits are pending");
+        let generation = state
+            .gc_barrier_generation
+            .checked_add(1)
+            .context("MVCC GC barrier generation overflow")?;
+        state.gc_barrier_generation = generation;
         state.gc_active = true;
         Ok(MvccGcBarrierPermit {
             state: Some(self.state.clone()),
+            generation,
         })
     }
 
@@ -124,19 +137,39 @@ impl MvccCoordinator {
     pub(super) fn with_gc_barrier<R>(
         &self,
         permit: &MvccGcBarrierPermit,
-        operation: impl FnOnce(MvccGcMetadata) -> Result<R>,
+        operation: impl FnOnce(MvccGcMetadata, MvccGcBarrierEpoch) -> Result<R>,
     ) -> Result<R> {
         let state = self.lock_gc_barrier(permit)?;
-        operation(gc_metadata(&state))
+        let metadata = gc_metadata(&state);
+        let epoch = MvccGcBarrierEpoch {
+            state: self.state.clone(),
+            generation: state.gc_barrier_generation,
+        };
+        operation(metadata, epoch)
     }
 
     pub(super) fn complete_gc_rebase<R>(
         &self,
         permit: &MvccGcBarrierPermit,
+        expected_epoch: &MvccGcBarrierEpoch,
+        expected_metadata: MvccGcMetadata,
         operation: impl FnOnce(MvccGcMetadata) -> Result<R>,
     ) -> Result<(R, MvccGcMetadata)> {
         let mut state = self.lock_gc_barrier(permit)?;
-        let value = operation(gc_metadata(&state))?;
+        ensure!(
+            Arc::ptr_eq(&expected_epoch.state, &self.state),
+            "validated MVCC GC rebase plan belongs to another coordinator"
+        );
+        ensure!(
+            expected_epoch.generation == state.gc_barrier_generation,
+            "validated MVCC GC rebase plan belongs to another barrier epoch"
+        );
+        let metadata = gc_metadata(&state);
+        ensure!(
+            metadata == expected_metadata,
+            "MVCC GC coordinator metadata changed after object validation"
+        );
+        let value = operation(metadata)?;
         state.baseline_timestamp = state.visible_timestamp;
         Ok((value, gc_metadata(&state)))
     }
@@ -192,6 +225,10 @@ impl MvccCoordinator {
         ensure!(
             state.gc_active,
             "MVCC GC barrier permit is no longer active"
+        );
+        ensure!(
+            state.gc_barrier_generation == permit.generation,
+            "MVCC GC barrier permit belongs to another barrier epoch"
         );
         ensure!(
             state.active_snapshots.is_empty(),
@@ -348,6 +385,7 @@ impl Drop for PendingCommitRegistration {
 #[derive(Debug)]
 pub(crate) struct MvccGcBarrierPermit {
     state: Option<Arc<Mutex<CoordinatorState>>>,
+    generation: u64,
 }
 
 impl Drop for MvccGcBarrierPermit {

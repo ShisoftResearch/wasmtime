@@ -1,4 +1,6 @@
+use super::super::ObjectTable;
 use super::super::visibility::CommitTimestamp;
+use super::coordinator::MvccGcBarrierEpoch;
 use super::{
     MvccGcBarrierPermit, MvccGcMetadata, MvccRuntime, ObjectId, ObjectPayload, VersionChain,
 };
@@ -27,8 +29,8 @@ pub(crate) struct MvccPruneReport {
     pub(crate) scanned_by_table: [usize; VERSION_TABLE_COUNT],
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum MvccExpectedObjectState {
+#[derive(Debug, PartialEq)]
+enum MvccExpectedObjectState {
     Present {
         object: ObjectId,
         payload: ObjectPayload,
@@ -38,8 +40,16 @@ pub(crate) enum MvccExpectedObjectState {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct MvccRebasePlan {
+    epoch: MvccGcBarrierEpoch,
+    metadata: MvccGcMetadata,
+    expected_objects: Vec<MvccExpectedObjectState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidatedMvccRebasePlan {
+    epoch: MvccGcBarrierEpoch,
     metadata: MvccGcMetadata,
     expected_objects: Vec<MvccExpectedObjectState>,
 }
@@ -49,8 +59,16 @@ impl MvccRebasePlan {
         self.metadata
     }
 
-    pub(crate) fn expected_objects(&self) -> &[MvccExpectedObjectState] {
-        &self.expected_objects
+    pub(crate) fn validate_current_objects(
+        self,
+        objects: &mut ObjectTable,
+    ) -> Result<ValidatedMvccRebasePlan> {
+        validate_current_objects(objects, &self.expected_objects)?;
+        Ok(ValidatedMvccRebasePlan {
+            epoch: self.epoch,
+            metadata: self.metadata,
+            expected_objects: self.expected_objects,
+        })
     }
 }
 
@@ -120,11 +138,12 @@ impl MvccRuntime {
         &self,
         permit: &MvccGcBarrierPermit,
     ) -> Result<MvccRebasePlan> {
-        self.coordinator.with_gc_barrier(permit, |metadata| {
+        self.coordinator.with_gc_barrier(permit, |metadata, epoch| {
             #[cfg(test)]
             self.run_gc_rebase_before_domains_hook_for_test()?;
             let state = self.domains.lock()?;
             Ok(MvccRebasePlan {
+                epoch,
                 metadata,
                 expected_objects: validate_rebase_state(&state)?,
             })
@@ -134,27 +153,36 @@ impl MvccRuntime {
     pub(crate) fn complete_full_rebase(
         &self,
         permit: &MvccGcBarrierPermit,
+        validated: ValidatedMvccRebasePlan,
     ) -> Result<MvccGcMetadata> {
-        let (_, metadata) = self.coordinator.complete_gc_rebase(permit, |_| {
-            #[cfg(test)]
-            self.run_gc_rebase_before_domains_hook_for_test()?;
-            let mut state = self.domains.lock()?;
-            validate_rebase_state(&state)?;
-            state.memories.chains.clear();
-            state.memories.prune_cursor = None;
-            state.memory_sizes.chains.clear();
-            state.memory_sizes.prune_cursor = None;
-            state.globals.chains.clear();
-            state.globals.prune_cursor = None;
-            state.tables.chains.clear();
-            state.tables.prune_cursor = None;
-            state.table_sizes.chains.clear();
-            state.table_sizes.prune_cursor = None;
-            state.objects.chains.clear();
-            state.objects.prune_cursor = None;
-            state.next_prune_table = 0;
-            Ok(())
-        })?;
+        let ValidatedMvccRebasePlan {
+            epoch,
+            metadata: expected_metadata,
+            expected_objects,
+        } = validated;
+        let (domains, metadata) =
+            self.coordinator
+                .complete_gc_rebase(permit, &epoch, expected_metadata, |_| {
+                    #[cfg(test)]
+                    self.run_gc_rebase_before_domains_hook_for_test()?;
+                    let mut state = self.domains.lock()?;
+                    validate_rebase_state_matches(&state, &expected_objects)?;
+                    state.memories.chains.clear();
+                    state.memories.prune_cursor = None;
+                    state.memory_sizes.chains.clear();
+                    state.memory_sizes.prune_cursor = None;
+                    state.globals.chains.clear();
+                    state.globals.prune_cursor = None;
+                    state.tables.chains.clear();
+                    state.tables.prune_cursor = None;
+                    state.table_sizes.chains.clear();
+                    state.table_sizes.prune_cursor = None;
+                    state.objects.chains.clear();
+                    state.objects.prune_cursor = None;
+                    state.next_prune_table = 0;
+                    Ok(state)
+                })?;
+        drop(domains);
         Ok(metadata)
     }
 
@@ -266,6 +294,77 @@ fn validate_rebase_state(
     Ok(expected_objects)
 }
 
+fn validate_current_objects(
+    objects: &mut ObjectTable,
+    expected_objects: &[MvccExpectedObjectState],
+) -> Result<()> {
+    for expected in expected_objects {
+        match expected {
+            MvccExpectedObjectState::Present { object, payload } => {
+                let current = objects.current_payload_snapshot(*object)?;
+                ensure!(
+                    current.is_some() && objects.is_persistent(*object)?,
+                    "MVCC GC rebase expected a live persistent object slot: {object:?}"
+                );
+                ensure!(
+                    current.as_ref() == Some(payload),
+                    "MVCC GC rebase current object payload does not match the newest committed \
+                     version: {object:?}"
+                );
+            }
+            MvccExpectedObjectState::Absent { object } => {
+                ensure!(
+                    objects.current_payload_snapshot(*object)?.is_none(),
+                    "MVCC GC rebase expected the current object slot to be absent: {object:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rebase_state_matches(
+    state: &super::domains::MvccDomainState,
+    expected_objects: &[MvccExpectedObjectState],
+) -> Result<()> {
+    validate_committed_chains(&state.memories.chains, "tmemory")?;
+    validate_committed_chains(&state.memory_sizes.chains, "tmemory size")?;
+    validate_committed_chains(&state.globals.chains, "global")?;
+    validate_committed_chains(&state.tables.chains, "table")?;
+    validate_committed_chains(&state.table_sizes.chains, "table size")?;
+    ensure!(
+        state.objects.chains.len() == expected_objects.len(),
+        "MVCC object version state changed after object validation"
+    );
+    for ((&object, chain), expected) in state.objects.chains.iter().zip(expected_objects) {
+        ensure!(
+            !chain.has_pending_version(),
+            "MVCC object chain has a pending version during GC rebase"
+        );
+        let matches = match (chain.newest_committed_value(), expected) {
+            (
+                Some(payload),
+                MvccExpectedObjectState::Present {
+                    object: expected_object,
+                    payload: expected_payload,
+                },
+            ) => object == *expected_object && payload == expected_payload,
+            (
+                None,
+                MvccExpectedObjectState::Absent {
+                    object: expected_object,
+                },
+            ) => object == *expected_object,
+            _ => false,
+        };
+        ensure!(
+            matches,
+            "MVCC object version state changed after object validation"
+        );
+    }
+    Ok(())
+}
+
 fn validate_committed_chains<K, T>(
     chains: &BTreeMap<K, VersionChain<T>>,
     description: &str,
@@ -313,4 +412,35 @@ where
                 .map(|(key, _)| *key)
         })
         .or_else(|| chains.keys().next().copied())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_table_cursor_selects_successors_inserted_on_either_side_then_wraps() {
+        let mut chains = BTreeMap::from([(10_u32, ()), (30, ())]);
+
+        assert_eq!(next_chain_key(&chains, None), Some(10));
+        assert_eq!(next_chain_key(&chains, Some(10)), Some(30));
+
+        chains.insert(20, ());
+        assert_eq!(next_chain_key(&chains, Some(10)), Some(20));
+
+        chains.insert(5, ());
+        assert_eq!(next_chain_key(&chains, Some(20)), Some(30));
+        assert_eq!(next_chain_key(&chains, Some(30)), Some(5));
+    }
+
+    #[test]
+    fn per_table_cursor_uses_removed_key_as_successor_boundary() {
+        let mut chains = BTreeMap::from([(5_u32, ()), (20, ()), (30, ())]);
+        chains.remove(&20);
+
+        assert_eq!(next_chain_key(&chains, Some(20)), Some(30));
+
+        chains.remove(&30);
+        assert_eq!(next_chain_key(&chains, Some(30)), Some(5));
+    }
 }

@@ -111,3 +111,73 @@ exit 0
 Only existing workspace warnings were emitted. No backend, durable-format,
 commit-LP, copy-on-write, persistent-GC policy, or object reachability code was
 changed in Task 12A.
+
+## Task 12A Review Fix: Validated Rebase Type State
+
+Review found that `complete_full_rebase` could clear histories without proving
+that the prepared object expectations had been checked against `ObjectTable`.
+The corrected API enforces this sequence:
+
+```text
+prepare_full_rebase(permit) -> MvccRebasePlan
+MvccRebasePlan::validate_current_objects(self, &mut ObjectTable)
+    -> ValidatedMvccRebasePlan
+complete_full_rebase(permit, ValidatedMvccRebasePlan)
+```
+
+`ValidatedMvccRebasePlan` has no public or crate-visible field constructor and
+is not cloneable. Validation refreshes each current object snapshot. A present
+expectation requires the exact `ObjectId` to name a live persistent slot and
+requires exact payload equality; an absent expectation requires no live current
+slot. Historical sidecars are not traversed through `ObjectTable`, exposed as
+roots, or made collector-visible.
+
+Every admitted barrier now receives a checked monotonic generation. The plan
+and validated token retain an opaque coordinator identity plus that generation.
+Completion rechecks coordinator identity, barrier generation, quiescence,
+complete coordinator metadata, and the internal expected object states while
+holding coordinator before domains. All fallible checks precede the six
+infallible map/cursor clears and baseline assignment. Stale, cross-barrier,
+cross-coordinator, metadata-changed, and sidecar-changed tokens fail without
+mutation.
+
+The first focused RED failed exactly on the missing type-state interface:
+
+```text
+E0599: no method named MvccRebasePlan::validate_current_objects
+E0061: complete_full_rebase accepted only the permit
+```
+
+After implementing the opaque token and updating real `ObjectTable` fixtures:
+
+```text
+mvcc_gc_ filter
+19 passed; 0 failed
+
+runtime::transaction::mvcc:: filter
+33 passed; 0 failed
+```
+
+The focused tests distinguish a payload-equal volatile slot from a persistent
+slot, reject payload mismatch, enforce absent slots for aborted-only new-object
+chains, reject prior-epoch and foreign-coordinator tokens, revalidate sidecars
+and metadata at completion, and prove failed validation preserves histories,
+baseline, and later snapshot admission. Two private `gc.rs` unit tests exercise
+actual per-table key selection across successor movement, insertion above and
+below the cursor, removal of the cursor key, and wraparound without adding a
+broad runtime test API.
+
+Fresh adjacent and compile verification:
+
+```text
+mvcc_serializable_ filter: 8 passed; 0 failed
+mvcc_commit_ filter: 19 passed; 0 failed
+complete MVCC feature-closure cargo check: exit 0
+non-MVCC OCC cargo check: exit 0
+```
+
+The plan still clones newest current object payloads for the bounded,
+quiescent barrier phase. This can temporarily increase peak memory, but keeping
+that stable validation snapshot is the current brief-required tradeoff.
+Chunked object validation would change adapter sequencing and is deferred
+outside this review fix.

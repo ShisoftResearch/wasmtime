@@ -10,8 +10,8 @@ use super::config::TMemoryRegionConfig;
 ))]
 use super::mvcc::{
     CommitRecord, CommitState, ModelCommitOutcome, ModelOperation, ModelTransaction,
-    MvccCommitTestHook, MvccExpectedObjectState, MvccPruneBudget, MvccRuntime,
-    SerializableMvccModel, SnapshotRegistration, generate_model_schedules,
+    MvccCommitTestHook, MvccPruneBudget, MvccRuntime, SerializableMvccModel, SnapshotRegistration,
+    generate_model_schedules,
 };
 #[cfg(feature = "transaction-mvcc")]
 use super::visibility::SelectedTransactionVisibility;
@@ -118,7 +118,7 @@ fn mvcc_gc_commit_memory(runtime: &MvccRuntime, granule: GranuleId, value: u8) -
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-fn mvcc_gc_commit_six_domains(runtime: &MvccRuntime) -> u64 {
+fn mvcc_gc_commit_six_domains(runtime: &MvccRuntime, objects: &mut ObjectTable) -> (u64, ObjectId) {
     let memory = GranuleId::TMemory {
         instance: Some(7),
         memory_index: 0,
@@ -141,9 +141,11 @@ fn mvcc_gc_commit_six_domains(runtime: &MvccRuntime) -> u64 {
         instance: Some(7),
         table_index: 0,
     };
-    let object = ObjectId {
-        object_index: 0x6c02,
-    };
+    let object_before = ObjectPayload::Struct(vec![ObjectValue::I32(1)]);
+    let object_after = ObjectPayload::Struct(vec![ObjectValue::I32(2)]);
+    let object = objects
+        .allocate_persistent_struct_for_gc_ref(0x6c02, vec![ObjectValue::I32(1)])
+        .unwrap();
     let table_before = TableGranuleSnapshot::new(vec![TableElementSnapshot::FuncRef(10)]).unwrap();
     let table_after = TableGranuleSnapshot::new(vec![TableElementSnapshot::FuncRef(20)]).unwrap();
     let (commit, mut pending) = runtime.begin_pending_commit().unwrap();
@@ -166,11 +168,29 @@ fn mvcc_gc_commit_six_domains(runtime: &MvccRuntime) -> u64 {
         .unwrap();
     prepare.prepare_table_size(table_size, || Ok(1), 2).unwrap();
     prepare
-        .prepare_object(
-            object,
-            || Ok(Some(ObjectPayload::Struct(vec![ObjectValue::I32(1)]))),
-            ObjectPayload::Struct(vec![ObjectValue::I32(2)]),
-        )
+        .prepare_object(object, || Ok(Some(object_before)), object_after.clone())
+        .unwrap();
+    drop(prepare);
+    objects
+        .install_current_payload_snapshot(object, &object_after)
+        .unwrap();
+    (pending.publish().unwrap(), object)
+}
+
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_commit_object(
+    runtime: &MvccRuntime,
+    object: ObjectId,
+    predecessor: Option<ObjectPayload>,
+    value: ObjectPayload,
+) -> u64 {
+    let (commit, mut pending) = runtime.begin_pending_commit().unwrap();
+    let mut prepare = runtime.begin_prepare(commit).unwrap();
+    prepare
+        .prepare_object(object, || Ok(predecessor), value)
         .unwrap();
     drop(prepare);
     pending.publish().unwrap()
@@ -324,7 +344,8 @@ fn mvcc_gc_active_horizon_retains_one_predecessor_and_every_newer_commit() {
 ))]
 fn mvcc_gc_budget_is_bounded_and_round_robin_visits_all_six_tables_then_wraps() {
     let runtime = MvccRuntime::default();
-    assert_eq!(mvcc_gc_commit_six_domains(&runtime), 1);
+    let mut objects = ObjectTable::default();
+    assert_eq!(mvcc_gc_commit_six_domains(&runtime, &mut objects).0, 1);
 
     for expected_table in 0..6 {
         let report = runtime
@@ -354,7 +375,9 @@ fn mvcc_gc_budget_is_bounded_and_round_robin_visits_all_six_tables_then_wraps() 
 fn mvcc_gc_exact_barrier_rebase_exposes_objects_then_clears_cursors_and_advances_baseline() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
-    assert_eq!(mvcc_gc_commit_six_domains(runtime), 1);
+    let mut objects = ObjectTable::default();
+    let (timestamp, object) = mvcc_gc_commit_six_domains(runtime, &mut objects);
+    assert_eq!(timestamp, 1);
     runtime
         .prune_versions_for_test(MvccPruneBudget::chains(1))
         .unwrap();
@@ -370,18 +393,11 @@ fn mvcc_gc_exact_barrier_rebase_exposes_objects_then_clears_cursors_and_advances
     assert_eq!(plan.metadata().visible_timestamp, 1);
     assert_eq!(plan.metadata().baseline_timestamp, 0);
     assert!(plan.metadata().quiescent);
-    assert_eq!(
-        plan.expected_objects(),
-        &[MvccExpectedObjectState::Present {
-            object: ObjectId {
-                object_index: 0x6c02,
-            },
-            payload: ObjectPayload::Struct(vec![ObjectValue::I32(2)]),
-        }]
-    );
+    assert_eq!(objects.is_persistent(object).unwrap(), true);
     assert_eq!(runtime.total_version_chain_count_for_test().unwrap(), 6);
 
-    let metadata = runtime.complete_full_rebase(&barrier).unwrap();
+    let validated = plan.validate_current_objects(&mut objects).unwrap();
+    let metadata = runtime.complete_full_rebase(&barrier, validated).unwrap();
 
     assert_eq!(metadata.visible_timestamp, 1);
     assert_eq!(metadata.baseline_timestamp, 1);
@@ -405,6 +421,7 @@ fn mvcc_gc_exact_barrier_rebase_exposes_objects_then_clears_cursors_and_advances
 fn mvcc_gc_barrier_rebase_purges_residual_aborted_only_object_chain() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
+    let mut objects = ObjectTable::default();
     let object = ObjectId {
         object_index: 0x6c03,
     };
@@ -423,12 +440,320 @@ fn mvcc_gc_barrier_rebase_purges_residual_aborted_only_object_chain() {
 
     let plan = runtime.prepare_full_rebase(&barrier).unwrap();
 
-    assert_eq!(
-        plan.expected_objects(),
-        &[MvccExpectedObjectState::Absent { object }]
-    );
-    runtime.complete_full_rebase(&barrier).unwrap();
+    let validated = plan.validate_current_objects(&mut objects).unwrap();
+    runtime.complete_full_rebase(&barrier, validated).unwrap();
     assert_eq!(runtime.object_chain_count_for_test().unwrap(), 0);
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_object_validation_rejects_payload_equal_volatile_slot() {
+    let visibility = SelectedTransactionVisibility::default();
+    let runtime = visibility.runtime();
+    let mut objects = ObjectTable::default();
+    let object = objects.allocate_struct(vec![ObjectValue::I32(7)]).unwrap();
+    let payload = objects.current_payload_snapshot(object).unwrap().unwrap();
+    assert_eq!(
+        mvcc_gc_commit_object(runtime, object, Some(payload.clone()), payload),
+        1
+    );
+    let barrier = visibility.begin_gc_barrier_for_test().unwrap();
+    let plan = runtime.prepare_full_rebase(&barrier).unwrap();
+
+    let error = plan.validate_current_objects(&mut objects).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!("MVCC GC rebase expected a live persistent object slot: {object:?}")
+    );
+    assert_eq!(runtime.object_version_count_for_test(object).unwrap(), 2);
+    assert_eq!(
+        runtime
+            .coordinator_metadata_for_test()
+            .unwrap()
+            .baseline_timestamp,
+        0
+    );
+    drop(barrier);
+    visibility.begin_snapshot().unwrap().finish().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_object_validation_rejects_payload_mismatch_without_mutation() {
+    let visibility = SelectedTransactionVisibility::default();
+    let runtime = visibility.runtime();
+    let mut objects = ObjectTable::default();
+    let object = objects
+        .allocate_persistent_struct_for_gc_ref(0x6c04, vec![ObjectValue::I32(8)])
+        .unwrap();
+    let predecessor = objects.current_payload_snapshot(object).unwrap();
+    let expected = ObjectPayload::Struct(vec![ObjectValue::I32(9)]);
+    assert_eq!(
+        mvcc_gc_commit_object(runtime, object, predecessor, expected.clone()),
+        1
+    );
+    let barrier = visibility.begin_gc_barrier_for_test().unwrap();
+    let plan = runtime.prepare_full_rebase(&barrier).unwrap();
+
+    let error = plan.validate_current_objects(&mut objects).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "MVCC GC rebase current object payload does not match the newest committed version: \
+             {object:?}"
+        )
+    );
+    assert_eq!(runtime.object_version_count_for_test(object).unwrap(), 2);
+    assert_eq!(
+        runtime
+            .coordinator_metadata_for_test()
+            .unwrap()
+            .baseline_timestamp,
+        0
+    );
+    drop(barrier);
+    let snapshot = visibility.begin_snapshot().unwrap();
+    assert_eq!(
+        runtime
+            .read_object(snapshot.timestamp(), object, || {
+                panic!("validation failure must retain the object version chain")
+            })
+            .unwrap(),
+        Some(expected)
+    );
+    snapshot.finish().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_object_validation_requires_aborted_only_new_object_to_be_absent() {
+    let visibility = SelectedTransactionVisibility::default();
+    let runtime = visibility.runtime();
+    let mut objects = ObjectTable::default();
+    let object = objects
+        .allocate_persistent_struct_for_gc_ref(0x6c05, vec![ObjectValue::I32(10)])
+        .unwrap();
+    let payload = objects.current_payload_snapshot(object).unwrap().unwrap();
+    let (commit, mut pending) = runtime.begin_pending_commit().unwrap();
+    let mut prepare = runtime.begin_prepare(commit.clone()).unwrap();
+    prepare
+        .prepare_object(object, || Ok(None), payload)
+        .unwrap();
+    drop(prepare);
+    pending.abort().unwrap();
+    let barrier = visibility.begin_gc_barrier_for_test().unwrap();
+    let plan = runtime.prepare_full_rebase(&barrier).unwrap();
+
+    let error = plan.validate_current_objects(&mut objects).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!("MVCC GC rebase expected the current object slot to be absent: {object:?}")
+    );
+    assert_eq!(runtime.object_version_count_for_test(object).unwrap(), 1);
+    assert_eq!(
+        runtime
+            .coordinator_metadata_for_test()
+            .unwrap()
+            .baseline_timestamp,
+        0
+    );
+    drop(barrier);
+    objects.free(object).unwrap();
+    runtime.remove_aborted_commit_versions(&commit).unwrap();
+    visibility.begin_snapshot().unwrap().finish().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_rebase_rejects_validated_token_from_a_prior_barrier_epoch() {
+    let visibility = SelectedTransactionVisibility::default();
+    let runtime = visibility.runtime();
+    let granule = mvcc_certification_granule(46);
+    assert_eq!(mvcc_gc_commit_memory(runtime, granule, 1), 1);
+    let mut objects = ObjectTable::default();
+    let first_barrier = visibility.begin_gc_barrier_for_test().unwrap();
+    let validated = runtime
+        .prepare_full_rebase(&first_barrier)
+        .unwrap()
+        .validate_current_objects(&mut objects)
+        .unwrap();
+    drop(first_barrier);
+    let second_barrier = visibility.begin_gc_barrier_for_test().unwrap();
+
+    let error = runtime
+        .complete_full_rebase(&second_barrier, validated)
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "validated MVCC GC rebase plan belongs to another barrier epoch"
+    );
+    assert_eq!(runtime.granule_version_count_for_test(granule).unwrap(), 2);
+    assert_eq!(
+        runtime
+            .coordinator_metadata_for_test()
+            .unwrap()
+            .baseline_timestamp,
+        0
+    );
+    drop(second_barrier);
+    let snapshot = visibility.begin_snapshot().unwrap();
+    assert_eq!(
+        runtime
+            .read_memory(snapshot.timestamp(), granule, || {
+                panic!("stale validation must not clear the version chain")
+            })
+            .unwrap(),
+        vec![1]
+    );
+    snapshot.finish().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_rebase_rejects_validated_token_from_another_coordinator() {
+    let first = SelectedTransactionVisibility::default();
+    let second = SelectedTransactionVisibility::default();
+    let mut objects = ObjectTable::default();
+    let first_barrier = first.begin_gc_barrier_for_test().unwrap();
+    let validated = first
+        .runtime()
+        .prepare_full_rebase(&first_barrier)
+        .unwrap()
+        .validate_current_objects(&mut objects)
+        .unwrap();
+    let second_barrier = second.begin_gc_barrier_for_test().unwrap();
+
+    let error = second
+        .runtime()
+        .complete_full_rebase(&second_barrier, validated)
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "validated MVCC GC rebase plan belongs to another coordinator"
+    );
+    assert_eq!(
+        second
+            .runtime()
+            .coordinator_metadata_for_test()
+            .unwrap()
+            .baseline_timestamp,
+        0
+    );
+    drop(second_barrier);
+    drop(first_barrier);
+    second.begin_snapshot().unwrap().finish().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_rebase_revalidates_object_sidecars_after_current_object_validation() {
+    let visibility = SelectedTransactionVisibility::default();
+    let runtime = visibility.runtime();
+    let mut objects = ObjectTable::default();
+    let barrier = visibility.begin_gc_barrier_for_test().unwrap();
+    let validated = runtime
+        .prepare_full_rebase(&barrier)
+        .unwrap()
+        .validate_current_objects(&mut objects)
+        .unwrap();
+    let object = ObjectId {
+        object_index: 0x6c06,
+    };
+    let late_commit = Arc::new(CommitRecord::pending());
+    let mut prepare = runtime.begin_prepare(late_commit.clone()).unwrap();
+    prepare
+        .prepare_object(
+            object,
+            || Ok(None),
+            ObjectPayload::Struct(vec![ObjectValue::I32(11)]),
+        )
+        .unwrap();
+    drop(prepare);
+    late_commit.commit(1).unwrap();
+
+    let error = runtime
+        .complete_full_rebase(&barrier, validated)
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "MVCC object version state changed after object validation"
+    );
+    assert_eq!(runtime.object_version_count_for_test(object).unwrap(), 1);
+    assert_eq!(
+        runtime
+            .coordinator_metadata_for_test()
+            .unwrap()
+            .baseline_timestamp,
+        0
+    );
+    drop(barrier);
+    visibility.begin_snapshot().unwrap().finish().unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_gc_rebase_rejects_second_validated_token_after_baseline_changes() {
+    let visibility = SelectedTransactionVisibility::default();
+    let runtime = visibility.runtime();
+    let granule = mvcc_certification_granule(47);
+    assert_eq!(mvcc_gc_commit_memory(runtime, granule, 1), 1);
+    let mut objects = ObjectTable::default();
+    let barrier = visibility.begin_gc_barrier_for_test().unwrap();
+    let first = runtime
+        .prepare_full_rebase(&barrier)
+        .unwrap()
+        .validate_current_objects(&mut objects)
+        .unwrap();
+    let second = runtime
+        .prepare_full_rebase(&barrier)
+        .unwrap()
+        .validate_current_objects(&mut objects)
+        .unwrap();
+    runtime.complete_full_rebase(&barrier, first).unwrap();
+
+    let error = runtime.complete_full_rebase(&barrier, second).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "MVCC GC coordinator metadata changed after object validation"
+    );
+    assert_eq!(runtime.total_version_chain_count_for_test().unwrap(), 0);
+    assert_eq!(
+        runtime
+            .coordinator_metadata_for_test()
+            .unwrap()
+            .baseline_timestamp,
+        1
+    );
+    drop(barrier);
+    visibility.begin_snapshot().unwrap().finish().unwrap();
 }
 
 #[test]

@@ -32,7 +32,7 @@ pub(crate) use domains::{MvccCommitFaultPoint, MvccCommitTestHook};
     unused_imports,
     reason = "MVCC pruning and rebase values are consumed by the persistent-GC adapter"
 )]
-pub(crate) use gc::{MvccExpectedObjectState, MvccPruneBudget, MvccPruneReport, MvccRebasePlan};
+pub(crate) use gc::{MvccPruneBudget, MvccPruneReport, MvccRebasePlan, ValidatedMvccRebasePlan};
 #[cfg(test)]
 pub(crate) use model::{
     ModelCommitOutcome, ModelOperation, ModelTransaction, SerializableMvccModel,
