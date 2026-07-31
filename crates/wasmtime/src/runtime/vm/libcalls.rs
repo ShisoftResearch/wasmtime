@@ -59,8 +59,6 @@ use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 #[cfg(feature = "gc")]
 use crate::runtime::transaction::DurableExternRefHostData;
-#[cfg(feature = "transaction-mvcc")]
-use crate::runtime::transaction::TMemoryGranuleSnapshot;
 use crate::runtime::transaction::{
     DurableReferenceRegistry, GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
@@ -72,6 +70,10 @@ use crate::runtime::transaction::{
     TableElementSnapshot, TableGranuleSnapshot, TransactionId, TransactionState,
     WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
     collect_tmemory_access_snapshot, combine_operation_and_cleanup_results,
+};
+#[cfg(feature = "transaction-mvcc")]
+use crate::runtime::transaction::{
+    PreparedDomainValues, PreparedObjectValue, PreparedValue, TMemoryGranuleSnapshot,
 };
 use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::{
@@ -981,7 +983,7 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
         .acquire_active_mvcc_certification(&visibility, snapshot, transaction, &reads, &writes)?;
 
     let (commit, pending) = visibility.begin_pending_commit()?;
-    let mut prepare = visibility.begin_prepare(commit)?;
+    let mut physical_values = PreparedDomainValues::default();
     let mut table_granules = BTreeSet::new();
     for record in &records {
         match record {
@@ -1004,7 +1006,19 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
                     *granule_index,
                     bytes.len(),
                 )?;
-                prepare.prepare_memory(granule, || Ok(current), bytes.clone())?;
+                ensure!(
+                    physical_values
+                        .memories
+                        .insert(
+                            granule,
+                            PreparedValue {
+                                predecessor: current,
+                                value: bytes.clone(),
+                            },
+                        )
+                        .is_none(),
+                    "memory granule was prepared more than once"
+                );
             }
             StagedRecord::MemorySize {
                 owner_instance,
@@ -1018,7 +1032,19 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
                 };
                 let current =
                     current_tmemory_pages(store, owner, MemoryIndex::from_u32(*memory_index))?;
-                prepare.prepare_memory_size(granule, || Ok(current), *new_pages)?;
+                ensure!(
+                    physical_values
+                        .memory_sizes
+                        .insert(
+                            granule,
+                            PreparedValue {
+                                predecessor: current,
+                                value: *new_pages,
+                            },
+                        )
+                        .is_none(),
+                    "memory size was prepared more than once"
+                );
             }
             StagedRecord::Global {
                 owner_instance,
@@ -1036,7 +1062,19 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
                     GlobalIndex::from_u32(*global_index),
                     *value,
                 )?;
-                prepare.prepare_global(granule, || Ok(current), *value)?;
+                ensure!(
+                    physical_values
+                        .globals
+                        .insert(
+                            granule,
+                            PreparedValue {
+                                predecessor: current,
+                                value: *value,
+                            },
+                        )
+                        .is_none(),
+                    "global was prepared more than once"
+                );
             }
             StagedRecord::TableSize {
                 owner_instance,
@@ -1050,7 +1088,19 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
                 };
                 let current = u64::try_from(defined_table_size(store, owner, *table_index)?)
                     .context("defined table size does not fit u64")?;
-                prepare.prepare_table_size(granule, || Ok(current), *new_elements)?;
+                ensure!(
+                    physical_values
+                        .table_sizes
+                        .insert(
+                            granule,
+                            PreparedValue {
+                                predecessor: current,
+                                value: *new_elements,
+                            },
+                        )
+                        .is_none(),
+                    "table size was prepared more than once"
+                );
             }
             StagedRecord::TableElement {
                 owner_instance,
@@ -1136,7 +1186,13 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
             table_index,
             granule_index,
         };
-        prepare.prepare_table(granule, || Ok(predecessor), value)?;
+        ensure!(
+            physical_values
+                .tables
+                .insert(granule, PreparedValue { predecessor, value })
+                .is_none(),
+            "table granule was prepared more than once"
+        );
     }
 
     for (object, value) in staged_objects {
@@ -1151,8 +1207,18 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
             let (_state, object_table) = store.transaction_state_and_object_table_mut();
             object_table.current_payload_snapshot(object)?
         };
-        prepare.prepare_object(object, || Ok(predecessor), value)?;
+        ensure!(
+            physical_values
+                .objects
+                .insert(object, PreparedObjectValue { predecessor, value })
+                .is_none(),
+            "object was prepared more than once"
+        );
     }
+    #[cfg(test)]
+    visibility.run_predecessor_collected_hook_for_test()?;
+    let mut prepare = visibility.begin_prepare(commit)?;
+    prepare.append_prepared_values(physical_values)?;
     let prepared_values = prepare.into_values();
 
     let (stream_id, txid) = {

@@ -112,6 +112,8 @@ pub(crate) use durable_ref::DurableExternRefHostData;
 pub(crate) use durable_ref::{
     DurableExternIdentity, DurableFuncIdentity, DurableReferenceRegistry,
 };
+#[cfg(feature = "transaction-mvcc")]
+pub(crate) use mvcc::{PreparedDomainValues, PreparedObjectValue, PreparedValue};
 pub(crate) use object_heap::TxObjectHeader;
 pub(crate) use object_heap::encode_object_record as encode_object_record_for_recovery;
 #[cfg(test)]

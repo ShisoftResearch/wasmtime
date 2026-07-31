@@ -460,6 +460,66 @@ fn mvcc_commit_prepare_disjoint_installations_overlap() {
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
+fn mvcc_commit_prepare_collects_physical_predecessors_without_domain_lock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 1))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let predecessor_collected = Arc::new(MvccCommitTestHook::new(1));
+    visibility
+        .runtime()
+        .set_predecessor_collected_hook_for_test(Some(predecessor_collected.clone()))
+        .unwrap();
+
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime);
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = GranuleId::TMemory {
+        instance: Some(instance.id().as_u32()),
+        memory_index: 0,
+        granule_index: 0,
+    };
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+    let writer = std::thread::spawn(move || write.call(&mut store, ()));
+
+    assert!(predecessor_collected.wait_until_reached(Duration::from_secs(5)));
+    let probe_visibility = visibility.clone();
+    let (probe_tx, probe_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        probe_tx.send(
+            probe_visibility
+                .runtime()
+                .latest_committed_timestamp(memory),
+        )
+    });
+    let domain_lock_was_free = probe_rx.recv_timeout(Duration::from_secs(1));
+    predecessor_collected.release();
+    writer.join().unwrap().unwrap();
+
+    assert!(
+        matches!(domain_lock_was_free, Ok(Ok(_))),
+        "physical predecessor collection completed while the MVCC domain lock was held"
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
 fn mvcc_certification_assigns_shared_reads_and_exclusive_writes() {
     let policy = ConcurrencyControlState::default();
     let transaction = TransactionId::from_raw(1);

@@ -9,6 +9,8 @@ use alloc::sync::Arc;
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::{Mutex, MutexGuard};
+#[cfg(test)]
+use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedValue<T> {
@@ -108,15 +110,25 @@ impl MvccRuntime {
         after_publish: Option<Arc<MvccCommitTestHook>>,
         inside_install: Option<Arc<MvccCommitTestHook>>,
     ) -> Result<()> {
-        *self
+        let mut hooks = self
             .commit_hooks
             .lock()
-            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))? =
-            MvccCommitHooks {
-                before_publish,
-                after_publish,
-                inside_install,
-            };
+            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))?;
+        hooks.before_publish = before_publish;
+        hooks.after_publish = after_publish;
+        hooks.inside_install = inside_install;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_predecessor_collected_hook_for_test(
+        &self,
+        hook: Option<Arc<MvccCommitTestHook>>,
+    ) -> Result<()> {
+        self.commit_hooks
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))?
+            .predecessor_collected = hook;
         Ok(())
     }
 
@@ -136,6 +148,11 @@ impl MvccRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn run_predecessor_collected_hook_for_test(&self) -> Result<()> {
+        self.commit_hook_for_test(|hooks| hooks.predecessor_collected.clone())
+    }
+
+    #[cfg(test)]
     fn commit_hook_for_test(
         &self,
         select: impl FnOnce(&MvccCommitHooks) -> Option<Arc<MvccCommitTestHook>>,
@@ -147,7 +164,7 @@ impl MvccRuntime {
         let hook = select(&hooks);
         drop(hooks);
         if let Some(hook) = hook {
-            hook.wait();
+            hook.wait()?;
         }
         Ok(())
     }
@@ -345,12 +362,14 @@ struct MvccCommitHooks {
     before_publish: Option<Arc<MvccCommitTestHook>>,
     after_publish: Option<Arc<MvccCommitTestHook>>,
     inside_install: Option<Arc<MvccCommitTestHook>>,
+    predecessor_collected: Option<Arc<MvccCommitTestHook>>,
 }
 
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct MvccCommitTestHook {
     expected: usize,
+    participant_timeout: Duration,
     state: Mutex<MvccCommitTestHookState>,
     changed: Condvar,
 }
@@ -365,20 +384,38 @@ struct MvccCommitTestHookState {
 #[cfg(test)]
 impl MvccCommitTestHook {
     pub(crate) fn new(participants: usize) -> Self {
+        Self::new_with_timeout_for_test(participants, Duration::from_secs(5))
+    }
+
+    pub(crate) fn new_with_timeout_for_test(
+        participants: usize,
+        participant_timeout: Duration,
+    ) -> Self {
         Self {
             expected: participants,
+            participant_timeout,
             state: Mutex::new(MvccCommitTestHookState::default()),
             changed: Condvar::new(),
         }
     }
 
-    pub(crate) fn wait(&self) {
-        let mut state = self.state.lock().unwrap();
+    pub(crate) fn wait(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))?;
+        let mut state = state;
         state.reached += 1;
         self.changed.notify_all();
-        while !state.released {
-            state = self.changed.wait(state).unwrap();
-        }
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, self.participant_timeout, |state| !state.released)
+            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))?;
+        ensure!(
+            state.released,
+            "timed out waiting for MVCC commit test hook release"
+        );
+        Ok(())
     }
 
     pub(crate) fn wait_until_reached(&self, timeout: std::time::Duration) -> bool {
@@ -465,6 +502,40 @@ impl MvccPrepareGuard<'_> {
 
     pub(crate) fn into_values(self) -> PreparedDomainValues {
         self.values
+    }
+
+    /// Appends an already-materialized commit batch while holding only the
+    /// MVCC domain metadata lock. Every fallback closure below moves an owned
+    /// predecessor and therefore cannot perform storage or mapping I/O.
+    pub(crate) fn append_prepared_values(&mut self, values: PreparedDomainValues) -> Result<()> {
+        let PreparedDomainValues {
+            memories,
+            memory_sizes,
+            globals,
+            tables,
+            table_sizes,
+            objects,
+        } = values;
+
+        for (granule, PreparedValue { predecessor, value }) in memories {
+            self.prepare_memory(granule, move || Ok(predecessor), value)?;
+        }
+        for (granule, PreparedValue { predecessor, value }) in memory_sizes {
+            self.prepare_memory_size(granule, move || Ok(predecessor), value)?;
+        }
+        for (granule, PreparedValue { predecessor, value }) in globals {
+            self.prepare_global(granule, move || Ok(predecessor), value)?;
+        }
+        for (granule, PreparedValue { predecessor, value }) in tables {
+            self.prepare_table(granule, move || Ok(predecessor), value)?;
+        }
+        for (granule, PreparedValue { predecessor, value }) in table_sizes {
+            self.prepare_table_size(granule, move || Ok(predecessor), value)?;
+        }
+        for (object, PreparedObjectValue { predecessor, value }) in objects {
+            self.prepare_object(object, move || Ok(predecessor), value)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_memory(
@@ -1087,6 +1158,18 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.to_string(), "memory granule payload exceeds 64 bytes");
+    }
+
+    #[test]
+    fn commit_test_hook_participant_wait_is_bounded() {
+        let hook = MvccCommitTestHook::new_with_timeout_for_test(1, Duration::from_millis(10));
+
+        let error = hook.wait().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "timed out waiting for MVCC commit test hook release"
+        );
     }
 
     #[test]
