@@ -82,6 +82,8 @@ use crate::runtime::vm::{
 use crate::{ArrayType, StructType};
 use crate::{Engine, HeapType, StorageType, ValType};
 use alloc::collections::BTreeMap;
+#[cfg(feature = "transaction-mvcc")]
+use alloc::collections::BTreeSet;
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
@@ -734,7 +736,7 @@ impl OrdinaryGcPromotionAdapter for StoreBackedOrdinaryGcPromotionAdapter<'_> {
 fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (records, read_granules) = {
+    {
         let state = store.store_opaque_mut().transaction_state_mut();
         if state.structured_failure_pending() {
             state.clear_structured_failure();
@@ -743,6 +745,21 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         if state.active_transaction().is_none() {
             return Ok(());
         }
+    }
+
+    #[cfg(not(feature = "transaction-mvcc"))]
+    return transaction_commit_single_version_impl(store, instance);
+    #[cfg(feature = "transaction-mvcc")]
+    return transaction_commit_mvcc_impl(store, instance);
+}
+
+#[cfg(not(feature = "transaction-mvcc"))]
+fn transaction_commit_single_version_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+) -> Result<()> {
+    let (records, read_granules) = {
+        let state = store.store_opaque_mut().transaction_state_mut();
         (state.staged_records()?, state.active_read_granules()?)
     };
 
@@ -908,6 +925,393 @@ fn transaction_commit_impl(store: &mut dyn VMStore, instance: InstanceId) -> Res
         &persistent_gc_delta,
     );
     Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+    {
+        let store = store.store_opaque_mut();
+        let (engine, gc_store, durable_refs, state, object_table) =
+            store.transaction_promotion_context_mut();
+        let mut adapter =
+            StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
+        state
+            .promote_persistent_references_before_commit_with_adapter(object_table, &mut adapter)?;
+        state.finalize_transaction_local_objects_after_promotion(object_table)?;
+    }
+
+    let (records, visibility, snapshot, transaction, reads, writes) = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        let (visibility, snapshot, transaction, reads, writes) =
+            state.active_mvcc_commit_context()?;
+        (
+            state.staged_records()?,
+            visibility,
+            snapshot,
+            transaction,
+            reads,
+            writes,
+        )
+    };
+    let staged_objects = {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.staged_object_payloads_for_commit(&*object_table)?
+    };
+
+    let _user_transaction_region_permit = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        if let Some(runtime) = state.shared_region_runtime_for_publication() {
+            Some(runtime.begin_user_transaction_region()?)
+        } else {
+            None
+        }
+    };
+
+    if writes.is_empty() {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.begin_terminal_commit_with_object_cleanup(object_table)?;
+        return state.complete_commit();
+    }
+
+    let certification = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_active_mvcc_certification(&visibility, snapshot, transaction, &reads, &writes)?;
+
+    let (commit, pending) = visibility.begin_pending_commit()?;
+    let mut prepare = visibility.begin_prepare(commit)?;
+    let mut table_granules = BTreeSet::new();
+    for record in &records {
+        match record {
+            StagedRecord::MemoryGranule {
+                owner_instance,
+                memory_index,
+                granule_index,
+                bytes,
+            } => {
+                let owner = owner_instance.unwrap_or(instance);
+                let granule = GranuleId::TMemory {
+                    instance: owner_instance.map(InstanceId::as_u32),
+                    memory_index: *memory_index,
+                    granule_index: *granule_index,
+                };
+                let current = current_tmemory_granule(
+                    store,
+                    owner,
+                    *memory_index,
+                    *granule_index,
+                    bytes.len(),
+                )?;
+                prepare.prepare_memory(granule, || Ok(current), bytes.clone())?;
+            }
+            StagedRecord::MemorySize {
+                owner_instance,
+                memory_index,
+                new_pages,
+            } => {
+                let owner = owner_instance.unwrap_or(instance);
+                let granule = GranuleId::TMemorySize {
+                    instance: owner_instance.map(InstanceId::as_u32),
+                    memory_index: *memory_index,
+                };
+                let current =
+                    current_tmemory_pages(store, owner, MemoryIndex::from_u32(*memory_index))?;
+                prepare.prepare_memory_size(granule, || Ok(current), *new_pages)?;
+            }
+            StagedRecord::Global {
+                owner_instance,
+                global_index,
+                value,
+            } => {
+                let owner = owner_instance.unwrap_or(instance);
+                let granule = GranuleId::TGlobal {
+                    instance: owner_instance.map(InstanceId::as_u32),
+                    global_index: *global_index,
+                };
+                let current = read_global_snapshot_like(
+                    store,
+                    owner,
+                    GlobalIndex::from_u32(*global_index),
+                    *value,
+                )?;
+                prepare.prepare_global(granule, || Ok(current), *value)?;
+            }
+            StagedRecord::TableSize {
+                owner_instance,
+                table_index,
+                new_elements,
+            } => {
+                let owner = owner_instance.unwrap_or(instance);
+                let granule = GranuleId::TTableSize {
+                    instance: owner_instance.map(InstanceId::as_u32),
+                    table_index: *table_index,
+                };
+                let current = u64::try_from(defined_table_size(store, owner, *table_index)?)
+                    .context("defined table size does not fit u64")?;
+                prepare.prepare_table_size(granule, || Ok(current), *new_elements)?;
+            }
+            StagedRecord::TableElement {
+                owner_instance,
+                table_index,
+                element_index,
+                ..
+            } => {
+                table_granules.insert((
+                    owner_instance.map(InstanceId::as_u32),
+                    *table_index,
+                    element_index / TableGranuleSnapshot::ELEMENT_CAPACITY,
+                ));
+            }
+        }
+    }
+
+    for (owner_instance, table_index, granule_index) in table_granules {
+        let owner_instance = owner_instance.map(InstanceId::from_u32);
+        let owner = owner_instance.unwrap_or(instance);
+        let physical_size = u64::try_from(defined_table_size(store, owner, table_index)?)
+            .context("defined table size does not fit u64")?;
+        let final_size = store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .staged_table_size_owned(owner_instance, table_index)
+            .unwrap_or(physical_size);
+        let predecessor =
+            collect_current_table_granule(store, owner, table_index, granule_index, physical_size)?;
+        let mut elements = predecessor.elements().to_vec();
+        let granule_start = granule_index
+            .checked_mul(TableGranuleSnapshot::ELEMENT_CAPACITY)
+            .context("ttable granule start overflow")?;
+        let final_len = final_size
+            .saturating_sub(granule_start)
+            .min(TableGranuleSnapshot::ELEMENT_CAPACITY);
+        let null = records
+            .iter()
+            .find_map(|record| match record {
+                StagedRecord::TableElement {
+                    owner_instance: staged_owner,
+                    table_index: staged_table,
+                    element_index,
+                    value,
+                } if *staged_owner == owner_instance
+                    && *staged_table == table_index
+                    && *element_index / TableGranuleSnapshot::ELEMENT_CAPACITY == granule_index =>
+                {
+                    Some(match value {
+                        TableElementSnapshot::FuncRef(_) => TableElementSnapshot::FuncRef(0),
+                        TableElementSnapshot::GcRef(_) => TableElementSnapshot::GcRef(0),
+                    })
+                }
+                _ => None,
+            })
+            .context("staged table granule has no element value")?;
+        elements.resize(
+            usize::try_from(final_len).context("ttable granule length does not fit usize")?,
+            null,
+        );
+        for record in &records {
+            let StagedRecord::TableElement {
+                owner_instance: staged_owner,
+                table_index: staged_table,
+                element_index,
+                value,
+            } = record
+            else {
+                continue;
+            };
+            if *staged_owner != owner_instance
+                || *staged_table != table_index
+                || *element_index / TableGranuleSnapshot::ELEMENT_CAPACITY != granule_index
+            {
+                continue;
+            }
+            let offset = usize::try_from(*element_index - granule_start)
+                .context("ttable granule offset does not fit usize")?;
+            elements[offset] = *value;
+        }
+        let value = TableGranuleSnapshot::new(elements)?;
+        let granule = GranuleId::TTable {
+            instance: owner_instance.map(InstanceId::as_u32),
+            table_index,
+            granule_index,
+        };
+        prepare.prepare_table(granule, || Ok(predecessor), value)?;
+    }
+
+    for (object, value) in staged_objects {
+        let newly_allocated = store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .object_is_newly_allocated_for_commit(object)?;
+        let predecessor = if newly_allocated {
+            None
+        } else {
+            let store = store.store_opaque_mut();
+            let (_state, object_table) = store.transaction_state_and_object_table_mut();
+            object_table.current_payload_snapshot(object)?
+        };
+        prepare.prepare_object(object, || Ok(predecessor), value)?;
+    }
+    let prepared_values = prepare.into_values();
+
+    let (stream_id, txid) = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        let transaction_id = state.active_transaction_required_raw()?;
+        let stream_id = if let Some(region) = state.shared_region_runtime_for_publication() {
+            region.current_thread_log_segment()?.stream_id()
+        } else {
+            u32::try_from(transaction_id)
+                .context("transaction id does not fit durable transaction stream id")?
+        };
+        let txid = u32::try_from(transaction_id)
+            .context("transaction id does not fit durable transaction id")?;
+        (stream_id, txid)
+    };
+
+    {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.begin_terminal_commit_with_object_cleanup(object_table)?;
+    }
+
+    let mut final_marker =
+        commit_staged_tmemory_records(store, instance, &records, stream_id, txid)?;
+    #[cfg(test)]
+    visibility.run_inside_install_hook_for_test()?;
+    for record in &records {
+        apply_staged_transaction_record(store, instance, record)?;
+    }
+
+    let (durable_publications, root_delta, persistent_gc_delta) = {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        let mut object_publications = Vec::new();
+        state.commit_object_payloads_into(object_table, &mut object_publications)?;
+        let root_delta = state.staged_persistent_root_delta(&*object_table)?;
+        let root_publications = state.persistent_root_publications(&root_delta)?;
+        let tmemory_size_publications = state.tmemory_size_publications()?;
+        let persistent_gc_delta =
+            state.persistent_gc_commit_delta(&*object_table, &object_publications)?;
+        object_publications.extend(root_publications);
+        object_publications.extend(tmemory_size_publications);
+        (object_publications, root_delta, persistent_gc_delta)
+    };
+    let mut durable_publication_markers = Vec::new();
+    if !durable_publications.is_empty() {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        durable_publication_markers = state
+            .publish_object_publications_before_commit_with_markers(
+                stream_id,
+                txid,
+                &*object_table,
+                &durable_publications,
+            )?;
+        final_marker = durable_publication_markers.last().copied().or(final_marker);
+    }
+    if let Some(marker) = final_marker {
+        if store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .take_fail_next_commit_before_lp_for_test()
+        {
+            bail!("transaction test failure before commit LP");
+        }
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .publish_commit_lp(stream_id, txid, marker)?;
+    }
+
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .prepare_mvcc_commit_completion(root_delta)?;
+    {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        if !durable_publication_markers.is_empty() {
+            state.install_committed_mapped_object_publications(
+                object_table,
+                &durable_publications,
+                &durable_publication_markers,
+            )?;
+        }
+        let _ = state.observe_persistent_gc_commit_delta_after_commit_best_effort(
+            object_table,
+            &persistent_gc_delta,
+        );
+    }
+
+    #[cfg(test)]
+    visibility.run_before_publish_hook_for_test()?;
+    let _timestamp = pending.publish()?;
+    #[cfg(test)]
+    visibility.run_after_publish_hook_for_test()?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .finish_mvcc_commit_cleanup()?;
+    drop(certification);
+    drop(prepared_values);
+    Ok(())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn current_tmemory_granule(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: u32,
+    granule_index: u64,
+    value_len: usize,
+) -> Result<Vec<u8>> {
+    let addr = granule_index
+        .checked_mul(u64::try_from(crate::runtime::transaction::TMEMORY_GRANULE_SIZE).unwrap())
+        .context("tmemory granule address overflow")?;
+    let memory_index = MemoryIndex::from_u32(memory_index);
+    let pages = current_tmemory_pages(store, instance, memory_index)?;
+    let byte_len = pages
+        .checked_mul(u64::try_from(crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE).unwrap())
+        .context("tmemory byte length overflow")?;
+    if addr >= byte_len {
+        return Ok(vec![0; value_len]);
+    }
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let tmemory = instance_ref
+        .get_tmemory(memory_index)
+        .context("transactional memory operation targeted non-transactional memory")?;
+    Ok(collect_tmemory_access_snapshot(tmemory, addr, value_len)?
+        .into_granules()
+        .into_iter()
+        .next()
+        .context("current tmemory snapshot is missing its granule")?
+        .into_bytes())
+}
+
+#[cfg(feature = "transaction-mvcc")]
+fn read_global_snapshot_like(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    global: GlobalIndex,
+    value: GlobalSnapshot,
+) -> Result<GlobalSnapshot> {
+    let global = global_definition_ptr(store, instance, global)?;
+    let global = unsafe { global.as_ref() };
+    Ok(match value {
+        GlobalSnapshot::I32(_) => GlobalSnapshot::I32(unsafe { *global.as_i32() }),
+        GlobalSnapshot::I64(_) => GlobalSnapshot::I64(unsafe { *global.as_i64() }),
+        GlobalSnapshot::F32(_) => GlobalSnapshot::F32(unsafe { *global.as_f32_bits() }),
+        GlobalSnapshot::F64(_) => GlobalSnapshot::F64(unsafe { *global.as_f64_bits() }),
+        GlobalSnapshot::V128(_) => GlobalSnapshot::V128(unsafe { *global.as_u128_bits() }),
+        GlobalSnapshot::FuncRef(_) => {
+            GlobalSnapshot::FuncRef(unsafe { global.as_func_ref() as usize })
+        }
+        GlobalSnapshot::GcRef(_) => {
+            GlobalSnapshot::GcRef(unsafe { global.as_gc_ref().map_or(0, VMGcRef::as_raw_u32) })
+        }
+    })
 }
 
 fn transaction_fail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
@@ -4499,6 +4903,7 @@ fn collect_tmemory_snapshot(
     }
 }
 
+#[cfg(not(feature = "transaction-mvcc"))]
 fn current_granule_version(
     store: &mut dyn VMStore,
     instance: InstanceId,

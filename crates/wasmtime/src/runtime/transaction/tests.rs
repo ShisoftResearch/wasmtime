@@ -8,7 +8,7 @@ use super::config::TMemoryRegionConfig;
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-use super::mvcc::{CommitRecord, MvccRuntime};
+use super::mvcc::{CommitRecord, MvccCommitTestHook, MvccRuntime};
 #[cfg(feature = "transaction-mvcc")]
 use super::visibility::SelectedTransactionVisibility;
 use super::*;
@@ -89,6 +89,370 @@ fn mvcc_certification_install_committed_memory_version(
         .unwrap();
     drop(prepare);
     commit.commit(timestamp).unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_prepare_read_only_skips_certification_and_pending_record() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+    assert_eq!(
+        runtime
+            .visibility_for_test()
+            .runtime()
+            .commit_lifecycle_counts_for_test()
+            .unwrap(),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (0, 0)
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_prepare_unpromoted_volatile_object_creates_no_sidecar_chain() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (struct (field (mut i32))))
+              (tmemory 1)
+              (tfunc (export "create")
+                (drop (tstruct.new $s (i32.const 41)))
+                (i32.tstore (i32.const 0) (i32.const 7))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime);
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let create = instance
+        .get_typed_func::<(), ()>(&mut store, "create")
+        .unwrap();
+
+    create.call(&mut store, ()).unwrap();
+
+    assert_eq!(
+        visibility.runtime().object_chain_count_for_test().unwrap(),
+        0
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .commit_lifecycle_counts_for_test()
+            .unwrap(),
+        (1, 1, 0)
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_prepare_writer_certifies_union_and_shares_one_record() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tglobal $g (mut i32) (i32.const 3))
+              (ttable $t 1 funcref)
+              (tfunc (export "write")
+                (drop (i32.tload (i32.const 64)))
+                (i32.tstore (i32.const 0) (i32.const 2))
+                (tglobal.set $g (i32.const 4))
+                (ttable.set $t (i32.const 0) (ref.null func))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+
+    write.call(&mut store, ()).unwrap();
+
+    let read_only = GranuleId::TMemory {
+        instance: Some(instance.id().as_u32()),
+        memory_index: 0,
+        granule_index: 1,
+    };
+    let memory = GranuleId::TMemory {
+        instance: Some(instance.id().as_u32()),
+        memory_index: 0,
+        granule_index: 0,
+    };
+    let global = GranuleId::TGlobal {
+        instance: Some(instance.id().as_u32()),
+        global_index: 0,
+    };
+    let memory_size = GranuleId::TMemorySize {
+        instance: Some(instance.id().as_u32()),
+        memory_index: 0,
+    };
+    let table = GranuleId::TTable {
+        instance: Some(instance.id().as_u32()),
+        table_index: 0,
+        granule_index: 0,
+    };
+    let table_size = GranuleId::TTableSize {
+        instance: Some(instance.id().as_u32()),
+        table_index: 0,
+    };
+    assert_eq!(
+        runtime
+            .mvcc_last_certification_for_test()
+            .unwrap()
+            .as_slice(),
+        &[
+            (memory, CertificationMode::Exclusive),
+            (read_only, CertificationMode::Shared),
+            (memory_size, CertificationMode::Shared),
+            (global, CertificationMode::Exclusive),
+            (table, CertificationMode::Exclusive),
+            (table_size, CertificationMode::Shared),
+        ]
+    );
+    let memory_record = visibility
+        .runtime()
+        .newest_commit_record_for_granule_for_test(memory)
+        .unwrap()
+        .unwrap();
+    let global_record = visibility
+        .runtime()
+        .newest_commit_record_for_granule_for_test(global)
+        .unwrap()
+        .unwrap();
+    let table_record = visibility
+        .runtime()
+        .newest_commit_record_for_granule_for_test(table)
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&memory_record, &global_record));
+    assert!(Arc::ptr_eq(&memory_record, &table_record));
+    assert_eq!(
+        visibility
+            .runtime()
+            .commit_lifecycle_counts_for_test()
+            .unwrap(),
+        (1, 1, 0)
+    );
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 0)
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_prepare_transition_is_atomic_and_keeps_latches() {
+    use std::time::Duration;
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tglobal $g (mut i32) (i32.const 3))
+              (func $target)
+              (elem declare func $target)
+              (ttable $t 1 funcref)
+              (tfunc (export "write")
+                (i32.tstore (i32.const 0) (i32.const 2))
+                (tglobal.set $g (i32.const 4))
+                (ttable.set $t (i32.const 0) (ref.func $target))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let before = Arc::new(MvccCommitTestHook::new(1));
+    let after = Arc::new(MvccCommitTestHook::new(1));
+    visibility
+        .runtime()
+        .set_commit_hooks_for_test(Some(before.clone()), Some(after.clone()), None)
+        .unwrap();
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime.clone());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let owner = instance.id().as_u32();
+    let write = instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap();
+    let writer = std::thread::spawn(move || write.call(&mut store, ()));
+
+    assert!(before.wait_until_reached(Duration::from_secs(5)));
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 1)
+    );
+    let memory = GranuleId::TMemory {
+        instance: Some(owner),
+        memory_index: 0,
+        granule_index: 0,
+    };
+    let global = GranuleId::TGlobal {
+        instance: Some(owner),
+        global_index: 0,
+    };
+    let table = GranuleId::TTable {
+        instance: Some(owner),
+        table_index: 0,
+        granule_index: 0,
+    };
+    assert_eq!(
+        visibility
+            .runtime()
+            .read_memory(u64::MAX - 1, memory, || panic!("prepared chain must exist"))
+            .unwrap()[..4],
+        0_i32.to_le_bytes()
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .read_global(u64::MAX - 1, global, || panic!("prepared chain must exist"))
+            .unwrap(),
+        GlobalSnapshot::I32(3)
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .read_table(u64::MAX - 1, table, || panic!("prepared chain must exist"))
+            .unwrap()
+            .elements(),
+        &[TableElementSnapshot::FuncRef(0)]
+    );
+    before.release();
+
+    assert!(after.wait_until_reached(Duration::from_secs(5)));
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 1)
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .read_memory(u64::MAX - 1, memory, || panic!("prepared chain must exist"))
+            .unwrap()[..4],
+        2_i32.to_le_bytes()
+    );
+    assert_eq!(
+        visibility
+            .runtime()
+            .read_global(u64::MAX - 1, global, || panic!("prepared chain must exist"))
+            .unwrap(),
+        GlobalSnapshot::I32(4)
+    );
+    assert!(matches!(
+        visibility
+            .runtime()
+            .read_table(u64::MAX - 1, table, || panic!("prepared chain must exist"))
+            .unwrap()
+            .elements(),
+        [TableElementSnapshot::FuncRef(value)] if *value != 0
+    ));
+    after.release();
+    writer.join().unwrap().unwrap();
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (1, 0)
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+fn mvcc_commit_prepare_disjoint_installations_overlap() {
+    use std::time::Duration;
+
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory $left 1)
+              (tmemory $right 1)
+              (tfunc (export "write_left")
+                (i32.tstore $left (i32.const 0) (i32.const 1)))
+              (tfunc (export "write_right")
+                (i32.tstore $right (i32.const 0) (i32.const 2))))
+        "#,
+    );
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let visibility = runtime.visibility_for_test();
+    let inside_install = Arc::new(MvccCommitTestHook::new(2));
+    visibility
+        .runtime()
+        .set_commit_hooks_for_test(None, None, Some(inside_install.clone()))
+        .unwrap();
+
+    let mut left_store = crate::Store::new(&engine, ());
+    left_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let left_instance = crate::Instance::new(&mut left_store, &module, &[]).unwrap();
+    let write_left = left_instance
+        .get_typed_func::<(), ()>(&mut left_store, "write_left")
+        .unwrap();
+    let left = std::thread::spawn(move || write_left.call(&mut left_store, ()));
+
+    let mut right_store = crate::Store::new(&engine, ());
+    right_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let right_instance = crate::Instance::new(&mut right_store, &module, &[]).unwrap();
+    let write_right = right_instance
+        .get_typed_func::<(), ()>(&mut right_store, "write_right")
+        .unwrap();
+    let right = std::thread::spawn(move || write_right.call(&mut right_store, ()));
+
+    assert!(inside_install.wait_until_reached(Duration::from_secs(5)));
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (2, 2)
+    );
+    inside_install.release();
+    left.join().unwrap().unwrap();
+    right.join().unwrap().unwrap();
+    assert_eq!(
+        runtime.mvcc_certification_counts_for_test().unwrap(),
+        (2, 0)
+    );
 }
 
 #[test]
@@ -900,7 +1264,7 @@ fn mvcc_object_shared_install_rejects_local_update_and_refreshes_newer_directory
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-fn mvcc_object_commit_prepare_for_transaction_local_promotion_is_pending_only() {
+fn mvcc_commit_prepare_transaction_local_promotion_is_pending_only() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
     let visibility = runtime.visibility_for_test();
@@ -959,7 +1323,7 @@ fn mvcc_object_commit_prepare_for_transaction_local_promotion_is_pending_only() 
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-fn mvcc_object_aborting_shared_promotion_record_removes_all_pending_versions_and_allocations() {
+fn mvcc_commit_prepare_transaction_local_promotions_share_one_record() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
     let visibility = runtime.visibility_for_test();

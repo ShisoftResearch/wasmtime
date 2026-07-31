@@ -62,6 +62,12 @@ struct CertificationState {
     granules: BTreeMap<GranuleId, LatchState>,
     #[cfg(test)]
     blocked_transactions: BTreeSet<TransactionId>,
+    #[cfg(test)]
+    acquisitions: usize,
+    #[cfg(test)]
+    active_permits: usize,
+    #[cfg(test)]
+    last_reservations: Vec<(GranuleId, CertificationMode)>,
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +111,12 @@ impl MvccCertificationAuthority {
                 .or_default()
                 .reserve(transaction, mode);
         }
+        #[cfg(test)]
+        {
+            state.acquisitions += 1;
+            state.active_permits += 1;
+            state.last_reservations = reservations.clone();
+        }
         drop(state);
         Ok(MvccCertificationPermit {
             authority: self.clone(),
@@ -127,6 +139,17 @@ impl MvccCertificationAuthority {
             })
             .map_err(|_| crate::format_err!("MVCC certification authority lock is poisoned"))?;
         Ok(state.blocked_transactions.contains(&transaction))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_counts_for_test(&self) -> Result<(usize, usize)> {
+        let state = self.lock()?;
+        Ok((state.acquisitions, state.active_permits))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_reservations_for_test(&self) -> Result<Vec<(GranuleId, CertificationMode)>> {
+        Ok(self.lock()?.last_reservations.clone())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CertificationState>> {
@@ -182,6 +205,10 @@ impl Drop for MvccCertificationPermit {
             if remove {
                 state.granules.remove(&granule);
             }
+        }
+        #[cfg(test)]
+        {
+            state.active_permits -= 1;
         }
         drop(state);
         self.authority.changed.notify_all();

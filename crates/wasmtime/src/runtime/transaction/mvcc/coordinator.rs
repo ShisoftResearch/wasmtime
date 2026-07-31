@@ -20,6 +20,12 @@ struct CoordinatorState {
     #[cfg(test)]
     fail_finish_snapshot_once: bool,
     pending_commits: usize,
+    #[cfg(test)]
+    pending_commits_registered: usize,
+    #[cfg(test)]
+    pending_commits_published: usize,
+    #[cfg(test)]
+    pending_commits_aborted: usize,
     gc_active: bool,
 }
 
@@ -64,6 +70,10 @@ impl MvccCoordinator {
     ) -> Result<PendingCommitRegistration> {
         let mut state = self.lock()?;
         state.pending_commits += 1;
+        #[cfg(test)]
+        {
+            state.pending_commits_registered += 1;
+        }
         Ok(PendingCommitRegistration {
             commit,
             state: Some(self.state.clone()),
@@ -102,6 +112,16 @@ impl MvccCoordinator {
     pub(crate) fn fail_finish_snapshot_once_for_test(&self) -> Result<()> {
         self.lock()?.fail_finish_snapshot_once = true;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_lifecycle_counts_for_test(&self) -> Result<(usize, usize, usize)> {
+        let state = self.lock()?;
+        Ok((
+            state.pending_commits_registered,
+            state.pending_commits_published,
+            state.pending_commits_aborted,
+        ))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CoordinatorState>> {
@@ -195,6 +215,10 @@ impl PendingCommitRegistration {
         self.commit.commit(timestamp)?;
         state.visible_timestamp = timestamp;
         state.pending_commits -= 1;
+        #[cfg(test)]
+        {
+            state.pending_commits_published += 1;
+        }
         drop(state);
         self.state = None;
         Ok(timestamp)
@@ -211,6 +235,10 @@ impl PendingCommitRegistration {
             .map_err(|_| crate::format_err!("MVCC coordinator lock is poisoned"))?;
         let result = self.commit.abort();
         state.pending_commits -= 1;
+        #[cfg(test)]
+        {
+            state.pending_commits_aborted += 1;
+        }
         drop(state);
         self.state = None;
         result
@@ -227,6 +255,10 @@ impl Drop for PendingCommitRegistration {
         };
         if matches!(self.commit.state(), CommitState::Pending) {
             let _ = self.commit.abort();
+            #[cfg(test)]
+            {
+                state.pending_commits_aborted += 1;
+            }
         }
         state.pending_commits -= 1;
     }

@@ -1,11 +1,13 @@
 use super::super::visibility::CommitTimestamp;
-use super::{CommitRecord, CommitState, MvccCoordinator, VersionChain};
+use super::{CommitRecord, CommitState, MvccCoordinator, PendingCommitRegistration, VersionChain};
 use crate::prelude::*;
 use crate::runtime::transaction::{
     GlobalSnapshot, GranuleId, ObjectId, ObjectPayload, TMEMORY_GRANULE_SIZE, TableGranuleSnapshot,
 };
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,9 +73,19 @@ struct MvccDomains {
 pub(crate) struct MvccRuntime {
     pub(super) coordinator: MvccCoordinator,
     domains: MvccDomains,
+    #[cfg(test)]
+    commit_hooks: Mutex<MvccCommitHooks>,
 }
 
 impl MvccRuntime {
+    pub(crate) fn begin_pending_commit(
+        &self,
+    ) -> Result<(Arc<CommitRecord>, PendingCommitRegistration)> {
+        let commit = Arc::new(CommitRecord::pending());
+        let pending = self.coordinator.register_pending_commit(commit.clone())?;
+        Ok((commit, pending))
+    }
+
     pub(crate) fn begin_prepare(&self, commit: Arc<CommitRecord>) -> Result<MvccPrepareGuard<'_>> {
         ensure!(
             matches!(commit.state(), CommitState::Pending),
@@ -87,6 +99,57 @@ impl MvccRuntime {
             baseline_commit,
             values: PreparedDomainValues::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_commit_hooks_for_test(
+        &self,
+        before_publish: Option<Arc<MvccCommitTestHook>>,
+        after_publish: Option<Arc<MvccCommitTestHook>>,
+        inside_install: Option<Arc<MvccCommitTestHook>>,
+    ) -> Result<()> {
+        *self
+            .commit_hooks
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))? =
+            MvccCommitHooks {
+                before_publish,
+                after_publish,
+                inside_install,
+            };
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_before_publish_hook_for_test(&self) -> Result<()> {
+        self.commit_hook_for_test(|hooks| hooks.before_publish.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_publish_hook_for_test(&self) -> Result<()> {
+        self.commit_hook_for_test(|hooks| hooks.after_publish.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_inside_install_hook_for_test(&self) -> Result<()> {
+        self.commit_hook_for_test(|hooks| hooks.inside_install.clone())
+    }
+
+    #[cfg(test)]
+    fn commit_hook_for_test(
+        &self,
+        select: impl FnOnce(&MvccCommitHooks) -> Option<Arc<MvccCommitTestHook>>,
+    ) -> Result<()> {
+        let hooks = self
+            .commit_hooks
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))?;
+        let hook = select(&hooks);
+        drop(hooks);
+        if let Some(hook) = hook {
+            hook.wait();
+        }
+        Ok(())
     }
 
     pub(crate) fn read_memory(
@@ -165,6 +228,49 @@ impl MvccRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn commit_lifecycle_counts_for_test(&self) -> Result<(usize, usize, usize)> {
+        self.coordinator.commit_lifecycle_counts_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn newest_commit_record_for_granule_for_test(
+        &self,
+        granule: GranuleId,
+    ) -> Result<Option<Arc<CommitRecord>>> {
+        let state = self.domains.lock()?;
+        let record = match granule {
+            GranuleId::TMemory { .. } => state
+                .memories
+                .chains
+                .get(&granule)
+                .and_then(VersionChain::newest_commit_record),
+            GranuleId::TMemorySize { .. } => state
+                .memory_sizes
+                .chains
+                .get(&granule)
+                .and_then(VersionChain::newest_commit_record),
+            GranuleId::TGlobal { .. } => state
+                .globals
+                .chains
+                .get(&granule)
+                .and_then(VersionChain::newest_commit_record),
+            GranuleId::TTable { .. } => state
+                .tables
+                .chains
+                .get(&granule)
+                .and_then(VersionChain::newest_commit_record),
+            GranuleId::TTableSize { .. } => state
+                .table_sizes
+                .chains
+                .get(&granule)
+                .and_then(VersionChain::newest_commit_record),
+            GranuleId::Object { .. } => None,
+        }
+        .cloned();
+        Ok(record)
+    }
+
+    #[cfg(test)]
     pub(crate) fn abort_prepared_object_promotions_for_test(
         &self,
         commit: &Arc<CommitRecord>,
@@ -230,6 +336,65 @@ impl MvccRuntime {
             .get(&object)
             .map(VersionChain::version_count)
             .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct MvccCommitHooks {
+    before_publish: Option<Arc<MvccCommitTestHook>>,
+    after_publish: Option<Arc<MvccCommitTestHook>>,
+    inside_install: Option<Arc<MvccCommitTestHook>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct MvccCommitTestHook {
+    expected: usize,
+    state: Mutex<MvccCommitTestHookState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct MvccCommitTestHookState {
+    reached: usize,
+    released: bool,
+}
+
+#[cfg(test)]
+impl MvccCommitTestHook {
+    pub(crate) fn new(participants: usize) -> Self {
+        Self {
+            expected: participants,
+            state: Mutex::new(MvccCommitTestHookState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.reached += 1;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    pub(crate) fn wait_until_reached(&self, timeout: std::time::Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        self.changed
+            .wait_timeout_while(state, timeout, |state| state.reached < self.expected)
+            .unwrap()
+            .0
+            .reached
+            >= self.expected
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
     }
 }
 
@@ -608,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_values_keep_six_domains_typed_and_share_one_commit_record() {
+    fn mvcc_commit_prepare_keeps_six_domains_typed_and_shares_one_record() {
         let runtime = MvccRuntime::default();
         let commit = Arc::new(CommitRecord::pending());
         let table_before =
@@ -947,6 +1112,131 @@ mod tests {
                 .read_memory(0, memory_granule(), || panic!("chain already exists"))
                 .unwrap(),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn mvcc_commit_prepare_mixed_domains_stay_invisible_until_one_publication() {
+        let runtime = MvccRuntime::default();
+        let (commit, pending) = runtime.begin_pending_commit().unwrap();
+        let table_before =
+            TableGranuleSnapshot::new(vec![TableElementSnapshot::FuncRef(5)]).unwrap();
+        let table_after =
+            TableGranuleSnapshot::new(vec![TableElementSnapshot::FuncRef(6)]).unwrap();
+        let mut prepare = runtime.begin_prepare(commit.clone()).unwrap();
+        prepare
+            .prepare_memory(memory_granule(), || Ok(vec![1]), vec![2])
+            .unwrap();
+        prepare
+            .prepare_global(
+                global_granule(),
+                || Ok(GlobalSnapshot::I32(3)),
+                GlobalSnapshot::I32(4),
+            )
+            .unwrap();
+        prepare
+            .prepare_table(
+                table_granule(),
+                || Ok(table_before.clone()),
+                table_after.clone(),
+            )
+            .unwrap();
+        prepare
+            .prepare_object(
+                object_id(),
+                || Ok(Some(object_payload(7))),
+                object_payload(8),
+            )
+            .unwrap();
+        drop(prepare);
+
+        let memory_record = runtime
+            .newest_commit_record_for_granule_for_test(memory_granule())
+            .unwrap()
+            .unwrap();
+        let global_record = runtime
+            .newest_commit_record_for_granule_for_test(global_granule())
+            .unwrap()
+            .unwrap();
+        let table_record = runtime
+            .newest_commit_record_for_granule_for_test(table_granule())
+            .unwrap()
+            .unwrap();
+        let object_record = runtime
+            .object_newest_commit_record_for_test(object_id())
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&commit, &memory_record));
+        assert!(Arc::ptr_eq(&memory_record, &global_record));
+        assert!(Arc::ptr_eq(&memory_record, &table_record));
+        assert!(Arc::ptr_eq(&memory_record, &object_record));
+
+        assert_eq!(
+            runtime
+                .read_memory(u64::MAX - 1, memory_granule(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            runtime
+                .read_global(u64::MAX - 1, global_granule(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            GlobalSnapshot::I32(3)
+        );
+        assert_eq!(
+            runtime
+                .read_table(u64::MAX - 1, table_granule(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            table_before
+        );
+        assert_eq!(
+            runtime
+                .read_object(u64::MAX - 1, object_id(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            Some(object_payload(7))
+        );
+
+        let timestamp = pending.publish().unwrap();
+
+        assert_eq!(
+            runtime
+                .read_memory(timestamp, memory_granule(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            vec![2]
+        );
+        assert_eq!(
+            runtime
+                .read_global(timestamp, global_granule(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            GlobalSnapshot::I32(4)
+        );
+        assert_eq!(
+            runtime
+                .read_table(timestamp, table_granule(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            table_after
+        );
+        assert_eq!(
+            runtime
+                .read_object(timestamp, object_id(), || {
+                    panic!("prepared chain must exist")
+                })
+                .unwrap(),
+            Some(object_payload(8))
         );
     }
 }

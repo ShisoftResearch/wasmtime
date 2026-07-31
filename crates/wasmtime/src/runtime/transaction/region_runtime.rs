@@ -8,6 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
+#[cfg(all(
+    test,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+use super::concurrency::CertificationMode;
 use super::concurrency::TransactionConflictAction;
 #[cfg(all(
     feature = "transaction-mvcc",
@@ -850,6 +856,28 @@ impl TransactionRegionRuntime {
             .lock_authority()?
             .concurrency
             .mvcc_certification_authority())
+    }
+
+    #[cfg(all(
+        test,
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn mvcc_certification_counts_for_test(&self) -> Result<(usize, usize)> {
+        self.mvcc_certification_authority()?
+            .lifecycle_counts_for_test()
+    }
+
+    #[cfg(all(
+        test,
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn mvcc_last_certification_for_test(
+        &self,
+    ) -> Result<Vec<(GranuleId, CertificationMode)>> {
+        self.mvcc_certification_authority()?
+            .last_reservations_for_test()
     }
 
     pub(crate) fn take_conflict_aborted_transaction(

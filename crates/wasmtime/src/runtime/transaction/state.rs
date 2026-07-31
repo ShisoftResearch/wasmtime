@@ -1,7 +1,11 @@
 use crate::runtime::transaction::concurrency::TransactionConflictAction;
+#[cfg(feature = "transaction-mvcc")]
+use alloc::sync::Arc;
 use wasmtime_environ::VMSharedTypeIndex;
 
 use super::object_table::default_type_layout_id_for_kind;
+#[cfg(feature = "transaction-mvcc")]
+use super::visibility::CommitTimestamp;
 use super::visibility::{
     SelectedTransactionVisibility, SelectedVisibilitySnapshot, TransactionVisibility,
     VisibilityReadContext,
@@ -699,6 +703,63 @@ impl TransactionState {
             visibility: visibility.clone(),
             snapshot: SelectedTransactionVisibility::snapshot_timestamp(snapshot),
         })
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn active_mvcc_commit_context(
+        &self,
+    ) -> Result<(
+        Arc<mvcc::MvccRuntime>,
+        CommitTimestamp,
+        TransactionId,
+        BTreeSet<GranuleId>,
+        BTreeSet<GranuleId>,
+    )> {
+        let transaction = self.active_transaction_required()?;
+        let context = self.active_visibility_read_context()?;
+        Ok((
+            context.visibility.runtime().clone(),
+            context.snapshot,
+            transaction,
+            self.read_granules.clone(),
+            self.write_granules.clone(),
+        ))
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn acquire_active_mvcc_certification(
+        &self,
+        runtime: &Arc<mvcc::MvccRuntime>,
+        snapshot: CommitTimestamp,
+        transaction: TransactionId,
+        reads: &BTreeSet<GranuleId>,
+        writes: &BTreeSet<GranuleId>,
+    ) -> Result<concurrency::MvccCertificationPermit> {
+        if let Some(region) = &self.shared_region_runtime {
+            return region.acquire_mvcc_certification(
+                transaction,
+                reads,
+                writes,
+                snapshot,
+                runtime,
+            );
+        }
+        let permit = self
+            .concurrency
+            .acquire_mvcc_certification(transaction, reads, writes)?;
+        for granule in reads.union(writes).copied() {
+            ensure!(
+                runtime.latest_committed_timestamp(granule)? <= snapshot,
+                "transaction MVCC certification conflict on {granule:?}"
+            );
+        }
+        Ok(permit)
     }
 
     fn visibility_for_new_workspace(&self) -> SelectedTransactionVisibility {
@@ -1483,6 +1544,30 @@ impl TransactionState {
         self.finish_commit_after_policy_hook(transaction)?;
         self.apply_committed_persistent_root_delta(delta)?;
         Ok(())
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn prepare_mvcc_commit_completion(
+        &mut self,
+        delta: PersistentRootDelta,
+    ) -> Result<()> {
+        self.begin_terminal_commit()?;
+        self.ensure_no_pending_conflict_aborted_allocated_objects()?;
+        self.retry_post_commit_linear_undo_retirement();
+        if self.shared_region_runtime.is_some() {
+            self.commit_shared_persistent_root_delta_before_complete_commit(delta)?;
+            self.bump_active_versioned_write_granules()?;
+        } else {
+            self.bump_active_versioned_write_granules()?;
+            self.apply_committed_persistent_root_delta(delta)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn finish_mvcc_commit_cleanup(&mut self) -> Result<()> {
+        let transaction = self.active_transaction_required()?;
+        self.finish_commit_after_policy_hook(transaction)
     }
 
     fn finish_commit_after_policy_hook(&mut self, transaction: TransactionId) -> Result<()> {
@@ -2823,6 +2908,30 @@ impl TransactionState {
             pending_publications.push(publication);
             Ok(())
         })
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn staged_object_payloads_for_commit(
+        &self,
+        object_table: &ObjectTable,
+    ) -> Result<Vec<(ObjectId, ObjectPayload)>> {
+        self.ensure_active()?;
+        self.staged_objects
+            .iter()
+            .filter_map(
+                |(&object, record)| match object_table.is_persistent(object) {
+                    Ok(true) => Some(Ok((object, record.payload().clone()))),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect()
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn object_is_newly_allocated_for_commit(&self, object: ObjectId) -> Result<bool> {
+        self.ensure_active()?;
+        Ok(self.allocated_objects.contains(&object))
     }
 
     pub(crate) fn staged_persistent_root_delta(
