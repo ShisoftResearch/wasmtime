@@ -172,3 +172,63 @@ step. `TMemoryDaxPmemBacking::ResearchTemp` is tested only within one runtime
 and against a newly constructed empty runtime; no claim is made that its bytes
 survive destruction. Hardware-required fsdax reopen tests remain unrun because
 the host was not explicitly configured for PMEM.
+
+## Review Hardening: Post-Hoc Mutation Sensitivity
+
+The following negative controls were performed after the original Task 13
+commit. They are mutation-sensitivity evidence, not chronological TDD evidence.
+Each mutation was applied with `apply_patch`, exercised with a focused command,
+and fully reverted before the review fix.
+
+The first mutation replaced restoration of the saved predecessor workspace with
+a new snapshot after value 22 had committed:
+
+```text
+cargo test -p wasmtime --no-default-features \
+  --features "anyhow,async,backtrace,cache,gc,gc-copying,gc-drc,gc-null,wat,profiling,parallel-compilation,cranelift,pooling-allocator,demangle,addr2line,coredump,debug-builtins,runtime,component-model,component-model-async,threads,stack-switching,std,debug,compile-time-builtins,wit-parser,transaction-mvcc,transaction-cc-optimistic-validation" \
+  mvcc_backend_vmemory_keeps_history_above_current_state_storage --lib -- --nocapture
+
+exit 101
+tests.rs:956: assertion `left == right` failed
+left: 22
+right: 11
+```
+
+This proves the backend fixture's predecessor assertion detects replacement of
+the saved timestamp-1 snapshot with the current timestamp-2 snapshot.
+
+The second mutation appended a synthetic committed tmemory data record with
+`publish_committed_tmemory_update` after dropping the old runtime and before
+recovery:
+
+```text
+cargo test -p wasmtime --no-default-features \
+  --features "anyhow,async,backtrace,cache,gc,gc-copying,gc-drc,gc-null,wat,profiling,parallel-compilation,cranelift,pooling-allocator,demangle,addr2line,coredump,debug-builtins,runtime,component-model,component-model-async,threads,stack-switching,std,debug,compile-time-builtins,wit-parser,transaction-mvcc,transaction-cc-optimistic-validation" \
+  --test transaction_persistence \
+  mvcc_file_backed_restart_recovers_latest_current_state_without_history_records \
+  -- --nocapture
+
+exit 101
+transaction_persistence.rs:1206:
+assertion failed: recovered.winners.is_empty()
+```
+
+This proves the restart test rejects a serialized durable current-data winner
+where the MVCC workload should expose no such recovery record.
+
+One additional temporary fault validated the reader cleanup path. The successor
+writer was forced to fail before LP, and a diagnostic marker was emitted only
+after `reader.join()` returned. The same focused integration command produced:
+
+```text
+NEGATIVE_CONTROL_READER_JOINED
+Error: transaction test failure before commit LP
+exit 101
+```
+
+There was no child panic. The fault and marker were then reverted. The final
+test now captures gate/writer/read, release, reader-outcome, and join results
+without propagating any error between spawn and join. It always attempts the
+release, collects the child outcome, and joins before propagating the primary
+writer or gate error. The child outcome send and release-gate lock handling no
+longer panic.

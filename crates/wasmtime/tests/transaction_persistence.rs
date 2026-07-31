@@ -1146,7 +1146,7 @@ fn mvcc_file_backed_restart_recovers_latest_current_state_without_history_record
                         .map_err(|_| wasmtime::Error::msg("reader gate receiver was dropped"))?;
                     release_rx
                         .lock()
-                        .unwrap()
+                        .map_err(|_| wasmtime::Error::msg("reader release gate was poisoned"))?
                         .recv_timeout(Duration::from_secs(5))
                         .map_err(|error| {
                             wasmtime::Error::msg(format!(
@@ -1160,35 +1160,45 @@ fn mvcc_file_backed_restart_recovers_latest_current_state_without_history_record
                     .get_typed_func::<(), (i32, i32)>(&mut store, "read-twice")?
                     .call(&mut store, ())
             })();
-            outcome_tx.send(outcome).unwrap();
+            outcome_tx.send(outcome)
         })
     };
 
-    reached_rx
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|error| {
-            wasmtime::Error::msg(format!(
-                "old MVCC snapshot did not reach its bounded gate: {error}"
-            ))
-        })?;
-    write.call(&mut writer_store, 22)?;
-    assert_eq!(read_current.call(&mut writer_store, ())?, 22);
-    release_tx
-        .send(())
-        .map_err(|_| wasmtime::Error::msg("old MVCC snapshot exited before release"))?;
-    assert_eq!(
-        outcome_rx
+    let writer_outcome = (|| -> Result<i32> {
+        reached_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|error| {
                 wasmtime::Error::msg(format!(
-                    "old MVCC snapshot did not finish after release: {error}"
+                    "old MVCC snapshot did not reach its bounded gate: {error}"
                 ))
-            })??,
-        (11, 11)
-    );
-    reader
+            })?;
+        write.call(&mut writer_store, 22)?;
+        read_current.call(&mut writer_store, ())
+    })();
+    let release_outcome = release_tx
+        .send(())
+        .map_err(|_| wasmtime::Error::msg("old MVCC snapshot exited before release"));
+    let reader_outcome = outcome_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            wasmtime::Error::msg(format!(
+                "old MVCC snapshot outcome was not collected during cleanup: {error}"
+            ))
+        });
+    let join_outcome = reader
         .join()
-        .map_err(|_| wasmtime::Error::msg("old MVCC snapshot thread panicked"))?;
+        .map_err(|_| wasmtime::Error::msg("old MVCC snapshot thread panicked"))
+        .and_then(|send_outcome| {
+            send_outcome
+                .map_err(|_| wasmtime::Error::msg("old MVCC snapshot outcome receiver was dropped"))
+        });
+
+    let current = writer_outcome?;
+    join_outcome?;
+    let reads = reader_outcome??;
+    release_outcome?;
+    assert_eq!(current, 22);
+    assert_eq!(reads, (11, 11));
 
     drop(read_current);
     drop(write);
