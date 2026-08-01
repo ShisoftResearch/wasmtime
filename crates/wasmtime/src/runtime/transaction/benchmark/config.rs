@@ -39,6 +39,8 @@ pub(super) struct BenchmarkRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct CellSpec {
     pub policy: String,
+    pub visibility_mode: String,
+    pub concurrency_control: String,
     pub compiled_features: Vec<String>,
     pub backend: BackendKind,
     pub workload: WorkloadKind,
@@ -62,7 +64,7 @@ pub(super) struct MatrixEntry {
 impl BenchmarkRequest {
     pub(super) fn quick(expected_policy: String) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             expected_policy,
             warmup_ms: 100,
             measure_ms: 500,
@@ -88,7 +90,7 @@ impl BenchmarkRequest {
 
     pub(super) fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema_version == 1,
+            self.schema_version == 2,
             "unsupported request schema version {}",
             self.schema_version
         );
@@ -131,11 +133,6 @@ impl BenchmarkRequest {
             self.expected_policy,
             compiled_policy_name()
         );
-        ensure!(
-            !cfg!(feature = "transaction-mvcc")
-                || cfg!(feature = "transaction-cc-optimistic-validation"),
-            "MVCC requires the optimistic validation compiled policy"
-        );
         Ok(())
     }
 
@@ -152,6 +149,8 @@ impl BenchmarkRequest {
                     for repetition in 0..self.repetitions {
                         let spec = CellSpec {
                             policy: compiled_policy_name().to_string(),
+                            visibility_mode: compiled_visibility_mode().to_string(),
+                            concurrency_control: compiled_concurrency_control_name().to_string(),
                             compiled_features: features.clone(),
                             backend,
                             workload,
@@ -184,10 +183,30 @@ fn has_duplicates<T: Eq>(items: &[T]) -> bool {
 }
 
 pub(super) fn compiled_policy_name() -> &'static str {
-    if cfg!(feature = "transaction-mvcc") {
-        return "mvcc-optimistic";
+    match (
+        cfg!(feature = "transaction-mvcc"),
+        ConcurrencyControl::default_for_build(),
+    ) {
+        (false, policy) => single_version_policy_name(policy),
+        (true, ConcurrencyControl::LockBased) => "mvcc-lockbased",
+        (true, ConcurrencyControl::NoWaitAbort) => "mvcc-no-wait",
+        (true, ConcurrencyControl::StrictTwoPhaseLocking) => "mvcc-strict-2pl",
+        (true, ConcurrencyControl::WoundWait) => "mvcc-wound-wait",
+        (true, ConcurrencyControl::WaitDie) => "mvcc-wait-die",
+        (true, ConcurrencyControl::OptimisticValidation) => "mvcc-optimistic",
+        (true, ConcurrencyControl::TimestampOrdering) => "mvcc-timestamp",
     }
+}
 
+pub(super) fn compiled_visibility_mode() -> &'static str {
+    if cfg!(feature = "transaction-mvcc") {
+        "mvcc"
+    } else {
+        "single-version"
+    }
+}
+
+pub(super) fn compiled_concurrency_control_name() -> &'static str {
     single_version_policy_name(ConcurrencyControl::default_for_build())
 }
 
@@ -204,61 +223,34 @@ fn single_version_policy_name(policy: ConcurrencyControl) -> &'static str {
 }
 
 pub(super) fn compiled_transaction_features() -> &'static [&'static str] {
-    #[cfg(feature = "transaction-mvcc")]
-    {
-        return &["transaction-mvcc", "transaction-cc-optimistic-validation"];
-    }
-
-    #[cfg(feature = "transaction-cc-lockbased")]
-    {
-        return &["transaction-cc-lockbased"];
-    }
-
-    #[cfg(feature = "transaction-cc-nowait-abort")]
-    {
-        return &["transaction-cc-nowait-abort"];
-    }
-
-    #[cfg(all(
-        not(feature = "transaction-mvcc"),
-        feature = "transaction-cc-optimistic-validation"
-    ))]
-    {
-        return &["transaction-cc-optimistic-validation"];
-    }
-
-    #[cfg(feature = "transaction-cc-strict-2pl")]
-    {
-        return &["transaction-cc-strict-2pl"];
-    }
-
-    #[cfg(feature = "transaction-cc-timestamp-ordering")]
-    {
-        return &["transaction-cc-timestamp-ordering"];
-    }
-
-    #[cfg(feature = "transaction-cc-wait-die")]
-    {
-        return &["transaction-cc-wait-die"];
-    }
-
-    #[cfg(feature = "transaction-cc-wound-wait")]
-    {
-        return &["transaction-cc-wound-wait"];
-    }
-
-    #[cfg(not(any(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-lockbased",
-        feature = "transaction-cc-nowait-abort",
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-strict-2pl",
-        feature = "transaction-cc-timestamp-ordering",
-        feature = "transaction-cc-wait-die",
-        feature = "transaction-cc-wound-wait"
-    )))]
-    {
-        &[]
+    match (
+        cfg!(feature = "transaction-mvcc"),
+        ConcurrencyControl::default_for_build(),
+    ) {
+        (false, ConcurrencyControl::LockBased) => &["transaction-cc-lockbased"],
+        (false, ConcurrencyControl::NoWaitAbort) => &["transaction-cc-nowait-abort"],
+        (false, ConcurrencyControl::StrictTwoPhaseLocking) => &["transaction-cc-strict-2pl"],
+        (false, ConcurrencyControl::WoundWait) => &["transaction-cc-wound-wait"],
+        (false, ConcurrencyControl::WaitDie) => &["transaction-cc-wait-die"],
+        (false, ConcurrencyControl::OptimisticValidation) => {
+            &["transaction-cc-optimistic-validation"]
+        }
+        (false, ConcurrencyControl::TimestampOrdering) => &["transaction-cc-timestamp-ordering"],
+        (true, ConcurrencyControl::LockBased) => &["transaction-mvcc", "transaction-cc-lockbased"],
+        (true, ConcurrencyControl::NoWaitAbort) => {
+            &["transaction-mvcc", "transaction-cc-nowait-abort"]
+        }
+        (true, ConcurrencyControl::StrictTwoPhaseLocking) => {
+            &["transaction-mvcc", "transaction-cc-strict-2pl"]
+        }
+        (true, ConcurrencyControl::WoundWait) => &["transaction-mvcc", "transaction-cc-wound-wait"],
+        (true, ConcurrencyControl::WaitDie) => &["transaction-mvcc", "transaction-cc-wait-die"],
+        (true, ConcurrencyControl::OptimisticValidation) => {
+            &["transaction-mvcc", "transaction-cc-optimistic-validation"]
+        }
+        (true, ConcurrencyControl::TimestampOrdering) => {
+            &["transaction-mvcc", "transaction-cc-timestamp-ordering"]
+        }
     }
 }
 

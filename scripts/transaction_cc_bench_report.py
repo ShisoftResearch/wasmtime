@@ -13,7 +13,7 @@ import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BACKENDS = ("vmemory", "file-backed")
 WORKLOADS = ("read-only", "disjoint-writes", "hot-key", "write-skew")
@@ -23,7 +23,7 @@ U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
 USIZE_MAX = (1 << (8 * struct.calcsize("P"))) - 1
 MAX_PHASE_MS = 24 * 60 * 60 * 1000
-POLICY_FEATURES = {
+BASE_POLICY_FEATURES = {
     "lockbased": ("transaction-cc-lockbased",),
     "no-wait": ("transaction-cc-nowait-abort",),
     "optimistic": ("transaction-cc-optimistic-validation",),
@@ -31,10 +31,13 @@ POLICY_FEATURES = {
     "timestamp": ("transaction-cc-timestamp-ordering",),
     "wait-die": ("transaction-cc-wait-die",),
     "wound-wait": ("transaction-cc-wound-wait",),
-    "mvcc-optimistic": (
-        "transaction-mvcc",
-        "transaction-cc-optimistic-validation",
-    ),
+}
+POLICY_FEATURES = {
+    **BASE_POLICY_FEATURES,
+    **{
+        f"mvcc-{policy}": ("transaction-mvcc", *features)
+        for policy, features in BASE_POLICY_FEATURES.items()
+    },
 }
 
 CellKey = tuple[str, str, str, int, int, int]
@@ -59,6 +62,8 @@ CSV_COLUMNS = (
     "record_kind",
     "status",
     "policy",
+    "visibility_mode",
+    "concurrency_control",
     "compiled_features",
     "backend",
     "workload",
@@ -169,6 +174,13 @@ def _features(policy: str) -> tuple[str, ...]:
         raise ValueError(f"unknown requested policy {policy!r}") from error
 
 
+def _policy_identity(policy: str) -> tuple[str, str]:
+    _features(policy)
+    if policy.startswith("mvcc-"):
+        return "mvcc", policy.removeprefix("mvcc-")
+    return "single-version", policy
+
+
 def _validate_features(value: Any, policy: str, context: str) -> None:
     expected = _features(policy)
     if not isinstance(value, list) or tuple(value) != expected:
@@ -176,6 +188,21 @@ def _validate_features(value: Any, policy: str, context: str) -> None:
             f"{context}: compiled transaction features {value!r} do not match "
             f"policy {policy!r}: {list(expected)!r}"
         )
+
+
+def _validate_identity(value: Mapping[str, Any], policy: str, context: str) -> None:
+    expected_visibility, expected_cc = _policy_identity(policy)
+    if value.get("visibility_mode") != expected_visibility:
+        raise ValueError(
+            f"{context}: visibility_mode {value.get('visibility_mode')!r} does not "
+            f"match policy {policy!r}: {expected_visibility!r}"
+        )
+    if value.get("concurrency_control") != expected_cc:
+        raise ValueError(
+            f"{context}: concurrency_control {value.get('concurrency_control')!r} "
+            f"does not match policy {policy!r}: {expected_cc!r}"
+        )
+    _validate_features(value.get("compiled_features"), policy, context)
 
 
 def _nonnegative_integer(
@@ -328,7 +355,7 @@ def _cell_key(spec: Any, context: str) -> CellKey:
         raise ValueError(f"{context}.backend is not a Rust backend: {backend!r}")
     if workload not in WORKLOADS:
         raise ValueError(f"{context}.workload is not a Rust workload: {workload!r}")
-    _validate_features(spec.get("compiled_features"), policy, context)
+    _validate_identity(spec, policy, context)
     return policy, backend, workload, workers, repetition, seed
 
 
@@ -349,6 +376,12 @@ def _load_orchestrator(
     policies = tuple(policies_value)
     for policy in policies:
         _features(policy)
+        visibility, concurrency_control = _policy_identity(policy)
+        if visibility == "mvcc" and concurrency_control not in policies:
+            raise ValueError(
+                f"MVCC policy {policy!r} requires matching single-version baseline "
+                f"{concurrency_control!r}"
+            )
     completed = [
         record.get("policy")
         for record in records
@@ -524,7 +557,7 @@ def _load_run(run_dir: Path, *, lifecycle: str) -> RunData:
         driver = drivers[0]
         if driver.get("compiled_policy") != policy:
             raise ValueError(f"{path}: compiled policy does not match requested policy")
-        _validate_features(driver.get("compiled_features"), policy, f"{path} driver")
+        _validate_identity(driver, policy, f"{path} driver")
         available = _nonnegative_integer(
             driver.get("available_parallelism"),
             f"{path} available_parallelism",
@@ -537,6 +570,16 @@ def _load_run(run_dir: Path, *, lifecycle: str) -> RunData:
             raise ValueError(
                 f"{path}: driver GC policy mode is outside the Rust domain: "
                 f"{gc_policy_mode!r}"
+            )
+        expected_gc_policy_mode = (
+            "mvcc-compliant"
+            if driver["visibility_mode"] == "mvcc"
+            else "current-state-only"
+        )
+        if gc_policy_mode != expected_gc_policy_mode:
+            raise ValueError(
+                f"{path}: driver GC policy mode {gc_policy_mode!r} does not match "
+                f"visibility mode {driver['visibility_mode']!r}"
             )
 
         policy_cells: list[Mapping[str, Any]] = []
@@ -570,7 +613,7 @@ def _load_run(run_dir: Path, *, lifecycle: str) -> RunData:
             elif record_type == "tfunc_control":
                 if record.get("policy") != policy:
                     raise ValueError(f"{context}: control policy does not match raw stream")
-                _validate_features(record.get("compiled_features"), policy, context)
+                _validate_identity(record, policy, context)
                 backend = record.get("backend")
                 control = record.get("control")
                 repetition = record.get("repetition")
@@ -744,6 +787,8 @@ def _csv_rows(data: RunData) -> Iterable[dict[str, Any]]:
                     "record_kind": "cell",
                     "status": "completed" if record_type == "cell" else "skipped",
                     "policy": spec["policy"],
+                    "visibility_mode": spec["visibility_mode"],
+                    "concurrency_control": spec["concurrency_control"],
                     "compiled_features": ",".join(spec["compiled_features"]),
                     "backend": spec["backend"],
                     "workload": spec["workload"],
@@ -764,6 +809,8 @@ def _csv_rows(data: RunData) -> Iterable[dict[str, Any]]:
                     "record_kind": "tfunc_control",
                     "status": "control",
                     "policy": record["policy"],
+                    "visibility_mode": record["visibility_mode"],
+                    "concurrency_control": record["concurrency_control"],
                     "compiled_features": ",".join(record["compiled_features"]),
                     "backend": record["backend"],
                     "control": record["control"],
@@ -921,20 +968,30 @@ def write_markdown(data: RunData, path: Path) -> None:
         )
     )
 
-    optimistic = {
-        _cell_identity(record, without="policy"): record for record in data.cells
-        if record["spec"]["policy"] == "optimistic"
+    single_version = {
+        (
+            record["spec"]["concurrency_control"],
+            *_cell_identity(record, without="policy"),
+        ): record
+        for record in data.cells
+        if record["spec"]["visibility_mode"] == "single-version"
     }
     mvcc_rows = []
     for record in data.cells:
-        if record["spec"]["policy"] != "mvcc-optimistic":
-            continue
-        baseline = optimistic.get(_cell_identity(record, without="policy"))
-        if baseline is None:
+        if record["spec"]["visibility_mode"] != "mvcc":
             continue
         spec = record["spec"]
+        baseline = single_version.get(
+            (
+                spec["concurrency_control"],
+                *_cell_identity(record, without="policy"),
+            )
+        )
+        if baseline is None:
+            continue
         mvcc_rows.append(
             (
+                spec["concurrency_control"],
                 spec["backend"],
                 spec["workload"],
                 spec["workers"],
@@ -948,14 +1005,15 @@ def write_markdown(data: RunData, path: Path) -> None:
         )
     lines.extend(
         _comparison_table(
-            "MVCC versus OCC",
+            "MVCC versus matching single-version CC",
             (
+                "concurrency control",
                 "backend",
                 "workload",
                 "workers",
                 "repetition",
                 "seed",
-                "MVCC/OCC commits/s",
+                "MVCC/single-version commits/s",
             ),
             mvcc_rows,
         )

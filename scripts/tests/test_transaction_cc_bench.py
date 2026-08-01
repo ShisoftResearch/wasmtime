@@ -18,21 +18,23 @@ SPEC.loader.exec_module(bench)
 
 
 class TransactionCcBenchTests(unittest.TestCase):
-    def test_mvcc_command_has_exactly_optimistic_and_mvcc(self):
-        cmd = bench.build_command(
-            "mvcc-optimistic", Path("request.json"), Path("out.jsonl")
-        )
-        features = cmd[cmd.index("--features") + 1].split(",")
+    def test_mvcc_commands_pair_mvcc_with_exactly_one_selected_cc(self):
+        for policy, cc_feature in bench.BASE_POLICIES.items():
+            with self.subTest(policy=policy):
+                command = bench.build_command(
+                    f"mvcc-{policy}", Path("request.json"), Path("out.jsonl")
+                )
+                features = command[command.index("--features") + 1].split(",")
 
-        self.assertIn("transaction-mvcc", features)
-        self.assertIn("transaction-cc-optimistic-validation", features)
-        self.assertEqual(
-            1, len([f for f in features if f.startswith("transaction-cc-")])
-        )
+                self.assertIn("transaction-mvcc", features)
+                self.assertIn(cc_feature, features)
+                self.assertEqual(
+                    1, len([f for f in features if f.startswith("transaction-cc-")])
+                )
 
     def test_single_version_commands_have_one_cc_and_no_mvcc(self):
         for policy in bench.POLICIES:
-            if policy == "mvcc-optimistic":
+            if policy.startswith("mvcc-"):
                 continue
             with self.subTest(policy=policy):
                 features = bench.features_for(policy)
@@ -43,22 +45,30 @@ class TransactionCcBenchTests(unittest.TestCase):
                 )
 
     def test_policy_mapping_and_complete_feature_closure_are_exact(self):
-        self.assertEqual(
-            {
-                "lockbased": ["transaction-cc-lockbased"],
-                "no-wait": ["transaction-cc-nowait-abort"],
-                "optimistic": ["transaction-cc-optimistic-validation"],
-                "strict-2pl": ["transaction-cc-strict-2pl"],
-                "timestamp": ["transaction-cc-timestamp-ordering"],
-                "wait-die": ["transaction-cc-wait-die"],
-                "wound-wait": ["transaction-cc-wound-wait"],
-                "mvcc-optimistic": [
-                    "transaction-mvcc",
-                    "transaction-cc-optimistic-validation",
-                ],
+        expected_base = {
+            "lockbased": ["transaction-cc-lockbased"],
+            "no-wait": ["transaction-cc-nowait-abort"],
+            "optimistic": ["transaction-cc-optimistic-validation"],
+            "strict-2pl": ["transaction-cc-strict-2pl"],
+            "timestamp": ["transaction-cc-timestamp-ordering"],
+            "wait-die": ["transaction-cc-wait-die"],
+            "wound-wait": ["transaction-cc-wound-wait"],
+        }
+        expected = {
+            **expected_base,
+            **{
+                f"mvcc-{policy}": ["transaction-mvcc", *features]
+                for policy, features in expected_base.items()
             },
-            bench.POLICIES,
+        }
+        self.assertEqual(
+            expected_base,
+            {
+                policy: [feature] for policy, feature in bench.BASE_POLICIES.items()
+            },
         )
+        self.assertEqual(expected, bench.POLICIES)
+        self.assertEqual(14, len(bench.POLICIES))
         self.assertEqual(
             (
                 "anyhow",
@@ -145,7 +155,7 @@ class TransactionCcBenchTests(unittest.TestCase):
 
         self.assertEqual(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "expected_policy": "lockbased",
                 "warmup_ms": 7,
                 "measure_ms": 11,

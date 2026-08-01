@@ -429,6 +429,8 @@ mod tests {
     fn spec(workload: WorkloadKind, workers: usize) -> CellSpec {
         CellSpec {
             policy: "test".to_string(),
+            visibility_mode: "test".to_string(),
+            concurrency_control: "test".to_string(),
             compiled_features: Vec::new(),
             backend: BackendKind::Vmemory,
             workload,

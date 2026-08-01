@@ -7,8 +7,8 @@ mod tfunc;
 mod workload;
 
 use self::config::{
-    BenchmarkRequest, CellSpec, MatrixDisposition, compiled_policy_name,
-    compiled_transaction_features,
+    BenchmarkRequest, CellSpec, MatrixDisposition, compiled_concurrency_control_name,
+    compiled_policy_name, compiled_transaction_features, compiled_visibility_mode,
 };
 use self::record::{
     BenchmarkRecord, CellRecord, CompleteRecord, DriverRecord, FailureRecord, JsonlWriter,
@@ -44,6 +44,8 @@ fn run_driver_with_cell_runner(
     writer.write(&BenchmarkRecord::Driver(DriverRecord {
         schema_version: SCHEMA_VERSION,
         compiled_policy: compiled_policy_name().into(),
+        visibility_mode: compiled_visibility_mode().into(),
+        concurrency_control: compiled_concurrency_control_name().into(),
         compiled_features,
         available_parallelism,
         gc_policy_mode: gc_policy_mode.into(),
@@ -156,7 +158,7 @@ mod tests {
         let request_path = directory.path().join("request.json");
         let output_path = directory.path().join("output.jsonl");
         let request = BenchmarkRequest {
-            schema_version: 1,
+            schema_version: 2,
             expected_policy: compiled_policy_name().into(),
             warmup_ms: 1,
             measure_ms: 5,
@@ -191,6 +193,19 @@ mod tests {
             ]
         );
         assert_eq!(records[0]["compiled_policy"], compiled_policy_name());
+        assert_eq!(records[0]["visibility_mode"], compiled_visibility_mode());
+        assert_eq!(
+            records[0]["concurrency_control"],
+            compiled_concurrency_control_name()
+        );
+        assert_eq!(
+            records[1]["spec"]["visibility_mode"],
+            compiled_visibility_mode()
+        );
+        assert_eq!(
+            records[2]["concurrency_control"],
+            compiled_concurrency_control_name()
+        );
         assert_eq!(
             records[0]["gc_policy_mode"], records[1]["metrics"]["gc"]["policy_mode"],
             "driver GC mode must match the selected pluggable collector"

@@ -1,5 +1,6 @@
 use super::config::{
-    BackendKind, CellSpec, WorkloadKind, compiled_policy_name, compiled_transaction_features,
+    BackendKind, CellSpec, WorkloadKind, compiled_concurrency_control_name, compiled_policy_name,
+    compiled_transaction_features, compiled_visibility_mode,
 };
 use super::metrics::CellMetrics;
 use super::*;
@@ -8,7 +9,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-pub(super) const SCHEMA_VERSION: u32 = 1;
+pub(super) const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
@@ -25,6 +26,8 @@ pub(super) enum BenchmarkRecord {
 pub(super) struct DriverRecord {
     pub schema_version: u32,
     pub compiled_policy: String,
+    pub visibility_mode: String,
+    pub concurrency_control: String,
     pub compiled_features: Vec<String>,
     pub available_parallelism: usize,
     pub gc_policy_mode: String,
@@ -41,6 +44,8 @@ pub(super) struct CellRecord {
 pub(super) struct TfuncControlRecord {
     pub schema_version: u32,
     pub policy: String,
+    pub visibility_mode: String,
+    pub concurrency_control: String,
     pub compiled_features: Vec<String>,
     pub backend: BackendKind,
     pub control: String,
@@ -99,6 +104,8 @@ fn jsonl_round_trip_preserves_skipped_cell_identity() {
     let path = directory.path().join("benchmark.jsonl");
     let spec = CellSpec {
         policy: compiled_policy_name().into(),
+        visibility_mode: compiled_visibility_mode().into(),
+        concurrency_control: compiled_concurrency_control_name().into(),
         compiled_features: compiled_transaction_features()
             .iter()
             .map(|feature| (*feature).into())
@@ -122,8 +129,13 @@ fn jsonl_round_trip_preserves_skipped_cell_identity() {
     let contents = std::fs::read_to_string(path).unwrap();
     let value: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
     assert_eq!(value["record_type"], "skipped_cell");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["spec"]["policy"], spec.policy);
+    assert_eq!(value["spec"]["visibility_mode"], spec.visibility_mode);
+    assert_eq!(
+        value["spec"]["concurrency_control"],
+        spec.concurrency_control
+    );
     assert_eq!(
         value["spec"]["compiled_features"],
         serde_json::to_value(&spec.compiled_features).unwrap()

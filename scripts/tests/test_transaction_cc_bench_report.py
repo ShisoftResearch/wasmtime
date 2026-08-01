@@ -25,6 +25,11 @@ FEATURES = {
     ],
 }
 
+IDENTITY = {
+    "optimistic": ("single-version", "optimistic"),
+    "mvcc-optimistic": ("mvcc", "optimistic"),
+}
+
 
 def metrics(multiplier=1):
     commits = 100 * multiplier
@@ -85,7 +90,7 @@ def make_run(directory):
     run_dir = Path(directory)
     policies = ["optimistic", "mvcc-optimistic"]
     invocation = {
-        "schema_version": 1,
+        "schema_version": 2,
         "git_revision": "0123456789abcdef" * 2 + "01234567",
         "git_short_revision": "0123456789ab",
         "dirty": True,
@@ -116,7 +121,7 @@ def make_run(directory):
         [
             {
                 "record_type": "orchestrator_start",
-                "schema_version": 1,
+                "schema_version": 2,
                 "started_utc": invocation["start_utc"],
                 "policies": policies,
                 "backends": ["vmemory", "file-backed"],
@@ -126,14 +131,14 @@ def make_run(directory):
             *[
                 {
                     "record_type": "policy_complete",
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "policy": policy,
                 }
                 for policy in policies
             ],
             {
                 "record_type": "complete",
-                "schema_version": 1,
+                "schema_version": 2,
                 "completed_policies": 2,
                 "ended_utc": invocation["end_utc"],
             },
@@ -145,7 +150,7 @@ def make_run(directory):
             "mvcc-compliant" if policy == "mvcc-optimistic" else "current-state-only"
         )
         request = {
-            "schema_version": 1,
+            "schema_version": 2,
             "expected_policy": policy,
             "warmup_ms": 100,
             "measure_ms": 500,
@@ -161,9 +166,11 @@ def make_run(directory):
         records = [
             {
                 "record_type": "driver",
-                "schema_version": 1,
+                "schema_version": 2,
                 "compiled_policy": policy,
                 "compiled_features": FEATURES[policy],
+                "visibility_mode": IDENTITY[policy][0],
+                "concurrency_control": IDENTITY[policy][1],
                 "available_parallelism": 2,
                 "gc_policy_mode": policy_mode,
             }
@@ -173,6 +180,8 @@ def make_run(directory):
                 spec = {
                     "policy": policy,
                     "compiled_features": FEATURES[policy],
+                    "visibility_mode": IDENTITY[policy][0],
+                    "concurrency_control": IDENTITY[policy][1],
                     "backend": backend,
                     "workload": "hot-key",
                     "workers": workers,
@@ -183,7 +192,7 @@ def make_run(directory):
                     records.append(
                         {
                             "record_type": "skipped_cell",
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "spec": spec,
                             "reason": "worker count 4 exceeds available parallelism 2",
                         }
@@ -194,7 +203,7 @@ def make_run(directory):
                     records.append(
                         {
                             "record_type": "cell",
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "spec": spec,
                             "metrics": cell_metrics,
                         }
@@ -206,9 +215,11 @@ def make_run(directory):
                 records.append(
                     {
                         "record_type": "tfunc_control",
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "policy": policy,
                         "compiled_features": FEATURES[policy],
+                        "visibility_mode": IDENTITY[policy][0],
+                        "concurrency_control": IDENTITY[policy][1],
                         "backend": backend,
                         "control": control,
                         "repetition": 0,
@@ -219,7 +230,7 @@ def make_run(directory):
         records.append(
             {
                 "record_type": "complete",
-                "schema_version": 1,
+                "schema_version": 2,
                 "policy": policy,
                 "completed_cells": 4,
                 "skipped_cells": 2,
@@ -241,6 +252,37 @@ class TransactionCcBenchReportTests(unittest.TestCase):
             write_jsonl(raw, records)
 
             with self.assertRaisesRegex(ValueError, "duplicate cell identity"):
+                report.load_complete_run(run_dir)
+
+    def test_inconsistent_visibility_cc_and_features_are_rejected(self):
+        mutations = (
+            ("visibility_mode", "single-version", "visibility_mode"),
+            ("concurrency_control", "lockbased", "concurrency_control"),
+            ("compiled_features", ["transaction-cc-optimistic-validation"], "features"),
+        )
+        for field, value, message in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                run_dir = make_run(directory)
+                raw = run_dir / "raw" / "mvcc-optimistic.jsonl"
+                records = [json.loads(line) for line in raw.read_text().splitlines()]
+                records[0][field] = value
+                write_jsonl(raw, records)
+
+                with self.assertRaisesRegex(ValueError, message):
+                    report.load_complete_run(run_dir)
+
+    def test_mvcc_policy_requires_matching_single_version_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            start_path = run_dir / "orchestrator.jsonl"
+            records = [json.loads(line) for line in start_path.read_text().splitlines()]
+            records[0]["policies"] = ["mvcc-optimistic"]
+            records = [records[0], records[2], records[-1]]
+            records[-1]["completed_policies"] = 1
+            write_jsonl(start_path, records)
+            (run_dir / "raw" / "optimistic.jsonl").unlink()
+
+            with self.assertRaisesRegex(ValueError, "matching single-version baseline"):
                 report.load_complete_run(run_dir)
 
     def test_missing_complete_footer_is_rejected(self):
@@ -273,7 +315,7 @@ class TransactionCcBenchReportTests(unittest.TestCase):
             run_dir = make_run(directory)
             raw = run_dir / "raw" / "mvcc-optimistic.jsonl"
             records = [json.loads(line) for line in raw.read_text().splitlines()]
-            records[2]["schema_version"] = 2
+            records[2]["schema_version"] = 1
             write_jsonl(raw, records)
 
             with self.assertRaisesRegex(ValueError, "schema_version"):
@@ -403,6 +445,11 @@ class TransactionCcBenchReportTests(unittest.TestCase):
                 [row["policy"] for row in rows[:3]],
             )
             self.assertEqual(
+                ["single-version", "single-version", "single-version"],
+                [row["visibility_mode"] for row in rows[:3]],
+            )
+            self.assertEqual("optimistic", rows[0]["concurrency_control"])
+            self.assertEqual(
                 8,
                 sum(row["status"] == "completed" for row in rows),
             )
@@ -415,7 +462,7 @@ class TransactionCcBenchReportTests(unittest.TestCase):
             for text in (
                 "optimistic",
                 "mvcc-optimistic",
-                "MVCC versus OCC",
+                "MVCC versus matching single-version CC",
                 "Backend delta",
                 "Scaling",
                 "Abort and retry",

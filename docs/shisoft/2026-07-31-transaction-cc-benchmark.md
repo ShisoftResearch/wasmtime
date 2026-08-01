@@ -52,7 +52,8 @@ accept other paths for tests and explicitly managed archived data.
 
 ## Matrix
 
-The exact policy names are:
+The fourteen exact build names are the seven concurrency controls with MVCC
+disabled:
 
 - `lockbased`
 - `no-wait`
@@ -61,13 +62,22 @@ The exact policy names are:
 - `timestamp`
 - `wait-die`
 - `wound-wait`
-- `mvcc-optimistic`
 
-The first seven are single-version builds. `mvcc-optimistic` is the only MVCC
-build and combines `transaction-mvcc` with optimistic validation. Each Cargo
-invocation selects exactly one transaction concurrency-control feature; the
-orchestrator validates the mapping before invoking Cargo, and the reporter
-validates it again from the Rust driver's records.
+and the same seven with MVCC enabled:
+
+- `mvcc-lockbased`
+- `mvcc-no-wait`
+- `mvcc-optimistic`
+- `mvcc-strict-2pl`
+- `mvcc-timestamp`
+- `mvcc-wait-die`
+- `mvcc-wound-wait`
+
+Each Cargo invocation independently selects zero or one `transaction-mvcc`
+feature and exactly one transaction concurrency-control feature. Backend
+selection remains a runtime axis. The driver records `visibility_mode` and
+`concurrency_control` separately from the composed policy name, and the
+reporter validates all three identities against the exact feature list.
 
 The runtime-selectable backend names are `vmemory` and `file-backed`. DAX is
 deliberately excluded from the default suite because its setup and host
@@ -121,10 +131,12 @@ results.csv                stable cell, skip, and control rows
 summary.md                 comparisons derived from validated JSONL
 ```
 
-The current schema version is 1. Raw JSONL is authoritative. Reporting rejects
+The current schema version is 2. Raw JSONL is authoritative. Reporting rejects
 unknown or mixed schemas, failed or incomplete streams, policy/feature
-mismatches, invalid attempt identities, duplicate identities, missing matrix
-cells, implicit unsupported-worker omissions, and footer count mismatches.
+mismatches, visibility/concurrency-control mismatches, missing matching
+single-version baselines for requested MVCC policies, invalid attempt
+identities, duplicate identities, missing matrix cells, implicit
+unsupported-worker omissions, and footer count mismatches.
 It also requires every requested `tfunc` control and the exact closed Rust
 domains for backend, workload, GC mode, integer widths, and phase duration.
 Unavailable latency percentiles are empty in CSV and shown as `n/a` in
@@ -139,7 +151,8 @@ orchestrator footer. That terminal elapsed value is frozen once and rendered
 into Markdown once; the final metadata render is not recursively added to the
 duration it displays.
 
-The Markdown report includes core scaling, MVCC-versus-OCC throughput,
+The Markdown report includes core scaling, MVCC-versus-matching-single-version
+throughput for every selected concurrency control,
 file-backed-versus-vmemory throughput, abort and retry behavior, GC and version
 statistics, `tfunc` controls, explicit skips, aggregate counts, and actual
 elapsed time. Ratios only appear when both matching measurements exist and the

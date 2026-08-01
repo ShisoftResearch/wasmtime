@@ -1460,8 +1460,8 @@ fn version_metrics_between(
 mod tests {
     use super::*;
     use crate::runtime::transaction::benchmark::config::{
-        BackendKind, BenchmarkRequest, CellSpec, WorkloadKind, compiled_policy_name,
-        compiled_transaction_features,
+        BackendKind, BenchmarkRequest, CellSpec, WorkloadKind, compiled_concurrency_control_name,
+        compiled_policy_name, compiled_transaction_features, compiled_visibility_mode,
     };
     use crate::runtime::transaction::benchmark::workload::DeterministicRng;
     use std::string::ToString;
@@ -1472,7 +1472,7 @@ mod tests {
 
     fn request(gc_commit_interval: u64) -> BenchmarkRequest {
         BenchmarkRequest {
-            schema_version: 1,
+            schema_version: 2,
             expected_policy: compiled_policy_name().to_string(),
             warmup_ms: 5,
             measure_ms: 20,
@@ -1489,6 +1489,8 @@ mod tests {
     fn spec(workload: WorkloadKind, workers: usize) -> CellSpec {
         CellSpec {
             policy: compiled_policy_name().to_string(),
+            visibility_mode: compiled_visibility_mode().to_string(),
+            concurrency_control: compiled_concurrency_control_name().to_string(),
             compiled_features: compiled_transaction_features()
                 .iter()
                 .map(|feature| (*feature).to_string())

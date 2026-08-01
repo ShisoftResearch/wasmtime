@@ -22155,7 +22155,7 @@ fn two_stores_conflict_on_same_persistent_object_write_with_older_requester() ->
         assert!(owner_state.owns_object_write(object));
         owner_state.abort()?;
         assert_eq!(current_thread_transaction_for_test(), None);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(all(
@@ -22184,10 +22184,8 @@ fn two_stores_conflict_on_same_persistent_object_write_with_older_requester() ->
         assert!(requester_state.owns_object_write(object));
         requester_state.abort()?;
         assert_eq!(current_thread_transaction_for_test(), None);
-        return Ok(());
+        Ok(())
     }
-
-    unreachable!("test requires wait-die or wound-wait concurrency control");
 }
 
 #[test]

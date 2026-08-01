@@ -1,5 +1,6 @@
 use super::config::{
-    BackendKind, BenchmarkRequest, compiled_policy_name, compiled_transaction_features,
+    BackendKind, BenchmarkRequest, compiled_concurrency_control_name, compiled_policy_name,
+    compiled_transaction_features, compiled_visibility_mode,
 };
 use super::metrics::{CellAggregateInput, CellMetrics, GcMetrics, VersionMetrics, WorkerMetrics};
 use super::record::{SCHEMA_VERSION, TfuncControlRecord};
@@ -235,6 +236,8 @@ fn control_record(
     TfuncControlRecord {
         schema_version: SCHEMA_VERSION,
         policy: compiled_policy_name().into(),
+        visibility_mode: compiled_visibility_mode().into(),
+        concurrency_control: compiled_concurrency_control_name().into(),
         compiled_features: compiled_transaction_features()
             .iter()
             .map(|feature| (*feature).into())

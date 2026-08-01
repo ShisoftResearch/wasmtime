@@ -21,7 +21,7 @@ except ModuleNotFoundError:
     import transaction_cc_bench_report as reporter
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 BASE_FEATURES = (
@@ -53,18 +53,22 @@ BASE_FEATURES = (
     "wit-parser",
 )
 
+BASE_POLICIES = {
+    "lockbased": "transaction-cc-lockbased",
+    "no-wait": "transaction-cc-nowait-abort",
+    "optimistic": "transaction-cc-optimistic-validation",
+    "strict-2pl": "transaction-cc-strict-2pl",
+    "timestamp": "transaction-cc-timestamp-ordering",
+    "wait-die": "transaction-cc-wait-die",
+    "wound-wait": "transaction-cc-wound-wait",
+}
+
 POLICIES = {
-    "lockbased": ["transaction-cc-lockbased"],
-    "no-wait": ["transaction-cc-nowait-abort"],
-    "optimistic": ["transaction-cc-optimistic-validation"],
-    "strict-2pl": ["transaction-cc-strict-2pl"],
-    "timestamp": ["transaction-cc-timestamp-ordering"],
-    "wait-die": ["transaction-cc-wait-die"],
-    "wound-wait": ["transaction-cc-wound-wait"],
-    "mvcc-optimistic": [
-        "transaction-mvcc",
-        "transaction-cc-optimistic-validation",
-    ],
+    **{policy: [feature] for policy, feature in BASE_POLICIES.items()},
+    **{
+        f"mvcc-{policy}": ["transaction-mvcc", feature]
+        for policy, feature in BASE_POLICIES.items()
+    },
 }
 
 BACKENDS = ("vmemory", "file-backed")
@@ -104,7 +108,7 @@ def features_for(policy: str) -> list[str]:
     cc_features = [feature for feature in features if feature.startswith("transaction-cc-")]
     if len(cc_features) != 1:
         raise AssertionError(f"policy {policy!r} selected {len(cc_features)} CC features")
-    if policy == "mvcc-optimistic":
+    if policy.startswith("mvcc-"):
         if "transaction-mvcc" not in features:
             raise AssertionError("MVCC policy omitted transaction-mvcc")
     elif "transaction-mvcc" in features:
