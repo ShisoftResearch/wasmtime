@@ -268,10 +268,16 @@ impl BenchmarkStorage {
     }
 
     pub(super) fn validate_lifecycle(&self) -> Result<()> {
-        #[cfg(all(
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        ))]
+        #[cfg(feature = "transaction-cc-optimistic-validation")]
+        {
+            let (acquired, active_permits) =
+                self.runtime.optimistic_certification_counts_for_test()?;
+            ensure!(
+                active_permits == 0,
+                "benchmark leaked lifecycle resources (active certification permits: {active_permits}; acquired certification permits: {acquired})"
+            );
+        }
+        #[cfg(feature = "transaction-mvcc")]
         {
             let (active, begun, finished, dropped) = self
                 .runtime
@@ -284,10 +290,9 @@ impl BenchmarkStorage {
                     == Some(begun),
                 "benchmark snapshot lifecycle is inconsistent (active: {active}, begun: {begun}, finished: {finished}, dropped: {dropped})"
             );
-            let (acquired, active_permits) = self.runtime.mvcc_certification_counts_for_test()?;
             ensure!(
-                active == 0 && active_permits == 0,
-                "benchmark leaked lifecycle resources (active snapshots: {active}; begun: {begun}; finished: {finished}; dropped: {dropped}; active certification permits: {active_permits}; acquired certification permits: {acquired})"
+                active == 0,
+                "benchmark leaked lifecycle resources (active snapshots: {active}; begun: {begun}; finished: {finished}; dropped: {dropped})"
             );
         }
         Ok(())
@@ -533,6 +538,34 @@ mod tests {
         let error = storage.validate_lifecycle().unwrap_err().to_string();
         assert!(error.contains("active snapshots: 1"), "{error}");
 
+        storage.abort_if_active(&mut state).unwrap();
+        storage.validate_lifecycle().unwrap();
+    }
+
+    #[cfg(all(
+        feature = "transaction-cc-optimistic-validation",
+        not(feature = "transaction-mvcc")
+    ))]
+    #[test]
+    fn lifecycle_validator_reports_single_version_certification_permit_then_accepts_cleanup() {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let mut state = storage.new_transaction_state().unwrap();
+        storage.begin(&mut state).unwrap();
+        storage.read_u64(&mut state, 0).unwrap();
+        let certification = state.acquire_active_optimistic_certification().unwrap();
+        assert_eq!(
+            storage
+                .runtime
+                .optimistic_certification_counts_for_test()
+                .unwrap(),
+            (1, 1)
+        );
+
+        let error = storage.validate_lifecycle().unwrap_err().to_string();
+        assert!(error.contains("active certification permits: 1"), "{error}");
+
+        drop(certification);
         storage.abort_if_active(&mut state).unwrap();
         storage.validate_lifecycle().unwrap();
     }

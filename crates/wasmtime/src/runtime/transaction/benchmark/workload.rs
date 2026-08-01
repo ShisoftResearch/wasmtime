@@ -16,9 +16,10 @@ const DISJOINT_START: u64 = 257;
 const DISJOINT_COUNTERS: usize = 16;
 const WRITE_SKEW_START: u64 = 288;
 const WRITE_SKEW_GRANULES: u64 = 16;
-const READS_PER_ATTEMPT: u64 = 8;
+const READS_PER_ATTEMPT: usize = 8;
 const WORKER_SEED_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 const XORSHIFT64_STAR_MULTIPLIER: u64 = 0x2545_f491_4f6c_dd1d;
+const READ_ONLY_SEQUENCE_MULTIPLIER: u64 = 0xd134_2543_de82_ef95;
 
 pub(super) struct WorkloadState {
     storage: Arc<BenchmarkStorage>,
@@ -186,7 +187,19 @@ impl WorkloadState {
         self.storage.begin(&mut worker.state)?;
         worker.sequence = sequence;
         let result = match self.kind {
-            WorkloadKind::ReadOnly => read_eight_and_checksum(&self.storage, worker),
+            WorkloadKind::ReadOnly => {
+                let granules = read_only_access_plan(self.seed, worker.index, sequence);
+                read_eight_and_checksum(&self.storage, worker, &granules).and_then(|effect| {
+                    let expected = read_eight_checksum(self.seed, &granules);
+                    ensure!(
+                        effect.checksum == expected,
+                        "read-only checksum {} does not equal expected checksum {expected} for worker {} sequence {sequence}",
+                        effect.checksum,
+                        worker.index
+                    );
+                    Ok(effect)
+                })
+            }
             WorkloadKind::DisjointWrites => {
                 increment(&self.storage, worker, disjoint_addr(worker.index))
             }
@@ -314,22 +327,31 @@ fn read_only_value(seed: u64, granule: u64) -> u64 {
     seed.rotate_left((granule % 64) as u32) ^ granule
 }
 
-fn read_eight_checksum(seed: u64, rng: &mut DeterministicRng) -> u64 {
-    (0..READS_PER_ATTEMPT).fold(0, |checksum, _| {
-        checksum.wrapping_add(read_only_value(seed, read_only_granule(rng)))
+fn read_only_access_plan(
+    seed: u64,
+    worker_index: usize,
+    sequence: u64,
+) -> [u64; READS_PER_ATTEMPT] {
+    let logical_seed = seed ^ sequence.wrapping_mul(READ_ONLY_SEQUENCE_MULTIPLIER);
+    let mut rng = DeterministicRng::new(logical_seed, worker_index);
+    std::array::from_fn(|_| read_only_granule(&mut rng))
+}
+
+fn read_eight_checksum(seed: u64, granules: &[u64; READS_PER_ATTEMPT]) -> u64 {
+    granules.iter().fold(0, |checksum, granule| {
+        checksum.wrapping_add(read_only_value(seed, *granule))
     })
 }
 
 fn read_eight_and_checksum(
     storage: &BenchmarkStorage,
     worker: &mut WorkerContext,
+    granules: &[u64; READS_PER_ATTEMPT],
 ) -> Result<OperationEffect> {
     let mut checksum: u64 = 0;
-    for _ in 0..READS_PER_ATTEMPT {
-        checksum = checksum.wrapping_add(storage.read_u64(
-            &mut worker.state,
-            granule_addr(read_only_granule(&mut worker.rng)),
-        )?);
+    for granule in granules {
+        checksum =
+            checksum.wrapping_add(storage.read_u64(&mut worker.state, granule_addr(*granule))?);
     }
     Ok(OperationEffect {
         checksum,
@@ -442,13 +464,13 @@ mod tests {
     #[test]
     fn read_only_checksum_covers_eight_deterministic_granules() {
         let seed = 7;
-        let mut rng = DeterministicRng::new(seed, 3);
-        let expected = (0..READS_PER_ATTEMPT)
-            .map(|_| read_only_value(seed, read_only_granule(&mut rng)))
+        let granules = read_only_access_plan(seed, 3, 0);
+        let expected = granules
+            .iter()
+            .map(|granule| read_only_value(seed, *granule))
             .fold(0, u64::wrapping_add);
 
-        let mut rng = DeterministicRng::new(seed, 3);
-        assert_eq!(read_eight_checksum(seed, &mut rng), expected);
+        assert_eq!(read_eight_checksum(seed, &granules), expected);
     }
 
     #[test]
@@ -458,13 +480,13 @@ mod tests {
         let workload =
             WorkloadState::initialize(&storage, &spec(WorkloadKind::ReadOnly, 1)).unwrap();
         let mut worker = WorkerContext::new(&storage, 7, 0).unwrap();
-        let mut expected_rng = DeterministicRng::new(7, 0);
+        let expected_granules = read_only_access_plan(7, 0, 0);
 
         let outcome = workload.execute_attempt(&mut worker, 0).unwrap();
         let AttemptOutcome::Committed(effect) = outcome else {
             panic!("read-only attempt unexpectedly conflicted");
         };
-        assert_eq!(effect.checksum, read_eight_checksum(7, &mut expected_rng));
+        assert_eq!(effect.checksum, read_eight_checksum(7, &expected_granules));
         assert_eq!(effect.writes, 0);
         assert_eq!(effect.counter_delta, 0);
 
@@ -472,6 +494,29 @@ mod tests {
         workload
             .validate(&storage, &baseline, &AttemptCounts::default())
             .unwrap();
+    }
+
+    #[test]
+    fn read_only_retry_reuses_logical_access_plan_despite_backoff_rng() {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let workload =
+            WorkloadState::initialize(&storage, &spec(WorkloadKind::ReadOnly, 1)).unwrap();
+        let mut worker = WorkerContext::new(&storage, 7, 0).unwrap();
+
+        let AttemptOutcome::Committed(first) = workload.execute_attempt(&mut worker, 11).unwrap()
+        else {
+            panic!("first read-only attempt unexpectedly conflicted");
+        };
+        for _ in 0..4 {
+            worker.rng.next_u64();
+        }
+        let AttemptOutcome::Committed(retry) = workload.execute_attempt(&mut worker, 11).unwrap()
+        else {
+            panic!("retry read-only attempt unexpectedly conflicted");
+        };
+
+        assert_eq!(retry.checksum, first.checksum);
     }
 
     #[test]

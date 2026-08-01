@@ -18,6 +18,14 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+const MAX_BENCHMARK_PHASE_MS: u64 = 24 * 60 * 60 * 1_000;
+
+fn checked_deadline(start: Instant, duration: Duration, description: &str) -> Result<Instant> {
+    start
+        .checked_add(duration)
+        .with_context(|| format!("{description} duration exceeds the supported Instant range"))
+}
+
 pub(super) struct WriteSkewPair {
     addresses: [u64; 2],
     rendezvous: Arc<CancellableRendezvous>,
@@ -140,10 +148,11 @@ impl CellPhases {
     fn begin_warmup(&self, duration: Duration, watchdog_deadline: Instant) -> Result<Instant> {
         let leader = self.rendezvous.wait_for_leader(watchdog_deadline)?;
         if leader {
+            let warmup_deadline = checked_deadline(Instant::now(), duration, "benchmark warmup")?;
             self.times
                 .lock()
                 .map_err(|_| crate::format_err!("benchmark phase timing lock is poisoned"))?
-                .warmup_deadline = Some(Instant::now() + duration);
+                .warmup_deadline = Some(warmup_deadline);
         }
         self.rendezvous.wait(watchdog_deadline)?;
         self.times
@@ -168,7 +177,11 @@ impl CellPhases {
                 .lock()
                 .map_err(|_| crate::format_err!("benchmark phase timing lock is poisoned"))?;
             times.measurement_started = Some(started);
-            times.measurement_deadline = Some(started + duration);
+            times.measurement_deadline = Some(checked_deadline(
+                started,
+                duration,
+                "benchmark measurement",
+            )?);
         }
         self.rendezvous.wait(watchdog_deadline)?;
         self.times
@@ -449,6 +462,19 @@ struct WorkerReport {
 }
 
 type WorkerFn = Box<dyn FnOnce() -> Result<WorkerReport> + Send + 'static>;
+type WorkerThreadFn = Box<dyn FnOnce() + Send + 'static>;
+
+trait WorkerSpawner {
+    fn spawn(&mut self, name: String, run: WorkerThreadFn) -> std::io::Result<JoinHandle<()>>;
+}
+
+struct SystemWorkerSpawner;
+
+impl WorkerSpawner for SystemWorkerSpawner {
+    fn spawn(&mut self, name: String, run: WorkerThreadFn) -> std::io::Result<JoinHandle<()>> {
+        thread::Builder::new().name(name).spawn(run)
+    }
+}
 
 struct WorkerJob {
     name: String,
@@ -487,7 +513,15 @@ struct RunningWorker {
     handle: Option<JoinHandle<()>>,
 }
 
-fn spawn_jobs(jobs: Vec<WorkerJob>) -> Result<(Vec<RunningWorker>, Receiver<WorkerEvent>)> {
+struct SpawnJobsFailure {
+    message: String,
+    running: Vec<RunningWorker>,
+}
+
+fn spawn_jobs_with(
+    jobs: Vec<WorkerJob>,
+    spawner: &mut impl WorkerSpawner,
+) -> std::result::Result<(Vec<RunningWorker>, Receiver<WorkerEvent>), SpawnJobsFailure> {
     let (sender, receiver) = mpsc::channel();
     let mut running = Vec::with_capacity(jobs.len());
     for job in jobs {
@@ -498,9 +532,9 @@ fn spawn_jobs(jobs: Vec<WorkerJob>) -> Result<(Vec<RunningWorker>, Receiver<Work
         let progress_for_handle = progress.clone();
         let sender = sender.clone();
         let run = job.run;
-        let handle = thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
+        let handle = match spawner.spawn(
+            thread_name,
+            Box::new(move || {
                 let outcome = match catch_unwind(AssertUnwindSafe(run)) {
                     Ok(Ok(report)) => WorkerOutcome::Completed(report),
                     Ok(Err(error)) => WorkerOutcome::Failed(format!("{error:#}")),
@@ -510,8 +544,16 @@ fn spawn_jobs(jobs: Vec<WorkerJob>) -> Result<(Vec<RunningWorker>, Receiver<Work
                     name: event_name,
                     outcome,
                 });
-            })
-            .context("failed to spawn benchmark worker")?;
+            }),
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Err(SpawnJobsFailure {
+                    message: format!("failed to spawn benchmark worker {name}: {error}"),
+                    running,
+                });
+            }
+        };
         running.push(RunningWorker {
             name,
             progress: progress_for_handle,
@@ -540,7 +582,44 @@ fn supervise_jobs(
     cancelled: Arc<AtomicBool>,
     rendezvous: &[Arc<CancellableRendezvous>],
 ) -> Result<Vec<WorkerReport>> {
-    let (mut running, receiver) = spawn_jobs(jobs)?;
+    supervise_jobs_with_spawner(
+        spec,
+        phase,
+        jobs,
+        watchdog_deadline,
+        cancelled,
+        rendezvous,
+        &mut SystemWorkerSpawner,
+    )
+}
+
+fn supervise_jobs_with_spawner(
+    spec: &CellSpec,
+    phase: &str,
+    jobs: Vec<WorkerJob>,
+    watchdog_deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    rendezvous: &[Arc<CancellableRendezvous>],
+    spawner: &mut impl WorkerSpawner,
+) -> Result<Vec<WorkerReport>> {
+    let (mut running, receiver) = match spawn_jobs_with(jobs, spawner) {
+        Ok(spawned) => spawned,
+        Err(failure) => {
+            let mut running = failure.running;
+            cancel_workers(&cancelled, rendezvous);
+            drain_finished_workers(&mut running, watchdog_deadline);
+            return Err(cell_failure(
+                spec,
+                "worker-startup",
+                format!(
+                    "{} while preparing {phase}; unfinished workers: {}; last progress: {}",
+                    failure.message,
+                    unfinished_workers(&running),
+                    worker_progress(&running)
+                ),
+            ));
+        }
+    };
     let expected = running.len();
     let mut reports = Vec::with_capacity(expected);
     let mut primary_failure = None;
@@ -693,11 +772,14 @@ fn supervise_test_jobs(
     cancelled: Arc<AtomicBool>,
     rendezvous: Vec<Arc<CancellableRendezvous>>,
 ) -> Result<Vec<WorkerReport>> {
+    let watchdog_duration = requested
+        .checked_add(grace)
+        .context("benchmark test watchdog duration overflow")?;
     supervise_jobs(
         spec,
         phase,
         jobs,
-        Instant::now() + requested + grace,
+        checked_deadline(Instant::now(), watchdog_duration, "benchmark test watchdog")?,
         cancelled,
         &rendezvous,
     )
@@ -920,6 +1002,10 @@ fn rendezvous_list(
 pub(super) fn run_cell(request: &BenchmarkRequest, spec: &CellSpec) -> Result<CellRecord> {
     request.validate()?;
     ensure!(
+        request.warmup_ms <= MAX_BENCHMARK_PHASE_MS && request.measure_ms <= MAX_BENCHMARK_PHASE_MS,
+        "benchmark warmup and measurement duration must each be at most {MAX_BENCHMARK_PHASE_MS} milliseconds"
+    );
+    ensure!(
         spec.workers > 0,
         "benchmark cell worker count must be nonzero"
     );
@@ -944,9 +1030,15 @@ pub(super) fn run_cell(request: &BenchmarkRequest, spec: &CellSpec) -> Result<Ce
     let cell_started = Instant::now();
     let warmup = Duration::from_millis(request.warmup_ms);
     let measurement = Duration::from_millis(request.measure_ms);
-    let requested = warmup + measurement;
+    let requested = warmup
+        .checked_add(measurement)
+        .context("benchmark requested duration overflow")?;
     let grace = Duration::from_secs(5).max(requested.saturating_mul(2));
-    let watchdog_deadline = cell_started + requested + grace;
+    let watchdog_duration = requested
+        .checked_add(grace)
+        .context("benchmark watchdog duration overflow")?;
+    let watchdog_deadline =
+        checked_deadline(cell_started, watchdog_duration, "benchmark cell watchdog")?;
     let mut jobs = Vec::with_capacity(spec.workers);
     let worker_count = spec.workers;
 
@@ -1120,7 +1212,11 @@ fn run_fixed_write_skew_cell(
         .collect::<Vec<_>>();
     let start = Arc::new(CancellableRendezvous::new(spec.workers, cancelled.clone()));
     let measurement_started = Arc::new(Mutex::new(None));
-    let watchdog_deadline = Instant::now() + Duration::from_secs(10);
+    let watchdog_deadline = checked_deadline(
+        Instant::now(),
+        Duration::from_secs(10),
+        "fixed write-skew watchdog",
+    )?;
     let mut jobs = Vec::new();
     for index in 0..spec.workers {
         let storage = storage.clone();
@@ -1463,6 +1559,128 @@ mod tests {
         assert!(error.contains("measurement"), "{error}");
         assert!(error.contains("read-only"), "{error}");
         assert!(error.contains("parked-worker=7"), "{error}");
+    }
+
+    #[test]
+    fn incorrect_measured_read_only_checksum_fails_cell() {
+        let cell = spec(WorkloadKind::ReadOnly, 1);
+        let storage = BenchmarkStorage::new(cell.backend).unwrap();
+        let workload = Arc::new(WorkloadState::initialize(&storage, &cell).unwrap());
+        let maintenance = Arc::new(MaintenanceGate::new(storage.clone(), 4).unwrap());
+        let mut selection = DeterministicRng::new(cell.seed, 0);
+        let selected_addr = (selection.next_u64() % 256) * 64;
+        let mut corrupting = storage.new_transaction_state().unwrap();
+        storage.begin(&mut corrupting).unwrap();
+        let value = storage.read_u64(&mut corrupting, selected_addr).unwrap();
+        storage
+            .stage_u64(&mut corrupting, selected_addr, value.wrapping_add(1))
+            .unwrap();
+        assert!(matches!(
+            storage.finish_attempt(&mut corrupting, Ok(())).unwrap(),
+            AttemptOutcome::Committed(())
+        ));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let job = {
+            let storage = storage.clone();
+            let workload = workload.clone();
+            let maintenance = maintenance.clone();
+            let cancelled = cancelled.clone();
+            let progress_for_job = progress.clone();
+            WorkerJob::injected("checksum-worker", progress, move || {
+                let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+                let mut worker = WorkerContext::new(&storage, cell.seed, 0)?;
+                run_standard_phase(
+                    &workload,
+                    &mut worker,
+                    &maintenance,
+                    &cancelled,
+                    &progress_for_job,
+                    Instant::now() + Duration::from_millis(5),
+                )
+            })
+        };
+
+        let error = supervise_test_jobs(
+            &cell,
+            "measurement",
+            vec![job],
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            cancelled,
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("read-only checksum"));
+    }
+
+    struct FailAfterOneSpawn {
+        attempts: usize,
+    }
+
+    impl WorkerSpawner for FailAfterOneSpawn {
+        fn spawn(&mut self, name: String, run: WorkerThreadFn) -> std::io::Result<JoinHandle<()>> {
+            if self.attempts == 1 {
+                return Err(std::io::Error::other("injected worker spawn failure"));
+            }
+            self.attempts += 1;
+            thread::Builder::new().name(name).spawn(run)
+        }
+    }
+
+    #[test]
+    fn partial_spawn_failure_cancels_and_drains_started_worker() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let rendezvous = Arc::new(CancellableRendezvous::new(2, cancelled.clone()));
+        let first_exited = Arc::new(AtomicBool::new(false));
+        let waiting = {
+            let rendezvous = rendezvous.clone();
+            let first_exited = first_exited.clone();
+            WorkerJob::injected("started-worker", Arc::new(AtomicU64::new(0)), move || {
+                let result = rendezvous.wait(Instant::now() + Duration::from_secs(1));
+                first_exited.store(true, Ordering::Release);
+                result?;
+                Ok(WorkerReport::default())
+            })
+        };
+        let never_started =
+            WorkerJob::injected("unstarted-worker", Arc::new(AtomicU64::new(0)), || {
+                Ok(WorkerReport::default())
+            });
+        let mut spawner = FailAfterOneSpawn { attempts: 0 };
+        let started = Instant::now();
+
+        let error = supervise_jobs_with_spawner(
+            &spec(WorkloadKind::ReadOnly, 2),
+            "warmup-and-measurement",
+            vec![waiting, never_started],
+            Instant::now() + Duration::from_millis(100),
+            cancelled.clone(),
+            &[rendezvous],
+            &mut spawner,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected worker spawn failure"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(first_exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn extreme_duration_returns_error_without_panicking() {
+        let mut extreme = request(4);
+        extreme.warmup_ms = u64::MAX;
+        extreme.measure_ms = u64::MAX;
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            run_cell(&extreme, &spec(WorkloadKind::ReadOnly, 1))
+        }));
+
+        assert!(outcome.is_ok(), "extreme duration panicked");
+        let error = outcome.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("duration"));
     }
 
     #[test]
