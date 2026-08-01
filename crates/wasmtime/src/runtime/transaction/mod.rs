@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use core::mem;
 use std::path::Path;
 
+#[cfg(test)]
+mod benchmark;
 mod concurrency;
 mod config;
 mod durable_ref;
