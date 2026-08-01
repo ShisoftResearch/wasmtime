@@ -53,6 +53,13 @@ pub(super) struct GcBarrierObservation {
     pub opportunistically_pruned_versions: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct VersionCounterSnapshot {
+    pub created: u64,
+    pub resident: u64,
+    pub opportunistically_pruned: u64,
+}
+
 impl BenchmarkStorage {
     pub(super) fn new(backend: BackendKind) -> Result<Arc<Self>> {
         let (runtime, tmemory, file_paths) = match backend {
@@ -240,6 +247,52 @@ impl BenchmarkStorage {
         Ok(())
     }
 
+    pub(super) fn version_counter_snapshot(&self) -> Result<VersionCounterSnapshot> {
+        #[cfg(feature = "transaction-mvcc")]
+        let (resident, opportunistically_pruned) = {
+            let visibility = self.runtime.visibility_for_test();
+            (
+                u64::try_from(visibility.runtime().total_version_count_for_test()?)
+                    .context("benchmark resident MVCC version count does not fit u64")?,
+                visibility.opportunistically_pruned_version_count_for_test(),
+            )
+        };
+        #[cfg(not(feature = "transaction-mvcc"))]
+        let (resident, opportunistically_pruned) = (0, 0);
+
+        Ok(VersionCounterSnapshot {
+            created: self.mvcc_versions_created.load(Ordering::Relaxed),
+            resident,
+            opportunistically_pruned,
+        })
+    }
+
+    pub(super) fn validate_lifecycle(&self) -> Result<()> {
+        #[cfg(all(
+            feature = "transaction-mvcc",
+            feature = "transaction-cc-optimistic-validation"
+        ))]
+        {
+            let (active, begun, finished, dropped) = self
+                .runtime
+                .visibility_for_test()
+                .snapshot_lifecycle_counts_for_test()?;
+            ensure!(
+                finished
+                    .checked_add(dropped)
+                    .and_then(|completed| completed.checked_add(active))
+                    == Some(begun),
+                "benchmark snapshot lifecycle is inconsistent (active: {active}, begun: {begun}, finished: {finished}, dropped: {dropped})"
+            );
+            let (acquired, active_permits) = self.runtime.mvcc_certification_counts_for_test()?;
+            ensure!(
+                active == 0 && active_permits == 0,
+                "benchmark leaked lifecycle resources (active snapshots: {active}; begun: {begun}; finished: {finished}; dropped: {dropped}; active certification permits: {active_permits}; acquired certification permits: {acquired})"
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn run_gc_barrier(&self) -> Result<GcBarrierObservation> {
         let mode = self.runtime.persistent_gc_mode_for_test()?;
         let policy_mode = match mode {
@@ -345,6 +398,16 @@ mod tests {
         drop(state);
         drop(storage);
         assert!(!directory.exists());
+    }
+
+    #[cfg(not(feature = "transaction-mvcc"))]
+    #[test]
+    fn single_version_counter_snapshot_uses_zero_mvcc_counts() {
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let snapshot = storage.version_counter_snapshot().unwrap();
+        assert_eq!(snapshot.created, 0);
+        assert_eq!(snapshot.opportunistically_pruned, 0);
+        assert_eq!(snapshot.resident, 0);
     }
 
     #[test]
@@ -454,6 +517,64 @@ mod tests {
                 .0,
             0
         );
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    #[test]
+    fn lifecycle_validator_reports_active_snapshot_then_accepts_cleanup() {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let mut state = storage.new_transaction_state().unwrap();
+        storage.begin(&mut state).unwrap();
+
+        let error = storage.validate_lifecycle().unwrap_err().to_string();
+        assert!(error.contains("active snapshots: 1"), "{error}");
+
+        storage.abort_if_active(&mut state).unwrap();
+        storage.validate_lifecycle().unwrap();
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    #[test]
+    fn lifecycle_validator_reports_active_certification_permit_then_accepts_cleanup() {
+        use crate::runtime::transaction::mvcc::MvccCommitTestHook;
+
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let certification = Arc::new(MvccCommitTestHook::new(1));
+        storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .set_predecessor_collected_hook_for_test(Some(certification.clone()))
+            .unwrap();
+        let committing_storage = storage.clone();
+        let committing = std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut state = committing_storage.new_transaction_state()?;
+            committing_storage.begin(&mut state)?;
+            committing_storage.stage_u64(&mut state, 0, 1)?;
+            committing_storage.commit(&mut state)
+        });
+        assert!(certification.wait_until_reached(Duration::from_secs(5)));
+
+        let error = storage.validate_lifecycle().unwrap_err().to_string();
+        assert!(error.contains("active certification permits: 1"), "{error}");
+
+        certification.release();
+        committing.join().unwrap().unwrap();
+        storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .set_predecessor_collected_hook_for_test(None)
+            .unwrap();
+        storage.validate_lifecycle().unwrap();
     }
 
     fn helper_rmw_result(backend: BackendKind) -> u64 {

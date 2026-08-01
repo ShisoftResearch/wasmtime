@@ -145,15 +145,28 @@ impl WorkerMetrics {
         Ok(())
     }
 
-    pub(super) fn record_conflict(&mut self, elapsed: Duration) -> Result<()> {
+    pub(super) fn record_conflict(&mut self) -> Result<()> {
         let attempts = checked_add(self.counts.attempts, 1, "attempts")?;
         let conflict_aborts = checked_add(self.counts.conflict_aborts, 1, "conflict aborts")?;
         let retries = checked_add(self.counts.retries, 1, "retries")?;
-        self.latency.record(elapsed)?;
         self.counts.attempts = attempts;
         self.counts.conflict_aborts = conflict_aborts;
         self.counts.retries = retries;
         Ok(())
+    }
+
+    pub(super) fn counts(&self) -> &AttemptCounts {
+        &self.counts
+    }
+
+    pub(super) fn restore_metrics(&self) -> Result<RestoreMetrics> {
+        self.counts.validate()?;
+        Ok(RestoreMetrics {
+            counts: self.counts.clone(),
+            p50_ns: self.latency.percentile(0.50),
+            p95_ns: self.latency.percentile(0.95),
+            p99_ns: self.latency.percentile(0.99),
+        })
     }
 
     pub(super) fn merge(&mut self, other: &Self) -> Result<()> {
@@ -222,7 +235,7 @@ pub(super) struct CellAggregateInput {
     pub effective_elapsed: Duration,
     pub gc: GcMetrics,
     pub versions: VersionMetrics,
-    pub schedules: u64,
+    pub schedules: Option<u64>,
     pub restore: Option<RestoreMetrics>,
     pub anomalous_conflict: bool,
 }
@@ -268,10 +281,40 @@ impl CellMetrics {
             fairness,
             gc: input.gc,
             versions: input.versions,
-            schedules_per_second: Some(input.schedules as f64 / elapsed_secs),
+            schedules_per_second: input
+                .schedules
+                .map(|schedules| schedules as f64 / elapsed_secs),
             restore: input.restore,
             anomalous_conflict: input.anomalous_conflict,
         })
+    }
+
+    pub(super) fn validate_finite(&self) -> Result<()> {
+        ensure!(
+            self.attempts_per_second.is_finite(),
+            "attempt throughput must be finite"
+        );
+        ensure!(
+            self.committed_operations_per_second.is_finite(),
+            "committed-operation throughput must be finite"
+        );
+        ensure!(self.gc.elapsed_share.is_finite(), "GC share must be finite");
+        for (name, value) in [
+            (
+                "fairness minimum/maximum ratio",
+                self.fairness.min_max_ratio,
+            ),
+            (
+                "fairness coefficient of variation",
+                self.fairness.coefficient_of_variation,
+            ),
+            ("write-skew schedule throughput", self.schedules_per_second),
+        ] {
+            if let Some(value) = value {
+                ensure!(value.is_finite(), "{name} must be finite");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -369,7 +412,7 @@ fn aggregate_reports_fairness_and_effective_elapsed_throughput() {
             effective_elapsed: Duration::from_secs(2),
             gc: GcMetrics::default(),
             versions: VersionMetrics::default(),
-            schedules: 6,
+            schedules: Some(6),
             restore: None,
             anomalous_conflict: false,
         },

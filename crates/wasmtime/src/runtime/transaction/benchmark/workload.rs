@@ -4,6 +4,7 @@ use super::storage::{AttemptOutcome, BenchmarkStorage};
 use crate::prelude::*;
 use crate::runtime::transaction::TransactionState;
 use std::sync::Arc;
+use std::time::Instant;
 use std::vec::Vec;
 
 const PAGE_BYTES: u64 = 64 * 1024;
@@ -28,9 +29,13 @@ pub(super) struct WorkloadState {
 
 pub(super) struct WorkerContext {
     pub(super) index: usize,
+    pub(super) storage: Arc<BenchmarkStorage>,
     pub(super) state: TransactionState,
     pub(super) rng: DeterministicRng,
     pub(super) sequence: u64,
+    pub(super) write_skew_role: usize,
+    pub(super) write_skew_initial_attempt: bool,
+    pub(super) rendezvous_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -74,14 +79,54 @@ impl DeterministicRng {
 }
 
 impl WorkerContext {
-    pub(super) fn new(storage: &BenchmarkStorage, run_seed: u64, index: usize) -> Result<Self> {
+    pub(super) fn new(
+        storage: &Arc<BenchmarkStorage>,
+        run_seed: u64,
+        index: usize,
+    ) -> Result<Self> {
         Ok(Self {
             index,
+            storage: storage.clone(),
             state: storage.new_transaction_state()?,
             rng: DeterministicRng::new(run_seed, index),
             sequence: 0,
+            write_skew_role: index % 2,
+            write_skew_initial_attempt: false,
+            rendezvous_deadline: None,
         })
     }
+
+    pub(super) fn begin_write_skew_operation(&mut self, role: usize, deadline: Instant) {
+        self.write_skew_role = role;
+        self.write_skew_initial_attempt = true;
+        self.rendezvous_deadline = Some(deadline);
+    }
+}
+
+pub(super) fn write_skew_addresses(pair: usize) -> Result<[u64; 2]> {
+    let first = WRITE_SKEW_START
+        .checked_add(
+            u64::try_from(pair)
+                .context("write-skew pair index does not fit u64")?
+                .checked_mul(2)
+                .context("write-skew pair granule overflow")?,
+        )
+        .context("write-skew pair granule overflow")?;
+    ensure!(
+        first + 1 < WRITE_SKEW_START + WRITE_SKEW_GRANULES,
+        "write-skew pair {pair} exceeds the initialized dataset"
+    );
+    Ok([granule_addr(first), granule_addr(first + 1)])
+}
+
+pub(super) fn read_committed_u64s(
+    storage: &BenchmarkStorage,
+    addresses: [u64; 2],
+) -> Result<[u64; 2]> {
+    let values = read_values(storage, addresses)?;
+    values
+        .try_into()
+        .map_err(|_| crate::format_err!("write-skew pair read returned the wrong value count"))
 }
 
 impl WorkloadState {
