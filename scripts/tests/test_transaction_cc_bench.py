@@ -183,7 +183,9 @@ class TransactionCcBenchTests(unittest.TestCase):
 
     def test_third_policy_failure_preserves_raw_data_and_failure_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
-            run_dir = Path(directory) / "run"
+            repository_root = Path(directory) / "repository"
+            repository_root.mkdir()
+            run_dir = repository_root / "target" / "transaction-bench" / "run"
             args = bench.parse_args(
                 [
                     "--policies",
@@ -232,7 +234,9 @@ class TransactionCcBenchTests(unittest.TestCase):
                     command, 23 if len(cargo_calls) == 3 else 0
                 )
 
-            with mock.patch.object(bench.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(bench, "REPOSITORY_ROOT", repository_root), mock.patch.object(
+                bench.subprocess, "run", side_effect=fake_run
+            ):
                 status = bench.run(args, argv=["transaction-cc-bench.py", "--test"])
 
             self.assertEqual(1, status)
@@ -262,6 +266,93 @@ class TransactionCcBenchTests(unittest.TestCase):
                 ["tracked-file", "untracked-file"], invocation["changed_paths"]
             )
             self.assertTrue(invocation["dirty"])
+
+    def test_output_directory_must_remain_below_target_transaction_bench(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository_root = Path(directory) / "repository"
+            allowed_root = repository_root / "target" / "transaction-bench"
+            allowed_root.mkdir(parents=True)
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (allowed_root / "escape").symlink_to(outside, target_is_directory=True)
+
+            with mock.patch.object(bench, "REPOSITORY_ROOT", repository_root):
+                self.assertEqual(
+                    allowed_root / "run",
+                    bench.resolve_run_dir(allowed_root / "run"),
+                )
+                for requested in (
+                    repository_root / "elsewhere" / "run",
+                    allowed_root / ".." / "escaped",
+                    allowed_root / "escape" / "run",
+                ):
+                    with self.subTest(requested=requested), self.assertRaisesRegex(
+                        ValueError, "target/transaction-bench"
+                    ):
+                        bench.resolve_run_dir(requested)
+
+    def test_report_failure_preserves_raw_data_and_omits_success_footer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository_root = Path(directory) / "repository"
+            repository_root.mkdir()
+            run_dir = repository_root / "target" / "transaction-bench" / "run"
+            args = bench.parse_args(
+                [
+                    "--policies",
+                    "optimistic",
+                    "--backends",
+                    "vmemory",
+                    "--workloads",
+                    "read-only",
+                    "--workers",
+                    "1",
+                    "--warmup-ms",
+                    "1",
+                    "--measure-ms",
+                    "1",
+                    "--output-dir",
+                    str(run_dir),
+                    "--skip-tfunc-control",
+                ]
+            )
+
+            def fake_run(command, **kwargs):
+                if command[:3] == ["git", "rev-parse", "HEAD"]:
+                    return subprocess.CompletedProcess(command, 0, "0" * 40 + "\n", "")
+                if command[:2] == ["git", "status"]:
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if command[:2] == ["rustc", "-Vv"]:
+                    return subprocess.CompletedProcess(command, 0, "rustc fixture\n", "")
+                if command[0] == "uname":
+                    return subprocess.CompletedProcess(command, 0, "fixture-processor\n", "")
+                raw_path = Path(kwargs["env"]["WASMTIME_TRANSACTION_BENCH_OUTPUT"])
+                raw_path.write_text(
+                    json.dumps({"record_type": "complete", "schema_version": 1}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(bench, "REPOSITORY_ROOT", repository_root), mock.patch.object(
+                bench.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                bench.reporter,
+                "generate_reports",
+                side_effect=ValueError("fixture report validation failed"),
+            ):
+                status = bench.run(args, argv=["transaction-cc-bench.py", "--test"])
+
+            self.assertEqual(1, status)
+            self.assertTrue((run_dir / "raw" / "optimistic.jsonl").is_file())
+            records = [
+                json.loads(line)
+                for line in (run_dir / "orchestrator.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual("report_failure", records[-1]["record_type"])
+            self.assertIn("fixture report validation failed", records[-1]["error"])
+            self.assertNotIn("complete", [record["record_type"] for record in records])
+            invocation = json.loads((run_dir / "invocation.json").read_text())
+            self.assertEqual("failed", invocation["status"])
+            self.assertIsNone(invocation["failed_policy"])
 
 
 if __name__ == "__main__":

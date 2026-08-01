@@ -15,6 +15,11 @@ import sys
 import time
 from typing import Any, Sequence
 
+try:
+    from scripts import transaction_cc_bench_report as reporter
+except ModuleNotFoundError:
+    import transaction_cc_bench_report as reporter
+
 
 SCHEMA_VERSION = 1
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -433,6 +438,17 @@ def _default_run_dir(started: datetime, short_revision: str) -> Path:
     )
 
 
+def resolve_run_dir(requested: Path) -> Path:
+    """Resolve a generated run without allowing it to escape ignored output."""
+    output_root = (REPOSITORY_ROOT / "target" / "transaction-bench").resolve()
+    candidate = Path(requested).resolve()
+    if candidate == output_root or not candidate.is_relative_to(output_root):
+        raise ValueError(
+            f"output directory must be below repository target/transaction-bench: {candidate}"
+        )
+    return candidate
+
+
 def _finish_invocation(
     invocation_path: Path,
     invocation: dict[str, Any],
@@ -455,12 +471,12 @@ def run(args: argparse.Namespace, argv: Sequence[str] | None = None) -> int:
     )
     started = time.perf_counter()
     invocation = _host_metadata(actual_argv, started_utc)
-    run_dir = (
+    requested_run_dir = (
         args.output_dir
         if args.output_dir is not None
         else _default_run_dir(started_datetime, invocation["git_short_revision"])
     )
-    run_dir = run_dir.resolve()
+    run_dir = resolve_run_dir(requested_run_dir)
     run_dir.mkdir(parents=True, exist_ok=False)
     invocation["run_dir"] = str(run_dir)
     invocation_path = run_dir / "invocation.json"
@@ -513,6 +529,21 @@ def run(args: argparse.Namespace, argv: Sequence[str] | None = None) -> int:
             return 1
         completed_policies += 1
 
+    _finish_invocation(invocation_path, invocation, started, "complete")
+    try:
+        reporter.generate_reports(run_dir)
+    except Exception as error:
+        _append_jsonl(
+            orchestrator_path,
+            {
+                "record_type": "report_failure",
+                "schema_version": SCHEMA_VERSION,
+                "error": str(error),
+                "ended_utc": _utc_now(),
+            },
+        )
+        _finish_invocation(invocation_path, invocation, started, "failed")
+        return 1
     _append_jsonl(
         orchestrator_path,
         {
@@ -522,7 +553,6 @@ def run(args: argparse.Namespace, argv: Sequence[str] | None = None) -> int:
             "ended_utc": _utc_now(),
         },
     )
-    _finish_invocation(invocation_path, invocation, started, "complete")
     return 0
 
 
