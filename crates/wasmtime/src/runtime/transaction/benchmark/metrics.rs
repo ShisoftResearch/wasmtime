@@ -18,18 +18,25 @@ impl Default for LatencyHistogram {
 }
 
 impl LatencyHistogram {
-    pub(super) fn record(&mut self, elapsed: Duration) {
+    pub(super) fn record(&mut self, elapsed: Duration) -> Result<()> {
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1);
         let bucket = (63 - nanos.leading_zeros()) as usize;
-        self.buckets[bucket] += 1;
-        self.samples += 1;
+        let bucket_count = checked_add(self.buckets[bucket], 1, "latency bucket")?;
+        let samples = checked_add(self.samples, 1, "latency samples")?;
+        self.buckets[bucket] = bucket_count;
+        self.samples = samples;
+        Ok(())
     }
 
-    fn merge(&mut self, other: &Self) {
-        for (bucket, other_bucket) in self.buckets.iter_mut().zip(other.buckets) {
-            *bucket += other_bucket;
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        let mut buckets = self.buckets;
+        for (bucket, other_bucket) in buckets.iter_mut().zip(other.buckets) {
+            *bucket = checked_add(*bucket, other_bucket, "latency bucket")?;
         }
-        self.samples += other.samples;
+        let samples = checked_add(self.samples, other.samples, "latency samples")?;
+        self.buckets = buckets;
+        self.samples = samples;
+        Ok(())
     }
 
     pub(super) fn percentile(&self, percentile: f64) -> Option<u64> {
@@ -83,13 +90,38 @@ impl AttemptCounts {
         Ok(())
     }
 
-    fn merge(&mut self, other: &Self) {
-        self.attempts += other.attempts;
-        self.successful_attempts += other.successful_attempts;
-        self.conflict_aborts += other.conflict_aborts;
-        self.committed_operations += other.committed_operations;
-        self.retries += other.retries;
-        self.unexpected_errors += other.unexpected_errors;
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        let attempts = checked_add(self.attempts, other.attempts, "attempts")?;
+        let successful_attempts = checked_add(
+            self.successful_attempts,
+            other.successful_attempts,
+            "successful attempts",
+        )?;
+        let conflict_aborts = checked_add(
+            self.conflict_aborts,
+            other.conflict_aborts,
+            "conflict aborts",
+        )?;
+        let committed_operations = checked_add(
+            self.committed_operations,
+            other.committed_operations,
+            "committed operations",
+        )?;
+        let retries = checked_add(self.retries, other.retries, "retries")?;
+        let unexpected_errors = checked_add(
+            self.unexpected_errors,
+            other.unexpected_errors,
+            "unexpected errors",
+        )?;
+        *self = Self {
+            attempts,
+            successful_attempts,
+            conflict_aborts,
+            committed_operations,
+            retries,
+            unexpected_errors,
+        };
+        Ok(())
     }
 }
 
@@ -100,23 +132,38 @@ pub(super) struct WorkerMetrics {
 }
 
 impl WorkerMetrics {
-    pub(super) fn record_commit(&mut self, elapsed: Duration) {
-        self.counts.attempts += 1;
-        self.counts.successful_attempts += 1;
-        self.counts.committed_operations += 1;
-        self.latency.record(elapsed);
+    pub(super) fn record_commit(&mut self, elapsed: Duration) -> Result<()> {
+        let attempts = checked_add(self.counts.attempts, 1, "attempts")?;
+        let successful_attempts =
+            checked_add(self.counts.successful_attempts, 1, "successful attempts")?;
+        let committed_operations =
+            checked_add(self.counts.committed_operations, 1, "committed operations")?;
+        self.latency.record(elapsed)?;
+        self.counts.attempts = attempts;
+        self.counts.successful_attempts = successful_attempts;
+        self.counts.committed_operations = committed_operations;
+        Ok(())
     }
 
-    pub(super) fn record_conflict(&mut self, elapsed: Duration) {
-        self.counts.attempts += 1;
-        self.counts.conflict_aborts += 1;
-        self.counts.retries += 1;
-        self.latency.record(elapsed);
+    pub(super) fn record_conflict(&mut self, elapsed: Duration) -> Result<()> {
+        let attempts = checked_add(self.counts.attempts, 1, "attempts")?;
+        let conflict_aborts = checked_add(self.counts.conflict_aborts, 1, "conflict aborts")?;
+        let retries = checked_add(self.counts.retries, 1, "retries")?;
+        self.latency.record(elapsed)?;
+        self.counts.attempts = attempts;
+        self.counts.conflict_aborts = conflict_aborts;
+        self.counts.retries = retries;
+        Ok(())
     }
 
-    pub(super) fn merge(&mut self, other: &Self) {
-        self.counts.merge(&other.counts);
-        self.latency.merge(&other.latency);
+    pub(super) fn merge(&mut self, other: &Self) -> Result<()> {
+        let mut counts = self.counts.clone();
+        counts.merge(&other.counts)?;
+        let mut latency = self.latency.clone();
+        latency.merge(&other.latency)?;
+        self.counts = counts;
+        self.latency = latency;
+        Ok(())
     }
 }
 
@@ -192,7 +239,7 @@ impl CellMetrics {
         let mut merged = WorkerMetrics::default();
         for worker in workers {
             worker.counts.validate()?;
-            merged.merge(worker);
+            merged.merge(worker)?;
         }
         merged.counts.validate()?;
 
@@ -228,6 +275,13 @@ impl CellMetrics {
     }
 }
 
+fn checked_add(left: u64, right: u64, counter: &str) -> Result<u64> {
+    match left.checked_add(right) {
+        Some(value) => Ok(value),
+        None => bail!("{counter} counter overflow"),
+    }
+}
+
 fn fairness(committed: &[u64]) -> FairnessMetrics {
     let Some(&maximum) = committed.iter().max() else {
         return FairnessMetrics::default();
@@ -253,14 +307,14 @@ fn fairness(committed: &[u64]) -> FairnessMetrics {
 fn percentile_requires_enough_samples_and_returns_nanoseconds() {
     let mut histogram = LatencyHistogram::default();
     for micros in 1..=100 {
-        histogram.record(Duration::from_micros(micros));
+        histogram.record(Duration::from_micros(micros)).unwrap();
     }
     assert!(histogram.percentile(0.50).unwrap() >= 50_000);
     assert!(histogram.percentile(0.95).unwrap() >= 95_000);
     assert!(histogram.percentile(0.99).unwrap() >= 99_000);
 
     let mut sparse = LatencyHistogram::default();
-    sparse.record(Duration::from_nanos(7));
+    sparse.record(Duration::from_nanos(7)).unwrap();
     assert_eq!(sparse.percentile(0.50), None);
 }
 
@@ -301,11 +355,11 @@ fn aggregate_reports_fairness_and_effective_elapsed_throughput() {
     ];
     for worker in &mut workers[..2] {
         for _ in 0..100 {
-            worker.record_commit(Duration::from_micros(1));
+            worker.record_commit(Duration::from_micros(1)).unwrap();
         }
     }
     for _ in 0..50 {
-        workers[2].record_commit(Duration::from_micros(1));
+        workers[2].record_commit(Duration::from_micros(1)).unwrap();
     }
 
     let metrics = CellMetrics::from_workers(
@@ -328,4 +382,50 @@ fn aggregate_reports_fairness_and_effective_elapsed_throughput() {
     assert_eq!(metrics.schedules_per_second, Some(3.0));
     assert_eq!(metrics.fairness.min_max_ratio, Some(0.5));
     assert!(metrics.fairness.coefficient_of_variation.unwrap() > 0.0);
+}
+
+#[test]
+fn worker_recording_rejects_counter_overflow_without_wrapping() {
+    let mut worker = WorkerMetrics {
+        counts: AttemptCounts {
+            attempts: u64::MAX,
+            successful_attempts: u64::MAX,
+            conflict_aborts: 0,
+            committed_operations: u64::MAX,
+            retries: 0,
+            unexpected_errors: 0,
+        },
+        latency: LatencyHistogram::default(),
+    };
+
+    assert!(worker.record_commit(Duration::from_nanos(1)).is_err());
+    assert_eq!(worker.counts.attempts, u64::MAX);
+}
+
+#[test]
+fn aggregation_rejects_merged_counter_overflow() {
+    let maximum = WorkerMetrics {
+        counts: AttemptCounts {
+            attempts: u64::MAX,
+            successful_attempts: u64::MAX,
+            conflict_aborts: 0,
+            committed_operations: u64::MAX,
+            retries: 0,
+            unexpected_errors: 0,
+        },
+        latency: LatencyHistogram::default(),
+    };
+    let mut one = WorkerMetrics::default();
+    one.record_commit(Duration::from_nanos(1)).unwrap();
+
+    assert!(
+        CellMetrics::from_workers(
+            &[maximum, one],
+            CellAggregateInput {
+                effective_elapsed: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .is_err()
+    );
 }
