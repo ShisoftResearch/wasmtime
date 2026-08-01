@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::ThreadId;
 
+#[cfg(test)]
+use super::GcMvccMode;
 #[cfg(all(
     test,
     feature = "transaction-mvcc",
@@ -1299,6 +1301,11 @@ impl TransactionRegionRuntime {
     #[cfg(test)]
     pub(crate) fn visibility_for_test(&self) -> SelectedTransactionVisibility {
         self.visibility()
+    }
+
+    #[cfg(test)]
+    pub(super) fn persistent_gc_mode_for_test(&self) -> Result<GcMvccMode> {
+        Ok(self.lock_persistent_gc_policy()?.mvcc_mode())
     }
 
     #[cfg(test)]

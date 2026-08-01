@@ -81,6 +81,13 @@ impl MvccVisibility {
     pub(crate) fn fail_finish_snapshot_once_for_test(&self) -> Result<()> {
         self.0.coordinator.fail_finish_snapshot_once_for_test()
     }
+
+    #[cfg(test)]
+    pub(crate) fn opportunistically_pruned_version_count_for_test(&self) -> u64 {
+        self.0
+            .opportunistically_pruned_versions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Default for MvccVisibility {
@@ -102,6 +109,14 @@ impl TransactionVisibility for MvccVisibility {
 
     fn finish_snapshot(&self, snapshot: Self::Snapshot) -> Result<()> {
         snapshot.finish()?;
+        #[cfg(test)]
+        if let Ok(report) = self.0.prune_versions(MvccPruneBudget::chains(8)) {
+            self.0.opportunistically_pruned_versions.fetch_add(
+                u64::try_from(report.removed_versions).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        #[cfg(not(test))]
         let _ = self.0.prune_versions(MvccPruneBudget::chains(8));
         Ok(())
     }

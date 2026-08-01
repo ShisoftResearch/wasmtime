@@ -10,6 +10,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 #[cfg(test)]
 use std::sync::Condvar;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
@@ -96,6 +98,8 @@ pub(crate) struct MvccRuntime {
     commit_fault: Mutex<VecDeque<MvccCommitFaultPoint>>,
     #[cfg(test)]
     pub(super) gc_rebase_before_domains: Mutex<Option<Arc<MvccCommitTestHook>>>,
+    #[cfg(test)]
+    pub(super) opportunistically_pruned_versions: AtomicU64,
 }
 
 impl MvccRuntime {
@@ -131,6 +135,47 @@ impl MvccRuntime {
             !chain.is_empty()
         });
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_version_count_for_test(&self) -> Result<usize> {
+        let state = self.domains.lock()?;
+        Ok(state
+            .memories
+            .chains
+            .values()
+            .map(VersionChain::version_count)
+            .sum::<usize>()
+            + state
+                .memory_sizes
+                .chains
+                .values()
+                .map(VersionChain::version_count)
+                .sum::<usize>()
+            + state
+                .globals
+                .chains
+                .values()
+                .map(VersionChain::version_count)
+                .sum::<usize>()
+            + state
+                .tables
+                .chains
+                .values()
+                .map(VersionChain::version_count)
+                .sum::<usize>()
+            + state
+                .table_sizes
+                .chains
+                .values()
+                .map(VersionChain::version_count)
+                .sum::<usize>()
+            + state
+                .objects
+                .chains
+                .values()
+                .map(VersionChain::version_count)
+                .sum::<usize>())
     }
 
     #[cfg(test)]

@@ -58,6 +58,12 @@ pub(crate) struct TransactionState {
     pub(super) durable_log: TxDurableLog,
     #[cfg(feature = "transaction-mvcc")]
     pub(super) mvcc_terminal_commit: Option<MvccTerminalCommitState>,
+    #[cfg(all(
+        test,
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(super) benchmark_mvcc_terminal_commit: Option<BenchmarkMvccTerminalCommitState>,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +91,12 @@ pub(super) struct TransactionWorkspace {
     pending_memory_store: Option<PendingMemoryStore>,
     #[cfg(feature = "transaction-mvcc")]
     mvcc_terminal_commit: Option<MvccTerminalCommitState>,
+    #[cfg(all(
+        test,
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    benchmark_mvcc_terminal_commit: Option<BenchmarkMvccTerminalCommitState>,
 }
 
 impl Default for TransactionState {
@@ -131,6 +143,12 @@ impl Default for TransactionState {
             durable_log: TxDurableLog::default(),
             #[cfg(feature = "transaction-mvcc")]
             mvcc_terminal_commit: None,
+            #[cfg(all(
+                test,
+                feature = "transaction-mvcc",
+                feature = "transaction-cc-optimistic-validation"
+            ))]
+            benchmark_mvcc_terminal_commit: None,
         }
     }
 }
@@ -174,6 +192,31 @@ pub(crate) struct MvccTerminalCommitState {
     pub(crate) before_publish_hook_ran: bool,
     #[cfg(test)]
     pub(crate) after_publish_hook_ran: bool,
+}
+
+#[cfg(all(
+    test,
+    feature = "transaction-mvcc",
+    feature = "transaction-cc-optimistic-validation"
+))]
+#[derive(Debug)]
+pub(super) struct BenchmarkMvccTerminalCommitState {
+    visibility: Arc<mvcc::MvccRuntime>,
+    commit: Arc<mvcc::CommitRecord>,
+    pending: Option<mvcc::PendingCommitRegistration>,
+    certification: Option<concurrency::MvccCertificationPermit>,
+    user_region_permit: Option<region_runtime::UserTransactionRegionPermit>,
+    prepared: PreparedDomainValues,
+    installed: BTreeSet<GranuleId>,
+    undo_published: BTreeSet<GranuleId>,
+    stream_id: u32,
+    txid: u32,
+    final_marker: Option<PendingCommitLogEntry>,
+    lp_published: bool,
+    version_bumps_applied: bool,
+    wrote: bool,
+    decision: MvccTerminalDecision,
+    completion_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -4337,6 +4380,15 @@ impl TransactionState {
             self.mvcc_terminal_commit.is_none(),
             "MVCC terminal commit retry is pending"
         );
+        #[cfg(all(
+            test,
+            feature = "transaction-mvcc",
+            feature = "transaction-cc-optimistic-validation"
+        ))]
+        ensure!(
+            self.benchmark_mvcc_terminal_commit.is_none(),
+            "benchmark MVCC terminal commit retry is pending"
+        );
         Ok(())
     }
 
@@ -4377,6 +4429,12 @@ impl TransactionState {
             pending_memory_store: self.pending_memory_store.take(),
             #[cfg(feature = "transaction-mvcc")]
             mvcc_terminal_commit: self.mvcc_terminal_commit.take(),
+            #[cfg(all(
+                test,
+                feature = "transaction-mvcc",
+                feature = "transaction-cc-optimistic-validation"
+            ))]
+            benchmark_mvcc_terminal_commit: self.benchmark_mvcc_terminal_commit.take(),
         }
     }
 
@@ -4405,6 +4463,14 @@ impl TransactionState {
         #[cfg(feature = "transaction-mvcc")]
         {
             self.mvcc_terminal_commit = workspace.mvcc_terminal_commit;
+        }
+        #[cfg(all(
+            test,
+            feature = "transaction-mvcc",
+            feature = "transaction-cc-optimistic-validation"
+        ))]
+        {
+            self.benchmark_mvcc_terminal_commit = workspace.benchmark_mvcc_terminal_commit;
         }
     }
 
@@ -4684,6 +4750,593 @@ impl TransactionState {
 
     pub(super) fn commit_tmemory_for_test(&mut self, tmemory: &mut TMemory) -> Result<bool> {
         self.commit_tmemory_owned(Some(InstanceId::from_u32(0)), 0, tmemory)
+    }
+
+    pub(crate) fn commit_single_tmemory_for_benchmark(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+    ) -> Result<bool> {
+        #[cfg(all(
+            feature = "transaction-mvcc",
+            feature = "transaction-cc-optimistic-validation"
+        ))]
+        {
+            return self.commit_single_tmemory_for_benchmark_mvcc(tmemory);
+        }
+
+        #[cfg(not(all(
+            feature = "transaction-mvcc",
+            feature = "transaction-cc-optimistic-validation"
+        )))]
+        {
+            let granules = self
+                .active_read_granules()?
+                .into_iter()
+                .chain(self.active_write_granules()?)
+                .collect::<BTreeSet<_>>();
+            let versions = {
+                let tmemory = tmemory
+                    .lock()
+                    .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+                granules
+                    .into_iter()
+                    .map(|granule| {
+                        let GranuleId::TMemory {
+                            instance: None,
+                            memory_index: 0,
+                            granule_index,
+                        } = granule
+                        else {
+                            bail!("single-tmemory benchmark state contains a non-benchmark granule")
+                        };
+                        let granule_index = usize::try_from(granule_index)
+                            .context("benchmark tmemory granule index does not fit usize")?;
+                        Ok((granule, tmemory.granule_version(granule_index)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?
+            };
+            let current_version = |granule| {
+                versions
+                    .get(&granule)
+                    .copied()
+                    .context("benchmark tmemory validation granule was not captured")
+            };
+            self.validate_active_reads_with(current_version)?;
+            self.validate_active_writes_with(&mut |granule| {
+                versions
+                    .get(&granule)
+                    .copied()
+                    .context("benchmark tmemory validation granule was not captured")
+            })?;
+            self.begin_terminal_commit()?;
+            let wrote = {
+                let mut tmemory = tmemory
+                    .lock()
+                    .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+                self.commit_tmemory_owned(None, 0, &mut *tmemory)?
+            };
+            self.complete_commit()?;
+            Ok(wrote)
+        }
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn commit_single_tmemory_for_benchmark_mvcc(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+    ) -> Result<bool> {
+        if self.benchmark_mvcc_terminal_commit.is_some() {
+            return self.drive_benchmark_mvcc_terminal_commit(tmemory);
+        }
+
+        let (visibility, snapshot, transaction, reads, writes) =
+            self.active_mvcc_commit_context()?;
+        let shared_runtime = self.shared_region_runtime_for_publication().cloned();
+        let user_region_permit = shared_runtime
+            .as_ref()
+            .map(TransactionRegionRuntime::begin_user_transaction_region)
+            .transpose()?;
+
+        if writes.is_empty() {
+            self.begin_terminal_commit()?;
+            self.complete_commit()?;
+            drop(user_region_permit);
+            return Ok(false);
+        }
+
+        let certification = match self.acquire_active_mvcc_certification(
+            &visibility,
+            snapshot,
+            transaction,
+            &reads,
+            &writes,
+        ) {
+            Ok(certification) => certification,
+            Err(error) => {
+                let cleanup = if self.active_transaction().is_some() {
+                    self.abort()
+                } else {
+                    Ok(())
+                };
+                return combine_operation_and_cleanup_results(
+                    Err(error),
+                    cleanup,
+                    "failed to abort benchmark transaction after MVCC certification conflict",
+                );
+            }
+        };
+        let (commit, pending) = match visibility.begin_pending_commit() {
+            Ok(pending) => pending,
+            Err(error) => {
+                let cleanup = if self.active_transaction().is_some() {
+                    self.abort()
+                } else {
+                    Ok(())
+                };
+                return combine_operation_and_cleanup_results(
+                    Err(error),
+                    cleanup,
+                    "failed to abort benchmark transaction after pending-commit registration",
+                );
+            }
+        };
+
+        let publication_ids = (|| -> Result<(u32, u32)> {
+            let transaction_id = self.active_transaction_required_raw()?;
+            let stream_id = if let Some(runtime) = self.shared_region_runtime_for_publication() {
+                runtime.current_thread_log_segment()?.stream_id()
+            } else {
+                u32::try_from(transaction_id)
+                    .context("transaction id does not fit durable tmemory stream id")?
+            };
+            let txid = u32::try_from(transaction_id)
+                .context("transaction id does not fit durable transaction id")?;
+            Ok((stream_id, txid))
+        })();
+        let (stream_id, txid) = match publication_ids {
+            Ok(ids) => ids,
+            Err(error) => {
+                return self.finish_benchmark_mvcc_uninstalled_failure(
+                    tmemory,
+                    visibility,
+                    commit,
+                    pending,
+                    certification,
+                    user_region_permit,
+                    PreparedDomainValues::default(),
+                    0,
+                    0,
+                    error,
+                );
+            }
+        };
+
+        let preparation = (|| -> Result<PreparedDomainValues> {
+            let staged = self.staged_tmemory_granules_owned(None, 0)?;
+            let tmemory_guard = tmemory
+                .lock()
+                .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+            let mut physical_values = PreparedDomainValues::default();
+            for (granule, granule_index, value) in staged {
+                let addr = u64::try_from(granule_index)
+                    .context("benchmark tmemory granule index does not fit u64")?
+                    .checked_mul(u64::try_from(TMEMORY_GRANULE_SIZE).unwrap())
+                    .context("benchmark tmemory granule address overflow")?;
+                let predecessor =
+                    collect_tmemory_access_snapshot(&tmemory_guard, addr, value.len())?.bytes;
+                ensure!(
+                    physical_values
+                        .memories
+                        .insert(granule, PreparedValue { predecessor, value })
+                        .is_none(),
+                    "benchmark tmemory granule was prepared more than once"
+                );
+            }
+            drop(tmemory_guard);
+            visibility.run_predecessor_collected_hook_for_test()?;
+            let mut prepare = visibility.begin_prepare(commit.clone())?;
+            prepare.append_prepared_values(physical_values)?;
+            Ok(prepare.into_values())
+        })();
+        let prepared = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self.finish_benchmark_mvcc_uninstalled_failure(
+                    tmemory,
+                    visibility,
+                    commit,
+                    pending,
+                    certification,
+                    user_region_permit,
+                    PreparedDomainValues::default(),
+                    stream_id,
+                    txid,
+                    error,
+                );
+            }
+        };
+
+        if let Err(error) = self.begin_terminal_commit() {
+            return self.finish_benchmark_mvcc_uninstalled_failure(
+                tmemory,
+                visibility,
+                commit,
+                pending,
+                certification,
+                user_region_permit,
+                prepared,
+                stream_id,
+                txid,
+                error,
+            );
+        }
+
+        self.benchmark_mvcc_terminal_commit = Some(BenchmarkMvccTerminalCommitState {
+            visibility,
+            commit,
+            pending: Some(pending),
+            certification: Some(certification),
+            user_region_permit,
+            wrote: !prepared.memories.is_empty(),
+            prepared,
+            installed: BTreeSet::new(),
+            undo_published: BTreeSet::new(),
+            stream_id,
+            txid,
+            final_marker: None,
+            lp_published: false,
+            version_bumps_applied: false,
+            decision: MvccTerminalDecision::Abortable,
+            completion_error: None,
+        });
+        self.drive_benchmark_mvcc_terminal_commit(tmemory)
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn benchmark_mvcc_version_count_for_commit(&self) -> Result<u64> {
+        let count = match &self.benchmark_mvcc_terminal_commit {
+            Some(terminal) => terminal.prepared.memories.len(),
+            None => self
+                .staged_granules
+                .keys()
+                .filter(|granule| {
+                    matches!(
+                        granule,
+                        GranuleId::TMemory {
+                            instance: None,
+                            memory_index: 0,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+        };
+        u64::try_from(count).context("benchmark MVCC created-version count does not fit u64")
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn has_benchmark_mvcc_terminal_for_test(&self) -> bool {
+        self.benchmark_mvcc_terminal_commit.is_some()
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn finish_benchmark_mvcc_uninstalled_failure(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        visibility: Arc<mvcc::MvccRuntime>,
+        commit: Arc<mvcc::CommitRecord>,
+        pending: mvcc::PendingCommitRegistration,
+        certification: concurrency::MvccCertificationPermit,
+        user_region_permit: Option<region_runtime::UserTransactionRegionPermit>,
+        prepared: PreparedDomainValues,
+        stream_id: u32,
+        txid: u32,
+        error: crate::Error,
+    ) -> Result<bool> {
+        let terminal = BenchmarkMvccTerminalCommitState {
+            visibility,
+            commit,
+            pending: Some(pending),
+            certification: Some(certification),
+            user_region_permit,
+            wrote: !prepared.memories.is_empty(),
+            prepared,
+            installed: BTreeSet::new(),
+            undo_published: BTreeSet::new(),
+            stream_id,
+            txid,
+            final_marker: None,
+            lp_published: false,
+            version_bumps_applied: false,
+            decision: MvccTerminalDecision::Abortable,
+            completion_error: None,
+        };
+        self.finish_benchmark_mvcc_pre_decision_failure(tmemory, terminal, format!("{error:#}"))
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn drive_benchmark_mvcc_terminal_commit(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+    ) -> Result<bool> {
+        let mut terminal = self
+            .benchmark_mvcc_terminal_commit
+            .take()
+            .context("benchmark MVCC terminal commit state is missing")?;
+        if terminal.decision == MvccTerminalDecision::Rollback {
+            let original = terminal
+                .completion_error
+                .clone()
+                .unwrap_or_else(|| "benchmark MVCC rollback retry".to_string());
+            return self.finish_benchmark_mvcc_pre_decision_failure(tmemory, terminal, original);
+        }
+
+        let attempt = (|| -> Result<()> {
+            if terminal.decision == MvccTerminalDecision::Abortable {
+                terminal
+                    .visibility
+                    .inject_commit_fault_for_test(MvccCommitFaultPoint::AfterPreparation)?;
+                self.install_benchmark_mvcc_current_values(tmemory, &mut terminal)?;
+                if let Some(marker) = terminal.final_marker {
+                    self.publish_commit_lp(terminal.stream_id, terminal.txid, marker)?;
+                    terminal.lp_published = true;
+                    terminal.decision = MvccTerminalDecision::ForceCommit;
+                    terminal
+                        .visibility
+                        .inject_commit_fault_for_test(MvccCommitFaultPoint::AfterDurableLp)?;
+                }
+            }
+            self.force_complete_benchmark_mvcc_commit(&mut terminal)
+        })();
+
+        match attempt {
+            Ok(()) => Ok(terminal.wrote),
+            Err(error) if terminal.decision == MvccTerminalDecision::Abortable => self
+                .finish_benchmark_mvcc_pre_decision_failure(
+                    tmemory,
+                    terminal,
+                    format!("{error:#}"),
+                ),
+            Err(error) => {
+                let original = format!("{error:#}");
+                terminal.completion_error = Some(original.clone());
+                let outcome = if terminal.lp_published {
+                    "committed durably"
+                } else {
+                    "committed irrevocably"
+                };
+                if self.active_transaction().is_none() {
+                    return Err(crate::format_err!(
+                        "benchmark transaction {outcome} but completion/cleanup failed: {original}"
+                    ));
+                }
+                match self.force_complete_benchmark_mvcc_commit(&mut terminal) {
+                    Ok(()) => Err(crate::format_err!(
+                        "benchmark transaction {outcome} but completion/cleanup failed: {original}"
+                    )),
+                    Err(completion_error) => {
+                        if self.active_transaction().is_some() {
+                            self.benchmark_mvcc_terminal_commit = Some(terminal);
+                        }
+                        Err(crate::format_err!(
+                            "benchmark transaction {outcome} but completion/cleanup failed: {original}; force-completion also failed: {completion_error:#}"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn install_benchmark_mvcc_current_values(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        terminal: &mut BenchmarkMvccTerminalCommitState,
+    ) -> Result<()> {
+        let values = terminal
+            .prepared
+            .memories
+            .iter()
+            .map(|(&granule, value)| (granule, value.value.clone()))
+            .collect::<Vec<_>>();
+        let mut tmemory = tmemory
+            .lock()
+            .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+
+        if tmemory.backend() != TMemoryBackend::VMemory {
+            for (granule, value) in &values {
+                if terminal.undo_published.contains(granule) {
+                    continue;
+                }
+                let GranuleId::TMemory {
+                    instance: None,
+                    memory_index: 0,
+                    granule_index,
+                } = *granule
+                else {
+                    bail!("benchmark MVCC installer received a non-benchmark granule")
+                };
+                let undo = tmemory.prepare_tmemory_undo_record(None, 0, granule_index, value)?;
+                terminal.final_marker = Some(self.publish_tmemory_undo_before_in_place_write(
+                    terminal.stream_id,
+                    terminal.txid,
+                    &undo,
+                )?);
+                terminal.undo_published.insert(*granule);
+            }
+        }
+
+        for (granule, value) in values {
+            if terminal.installed.contains(&granule) {
+                continue;
+            }
+            let GranuleId::TMemory {
+                instance: None,
+                memory_index: 0,
+                granule_index,
+            } = granule
+            else {
+                bail!("benchmark MVCC installer received a non-benchmark granule")
+            };
+            tmemory.commit_staged_tmemory_granule(granule_index, &value)?;
+            terminal.installed.insert(granule);
+            terminal
+                .visibility
+                .inject_commit_fault_for_test(MvccCommitFaultPoint::AfterMemoryInstall)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn force_complete_benchmark_mvcc_commit(
+        &mut self,
+        terminal: &mut BenchmarkMvccTerminalCommitState,
+    ) -> Result<()> {
+        if let Some(pending) = terminal.pending.as_mut() {
+            terminal
+                .visibility
+                .inject_commit_fault_for_test(MvccCommitFaultPoint::BeforeRecordPublication)?;
+            let _timestamp = pending.publish()?;
+            terminal.pending = None;
+            terminal.decision = MvccTerminalDecision::ForceCommit;
+        }
+        terminal
+            .visibility
+            .inject_commit_fault_for_test(MvccCommitFaultPoint::AfterRecordTransition)?;
+        if !terminal.version_bumps_applied {
+            self.prepare_mvcc_version_commit_completion()?;
+            terminal.version_bumps_applied = true;
+        }
+        self.remove_staged_tmemory_granules_owned(None, 0)?;
+        terminal
+            .visibility
+            .inject_commit_fault_for_test(MvccCommitFaultPoint::DuringCleanup)?;
+        self.finish_mvcc_commit_cleanup()?;
+        terminal.certification.take();
+        terminal.user_region_permit.take();
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn finish_benchmark_mvcc_pre_decision_failure(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        mut terminal: BenchmarkMvccTerminalCommitState,
+        original: String,
+    ) -> Result<bool> {
+        terminal.decision = MvccTerminalDecision::Rollback;
+        terminal.completion_error = Some(original.clone());
+        let abort_record = match terminal.pending.as_mut() {
+            Some(pending) => pending.abort(),
+            None => Ok(()),
+        };
+        if abort_record.is_ok() {
+            terminal.pending = None;
+        }
+        let rollback = self.rollback_benchmark_mvcc_current_values(tmemory, &mut terminal);
+        let remove_versions = if abort_record.is_ok() && rollback.is_ok() {
+            terminal
+                .visibility
+                .remove_aborted_commit_versions(&terminal.commit)
+        } else {
+            Ok(())
+        };
+        let retry_required = abort_record.is_err() || rollback.is_err() || remove_versions.is_err();
+        let abort = if retry_required {
+            Ok(())
+        } else if self.active_transaction().is_some() {
+            self.abort()
+        } else {
+            Ok(())
+        };
+
+        let cleanup = combine_operation_and_cleanup_results(
+            abort_record,
+            rollback,
+            "failed to restore benchmark MVCC current values",
+        );
+        let cleanup = combine_operation_and_cleanup_results(
+            cleanup,
+            remove_versions,
+            "failed to remove aborted benchmark MVCC versions",
+        );
+        let cleanup = combine_operation_and_cleanup_results(
+            cleanup,
+            abort,
+            "failed to abort benchmark MVCC transaction",
+        );
+        match cleanup {
+            Ok(()) => Err(crate::format_err!("{original}")),
+            Err(cleanup_error) => {
+                if retry_required && self.active_transaction().is_some() {
+                    self.benchmark_mvcc_terminal_commit = Some(terminal);
+                    Err(crate::format_err!(
+                        "{original}; benchmark MVCC rollback requires an explicit retry: {cleanup_error:#}"
+                    ))
+                } else {
+                    Err(crate::format_err!(
+                        "{original}; benchmark MVCC rollback/cleanup also failed: {cleanup_error:#}"
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn rollback_benchmark_mvcc_current_values(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        terminal: &mut BenchmarkMvccTerminalCommitState,
+    ) -> Result<()> {
+        let installed = terminal.installed.iter().rev().copied().collect::<Vec<_>>();
+        let mut tmemory = tmemory
+            .lock()
+            .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+        for granule in installed {
+            let predecessor = terminal
+                .prepared
+                .memories
+                .get(&granule)
+                .context("installed benchmark MVCC granule has no predecessor")?
+                .predecessor
+                .clone();
+            let GranuleId::TMemory { granule_index, .. } = granule else {
+                bail!("benchmark MVCC rollback received a non-memory granule")
+            };
+            tmemory.commit_staged_tmemory_granule(granule_index, &predecessor)?;
+            terminal.installed.remove(&granule);
+            terminal
+                .visibility
+                .inject_commit_fault_for_test(MvccCommitFaultPoint::DuringRollback)?;
+        }
+        Ok(())
     }
 
     pub(super) fn begin_terminal_commit_with_cleanup_for_test(
