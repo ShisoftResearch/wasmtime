@@ -12597,7 +12597,10 @@ fn lower_transaction_id_cannot_preempt_higher_suspended_writer_under_nowait_abor
 }
 
 #[test]
-#[cfg(feature = "transaction-cc-lockbased")]
+#[cfg(all(
+    not(feature = "transaction-mvcc"),
+    feature = "transaction-cc-lockbased"
+))]
 fn lower_transaction_id_reader_records_version_after_aborting_writer() {
     clear_current_thread_transaction_for_test();
     let mut state = TransactionState::default();
@@ -12992,7 +12995,7 @@ fn aborting_suspended_transaction_releases_only_its_locks() {
         .acquire_memory_granule_write(0, 1, vec![0xbb; TMEMORY_GRANULE_SIZE])
         .unwrap();
 
-    if transaction_cc_is_ownerless_multiwriter() {
+    if cfg!(feature = "transaction-mvcc") || transaction_cc_is_ownerless_multiwriter() {
         state.acquire_memory_granule_read(0, 0).unwrap();
     } else {
         let conflict = state.acquire_memory_granule_read(0, 0).unwrap_err();

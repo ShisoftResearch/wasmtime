@@ -547,7 +547,7 @@ Apply formatting only if required and inspect all formatter changes.
 ```bash
 for cc in lockbased nowait-abort optimistic-validation strict-2pl timestamp-ordering wait-die wound-wait; do
   for visibility in single mvcc; do
-    features="std,runtime,cranelift,wat,transaction-cc-$cc"
+    features="anyhow,async,backtrace,cache,gc,gc-copying,gc-drc,gc-null,wat,profiling,parallel-compilation,cranelift,pooling-allocator,demangle,addr2line,coredump,debug-builtins,runtime,component-model,component-model-async,threads,stack-switching,std,debug,compile-time-builtins,wit-parser,transaction-cc-$cc"
     test "$visibility" = mvcc && features="$features,transaction-mvcc"
     cargo test -p wasmtime --no-default-features --features "$features" --lib || exit 1
   done
@@ -562,7 +562,7 @@ Use the same loop with:
 
 ```bash
 cargo test -p wasmtime --no-default-features --features "$features" \
-  --test all transaction_persistence -- --nocapture
+  --test transaction_persistence -- --nocapture
 ```
 
 Expected: fourteen successful suites.
