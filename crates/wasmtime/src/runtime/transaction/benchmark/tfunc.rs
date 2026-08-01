@@ -252,6 +252,8 @@ mod tests {
     use super::super::config::compiled_policy_name;
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc;
+    use std::thread;
 
     #[test]
     fn controls_validate_read_checksum_and_rmw_delta_for_both_backends() -> Result<()> {
@@ -293,5 +295,27 @@ mod tests {
         let result = outcome.expect("extreme tfunc duration must not panic");
         let error = result.unwrap_err().to_string();
         assert!(error.contains("deadline overflow"), "{error}");
+    }
+
+    #[test]
+    fn controls_reject_overlong_finite_phases_before_starting_warmup() {
+        let mut request = BenchmarkRequest::quick(compiled_policy_name().into());
+        request.warmup_ms = 24 * 60 * 60 * 1_000 + 1;
+        request.measure_ms = 1;
+        request.repetitions = 1;
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = run_tfunc_controls(&request, BackendKind::Vmemory)
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("overlong tfunc request started executing instead of failing validation");
+        worker.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("at most"), "{error}");
     }
 }

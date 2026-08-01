@@ -7,24 +7,34 @@ mod tfunc;
 mod workload;
 
 use self::config::{
-    BenchmarkRequest, MatrixDisposition, compiled_policy_name, compiled_transaction_features,
+    BenchmarkRequest, CellSpec, MatrixDisposition, compiled_policy_name,
+    compiled_transaction_features,
 };
 use self::record::{
-    BenchmarkRecord, CompleteRecord, DriverRecord, FailureRecord, JsonlWriter, SCHEMA_VERSION,
-    SkippedCellRecord,
+    BenchmarkRecord, CellRecord, CompleteRecord, DriverRecord, FailureRecord, JsonlWriter,
+    SCHEMA_VERSION, SkippedCellRecord,
 };
-use self::runner::run_cell;
+use self::runner::{cell_failure_record, run_cell};
 use self::tfunc::run_tfunc_controls;
 use super::{GcMvccMode, TransactionRegionRuntime};
 use crate::prelude::*;
 use std::path::Path;
 
 fn run_driver(request_path: &Path, output_path: &Path) -> Result<()> {
-    let request = BenchmarkRequest::read(request_path)?;
-    request.validate()?;
     let available_parallelism = std::thread::available_parallelism()
         .map(usize::from)
         .context("failed to determine available parallelism")?;
+    run_driver_with_cell_runner(request_path, output_path, available_parallelism, run_cell)
+}
+
+fn run_driver_with_cell_runner(
+    request_path: &Path,
+    output_path: &Path,
+    available_parallelism: usize,
+    mut cell_runner: impl FnMut(&BenchmarkRequest, &CellSpec) -> Result<CellRecord>,
+) -> Result<()> {
+    let request = BenchmarkRequest::read(request_path)?;
+    request.validate()?;
     let gc_policy_mode = selected_gc_policy_mode()?;
     let mut writer = JsonlWriter::create(output_path)?;
     let compiled_features = compiled_transaction_features()
@@ -43,13 +53,13 @@ fn run_driver(request_path: &Path, output_path: &Path) -> Result<()> {
     let mut skipped_cells = 0usize;
     for entry in request.cells(available_parallelism) {
         match entry.disposition {
-            MatrixDisposition::Run => match run_cell(&request, &entry.spec) {
+            MatrixDisposition::Run => match cell_runner(&request, &entry.spec) {
                 Ok(record) => {
                     writer.write(&BenchmarkRecord::Cell(record))?;
                     completed_cells += 1;
                 }
                 Err(error) => {
-                    write_failure(&mut writer, Some(entry.spec), "cell", &error)?;
+                    write_cell_failure(&mut writer, &entry.spec, &error)?;
                     return Err(error);
                 }
             },
@@ -89,6 +99,18 @@ fn run_driver(request_path: &Path, output_path: &Path) -> Result<()> {
         tfunc_controls,
     }))?;
     Ok(())
+}
+
+fn write_cell_failure(writer: &mut JsonlWriter, spec: &CellSpec, error: &Error) -> Result<()> {
+    if let Some(failure) = cell_failure_record(error) {
+        ensure!(
+            failure.cell.as_ref() == Some(spec),
+            "typed benchmark cell failure does not match the active cell"
+        );
+        writer.write(&BenchmarkRecord::Failure(failure.clone()))
+    } else {
+        write_failure(writer, Some(spec.clone()), "cell", error)
+    }
 }
 
 fn write_failure(
@@ -178,6 +200,79 @@ mod tests {
             "tfunc GC identity must match the selected pluggable collector"
         );
         assert_eq!(records.last().unwrap()["record_type"], "complete");
+        Ok(())
+    }
+
+    #[test]
+    fn all_skipped_driver_rejects_overlong_phases_before_writing_output() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let request_path = directory.path().join("request.json");
+        let output_path = directory.path().join("output.jsonl");
+        let mut request = BenchmarkRequest::quick(compiled_policy_name().into());
+        request.warmup_ms = 24 * 60 * 60 * 1_000 + 1;
+        request.measure_ms = 1;
+        request.backends = vec![BackendKind::Vmemory];
+        request.workloads = vec![WorkloadKind::ReadOnly];
+        request.workers = vec![usize::MAX];
+        request.include_tfunc_control = false;
+        std::fs::write(&request_path, serde_json::to_vec(&request)?)?;
+
+        let error = run_driver(&request_path, &output_path).unwrap_err();
+
+        assert!(format!("{error:#}").contains("at most"));
+        assert!(!output_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn driver_streams_exact_cell_failure_phase_after_prior_records() -> Result<()> {
+        for phase in [
+            "worker-startup",
+            "warmup-and-measurement",
+            "fixed-write-skew",
+        ] {
+            let directory = tempfile::tempdir()?;
+            let request_path = directory.path().join("request.json");
+            let output_path = directory.path().join("output.jsonl");
+            let mut request = BenchmarkRequest::quick(compiled_policy_name().into());
+            request.warmup_ms = 1;
+            request.measure_ms = 1;
+            request.backends = vec![BackendKind::Vmemory];
+            request.workloads = vec![WorkloadKind::ReadOnly];
+            request.workers = vec![usize::MAX, 1];
+            request.include_tfunc_control = false;
+            std::fs::write(&request_path, serde_json::to_vec(&request)?)?;
+
+            let error =
+                run_driver_with_cell_runner(&request_path, &output_path, 1, |_request, spec| {
+                    Err(runner::cell_failure(
+                        spec,
+                        phase,
+                        "injected driver failure".into(),
+                    ))
+                })
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("injected driver failure"));
+
+            let records = std::fs::read_to_string(&output_path)?
+                .lines()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let kinds = records
+                .iter()
+                .map(|record| record["record_type"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(kinds, ["driver", "skipped_cell", "failure"]);
+            assert_eq!(records[1]["spec"]["workers"], usize::MAX);
+            assert_eq!(records[2]["phase"], phase);
+            assert_eq!(records[2]["cell"]["workers"], 1);
+            assert_eq!(records[2]["message"], "injected driver failure");
+            assert!(
+                !records
+                    .iter()
+                    .any(|record| record["record_type"] == "complete")
+            );
+        }
         Ok(())
     }
 }

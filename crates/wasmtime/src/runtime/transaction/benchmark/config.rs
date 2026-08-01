@@ -3,6 +3,8 @@ use crate::prelude::*;
 use serde_derive::{Deserialize, Serialize};
 use std::path::Path;
 
+pub(super) const MAX_BENCHMARK_PHASE_MS: u64 = 24 * 60 * 60 * 1_000;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum BackendKind {
@@ -92,6 +94,10 @@ impl BenchmarkRequest {
         );
         ensure!(self.warmup_ms > 0, "warmup duration must be nonzero");
         ensure!(self.measure_ms > 0, "measurement duration must be nonzero");
+        ensure!(
+            self.warmup_ms <= MAX_BENCHMARK_PHASE_MS && self.measure_ms <= MAX_BENCHMARK_PHASE_MS,
+            "benchmark warmup and measurement duration must each be at most {MAX_BENCHMARK_PHASE_MS} milliseconds"
+        );
         ensure!(self.repetitions > 0, "repetitions must be nonzero");
         ensure!(
             self.gc_commit_interval > 0,
@@ -307,4 +313,22 @@ fn approved_single_version_policy_names_match_the_orchestrator_contract() {
         single_version_policy_name(ConcurrencyControl::TimestampOrdering),
         "timestamp"
     );
+}
+
+#[test]
+fn request_rejects_phase_durations_above_twenty_four_hours() {
+    const TWENTY_FOUR_HOURS_MS: u64 = 24 * 60 * 60 * 1_000;
+    let mut request = BenchmarkRequest::quick(compiled_policy_name().into());
+
+    request.warmup_ms = TWENTY_FOUR_HOURS_MS + 1;
+    let error = request.validate().unwrap_err().to_string();
+    assert!(error.contains("at most"), "{error}");
+
+    request.warmup_ms = TWENTY_FOUR_HOURS_MS;
+    request.measure_ms = TWENTY_FOUR_HOURS_MS + 1;
+    let error = request.validate().unwrap_err().to_string();
+    assert!(error.contains("at most"), "{error}");
+
+    request.measure_ms = TWENTY_FOUR_HOURS_MS;
+    request.validate().unwrap();
 }

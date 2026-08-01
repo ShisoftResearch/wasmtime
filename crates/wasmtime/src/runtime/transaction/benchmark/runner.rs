@@ -1,4 +1,4 @@
-use super::config::{BenchmarkRequest, CellSpec, WorkloadKind};
+use super::config::{BenchmarkRequest, CellSpec, MAX_BENCHMARK_PHASE_MS, WorkloadKind};
 use super::metrics::{CellAggregateInput, CellMetrics, GcMetrics, VersionMetrics, WorkerMetrics};
 use super::record::{CellRecord, FailureRecord, SCHEMA_VERSION};
 use super::storage::{
@@ -11,14 +11,13 @@ use super::workload::{
 use crate::prelude::*;
 use crate::runtime::transaction::clear_current_thread_transaction_on_drop_for_test;
 use std::any::Any;
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-const MAX_BENCHMARK_PHASE_MS: u64 = 24 * 60 * 60 * 1_000;
 
 fn checked_deadline(start: Instant, duration: Duration, description: &str) -> Result<Instant> {
     start
@@ -728,7 +727,36 @@ fn unfinished_workers(running: &[RunningWorker]) -> String {
     }
 }
 
-fn cell_failure(spec: &CellSpec, phase: &str, message: String) -> crate::Error {
+#[derive(Debug)]
+struct CellRunFailure {
+    record: FailureRecord,
+}
+
+impl fmt::Display for CellRunFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cell = self
+            .record
+            .cell
+            .as_ref()
+            .map(cell_name)
+            .unwrap_or_else(|| "unknown".into());
+        write!(
+            formatter,
+            "transaction benchmark failure in cell {} during phase {}: {}",
+            cell, self.record.phase, self.record.message
+        )
+    }
+}
+
+impl std::error::Error for CellRunFailure {}
+
+pub(super) fn cell_failure_record(error: &crate::Error) -> Option<&FailureRecord> {
+    error
+        .downcast_ref::<CellRunFailure>()
+        .map(|failure| &failure.record)
+}
+
+pub(super) fn cell_failure(spec: &CellSpec, phase: &str, message: String) -> crate::Error {
     let failure = FailureRecord {
         schema_version: SCHEMA_VERSION,
         policy: spec.policy.clone(),
@@ -736,12 +764,7 @@ fn cell_failure(spec: &CellSpec, phase: &str, message: String) -> crate::Error {
         phase: phase.to_string(),
         message,
     };
-    crate::format_err!(
-        "transaction benchmark failure in cell {} during phase {}: {}",
-        cell_name(spec),
-        failure.phase,
-        failure.message
-    )
+    crate::Error::new(CellRunFailure { record: failure })
 }
 
 fn cell_name(spec: &CellSpec) -> String {
@@ -1460,6 +1483,17 @@ mod tests {
             repetition: 0,
             seed: 0x5eed,
         }
+    }
+
+    #[test]
+    fn cell_failure_exposes_its_structured_phase_and_cell() {
+        let spec = spec(WorkloadKind::ReadOnly, 2);
+        let error = cell_failure(&spec, "warmup-and-measurement", "injected failure".into());
+
+        let failure = cell_failure_record(&error).expect("missing typed cell failure");
+        assert_eq!(failure.phase, "warmup-and-measurement");
+        assert_eq!(failure.cell.as_ref(), Some(&spec));
+        assert_eq!(failure.message, "injected failure");
     }
 
     #[test]
