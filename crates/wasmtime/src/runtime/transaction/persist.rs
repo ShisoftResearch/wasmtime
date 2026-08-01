@@ -5340,6 +5340,62 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
     }
 
     #[test]
+    fn stale_file_backed_data_cursor_refreshes_after_shared_chunk_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let mut first = TxDurableLog::create_file_backed(&path, 64).unwrap();
+
+        let first_marker = {
+            let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0300, 1, vec![1; 64]);
+            let mut sink = first.stream_sink(1);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 1, 1);
+            let marker = publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap();
+            publisher
+                .publish_commit_lp_deferred_retirement(marker)
+                .unwrap();
+            marker
+        };
+
+        let mut second = TxDurableLog::open_file_backed(&path).unwrap();
+        second
+            .retire_committed_linear_undo_chunk(LinearUndoChunkId::from_marker(first_marker))
+            .unwrap();
+        let reused_marker = {
+            let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0301, 2, vec![2; 64]);
+            let mut sink = second.stream_sink(2);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 2, 2);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap()
+        };
+        assert_eq!(
+            reused_marker.chunk_start_block,
+            first_marker.chunk_start_block
+        );
+
+        let stale_handle_marker = {
+            let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0302, 3, vec![3; 64]);
+            let mut sink = first.stream_sink(1);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 1, 3);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap()
+        };
+        let expected_stream = DurableDataStream::TMemoryUndo
+            .file_backed_stream_id(1)
+            .unwrap();
+        assert_eq!(
+            first
+                .data_chunk_stream_id_for_data_block_for_test(stale_handle_marker.data_block)
+                .unwrap(),
+            expected_stream,
+            "the stale handle appended into another stream's reused data chunk"
+        );
+    }
+
+    #[test]
     fn file_backed_log_invalidates_its_cursor_after_retiring_an_undo_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tx-log.bin");

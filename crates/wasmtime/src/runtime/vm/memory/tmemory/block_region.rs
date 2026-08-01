@@ -2288,6 +2288,44 @@ struct StreamState {
     current_data_chunk_start: Option<u32>,
 }
 
+fn data_chunk_is_current_stream_tail(
+    state: &StreamState,
+    stream_id: u32,
+    start_block: u32,
+    kind: BlockKind,
+    cached_meta: BlockMeta,
+    current_meta: BlockMeta,
+    header: DataChunkHeader,
+) -> Result<bool> {
+    Ok(cached_meta == current_meta
+        && current_meta.is_active_or_sealed()?
+        && current_meta.kind()? == kind
+        && current_meta.chunk_start == start_block
+        && current_meta.chunk_blocks > 0
+        && header.magic == DATA_CHUNK_MAGIC
+        && header.stream_id == stream_id
+        && header.chunk_seq.checked_add(1) == Some(state.next_data_chunk_seq)
+        && header.chunk_blocks == current_meta.chunk_blocks)
+}
+
+fn log_block_is_current_stream_tail(
+    state: &StreamState,
+    stream_id: u32,
+    start_block: u32,
+    cached_meta: BlockMeta,
+    current_meta: BlockMeta,
+    header: LogBlockHeader,
+) -> Result<bool> {
+    Ok(cached_meta == current_meta
+        && current_meta.is_active_or_sealed()?
+        && current_meta.kind()? == BlockKind::Log
+        && current_meta.chunk_start == start_block
+        && current_meta.chunk_blocks == 1
+        && header.magic == LOG_BLOCK_MAGIC
+        && header.stream_id == stream_id
+        && header.block_seq.checked_add(1) == Some(state.next_log_block_seq))
+}
+
 impl VMemoryBlockRegion {
     pub(crate) fn new(num_blocks: usize) -> Result<Self> {
         let bytes_len = num_blocks
@@ -2406,8 +2444,18 @@ impl VMemoryBlockRegion {
             return Ok(true);
         };
         let header = self.data_chunk_header(start_block)?;
-        let current_kind = self.block_meta(start_block)?.kind()?;
-        Ok(!(current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len()))
+        if !data_chunk_is_current_stream_tail(
+            state,
+            stream.stream_id,
+            start_block,
+            kind,
+            self.block_meta(start_block)?,
+            self.current_block_meta(start_block)?,
+            header,
+        )? {
+            return Ok(true);
+        }
+        Ok(self.chunk_remaining_capacity(header)? < bytes.len())
     }
 
     pub(crate) fn append_log_entry_requires_allocation(
@@ -2421,6 +2469,16 @@ impl VMemoryBlockRegion {
             return Ok(true);
         };
         let header = self.log_block_header(start_block)?;
+        if !log_block_is_current_stream_tail(
+            state,
+            stream.stream_id,
+            start_block,
+            self.block_meta(start_block)?,
+            self.current_block_meta(start_block)?,
+            header,
+        )? {
+            return Ok(true);
+        }
         Ok(
             usize::try_from(header.entry_count)
                 .context("transactional log entry count overflow")?
@@ -3027,6 +3085,10 @@ impl VMemoryBlockRegion {
             .context("transactional block metadata index out of bounds")
     }
 
+    fn current_block_meta(&self, block: u32) -> Result<BlockMeta> {
+        self.block_meta(block)
+    }
+
     #[cfg(test)]
     pub(crate) fn block_meta_for_test(&self, block: usize) -> Result<BlockMeta> {
         self.block_metas
@@ -3430,8 +3492,18 @@ impl DaxPmemBlockRegion {
             return Ok(true);
         };
         let header = self.data_chunk_header(start_block)?;
-        let current_kind = self.block_meta(start_block)?.kind()?;
-        Ok(!(current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len()))
+        if !data_chunk_is_current_stream_tail(
+            state,
+            stream.stream_id,
+            start_block,
+            kind,
+            self.block_meta(start_block)?,
+            self.current_block_meta(start_block)?,
+            header,
+        )? {
+            return Ok(true);
+        }
+        Ok(self.chunk_remaining_capacity(header)? < bytes.len())
     }
 
     pub(crate) fn append_log_entry_requires_allocation(
@@ -3445,6 +3517,16 @@ impl DaxPmemBlockRegion {
             return Ok(true);
         };
         let header = self.log_block_header(start_block)?;
+        if !log_block_is_current_stream_tail(
+            state,
+            stream.stream_id,
+            start_block,
+            self.block_meta(start_block)?,
+            self.current_block_meta(start_block)?,
+            header,
+        )? {
+            return Ok(true);
+        }
         Ok(
             usize::try_from(header.entry_count)
                 .context("transactional log entry count overflow")?
@@ -4110,6 +4192,11 @@ impl DaxPmemBlockRegion {
             .get(block)
             .copied()
             .context("transactional DAX PMEM block metadata index out of bounds")
+    }
+
+    fn current_block_meta(&self, block: u32) -> Result<BlockMeta> {
+        let block = usize::try_from(block).context("transactional block index overflow")?;
+        BlockMeta::from_bytes(self.read(self.block_meta_offset(block)?, BlockMeta::BYTE_LEN)?)
     }
 
     fn initialize_region_image(&mut self) -> Result<()> {
@@ -5020,8 +5107,18 @@ impl FileBackedMemoryBlockRegion {
             return Ok(true);
         };
         let header = self.data_chunk_header(start_block)?;
-        let current_kind = self.block_meta(start_block)?.kind()?;
-        Ok(!(current_kind == kind && self.chunk_remaining_capacity(header)? >= bytes.len()))
+        if !data_chunk_is_current_stream_tail(
+            state,
+            stream.stream_id,
+            start_block,
+            kind,
+            self.block_meta(start_block)?,
+            self.current_block_meta(start_block)?,
+            header,
+        )? {
+            return Ok(true);
+        }
+        Ok(self.chunk_remaining_capacity(header)? < bytes.len())
     }
 
     pub(crate) fn append_log_entry_requires_allocation(
@@ -5035,6 +5132,16 @@ impl FileBackedMemoryBlockRegion {
             return Ok(true);
         };
         let header = self.log_block_header(start_block)?;
+        if !log_block_is_current_stream_tail(
+            state,
+            stream.stream_id,
+            start_block,
+            self.block_meta(start_block)?,
+            self.current_block_meta(start_block)?,
+            header,
+        )? {
+            return Ok(true);
+        }
         Ok(
             usize::try_from(header.entry_count)
                 .context("transactional log entry count overflow")?
@@ -5879,6 +5986,11 @@ impl FileBackedMemoryBlockRegion {
             .get(block)
             .copied()
             .context("transactional FileBackedMemory block metadata index out of bounds")
+    }
+
+    fn current_block_meta(&self, block: u32) -> Result<BlockMeta> {
+        let block = usize::try_from(block).context("transactional block index overflow")?;
+        BlockMeta::from_bytes(self.read(self.block_meta_offset(block)?, BlockMeta::BYTE_LEN)?)
     }
 
     pub(crate) fn block_generation(&self, block: u32) -> Result<u32> {
