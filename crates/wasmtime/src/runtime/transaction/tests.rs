@@ -1,9 +1,6 @@
 #[cfg(not(feature = "transaction-cc-strict-2pl"))]
 use super::concurrency::CertificationMode;
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 use super::concurrency::MvccCertificationAuthority;
 #[cfg(not(feature = "transaction-cc-strict-2pl"))]
 use super::concurrency::OptimisticCertificationAuthority;
@@ -1215,10 +1212,7 @@ fn transaction_cc_read_version_conflict_message() -> &'static str {
     }
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_granule(granule_index: u64) -> GranuleId {
     GranuleId::TMemory {
         instance: Some(1),
@@ -3803,6 +3797,22 @@ fn mvcc_certification_assigns_shared_reads_and_exclusive_writes() {
             (blind_write, CertificationMode::Exclusive),
         ]
     );
+}
+
+#[test]
+#[cfg(feature = "transaction-mvcc")]
+fn mvcc_certification_lifecycle_is_available_for_selected_cc() {
+    let authority = Arc::new(MvccCertificationAuthority::default());
+    let transaction = TransactionId::from_raw(1);
+    let granule = mvcc_certification_granule(3);
+
+    let permit = authority
+        .acquire(transaction, &BTreeSet::from([granule]), &BTreeSet::new())
+        .unwrap();
+    assert_eq!(authority.lifecycle_counts_for_test().unwrap(), (1, 1));
+
+    drop(permit);
+    assert_eq!(authority.lifecycle_counts_for_test().unwrap(), (1, 0));
 }
 
 #[test]

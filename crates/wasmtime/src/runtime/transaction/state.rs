@@ -902,10 +902,7 @@ impl TransactionState {
         })
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn active_mvcc_commit_context(
         &self,
     ) -> Result<(
@@ -943,10 +940,7 @@ impl TransactionState {
             .acquire_optimistic_certification(transaction, &reads, &writes)
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn acquire_active_mvcc_certification(
         &self,
         runtime: &Arc<mvcc::MvccRuntime>,

@@ -1,6 +1,9 @@
 use crate::prelude::*;
 use alloc::collections::BTreeSet;
-#[cfg(not(feature = "transaction-cc-strict-2pl"))]
+#[cfg(any(
+    not(feature = "transaction-cc-strict-2pl"),
+    feature = "transaction-mvcc"
+))]
 use alloc::sync::Arc;
 
 use super::{ConcurrencyControl, GranuleId, TransactionId};
@@ -9,7 +12,10 @@ use super::{ConcurrencyControl, GranuleId, TransactionId};
 mod lock_based;
 #[cfg(feature = "transaction-cc-nowait-abort")]
 mod no_wait_abort;
-#[cfg(not(feature = "transaction-cc-strict-2pl"))]
+#[cfg(any(
+    not(feature = "transaction-cc-strict-2pl"),
+    feature = "transaction-mvcc"
+))]
 mod optimistic_certification;
 #[cfg(feature = "transaction-cc-optimistic-validation")]
 mod optimistic_validation;
@@ -26,23 +32,24 @@ mod wound_wait;
 pub(crate) use self::lock_based::LockBased;
 #[cfg(all(test, feature = "transaction-cc-lockbased"))]
 pub(crate) use self::lock_based::{LockBasedConflictKindForTest, LockBasedSnapshotForTest};
-#[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
+#[cfg(all(
+    test,
+    any(
+        not(feature = "transaction-cc-strict-2pl"),
+        feature = "transaction-mvcc"
+    )
+))]
 pub(crate) use self::optimistic_certification::CertificationMode;
-#[cfg(not(feature = "transaction-cc-strict-2pl"))]
+#[cfg(any(
+    not(feature = "transaction-cc-strict-2pl"),
+    feature = "transaction-mvcc"
+))]
 pub(crate) use self::optimistic_certification::{
     OptimisticCertificationAuthority, OptimisticCertificationPermit,
 };
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-cc-strict-2pl")
-))]
+#[cfg(feature = "transaction-mvcc")]
 pub(crate) type MvccCertificationAuthority = OptimisticCertificationAuthority;
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-cc-strict-2pl")
-))]
+#[cfg(feature = "transaction-mvcc")]
 pub(crate) type MvccCertificationPermit = OptimisticCertificationPermit;
 #[cfg(feature = "transaction-cc-nowait-abort")]
 pub(crate) use self::no_wait_abort::NoWaitAbort;
@@ -224,7 +231,10 @@ pub(crate) trait TransactionConcurrencyControl {
 #[derive(Debug, Default)]
 pub(crate) struct ConcurrencyControlState {
     policy: SelectedConcurrencyControl,
-    #[cfg(not(feature = "transaction-cc-strict-2pl"))]
+    #[cfg(any(
+        not(feature = "transaction-cc-strict-2pl"),
+        feature = "transaction-mvcc"
+    ))]
     commit_certification: Arc<OptimisticCertificationAuthority>,
 }
 
@@ -332,27 +342,20 @@ impl ConcurrencyControlState {
         self.commit_certification.clone()
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation",
-        not(feature = "transaction-cc-strict-2pl")
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn acquire_mvcc_certification(
         &self,
         transaction: TransactionId,
         reads: &BTreeSet<GranuleId>,
         writes: &BTreeSet<GranuleId>,
     ) -> Result<MvccCertificationPermit> {
-        self.acquire_optimistic_certification(transaction, reads, writes)
+        self.commit_certification
+            .acquire(transaction, reads, writes)
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation",
-        not(feature = "transaction-cc-strict-2pl")
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     pub(super) fn mvcc_certification_authority(&self) -> Arc<MvccCertificationAuthority> {
-        self.optimistic_certification_authority()
+        self.commit_certification.clone()
     }
 
     #[cfg(test)]

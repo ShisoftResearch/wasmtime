@@ -123,16 +123,6 @@ compile_error!(
      transaction-cc-timestamp-ordering"
 );
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    not(feature = "transaction-cc-optimistic-validation")
-))]
-compile_error!(
-    "transaction-mvcc currently requires \
-     transaction-cc-optimistic-validation; MVCC is an independent \
-     visibility feature and other concurrency-control adapters are not yet implemented"
-);
-
 // Milestone runtime core for proposal WAST progress. The current runtime uses
 // store-local transaction state, `VMemory` and configurable durable tmemory
 // transactional memory storage, and real `tmemory` sidecars. Remaining

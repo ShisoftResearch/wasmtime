@@ -61,8 +61,7 @@
 Run:
 
 ```bash
-cargo test -p wasmtime --no-default-features \
-  --features 'std,runtime,cranelift,wat,transaction-mvcc,transaction-cc-lockbased' \
+cargo test -p wasmtime --features transaction-mvcc \
   mvcc_is_visibility_not_concurrency_control --lib -- --exact
 ```
 
