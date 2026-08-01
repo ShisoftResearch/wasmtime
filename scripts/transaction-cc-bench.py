@@ -568,15 +568,7 @@ def run(args: argparse.Namespace, argv: Sequence[str] | None = None) -> int:
         invocation["failed_policy"] = None
         invocation["end_utc"] = _utc_now()
         invocation["elapsed_seconds"] = time.perf_counter() - started
-        for _ in range(10):
-            displayed_elapsed = f"{invocation['elapsed_seconds']:.3f}"
-            reporter._write_terminal_markdown(report_data, invocation)
-            invocation["end_utc"] = _utc_now()
-            invocation["elapsed_seconds"] = time.perf_counter() - started
-            if f"{invocation['elapsed_seconds']:.3f}" == displayed_elapsed:
-                break
-        else:
-            raise RuntimeError("total elapsed display did not stabilize")
+        reporter._write_terminal_markdown(report_data, invocation)
     except Exception as error:
         _append_jsonl(
             orchestrator_path,

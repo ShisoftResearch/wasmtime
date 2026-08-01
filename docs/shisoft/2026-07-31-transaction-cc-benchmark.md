@@ -135,7 +135,9 @@ During report construction, `invocation.json` remains nonterminal with status
 and reports finish, the orchestrator writes its single matching completion
 footer, and terminal invocation metadata is published as the final lifecycle
 write. Consequently the recorded elapsed time includes reporting and the
-orchestrator footer.
+orchestrator footer. That terminal elapsed value is frozen once and rendered
+into Markdown once; the final metadata render is not recursively added to the
+duration it displays.
 
 The Markdown report includes core scaling, MVCC-versus-OCC throughput,
 file-backed-versus-vmemory throughput, abort and retry behavior, GC and version

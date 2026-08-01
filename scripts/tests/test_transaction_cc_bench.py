@@ -379,6 +379,13 @@ class TransactionCcBenchTests(unittest.TestCase):
                 ]
             )
             observations = []
+            markdown_calls = 0
+            clock = 0.0
+
+            def advancing_clock():
+                nonlocal clock
+                clock += 0.002
+                return clock
 
             def fake_run(command, **kwargs):
                 if command[:3] == ["git", "rev-parse", "HEAD"]:
@@ -406,6 +413,8 @@ class TransactionCcBenchTests(unittest.TestCase):
                 return "prepared-data"
 
             def fake_terminal_markdown(data, invocation):
+                nonlocal markdown_calls
+                markdown_calls += 1
                 self.assertEqual("prepared-data", data)
                 on_disk = json.loads((run_dir / "invocation.json").read_text())
                 records = [
@@ -414,9 +423,14 @@ class TransactionCcBenchTests(unittest.TestCase):
                 ]
                 observations.append((on_disk["status"], records[-1]["record_type"]))
                 self.assertEqual("complete", invocation["status"])
+                # A large summary can take longer than the displayed 1 ms
+                # precision to write. That must not trigger recursive rewrites.
+                bench.time.perf_counter()
 
             with mock.patch.object(bench, "REPOSITORY_ROOT", repository_root), mock.patch.object(
                 bench.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                bench.time, "perf_counter", side_effect=advancing_clock
             ), mock.patch.object(
                 bench.reporter,
                 "_prepare_reports_before_completion",
@@ -437,6 +451,7 @@ class TransactionCcBenchTests(unittest.TestCase):
             self.assertEqual("complete", invocation["status"])
             self.assertIsNotNone(invocation["end_utc"])
             self.assertGreater(invocation["elapsed_seconds"], 0)
+            self.assertEqual(1, markdown_calls)
 
 
 if __name__ == "__main__":
