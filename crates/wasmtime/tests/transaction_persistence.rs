@@ -1018,20 +1018,37 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
     let second_outcome = second_instance
         .get_typed_func::<i32, ()>(&mut second_store, "publish")?
         .call(&mut second_store, 22);
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     {
         let err = format!("{:?}", second_outcome.unwrap_err());
         assert!(err.contains("transaction write conflict"), "{err}");
     }
-    #[cfg(feature = "transaction-mvcc")]
+    #[cfg(any(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     second_outcome?;
 
     *released = false;
     ready.notify_one();
     drop(released);
     let first_outcome = first.join().unwrap();
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     first_outcome?;
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    {
+        let err = format!("{:?}", first_outcome.unwrap_err());
+        assert_transaction_conflict(&err);
+    }
     #[cfg(feature = "transaction-mvcc")]
     {
         let err = format!("{:?}", first_outcome.unwrap_err());
@@ -1041,9 +1058,15 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
     let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
     assert_eq!(recovered.root_object_ids.len(), 1);
     assert_eq!(recovered.object_winners.len(), 2);
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11]);
-    #[cfg(feature = "transaction-mvcc")]
+    #[cfg(any(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![22]);
 
     Ok(())
@@ -1440,20 +1463,37 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
     let second_outcome = second_instance
         .get_typed_func::<i32, ()>(&mut second_store, "write")?
         .call(&mut second_store, 0x5566_7788);
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     {
         let err = format!("{:?}", second_outcome.unwrap_err());
         assert_transaction_conflict(&err);
     }
-    #[cfg(feature = "transaction-mvcc")]
+    #[cfg(any(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     second_outcome?;
 
     *released = false;
     ready.notify_one();
     drop(released);
     let first_outcome = first.join().unwrap();
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     first_outcome?;
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    {
+        let err = format!("{:?}", first_outcome.unwrap_err());
+        assert_transaction_conflict(&err);
+    }
     #[cfg(feature = "transaction-mvcc")]
     {
         let err = format!("{:?}", first_outcome.unwrap_err());
@@ -1466,9 +1506,15 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
         1,
         Some(1),
     )?;
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &0x1122_3344u32.to_le_bytes())?;
-    #[cfg(feature = "transaction-mvcc")]
+    #[cfg(any(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &0x5566_7788u32.to_le_bytes())?;
 
     Ok(())
@@ -1601,20 +1647,37 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
     let second_outcome = second_instance
         .get_typed_func::<i32, ()>(&mut second_store, "publish")?
         .call(&mut second_store, 22);
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     {
         let err = format!("{:?}", second_outcome.unwrap_err());
         assert_transaction_conflict(&err);
     }
-    #[cfg(feature = "transaction-mvcc")]
+    #[cfg(any(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     second_outcome?;
 
     *released = false;
     ready.notify_one();
     drop(released);
     let first_outcome = first.join().unwrap();
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     first_outcome?;
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    {
+        let err = format!("{:?}", first_outcome.unwrap_err());
+        assert_transaction_conflict(&err);
+    }
     #[cfg(feature = "transaction-mvcc")]
     {
         let err = format!("{:?}", first_outcome.unwrap_err());
@@ -1624,9 +1687,15 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
     let recovered = reopen_and_recover_file_backed_region(&tx_log_path)?;
     assert_eq!(recovered.root_object_ids.len(), 1);
     assert_eq!(recovered.object_winners.len(), 2);
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11]);
-    #[cfg(feature = "transaction-mvcc")]
+    #[cfg(any(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![22]);
 
     wasmtime::_internal::transaction_persistence::recover_file_backed_tmemory_for_test(
@@ -1635,9 +1704,15 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
         1,
         Some(1),
     )?;
-    #[cfg(not(feature = "transaction-mvcc"))]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-optimistic-validation")
+    ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &11u32.to_le_bytes())?;
-    #[cfg(feature = "transaction-mvcc")]
+    #[cfg(any(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &22u32.to_le_bytes())?;
 
     Ok(())
