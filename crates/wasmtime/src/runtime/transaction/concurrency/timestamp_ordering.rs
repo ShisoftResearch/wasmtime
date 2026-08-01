@@ -1,10 +1,11 @@
 use crate::prelude::*;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 
 use super::super::{GranuleId, TransactionId};
 use super::{
-    TransactionConcurrencyControl, TransactionConflictAction, TransactionTimestamp, is_older,
-    timestamp_for_transaction,
+    OptimisticCertificationAuthority, OptimisticCertificationPermit, TransactionConcurrencyControl,
+    TransactionConflictAction, TransactionTimestamp, is_older, timestamp_for_transaction,
 };
 
 #[derive(Debug, Default)]
@@ -13,6 +14,7 @@ pub(crate) struct TimestampOrdering {
     pub(crate) write_timestamps: BTreeMap<GranuleId, TransactionTimestamp>,
     pub(crate) read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
     pub(crate) write_versions: BTreeMap<(TransactionId, GranuleId), u64>,
+    commit_certification: Arc<OptimisticCertificationAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +52,20 @@ impl TimestampOrderingConflictKind {
 pub(crate) use self::TimestampOrderingConflictKind as TimestampOrderingConflictKindForTest;
 
 impl TimestampOrdering {
+    pub(crate) fn acquire_commit_certification(
+        &self,
+        transaction: TransactionId,
+        reads: &BTreeSet<GranuleId>,
+        writes: &BTreeSet<GranuleId>,
+    ) -> Result<OptimisticCertificationPermit> {
+        self.commit_certification
+            .acquire(transaction, reads, writes)
+    }
+
+    pub(crate) fn commit_certification_authority(&self) -> Arc<OptimisticCertificationAuthority> {
+        self.commit_certification.clone()
+    }
+
     pub(crate) fn record_read(
         &mut self,
         transaction: TransactionId,

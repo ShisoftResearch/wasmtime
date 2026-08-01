@@ -837,7 +837,10 @@ impl TransactionState {
     }
 
     #[cfg(all(
-        feature = "transaction-cc-optimistic-validation",
+        any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ),
         not(feature = "transaction-mvcc")
     ))]
     pub(crate) fn acquire_active_optimistic_certification(
@@ -1259,7 +1262,10 @@ impl TransactionState {
         #[cfg(not(feature = "transaction-mvcc"))]
         let mut current_version_fn = current_version_fn;
         #[cfg(all(
-            feature = "transaction-cc-optimistic-validation",
+            any(
+                feature = "transaction-cc-optimistic-validation",
+                feature = "transaction-cc-timestamp-ordering"
+            ),
             not(feature = "transaction-mvcc")
         ))]
         let _certification = self.acquire_active_optimistic_certification()?;
@@ -1276,18 +1282,24 @@ impl TransactionState {
             self.complete_commit()
         })();
         #[cfg(all(
-            feature = "transaction-cc-optimistic-validation",
+            any(
+                feature = "transaction-cc-optimistic-validation",
+                feature = "transaction-cc-timestamp-ordering"
+            ),
             not(feature = "transaction-mvcc")
         ))]
-        let shared_single_version_occ = self.shared_region_runtime.is_some();
+        let shared_single_version_certification = self.shared_region_runtime.is_some();
         #[cfg(not(all(
-            feature = "transaction-cc-optimistic-validation",
+            any(
+                feature = "transaction-cc-optimistic-validation",
+                feature = "transaction-cc-timestamp-ordering"
+            ),
             not(feature = "transaction-mvcc")
         )))]
-        let shared_single_version_occ = false;
+        let shared_single_version_certification = false;
         if result.is_err()
             && self.active_transaction().is_some()
-            && (self.terminal_commit_active || shared_single_version_occ)
+            && (self.terminal_commit_active || shared_single_version_certification)
         {
             return Self::combine_results(
                 result,
@@ -1384,7 +1396,10 @@ impl TransactionState {
         backend_version: u64,
     ) -> Result<u64> {
         #[cfg(all(
-            feature = "transaction-cc-optimistic-validation",
+            any(
+                feature = "transaction-cc-optimistic-validation",
+                feature = "transaction-cc-timestamp-ordering"
+            ),
             not(feature = "transaction-mvcc")
         ))]
         if let Some(runtime) = &self.shared_region_runtime {
@@ -1524,7 +1539,10 @@ impl TransactionState {
         for granule in self.active_write_granules()? {
             let current_version = current_version_fn(granule)?;
             #[cfg(all(
-                feature = "transaction-cc-optimistic-validation",
+                any(
+                    feature = "transaction-cc-optimistic-validation",
+                    feature = "transaction-cc-timestamp-ordering"
+                ),
                 not(feature = "transaction-mvcc")
             ))]
             let current_version = if self.shared_region_runtime.is_some() {
@@ -4856,11 +4874,29 @@ impl TransactionState {
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
     ) -> Result<bool> {
+        self.commit_single_tmemory_for_benchmark_inner(tmemory, || Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_single_tmemory_for_benchmark_with_validation_hook(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        after_validation: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        self.commit_single_tmemory_for_benchmark_inner(tmemory, after_validation)
+    }
+
+    fn commit_single_tmemory_for_benchmark_inner(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        after_validation: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
         #[cfg(all(
             feature = "transaction-mvcc",
             feature = "transaction-cc-optimistic-validation"
         ))]
         {
+            let _ = after_validation;
             return self.commit_single_tmemory_for_benchmark_mvcc(tmemory);
         }
 
@@ -4870,7 +4906,10 @@ impl TransactionState {
         )))]
         {
             #[cfg(all(
-                feature = "transaction-cc-optimistic-validation",
+                any(
+                    feature = "transaction-cc-optimistic-validation",
+                    feature = "transaction-cc-timestamp-ordering"
+                ),
                 not(feature = "transaction-mvcc")
             ))]
             let _certification = self.acquire_active_optimistic_certification()?;
@@ -4916,6 +4955,7 @@ impl TransactionState {
                         .copied()
                         .context("benchmark tmemory validation granule was not captured")
                 })?;
+                after_validation()?;
                 self.begin_terminal_commit()?;
                 let wrote = {
                     let mut tmemory = tmemory

@@ -268,7 +268,10 @@ impl BenchmarkStorage {
     }
 
     pub(super) fn validate_lifecycle(&self) -> Result<()> {
-        #[cfg(feature = "transaction-cc-optimistic-validation")]
+        #[cfg(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))]
         {
             let (acquired, active_permits) =
                 self.runtime.optimistic_certification_counts_for_test()?;
@@ -446,6 +449,93 @@ mod tests {
             outcomes
                 .iter()
                 .any(|outcome| matches!(outcome, AttemptOutcome::Conflict))
+        );
+        assert_eq!(committed_u64(&storage, 0), 1);
+    }
+
+    #[cfg(all(
+        feature = "transaction-cc-timestamp-ordering",
+        not(feature = "transaction-mvcc")
+    ))]
+    #[test]
+    fn timestamp_commit_serializes_validation_with_install() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Duration;
+
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let (a_staged_tx, a_staged_rx) = channel();
+        let (start_a_tx, start_a_rx) = channel();
+        let (a_validated_tx, a_validated_rx) = channel();
+        let (release_a_tx, release_a_rx) = channel();
+        let a_storage = storage.clone();
+        let a = std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut state = a_storage.new_transaction_state().unwrap();
+            a_storage.begin(&mut state).unwrap();
+            let value = a_storage.read_u64(&mut state, 0).unwrap();
+            a_storage.stage_u64(&mut state, 0, value + 1).unwrap();
+            a_staged_tx.send(()).unwrap();
+            start_a_rx.recv().unwrap();
+            state
+                .commit_single_tmemory_for_benchmark_with_validation_hook(
+                    &a_storage.tmemory,
+                    || {
+                        a_validated_tx.send(()).unwrap();
+                        release_a_rx.recv().unwrap();
+                        Ok(())
+                    },
+                )
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
+        });
+        a_staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (b_staged_tx, b_staged_rx) = channel();
+        let (b_outcome_tx, b_outcome_rx) = channel();
+        let b_storage = storage.clone();
+        let b = std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut state = b_storage.new_transaction_state().unwrap();
+            b_storage.begin(&mut state).unwrap();
+            let value = b_storage.read_u64(&mut state, 0).unwrap();
+            b_storage.stage_u64(&mut state, 0, value + 1).unwrap();
+            b_staged_tx.send(()).unwrap();
+            a_validated_rx.recv().unwrap();
+            let outcome = b_storage
+                .commit(&mut state)
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+            b_outcome_tx.send(outcome).unwrap();
+        });
+        b_staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        start_a_tx.send(()).unwrap();
+
+        let b_while_a_is_paused = match b_outcome_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(outcome) => Some(outcome),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => panic!("timestamp writer disconnected"),
+        };
+        let b_completed_while_a_was_paused = b_while_a_is_paused.is_some();
+        release_a_tx.send(()).unwrap();
+        let a_outcome = a.join().unwrap();
+        let b_outcome = match b_while_a_is_paused {
+            Some(outcome) => outcome,
+            None => b_outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        };
+        b.join().unwrap();
+
+        assert!(
+            !b_completed_while_a_was_paused,
+            "second timestamp commit completed inside the first commit's validation/install window"
+        );
+        assert!(
+            a_outcome.is_ok(),
+            "first timestamp commit failed: {a_outcome:?}"
+        );
+        let conflict = b_outcome.expect_err("second stale timestamp writer committed");
+        assert!(
+            conflict.contains("transaction read conflict: timestamp ordering read version changed"),
+            "{conflict}"
         );
         assert_eq!(committed_u64(&storage, 0), 1);
     }

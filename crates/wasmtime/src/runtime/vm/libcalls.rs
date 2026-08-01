@@ -807,7 +807,10 @@ fn transaction_commit_single_version_impl(
         }
     };
 
-    #[cfg(feature = "transaction-cc-optimistic-validation")]
+    #[cfg(any(
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
+    ))]
     let _certification = store
         .store_opaque_mut()
         .transaction_state_mut()

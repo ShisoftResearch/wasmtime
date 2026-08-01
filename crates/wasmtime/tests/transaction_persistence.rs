@@ -1020,7 +1020,10 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
         .call(&mut second_store, 22);
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     {
         let err = format!("{:?}", second_outcome.unwrap_err());
@@ -1028,7 +1031,8 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
     }
     #[cfg(any(
         feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))]
     second_outcome?;
 
@@ -1038,12 +1042,18 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
     let first_outcome = first.join().unwrap();
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     first_outcome?;
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        feature = "transaction-cc-optimistic-validation"
+        any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        )
     ))]
     {
         let err = format!("{:?}", first_outcome.unwrap_err());
@@ -1060,12 +1070,16 @@ fn shared_runtime_same_object_conflict_recovers_only_committed_version() -> Resu
     assert_eq!(recovered.object_winners.len(), 2);
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11]);
     #[cfg(any(
         feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![22]);
 
@@ -1465,7 +1479,10 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
         .call(&mut second_store, 0x5566_7788);
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     {
         let err = format!("{:?}", second_outcome.unwrap_err());
@@ -1473,7 +1490,8 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
     }
     #[cfg(any(
         feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))]
     second_outcome?;
 
@@ -1483,12 +1501,18 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
     let first_outcome = first.join().unwrap();
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     first_outcome?;
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        feature = "transaction-cc-optimistic-validation"
+        any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        )
     ))]
     {
         let err = format!("{:?}", first_outcome.unwrap_err());
@@ -1508,12 +1532,16 @@ fn shared_runtime_threaded_tmemory_conflict_recovers_only_committed_version() ->
     )?;
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &0x1122_3344u32.to_le_bytes())?;
     #[cfg(any(
         feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &0x5566_7788u32.to_le_bytes())?;
 
@@ -1649,7 +1677,10 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
         .call(&mut second_store, 22);
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     {
         let err = format!("{:?}", second_outcome.unwrap_err());
@@ -1657,7 +1688,8 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
     }
     #[cfg(any(
         feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))]
     second_outcome?;
 
@@ -1667,12 +1699,18 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
     let first_outcome = first.join().unwrap();
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     first_outcome?;
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        feature = "transaction-cc-optimistic-validation"
+        any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        )
     ))]
     {
         let err = format!("{:?}", first_outcome.unwrap_err());
@@ -1689,12 +1727,16 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
     assert_eq!(recovered.object_winners.len(), 2);
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![11]);
     #[cfg(any(
         feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))]
     assert_eq!(recovered_graph_leaf_values(&recovered)?, vec![22]);
 
@@ -1706,12 +1748,16 @@ fn shared_runtime_threaded_mixed_conflict_recovers_only_committed_version() -> R
     )?;
     #[cfg(all(
         not(feature = "transaction-mvcc"),
-        not(feature = "transaction-cc-optimistic-validation")
+        not(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        ))
     ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &11u32.to_le_bytes())?;
     #[cfg(any(
         feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
     ))]
     assert_tmemory_file_bytes(&tmemory_path, 0, &22u32.to_le_bytes())?;
 
