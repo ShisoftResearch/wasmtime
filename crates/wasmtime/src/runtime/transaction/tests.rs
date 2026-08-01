@@ -4159,6 +4159,288 @@ fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
 }
 
 #[cfg(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn optimistic_validation_single_version_assert_runtime_quiescent(
+    runtime: &TransactionRegionRuntime,
+) {
+    assert_eq!(
+        runtime
+            .optimistic_certification_counts_for_test()
+            .unwrap()
+            .1,
+        0
+    );
+    assert_eq!(runtime.terminal_commit_count_for_test().unwrap(), 0);
+}
+
+#[test]
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn optimistic_validation_single_version_tfunc_prevents_write_skew() {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = TransactionRegionRuntime::create_file_backed_for_test(
+        &dir.path().join("tmemory.bin"),
+        &dir.path().join("tx-log.bin"),
+        64,
+    )
+    .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "host" "sync" (func $sync))
+              (tmemory 1)
+              (tfunc (export "init")
+                (i64.tstore (i32.const 0) (i64.const 1))
+                (i64.tstore (i32.const 64) (i64.const 1)))
+              (tfunc (export "write_skew_a")
+                (local $b i64)
+                (local.set $b (i64.tload (i32.const 64)))
+                (call $sync)
+                (if (i64.eq (local.get $b) (i64.const 1))
+                  (then (i64.tstore (i32.const 0) (i64.const 0)))))
+              (tfunc (export "write_skew_b")
+                (local $a i64)
+                (local.set $a (i64.tload (i32.const 0)))
+                (call $sync)
+                (if (i64.eq (local.get $a) (i64.const 1))
+                  (then (i64.tstore (i32.const 64) (i64.const 0)))))
+              (tfunc (export "read") (result i64 i64)
+                (i64.tload (i32.const 0))
+                (i64.tload (i32.const 64))))
+        "#,
+    );
+
+    let mut init_linker = crate::Linker::new(&engine);
+    init_linker.func_wrap("host", "sync", || Ok(())).unwrap();
+    let mut init_store = crate::Store::new(&engine, ());
+    init_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let init_instance = init_linker.instantiate(&mut init_store, &module).unwrap();
+    init_instance
+        .get_typed_func::<(), ()>(&mut init_store, "init")
+        .unwrap()
+        .call(&mut init_store, ())
+        .unwrap();
+    drop(init_store);
+
+    let gate = Arc::new(super::region_runtime::TransactionTestGate::new(2));
+    let make_store = |gate: Arc<super::region_runtime::TransactionTestGate>| {
+        let mut linker = crate::Linker::new(&engine);
+        linker
+            .func_wrap("host", "sync", move || gate.wait())
+            .unwrap();
+        let mut store = crate::Store::new(&engine, ());
+        store.set_transaction_region_runtime_for_test(runtime.clone());
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        (store, instance)
+    };
+    let (mut a_store, a_instance) = make_store(gate.clone());
+    let write_a = a_instance
+        .get_typed_func::<(), ()>(&mut a_store, "write_skew_a")
+        .unwrap();
+    let (mut b_store, b_instance) = make_store(gate.clone());
+    let write_b = b_instance
+        .get_typed_func::<(), ()>(&mut b_store, "write_skew_b")
+        .unwrap();
+
+    let (outcome_tx, outcome_rx) = mpsc::sync_channel(2);
+    let a_outcome_tx = outcome_tx.clone();
+    let a_writer = std::thread::spawn(move || {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let result = write_a
+            .call(&mut a_store, ())
+            .map_err(|error| format!("{error:#}"));
+        a_outcome_tx.send(result).unwrap();
+    });
+    let b_writer = std::thread::spawn(move || {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let result = write_b
+            .call(&mut b_store, ())
+            .map_err(|error| format!("{error:#}"));
+        outcome_tx.send(result).unwrap();
+    });
+
+    let reached = gate.wait_until_reached(Duration::from_secs(5)).unwrap();
+    gate.release().unwrap();
+    assert!(reached, "write-skew read gate did not reach both workers");
+    let outcomes = [
+        outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+    ];
+    a_writer.join().unwrap();
+    b_writer.join().unwrap();
+    let conflict_count = outcomes.iter().filter(|outcome| outcome.is_err()).count();
+    assert!(
+        outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .all(|error| error.contains("transaction read conflict")
+                || error.contains("transaction write conflict")),
+        "unexpected write-skew outcomes: {outcomes:?}"
+    );
+
+    let mut read_linker = crate::Linker::new(&engine);
+    read_linker.func_wrap("host", "sync", || Ok(())).unwrap();
+    let mut read_store = crate::Store::new(&engine, ());
+    read_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let read_instance = read_linker.instantiate(&mut read_store, &module).unwrap();
+    let (a, b) = read_instance
+        .get_typed_func::<(), (i64, i64)>(&mut read_store, "read")
+        .unwrap()
+        .call(&mut read_store, ())
+        .unwrap();
+    assert!(
+        a + b >= 1,
+        "single-version OCC write skew violated A + B >= 1: A={a}, B={b}"
+    );
+    assert_eq!(conflict_count, 1);
+    optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    unix,
+    has_virtual_memory,
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn optimistic_validation_disjoint_tfunc_commits_overlap_certification() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = TransactionRegionRuntime::create_file_backed_for_test(
+        &dir.path().join("tmemory.bin"),
+        &dir.path().join("tx-log.bin"),
+        64,
+    )
+    .unwrap();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc (export "write_a")
+                (i64.tstore (i32.const 0) (i64.const 11)))
+              (tfunc (export "write_b")
+                (i64.tstore (i32.const 64) (i64.const 22))))
+        "#,
+    );
+
+    let mut a_store = crate::Store::new(&engine, ());
+    a_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let a_instance = crate::Instance::new(&mut a_store, &module, &[]).unwrap();
+    let write_a = a_instance
+        .get_typed_func::<(), ()>(&mut a_store, "write_a")
+        .unwrap();
+    let mut b_store = crate::Store::new(&engine, ());
+    b_store.set_transaction_region_runtime_for_test(runtime.clone());
+    let b_instance = crate::Instance::new(&mut b_store, &module, &[]).unwrap();
+    let write_b = b_instance
+        .get_typed_func::<(), ()>(&mut b_store, "write_b")
+        .unwrap();
+
+    let gate = Arc::new(super::region_runtime::TransactionTestGate::new(2));
+    runtime
+        .set_optimistic_certification_gate_for_test(Some(gate.clone()))
+        .unwrap();
+    let a_writer = std::thread::spawn(move || {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        write_a
+            .call(&mut a_store, ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    let b_writer = std::thread::spawn(move || {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        write_b
+            .call(&mut b_store, ())
+            .map_err(|error| format!("{error:#}"))
+    });
+
+    let reached = gate.wait_until_reached(Duration::from_secs(5)).unwrap();
+    if !reached {
+        gate.release().unwrap();
+        let outcomes = [a_writer.join().unwrap(), b_writer.join().unwrap()];
+        panic!("disjoint commits did not both reach certification: {outcomes:?}");
+    }
+    assert_eq!(
+        runtime.optimistic_certification_counts_for_test().unwrap(),
+        (2, 2)
+    );
+    gate.release().unwrap();
+    let outcomes = [a_writer.join().unwrap(), b_writer.join().unwrap()];
+    runtime
+        .set_optimistic_certification_gate_for_test(None)
+        .unwrap();
+
+    assert!(
+        outcomes.iter().all(std::result::Result::is_ok),
+        "disjoint certified commits conflicted: {outcomes:?}"
+    );
+    assert_eq!(
+        runtime.optimistic_certification_counts_for_test().unwrap(),
+        (2, 0)
+    );
+    optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn optimistic_validation_certification_version_mismatch_cleans_lifecycle() -> Result<()> {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut state = TransactionState::default();
+    let transaction = state.begin_with_region_runtime(&runtime)?;
+    let granule = GranuleId::TMemory {
+        instance: None,
+        memory_index: 0,
+        granule_index: 7,
+    };
+    state.acquire_granule_read(granule, 0)?;
+    let certification = state.acquire_active_optimistic_certification()?;
+    assert_eq!(runtime.optimistic_certification_counts_for_test()?, (1, 1));
+
+    runtime.bump_versioned_granules([granule])?;
+    let error = state.validate_active_read(granule, 0).unwrap_err();
+    assert!(
+        error.to_string().contains("transaction read conflict"),
+        "{error:?}"
+    );
+    assert!(!runtime.transaction_is_terminal_commit_for_test(transaction)?);
+    state.abort()?;
+    drop(certification);
+
+    assert!(state.active_transaction().is_none());
+    assert!(state.selected_visibility.is_none());
+    assert!(state.visibility_snapshot.is_none());
+    assert!(state.suspended.is_empty());
+    assert!(!state.terminal_commit_active);
+    assert_eq!(runtime.optimistic_certification_counts_for_test()?, (1, 0));
+    optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+    clear_current_thread_transaction_for_test();
+    Ok(())
+}
+
+#[cfg(all(
     unix,
     has_virtual_memory,
     feature = "transaction-mvcc",
@@ -8743,6 +9025,17 @@ fn shared_region_runtime_pre_lp_failure_retires_log_segment() {
     assert_eq!(current_thread_transaction_for_test(), None);
     assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
     assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 0);
+    #[cfg(all(
+        feature = "transaction-cc-optimistic-validation",
+        not(feature = "transaction-mvcc")
+    ))]
+    {
+        assert_eq!(
+            runtime.optimistic_certification_counts_for_test().unwrap(),
+            (1, 0)
+        );
+        optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+    }
 
     let next_runtime = runtime.clone();
     let next = std::thread::spawn(move || {

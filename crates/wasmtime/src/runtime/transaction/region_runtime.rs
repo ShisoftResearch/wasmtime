@@ -16,12 +16,19 @@ use super::GcMvccMode;
     feature = "transaction-cc-optimistic-validation"
 ))]
 use super::concurrency::CertificationMode;
-use super::concurrency::TransactionConflictAction;
 #[cfg(all(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-use super::concurrency::{MvccCertificationAuthority, MvccCertificationPermit};
+use super::concurrency::MvccCertificationPermit;
+use super::concurrency::TransactionConflictAction;
+#[cfg(feature = "transaction-cc-optimistic-validation")]
+use super::concurrency::{OptimisticCertificationAuthority, OptimisticCertificationPermit};
+#[cfg(not(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+)))]
+use super::granule_uses_transaction_state_version;
 #[cfg(all(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
@@ -40,8 +47,7 @@ use super::{
     ConcurrencyControlState, CurrentStatePersistentGc, GranuleId, ObjectId, ObjectKind,
     ObjectTable, PersistentObjectDirectoryEntry, PersistentObjectRecordLocation,
     PersistentObjectRecordSource, PersistentRootKey, TMemoryFileBacking, TransactionConfig,
-    TransactionId, TransactionPersistentGc, TxDurableLog, granule_uses_transaction_state_version,
-    persistent_root_key_from_logical_id,
+    TransactionId, TransactionPersistentGc, TxDurableLog, persistent_root_key_from_logical_id,
 };
 
 const FIRST_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x2000_0000;
@@ -69,6 +75,74 @@ pub(crate) struct UserTransactionRegionPermit {
 #[derive(Debug)]
 pub(crate) struct PersistentGcRegionPermit {
     runtime: TransactionRegionRuntime,
+}
+
+#[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+#[derive(Debug)]
+pub(crate) struct TransactionTestGate {
+    expected: usize,
+    state: Mutex<TransactionTestGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+#[derive(Debug, Default)]
+struct TransactionTestGateState {
+    reached: usize,
+    released: bool,
+}
+
+#[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+impl TransactionTestGate {
+    pub(crate) fn new(expected: usize) -> Self {
+        Self {
+            expected,
+            state: Mutex::new(TransactionTestGateState::default()),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn wait(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::format_err!("transaction test gate is poisoned"))?;
+        state.reached += 1;
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+                !state.released
+            })
+            .map_err(|_| crate::format_err!("transaction test gate is poisoned"))?;
+        ensure!(
+            state.released,
+            "timed out waiting for transaction test gate"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn wait_until_reached(&self, timeout: std::time::Duration) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::format_err!("transaction test gate is poisoned"))?;
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.reached < self.expected)
+            .map_err(|_| crate::format_err!("transaction test gate is poisoned"))?;
+        Ok(state.reached >= self.expected)
+    }
+
+    pub(crate) fn release(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::format_err!("transaction test gate is poisoned"))?;
+        state.released = true;
+        self.changed.notify_all();
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -184,6 +258,8 @@ struct TransactionRegionRuntimeInner {
     file_backed_storage: Mutex<Option<SharedFileBackedStorageConfig>>,
     gc_state: Mutex<GcCoordinationState>,
     persistent_gc_policy: Mutex<Arc<dyn TransactionPersistentGc>>,
+    #[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+    optimistic_certification_gate_for_test: Mutex<Option<Arc<TransactionTestGate>>>,
 }
 
 #[derive(Debug)]
@@ -260,6 +336,8 @@ impl Default for TransactionRegionRuntimeInner {
             file_backed_storage: Mutex::new(None),
             gc_state: Mutex::new(GcCoordinationState::default()),
             persistent_gc_policy: Mutex::new(Arc::new(CurrentStatePersistentGc)),
+            #[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+            optimistic_certification_gate_for_test: Mutex::new(None),
         }
     }
 }
@@ -444,6 +522,11 @@ impl TransactionRegionRuntime {
         I: IntoIterator<Item = PersistentObjectDirectoryEntry>,
     {
         let mut bumped_epoch = false;
+        #[cfg(all(
+            feature = "transaction-cc-optimistic-validation",
+            not(feature = "transaction-mvcc")
+        ))]
+        let mut changed_granules = BTreeSet::new();
         let installed = {
             let mut metadata = self.lock_persistent_metadata()?;
             let mut directory = self.lock_object_directory()?;
@@ -501,18 +584,29 @@ impl TransactionRegionRuntime {
                 directory.next_directory_version = next_version;
                 entry.directory_version = next_version;
 
-                directory.entries.insert(entry.object_id, entry.clone());
-                directory.reservations.remove(&entry.object_id);
+                let object_id = entry.object_id;
+                directory.entries.insert(object_id, entry.clone());
+                directory.reservations.remove(&object_id);
                 metadata
                     .object_versions
-                    .entry(entry.object_id)
+                    .entry(object_id)
                     .and_modify(|version| *version = (*version).max(entry.record_version))
                     .or_insert(entry.record_version);
                 installed.push(entry);
                 bumped_epoch = true;
+                #[cfg(all(
+                    feature = "transaction-cc-optimistic-validation",
+                    not(feature = "transaction-mvcc")
+                ))]
+                changed_granules.insert(GranuleId::Object { object_id });
             }
             installed
         };
+        #[cfg(all(
+            feature = "transaction-cc-optimistic-validation",
+            not(feature = "transaction-mvcc")
+        ))]
+        self.bump_versioned_granules(changed_granules)?;
         if bumped_epoch {
             self.bump_persistent_gc_epoch()?;
         }
@@ -888,6 +982,38 @@ impl TransactionRegionRuntime {
         runtime.concurrency.commit_transaction_result(transaction)
     }
 
+    #[cfg(feature = "transaction-cc-optimistic-validation")]
+    pub(crate) fn acquire_optimistic_certification(
+        &self,
+        transaction: TransactionId,
+        reads: &BTreeSet<GranuleId>,
+        writes: &BTreeSet<GranuleId>,
+    ) -> Result<OptimisticCertificationPermit> {
+        let permit =
+            self.optimistic_certification_authority()?
+                .acquire(transaction, reads, writes)?;
+        #[cfg(test)]
+        let gate = self
+            .0
+            .optimistic_certification_gate_for_test
+            .lock()
+            .map_err(|_| crate::format_err!("optimistic certification test gate is poisoned"))?
+            .clone();
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.wait()?;
+        }
+        Ok(permit)
+    }
+
+    #[cfg(feature = "transaction-cc-optimistic-validation")]
+    fn optimistic_certification_authority(&self) -> Result<Arc<OptimisticCertificationAuthority>> {
+        Ok(self
+            .lock_authority()?
+            .concurrency
+            .optimistic_certification_authority())
+    }
+
     #[cfg(all(
         feature = "transaction-mvcc",
         feature = "transaction-cc-optimistic-validation"
@@ -900,8 +1026,7 @@ impl TransactionRegionRuntime {
         snapshot: CommitTimestamp,
         visibility: &MvccRuntime,
     ) -> Result<MvccCertificationPermit> {
-        let authority = self.mvcc_certification_authority()?;
-        let permit = authority.acquire(transaction, reads, writes)?;
+        let permit = self.acquire_optimistic_certification(transaction, reads, writes)?;
         for granule in reads.union(writes).copied() {
             ensure!(
                 visibility.latest_committed_timestamp(granule)? <= snapshot,
@@ -915,11 +1040,14 @@ impl TransactionRegionRuntime {
         feature = "transaction-mvcc",
         feature = "transaction-cc-optimistic-validation"
     ))]
-    fn mvcc_certification_authority(&self) -> Result<Arc<MvccCertificationAuthority>> {
-        Ok(self
-            .lock_authority()?
-            .concurrency
-            .mvcc_certification_authority())
+    fn mvcc_certification_authority(&self) -> Result<Arc<OptimisticCertificationAuthority>> {
+        self.optimistic_certification_authority()
+    }
+
+    #[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+    pub(crate) fn optimistic_certification_counts_for_test(&self) -> Result<(usize, usize)> {
+        self.optimistic_certification_authority()?
+            .lifecycle_counts_for_test()
     }
 
     #[cfg(all(
@@ -928,8 +1056,7 @@ impl TransactionRegionRuntime {
         feature = "transaction-cc-optimistic-validation"
     ))]
     pub(crate) fn mvcc_certification_counts_for_test(&self) -> Result<(usize, usize)> {
-        self.mvcc_certification_authority()?
-            .lifecycle_counts_for_test()
+        self.optimistic_certification_counts_for_test()
     }
 
     #[cfg(all(
@@ -985,7 +1112,23 @@ impl TransactionRegionRuntime {
         let mut runtime = self.lock_authority()?;
         let updates = granules
             .into_iter()
-            .filter(|granule| granule_uses_transaction_state_version(*granule))
+            .filter(|granule| {
+                #[cfg(all(
+                    feature = "transaction-cc-optimistic-validation",
+                    not(feature = "transaction-mvcc")
+                ))]
+                {
+                    let _ = granule;
+                    true
+                }
+                #[cfg(not(all(
+                    feature = "transaction-cc-optimistic-validation",
+                    not(feature = "transaction-mvcc")
+                )))]
+                {
+                    granule_uses_transaction_state_version(*granule)
+                }
+            })
             .map(|granule| {
                 let version = runtime
                     .granule_versions
@@ -1372,6 +1515,25 @@ impl TransactionRegionRuntime {
             .lock_authority()?
             .terminal_commits
             .contains(&transaction))
+    }
+
+    #[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+    pub(crate) fn terminal_commit_count_for_test(&self) -> Result<usize> {
+        Ok(self.lock_authority()?.terminal_commits.len())
+    }
+
+    #[cfg(all(test, feature = "transaction-cc-optimistic-validation"))]
+    pub(crate) fn set_optimistic_certification_gate_for_test(
+        &self,
+        gate: Option<Arc<TransactionTestGate>>,
+    ) -> Result<()> {
+        *self
+            .0
+            .optimistic_certification_gate_for_test
+            .lock()
+            .map_err(|_| crate::format_err!("optimistic certification test gate is poisoned"))? =
+            gate;
+        Ok(())
     }
 
     pub(crate) fn is_shared_with(&self, other: &Self) -> bool {

@@ -837,6 +837,23 @@ impl TransactionState {
     }
 
     #[cfg(all(
+        feature = "transaction-cc-optimistic-validation",
+        not(feature = "transaction-mvcc")
+    ))]
+    pub(crate) fn acquire_active_optimistic_certification(
+        &self,
+    ) -> Result<concurrency::OptimisticCertificationPermit> {
+        let transaction = self.active_transaction_required()?;
+        let reads = self.read_granules.clone();
+        let writes = self.write_granules.clone();
+        if let Some(region) = &self.shared_region_runtime {
+            return region.acquire_optimistic_certification(transaction, &reads, &writes);
+        }
+        self.concurrency
+            .acquire_optimistic_certification(transaction, &reads, &writes)
+    }
+
+    #[cfg(all(
         feature = "transaction-mvcc",
         feature = "transaction-cc-optimistic-validation"
     ))]
@@ -1241,16 +1258,44 @@ impl TransactionState {
         let _ = current_version_fn;
         #[cfg(not(feature = "transaction-mvcc"))]
         let mut current_version_fn = current_version_fn;
-        #[cfg(not(feature = "transaction-mvcc"))]
-        self.validate_active_read_granules_with(&mut current_version_fn)?;
-        #[cfg(not(feature = "transaction-mvcc"))]
-        self.validate_active_writes_with(&mut current_version_fn)?;
-        let records = self.staged_records()?;
-        self.begin_terminal_commit()?;
-        for record in records {
-            apply(&record)?;
+        #[cfg(all(
+            feature = "transaction-cc-optimistic-validation",
+            not(feature = "transaction-mvcc")
+        ))]
+        let _certification = self.acquire_active_optimistic_certification()?;
+        let result = (|| {
+            #[cfg(not(feature = "transaction-mvcc"))]
+            self.validate_active_read_granules_with(&mut current_version_fn)?;
+            #[cfg(not(feature = "transaction-mvcc"))]
+            self.validate_active_writes_with(&mut current_version_fn)?;
+            let records = self.staged_records()?;
+            self.begin_terminal_commit()?;
+            for record in records {
+                apply(&record)?;
+            }
+            self.complete_commit()
+        })();
+        #[cfg(all(
+            feature = "transaction-cc-optimistic-validation",
+            not(feature = "transaction-mvcc")
+        ))]
+        let shared_single_version_occ = self.shared_region_runtime.is_some();
+        #[cfg(not(all(
+            feature = "transaction-cc-optimistic-validation",
+            not(feature = "transaction-mvcc")
+        )))]
+        let shared_single_version_occ = false;
+        if result.is_err()
+            && self.active_transaction().is_some()
+            && (self.terminal_commit_active || shared_single_version_occ)
+        {
+            return Self::combine_results(
+                result,
+                self.abort(),
+                "failed to abort transaction after terminal commit failure",
+            );
         }
-        self.complete_commit()
+        result
     }
 
     pub(crate) fn validate_active_reads_with<F>(&self, current_version_fn: F) -> Result<()>
@@ -1310,6 +1355,25 @@ impl TransactionState {
         }
     }
 
+    pub(crate) fn validate_active_write(
+        &self,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<()> {
+        #[cfg(feature = "transaction-mvcc")]
+        {
+            let _ = (granule, current_version);
+            self.ensure_active()?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "transaction-mvcc"))]
+        {
+            let transaction = self.active_transaction_required()?;
+            let current_version = self.current_version_for_granule(granule, current_version)?;
+            self.validate_granule_write_authority(transaction, granule, current_version)
+        }
+    }
+
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> u64 {
         self.granule_versions.get(&granule).copied().unwrap_or(0)
     }
@@ -1319,6 +1383,13 @@ impl TransactionState {
         granule: GranuleId,
         backend_version: u64,
     ) -> Result<u64> {
+        #[cfg(all(
+            feature = "transaction-cc-optimistic-validation",
+            not(feature = "transaction-mvcc")
+        ))]
+        if let Some(runtime) = &self.shared_region_runtime {
+            return runtime.versioned_granule_version(granule);
+        }
         if granule_uses_transaction_state_version(granule) {
             if let Some(runtime) = &self.shared_region_runtime {
                 runtime.versioned_granule_version(granule)
@@ -1330,7 +1401,7 @@ impl TransactionState {
         }
     }
 
-    fn current_object_version_for_granule(
+    pub(crate) fn current_object_version_for_granule(
         &self,
         granule: GranuleId,
         object_table: &ObjectTable,
@@ -1452,6 +1523,15 @@ impl TransactionState {
         let transaction = self.active_transaction_required()?;
         for granule in self.active_write_granules()? {
             let current_version = current_version_fn(granule)?;
+            #[cfg(all(
+                feature = "transaction-cc-optimistic-validation",
+                not(feature = "transaction-mvcc")
+            ))]
+            let current_version = if self.shared_region_runtime.is_some() {
+                self.current_version_for_granule(granule, current_version)?
+            } else {
+                current_version
+            };
             self.validate_granule_write_authority(transaction, granule, current_version)?;
         }
         Ok(())
@@ -4789,54 +4869,73 @@ impl TransactionState {
             feature = "transaction-cc-optimistic-validation"
         )))]
         {
-            let granules = self
-                .active_read_granules()?
-                .into_iter()
-                .chain(self.active_write_granules()?)
-                .collect::<BTreeSet<_>>();
-            let versions = {
-                let tmemory = tmemory
-                    .lock()
-                    .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
-                granules
+            #[cfg(all(
+                feature = "transaction-cc-optimistic-validation",
+                not(feature = "transaction-mvcc")
+            ))]
+            let _certification = self.acquire_active_optimistic_certification()?;
+            let result = (|| {
+                let granules = self
+                    .active_read_granules()?
                     .into_iter()
-                    .map(|granule| {
-                        let GranuleId::TMemory {
-                            instance: None,
-                            memory_index: 0,
-                            granule_index,
-                        } = granule
-                        else {
-                            bail!("single-tmemory benchmark state contains a non-benchmark granule")
-                        };
-                        let granule_index = usize::try_from(granule_index)
-                            .context("benchmark tmemory granule index does not fit usize")?;
-                        Ok((granule, tmemory.granule_version(granule_index)?))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?
-            };
-            let current_version = |granule| {
-                versions
-                    .get(&granule)
-                    .copied()
-                    .context("benchmark tmemory validation granule was not captured")
-            };
-            self.validate_active_reads_with(current_version)?;
-            self.validate_active_writes_with(&mut |granule| {
-                versions
-                    .get(&granule)
-                    .copied()
-                    .context("benchmark tmemory validation granule was not captured")
-            })?;
-            self.begin_terminal_commit()?;
-            let wrote = {
-                let mut tmemory = tmemory
-                    .lock()
-                    .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
-                self.commit_tmemory_owned(None, 0, &mut *tmemory)?
-            };
-            self.complete_commit()?;
-            Ok(wrote)
+                    .chain(self.active_write_granules()?)
+                    .collect::<BTreeSet<_>>();
+                let versions = {
+                    let tmemory = tmemory
+                        .lock()
+                        .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+                    granules
+                        .into_iter()
+                        .map(|granule| {
+                            let GranuleId::TMemory {
+                                instance: None,
+                                memory_index: 0,
+                                granule_index,
+                            } = granule
+                            else {
+                                bail!(
+                                    "single-tmemory benchmark state contains a non-benchmark granule"
+                                )
+                            };
+                            let granule_index = usize::try_from(granule_index)
+                                .context("benchmark tmemory granule index does not fit usize")?;
+                            Ok((granule, tmemory.granule_version(granule_index)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()?
+                };
+                let current_version = |granule| {
+                    versions
+                        .get(&granule)
+                        .copied()
+                        .context("benchmark tmemory validation granule was not captured")
+                };
+                self.validate_active_reads_with(current_version)?;
+                self.validate_active_writes_with(&mut |granule| {
+                    versions
+                        .get(&granule)
+                        .copied()
+                        .context("benchmark tmemory validation granule was not captured")
+                })?;
+                self.begin_terminal_commit()?;
+                let wrote = {
+                    let mut tmemory = tmemory
+                        .lock()
+                        .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+                    self.commit_tmemory_owned(None, 0, &mut *tmemory)?
+                };
+                self.complete_commit()?;
+                Ok(wrote)
+            })();
+            if result.is_err() && self.active_transaction().is_some() {
+                let cleanup = self.abort();
+                self.record_benchmark_cleanup_failure_for_test(&cleanup);
+                return Self::combine_results(
+                    result,
+                    cleanup,
+                    "failed to abort benchmark transaction after certified commit failure",
+                );
+            }
+            result
         }
     }
 

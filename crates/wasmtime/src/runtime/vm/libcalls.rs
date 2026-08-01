@@ -788,22 +788,6 @@ fn transaction_commit_single_version_impl(
     store: &mut dyn VMStore,
     instance: InstanceId,
 ) -> Result<()> {
-    let (records, read_granules) = {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        (state.staged_records()?, state.active_read_granules()?)
-    };
-
-    for granule in read_granules {
-        if matches!(granule, GranuleId::Object { .. }) {
-            continue;
-        }
-        let current_version = current_granule_version(store, instance, granule)?;
-        store
-            .store_opaque_mut()
-            .transaction_state_mut()
-            .validate_active_read(granule, current_version)?;
-    }
-
     {
         let store = store.store_opaque_mut();
         let (engine, gc_store, durable_refs, state, object_table) =
@@ -812,7 +796,6 @@ fn transaction_commit_single_version_impl(
             StoreBackedOrdinaryGcPromotionAdapter::new(engine, gc_store, durable_refs);
         state
             .promote_persistent_references_before_commit_with_adapter(object_table, &mut adapter)?;
-        state.validate_active_object_reads(&*object_table)?;
     }
 
     let _user_transaction_region_permit = {
@@ -823,6 +806,50 @@ fn transaction_commit_single_version_impl(
             None
         }
     };
+
+    #[cfg(feature = "transaction-cc-optimistic-validation")]
+    let _certification = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_active_optimistic_certification()?;
+
+    let result = transaction_commit_single_version_certified(store, instance);
+    let cleanup = abort_active_transaction_on_error(store, &result);
+    combine_operation_and_cleanup_results(
+        result,
+        cleanup,
+        "failed to abort single-version transaction after certified commit failure",
+    )
+}
+
+#[cfg(not(feature = "transaction-mvcc"))]
+fn transaction_commit_single_version_certified(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+) -> Result<()> {
+    let (records, read_granules, write_granules) = {
+        let state = store.store_opaque_mut().transaction_state_mut();
+        (
+            state.staged_records()?,
+            state.active_read_granules()?,
+            state.active_write_granules()?,
+        )
+    };
+
+    for granule in read_granules {
+        let current_version = current_granule_version(store, instance, granule)?;
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .validate_active_read(granule, current_version)?;
+    }
+    for granule in write_granules {
+        let current_version = current_granule_version(store, instance, granule)?;
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .validate_active_write(granule, current_version)?;
+    }
 
     let (stream_id, txid) = {
         let state = store.store_opaque_mut().transaction_state_mut();
@@ -5921,10 +5948,11 @@ fn current_granule_version(
                     .context("tmemory granule index does not fit host usize")?,
             )
         }
-        GranuleId::Object { object_id } => store
-            .store_opaque_mut()
-            .transaction_object_table()
-            .version(object_id),
+        GranuleId::Object { .. } => {
+            let store = store.store_opaque_mut();
+            let (state, object_table) = store.transaction_state_and_object_table_mut();
+            state.current_object_version_for_granule(granule, &*object_table)
+        }
         GranuleId::TMemorySize { .. }
         | GranuleId::TGlobal { .. }
         | GranuleId::TTable { .. }
