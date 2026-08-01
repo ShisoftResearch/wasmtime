@@ -1391,7 +1391,8 @@ impl TransactionState {
                 self.refresh_read_version_authority(transaction, granule, current_version)?;
             }
             self.read_granules.insert(granule);
-            debug_assert!(self.write_granules.insert(granule));
+            let inserted = self.write_granules.insert(granule);
+            debug_assert!(inserted);
             return Ok(true);
         }
         #[cfg(not(feature = "transaction-mvcc"))]

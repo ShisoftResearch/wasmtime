@@ -82,6 +82,7 @@ fn mvcc_first_write_enters_selected_cc_once() {
     let granule = global_granule_id(None, 0);
 
     assert!(state.acquire_granule_write(granule, 0).unwrap());
+    assert!(state.owns_granule_write(granule));
     assert!(!state.acquire_granule_write(granule, 0).unwrap());
     assert_eq!(
         runtime

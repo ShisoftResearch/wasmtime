@@ -571,17 +571,6 @@ def _load_run(run_dir: Path, *, lifecycle: str) -> RunData:
                 f"{path}: driver GC policy mode is outside the Rust domain: "
                 f"{gc_policy_mode!r}"
             )
-        expected_gc_policy_mode = (
-            "mvcc-compliant"
-            if driver["visibility_mode"] == "mvcc"
-            else "current-state-only"
-        )
-        if gc_policy_mode != expected_gc_policy_mode:
-            raise ValueError(
-                f"{path}: driver GC policy mode {gc_policy_mode!r} does not match "
-                f"visibility mode {driver['visibility_mode']!r}"
-            )
-
         policy_cells: list[Mapping[str, Any]] = []
         policy_skipped: list[Mapping[str, Any]] = []
         policy_controls: list[Mapping[str, Any]] = []

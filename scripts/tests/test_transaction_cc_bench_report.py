@@ -421,6 +421,19 @@ class TransactionCcBenchReportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "GC policy mode"):
                 report.load_complete_run(run_dir)
 
+    def test_mvcc_run_accepts_current_state_only_pluggable_gc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            raw_path = run_dir / "raw" / "mvcc-optimistic.jsonl"
+            records = [json.loads(line) for line in raw_path.read_text().splitlines()]
+            records[0]["gc_policy_mode"] = "current-state-only"
+            for record in records:
+                if record.get("record_type") in ("cell", "tfunc_control"):
+                    record["metrics"]["gc"]["policy_mode"] = "current-state-only"
+            write_jsonl(raw_path, records)
+
+            report.load_complete_run(run_dir)
+
     def test_policy_requests_must_have_the_same_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = make_run(directory)
