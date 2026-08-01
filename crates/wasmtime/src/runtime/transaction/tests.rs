@@ -23,6 +23,208 @@ use crate::runtime::store::AsStoreOpaque;
 use alloc::sync::Arc;
 
 #[test]
+#[cfg(feature = "transaction-mvcc")]
+fn mvcc_snapshot_read_does_not_enter_selected_cc() {
+    let runtime = TransactionRegionRuntime::default();
+    let mut state = TransactionState::default();
+    let transaction = state.begin_with_region_runtime(&runtime).unwrap();
+    let granule = global_granule_id(None, 0);
+
+    assert!(state.acquire_granule_read(granule, 0).unwrap());
+    assert!(state.owns_granule_read(granule));
+    assert_eq!(
+        runtime
+            .selected_policy_read_granules_for_test(transaction)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(transaction)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+    state.abort().unwrap();
+}
+
+#[test]
+#[cfg(feature = "transaction-mvcc")]
+fn mvcc_first_write_enters_selected_cc_once() {
+    let runtime = TransactionRegionRuntime::default();
+    let mut state = TransactionState::default();
+    let transaction = state.begin_with_region_runtime(&runtime).unwrap();
+    let granule = global_granule_id(None, 0);
+
+    assert!(state.acquire_granule_write(granule, 0).unwrap());
+    assert!(!state.acquire_granule_write(granule, 0).unwrap());
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(transaction)
+            .unwrap(),
+        vec![granule]
+    );
+    state.abort().unwrap();
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(transaction)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    any(
+        feature = "transaction-cc-nowait-abort",
+        feature = "transaction-cc-strict-2pl"
+    )
+))]
+fn mvcc_eager_conflict_policy_rejects_second_writer_and_releases_owner() {
+    let runtime = TransactionRegionRuntime::default();
+    let granule = global_granule_id(None, 0);
+    let first = TransactionId::from_raw(1);
+    let second = TransactionId::from_raw(2);
+
+    assert_eq!(
+        runtime
+            .acquire_mvcc_granule_write(first, granule, 0)
+            .unwrap(),
+        super::concurrency::TransactionConflictAction::Continue
+    );
+    let error = runtime
+        .acquire_mvcc_granule_write(second, granule, 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("transaction write conflict"));
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(second)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+
+    runtime.release_transaction_for_test(first).unwrap();
+    assert_eq!(
+        runtime
+            .acquire_mvcc_granule_write(second, granule, 0)
+            .unwrap(),
+        super::concurrency::TransactionConflictAction::Continue
+    );
+    runtime.release_transaction_for_test(second).unwrap();
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(second)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+}
+
+#[test]
+#[cfg(all(feature = "transaction-mvcc", feature = "transaction-cc-wait-die"))]
+fn mvcc_wait_die_preserves_older_waits_younger_dies_ordering() {
+    let runtime = TransactionRegionRuntime::default();
+    let granule = global_granule_id(None, 0);
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+
+    runtime
+        .acquire_mvcc_granule_write(younger, granule, 0)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .acquire_mvcc_granule_write(older, granule, 0)
+            .unwrap(),
+        super::concurrency::TransactionConflictAction::WouldWait(younger)
+    );
+    runtime.release_transaction_for_test(younger).unwrap();
+
+    runtime
+        .acquire_mvcc_granule_write(older, granule, 0)
+        .unwrap();
+    let error = runtime
+        .acquire_mvcc_granule_write(younger, granule, 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("transaction write conflict"));
+    runtime.release_transaction_for_test(older).unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    any(
+        feature = "transaction-cc-lockbased",
+        feature = "transaction-cc-wound-wait"
+    )
+))]
+fn mvcc_preemptive_policy_displaces_younger_writer() {
+    let runtime = TransactionRegionRuntime::default();
+    let granule = global_granule_id(None, 0);
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+
+    runtime
+        .acquire_mvcc_granule_write(younger, granule, 0)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .acquire_mvcc_granule_write(older, granule, 0)
+            .unwrap(),
+        super::concurrency::TransactionConflictAction::AbortOther(younger)
+    );
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(younger)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(older)
+            .unwrap(),
+        vec![granule]
+    );
+    runtime.release_transaction_for_test(older).unwrap();
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(older)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    any(
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
+    )
+))]
+fn mvcc_deferred_policy_records_both_colliding_writers() {
+    let runtime = TransactionRegionRuntime::default();
+    let granule = global_granule_id(None, 0);
+    let first = TransactionId::from_raw(1);
+    let second = TransactionId::from_raw(2);
+
+    for transaction in [first, second] {
+        assert_eq!(
+            runtime
+                .acquire_mvcc_granule_write(transaction, granule, 0)
+                .unwrap(),
+            super::concurrency::TransactionConflictAction::Continue
+        );
+        assert_eq!(
+            runtime
+                .selected_policy_write_granules_for_test(transaction)
+                .unwrap(),
+            vec![granule]
+        );
+    }
+    runtime.release_transaction_for_test(first).unwrap();
+    runtime.release_transaction_for_test(second).unwrap();
+}
+
+#[test]
 fn mvcc_gc_policy_default_is_current_state_only_and_object_safe() {
     let policy = CurrentStatePersistentGc::default();
     let policy: &dyn TransactionPersistentGc = &policy;
@@ -827,8 +1029,8 @@ fn mvcc_gc_policy_shared_replacement_rejects_active_user_commit_without_mutation
 #[test]
 fn mvcc_is_visibility_not_concurrency_control() {
     assert_eq!(
-        ConcurrencyControl::default_for_build(),
-        ConcurrencyControl::OptimisticValidation
+        TransactionConfig::default().concurrency_control(),
+        ConcurrencyControl::default_for_build()
     );
     let visibility = SelectedTransactionVisibility::default();
     assert!(visibility.is_multiversion());
@@ -11879,7 +12081,7 @@ fn transaction_constructor_boundary_result_composition_preserves_both_errors() {
 
 #[cfg(feature = "transaction-mvcc")]
 #[test]
-fn mvcc_snapshot_workspace_acquisition_records_sets_without_cc_access() {
+fn mvcc_snapshot_read_acquisition_bypasses_cc_access() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
     let visibility = runtime.visibility_for_test();
@@ -11887,13 +12089,9 @@ fn mvcc_snapshot_workspace_acquisition_records_sets_without_cc_access() {
     state.begin_with_region_runtime(&runtime).unwrap();
     runtime.poison_lock_authority_for_test();
     let read = global_granule_id(None, 1);
-    let write = global_granule_id(None, 2);
 
     assert!(state.acquire_granule_read(read, u64::MAX).unwrap());
-    assert!(state.acquire_granule_write(write, u64::MAX).unwrap());
     assert!(state.owns_granule_read(read));
-    assert!(state.owns_granule_read(write));
-    assert!(state.owns_granule_write(write));
     state
         .validate_active_reads_with(|_| panic!("MVCC validation called current-version closure"))
         .unwrap();

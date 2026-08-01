@@ -1400,10 +1400,23 @@ impl TransactionState {
     ) -> Result<bool> {
         #[cfg(feature = "transaction-mvcc")]
         {
-            let _ = current_version;
             self.ensure_active()?;
+            if self.write_granules.contains(&granule) {
+                return Ok(false);
+            }
+            let transaction = self.active_transaction_required()?;
+            let current_version = self.current_version_for_granule(granule, current_version)?;
+            let action =
+                self.acquire_mvcc_granule_write_authority(transaction, granule, current_version)?;
+            let refresh_after_abort = action.aborted_transaction().is_some();
+            self.handle_conflict_action(action)?;
+            if refresh_after_abort {
+                let current_version = self.current_version_for_granule(granule, current_version)?;
+                self.refresh_read_version_authority(transaction, granule, current_version)?;
+            }
             self.read_granules.insert(granule);
-            return Ok(self.write_granules.insert(granule));
+            debug_assert!(self.write_granules.insert(granule));
+            return Ok(true);
         }
         #[cfg(not(feature = "transaction-mvcc"))]
         {
@@ -1646,6 +1659,21 @@ impl TransactionState {
         } else {
             self.concurrency
                 .acquire_granule_write(transaction, granule, current_version)
+        }
+    }
+
+    #[cfg(feature = "transaction-mvcc")]
+    fn acquire_mvcc_granule_write_authority(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<TransactionConflictAction> {
+        if let Some(runtime) = &self.shared_region_runtime {
+            runtime.acquire_mvcc_granule_write(transaction, granule, current_version)
+        } else {
+            self.concurrency
+                .acquire_mvcc_granule_write(transaction, granule, current_version)
         }
     }
 

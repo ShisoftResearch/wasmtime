@@ -1190,6 +1190,26 @@ impl TransactionRegionRuntime {
         Ok(action)
     }
 
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn acquire_mvcc_granule_write(
+        &self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<TransactionConflictAction> {
+        let mut runtime = self.lock_authority()?;
+        Self::check_terminal_owner_conflict(&runtime, transaction, granule, true)?;
+        let action = runtime.concurrency.acquire_mvcc_granule_write(
+            transaction,
+            granule,
+            current_version,
+        )?;
+        if let Some(aborted) = action.aborted_transaction() {
+            runtime.conflict_aborted_transactions.insert(aborted);
+        }
+        Ok(action)
+    }
+
     pub(crate) fn validate_granule_read(
         &self,
         transaction: TransactionId,
@@ -1758,6 +1778,28 @@ impl TransactionRegionRuntime {
         current_version: u64,
     ) -> Result<TransactionConflictAction> {
         self.acquire_granule_write(transaction, granule, current_version)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_policy_read_granules_for_test(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Vec<GranuleId>> {
+        Ok(self
+            .lock_authority()?
+            .concurrency
+            .read_granules_for_transaction(transaction))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_policy_write_granules_for_test(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Vec<GranuleId>> {
+        Ok(self
+            .lock_authority()?
+            .concurrency
+            .write_granules_for_transaction(transaction))
     }
 
     #[cfg(test)]

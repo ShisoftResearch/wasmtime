@@ -264,6 +264,17 @@ impl ConcurrencyControlState {
             .acquire_granule_write(transaction, granule, current_version)
     }
 
+    #[cfg(feature = "transaction-mvcc")]
+    pub(crate) fn acquire_mvcc_granule_write(
+        &mut self,
+        transaction: TransactionId,
+        granule: GranuleId,
+        current_version: u64,
+    ) -> Result<TransactionConflictAction> {
+        self.policy
+            .acquire_granule_write(transaction, granule, current_version)
+    }
+
     pub(crate) fn validate_read(
         &self,
         transaction: TransactionId,
