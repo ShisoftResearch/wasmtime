@@ -1,10 +1,13 @@
 import csv
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "transaction_cc_bench_report.py"
@@ -51,7 +54,7 @@ def metrics(multiplier=1):
             "total_ns": 1_000,
             "max_pause_ns": 700,
             "elapsed_share": 0.001,
-            "policy_mode": "version-aware" if multiplier == 2 else "current-state-only",
+            "policy_mode": "mvcc-compliant" if multiplier == 2 else "current-state-only",
         },
         "versions": {
             "created": 20 if multiplier == 2 else 0,
@@ -128,12 +131,18 @@ def make_run(directory):
                 }
                 for policy in policies
             ],
+            {
+                "record_type": "complete",
+                "schema_version": 1,
+                "completed_policies": 2,
+                "ended_utc": invocation["end_utc"],
+            },
         ],
     )
 
     for policy_index, policy in enumerate(policies, start=1):
         policy_mode = (
-            "version-aware" if policy == "mvcc-optimistic" else "current-state-only"
+            "mvcc-compliant" if policy == "mvcc-optimistic" else "current-state-only"
         )
         request = {
             "schema_version": 1,
@@ -190,21 +199,23 @@ def make_run(directory):
                             "metrics": cell_metrics,
                         }
                     )
-        control_metrics = metrics(policy_index)
-        control_metrics["gc"]["policy_mode"] = policy_mode
-        records.append(
-            {
-                "record_type": "tfunc_control",
-                "schema_version": 1,
-                "policy": policy,
-                "compiled_features": FEATURES[policy],
-                "backend": "vmemory",
-                "control": "rmw",
-                "repetition": 0,
-                "seed": 42,
-                "metrics": control_metrics,
-            }
-        )
+        for backend in request["backends"]:
+            for control in ("read-only", "rmw"):
+                control_metrics = metrics(policy_index)
+                control_metrics["gc"]["policy_mode"] = policy_mode
+                records.append(
+                    {
+                        "record_type": "tfunc_control",
+                        "schema_version": 1,
+                        "policy": policy,
+                        "compiled_features": FEATURES[policy],
+                        "backend": backend,
+                        "control": control,
+                        "repetition": 0,
+                        "seed": 42,
+                        "metrics": control_metrics,
+                    }
+                )
         records.append(
             {
                 "record_type": "complete",
@@ -212,7 +223,7 @@ def make_run(directory):
                 "policy": policy,
                 "completed_cells": 4,
                 "skipped_cells": 2,
-                "tfunc_controls": 1,
+                "tfunc_controls": 4,
             }
         )
         write_jsonl(run_dir / "raw" / f"{policy}.jsonl", records)
@@ -240,6 +251,21 @@ class TransactionCcBenchReportTests(unittest.TestCase):
             write_jsonl(raw, records)
 
             with self.assertRaisesRegex(ValueError, "complete footer"):
+                report.load_complete_run(run_dir)
+
+    def test_public_loader_requires_one_final_orchestrator_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            path = run_dir / "orchestrator.jsonl"
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            write_jsonl(path, records[:-1])
+
+            with self.assertRaisesRegex(ValueError, "final orchestrator complete"):
+                report.load_complete_run(run_dir)
+
+            records[-1]["completed_policies"] = 1
+            write_jsonl(path, records)
+            with self.assertRaisesRegex(ValueError, "completed_policies"):
                 report.load_complete_run(run_dir)
 
     def test_mixed_schema_versions_are_rejected(self):
@@ -279,6 +305,80 @@ class TransactionCcBenchReportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "control identity"):
                 report.load_complete_run(run_dir)
 
+    def test_missing_requested_tfunc_control_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            raw = run_dir / "raw" / "optimistic.jsonl"
+            records = [json.loads(line) for line in raw.read_text().splitlines()]
+            missing_index = next(
+                index
+                for index, record in enumerate(records)
+                if record.get("record_type") == "tfunc_control"
+                and record["backend"] == "file-backed"
+                and record["control"] == "read-only"
+            )
+            records.pop(missing_index)
+            records[-1]["tfunc_controls"] -= 1
+            write_jsonl(raw, records)
+
+            with self.assertRaisesRegex(ValueError, "missing tfunc control"):
+                report.load_complete_run(run_dir)
+
+    def test_non_rust_workload_domain_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            start_path = run_dir / "orchestrator.jsonl"
+            start_records = [
+                json.loads(line) for line in start_path.read_text().splitlines()
+            ]
+            start_records[0]["workloads"] = ["not-a-rust-workload"]
+            write_jsonl(start_path, start_records)
+            for policy in FEATURES:
+                request_path = run_dir / "requests" / f"{policy}.json"
+                request = json.loads(request_path.read_text())
+                request["workloads"] = ["not-a-rust-workload"]
+                write_json(request_path, request)
+                raw_path = run_dir / "raw" / f"{policy}.jsonl"
+                records = [
+                    json.loads(line) for line in raw_path.read_text().splitlines()
+                ]
+                for record in records:
+                    if "spec" in record:
+                        record["spec"]["workload"] = "not-a-rust-workload"
+                write_jsonl(raw_path, records)
+
+            with self.assertRaisesRegex(ValueError, "Rust workload"):
+                report.load_complete_run(run_dir)
+
+    def test_rust_duration_and_integer_bounds_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            request_path = run_dir / "requests" / "mvcc-optimistic.json"
+            request = json.loads(request_path.read_text())
+            request["measure_ms"] = 86_400_001
+            write_json(request_path, request)
+            with self.assertRaisesRegex(ValueError, "24 hours"):
+                report.load_complete_run(run_dir)
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            request_path = run_dir / "requests" / "optimistic.json"
+            request = json.loads(request_path.read_text())
+            request["seed"] = 1 << 64
+            write_json(request_path, request)
+            with self.assertRaisesRegex(ValueError, "Rust integer bound"):
+                report.load_complete_run(run_dir)
+
+    def test_non_rust_gc_mode_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(directory)
+            raw_path = run_dir / "raw" / "mvcc-optimistic.jsonl"
+            records = [json.loads(line) for line in raw_path.read_text().splitlines()]
+            records[0]["gc_policy_mode"] = "version-aware"
+            write_jsonl(raw_path, records)
+            with self.assertRaisesRegex(ValueError, "GC policy mode"):
+                report.load_complete_run(run_dir)
+
     def test_policy_requests_must_have_the_same_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = make_run(directory)
@@ -297,7 +397,7 @@ class TransactionCcBenchReportTests(unittest.TestCase):
 
             with (run_dir / "results.csv").open(newline="", encoding="utf-8") as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual(14, len(rows))
+            self.assertEqual(20, len(rows))
             self.assertEqual(
                 ["optimistic", "optimistic", "optimistic"],
                 [row["policy"] for row in rows[:3]],
@@ -307,9 +407,9 @@ class TransactionCcBenchReportTests(unittest.TestCase):
                 sum(row["status"] == "completed" for row in rows),
             )
             self.assertEqual(4, sum(row["status"] == "skipped" for row in rows))
-            self.assertEqual(2, sum(row["status"] == "control" for row in rows))
+            self.assertEqual(8, sum(row["status"] == "control" for row in rows))
 
-            expected = {"attempts": 2310, "committed": 2100, "aborts": 210, "retries": 210}
+            expected = {"attempts": 3300, "committed": 3000, "aborts": 300, "retries": 300}
             self.assertEqual(expected, data.aggregate_counts)
             summary = (run_dir / "summary.md").read_text(encoding="utf-8")
             for text in (
@@ -330,17 +430,31 @@ class TransactionCcBenchReportTests(unittest.TestCase):
                 "12.500 seconds",
             ):
                 self.assertIn(text, summary)
-            self.assertIn("| attempts | 2310 |", summary)
-            self.assertIn("| committed operations | 2100 |", summary)
-            self.assertIn("| conflict aborts | 210 |", summary)
-            self.assertIn("| retries | 210 |", summary)
+            self.assertIn("| attempts | 3300 |", summary)
+            self.assertIn("| committed operations | 3000 |", summary)
+            self.assertIn("| conflict aborts | 300 |", summary)
+            self.assertIn("| retries | 300 |", summary)
+            self.assertIn("| repetition | seed |", summary)
 
             merged = [
                 json.loads(line)
                 for line in (run_dir / "results.jsonl").read_text().splitlines()
             ]
             self.assertEqual("optimistic", merged[0]["compiled_policy"])
-            self.assertEqual("mvcc-optimistic", merged[9]["compiled_policy"])
+            self.assertEqual("mvcc-optimistic", merged[12]["compiled_policy"])
+
+    def test_standalone_cli_rejects_external_output_but_api_allows_fixtures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(Path(directory) / "fixture")
+            report.generate_reports(run_dir)
+            self.assertTrue((run_dir / "summary.md").is_file())
+
+            repository_root = Path(directory) / "repository"
+            repository_root.mkdir()
+            with mock.patch.object(
+                report, "REPOSITORY_ROOT", repository_root
+            ), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(1, report.main([str(run_dir)]))
 
 
 if __name__ == "__main__":

@@ -463,6 +463,16 @@ def _finish_invocation(
     _write_json(invocation_path, invocation)
 
 
+def _mark_invocation_reporting(
+    invocation_path: Path, invocation: dict[str, Any]
+) -> None:
+    invocation["end_utc"] = None
+    invocation["elapsed_seconds"] = None
+    invocation["status"] = "reporting"
+    invocation["failed_policy"] = None
+    _write_json(invocation_path, invocation)
+
+
 def run(args: argparse.Namespace, argv: Sequence[str] | None = None) -> int:
     actual_argv = list(sys.argv if argv is None else argv)
     started_datetime = datetime.now(timezone.utc)
@@ -529,9 +539,9 @@ def run(args: argparse.Namespace, argv: Sequence[str] | None = None) -> int:
             return 1
         completed_policies += 1
 
-    _finish_invocation(invocation_path, invocation, started, "complete")
+    _mark_invocation_reporting(invocation_path, invocation)
     try:
-        reporter.generate_reports(run_dir)
+        report_data = reporter._prepare_reports_before_completion(run_dir)
     except Exception as error:
         _append_jsonl(
             orchestrator_path,
@@ -553,6 +563,34 @@ def run(args: argparse.Namespace, argv: Sequence[str] | None = None) -> int:
             "ended_utc": _utc_now(),
         },
     )
+    try:
+        invocation["status"] = "complete"
+        invocation["failed_policy"] = None
+        invocation["end_utc"] = _utc_now()
+        invocation["elapsed_seconds"] = time.perf_counter() - started
+        for _ in range(10):
+            displayed_elapsed = f"{invocation['elapsed_seconds']:.3f}"
+            reporter._write_terminal_markdown(report_data, invocation)
+            invocation["end_utc"] = _utc_now()
+            invocation["elapsed_seconds"] = time.perf_counter() - started
+            if f"{invocation['elapsed_seconds']:.3f}" == displayed_elapsed:
+                break
+        else:
+            raise RuntimeError("total elapsed display did not stabilize")
+    except Exception as error:
+        _append_jsonl(
+            orchestrator_path,
+            {
+                "record_type": "report_failure",
+                "schema_version": SCHEMA_VERSION,
+                "error": str(error),
+                "ended_utc": _utc_now(),
+            },
+        )
+        _finish_invocation(invocation_path, invocation, started, "failed")
+        return 1
+    # Terminal invocation metadata is deliberately the final lifecycle write.
+    _write_json(invocation_path, invocation)
     return 0
 
 

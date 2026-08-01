@@ -4,15 +4,25 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
+import struct
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+BACKENDS = ("vmemory", "file-backed")
+WORKLOADS = ("read-only", "disjoint-writes", "hot-key", "write-skew")
+GC_POLICY_MODES = ("current-state-only", "mvcc-compliant")
+TFUNC_CONTROLS = ("read-only", "rmw")
+U32_MAX = (1 << 32) - 1
+U64_MAX = (1 << 64) - 1
+USIZE_MAX = (1 << (8 * struct.calcsize("P"))) - 1
+MAX_PHASE_MS = 24 * 60 * 60 * 1000
 POLICY_FEATURES = {
     "lockbased": ("transaction-cc-lockbased",),
     "no-wait": ("transaction-cc-nowait-abort",),
@@ -124,10 +134,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _require_schema(record: Mapping[str, Any], context: str) -> None:
-    if record.get("schema_version") != SCHEMA_VERSION:
+    version = record.get("schema_version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != SCHEMA_VERSION
+    ):
         raise ValueError(
             f"{context}: schema_version must be {SCHEMA_VERSION}, "
-            f"got {record.get('schema_version')!r}"
+            f"got {version!r}"
         )
 
 
@@ -163,9 +178,13 @@ def _validate_features(value: Any, policy: str, context: str) -> None:
         )
 
 
-def _nonnegative_integer(value: Any, context: str) -> int:
+def _nonnegative_integer(
+    value: Any, context: str, *, maximum: int = U64_MAX
+) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{context} must be a nonnegative integer")
+    if value > maximum:
+        raise ValueError(f"{context} exceeds the Rust integer bound {maximum}")
     return value
 
 
@@ -218,7 +237,9 @@ def _optional_nonnegative_integer(value: Any, context: str) -> None:
 def _validate_metrics(metrics: Any, context: str, *, control: bool = False) -> None:
     if not isinstance(metrics, dict):
         raise ValueError(f"{context} must be an object")
-    _nonnegative_integer(metrics.get("requested_elapsed_ns"), f"{context}.requested_elapsed_ns")
+    _nonnegative_integer(
+        metrics.get("requested_elapsed_ns"), f"{context}.requested_elapsed_ns"
+    )
     effective = _nonnegative_integer(
         metrics.get("effective_elapsed_ns"), f"{context}.effective_elapsed_ns"
     )
@@ -244,6 +265,11 @@ def _validate_metrics(metrics: Any, context: str, *, control: bool = False) -> N
     gc = metrics.get("gc")
     if not isinstance(gc, dict) or not isinstance(gc.get("policy_mode"), str):
         raise ValueError(f"{context}.gc must contain a policy_mode string")
+    if gc["policy_mode"] not in GC_POLICY_MODES:
+        raise ValueError(
+            f"{context}.gc.policy_mode is not a Rust GC policy mode: "
+            f"{gc['policy_mode']!r}"
+        )
     for name in ("barriers", "total_ns", "max_pause_ns"):
         _nonnegative_integer(gc.get(name), f"{context}.gc.{name}")
     _finite_nonnegative(gc.get("elapsed_share"), f"{context}.gc.elapsed_share")
@@ -295,11 +321,20 @@ def _cell_key(spec: Any, context: str) -> CellKey:
         raise ValueError(f"{context} has invalid integer identity fields")
     if workers <= 0 or repetition < 0 or seed < 0:
         raise ValueError(f"{context} has out-of-range identity fields")
+    _nonnegative_integer(workers, f"{context}.workers", maximum=USIZE_MAX)
+    _nonnegative_integer(repetition, f"{context}.repetition", maximum=U32_MAX)
+    _nonnegative_integer(seed, f"{context}.seed")
+    if backend not in BACKENDS:
+        raise ValueError(f"{context}.backend is not a Rust backend: {backend!r}")
+    if workload not in WORKLOADS:
+        raise ValueError(f"{context}.workload is not a Rust workload: {workload!r}")
     _validate_features(spec.get("compiled_features"), policy, context)
     return policy, backend, workload, workers, repetition, seed
 
 
-def _load_orchestrator(run_dir: Path) -> tuple[dict[str, Any], tuple[str, ...]]:
+def _load_orchestrator(
+    run_dir: Path, *, require_complete: bool
+) -> tuple[dict[str, Any], tuple[str, ...]]:
     records = _read_jsonl(run_dir / "orchestrator.jsonl")
     for index, record in enumerate(records):
         _require_schema(record, f"orchestrator record {index}")
@@ -323,6 +358,33 @@ def _load_orchestrator(run_dir: Path) -> tuple[dict[str, Any], tuple[str, ...]]:
         raise ValueError(
             f"orchestrator policy completion order {completed!r} does not match {list(policies)!r}"
         )
+    completions = [
+        record for record in records if record.get("record_type") == "complete"
+    ]
+    if require_complete:
+        if len(completions) != 1 or records[-1] is not completions[0]:
+            raise ValueError(
+                "complete run must end with exactly one final orchestrator complete record"
+            )
+        completed_policies = _nonnegative_integer(
+            completions[0].get("completed_policies"),
+            "orchestrator complete.completed_policies",
+            maximum=USIZE_MAX,
+        )
+        if completed_policies != len(policies):
+            raise ValueError(
+                "orchestrator complete.completed_policies does not match requested policies"
+            )
+    elif completions:
+        raise ValueError("pre-completion reporting cannot contain an orchestrator complete")
+    allowed = {"orchestrator_start", "policy_complete", "complete"}
+    unknown = [
+        record.get("record_type")
+        for record in records
+        if record.get("record_type") not in allowed
+    ]
+    if unknown:
+        raise ValueError(f"orchestrator contains unexpected records: {unknown!r}")
     return starts[0], policies
 
 
@@ -336,10 +398,32 @@ def _validate_request(
         values = _require_list(request.get(axis), f"{context}.{axis}")
         if values != start.get(axis):
             raise ValueError(f"{context}.{axis} does not match orchestration metadata")
-    for name in ("warmup_ms", "measure_ms", "repetitions", "gc_commit_interval"):
+    if any(value not in BACKENDS for value in request["backends"]):
+        raise ValueError(f"{context}.backends contains a value outside Rust backends")
+    if any(value not in WORKLOADS for value in request["workloads"]):
+        raise ValueError(f"{context}.workloads contains a value outside Rust workloads")
+    for workers in request["workers"]:
+        parsed = _nonnegative_integer(
+            workers, f"{context}.workers", maximum=USIZE_MAX
+        )
+        if parsed == 0:
+            raise ValueError(f"{context}.workers must be nonzero")
+    for name in ("warmup_ms", "measure_ms"):
         value = _nonnegative_integer(request.get(name), f"{context}.{name}")
         if value == 0:
             raise ValueError(f"{context}.{name} must be nonzero")
+        if value > MAX_PHASE_MS:
+            raise ValueError(f"{context}.{name} exceeds the Rust limit of 24 hours")
+    repetitions = _nonnegative_integer(
+        request.get("repetitions"), f"{context}.repetitions", maximum=U32_MAX
+    )
+    if repetitions == 0:
+        raise ValueError(f"{context}.repetitions must be nonzero")
+    gc_interval = _nonnegative_integer(
+        request.get("gc_commit_interval"), f"{context}.gc_commit_interval"
+    )
+    if gc_interval == 0:
+        raise ValueError(f"{context}.gc_commit_interval must be nonzero")
     _nonnegative_integer(request.get("seed"), f"{context}.seed")
     if not isinstance(request.get("include_tfunc_control"), bool):
         raise ValueError(f"{context}.include_tfunc_control must be boolean")
@@ -355,17 +439,25 @@ def _expected_cell_keys(policy: str, request: Mapping[str, Any]) -> set[CellKey]
     }
 
 
-def load_complete_run(run_dir: Path) -> RunData:
-    """Load a run only after validating its complete requested matrix."""
+def _load_run(run_dir: Path, *, lifecycle: str) -> RunData:
     run_dir = Path(run_dir)
     invocation = _read_json(run_dir / "invocation.json")
     _require_schema(invocation, "invocation")
-    if invocation.get("status") != "complete":
-        raise ValueError("invocation status must be complete before reporting")
-    elapsed = invocation.get("elapsed_seconds")
-    _finite_nonnegative(elapsed, "invocation.elapsed_seconds")
+    if lifecycle not in ("complete", "reporting"):
+        raise AssertionError(f"unknown report lifecycle {lifecycle!r}")
+    if invocation.get("status") != lifecycle:
+        raise ValueError(f"invocation status must be {lifecycle} for this report phase")
+    if lifecycle == "complete":
+        elapsed = invocation.get("elapsed_seconds")
+        _finite_nonnegative(elapsed, "invocation.elapsed_seconds")
+        if not isinstance(invocation.get("end_utc"), str):
+            raise ValueError("complete invocation must contain end_utc")
+    elif invocation.get("end_utc") is not None or invocation.get("elapsed_seconds") is not None:
+        raise ValueError("reporting invocation must remain nonterminal")
 
-    start, policies = _load_orchestrator(run_dir)
+    start, policies = _load_orchestrator(
+        run_dir, require_complete=lifecycle == "complete"
+    )
     requests: dict[str, Mapping[str, Any]] = {}
     all_records: list[Mapping[str, Any]] = []
     cells: list[Mapping[str, Any]] = []
@@ -434,13 +526,18 @@ def load_complete_run(run_dir: Path) -> RunData:
             raise ValueError(f"{path}: compiled policy does not match requested policy")
         _validate_features(driver.get("compiled_features"), policy, f"{path} driver")
         available = _nonnegative_integer(
-            driver.get("available_parallelism"), f"{path} available_parallelism"
+            driver.get("available_parallelism"),
+            f"{path} available_parallelism",
+            maximum=USIZE_MAX,
         )
         if available == 0:
             raise ValueError(f"{path}: available_parallelism must be nonzero")
         gc_policy_mode = driver.get("gc_policy_mode")
-        if not isinstance(gc_policy_mode, str) or not gc_policy_mode:
-            raise ValueError(f"{path}: driver gc_policy_mode must be a nonempty string")
+        if gc_policy_mode not in GC_POLICY_MODES:
+            raise ValueError(
+                f"{path}: driver GC policy mode is outside the Rust domain: "
+                f"{gc_policy_mode!r}"
+            )
 
         policy_cells: list[Mapping[str, Any]] = []
         policy_skipped: list[Mapping[str, Any]] = []
@@ -480,11 +577,13 @@ def load_complete_run(run_dir: Path) -> RunData:
                 seed = record.get("seed")
                 if not isinstance(backend, str) or not isinstance(control, str):
                     raise ValueError(f"{context}: invalid control identity")
-                _nonnegative_integer(repetition, f"{context}.repetition")
+                _nonnegative_integer(
+                    repetition, f"{context}.repetition", maximum=U32_MAX
+                )
                 _nonnegative_integer(seed, f"{context}.seed")
                 if (
                     backend not in request["backends"]
-                    or control not in ("read-only", "rmw")
+                    or control not in TFUNC_CONTROLS
                     or repetition >= request["repetitions"]
                     or seed != request["seed"]
                     or not request["include_tfunc_control"]
@@ -513,8 +612,32 @@ def load_complete_run(run_dir: Path) -> RunData:
             raise ValueError(f"{path}: missing matrix cell {sorted(missing)!r}")
         if extra:
             raise ValueError(f"{path}: unexpected matrix cell {sorted(extra)!r}")
-        if request["include_tfunc_control"] and not policy_controls:
-            raise ValueError(f"{path}: requested tfunc controls are missing")
+        actual_control_keys = {
+            (
+                record["policy"],
+                record["backend"],
+                record["control"],
+                record["repetition"],
+                record["seed"],
+            )
+            for record in policy_controls
+        }
+        expected_control_keys = (
+            {
+                (policy, backend, control, repetition, request["seed"])
+                for backend in request["backends"]
+                for control in TFUNC_CONTROLS
+                for repetition in range(request["repetitions"])
+            }
+            if request["include_tfunc_control"]
+            else set()
+        )
+        missing_controls = expected_control_keys - actual_control_keys
+        extra_controls = actual_control_keys - expected_control_keys
+        if missing_controls:
+            raise ValueError(f"{path}: missing tfunc control {sorted(missing_controls)!r}")
+        if extra_controls:
+            raise ValueError(f"{path}: unexpected tfunc control {sorted(extra_controls)!r}")
         footer = footers[0]
         if footer.get("policy") != policy:
             raise ValueError(f"{path}: complete footer policy mismatch")
@@ -524,7 +647,9 @@ def load_complete_run(run_dir: Path) -> RunData:
             len(policy_controls),
         )
         actual_counts = tuple(
-            _nonnegative_integer(footer.get(name), f"{path} footer {name}")
+            _nonnegative_integer(
+                footer.get(name), f"{path} footer {name}", maximum=USIZE_MAX
+            )
             for name in ("completed_cells", "skipped_cells", "tfunc_controls")
         )
         if actual_counts != expected_counts:
@@ -553,6 +678,11 @@ def load_complete_run(run_dir: Path) -> RunData:
         raw_paths=tuple(raw_paths),
         aggregate_counts=aggregate,
     )
+
+
+def load_complete_run(run_dir: Path) -> RunData:
+    """Load a terminal run with exactly one matching lifecycle footer."""
+    return _load_run(Path(run_dir), lifecycle="complete")
 
 
 def _empty_row() -> dict[str, Any]:
@@ -758,6 +888,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 spec["workload"],
                 spec["policy"],
                 spec["workers"],
+                spec["repetition"],
+                spec["seed"],
                 _format_rate(metrics["committed_operations_per_second"]),
                 scaling,
                 f"{abort_rate:.2%}",
@@ -775,6 +907,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 "workload",
                 "policy",
                 "workers",
+                "repetition",
+                "seed",
                 "commits/s",
                 "vs 1 worker",
                 "abort rate",
@@ -804,6 +938,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 spec["backend"],
                 spec["workload"],
                 spec["workers"],
+                spec["repetition"],
+                spec["seed"],
                 _ratio(
                     record["metrics"]["committed_operations_per_second"],
                     baseline["metrics"]["committed_operations_per_second"],
@@ -813,7 +949,14 @@ def write_markdown(data: RunData, path: Path) -> None:
     lines.extend(
         _comparison_table(
             "MVCC versus OCC",
-            ("backend", "workload", "workers", "MVCC/OCC commits/s"),
+            (
+                "backend",
+                "workload",
+                "workers",
+                "repetition",
+                "seed",
+                "MVCC/OCC commits/s",
+            ),
             mvcc_rows,
         )
     )
@@ -835,6 +978,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 spec["policy"],
                 spec["workload"],
                 spec["workers"],
+                spec["repetition"],
+                spec["seed"],
                 _ratio(
                     record["metrics"]["committed_operations_per_second"],
                     baseline["metrics"]["committed_operations_per_second"],
@@ -844,7 +989,14 @@ def write_markdown(data: RunData, path: Path) -> None:
     lines.extend(
         _comparison_table(
             "Backend delta",
-            ("policy", "workload", "workers", "file-backed/vmemory commits/s"),
+            (
+                "policy",
+                "workload",
+                "workers",
+                "repetition",
+                "seed",
+                "file-backed/vmemory commits/s",
+            ),
             backend_rows,
         )
     )
@@ -859,6 +1011,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 spec["backend"],
                 spec["workload"],
                 spec["workers"],
+                spec["repetition"],
+                spec["seed"],
                 counts["attempts"],
                 counts["conflict_aborts"],
                 counts["retries"],
@@ -867,7 +1021,17 @@ def write_markdown(data: RunData, path: Path) -> None:
     lines.extend(
         _comparison_table(
             "Abort and retry",
-            ("policy", "backend", "workload", "workers", "attempts", "aborts", "retries"),
+            (
+                "policy",
+                "backend",
+                "workload",
+                "workers",
+                "repetition",
+                "seed",
+                "attempts",
+                "aborts",
+                "retries",
+            ),
             abort_rows,
         )
     )
@@ -883,6 +1047,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 spec["backend"],
                 spec["workload"],
                 spec["workers"],
+                spec["repetition"],
+                spec["seed"],
                 gc["policy_mode"],
                 gc["barriers"],
                 f"{gc['elapsed_share']:.3%}",
@@ -900,6 +1066,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 "backend",
                 "workload",
                 "workers",
+                "repetition",
+                "seed",
                 "mode",
                 "barriers",
                 "GC share",
@@ -936,6 +1104,8 @@ def write_markdown(data: RunData, path: Path) -> None:
                 control["policy"],
                 control["backend"],
                 control["control"],
+                control["repetition"],
+                control["seed"],
                 _format_rate(control["metrics"]["committed_operations_per_second"]),
                 ratio,
             )
@@ -943,7 +1113,15 @@ def write_markdown(data: RunData, path: Path) -> None:
     lines.extend(
         _comparison_table(
             "tfunc controls",
-            ("policy", "backend", "control", "commits/s", "tfunc/core"),
+            (
+                "policy",
+                "backend",
+                "control",
+                "repetition",
+                "seed",
+                "commits/s",
+                "tfunc/core",
+            ),
             control_rows,
         )
     )
@@ -954,6 +1132,8 @@ def write_markdown(data: RunData, path: Path) -> None:
             record["spec"]["backend"],
             record["spec"]["workload"],
             record["spec"]["workers"],
+            record["spec"]["repetition"],
+            record["spec"]["seed"],
             record["reason"],
         )
         for record in data.skipped_cells
@@ -961,7 +1141,15 @@ def write_markdown(data: RunData, path: Path) -> None:
     lines.extend(
         _comparison_table(
             "Skipped cells",
-            ("policy", "backend", "workload", "workers", "reason"),
+            (
+                "policy",
+                "backend",
+                "workload",
+                "workers",
+                "repetition",
+                "seed",
+                "reason",
+            ),
             skip_rows,
         )
     )
@@ -1015,13 +1203,41 @@ def generate_reports(run_dir: Path) -> RunData:
     return data
 
 
+def _prepare_reports_before_completion(run_dir: Path) -> RunData:
+    """Validate the nonterminal run and create footer-independent artifacts."""
+    data = _load_run(Path(run_dir), lifecycle="reporting")
+    _write_merged_jsonl(data, data.run_dir / "results.jsonl")
+    write_csv(data, data.run_dir / "results.csv")
+    return data
+
+
+def _write_terminal_markdown(
+    data: RunData, terminal_invocation: Mapping[str, Any]
+) -> None:
+    """Finish a prepared report using terminal metadata held in memory."""
+    write_markdown(
+        replace(data, invocation=dict(terminal_invocation)),
+        data.run_dir / "summary.md",
+    )
+
+
+def _contained_cli_run_dir(run_dir: Path) -> Path:
+    output_root = (REPOSITORY_ROOT / "target" / "transaction-bench").resolve()
+    candidate = Path(run_dir).resolve()
+    if candidate == output_root or not candidate.is_relative_to(output_root):
+        raise ValueError(
+            f"run directory must be below repository target/transaction-bench: {candidate}"
+        )
+    return candidate
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if len(arguments) != 1:
         print("usage: transaction_cc_bench_report.py RUN_DIR", file=sys.stderr)
         return 2
     try:
-        generate_reports(Path(arguments[0]))
+        generate_reports(_contained_cli_run_dir(Path(arguments[0])))
     except (OSError, ValueError) as error:
         print(f"transaction-cc-bench-report: {error}", file=sys.stderr)
         return 1

@@ -39,6 +39,17 @@ python3 scripts/transaction-cc-bench.py \
 `target/transaction-bench/`. Paths containing `..` and symlinks cannot escape
 that generated-results boundary.
 
+An already completed run can be revalidated and its derived reports refreshed
+with:
+
+```console
+python3 scripts/transaction_cc_bench_report.py \
+  target/transaction-bench/<run-id>
+```
+
+The standalone reporter enforces the same output boundary. Its Python API can
+accept other paths for tests and explicitly managed archived data.
+
 ## Matrix
 
 The exact policy names are:
@@ -114,8 +125,17 @@ The current schema version is 1. Raw JSONL is authoritative. Reporting rejects
 unknown or mixed schemas, failed or incomplete streams, policy/feature
 mismatches, invalid attempt identities, duplicate identities, missing matrix
 cells, implicit unsupported-worker omissions, and footer count mismatches.
+It also requires every requested `tfunc` control and the exact closed Rust
+domains for backend, workload, GC mode, integer widths, and phase duration.
 Unavailable latency percentiles are empty in CSV and shown as `n/a` in
 Markdown; they are never changed to zero.
+
+During report construction, `invocation.json` remains nonterminal with status
+`reporting`. A run becomes consumable only after all requested policy streams
+and reports finish, the orchestrator writes its single matching completion
+footer, and terminal invocation metadata is published as the final lifecycle
+write. Consequently the recorded elapsed time includes reporting and the
+orchestrator footer.
 
 The Markdown report includes core scaling, MVCC-versus-OCC throughput,
 file-backed-versus-vmemory throughput, abort and retry behavior, GC and version

@@ -336,7 +336,7 @@ class TransactionCcBenchTests(unittest.TestCase):
                 bench.subprocess, "run", side_effect=fake_run
             ), mock.patch.object(
                 bench.reporter,
-                "generate_reports",
+                "_prepare_reports_before_completion",
                 side_effect=ValueError("fixture report validation failed"),
             ):
                 status = bench.run(args, argv=["transaction-cc-bench.py", "--test"])
@@ -353,6 +353,90 @@ class TransactionCcBenchTests(unittest.TestCase):
             invocation = json.loads((run_dir / "invocation.json").read_text())
             self.assertEqual("failed", invocation["status"])
             self.assertIsNone(invocation["failed_policy"])
+
+    def test_reporting_lifecycle_publishes_terminal_invocation_last(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository_root = Path(directory) / "repository"
+            repository_root.mkdir()
+            run_dir = repository_root / "target" / "transaction-bench" / "run"
+            args = bench.parse_args(
+                [
+                    "--policies",
+                    "optimistic",
+                    "--backends",
+                    "vmemory",
+                    "--workloads",
+                    "read-only",
+                    "--workers",
+                    "1",
+                    "--warmup-ms",
+                    "1",
+                    "--measure-ms",
+                    "1",
+                    "--output-dir",
+                    str(run_dir),
+                    "--skip-tfunc-control",
+                ]
+            )
+            observations = []
+
+            def fake_run(command, **kwargs):
+                if command[:3] == ["git", "rev-parse", "HEAD"]:
+                    return subprocess.CompletedProcess(command, 0, "0" * 40 + "\n", "")
+                if command[:2] == ["git", "status"]:
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if command[:2] == ["rustc", "-Vv"]:
+                    return subprocess.CompletedProcess(command, 0, "rustc fixture\n", "")
+                if command[0] == "uname":
+                    return subprocess.CompletedProcess(command, 0, "fixture-processor\n", "")
+                raw_path = Path(kwargs["env"]["WASMTIME_TRANSACTION_BENCH_OUTPUT"])
+                raw_path.write_text(
+                    json.dumps({"record_type": "complete", "schema_version": 1}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
+
+            def fake_prepare(path):
+                invocation = json.loads((path / "invocation.json").read_text())
+                records = [
+                    json.loads(line)
+                    for line in (path / "orchestrator.jsonl").read_text().splitlines()
+                ]
+                observations.append((invocation["status"], records[-1]["record_type"]))
+                return "prepared-data"
+
+            def fake_terminal_markdown(data, invocation):
+                self.assertEqual("prepared-data", data)
+                on_disk = json.loads((run_dir / "invocation.json").read_text())
+                records = [
+                    json.loads(line)
+                    for line in (run_dir / "orchestrator.jsonl").read_text().splitlines()
+                ]
+                observations.append((on_disk["status"], records[-1]["record_type"]))
+                self.assertEqual("complete", invocation["status"])
+
+            with mock.patch.object(bench, "REPOSITORY_ROOT", repository_root), mock.patch.object(
+                bench.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                bench.reporter,
+                "_prepare_reports_before_completion",
+                side_effect=fake_prepare,
+            ), mock.patch.object(
+                bench.reporter,
+                "_write_terminal_markdown",
+                side_effect=fake_terminal_markdown,
+            ):
+                status = bench.run(args, argv=["transaction-cc-bench.py", "--test"])
+
+            self.assertEqual(0, status)
+            self.assertEqual(
+                [("reporting", "policy_complete"), ("reporting", "complete")],
+                observations,
+            )
+            invocation = json.loads((run_dir / "invocation.json").read_text())
+            self.assertEqual("complete", invocation["status"])
+            self.assertIsNotNone(invocation["end_utc"])
+            self.assertGreater(invocation["elapsed_seconds"], 0)
 
 
 if __name__ == "__main__":
