@@ -1,17 +1,31 @@
-#[cfg(not(feature = "transaction-cc-strict-2pl"))]
+#[cfg(any(
+    all(
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-strict-2pl")
+    ),
+    all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    )
+))]
 use super::concurrency::CertificationMode;
 #[cfg(feature = "transaction-mvcc")]
 use super::concurrency::MvccCertificationAuthority;
-#[cfg(not(feature = "transaction-cc-strict-2pl"))]
+#[cfg(all(
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
+))]
 use super::concurrency::OptimisticCertificationAuthority;
 use super::config::TMemoryRegionConfig;
+#[cfg(feature = "transaction-mvcc")]
+use super::mvcc::MvccCommitTestHook;
 #[cfg(all(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
 use super::mvcc::{
     CommitRecord, CommitState, ModelCommitOutcome, ModelOperation, ModelTransaction,
-    MvccCommitTestHook, MvccPruneBudget, MvccRuntime, SerializableMvccModel, SnapshotRegistration,
+    MvccPruneBudget, MvccRuntime, SerializableMvccModel, SnapshotRegistration,
     generate_model_schedules,
 };
 #[cfg(feature = "transaction-mvcc")]
@@ -222,6 +236,27 @@ fn mvcc_deferred_policy_records_both_colliding_writers() {
     }
     runtime.release_transaction_for_test(first).unwrap();
     runtime.release_transaction_for_test(second).unwrap();
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-mvcc",
+    any(
+        feature = "transaction-cc-optimistic-validation",
+        feature = "transaction-cc-timestamp-ordering"
+    )
+))]
+fn mvcc_selected_policy_write_validation_rejects_changed_version() {
+    let runtime = TransactionRegionRuntime::default();
+    let mut state = TransactionState::default();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    let granule = global_granule_id(None, 0);
+
+    state.acquire_granule_write(granule, 0).unwrap();
+    runtime.bump_versioned_granules([granule]).unwrap();
+    let error = state.validate_active_write(granule, 0).unwrap_err();
+    assert!(error.to_string().contains("transaction write conflict"));
+    state.abort().unwrap();
 }
 
 #[test]
@@ -4650,12 +4685,7 @@ fn optimistic_validation_certification_version_mismatch_cleans_lifecycle() -> Re
     Ok(())
 }
 
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_shared_memory_module(engine: &crate::Engine) -> crate::Module {
     transaction_test_module(
         engine,
@@ -4721,12 +4751,7 @@ fn mvcc_serializable_shared_memory_module(engine: &crate::Engine) -> crate::Modu
     )
 }
 
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_shared_memory_store(
     engine: &crate::Engine,
     module: &crate::Module,
@@ -4736,12 +4761,7 @@ fn mvcc_serializable_shared_memory_store(
     mvcc_serializable_shared_memory_store_after_dummies(engine, module, runtime, sync, 0)
 }
 
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_shared_memory_store_after_dummies(
     engine: &crate::Engine,
     module: &crate::Module,
@@ -4761,10 +4781,7 @@ fn mvcc_serializable_shared_memory_store_after_dummies(
     (store, instance)
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_assert_one_commit_one_conflict(outcomes: &[std::result::Result<(), String>]) {
     assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
     let conflicts = outcomes
@@ -4773,16 +4790,16 @@ fn mvcc_serializable_assert_one_commit_one_conflict(outcomes: &[std::result::Res
         .collect::<Vec<_>>();
     assert_eq!(conflicts.len(), 1);
     assert!(
-        conflicts[0].contains("transaction MVCC certification conflict"),
-        "{}",
+        conflicts[0].contains("transaction MVCC certification conflict")
+            || conflicts[0].contains("transaction read conflict")
+            || conflicts[0].contains("transaction write conflict")
+            || conflicts[0].contains("transaction conflict would wait"),
+        "unexpected serializable MVCC conflict: {}",
         conflicts[0]
     );
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_assert_runtime_quiescent(runtime: &TransactionRegionRuntime) {
     let visibility = runtime.visibility_for_test();
     assert_eq!(runtime.mvcc_certification_counts_for_test().unwrap().1, 0);
@@ -4799,10 +4816,7 @@ fn mvcc_serializable_assert_runtime_quiescent(runtime: &TransactionRegionRuntime
     drop(runtime.begin_persistent_gc_for_test().unwrap());
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_release_gate_after_reached(
     gate: &MvccCommitTestHook,
     participants: usize,
@@ -4819,12 +4833,7 @@ fn mvcc_serializable_release_gate_after_reached(
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_write_skew_aborts_one_writer() {
     use std::sync::Arc;
     use std::sync::mpsc;
@@ -4919,12 +4928,7 @@ fn mvcc_serializable_write_skew_aborts_one_writer() {
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_blind_write_write_aborts_one_writer() {
     use std::sync::Arc;
     use std::sync::mpsc;
@@ -5006,12 +5010,7 @@ fn mvcc_serializable_blind_write_write_aborts_one_writer() {
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_lost_update_aborts_one_increment() {
     use std::sync::Arc;
     use std::sync::mpsc;
@@ -5093,12 +5092,7 @@ fn mvcc_serializable_lost_update_aborts_one_increment() {
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_changed_dependency_aborts_transaction_with_disjoint_write() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -5190,12 +5184,7 @@ fn mvcc_serializable_changed_dependency_aborts_transaction_with_disjoint_write()
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_read_only_snapshot_stays_stable_during_writer() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -5286,12 +5275,7 @@ fn mvcc_serializable_read_only_snapshot_stays_stable_during_writer() {
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    has_virtual_memory,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(unix, has_virtual_memory, feature = "transaction-mvcc"))]
 fn mvcc_serializable_disjoint_writers_overlap_terminal_publication() {
     use std::sync::mpsc;
     use std::time::Duration;

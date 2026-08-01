@@ -34,6 +34,10 @@ pub(crate) use domains::{MvccCommitFaultPoint, MvccCommitTestHook};
 )]
 pub(crate) use gc::{MvccPruneBudget, MvccPruneReport, MvccRebasePlan, ValidatedMvccRebasePlan};
 #[cfg(test)]
+#[allow(
+    unused_imports,
+    reason = "the exhaustive MVCC model suite is compiled only for configurations that exercise it"
+)]
 pub(crate) use model::{
     ModelCommitOutcome, ModelOperation, ModelTransaction, SerializableMvccModel,
     generate_model_schedules,

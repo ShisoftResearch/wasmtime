@@ -29,8 +29,6 @@ mod region_runtime;
 mod state;
 pub(crate) mod type_layout;
 mod visibility;
-#[cfg(feature = "transaction-mvcc")]
-pub(crate) use visibility::SelectedTransactionVisibility;
 mod wasmtime_layout;
 use concurrency::ConcurrencyControlState;
 #[cfg(all(

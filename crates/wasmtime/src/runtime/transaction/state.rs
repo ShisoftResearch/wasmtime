@@ -61,17 +61,9 @@ pub(crate) struct TransactionState {
     pub(super) mvcc_terminal_commit: Option<MvccTerminalCommitState>,
     #[cfg(test)]
     pub(super) benchmark_cleanup_failed: bool,
-    #[cfg(all(
-        test,
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(all(test, feature = "transaction-mvcc"))]
     pub(super) benchmark_committed_mvcc_versions_after_error: u64,
-    #[cfg(all(
-        test,
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(all(test, feature = "transaction-mvcc"))]
     pub(super) benchmark_mvcc_terminal_commit: Option<BenchmarkMvccTerminalCommitState>,
 }
 
@@ -101,11 +93,7 @@ pub(super) struct TransactionWorkspace {
     pending_memory_store: Option<PendingMemoryStore>,
     #[cfg(feature = "transaction-mvcc")]
     mvcc_terminal_commit: Option<MvccTerminalCommitState>,
-    #[cfg(all(
-        test,
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(all(test, feature = "transaction-mvcc"))]
     benchmark_mvcc_terminal_commit: Option<BenchmarkMvccTerminalCommitState>,
 }
 
@@ -223,17 +211,9 @@ impl Default for TransactionState {
             mvcc_terminal_commit: None,
             #[cfg(test)]
             benchmark_cleanup_failed: false,
-            #[cfg(all(
-                test,
-                feature = "transaction-mvcc",
-                feature = "transaction-cc-optimistic-validation"
-            ))]
+            #[cfg(all(test, feature = "transaction-mvcc"))]
             benchmark_committed_mvcc_versions_after_error: 0,
-            #[cfg(all(
-                test,
-                feature = "transaction-mvcc",
-                feature = "transaction-cc-optimistic-validation"
-            ))]
+            #[cfg(all(test, feature = "transaction-mvcc"))]
             benchmark_mvcc_terminal_commit: None,
         }
     }
@@ -280,11 +260,7 @@ pub(crate) struct MvccTerminalCommitState {
     pub(crate) after_publish_hook_ran: bool,
 }
 
-#[cfg(all(
-    test,
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(all(test, feature = "transaction-mvcc"))]
 #[derive(Debug)]
 pub(super) struct BenchmarkMvccTerminalCommitState {
     visibility: Arc<mvcc::MvccRuntime>,
@@ -1571,18 +1547,9 @@ impl TransactionState {
         granule: GranuleId,
         current_version: u64,
     ) -> Result<()> {
-        #[cfg(feature = "transaction-mvcc")]
-        {
-            let _ = (granule, current_version);
-            self.ensure_active()?;
-            return Ok(());
-        }
-        #[cfg(not(feature = "transaction-mvcc"))]
-        {
-            let transaction = self.active_transaction_required()?;
-            let current_version = self.current_version_for_granule(granule, current_version)?;
-            self.validate_granule_write_authority(transaction, granule, current_version)
-        }
+        let transaction = self.active_transaction_required()?;
+        let current_version = self.current_version_for_granule(granule, current_version)?;
+        self.validate_granule_write_authority(transaction, granule, current_version)
     }
 
     pub(crate) fn versioned_granule_version(&self, granule: GranuleId) -> u64 {
@@ -4724,11 +4691,7 @@ impl TransactionState {
             self.mvcc_terminal_commit.is_none(),
             "MVCC terminal commit retry is pending"
         );
-        #[cfg(all(
-            test,
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        ))]
+        #[cfg(all(test, feature = "transaction-mvcc"))]
         ensure!(
             self.benchmark_mvcc_terminal_commit.is_none(),
             "benchmark MVCC terminal commit retry is pending"
@@ -4774,11 +4737,7 @@ impl TransactionState {
             pending_memory_store: self.pending_memory_store.take(),
             #[cfg(feature = "transaction-mvcc")]
             mvcc_terminal_commit: self.mvcc_terminal_commit.take(),
-            #[cfg(all(
-                test,
-                feature = "transaction-mvcc",
-                feature = "transaction-cc-optimistic-validation"
-            ))]
+            #[cfg(all(test, feature = "transaction-mvcc"))]
             benchmark_mvcc_terminal_commit: self.benchmark_mvcc_terminal_commit.take(),
         }
     }
@@ -4810,11 +4769,7 @@ impl TransactionState {
         {
             self.mvcc_terminal_commit = workspace.mvcc_terminal_commit;
         }
-        #[cfg(all(
-            test,
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        ))]
+        #[cfg(all(test, feature = "transaction-mvcc"))]
         {
             self.benchmark_mvcc_terminal_commit = workspace.benchmark_mvcc_terminal_commit;
         }
@@ -5176,19 +5131,13 @@ impl TransactionState {
         tmemory: &std::sync::Mutex<TMemory>,
         after_validation: impl FnOnce() -> Result<()>,
     ) -> Result<bool> {
-        #[cfg(all(
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        ))]
+        #[cfg(feature = "transaction-mvcc")]
         {
             let _ = after_validation;
             return self.commit_single_tmemory_for_benchmark_mvcc(tmemory);
         }
 
-        #[cfg(not(all(
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        )))]
+        #[cfg(not(feature = "transaction-mvcc"))]
         {
             #[cfg(all(
                 not(feature = "transaction-mvcc"),
@@ -5269,18 +5218,12 @@ impl TransactionState {
         self.benchmark_cleanup_failed |= result.is_err();
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn take_benchmark_committed_mvcc_versions_after_error(&mut self) -> u64 {
         mem::take(&mut self.benchmark_committed_mvcc_versions_after_error)
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn commit_single_tmemory_for_benchmark_mvcc(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
@@ -5303,6 +5246,35 @@ impl TransactionState {
             drop(user_region_permit);
             return Ok(false);
         }
+
+        let write_versions = {
+            let tmemory = tmemory
+                .lock()
+                .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+            writes
+                .iter()
+                .copied()
+                .map(|granule| {
+                    let GranuleId::TMemory {
+                        instance: None,
+                        memory_index: 0,
+                        granule_index,
+                    } = granule
+                    else {
+                        bail!("single-tmemory benchmark state contains a non-benchmark granule")
+                    };
+                    let granule_index = usize::try_from(granule_index)
+                        .context("benchmark tmemory granule index does not fit usize")?;
+                    Ok((granule, tmemory.granule_version(granule_index)?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?
+        };
+        self.validate_active_writes_with(&mut |granule| {
+            write_versions
+                .get(&granule)
+                .copied()
+                .context("benchmark tmemory write-validation granule was not captured")
+        })?;
 
         let certification = match self.acquire_active_mvcc_certification(
             &visibility,
@@ -5443,10 +5415,7 @@ impl TransactionState {
         self.drive_benchmark_mvcc_terminal_commit(tmemory)
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn benchmark_mvcc_version_count_for_commit(&self) -> Result<u64> {
         let count = match &self.benchmark_mvcc_terminal_commit {
             Some(terminal) => terminal.prepared.memories.len(),
@@ -5468,18 +5437,12 @@ impl TransactionState {
         u64::try_from(count).context("benchmark MVCC created-version count does not fit u64")
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn has_benchmark_mvcc_terminal_for_test(&self) -> bool {
         self.benchmark_mvcc_terminal_commit.is_some()
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn finish_benchmark_mvcc_uninstalled_failure(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
@@ -5514,10 +5477,7 @@ impl TransactionState {
         self.finish_benchmark_mvcc_pre_decision_failure(tmemory, terminal, format!("{error:#}"))
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn drive_benchmark_mvcc_terminal_commit(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
@@ -5596,10 +5556,7 @@ impl TransactionState {
         }
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn record_benchmark_committed_mvcc_versions_after_error(
         &mut self,
         terminal: &BenchmarkMvccTerminalCommitState,
@@ -5617,10 +5574,7 @@ impl TransactionState {
         Ok(())
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn install_benchmark_mvcc_current_values(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
@@ -5635,10 +5589,7 @@ impl TransactionState {
         self.install_benchmark_mvcc_current_values_inner(tmemory, terminal)
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn install_benchmark_mvcc_current_values_inner(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
@@ -5699,10 +5650,7 @@ impl TransactionState {
         Ok(())
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn force_complete_benchmark_mvcc_commit(
         &mut self,
         terminal: &mut BenchmarkMvccTerminalCommitState,
@@ -5732,10 +5680,7 @@ impl TransactionState {
         Ok(())
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn finish_benchmark_mvcc_pre_decision_failure(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
@@ -5801,10 +5746,7 @@ impl TransactionState {
         }
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn rollback_benchmark_mvcc_current_values(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
@@ -5819,10 +5761,7 @@ impl TransactionState {
         self.rollback_benchmark_mvcc_current_values_inner(tmemory, terminal)
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     fn rollback_benchmark_mvcc_current_values_inner(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,

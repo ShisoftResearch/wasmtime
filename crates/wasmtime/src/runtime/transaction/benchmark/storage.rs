@@ -153,22 +153,13 @@ impl BenchmarkStorage {
     }
 
     pub(super) fn commit(&self, state: &mut TransactionState) -> Result<CommitObservation> {
-        #[cfg(all(
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        ))]
+        #[cfg(feature = "transaction-mvcc")]
         let staged_versions = state.benchmark_mvcc_version_count_for_commit()?;
-        #[cfg(not(all(
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        )))]
+        #[cfg(not(feature = "transaction-mvcc"))]
         let staged_versions = 0;
 
         let commit = state.commit_single_tmemory_for_benchmark(&self.tmemory);
-        #[cfg(all(
-            feature = "transaction-mvcc",
-            feature = "transaction-cc-optimistic-validation"
-        ))]
+        #[cfg(feature = "transaction-mvcc")]
         self.record_mvcc_versions_created(
             state.take_benchmark_committed_mvcc_versions_after_error(),
         )?;
@@ -259,8 +250,14 @@ impl BenchmarkStorage {
     }
 
     pub(super) fn validate_lifecycle(&self) -> Result<()> {
-        #[cfg(not(feature = "transaction-cc-strict-2pl"))]
+        #[cfg(any(
+            not(feature = "transaction-cc-strict-2pl"),
+            feature = "transaction-mvcc"
+        ))]
         {
+            #[cfg(feature = "transaction-mvcc")]
+            let (acquired, active_permits) = self.runtime.mvcc_certification_counts_for_test()?;
+            #[cfg(not(feature = "transaction-mvcc"))]
             let (acquired, active_permits) =
                 self.runtime.optimistic_certification_counts_for_test()?;
             ensure!(
@@ -526,10 +523,7 @@ mod tests {
         assert_eq!(committed_u64(&storage, 0), 1);
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn conflict_cleanup_failure_is_an_unexpected_attempt_error() {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
@@ -550,14 +544,14 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        storage.stage_u64(&mut stale, 0, 2).unwrap();
+        let staging = storage.stage_u64(&mut stale, 0, 2);
         storage
             .runtime
             .visibility_for_test()
             .fail_finish_snapshot_once_for_test()
             .unwrap();
 
-        let result = storage.finish_attempt(&mut stale, Ok(()));
+        let result = storage.finish_attempt(&mut stale, staging);
 
         let error = match result {
             Err(error) => error,
@@ -567,10 +561,7 @@ mod tests {
         assert!(format!("{error:#}").contains("injected snapshot finish failure"));
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn real_gc_barrier_removes_mvcc_versions_and_leaves_no_snapshots() {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
@@ -600,10 +591,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn lifecycle_validator_reports_active_snapshot_then_accepts_cleanup() {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
@@ -646,10 +634,7 @@ mod tests {
         storage.validate_lifecycle().unwrap();
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn lifecycle_validator_reports_active_certification_permit_then_accepts_cleanup() {
         use crate::runtime::transaction::mvcc::MvccCommitTestHook;
@@ -750,10 +735,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn mvcc_certification_does_not_hold_tmemory_mutex() {
         use crate::runtime::transaction::mvcc::MvccCommitTestHook;
@@ -801,10 +783,7 @@ mod tests {
         assert!(acquired, "tmemory mutex was held across MVCC certification");
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn shared_file_backed_write_lock_excludes_mvcc_install_and_rollback() {
         use crate::runtime::transaction::MvccCommitFaultPoint;
@@ -909,10 +888,7 @@ mod tests {
         assert_eq!(committed_u64(&rollback_storage, 0), 0);
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn mvcc_pre_lp_install_failure_rolls_back_current_value_for_both_backends() {
         use crate::runtime::transaction::MvccCommitFaultPoint;
@@ -941,10 +917,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn mvcc_post_lp_failure_retains_retryable_force_completion() {
         use crate::runtime::transaction::MvccCommitFaultPoint;
@@ -978,10 +951,7 @@ mod tests {
         assert_eq!(committed_u64(&storage, 0), 1);
     }
 
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
+    #[cfg(feature = "transaction-mvcc")]
     #[test]
     fn mvcc_synchronous_post_lp_force_completion_counts_versions_once() {
         use crate::runtime::transaction::MvccCommitFaultPoint;

@@ -62,6 +62,8 @@ use crate::runtime::transaction::DurableExternRefHostData;
 #[cfg(all(test, feature = "transaction-mvcc"))]
 use crate::runtime::transaction::MvccCommitFaultPoint;
 #[cfg(not(feature = "transaction-mvcc"))]
+use crate::runtime::transaction::PendingCommitLogEntry;
+#[cfg(not(feature = "transaction-mvcc"))]
 use crate::runtime::transaction::collect_tmemory_access_versions;
 use crate::runtime::transaction::{
     DurableReferenceRegistry, GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
@@ -70,10 +72,10 @@ use crate::runtime::transaction::{
     OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED, OBJECT_VALUE_ABI_TAG_REF, ObjectKind, ObjectPayload,
     ObjectTable, ObjectValue, ObjectValueAbi, OrdinaryGcPromotionAdapter,
     OrdinaryGcPromotionSource, OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE,
-    PendingCommitLogEntry, StagedRecord, TMemoryAccessSnapshot, TMemoryBackend,
-    TableElementSnapshot, TableGranuleSnapshot, TransactionId, TransactionState,
-    WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
-    collect_tmemory_access_snapshot, combine_operation_and_cleanup_results,
+    StagedRecord, TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot,
+    TableGranuleSnapshot, TransactionId, TransactionState, WasmtimePersistentFieldLayout,
+    WasmtimePersistentFieldLayoutAbi, collect_tmemory_access_snapshot,
+    combine_operation_and_cleanup_results,
 };
 #[cfg(feature = "transaction-mvcc")]
 use crate::runtime::transaction::{
@@ -1030,6 +1032,14 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
         let (state, object_table) = store.transaction_state_and_object_table_mut();
         state.begin_terminal_commit_with_object_cleanup(object_table)?;
         return state.complete_commit();
+    }
+
+    for granule in writes.iter().copied() {
+        let current_version = current_granule_version(store, instance, granule)?;
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .validate_active_write(granule, current_version)?;
     }
 
     let certification = store
@@ -5307,6 +5317,7 @@ fn collect_tmemory_participants(
     participants
 }
 
+#[cfg(not(feature = "transaction-mvcc"))]
 fn commit_staged_tmemory_records(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -5384,6 +5395,7 @@ fn commit_staged_tmemory_records(
     Ok(final_marker)
 }
 
+#[cfg(not(feature = "transaction-mvcc"))]
 fn apply_staged_transaction_record(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -5758,6 +5770,28 @@ fn current_tmemory_pages(
         .context("tmemory size overflow")
 }
 
+fn current_tmemory_granule_version(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: MemoryIndex,
+    granule_index: u64,
+) -> Result<u64> {
+    let granule_index =
+        usize::try_from(granule_index).context("tmemory granule index does not fit host usize")?;
+    let granule_start = granule_index
+        .checked_mul(crate::runtime::transaction::TMEMORY_GRANULE_SIZE)
+        .context("tmemory granule start overflow")?;
+    let instance_ref = store.instance_mut(instance);
+    let instance_ref = instance_ref.as_ref();
+    let tmemory = instance_ref
+        .get_tmemory(memory_index)
+        .context("transactional memory operation targeted non-transactional memory")?;
+    if granule_start >= tmemory.byte_len() {
+        return Ok(0);
+    }
+    tmemory.granule_version(granule_index)
+}
+
 fn snapshot_visible_tmemory_pages(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -5923,10 +5957,16 @@ fn collect_tmemory_snapshot(
             let overlap_start = current - granule_start;
             let overlap_end = (range.end.min(granule_end)) - granule_start;
             bytes.extend_from_slice(&visible_bytes[overlap_start..overlap_end]);
+            let current_version = current_tmemory_granule_version(
+                store,
+                instance,
+                memory_index,
+                u64::try_from(granule_index).context("tmemory granule index does not fit u64")?,
+            )?;
             granules.push(TMemoryGranuleSnapshot::new(
                 granule_index,
                 granule_range,
-                0,
+                current_version,
                 visible_bytes,
             )?);
             current = range.end.min(granule_end);
@@ -5936,7 +5976,6 @@ fn collect_tmemory_snapshot(
     }
 }
 
-#[cfg(not(feature = "transaction-mvcc"))]
 fn current_granule_version(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -5950,15 +5989,7 @@ fn current_granule_version(
         } => {
             let owner = owner_instance.map(InstanceId::from_u32).unwrap_or(instance);
             let memory_index = MemoryIndex::from_u32(memory_index);
-            let instance_ref = store.instance_mut(owner);
-            let instance_ref = instance_ref.as_ref();
-            let tmemory = instance_ref
-                .get_tmemory(memory_index)
-                .context("transactional memory operation targeted non-transactional memory")?;
-            tmemory.granule_version(
-                usize::try_from(granule_index)
-                    .context("tmemory granule index does not fit host usize")?,
-            )
+            current_tmemory_granule_version(store, owner, memory_index, granule_index)
         }
         GranuleId::Object { .. } => {
             let store = store.store_opaque_mut();
