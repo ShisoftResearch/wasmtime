@@ -111,6 +111,8 @@ pub use crate::runtime::vm::instance::{
 };
 pub use crate::runtime::vm::interpreter::*;
 #[cfg(has_virtual_memory)]
+pub(crate) use crate::runtime::vm::memory::tmemory::StorageIncarnation;
+#[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::TMemory;
 #[cfg(has_virtual_memory)]
 pub(crate) use crate::runtime::vm::memory::tmemory::TxDataRecordHeader;

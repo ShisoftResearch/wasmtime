@@ -102,8 +102,10 @@ use crate::runtime::vm::{
 use crate::trampoline::VMHostGlobalContext;
 #[cfg(feature = "debug")]
 use crate::{BreakpointState, DebugHandler, FrameDataCache};
-use crate::{Engine, HeapType, Module, Val, ValRaw, ValType, module::ModuleRegistry};
+use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
 use crate::{Global, Instance, Table};
+#[cfg(feature = "transaction")]
+use crate::{HeapType, ValType};
 use core::convert::Infallible;
 use core::fmt;
 #[cfg(any(feature = "async", feature = "gc"))]
@@ -118,7 +120,9 @@ use core::ptr::NonNull;
 use core::task::Poll;
 #[cfg(feature = "transaction")]
 use std::path::PathBuf;
-use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, FuncIndex, TripleExt};
+#[cfg(feature = "transaction")]
+use wasmtime_environ::FuncIndex;
+use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt};
 
 mod context;
 pub use self::context::*;
@@ -1838,16 +1842,18 @@ impl StoreOpaque {
         tx_log_blocks: u32,
     ) -> Result<()> {
         let config = TransactionConfig::with_file_backed_tmemory_path(tmemory_path.clone())?;
-        self.transaction_region_runtime
-            .record_created_file_backed_storage(&tmemory_path, &tx_log_path, tx_log_blocks)?;
-        let shared = self
-            .transaction_region_runtime
-            .shared_file_backed_storage()?
-            .context("shared file-backed storage config was not recorded")?;
+        let runtime = self.transaction_region_runtime.clone();
         self.transaction_state
-            .create_shared_file_backed_durable_log(&shared)?;
-        self.transaction_state
-            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
+            .set_shared_region_runtime(Some(runtime.clone()));
+        runtime.transition_to_created_file_backed_storage(
+            &tmemory_path,
+            &tx_log_path,
+            tx_log_blocks,
+            |shared| {
+                self.transaction_state
+                    .create_shared_file_backed_durable_log_during_storage_transition(shared)
+            },
+        )?;
         self.transaction_object_table
             .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
         self.transaction_config = config;
@@ -1862,38 +1868,6 @@ impl StoreOpaque {
     ) -> Result<()> {
         let config =
             TransactionConfig::with_file_backed_tmemory_existing_path(tmemory_path.clone())?;
-        let recovered =
-            crate::runtime::vm::block_region::reopen_and_recover_file_backed_region_for_runtime(
-                &tx_log_path,
-            )?;
-        let object_winners = recovered.committed_object_winners()?;
-        let mapped_source = recovered
-            .cloned_mapped_region_source()
-            .context("recovered file-backed region does not expose a mapped region source")?;
-        let mut recovered_object_table = ObjectTable::default();
-        let report = recovered_object_table
-            .rebuild_reachable_from_mapped_recovered_object_winners(
-                &recovered.type_layouts,
-                &object_winners,
-                &recovered.root_object_ids,
-                mapped_source.clone(),
-            )?;
-        let reachable_winners = object_winners
-            .iter()
-            .filter(|winner| {
-                report.mark.reachable.contains(&ObjectId {
-                    object_index: winner.object_id,
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        self.transaction_region_runtime
-            .install_recovered_type_layouts(&recovered.type_layouts)?;
-        self.transaction_region_runtime
-            .install_recovered_persistent_object_directory_entries(
-                &reachable_winners,
-                mapped_source,
-            )?;
         let tx_log_blocks = u32::try_from(
             std::fs::metadata(&tx_log_path)
                 .with_context(|| {
@@ -1903,37 +1877,78 @@ impl StoreOpaque {
                 / u64::try_from(crate::runtime::vm::block_region::BLOCK_SIZE).unwrap(),
         )
         .context("transaction log block count overflow")?;
-        self.transaction_region_runtime
-            .record_opened_file_backed_storage(&tmemory_path, &tx_log_path, tx_log_blocks)?;
-        if let Some(tmemory_pages) = recovered.committed_file_backed_tmemory_pages()? {
+        let runtime = self.transaction_region_runtime.clone();
+        self.transaction_state
+            .set_shared_region_runtime(Some(runtime.clone()));
+        let (recovered_object_table, recovered_tmemory_pages) = runtime
+            .transition_to_opened_file_backed_storage(
+                &tmemory_path,
+                &tx_log_path,
+                tx_log_blocks,
+                |shared| {
+                    self.transaction_state
+                        .open_shared_file_backed_durable_log_and_recover_during_storage_transition(
+                            shared,
+                            |state, recovered, mapped_source, mapped_blocks| {
+                                ensure!(
+                                    mapped_blocks == tx_log_blocks,
+                                    "transaction log size changed while opening storage"
+                                );
+                                let object_winners = recovered.committed_object_winners()?;
+                                let mut recovered_object_table = ObjectTable::default();
+                                let report = recovered_object_table
+                                    .rebuild_reachable_from_mapped_recovered_object_winners(
+                                        &recovered.type_layouts,
+                                        &object_winners,
+                                        &recovered.root_object_ids,
+                                        mapped_source.clone(),
+                                    )?;
+                                let reachable_winners = object_winners
+                                    .iter()
+                                    .filter(|winner| {
+                                        report.mark.reachable.contains(&ObjectId {
+                                            object_index: winner.object_id,
+                                        })
+                                    })
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                runtime.install_recovered_type_layouts(&recovered.type_layouts)?;
+                                runtime.install_recovered_persistent_object_directory_entries(
+                                    &reachable_winners,
+                                    mapped_source,
+                                )?;
+                                recovered_object_table
+                                    .set_shared_region_runtime(Some(runtime.clone()));
+                                runtime.observe_recovered_object_ids(object_winners.iter().map(
+                                    |winner| ObjectId {
+                                        object_index: winner.object_id,
+                                    },
+                                ))?;
+                                let recovered_roots = recovered
+                                    .root_object_ids
+                                    .iter()
+                                    .copied()
+                                    .map(|object_index| ObjectId { object_index });
+                                let recovered_versions = recovered
+                                    .winners
+                                    .iter()
+                                    .map(|winner| (winner.logical_id, winner.version));
+                                state.install_recovered_persistent_root_state(
+                                    recovered_roots,
+                                    recovered_versions,
+                                )?;
+                                Ok((
+                                    recovered_object_table,
+                                    recovered.committed_file_backed_tmemory_pages()?,
+                                ))
+                            },
+                        )
+                },
+            )?;
+        if let Some(tmemory_pages) = recovered_tmemory_pages {
             self.transaction_region_runtime
                 .record_file_backed_tmemory_pages(tmemory_pages)?;
         }
-        let shared = self
-            .transaction_region_runtime
-            .shared_file_backed_storage()?
-            .context("shared file-backed storage config was not recorded")?;
-        self.transaction_state
-            .open_shared_file_backed_durable_log(&shared)?;
-        self.transaction_state
-            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
-        recovered_object_table
-            .set_shared_region_runtime(Some(self.transaction_region_runtime.clone()));
-        self.transaction_region_runtime
-            .observe_recovered_object_ids(object_winners.iter().map(|winner| ObjectId {
-                object_index: winner.object_id,
-            }))?;
-        let recovered_roots = recovered
-            .root_object_ids
-            .iter()
-            .copied()
-            .map(|object_index| ObjectId { object_index });
-        let recovered_versions = recovered
-            .winners
-            .iter()
-            .map(|winner| (winner.logical_id, winner.version));
-        self.transaction_state
-            .install_recovered_persistent_root_state(recovered_roots, recovered_versions)?;
         self.transaction_object_table = recovered_object_table;
         self.transaction_config = config;
         Ok(())

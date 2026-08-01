@@ -55,7 +55,7 @@ impl TMemoryRegion {
                 false,
             ),
             TMemoryDaxPmemBacking::ExistingFsDaxPath(path) => (
-                DaxPmemBlockRegion::open_fsdax_path(path, block_count)?,
+                DaxPmemBlockRegion::open_fsdax_linear_memory_path(path, block_count)?,
                 true,
             ),
             TMemoryDaxPmemBacking::FsDaxRegions(regions) => {
@@ -112,7 +112,11 @@ impl TMemoryRegion {
                 reserved_len: region.reserved_len,
             };
             let mut backend = if existing {
-                DaxPmemBlockRegion::open_fsdax_path_in_window(region.path, payload_blocks, window)?
+                DaxPmemBlockRegion::open_fsdax_linear_memory_path_in_window(
+                    region.path,
+                    payload_blocks,
+                    window,
+                )?
             } else {
                 DaxPmemBlockRegion::create_fsdax_path_in_window(
                     region.path,

@@ -221,10 +221,11 @@ pub(crate) struct RegionHeader {
     pub(crate) metadata_descs_start_block: u32,
     pub(crate) metadata_descs_block_count: u32,
     pub(crate) num_descs: u32,
+    pub(crate) storage_incarnation: StorageIncarnation,
 }
 
 impl RegionHeader {
-    const BYTE_LEN: usize = 32;
+    const BYTE_LEN: usize = 48;
 
     pub(crate) fn as_bytes(&self) -> [u8; Self::BYTE_LEN] {
         let mut bytes = [0u8; Self::BYTE_LEN];
@@ -236,6 +237,8 @@ impl RegionHeader {
         bytes[20..24].copy_from_slice(&self.metadata_descs_start_block.to_le_bytes());
         bytes[24..28].copy_from_slice(&self.metadata_descs_block_count.to_le_bytes());
         bytes[28..32].copy_from_slice(&self.num_descs.to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.storage_incarnation.high.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.storage_incarnation.low.to_le_bytes());
         bytes
     }
 
@@ -254,7 +257,30 @@ impl RegionHeader {
             metadata_descs_start_block: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
             metadata_descs_block_count: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
             num_descs: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            storage_incarnation: StorageIncarnation {
+                high: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+                low: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            },
         })
+    }
+}
+
+/// Stable identity written into each persistent block-region image.
+///
+/// Paths are locators, not identities: aliases can name the same storage and a
+/// path can later name a replacement. Deferred cleanup and process-local
+/// allocator coordination use this value to bind work to the exact image that
+/// created it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct StorageIncarnation {
+    pub(crate) high: u64,
+    pub(crate) low: u64,
+}
+
+impl StorageIncarnation {
+    pub(crate) fn is_valid(self) -> bool {
+        self.high != 0 || self.low != 0
     }
 }
 

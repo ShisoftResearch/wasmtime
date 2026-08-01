@@ -12,9 +12,9 @@ use crate::runtime::vm::block_region::{
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::mem::size_of;
 #[cfg(test)]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::cell::Cell;
+use core::mem::size_of;
 
 const DEFAULT_OBJECT_HEAP_BLOCKS: usize = 4;
 const OBJECT_RECORD_ALIGN: usize = 8;
@@ -22,7 +22,9 @@ const OBJECT_VALUE_RECORD_LEN: usize = 20;
 const TX_DATA_RECORD_ROLE_OBJECT_PUBLICATION: u16 = 0;
 
 #[cfg(test)]
-static DECODE_RECORD_CALLS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    static DECODE_RECORD_CALLS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TxRecordHandle(u64);
@@ -597,12 +599,12 @@ impl ObjectHeap {
 
 #[cfg(test)]
 pub(crate) fn reset_decode_record_calls_for_test() {
-    DECODE_RECORD_CALLS_FOR_TEST.store(0, Ordering::SeqCst);
+    DECODE_RECORD_CALLS_FOR_TEST.set(0);
 }
 
 #[cfg(test)]
 pub(crate) fn decode_record_calls_for_test() -> usize {
-    DECODE_RECORD_CALLS_FOR_TEST.load(Ordering::SeqCst)
+    DECODE_RECORD_CALLS_FOR_TEST.get()
 }
 
 pub(crate) fn encode_object_record(
@@ -810,7 +812,7 @@ fn logical_record_len(payload: &ObjectPayload, array_length: Option<u32>) -> Res
 
 fn decode_record(bytes: &[u8]) -> Result<(TxObjectHeader, Option<u32>, ObjectPayload)> {
     #[cfg(test)]
-    DECODE_RECORD_CALLS_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+    DECODE_RECORD_CALLS_FOR_TEST.set(DECODE_RECORD_CALLS_FOR_TEST.get() + 1);
 
     let (header, array_length) = decode_record_metadata(bytes)?;
     let payload = decode_payload_bytes(header, array_length, bytes)?;

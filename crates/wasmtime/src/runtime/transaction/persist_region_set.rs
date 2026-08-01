@@ -2,8 +2,10 @@
 use super::persist::MultiRegionRecoveryTimingForTest;
 use super::persist::{
     DurableDataRecordPointer, DurableDataStream, DurableRegionLog, DurableRegionStorage,
-    PendingCommitLogEntry, TxDurableLogBackend,
+    LinearUndoChunkId, PendingCommitLogEntry, TxDurableLogBackend,
 };
+#[cfg(test)]
+use super::persist::{bind_opened_file_backed_region, bind_region_allocator_lock};
 use super::type_layout::{PersistentTypeLayout, TypeLayoutId};
 use crate::prelude::*;
 #[cfg(test)]
@@ -11,8 +13,8 @@ use crate::runtime::transaction::config::TMemoryRegionConfig;
 #[cfg(test)]
 use crate::runtime::vm::cpus_for_node;
 use crate::runtime::vm::{
-    CpuSet, NumaNode, RecoveryOptions, RecoveryParallelism, TxLogEntry, current_cpu, node_for_cpu,
-    pin_current_thread,
+    CpuSet, NumaNode, RecoveryOptions, RecoveryParallelism, StorageIncarnation, TxLogEntry,
+    current_cpu, node_for_cpu, pin_current_thread,
 };
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -150,6 +152,13 @@ impl<R> MultiRegionDurableLogBackend<R>
 where
     R: DurableRegionStorage,
 {
+    pub(super) fn storage_incarnations(&self) -> Result<Vec<StorageIncarnation>> {
+        self.regions
+            .iter()
+            .map(DurableRegionLog::storage_incarnation)
+            .collect()
+    }
+
     fn region_placement(&self, index: usize) -> Option<&RegionPlacement> {
         self.placements.get(index)
     }
@@ -446,8 +455,15 @@ where
         data_stream: DurableDataStream,
         record: &[u8],
     ) -> Result<DurableDataRecordPointer> {
-        self.selected_region_mut()?
-            .append_data_record(transaction_stream_id, data_stream, record)
+        let region_index = self.selected_region_index()?;
+        let mut pointer = self
+            .regions
+            .get_mut(region_index)
+            .context("selected multi-region durable log region is missing")?
+            .append_data_record(transaction_stream_id, data_stream, record)?;
+        pointer.durable_region_index = u32::try_from(region_index)
+            .context("selected multi-region durable log region index overflow")?;
+        Ok(pointer)
     }
 
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
@@ -476,9 +492,19 @@ where
         self.selected_region_mut()?.fence()
     }
 
-    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
-        self.selected_region_mut()?
-            .retire_committed_linear_undo_chunk(chunk_start_block)
+    fn retire_committed_linear_undo_chunk(&mut self, chunk: LinearUndoChunkId) -> Result<()> {
+        let region_index = usize::try_from(chunk.durable_region_index)
+            .context("linear undo durable region index overflow")?;
+        let region_count = self.regions.len();
+        self.regions
+            .get_mut(region_index)
+            .with_context(|| {
+                format!(
+                    "linear undo durable region index {region_index} is out of bounds for {} regions",
+                    region_count
+                )
+            })?
+            .retire_committed_linear_undo_chunk(chunk)
     }
 
     fn with_recovered_region_snapshot(
@@ -652,7 +678,7 @@ impl MultiRegionDurableLogBackend<crate::runtime::vm::block_region::DaxPmemBlock
         for _ in 0..region_count {
             let region =
                 crate::runtime::vm::block_region::DaxPmemBlockRegion::new_for_test(payload_blocks)?;
-            regions.push(DurableRegionLog::new(region, None));
+            regions.push(DurableRegionLog::new(region, None)?);
         }
         Ok(Self {
             backend_id: next_multi_region_backend_id(),
@@ -686,13 +712,18 @@ impl MultiRegionDurableLogBackend<crate::runtime::vm::block_region::DaxPmemBlock
                 region.path.display()
             );
             let payload_blocks = num_blocks - reserved_blocks;
-            let backend =
-                crate::runtime::vm::block_region::DaxPmemBlockRegion::create_fsdax_path_in_window(
-                    region.path.clone(),
-                    payload_blocks,
-                    fixed_window_for_region(region),
-                )?;
-            durable_regions.push(DurableRegionLog::new(backend, None));
+            let backend = super::persist::create_bound_file_backed_region(
+                &region.path,
+                None,
+                || {
+                    crate::runtime::vm::block_region::DaxPmemBlockRegion::create_fsdax_path_in_window(
+                        region.path.clone(),
+                        payload_blocks,
+                        fixed_window_for_region(region),
+                    )
+                },
+            )?;
+            durable_regions.push(backend);
         }
         Ok(Self {
             backend_id: next_multi_region_backend_id(),
@@ -729,7 +760,7 @@ impl MultiRegionDurableLogBackend<crate::runtime::vm::block_region::DaxPmemBlock
                     payload_blocks,
                     fixed_window_for_region(region),
                 )?;
-            durable_regions.push(DurableRegionLog::new(backend, None));
+            durable_regions.push(bind_region_allocator_lock(backend, None)?);
         }
         Ok(Self {
             backend_id: next_multi_region_backend_id(),
@@ -757,12 +788,14 @@ impl MultiRegionDurableLogBackend<crate::runtime::vm::block_region::FileBackedMe
         let mut durable_regions = Vec::with_capacity(regions.len());
         for region in &regions {
             let backend =
-                crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_in_window(
-                    &region.path,
-                    fixed_window_num_blocks(region)?,
-                    fixed_window_for_region(region),
-                )?;
-            durable_regions.push(DurableRegionLog::new(backend, None));
+                super::persist::create_bound_file_backed_region(&region.path, None, || {
+                    crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::create_in_window(
+                        &region.path,
+                        fixed_window_num_blocks(region)?,
+                        fixed_window_for_region(region),
+                    )
+                })?;
+            durable_regions.push(backend);
         }
         Ok(Self {
             backend_id: next_multi_region_backend_id(),
@@ -786,13 +819,12 @@ impl MultiRegionDurableLogBackend<crate::runtime::vm::block_region::FileBackedMe
         let placements = placements_for_regions(&regions)?;
         let mut durable_regions = Vec::with_capacity(regions.len());
         for region in &regions {
-            let mut backend =
+            let backend =
                 crate::runtime::vm::block_region::FileBackedMemoryBlockRegion::open_in_window(
                     &region.path,
                     fixed_window_for_region(region),
                 )?;
-            crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut backend)?;
-            durable_regions.push(DurableRegionLog::new(backend, None));
+            durable_regions.push(bind_opened_file_backed_region(backend, None)?);
         }
         Ok(Self {
             backend_id: next_multi_region_backend_id(),
@@ -817,7 +849,8 @@ mod tests {
     use crate::runtime::transaction::encode_object_record_for_test;
     use crate::runtime::transaction::persist::{
         DurableDataRecordPointer, DurableDataStream, DurableRegionLog, DurableRegionStorage,
-        PendingCommitLogEntry, PendingPublication, TxDurableLog, TxDurableLogBackend,
+        LinearUndoChunkId, PendingCommitLogEntry, PendingPublication, TxDurableLog,
+        TxDurableLogBackend,
     };
     use crate::runtime::transaction::type_layout::{
         PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
@@ -826,9 +859,11 @@ mod tests {
         ObjectPayload, ObjectValue, PersistentRecoveredRecordLocation, StreamPublisher,
     };
     use crate::runtime::vm::block_region::{
-        BlockRegionBackendView, StreamCursor, VMemoryBlockRegion,
+        BlockRegionBackendView, StorageCoordinationKey, StreamCursor, VMemoryBlockRegion,
     };
-    use crate::runtime::vm::{PackedGranuleDomain, TMemory, TxLogEntry, TxLogEntryRole};
+    use crate::runtime::vm::{
+        PackedGranuleDomain, StorageIncarnation, TMemory, TxLogEntry, TxLogEntryRole,
+    };
     use alloc::string::ToString;
     use alloc::sync::Arc;
     use alloc::vec;
@@ -840,6 +875,7 @@ mod tests {
         flush_data_count: u32,
         flush_log_count: u32,
         fence_count: u32,
+        retire_linear_undo_count: u32,
     }
 
     #[derive(Debug)]
@@ -873,6 +909,16 @@ mod tests {
     }
 
     impl DurableRegionStorage for RecordingRegion {
+        fn storage_incarnation(&self) -> Result<StorageIncarnation> {
+            Ok(StorageIncarnation { high: 1, low: 1 })
+        }
+
+        fn storage_coordination_key(&self) -> Result<StorageCoordinationKey> {
+            Ok(StorageCoordinationKey::Incarnation(
+                self.storage_incarnation()?,
+            ))
+        }
+
         fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
             self.inner.stream_cursor(stream_id)
         }
@@ -901,6 +947,7 @@ mod tests {
                 data_block,
                 data_offset: 0,
                 data_block_generation: 0,
+                durable_region_index: 0,
             })
         }
 
@@ -959,6 +1006,15 @@ mod tests {
             I: IntoIterator<Item = u32>,
         {
             Ok(Vec::new())
+        }
+
+        fn retire_linear_undo_chunk_generation(
+            &mut self,
+            _chunk_start_block: u32,
+            _expected_generation: u32,
+        ) -> Result<bool> {
+            self.state.lock().unwrap().retire_linear_undo_count += 1;
+            Ok(true)
         }
 
         fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion> {
@@ -1148,6 +1204,68 @@ mod tests {
     }
 
     #[test]
+    fn multi_region_deferred_undo_retirement_uses_recorded_region_after_owner_changes() {
+        let first_state = Arc::new(Mutex::new(RecordingRegionState::default()));
+        let second_state = Arc::new(Mutex::new(RecordingRegionState::default()));
+        let mut backend = MultiRegionDurableLogBackend {
+            backend_id: super::next_multi_region_backend_id(),
+            placements: vec![RegionPlacement::default(); 2],
+            regions: vec![
+                DurableRegionLog::new(
+                    RecordingRegion::new(first_state.clone(), false, false, false),
+                    None,
+                )
+                .unwrap(),
+                DurableRegionLog::new(
+                    RecordingRegion::new(second_state.clone(), false, false, false),
+                    None,
+                )
+                .unwrap(),
+            ],
+            selection: RegionSelection::ThreadOwned,
+            last_planned_recovery_worker_counts: Mutex::new(Vec::new()),
+            last_recovery_timing: Mutex::new(None),
+        };
+        let backend_id = backend.backend_id_for_test();
+        let record = TMemory::encode_granule_undo_data_record(
+            0x1000_0000_0000_000c,
+            1,
+            PackedGranuleDomain::TMemory as u16,
+            0,
+            &[1, 2, 3, 4],
+        )
+        .unwrap();
+
+        let pointer = {
+            let _owner = scoped_thread_owned_region_owner_for_test(backend_id, Some(0));
+            TxDurableLogBackend::append_data_record(
+                &mut backend,
+                12,
+                DurableDataStream::TMemoryUndo,
+                &record,
+            )
+            .unwrap()
+        };
+        assert_eq!(pointer.durable_region_index, 0);
+
+        {
+            let _owner = scoped_thread_owned_region_owner_for_test(backend_id, Some(1));
+            TxDurableLogBackend::retire_committed_linear_undo_chunk(
+                &mut backend,
+                LinearUndoChunkId {
+                    chunk_start_block: pointer.chunk_start_block,
+                    generation: pointer.data_block_generation,
+                    durable_region_index: pointer.durable_region_index,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(first_state.lock().unwrap().retire_linear_undo_count, 1);
+        assert_eq!(second_state.lock().unwrap().retire_linear_undo_count, 0);
+    }
+
+    #[test]
     fn multi_region_durable_log_ignores_thread_owned_owner_from_other_backend() {
         let stale_backend =
             MultiRegionDurableLogBackend::new_for_test(2, 32, RegionSelection::ThreadOwned)
@@ -1184,11 +1302,13 @@ mod tests {
                 DurableRegionLog::new(
                     RecordingRegion::new(selected_state.clone(), false, false, false),
                     None,
-                ),
+                )
+                .unwrap(),
                 DurableRegionLog::new(
                     RecordingRegion::new(unselected_state.clone(), true, true, true),
                     None,
-                ),
+                )
+                .unwrap(),
             ],
             selection: RegionSelection::Pinned(0),
             last_planned_recovery_worker_counts: Mutex::new(Vec::new()),

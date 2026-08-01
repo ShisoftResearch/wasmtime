@@ -61,6 +61,8 @@ use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::runtime::transaction::DurableExternRefHostData;
 #[cfg(all(test, feature = "transaction-mvcc"))]
 use crate::runtime::transaction::MvccCommitFaultPoint;
+#[cfg(not(feature = "transaction-mvcc"))]
+use crate::runtime::transaction::collect_tmemory_access_versions;
 use crate::runtime::transaction::{
     DurableReferenceRegistry, GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
@@ -97,13 +99,12 @@ use core::ptr::NonNull;
 #[cfg(feature = "threads")]
 use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
-#[cfg(feature = "gc")]
-use wasmtime_environ::GcLayout;
 use wasmtime_environ::{
     CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GlobalIndex, MemoryIndex,
-    PassiveElemIndex, TableIndex, Trap, TypeIndex, VMGcKind, VMSharedTypeIndex, WasmHeapTopType,
-    WasmValType,
+    PassiveElemIndex, TableIndex, Trap, VMGcKind, VMSharedTypeIndex, WasmHeapTopType, WasmValType,
 };
+#[cfg(feature = "gc")]
+use wasmtime_environ::{GcLayout, TypeIndex};
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::AccessError::{
     DoubleMalloc, InvalidFree, InvalidRead, InvalidWrite, OutOfBounds,
@@ -807,10 +808,7 @@ fn transaction_commit_single_version_impl(
         }
     };
 
-    #[cfg(any(
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-timestamp-ordering"
-    ))]
+    #[cfg(not(feature = "transaction-cc-strict-2pl"))]
     let _certification = store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -854,19 +852,10 @@ fn transaction_commit_single_version_certified(
             .validate_active_write(granule, current_version)?;
     }
 
-    let (stream_id, txid) = {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        let transaction_id = state.active_transaction_required_raw()?;
-        let stream_id = if let Some(region) = state.shared_region_runtime_for_publication() {
-            region.current_thread_log_segment()?.stream_id()
-        } else {
-            u32::try_from(transaction_id)
-                .context("transaction id does not fit durable transaction stream id")?
-        };
-        let txid = u32::try_from(transaction_id)
-            .context("transaction id does not fit durable transaction id")?;
-        (stream_id, txid)
-    };
+    let (stream_id, txid) = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .durable_publication_ids()?;
 
     {
         let store = store.store_opaque_mut();
@@ -1286,19 +1275,10 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
     #[cfg(test)]
     visibility.run_predecessor_collected_hook_for_test()?;
 
-    let (stream_id, txid) = {
-        let state = store.store_opaque_mut().transaction_state_mut();
-        let transaction_id = state.active_transaction_required_raw()?;
-        let stream_id = if let Some(region) = state.shared_region_runtime_for_publication() {
-            region.current_thread_log_segment()?.stream_id()
-        } else {
-            u32::try_from(transaction_id)
-                .context("transaction id does not fit durable transaction stream id")?
-        };
-        let txid = u32::try_from(transaction_id)
-            .context("transaction id does not fit durable transaction id")?;
-        (stream_id, txid)
-    };
+    let (stream_id, txid) = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .durable_publication_ids()?;
 
     {
         let store = store.store_opaque_mut();
@@ -2384,6 +2364,7 @@ const TRANSACTION_TREF_TEST_KIND_STRUCT: u32 = 3;
 const TRANSACTION_TREF_TEST_KIND_ARRAY: u32 = 4;
 const TRANSACTION_TREF_TEST_EXPECTED_TYPE_NONE: u32 = u32::MAX;
 
+#[cfg(feature = "gc")]
 fn transaction_module_type_index_to_shared(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -2400,6 +2381,15 @@ fn transaction_module_type_index_to_shared(
             bail!("transaction object constructor received a recgroup-relative type index")
         }
     }
+}
+
+#[cfg(not(feature = "gc"))]
+fn transaction_module_type_index_to_shared(
+    _store: &mut dyn VMStore,
+    _instance: InstanceId,
+    _type_index: u32,
+) -> Result<VMSharedTypeIndex> {
+    bail!("transaction object constructors require GC support")
 }
 
 fn transaction_tref_test(
@@ -5822,6 +5812,25 @@ fn collect_tmemory_snapshot(
 ) -> Result<TMemoryAccessSnapshot> {
     #[cfg(not(feature = "transaction-mvcc"))]
     {
+        // Register the observed versions before copying the bytes. A writer
+        // can otherwise publish between the copy and registration, making an
+        // old snapshot appear to have the writer's new shared version.
+        let versions = {
+            let instance_ref = store.instance_mut(instance);
+            let instance_ref = instance_ref.as_ref();
+            let tmemory = instance_ref
+                .get_tmemory(memory_index)
+                .context("transactional memory operation targeted non-transactional memory")?;
+            collect_tmemory_access_versions(tmemory, addr, len)?
+        };
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .register_tmemory_access_versions(
+                _owner_instance_key,
+                memory_index.as_u32(),
+                &versions,
+            )?;
         let instance_ref = store.instance_mut(instance);
         let instance_ref = instance_ref.as_ref();
         let tmemory = instance_ref

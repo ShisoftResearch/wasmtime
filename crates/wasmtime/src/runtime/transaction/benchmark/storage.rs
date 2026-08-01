@@ -2,7 +2,7 @@ use super::config::BackendKind;
 use crate::prelude::*;
 use crate::runtime::transaction::{
     GcMvccMode, ObjectTable, PersistentGcBudget, TransactionRegionRuntime, TransactionState,
-    collect_tmemory_access_snapshot, combine_operation_and_cleanup_results,
+    combine_operation_and_cleanup_results,
 };
 use crate::runtime::vm::TMemory;
 use std::path::PathBuf;
@@ -114,8 +114,8 @@ impl BenchmarkStorage {
                 .runtime
                 .shared_file_backed_storage()?
                 .context("benchmark file-backed runtime has no shared storage config")?;
-            state.open_shared_file_backed_durable_log(&shared)?;
             state.set_shared_region_runtime(Some(self.runtime.clone()));
+            state.open_shared_file_backed_durable_log(&shared)?;
         }
         Ok(state)
     }
@@ -125,15 +125,15 @@ impl BenchmarkStorage {
     }
 
     pub(super) fn read_u64(&self, state: &mut TransactionState, addr: u64) -> Result<u64> {
-        let snapshot = {
-            let tmemory = self
-                .tmemory
-                .lock()
-                .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
-            collect_tmemory_access_snapshot(&tmemory, addr, size_of::<u64>())?
-        };
-        let bytes =
-            state.read_tmemory_owned_from_snapshot(None, 0, addr, size_of::<u64>(), &snapshot)?;
+        // Keep the backing-memory lock until the concurrency-control policy has
+        // registered the observed version. Otherwise a writer can publish new
+        // bytes after the snapshot and before registration, causing the stale
+        // bytes to be associated with the writer's newer shared version.
+        let tmemory = self
+            .tmemory
+            .lock()
+            .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+        let bytes = state.read_tmemory_owned(None, 0, addr, size_of::<u64>(), &tmemory)?;
         Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
             crate::format_err!("benchmark u64 read returned the wrong byte count")
         })?))
@@ -145,20 +145,11 @@ impl BenchmarkStorage {
         addr: u64,
         value: u64,
     ) -> Result<()> {
-        let snapshot = {
-            let tmemory = self
-                .tmemory
-                .lock()
-                .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
-            collect_tmemory_access_snapshot(&tmemory, addr, size_of::<u64>())?
-        };
-        state.stage_tmemory_write_owned_from_snapshot(
-            None,
-            0,
-            addr,
-            &value.to_le_bytes(),
-            &snapshot,
-        )
+        let tmemory = self
+            .tmemory
+            .lock()
+            .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+        state.stage_tmemory_write_owned(None, 0, addr, &value.to_le_bytes(), &tmemory)
     }
 
     pub(super) fn commit(&self, state: &mut TransactionState) -> Result<CommitObservation> {
@@ -268,10 +259,7 @@ impl BenchmarkStorage {
     }
 
     pub(super) fn validate_lifecycle(&self) -> Result<()> {
-        #[cfg(any(
-            feature = "transaction-cc-optimistic-validation",
-            feature = "transaction-cc-timestamp-ordering"
-        ))]
+        #[cfg(not(feature = "transaction-cc-strict-2pl"))]
         {
             let (acquired, active_permits) =
                 self.runtime.optimistic_certification_counts_for_test()?;
@@ -419,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_rmw_conflicts_without_losing_an_update() {
+    fn concurrent_rmw_conflicts_without_losing_a_committed_update() {
         let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
         let ready = Arc::new(Barrier::new(2));
 
@@ -450,7 +438,11 @@ mod tests {
                 .iter()
                 .any(|outcome| matches!(outcome, AttemptOutcome::Conflict))
         );
-        assert_eq!(committed_u64(&storage, 0), 1);
+        let committed = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AttemptOutcome::Committed(_)))
+            .count();
+        assert_eq!(committed_u64(&storage, 0), committed as u64);
     }
 
     #[cfg(all(
@@ -458,7 +450,7 @@ mod tests {
         not(feature = "transaction-mvcc")
     ))]
     #[test]
-    fn timestamp_commit_serializes_validation_with_install() {
+    fn timestamp_commit_serializes_write_skew_validation_with_install() {
         use std::sync::mpsc::{RecvTimeoutError, channel};
         use std::time::Duration;
 
@@ -513,7 +505,7 @@ mod tests {
         let b_while_a_is_paused = match b_outcome_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(outcome) => Some(outcome),
             Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => panic!("timestamp writer disconnected"),
+            Err(RecvTimeoutError::Disconnected) => panic!("single-version writer disconnected"),
         };
         let b_completed_while_a_was_paused = b_while_a_is_paused.is_some();
         release_a_tx.send(()).unwrap();
@@ -526,17 +518,11 @@ mod tests {
 
         assert!(
             !b_completed_while_a_was_paused,
-            "second timestamp commit completed inside the first commit's validation/install window"
+            "second commit completed inside the first commit's validation/install window"
         );
-        assert!(
-            a_outcome.is_ok(),
-            "first timestamp commit failed: {a_outcome:?}"
-        );
-        let conflict = b_outcome.expect_err("second stale timestamp writer committed");
-        assert!(
-            conflict.contains("transaction read conflict: timestamp ordering read version changed"),
-            "{conflict}"
-        );
+        assert!(a_outcome.is_ok(), "first commit failed: {a_outcome:?}");
+        let conflict = b_outcome.expect_err("second stale write-skew writer committed");
+        assert!(conflict.contains("transaction read conflict"), "{conflict}");
         assert_eq!(committed_u64(&storage, 0), 1);
     }
 

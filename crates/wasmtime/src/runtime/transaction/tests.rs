@@ -1,14 +1,11 @@
-#[cfg(feature = "transaction-cc-optimistic-validation")]
+#[cfg(not(feature = "transaction-cc-strict-2pl"))]
 use super::concurrency::CertificationMode;
 #[cfg(all(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
 use super::concurrency::MvccCertificationAuthority;
-#[cfg(all(
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-mvcc")
-))]
+#[cfg(not(feature = "transaction-cc-strict-2pl"))]
 use super::concurrency::OptimisticCertificationAuthority;
 use super::config::TMemoryRegionConfig;
 #[cfg(all(
@@ -4159,12 +4156,10 @@ fn transaction_test_module(engine: &crate::Engine, wat: &str) -> crate::Module {
 }
 
 #[cfg(all(
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-mvcc")
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
 ))]
-fn optimistic_validation_single_version_assert_runtime_quiescent(
-    runtime: &TransactionRegionRuntime,
-) {
+fn single_version_certification_assert_runtime_quiescent(runtime: &TransactionRegionRuntime) {
     assert_eq!(
         runtime
             .optimistic_certification_counts_for_test()
@@ -4179,10 +4174,10 @@ fn optimistic_validation_single_version_assert_runtime_quiescent(
 #[cfg(all(
     unix,
     has_virtual_memory,
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-mvcc")
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
 ))]
-fn optimistic_validation_single_version_tfunc_prevents_write_skew() {
+fn single_version_tfunc_certification_prevents_write_skew() {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -4303,10 +4298,13 @@ fn optimistic_validation_single_version_tfunc_prevents_write_skew() {
         .unwrap();
     assert!(
         a + b >= 1,
-        "single-version OCC write skew violated A + B >= 1: A={a}, B={b}"
+        "single-version write skew violated A + B >= 1: A={a}, B={b}"
     );
-    assert_eq!(conflict_count, 1);
-    optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+    assert!(
+        conflict_count >= 1,
+        "write-skew schedule committed both transactions: {outcomes:?}"
+    );
+    single_version_certification_assert_runtime_quiescent(&runtime);
     clear_current_thread_transaction_for_test();
 }
 
@@ -4396,7 +4394,7 @@ fn optimistic_validation_disjoint_tfunc_commits_overlap_certification() {
         runtime.optimistic_certification_counts_for_test().unwrap(),
         (2, 0)
     );
-    optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+    single_version_certification_assert_runtime_quiescent(&runtime);
     clear_current_thread_transaction_for_test();
 }
 
@@ -4435,7 +4433,7 @@ fn optimistic_validation_certification_version_mismatch_cleans_lifecycle() -> Re
     assert!(state.suspended.is_empty());
     assert!(!state.terminal_commit_active);
     assert_eq!(runtime.optimistic_certification_counts_for_test()?, (1, 0));
-    optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+    single_version_certification_assert_runtime_quiescent(&runtime);
     clear_current_thread_transaction_for_test();
     Ok(())
 }
@@ -8313,10 +8311,7 @@ fn shared_region_runtime_uses_thread_log_segments_for_tmemory_publication() {
 
             ready_barrier.wait();
 
-            let stream_id = runtime
-                .current_thread_log_segment_for_test()
-                .unwrap()
-                .stream_id();
+            let (stream_id, _) = state.durable_publication_ids().unwrap();
             let txid = u32::try_from(transaction.as_raw()).unwrap();
             assert_ne!(stream_id, txid);
             segment_barrier.wait();
@@ -9004,10 +8999,6 @@ fn shared_region_runtime_pre_lp_failure_retires_log_segment() {
                 (i32.tstore (i32.const 0) (i32.const 42))))
         "#,
     );
-    let initial_stream_id = runtime
-        .current_thread_log_segment_for_test()
-        .unwrap()
-        .stream_id();
     let mut store = crate::Store::new(&engine, ());
     store.set_transaction_region_runtime_for_test(runtime.clone());
     store
@@ -9025,16 +9016,19 @@ fn shared_region_runtime_pre_lp_failure_retires_log_segment() {
     assert_eq!(current_thread_transaction_for_test(), None);
     assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
     assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 0);
+    let retired = runtime.retired_log_segment_stream_ids_for_test().unwrap();
+    assert_eq!(retired.len(), 1);
+    let initial_stream_id = retired[0];
     #[cfg(all(
-        feature = "transaction-cc-optimistic-validation",
-        not(feature = "transaction-mvcc")
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-strict-2pl")
     ))]
     {
         assert_eq!(
             runtime.optimistic_certification_counts_for_test().unwrap(),
             (1, 0)
         );
-        optimistic_validation_single_version_assert_runtime_quiescent(&runtime);
+        single_version_certification_assert_runtime_quiescent(&runtime);
     }
 
     let next_runtime = runtime.clone();
@@ -9069,10 +9063,7 @@ fn shared_region_runtime_publication_failure_retires_log_segment() {
     let first_stream_id = {
         let mut state = TransactionState::default();
         let transaction = state.begin_with_region_runtime(&runtime).unwrap();
-        let stream_id = runtime
-            .current_thread_log_segment_for_test()
-            .unwrap()
-            .stream_id();
+        let (stream_id, _) = state.durable_publication_ids().unwrap();
         let txid = u32::try_from(transaction.as_raw()).unwrap();
         state.durable_log = durable_log;
         let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0042, 1, vec![1, 2, 3, 4]);
@@ -9233,10 +9224,7 @@ fn linear_memory_commit_logs_only_touched_shared_file_backed_granules() {
         )
         .unwrap();
 
-    let stream_id = runtime
-        .current_thread_log_segment_for_test()
-        .unwrap()
-        .stream_id();
+    let (stream_id, _) = state.durable_publication_ids().unwrap();
     assert!(state.commit_tmemory_for_test(&mut tmemory).unwrap());
 
     let entries = state.durable_log_entries_for_test(stream_id);
@@ -15227,6 +15215,28 @@ fn transaction_state_publishes_committed_object_payload_to_file_backed_log() {
 }
 
 #[test]
+fn transaction_state_publish_commit_lp_retires_undo_chunk_once_on_success() {
+    let (durable_log, events) = TxDurableLog::recording_backend_for_test();
+    let mut state =
+        TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(17), durable_log);
+    let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0029, 12, vec![1, 2, 3, 4]);
+
+    let marker = state
+        .publish_tmemory_undo_before_in_place_write(17, 17, &undo)
+        .unwrap();
+    state.publish_commit_lp(17, 17, marker).unwrap();
+
+    assert!(!state.post_commit_linear_undo_chunks.contains_key(&17));
+    assert_eq!(
+        count_retire_committed_linear_undo_attempts(
+            &events.lock().unwrap(),
+            marker.chunk_start_block
+        ),
+        1
+    );
+}
+
+#[test]
 fn transaction_state_publish_commit_lp_succeeds_when_post_lp_retirement_fails() {
     let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failure_for_test();
     let mut state =
@@ -15247,7 +15257,7 @@ fn transaction_state_publish_commit_lp_succeeds_when_post_lp_retirement_fails() 
             .iter()
             .copied()
             .collect::<Vec<_>>(),
-        vec![marker.chunk_start_block]
+        vec![persist::LinearUndoChunkId::from_marker(marker)]
     );
     assert!(events.lock().unwrap().contains(
         &persist::RecordingBackendEvent::RetireCommittedLinearUndoChunk(marker.chunk_start_block)
@@ -15260,8 +15270,563 @@ fn transaction_state_publish_commit_lp_succeeds_when_post_lp_retirement_fails() 
 }
 
 #[test]
+fn deferred_undo_retirement_prevents_log_stream_reuse() {
+    use std::thread;
+
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let (durable_log, _) = TxDurableLog::recording_backend_with_retire_failures_for_test(3);
+    let mut state =
+        TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(23), durable_log);
+    state.set_shared_region_runtime(Some(runtime.clone()));
+    let (stream_id, _) = state.durable_publication_ids().unwrap();
+    let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0033, 5, vec![1, 3, 5, 7]);
+
+    let marker = state
+        .publish_tmemory_undo_before_in_place_write(stream_id, 23, &undo)
+        .unwrap();
+    state.publish_commit_lp(stream_id, 23, marker).unwrap();
+    state.complete_commit().unwrap();
+    let durable_log_identity = state.durable_log.cleanup_identity().clone();
+
+    assert!(
+        runtime
+            .deferred_linear_undo_cleanup_for_stream(stream_id, &durable_log_identity)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 0);
+
+    let next_runtime = runtime.clone();
+    let next_stream_id = thread::spawn(move || {
+        let segment = next_runtime.current_thread_log_segment_for_test().unwrap();
+        next_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        segment.stream_id()
+    })
+    .join()
+    .unwrap();
+    assert_ne!(next_stream_id, stream_id);
+
+    state.retry_post_commit_linear_undo_retirement();
+    assert!(
+        runtime
+            .deferred_linear_undo_cleanup_for_stream(stream_id, &durable_log_identity)
+            .unwrap()
+            .is_some()
+    );
+    state.retry_post_commit_linear_undo_retirement();
+    assert!(
+        runtime
+            .deferred_linear_undo_cleanup_for_stream(stream_id, &durable_log_identity)
+            .unwrap()
+            .is_none()
+    );
+
+    let reclaimed_runtime = runtime.clone();
+    let reclaimed_stream_id = thread::spawn(move || {
+        let segment = reclaimed_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap();
+        reclaimed_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        segment.stream_id()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(reclaimed_stream_id, stream_id);
+}
+
+#[test]
+fn completed_cleanup_before_stream_retirement_reclaims_on_release() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let stream_id = runtime
+        .current_thread_log_segment_for_test()
+        .unwrap()
+        .stream_id();
+
+    runtime.reclaim_retired_log_segment(stream_id).unwrap();
+    runtime.retire_current_thread_log_segment().unwrap();
+
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 1);
+    let reused = runtime
+        .current_thread_log_segment_for_test()
+        .unwrap()
+        .stream_id();
+    runtime
+        .release_current_thread_log_segment_for_test()
+        .unwrap();
+    assert_eq!(reused, stream_id);
+}
+
+#[test]
+fn suspended_uncommitted_transaction_keeps_its_log_segment_assigned() {
+    use std::thread;
+
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let (durable_log, _) = TxDurableLog::recording_backend_for_test();
+    let outer = TransactionId::from_raw(28);
+    let inner = TransactionId::from_raw(29);
+    let mut state = TransactionState::new_for_test_with_durable_log(outer, durable_log);
+    state.set_shared_region_runtime(Some(runtime.clone()));
+    let (outer_stream, _) = state.durable_publication_ids().unwrap();
+    let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0036, 8, vec![1, 4, 9, 16]);
+    state
+        .publish_tmemory_undo_before_in_place_write(outer_stream, 28, &undo)
+        .unwrap();
+
+    assert_eq!(state.enter_transaction(inner).unwrap(), Some(outer));
+    state.clear_active().unwrap();
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 1);
+
+    let other_runtime = runtime.clone();
+    let other_stream = thread::spawn(move || {
+        let stream = other_runtime
+            .current_thread_log_segment_for_test()
+            .unwrap()
+            .stream_id();
+        other_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        stream
+    })
+    .join()
+    .unwrap();
+    assert_ne!(other_stream, outer_stream);
+
+    state.restore_transaction(Some(outer)).unwrap();
+    state.abort().unwrap();
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 1);
+}
+
+#[test]
+fn nested_durable_transactions_use_distinct_log_segments_and_undo_chunks() {
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested-transaction-log.bin");
+    let durable_log = TxDurableLog::create_file_backed(&path, 64).unwrap();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let outer = TransactionId::from_raw(30);
+    let inner = TransactionId::from_raw(31);
+    let mut state = TransactionState::new_for_test_with_durable_log(outer, durable_log);
+    state.set_shared_region_runtime(Some(runtime));
+
+    let (outer_stream, outer_txid) = state.durable_publication_ids().unwrap();
+    let outer_undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0037, 9, vec![1, 2, 3, 4]);
+    let outer_marker = state
+        .publish_tmemory_undo_before_in_place_write(outer_stream, outer_txid, &outer_undo)
+        .unwrap();
+
+    assert_eq!(state.enter_transaction(inner).unwrap(), Some(outer));
+    let (inner_stream, inner_txid) = state.durable_publication_ids().unwrap();
+    assert_ne!(inner_stream, outer_stream);
+    let inner_undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0038, 10, vec![5, 6, 7, 8]);
+    let inner_marker = state
+        .publish_tmemory_undo_before_in_place_write(inner_stream, inner_txid, &inner_undo)
+        .unwrap();
+    assert_ne!(
+        inner_marker.chunk_start_block,
+        outer_marker.chunk_start_block
+    );
+    state
+        .publish_commit_lp(inner_stream, inner_txid, inner_marker)
+        .unwrap();
+    state.complete_commit().unwrap();
+
+    state.restore_transaction(Some(outer)).unwrap();
+    state.abort().unwrap();
+    drop(state);
+
+    let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+    assert_eq!(recovered.tmemory_undo_rollbacks.len(), 1);
+    assert_eq!(
+        recovered.tmemory_undo_rollbacks[0].old_granule_bytes,
+        outer_undo.old_granule_bytes
+    );
+}
+
+#[test]
+fn same_thread_transaction_states_receive_distinct_log_segment_leases() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let mut first = TransactionState::new_for_test(TransactionId::from_raw(32));
+    first.set_shared_region_runtime(Some(runtime.clone()));
+    let (first_stream, _) = first.durable_publication_ids().unwrap();
+
+    let mut second = TransactionState::new_for_test(TransactionId::from_raw(33));
+    second.set_shared_region_runtime(Some(runtime.clone()));
+    let (second_stream, _) = second.durable_publication_ids().unwrap();
+
+    assert_ne!(first_stream, second_stream);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 2);
+    drop(first);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 1);
+    drop(second);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 2);
+}
+
+#[test]
+fn dropping_dirty_state_retires_its_log_segment_lease() {
+    use std::thread;
+
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let (durable_log, _) = TxDurableLog::recording_backend_for_test();
+    let mut state =
+        TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(34), durable_log);
+    state.set_shared_region_runtime(Some(runtime.clone()));
+    let (stream_id, txid) = state.durable_publication_ids().unwrap();
+    let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0039, 11, vec![8, 6, 7, 5]);
+    state
+        .publish_tmemory_undo_before_in_place_write(stream_id, txid, &undo)
+        .unwrap();
+
+    drop(state);
+    assert_eq!(runtime.thread_log_segment_count_for_test().unwrap(), 0);
+    assert_eq!(runtime.free_log_segment_count_for_test().unwrap(), 0);
+
+    let next_runtime = runtime.clone();
+    let next_stream = thread::spawn(move || {
+        let segment = next_runtime.current_thread_log_segment_for_test().unwrap();
+        next_runtime
+            .release_current_thread_log_segment_for_test()
+            .unwrap();
+        segment.stream_id()
+    })
+    .join()
+    .unwrap();
+    assert_ne!(next_stream, stream_id);
+}
+
+#[test]
+fn pending_cleanup_prevents_shared_storage_reconfiguration() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_tmemory = dir.path().join("first-tmemory.bin");
+    let first_log = dir.path().join("first-log.bin");
+    let second_tmemory = dir.path().join("second-tmemory.bin");
+    let second_log = dir.path().join("second-log.bin");
+    let runtime =
+        TransactionRegionRuntime::create_file_backed_for_test(&first_tmemory, &first_log, 64)
+            .unwrap();
+    let shared = runtime
+        .shared_file_backed_storage()
+        .unwrap()
+        .expect("shared file-backed storage config");
+    let durable_log = TxDurableLog::open_file_backed_with_allocator_lock(
+        &first_log,
+        shared.durable_log_allocator_lock(),
+    )
+    .unwrap();
+    runtime
+        .defer_linear_undo_cleanup(
+            71,
+            durable_log.cleanup_identity().clone(),
+            [persist::LinearUndoChunkId {
+                chunk_start_block: 7,
+                generation: 1,
+                durable_region_index: 0,
+            }]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+
+    let error = runtime
+        .record_created_file_backed_storage(&second_tmemory, &second_log, 64)
+        .unwrap_err();
+    assert!(error.to_string().contains(
+        "cannot replace shared durable storage while cleanup for another backend is pending"
+    ));
+    assert_eq!(
+        runtime
+            .shared_file_backed_storage()
+            .unwrap()
+            .unwrap()
+            .tx_log_path(),
+        first_log
+    );
+}
+
+#[test]
+fn pending_cleanup_rejects_durable_log_creation_before_touching_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_log = dir.path().join("first-log.bin");
+    let replacement_log = dir.path().join("replacement-log.bin");
+    let durable_log = TxDurableLog::create_file_backed(&first_log, 64).unwrap();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    runtime
+        .defer_linear_undo_cleanup(
+            72,
+            durable_log.cleanup_identity().clone(),
+            [persist::LinearUndoChunkId {
+                chunk_start_block: 8,
+                generation: 1,
+                durable_region_index: 0,
+            }]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+    let mut state = TransactionState::new_for_test(TransactionId::from_raw(72));
+    state.set_shared_region_runtime(Some(runtime));
+
+    let error = state
+        .create_file_backed_durable_log(&replacement_log, 64)
+        .unwrap_err();
+    assert!(error.to_string().contains(
+        "cannot replace shared durable storage while cleanup for another backend is pending"
+    ));
+    assert!(!replacement_log.exists());
+}
+
+#[test]
+fn storage_creation_transition_serializes_concurrent_cleanup_handoff() {
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let (durable_log, _) = TxDurableLog::recording_backend_for_test();
+    let durable_log_identity = durable_log.cleanup_identity().clone();
+    let creator_runtime = runtime.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let creator = std::thread::spawn(move || {
+        creator_runtime
+            .with_no_deferred_cleanup_during_storage_creation(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    entered_rx.recv().unwrap();
+
+    let cleanup_runtime = runtime.clone();
+    let (cleanup_started_tx, cleanup_started_rx) = std::sync::mpsc::channel();
+    let (cleanup_finished_tx, cleanup_finished_rx) = std::sync::mpsc::channel();
+    let cleanup = std::thread::spawn(move || {
+        cleanup_started_tx.send(()).unwrap();
+        cleanup_runtime
+            .defer_linear_undo_cleanup(
+                73,
+                durable_log_identity,
+                [persist::LinearUndoChunkId {
+                    chunk_start_block: 9,
+                    generation: 1,
+                    durable_region_index: 0,
+                }]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        cleanup_finished_tx.send(()).unwrap();
+    });
+    cleanup_started_rx.recv().unwrap();
+    assert!(
+        cleanup_finished_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err()
+    );
+
+    release_tx.send(()).unwrap();
+    creator.join().unwrap();
+    cleanup_finished_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    cleanup.join().unwrap();
+}
+
+#[test]
+fn active_commit_rejects_storage_transition_without_changing_runtime_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_tmemory = dir.path().join("first-tmemory.bin");
+    let first_log = dir.path().join("first-log.bin");
+    let replacement_tmemory = dir.path().join("replacement-tmemory.bin");
+    let replacement_log = dir.path().join("replacement-log.bin");
+    let runtime =
+        TransactionRegionRuntime::create_file_backed_for_test(&first_tmemory, &first_log, 64)
+            .unwrap();
+    let _active_commit = runtime.begin_user_transaction_region_for_test().unwrap();
+
+    let error = runtime
+        .transition_to_created_file_backed_storage(
+            &replacement_tmemory,
+            &replacement_log,
+            64,
+            |_| -> Result<()> { panic!("transition callback must not run") },
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("user transaction commit is active")
+    );
+    assert_eq!(
+        runtime
+            .shared_file_backed_storage()
+            .unwrap()
+            .unwrap()
+            .tx_log_path(),
+        first_log
+    );
+    assert!(!replacement_log.exists());
+}
+
+#[test]
+fn shared_gc_barrier_reclaims_deferred_undo_after_originating_state_is_dropped() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let (origin_log, _) = TxDurableLog::recording_backend_with_retire_failures_for_test(3);
+    let mut origin =
+        TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(26), origin_log);
+    origin.set_shared_region_runtime(Some(runtime.clone()));
+    let (stream_id, _) = origin.durable_publication_ids().unwrap();
+    let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0035, 7, vec![2, 4, 6, 8]);
+    let marker = origin
+        .publish_tmemory_undo_before_in_place_write(stream_id, 26, &undo)
+        .unwrap();
+    origin.publish_commit_lp(stream_id, 26, marker).unwrap();
+    origin.complete_commit().unwrap();
+    let origin_log_identity = origin.durable_log.cleanup_identity().clone();
+    assert!(
+        runtime
+            .deferred_linear_undo_cleanup_for_stream(stream_id, &origin_log_identity)
+            .unwrap()
+            .is_some()
+    );
+    drop(origin);
+
+    let (cleanup_log, cleanup_events) = TxDurableLog::recording_backend_for_test();
+    let mut cleanup =
+        TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(27), cleanup_log);
+    cleanup.complete_commit().unwrap();
+    cleanup.set_shared_region_runtime(Some(runtime.clone()));
+    let mut objects = ObjectTable::default();
+    cleanup
+        .persistent_mark_sweep_collect_for_test(&mut objects)
+        .unwrap();
+
+    assert!(
+        runtime
+            .deferred_linear_undo_cleanup_for_stream(stream_id, &origin_log_identity)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        count_retire_committed_linear_undo_attempts(
+            &cleanup_events.lock().unwrap(),
+            marker.chunk_start_block,
+        ),
+        0
+    );
+
+    cleanup
+        .durable_log
+        .set_cleanup_identity_for_test(origin_log_identity.clone());
+    cleanup
+        .persistent_mark_sweep_collect_for_test(&mut objects)
+        .unwrap();
+
+    assert!(
+        runtime
+            .deferred_linear_undo_cleanup_for_stream(stream_id, &origin_log_identity)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        count_retire_committed_linear_undo_attempts(
+            &cleanup_events.lock().unwrap(),
+            marker.chunk_start_block,
+        ),
+        1
+    );
+    let reclaimed = runtime
+        .current_thread_log_segment_for_test()
+        .unwrap()
+        .stream_id();
+    runtime
+        .release_current_thread_log_segment_for_test()
+        .unwrap();
+    assert_eq!(reclaimed, stream_id);
+}
+
+#[test]
+fn deferred_undo_retirement_does_not_retry_successful_chunks() {
+    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(1);
+    let mut state =
+        TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(24), durable_log);
+    let first = persist::LinearUndoChunkId {
+        chunk_start_block: 10,
+        generation: 1,
+        durable_region_index: 0,
+    };
+    let second = persist::LinearUndoChunkId {
+        chunk_start_block: 20,
+        generation: 1,
+        durable_region_index: 0,
+    };
+    state
+        .post_commit_linear_undo_chunks
+        .insert(24, [first, second].into_iter().collect());
+
+    state.retry_post_commit_linear_undo_retirement_for_stream(24);
+    assert_eq!(
+        state
+            .post_commit_linear_undo_chunks
+            .get(&24)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first]
+    );
+    assert_eq!(
+        count_retire_committed_linear_undo_attempts(&events.lock().unwrap(), 20),
+        1
+    );
+
+    state.retry_post_commit_linear_undo_retirement_for_stream(24);
+    assert!(!state.post_commit_linear_undo_chunks.contains_key(&24));
+    assert_eq!(
+        count_retire_committed_linear_undo_attempts(&events.lock().unwrap(), 20),
+        1
+    );
+}
+
+#[test]
+fn persistent_gc_barrier_retries_deferred_undo_retirement() {
+    let (durable_log, events) = TxDurableLog::recording_backend_for_test();
+    let mut state =
+        TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(25), durable_log);
+    state.complete_commit().unwrap();
+    let chunk = persist::LinearUndoChunkId {
+        chunk_start_block: 30,
+        generation: 2,
+        durable_region_index: 0,
+    };
+    state
+        .post_commit_linear_undo_chunks
+        .insert(25, [chunk].into_iter().collect());
+    let mut objects = ObjectTable::default();
+
+    state
+        .persistent_mark_sweep_collect_for_test(&mut objects)
+        .unwrap();
+
+    assert!(!state.post_commit_linear_undo_chunks.contains_key(&25));
+    assert_eq!(
+        count_retire_committed_linear_undo_attempts(&events.lock().unwrap(), 30),
+        1
+    );
+}
+
+#[test]
 fn post_commit_linear_undo_cleanup_retries_on_abort_and_drains_queue() {
-    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(4);
+    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(3);
     let mut state =
         TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(19), durable_log);
     let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0031, 3, vec![4, 5, 6, 7]);
@@ -15280,7 +15845,7 @@ fn post_commit_linear_undo_cleanup_retries_on_abort_and_drains_queue() {
             .iter()
             .copied()
             .collect::<Vec<_>>(),
-        vec![marker.chunk_start_block]
+        vec![persist::LinearUndoChunkId::from_marker(marker)]
     );
 
     state.begin().unwrap();
@@ -15292,7 +15857,7 @@ fn post_commit_linear_undo_cleanup_retries_on_abort_and_drains_queue() {
             .iter()
             .copied()
             .collect::<Vec<_>>(),
-        vec![marker.chunk_start_block]
+        vec![persist::LinearUndoChunkId::from_marker(marker)]
     );
     state.abort().unwrap();
 
@@ -15302,13 +15867,13 @@ fn post_commit_linear_undo_cleanup_retries_on_abort_and_drains_queue() {
         count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
     let failed_attempts =
         count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
-    assert!(failed_attempts >= 1);
-    assert!(total_attempts > failed_attempts);
+    assert_eq!(failed_attempts, 3);
+    assert_eq!(total_attempts, 4);
 }
 
 #[test]
 fn post_commit_linear_undo_cleanup_retries_on_abort_allocated_objects_and_drains_queue() {
-    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(4);
+    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(3);
     let mut state =
         TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(20), durable_log);
     let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0032, 4, vec![7, 8, 9, 10]);
@@ -15327,7 +15892,7 @@ fn post_commit_linear_undo_cleanup_retries_on_abort_allocated_objects_and_drains
             .iter()
             .copied()
             .collect::<Vec<_>>(),
-        vec![marker.chunk_start_block]
+        vec![persist::LinearUndoChunkId::from_marker(marker)]
     );
 
     let mut objects = ObjectTable::default();
@@ -15342,7 +15907,7 @@ fn post_commit_linear_undo_cleanup_retries_on_abort_allocated_objects_and_drains
             .iter()
             .copied()
             .collect::<Vec<_>>(),
-        vec![marker.chunk_start_block]
+        vec![persist::LinearUndoChunkId::from_marker(marker)]
     );
     state.abort_allocated_objects(&mut objects).unwrap();
 
@@ -15352,13 +15917,13 @@ fn post_commit_linear_undo_cleanup_retries_on_abort_allocated_objects_and_drains
         count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
     let failed_attempts =
         count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
-    assert!(failed_attempts >= 1);
-    assert!(total_attempts > failed_attempts);
+    assert_eq!(failed_attempts, 3);
+    assert_eq!(total_attempts, 4);
 }
 
 #[test]
 fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_and_drains_queue() {
-    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(5);
+    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(4);
     let mut state =
         TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(21), durable_log);
     let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0033, 5, vec![11, 12, 13, 14]);
@@ -15381,7 +15946,7 @@ fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_and_drains_queue()
             .iter()
             .copied()
             .collect::<Vec<_>>(),
-        vec![marker.chunk_start_block]
+        vec![persist::LinearUndoChunkId::from_marker(marker)]
     );
     assert!(state.abort_transaction(suspended).unwrap());
 
@@ -15391,13 +15956,13 @@ fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_and_drains_queue()
         count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
     let failed_attempts =
         count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
-    assert!(failed_attempts >= 1);
-    assert!(total_attempts > failed_attempts);
+    assert_eq!(failed_attempts, 4);
+    assert_eq!(total_attempts, 5);
 }
 
 #[test]
 fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_allocated_objects_and_drains_queue() {
-    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(5);
+    let (durable_log, events) = TxDurableLog::recording_backend_with_retire_failures_for_test(4);
     let mut state =
         TransactionState::new_for_test_with_durable_log(TransactionId::from_raw(22), durable_log);
     let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_0034, 6, vec![15, 16, 17, 18]);
@@ -15423,7 +15988,7 @@ fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_allocated_objects_
             .iter()
             .copied()
             .collect::<Vec<_>>(),
-        vec![marker.chunk_start_block]
+        vec![persist::LinearUndoChunkId::from_marker(marker)]
     );
     assert!(
         state
@@ -15437,8 +16002,8 @@ fn post_commit_linear_undo_cleanup_retries_on_suspended_abort_allocated_objects_
         count_retire_committed_linear_undo_attempts(&events, marker.chunk_start_block);
     let failed_attempts =
         count_retire_committed_linear_undo_failures(&events, marker.chunk_start_block);
-    assert!(failed_attempts >= 1);
-    assert!(total_attempts > failed_attempts);
+    assert_eq!(failed_attempts, 4);
+    assert_eq!(total_attempts, 5);
 }
 
 #[test]
@@ -18538,6 +19103,15 @@ mod model_lock_based {
 
         fn record_read(&mut self, tx: u64, granule: u8, version: u64) -> LockModelStep {
             let mut step = LockModelStep::default();
+            if self
+                .read_versions
+                .get(&(tx, granule))
+                .is_some_and(|current| *current != version)
+            {
+                step.error_kind = Some(LockModelErrorKind::ReadVersionMismatch);
+                return step;
+            }
+
             match self.resolve_writer_conflict(tx, granule, false) {
                 Ok(released_owner) => step.released_owner = released_owner,
                 Err(error_kind) => {
@@ -18546,30 +19120,13 @@ mod model_lock_based {
                 }
             }
 
-            match self.read_versions.entry((tx, granule)) {
-                alloc::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(version);
-                }
-                alloc::collections::btree_map::Entry::Occupied(entry) => {
-                    if *entry.get() != version {
-                        step.error_kind = Some(LockModelErrorKind::ReadVersionMismatch);
-                    }
-                }
-            }
+            self.read_versions.entry((tx, granule)).or_insert(version);
 
             step
         }
 
         fn acquire_write(&mut self, tx: u64, granule: u8, version: u64) -> LockModelStep {
             let mut step = LockModelStep::default();
-            match self.resolve_writer_conflict(tx, granule, true) {
-                Ok(released_owner) => step.released_owner = released_owner,
-                Err(error_kind) => {
-                    step.error_kind = Some(error_kind);
-                    return step;
-                }
-            }
-
             if self
                 .read_versions
                 .get(&(tx, granule))
@@ -18577,6 +19134,14 @@ mod model_lock_based {
             {
                 step.error_kind = Some(LockModelErrorKind::WriteVersionMismatch);
                 return step;
+            }
+
+            match self.resolve_writer_conflict(tx, granule, true) {
+                Ok(released_owner) => step.released_owner = released_owner,
+                Err(error_kind) => {
+                    step.error_kind = Some(error_kind);
+                    return step;
+                }
             }
 
             if let Some(previous_owner) = self.owners.insert(granule, tx) {
@@ -18810,13 +19375,28 @@ mod model_lock_based {
                             == after.read_versions.get(&(tx, granule)),
                         "schedule prefix {prefix:?} should preserve the original read version on mismatch"
                     );
+                    ensure!(
+                        after.owners == before.owners,
+                        "schedule prefix {prefix:?} should preserve ownership on a stale read"
+                    );
                 }
             }
-            LockModelOp::Write { granule, .. } => {
+            LockModelOp::Write { tx, granule, .. } => {
                 if step.error_kind == Some(LockModelErrorKind::WriteOwnedByOther) {
                     ensure!(
                         after.owners.get(&granule) == before.owners.get(&granule),
                         "schedule prefix {prefix:?} should not steal ownership on failed write conflict"
+                    );
+                }
+                if step.error_kind == Some(LockModelErrorKind::WriteVersionMismatch) {
+                    ensure!(
+                        before.read_versions.get(&(tx, granule))
+                            == after.read_versions.get(&(tx, granule)),
+                        "schedule prefix {prefix:?} should preserve the original read version on a stale write"
+                    );
+                    ensure!(
+                        after.owners == before.owners,
+                        "schedule prefix {prefix:?} should preserve ownership on a stale write"
                     );
                 }
             }
@@ -27340,6 +27920,50 @@ fn lock_based_validates_optimistic_reads_at_commit() {
 
 #[test]
 #[cfg(feature = "transaction-cc-lockbased")]
+fn lock_based_stale_read_does_not_release_another_writer() {
+    let mut locks = LockBased::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    locks.record_read_for_test(older, granule, 7).unwrap();
+    locks.acquire_write_for_test(younger, granule, 7).unwrap();
+
+    let error = locks
+        .record_read_result_for_test(older, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, LockBasedConflictKindForTest::ReadVersionMismatch);
+    assert_eq!(locks.owner_for_test(granule), Some(younger));
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn lock_based_stale_write_does_not_release_another_writer() {
+    let mut locks = LockBased::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    locks.record_read_for_test(older, granule, 7).unwrap();
+    locks.acquire_write_for_test(younger, granule, 7).unwrap();
+
+    let error = locks
+        .acquire_write_result_for_test(older, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, LockBasedConflictKindForTest::WriteVersionMismatch);
+    assert_eq!(locks.owner_for_test(granule), Some(younger));
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
 fn lock_based_abort_releases_owned_granules() {
     let mut locks = LockBased::default();
     let transaction = TransactionId::from_raw(1);
@@ -27553,6 +28177,50 @@ fn wound_wait_rejects_write_after_stale_read_version() {
         .acquire_write_result_for_test(transaction, granule, 8)
         .unwrap_err();
     assert_eq!(error, WoundWaitConflictKindForTest::WriteVersionMismatch);
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
+fn wound_wait_stale_read_does_not_release_another_writer() {
+    let mut policy = WoundWait::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    policy.record_read_for_test(older, granule, 7).unwrap();
+    policy.acquire_write_for_test(younger, granule, 7).unwrap();
+
+    let error = policy
+        .record_read_result_for_test(older, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, WoundWaitConflictKindForTest::ReadVersionMismatch);
+    assert_eq!(policy.owner_for_test(granule), Some(younger));
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-wound-wait")]
+fn wound_wait_stale_write_does_not_release_another_writer() {
+    let mut policy = WoundWait::default();
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+    let granule = GranuleId::TMemory {
+        instance: Some(1),
+        memory_index: 0,
+        granule_index: 0,
+    };
+
+    policy.record_read_for_test(older, granule, 7).unwrap();
+    policy.acquire_write_for_test(younger, granule, 7).unwrap();
+
+    let error = policy
+        .acquire_write_result_for_test(older, granule, 8)
+        .unwrap_err();
+    assert_eq!(error, WoundWaitConflictKindForTest::WriteVersionMismatch);
+    assert_eq!(policy.owner_for_test(granule), Some(younger));
 }
 
 #[test]
@@ -27777,13 +28445,13 @@ fn optimistic_validation_rejects_changed_write_version() {
 
 #[test]
 #[cfg(all(
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-mvcc")
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
 ))]
 fn optimistic_certification_disjoint_permits_coexist() -> Result<()> {
     let authority = Arc::new(OptimisticCertificationAuthority::default());
-    let first = mvcc_certification_granule_for_single_version_test(10);
-    let second = mvcc_certification_granule_for_single_version_test(11);
+    let first = single_version_certification_granule_for_test(10);
+    let second = single_version_certification_granule_for_test(11);
     let first_permit = authority.acquire(
         TransactionId::from_raw(1),
         &BTreeSet::from([first]),
@@ -27802,15 +28470,15 @@ fn optimistic_certification_disjoint_permits_coexist() -> Result<()> {
 
 #[test]
 #[cfg(all(
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-mvcc")
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
 ))]
 fn optimistic_certification_write_skew_sets_block_atomically() -> Result<()> {
     use std::time::Duration;
 
     let authority = Arc::new(OptimisticCertificationAuthority::default());
-    let a = mvcc_certification_granule_for_single_version_test(20);
-    let b = mvcc_certification_granule_for_single_version_test(21);
+    let a = single_version_certification_granule_for_test(20);
+    let b = single_version_certification_granule_for_test(21);
     let first = authority.acquire(
         TransactionId::from_raw(1),
         &BTreeSet::from([a, b]),
@@ -27853,8 +28521,8 @@ fn optimistic_certification_write_skew_sets_block_atomically() -> Result<()> {
 ))]
 fn optimistic_validation_single_version_keeps_execution_time_version_checks() {
     let transaction = TransactionId::from_raw(1);
-    let read_granule = mvcc_certification_granule_for_single_version_test(0);
-    let write_granule = mvcc_certification_granule_for_single_version_test(1);
+    let read_granule = single_version_certification_granule_for_test(0);
+    let write_granule = single_version_certification_granule_for_test(1);
     let mut read_policy = OptimisticValidation::default();
     read_policy
         .record_read(transaction, read_granule, 5)
@@ -27885,10 +28553,10 @@ fn optimistic_validation_single_version_keeps_execution_time_version_checks() {
 }
 
 #[cfg(all(
-    feature = "transaction-cc-optimistic-validation",
-    not(feature = "transaction-mvcc")
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
 ))]
-fn mvcc_certification_granule_for_single_version_test(granule_index: u64) -> GranuleId {
+fn single_version_certification_granule_for_test(granule_index: u64) -> GranuleId {
     GranuleId::TMemory {
         instance: Some(1),
         memory_index: 0,

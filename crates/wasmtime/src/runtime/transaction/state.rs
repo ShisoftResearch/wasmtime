@@ -50,9 +50,10 @@ pub(crate) struct TransactionState {
     pub(super) granule_versions: BTreeMap<GranuleId, u64>,
     pub(super) read_granules: BTreeSet<GranuleId>,
     pub(super) write_granules: BTreeSet<GranuleId>,
+    pub(super) durable_log_segment: Option<DurableLogSegmentLease>,
     pub(super) uncommitted_publication_streams: BTreeSet<u32>,
-    pub(super) pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
-    pub(super) post_commit_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
+    pub(super) pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<persist::LinearUndoChunkId>>,
+    pub(super) post_commit_linear_undo_chunks: BTreeMap<u32, BTreeSet<persist::LinearUndoChunkId>>,
     pub(super) scratch: Vec<u8>,
     pub(super) pending_memory_store: Option<PendingMemoryStore>,
     pub(super) durable_log: TxDurableLog,
@@ -93,8 +94,9 @@ pub(super) struct TransactionWorkspace {
     conflict_aborted: bool,
     read_granules: BTreeSet<GranuleId>,
     write_granules: BTreeSet<GranuleId>,
+    durable_log_segment: Option<DurableLogSegmentLease>,
     uncommitted_publication_streams: BTreeSet<u32>,
-    pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<u32>>,
+    pending_linear_undo_chunks: BTreeMap<u32, BTreeSet<persist::LinearUndoChunkId>>,
     scratch: Vec<u8>,
     pending_memory_store: Option<PendingMemoryStore>,
     #[cfg(feature = "transaction-mvcc")]
@@ -105,6 +107,73 @@ pub(super) struct TransactionWorkspace {
         feature = "transaction-cc-optimistic-validation"
     ))]
     benchmark_mvcc_terminal_commit: Option<BenchmarkMvccTerminalCommitState>,
+}
+
+#[derive(Debug)]
+pub(super) struct DurableLogSegmentLease {
+    runtime: TransactionRegionRuntime,
+    segment: Option<region_runtime::DurableLogSegment>,
+    release: DurableLogSegmentRelease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableLogSegmentRelease {
+    Reusable,
+    PendingCleanup,
+    Uncommitted,
+}
+
+impl DurableLogSegmentLease {
+    fn new(runtime: TransactionRegionRuntime, segment: region_runtime::DurableLogSegment) -> Self {
+        Self {
+            runtime,
+            segment: Some(segment),
+            release: DurableLogSegmentRelease::Reusable,
+        }
+    }
+
+    fn stream_id(&self) -> u32 {
+        self.segment
+            .expect("active durable log segment lease has no segment")
+            .stream_id()
+    }
+
+    fn mark_uncommitted(&mut self) {
+        self.release = DurableLogSegmentRelease::Uncommitted;
+    }
+
+    fn mark_commit_lp(&mut self, has_pending_cleanup: bool) {
+        self.release = if has_pending_cleanup {
+            DurableLogSegmentRelease::PendingCleanup
+        } else {
+            DurableLogSegmentRelease::Reusable
+        };
+    }
+
+    fn release(mut self) -> Result<()> {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> Result<()> {
+        let Some(segment) = self.segment.take() else {
+            return Ok(());
+        };
+        match self.release {
+            DurableLogSegmentRelease::Reusable => {
+                self.runtime.release_log_segment_reusable(segment)
+            }
+            DurableLogSegmentRelease::PendingCleanup => {
+                self.runtime.retire_log_segment_pending_cleanup(segment)
+            }
+            DurableLogSegmentRelease::Uncommitted => self.runtime.retire_log_segment(segment),
+        }
+    }
+}
+
+impl Drop for DurableLogSegmentLease {
+    fn drop(&mut self) {
+        let _ = self.release_inner();
+    }
 }
 
 impl Default for TransactionState {
@@ -143,6 +212,7 @@ impl Default for TransactionState {
             granule_versions: BTreeMap::new(),
             read_granules: BTreeSet::new(),
             write_granules: BTreeSet::new(),
+            durable_log_segment: None,
             uncommitted_publication_streams: BTreeSet::new(),
             pending_linear_undo_chunks: BTreeMap::new(),
             post_commit_linear_undo_chunks: BTreeMap::new(),
@@ -745,6 +815,11 @@ impl TransactionState {
                 self.release_transaction_authority(transaction),
                 "failed to release suspended transaction authority",
             );
+            result = Self::combine_results(
+                result,
+                self.release_log_segment_after_last_suspended_abort(&mut workspace),
+                "failed to release transaction log segment after suspended abort",
+            );
             return Self::finish_workspace_snapshot(&mut workspace, result).map(|()| true);
         }
         Ok(false)
@@ -793,7 +868,22 @@ impl TransactionState {
             self.release_transaction_authority(transaction),
             "failed to release suspended transaction authority",
         );
+        result = Self::combine_results(
+            result,
+            self.release_log_segment_after_last_suspended_abort(&mut workspace),
+            "failed to release transaction log segment after suspended abort",
+        );
         Self::finish_workspace_snapshot(&mut workspace, result).map(|()| true)
+    }
+
+    fn release_log_segment_after_last_suspended_abort(
+        &self,
+        workspace: &mut TransactionWorkspace,
+    ) -> Result<()> {
+        let Some(lease) = workspace.durable_log_segment.take() else {
+            return Ok(());
+        };
+        lease.release()
     }
 
     pub(crate) fn active_visibility_read_context(&self) -> Result<VisibilityReadContext> {
@@ -837,11 +927,8 @@ impl TransactionState {
     }
 
     #[cfg(all(
-        any(
-            feature = "transaction-cc-optimistic-validation",
-            feature = "transaction-cc-timestamp-ordering"
-        ),
-        not(feature = "transaction-mvcc")
+        not(feature = "transaction-mvcc"),
+        not(feature = "transaction-cc-strict-2pl")
     ))]
     pub(crate) fn acquire_active_optimistic_certification(
         &self,
@@ -958,6 +1045,25 @@ impl TransactionState {
         Ok(self.active_transaction_required()?.as_raw())
     }
 
+    pub(crate) fn durable_publication_ids(&mut self) -> Result<(u32, u32)> {
+        let transaction_id = self.active_transaction_required_raw()?;
+        let txid = u32::try_from(transaction_id)
+            .context("transaction id does not fit durable transaction id")?;
+        let Some(runtime) = self.shared_region_runtime_for_publication().cloned() else {
+            return Ok((txid, txid));
+        };
+        let stream_id = match self.durable_log_segment.as_ref() {
+            Some(lease) => lease.stream_id(),
+            None => {
+                let segment = runtime.acquire_log_segment()?;
+                let stream_id = segment.stream_id();
+                self.durable_log_segment = Some(DurableLogSegmentLease::new(runtime, segment));
+                stream_id
+            }
+        };
+        Ok((stream_id, txid))
+    }
+
     pub(crate) fn shared_region_runtime_for_publication(
         &self,
     ) -> Option<&TransactionRegionRuntime> {
@@ -973,11 +1079,39 @@ impl TransactionState {
         path: &Path,
         num_blocks: u32,
     ) -> Result<()> {
-        self.durable_log = TxDurableLog::create_file_backed(path, num_blocks)?;
-        Ok(())
+        if let Some(runtime) = self.shared_region_runtime.clone() {
+            return runtime.with_no_deferred_cleanup_during_storage_creation(|| {
+                self.durable_log = TxDurableLog::create_file_backed(path, num_blocks)?;
+                Ok(())
+            });
+        }
+        let durable_log = TxDurableLog::create_file_backed(path, num_blocks)?;
+        self.install_durable_log(durable_log)
     }
 
     pub(crate) fn create_shared_file_backed_durable_log(
+        &mut self,
+        shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
+    ) -> Result<()> {
+        if let Some(runtime) = self.shared_region_runtime.clone() {
+            return runtime.with_no_deferred_cleanup_during_storage_creation(|| {
+                self.durable_log = TxDurableLog::create_file_backed_with_allocator_lock(
+                    shared.tx_log_path(),
+                    shared.tx_log_blocks(),
+                    shared.durable_log_allocator_lock(),
+                )?;
+                Ok(())
+            });
+        }
+        let durable_log = TxDurableLog::create_file_backed_with_allocator_lock(
+            shared.tx_log_path(),
+            shared.tx_log_blocks(),
+            shared.durable_log_allocator_lock(),
+        )?;
+        self.install_durable_log(durable_log)
+    }
+
+    pub(crate) fn create_shared_file_backed_durable_log_during_storage_transition(
         &mut self,
         shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
     ) -> Result<()> {
@@ -990,18 +1124,47 @@ impl TransactionState {
     }
 
     pub(crate) fn open_file_backed_durable_log(&mut self, path: &Path) -> Result<()> {
-        self.durable_log = TxDurableLog::open_file_backed(path)?;
-        Ok(())
+        let durable_log = TxDurableLog::open_file_backed(path)?;
+        self.install_durable_log(durable_log)
     }
 
     pub(crate) fn open_shared_file_backed_durable_log(
         &mut self,
         shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
     ) -> Result<()> {
-        self.durable_log = TxDurableLog::open_file_backed_with_allocator_lock(
+        let durable_log = TxDurableLog::open_file_backed_with_allocator_lock(
             shared.tx_log_path(),
             shared.durable_log_allocator_lock(),
         )?;
+        self.install_durable_log(durable_log)
+    }
+
+    pub(crate) fn open_shared_file_backed_durable_log_and_recover_during_storage_transition<T>(
+        &mut self,
+        shared: &crate::runtime::transaction::region_runtime::SharedFileBackedStorageConfig,
+        transition: impl FnOnce(
+            &mut Self,
+            &crate::runtime::vm::RecoveredRegion,
+            Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+            u32,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        TxDurableLog::open_file_backed_with_allocator_lock_during_transition(
+            shared.tx_log_path(),
+            shared.durable_log_allocator_lock(),
+            |durable_log, recovered, mapped_source, mapped_blocks| {
+                let output = transition(self, recovered, mapped_source, mapped_blocks)?;
+                self.durable_log = durable_log;
+                Ok(output)
+            },
+        )
+    }
+
+    fn install_durable_log(&mut self, durable_log: TxDurableLog) -> Result<()> {
+        if let Some(runtime) = self.shared_region_runtime.as_ref() {
+            runtime.ensure_deferred_cleanup_matches_durable_log(durable_log.cleanup_identity())?;
+        }
+        self.durable_log = durable_log;
         Ok(())
     }
 
@@ -1011,6 +1174,13 @@ impl TransactionState {
         txid: u32,
         undo: &PendingGranuleUndo,
     ) -> Result<PendingCommitLogEntry> {
+        if let Some(lease) = self.durable_log_segment.as_mut() {
+            ensure!(
+                lease.stream_id() == stream_id,
+                "tmemory undo stream does not match the active durable log segment lease"
+            );
+            lease.mark_uncommitted();
+        }
         self.uncommitted_publication_streams.insert(stream_id);
         let mut sink = self.durable_log.stream_sink(stream_id);
         let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
@@ -1018,7 +1188,7 @@ impl TransactionState {
         self.pending_linear_undo_chunks
             .entry(stream_id)
             .or_default()
-            .insert(marker.chunk_start_block);
+            .insert(persist::LinearUndoChunkId::from_marker(marker));
         Ok(marker)
     }
 
@@ -1049,6 +1219,13 @@ impl TransactionState {
     ) -> Result<Vec<PendingCommitLogEntry>> {
         if publications.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(lease) = self.durable_log_segment.as_mut() {
+            ensure!(
+                lease.stream_id() == stream_id,
+                "object publication stream does not match the active durable log segment lease"
+            );
+            lease.mark_uncommitted();
         }
         self.uncommitted_publication_streams.insert(stream_id);
         let mut required_layout_ids = BTreeSet::new();
@@ -1133,17 +1310,41 @@ impl TransactionState {
         txid: u32,
         marker: PendingCommitLogEntry,
     ) -> Result<()> {
+        let has_pending_cleanup = self
+            .pending_linear_undo_chunks
+            .get(&stream_id)
+            .is_some_and(|chunks| !chunks.is_empty());
+        if let Some(lease) = self.durable_log_segment.as_ref() {
+            ensure!(
+                lease.stream_id() == stream_id,
+                "commit LP stream does not match the active durable log segment lease"
+            );
+        }
         {
             let mut sink = self.durable_log.stream_sink(stream_id);
             let mut publisher = StreamPublisher::new(&mut sink, stream_id, txid);
-            publisher.publish_commit_lp(marker)?;
+            publisher.publish_commit_lp_deferred_retirement(marker)?;
+        }
+        if let Some(lease) = self.durable_log_segment.as_mut() {
+            lease.mark_commit_lp(has_pending_cleanup);
         }
         self.uncommitted_publication_streams.remove(&stream_id);
         if let Some(chunk_starts) = self.pending_linear_undo_chunks.remove(&stream_id) {
-            self.post_commit_linear_undo_chunks
-                .entry(stream_id)
-                .or_default()
-                .extend(chunk_starts);
+            let shared = self.shared_region_runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .defer_linear_undo_cleanup(
+                        stream_id,
+                        self.durable_log.cleanup_identity().clone(),
+                        chunk_starts.clone(),
+                    )
+                    .is_ok()
+            });
+            if !shared {
+                self.post_commit_linear_undo_chunks
+                    .entry(stream_id)
+                    .or_default()
+                    .extend(chunk_starts);
+            }
         }
         self.retry_post_commit_linear_undo_retirement_for_stream(stream_id);
         Ok(())
@@ -1262,11 +1463,8 @@ impl TransactionState {
         #[cfg(not(feature = "transaction-mvcc"))]
         let mut current_version_fn = current_version_fn;
         #[cfg(all(
-            any(
-                feature = "transaction-cc-optimistic-validation",
-                feature = "transaction-cc-timestamp-ordering"
-            ),
-            not(feature = "transaction-mvcc")
+            not(feature = "transaction-mvcc"),
+            not(feature = "transaction-cc-strict-2pl")
         ))]
         let _certification = self.acquire_active_optimistic_certification()?;
         let result = (|| {
@@ -1282,19 +1480,13 @@ impl TransactionState {
             self.complete_commit()
         })();
         #[cfg(all(
-            any(
-                feature = "transaction-cc-optimistic-validation",
-                feature = "transaction-cc-timestamp-ordering"
-            ),
-            not(feature = "transaction-mvcc")
+            not(feature = "transaction-mvcc"),
+            not(feature = "transaction-cc-strict-2pl")
         ))]
         let shared_single_version_certification = self.shared_region_runtime.is_some();
         #[cfg(not(all(
-            any(
-                feature = "transaction-cc-optimistic-validation",
-                feature = "transaction-cc-timestamp-ordering"
-            ),
-            not(feature = "transaction-mvcc")
+            not(feature = "transaction-mvcc"),
+            not(feature = "transaction-cc-strict-2pl")
         )))]
         let shared_single_version_certification = false;
         if result.is_err()
@@ -1396,14 +1588,19 @@ impl TransactionState {
         backend_version: u64,
     ) -> Result<u64> {
         #[cfg(all(
-            any(
-                feature = "transaction-cc-optimistic-validation",
-                feature = "transaction-cc-timestamp-ordering"
-            ),
-            not(feature = "transaction-mvcc")
+            not(feature = "transaction-mvcc"),
+            not(feature = "transaction-cc-strict-2pl")
         ))]
         if let Some(runtime) = &self.shared_region_runtime {
-            return runtime.versioned_granule_version(granule);
+            let use_shared_version = !matches!(granule, GranuleId::TMemory { .. })
+                || cfg!(any(
+                    feature = "transaction-cc-optimistic-validation",
+                    feature = "transaction-cc-timestamp-ordering"
+                ))
+                || runtime.has_shared_file_backed_storage();
+            if use_shared_version {
+                return runtime.versioned_granule_version(granule);
+            }
         }
         if granule_uses_transaction_state_version(granule) {
             if let Some(runtime) = &self.shared_region_runtime {
@@ -1539,11 +1736,8 @@ impl TransactionState {
         for granule in self.active_write_granules()? {
             let current_version = current_version_fn(granule)?;
             #[cfg(all(
-                any(
-                    feature = "transaction-cc-optimistic-validation",
-                    feature = "transaction-cc-timestamp-ordering"
-                ),
-                not(feature = "transaction-mvcc")
+                not(feature = "transaction-mvcc"),
+                not(feature = "transaction-cc-strict-2pl")
             ))]
             let current_version = if self.shared_region_runtime.is_some() {
                 self.current_version_for_granule(granule, current_version)?
@@ -2548,6 +2742,21 @@ impl TransactionState {
         self.read_tmemory_owned_from_snapshot(owner_instance, memory_index, addr, len, &snapshot)
     }
 
+    #[cfg(not(feature = "transaction-mvcc"))]
+    pub(crate) fn register_tmemory_access_versions(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        memory_index: u32,
+        versions: &[(usize, u64)],
+    ) -> Result<()> {
+        self.ensure_active()?;
+        for &(granule_index, version) in versions {
+            let key = memory_granule_key(owner_instance, memory_index, granule_index)?;
+            self.acquire_granule_read(key, version)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_tmemory_owned_from_snapshot(
         &mut self,
         owner_instance: Option<InstanceId>,
@@ -2727,15 +2936,7 @@ impl TransactionState {
             return Ok(false);
         }
 
-        let transaction_id = self.active_transaction_required_raw()?;
-        let stream_id = if let Some(region) = self.shared_region_runtime_for_publication() {
-            region.current_thread_log_segment()?.stream_id()
-        } else {
-            u32::try_from(transaction_id)
-                .context("transaction id does not fit durable tmemory stream id")?
-        };
-        let txid = u32::try_from(transaction_id)
-            .context("transaction id does not fit durable transaction id")?;
+        let (stream_id, txid) = self.durable_publication_ids()?;
         let staged = staged
             .iter()
             .map(|(_, granule_index, bytes)| {
@@ -3621,6 +3822,10 @@ impl TransactionState {
             .as_ref()
             .map(TransactionRegionRuntime::begin_persistent_gc_with_policy)
             .transpose()?;
+        // The GC barrier is also a safe maintenance point for post-commit
+        // durable undo cleanup. Retirement is best-effort because the
+        // transaction's commit linearization point is already durable.
+        self.retry_post_commit_linear_undo_retirement();
         let local_policy = shared_runtime
             .is_none()
             .then(|| self.persistent_gc_policy.clone());
@@ -3657,6 +3862,9 @@ impl TransactionState {
             .as_ref()
             .map(TransactionRegionRuntime::begin_persistent_gc_with_policy)
             .transpose()?;
+        // Keep this maintenance hook feature-neutral: non-MVCC collectors use
+        // the same barrier to drain generation-qualified durable undo cleanup.
+        self.retry_post_commit_linear_undo_retirement();
         let local_policy = shared_runtime
             .is_none()
             .then(|| self.persistent_gc_policy.clone());
@@ -4537,6 +4745,7 @@ impl TransactionState {
             conflict_aborted: mem::take(&mut self.active_conflict_aborted),
             read_granules: mem::take(&mut self.read_granules),
             write_granules: mem::take(&mut self.write_granules),
+            durable_log_segment: self.durable_log_segment.take(),
             uncommitted_publication_streams: mem::take(&mut self.uncommitted_publication_streams),
             pending_linear_undo_chunks: mem::take(&mut self.pending_linear_undo_chunks),
             scratch: mem::take(&mut self.scratch),
@@ -4570,6 +4779,7 @@ impl TransactionState {
         self.active_conflict_aborted = workspace.conflict_aborted;
         self.read_granules = workspace.read_granules;
         self.write_granules = workspace.write_granules;
+        self.durable_log_segment = workspace.durable_log_segment;
         self.uncommitted_publication_streams = workspace.uncommitted_publication_streams;
         self.pending_linear_undo_chunks = workspace.pending_linear_undo_chunks;
         self.scratch = workspace.scratch;
@@ -4591,6 +4801,7 @@ impl TransactionState {
     pub(super) fn clear_active(&mut self) -> Result<()> {
         let visibility = self.selected_visibility.take();
         let snapshot = self.visibility_snapshot.take();
+        let log_segment = self.durable_log_segment.take();
         let mut result = Ok(());
         if let Some(transaction) = self.active {
             if self.terminal_commit_active {
@@ -4607,15 +4818,10 @@ impl TransactionState {
                 self.release_transaction_authority(transaction),
                 "failed to release transaction authority",
             );
-            if let Some(runtime) = &self.shared_region_runtime {
-                let release_result = if self.uncommitted_publication_streams.is_empty() {
-                    runtime.release_current_thread_log_segment_reusable()
-                } else {
-                    runtime.retire_current_thread_log_segment()
-                };
+            if let Some(lease) = log_segment {
                 result = Self::combine_results(
                     result,
-                    release_result,
+                    lease.release(),
                     "failed to release transaction log segment",
                 );
             }
@@ -4655,19 +4861,76 @@ impl TransactionState {
         for stream_id in streams {
             self.retry_post_commit_linear_undo_retirement_for_stream(stream_id);
         }
+        let shared_streams = self
+            .shared_region_runtime
+            .as_ref()
+            .and_then(|runtime| {
+                runtime
+                    .deferred_linear_undo_cleanup_streams(self.durable_log.cleanup_identity())
+                    .ok()
+            })
+            .unwrap_or_default();
+        for stream_id in shared_streams {
+            self.retry_shared_linear_undo_retirement_for_stream(stream_id);
+        }
     }
 
     pub(super) fn retry_post_commit_linear_undo_retirement_for_stream(&mut self, stream_id: u32) {
-        let Some(chunk_starts) = self.post_commit_linear_undo_chunks.get(&stream_id).cloned()
+        if let Some(chunk_starts) = self.post_commit_linear_undo_chunks.get(&stream_id).cloned() {
+            for chunk in chunk_starts {
+                if self
+                    .durable_log
+                    .retire_committed_linear_undo_chunk(chunk)
+                    .is_ok()
+                {
+                    self.post_commit_linear_undo_chunks
+                        .get_mut(&stream_id)
+                        .expect("post-commit undo retirement stream disappeared")
+                        .remove(&chunk);
+                }
+            }
+            let all_chunks_retired = self
+                .post_commit_linear_undo_chunks
+                .get(&stream_id)
+                .is_some_and(BTreeSet::is_empty);
+            if all_chunks_retired {
+                let reclaimed: Result<()> = (|| {
+                    if let Some(runtime) = &self.shared_region_runtime {
+                        runtime.reclaim_retired_log_segment(stream_id)?;
+                    }
+                    Ok(())
+                })();
+                if reclaimed.is_ok() {
+                    self.post_commit_linear_undo_chunks.remove(&stream_id);
+                }
+            }
+        }
+        self.retry_shared_linear_undo_retirement_for_stream(stream_id);
+    }
+
+    fn retry_shared_linear_undo_retirement_for_stream(&mut self, stream_id: u32) {
+        let Some(runtime) = self.shared_region_runtime.clone() else {
+            return;
+        };
+        let durable_log_identity = self.durable_log.cleanup_identity().clone();
+        let Ok(Some(chunks)) =
+            runtime.deferred_linear_undo_cleanup_for_stream(stream_id, &durable_log_identity)
         else {
             return;
         };
-        if self
-            .durable_log
-            .retire_committed_linear_undo_chunks(chunk_starts)
-            .is_ok()
-        {
-            self.post_commit_linear_undo_chunks.remove(&stream_id);
+        for chunk in chunks {
+            if self
+                .durable_log
+                .retire_committed_linear_undo_chunk(chunk)
+                .is_err()
+            {
+                continue;
+            }
+            let _ = runtime.acknowledge_linear_undo_cleanup_and_reclaim_stream(
+                stream_id,
+                &durable_log_identity,
+                chunk,
+            );
         }
     }
 }
@@ -4906,11 +5169,8 @@ impl TransactionState {
         )))]
         {
             #[cfg(all(
-                any(
-                    feature = "transaction-cc-optimistic-validation",
-                    feature = "transaction-cc-timestamp-ordering"
-                ),
-                not(feature = "transaction-mvcc")
+                not(feature = "transaction-mvcc"),
+                not(feature = "transaction-cc-strict-2pl")
             ))]
             let _certification = self.acquire_active_optimistic_certification()?;
             let result = (|| {
@@ -5061,18 +5321,7 @@ impl TransactionState {
             }
         };
 
-        let publication_ids = (|| -> Result<(u32, u32)> {
-            let transaction_id = self.active_transaction_required_raw()?;
-            let stream_id = if let Some(runtime) = self.shared_region_runtime_for_publication() {
-                runtime.current_thread_log_segment()?.stream_id()
-            } else {
-                u32::try_from(transaction_id)
-                    .context("transaction id does not fit durable tmemory stream id")?
-            };
-            let txid = u32::try_from(transaction_id)
-                .context("transaction id does not fit durable transaction id")?;
-            Ok((stream_id, txid))
-        })();
+        let publication_ids = self.durable_publication_ids();
         let (stream_id, txid) = match publication_ids {
             Ok(ids) => ids,
             Err(error) => {

@@ -133,6 +133,7 @@ pub(crate) use object_heap::encode_object_record as encode_object_record_for_rec
 pub(crate) use object_heap::encode_object_record_for_test;
 pub(crate) use object_table::ObjectTable;
 use object_table::recovered_record_location_from_winner;
+#[cfg(feature = "transaction")]
 pub use object_table::retire_unreachable_object_chunks_for_test;
 #[cfg(all(test, feature = "transaction-mvcc"))]
 pub(crate) use persist::PendingPublication;
@@ -197,6 +198,26 @@ pub(crate) fn collect_tmemory_access_snapshot(
         byte_len: tmemory.byte_len(),
         granules,
     })
+}
+
+#[cfg(not(feature = "transaction-mvcc"))]
+pub(crate) fn collect_tmemory_access_versions(
+    tmemory: &TMemory,
+    addr: u64,
+    len: usize,
+) -> Result<Vec<(usize, u64)>> {
+    let range = checked_tmemory_range(addr, len, tmemory.byte_len())?;
+    let mut versions = Vec::new();
+    let mut current = range.start;
+
+    while current < range.end {
+        let granule_index = current / TMEMORY_GRANULE_SIZE;
+        let granule_range = tmemory_granule_backing_range(granule_index, tmemory.byte_len())?;
+        versions.push((granule_index, tmemory.granule_version(granule_index)?));
+        current = range.end.min(granule_range.end);
+    }
+
+    Ok(versions)
 }
 
 fn checked_tmemory_range(

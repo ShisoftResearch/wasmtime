@@ -119,18 +119,18 @@ impl WoundWait {
         granule: GranuleId,
         version: u64,
     ) -> core::result::Result<Option<TransactionId>, WoundWaitConflictKind> {
+        if self
+            .read_versions
+            .get(&(transaction, granule))
+            .is_some_and(|recorded| *recorded != version)
+        {
+            return Err(WoundWaitConflictKind::ReadVersionMismatch);
+        }
         let wounded = self.resolve_writer_conflict_typed(transaction, granule, false)?;
 
-        match self.read_versions.entry((transaction, granule)) {
-            alloc::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(version);
-            }
-            alloc::collections::btree_map::Entry::Occupied(entry) => {
-                if *entry.get() != version {
-                    return Err(WoundWaitConflictKind::ReadVersionMismatch);
-                }
-            }
-        }
+        self.read_versions
+            .entry((transaction, granule))
+            .or_insert(version);
 
         Ok(wounded)
     }
@@ -141,7 +141,6 @@ impl WoundWait {
         granule: GranuleId,
         current_version: u64,
     ) -> core::result::Result<Option<TransactionId>, WoundWaitConflictKind> {
-        let wounded = self.resolve_writer_conflict_typed(transaction, granule, true)?;
         if self
             .read_versions
             .get(&(transaction, granule))
@@ -149,6 +148,7 @@ impl WoundWait {
         {
             return Err(WoundWaitConflictKind::WriteVersionMismatch);
         }
+        let wounded = self.resolve_writer_conflict_typed(transaction, granule, true)?;
 
         self.owners.insert(granule, transaction);
         Ok(wounded)

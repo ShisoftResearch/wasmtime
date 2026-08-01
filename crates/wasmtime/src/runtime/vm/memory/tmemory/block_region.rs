@@ -5,7 +5,7 @@
 use super::{
     DATA_CHUNK_MAGIC, DataChunkClass, DataChunkHeader, DataRecordLocation, LOG_BLOCK_MAGIC,
     LogBlockHeader, NO_NEXT_BLOCK, PackedGranuleDomain, REGION_MAGIC, RegionHeader,
-    SMALL_DATA_LIMIT, TMemory, TxLogEntry, TxLogEntryRole,
+    SMALL_DATA_LIMIT, StorageIncarnation, TMemory, TxLogEntry, TxLogEntryRole,
     durable_log::{
         BlockKind, BlockMeta, BlockState, TxDataRecordHeader, TxDataRecordRole, TxEntryMeta,
     },
@@ -36,6 +36,7 @@ use core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,24 @@ pub(crate) const PMEM_CACHE_LINE_SIZE: usize = 64;
 pub(crate) const FIXED_WINDOW_TMEMORY_UNSUPPORTED_MESSAGE: &str =
     "multi-region fixed-window tmemory mappings are unsupported on this target";
 static FILE_BACKED_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static STORAGE_INCARNATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_storage_incarnation() -> StorageIncarnation {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = STORAGE_INCARNATION_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let process = u64::from(std::process::id());
+    let mut incarnation = StorageIncarnation {
+        high: (timestamp >> 64) as u64 ^ process.rotate_left(17),
+        low: timestamp as u64 ^ sequence.rotate_left(31) ^ process,
+    };
+    if !incarnation.is_valid() {
+        incarnation.low = 1;
+    }
+    incarnation
+}
 #[cfg(test)]
 std::thread_local! {
     static INJECT_NEXT_FILE_BACKED_MMAP_FAILURE: core::cell::Cell<bool> =
@@ -81,6 +100,65 @@ pub(crate) enum FileBackedRegionMode {
     Temp,
     Path(PathBuf),
     OpenExistingPath(PathBuf),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum StorageCoordinationKey {
+    File { device: u64, inode: u64 },
+    Locator(PathBuf),
+    Incarnation(StorageIncarnation),
+}
+
+fn normalized_storage_locator(path: &Path) -> Result<PathBuf> {
+    if let Ok(path) = path.canonicalize() {
+        return Ok(path);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("failed to resolve transactional storage working directory")?
+        .join(path))
+}
+
+fn file_storage_coordination_key(file: &File, path: &Path) -> Result<StorageCoordinationKey> {
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata().with_context(|| {
+            format!(
+                "failed to inspect transactional storage file {}",
+                path.display()
+            )
+        })?;
+        return Ok(StorageCoordinationKey::File {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(StorageCoordinationKey::Locator(normalized_storage_locator(
+            path,
+        )?))
+    }
+}
+
+pub(crate) fn file_backed_region_storage_coordination_key(
+    path: &Path,
+) -> Result<StorageCoordinationKey> {
+    match File::open(path) {
+        Ok(file) => file_storage_coordination_key(&file, path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(
+            StorageCoordinationKey::Locator(normalized_storage_locator(path)?),
+        ),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to open transactional storage file {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +251,10 @@ impl FileBackedMapping {
 
     pub(crate) fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    pub(crate) fn storage_coordination_key(&self) -> Result<StorageCoordinationKey> {
+        file_storage_coordination_key(&self.inner.file, &self.inner.path)
     }
 
     fn set_unlink_on_drop(&self, unlink_on_drop: bool) {
@@ -1771,6 +1853,28 @@ pub(crate) trait PersistentGcRegion {
         Ok(retired)
     }
 
+    fn retire_linear_undo_chunk_generation(
+        &mut self,
+        chunk_start_block: u32,
+        expected_generation: u32,
+    ) -> Result<bool> {
+        let meta = self.gc_block_meta(chunk_start_block)?;
+        if meta.kind()? != BlockKind::LinearUndo || meta.generation != expected_generation {
+            return Ok(false);
+        }
+        match meta.state()? {
+            BlockState::Active | BlockState::Sealed => {
+                self.retire_chunk_for_gc(chunk_start_block, BlockKind::LinearUndo)?;
+                self.gc_fence()?;
+                Ok(true)
+            }
+            // A retry after retirement reached persistence but before its
+            // caller acknowledged cleanup is successful and idempotent.
+            BlockState::Retired => Ok(true),
+            BlockState::Free => Ok(false),
+        }
+    }
+
     fn retire_whole_dead_object_chunks(
         &mut self,
         reachable: &[PersistentRecoveredRecordLocation],
@@ -3027,6 +3131,7 @@ pub(crate) struct DaxPmemBlockRegion {
     block_metas: Vec<BlockMeta>,
     line_marks: Vec<LineMark>,
     streams: BTreeMap<u32, StreamState>,
+    linear_payload_chunk: Option<RegionChunk>,
 }
 
 impl DaxPmemBlockRegion {
@@ -3050,6 +3155,7 @@ impl DaxPmemBlockRegion {
                 line_count
             ],
             streams: BTreeMap::new(),
+            linear_payload_chunk: None,
         })
     }
 
@@ -3106,6 +3212,21 @@ impl DaxPmemBlockRegion {
     }
 
     pub(crate) fn open_fsdax_path(path: PathBuf, payload_blocks: usize) -> Result<Self> {
+        Self::open_fsdax_path_with_role(path, payload_blocks, false)
+    }
+
+    pub(crate) fn open_fsdax_linear_memory_path(
+        path: PathBuf,
+        payload_blocks: usize,
+    ) -> Result<Self> {
+        Self::open_fsdax_path_with_role(path, payload_blocks, true)
+    }
+
+    fn open_fsdax_path_with_role(
+        path: PathBuf,
+        payload_blocks: usize,
+        linear_memory: bool,
+    ) -> Result<Self> {
         let mapping = DaxPmemMapping::open_existing_fsdax_path(path)?;
         ensure!(
             mapping.len() % BLOCK_SIZE == 0,
@@ -3118,7 +3239,11 @@ impl DaxPmemBlockRegion {
             "transactional DAX PMEM block region image is smaller than requested capacity"
         );
         let mut region = Self::with_mapping(mapping, num_blocks)?;
-        region.load_region_image()?;
+        if linear_memory {
+            region.load_region_image_with_linear_payload(payload_blocks)?;
+        } else {
+            region.load_region_image()?;
+        }
         Ok(region)
     }
 
@@ -3127,6 +3252,25 @@ impl DaxPmemBlockRegion {
         path: PathBuf,
         payload_blocks: usize,
         window: MappedAddressWindow,
+    ) -> Result<Self> {
+        Self::open_fsdax_path_in_window_with_role(path, payload_blocks, window, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_fsdax_linear_memory_path_in_window(
+        path: PathBuf,
+        payload_blocks: usize,
+        window: MappedAddressWindow,
+    ) -> Result<Self> {
+        Self::open_fsdax_path_in_window_with_role(path, payload_blocks, window, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_fsdax_path_in_window_with_role(
+        path: PathBuf,
+        payload_blocks: usize,
+        window: MappedAddressWindow,
+        linear_memory: bool,
     ) -> Result<Self> {
         let mapping = DaxPmemMapping::open_existing_fsdax_path_in_window(path, window)?;
         ensure!(
@@ -3140,12 +3284,25 @@ impl DaxPmemBlockRegion {
             "transactional DAX PMEM block region image is smaller than requested capacity"
         );
         let mut region = Self::with_mapping(mapping, num_blocks)?;
-        region.load_region_image()?;
+        if linear_memory {
+            region.load_region_image_with_linear_payload(payload_blocks)?;
+        } else {
+            region.load_region_image()?;
+        }
         Ok(region)
     }
 
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn open_fsdax_path_in_window(
+        _path: PathBuf,
+        _payload_blocks: usize,
+        _window: MappedAddressWindow,
+    ) -> Result<Self> {
+        bail!("{FIXED_WINDOW_TMEMORY_UNSUPPORTED_MESSAGE}")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open_fsdax_linear_memory_path_in_window(
         _path: PathBuf,
         _payload_blocks: usize,
         _window: MappedAddressWindow,
@@ -3179,7 +3336,13 @@ impl DaxPmemBlockRegion {
     }
 
     pub(crate) fn alloc_chunk(&mut self, block_count: usize) -> Result<RegionChunk> {
-        self.alloc_chunk_for_kind(block_count, BlockKind::ObjectData, 0)
+        let chunk = self.alloc_chunk_for_kind(block_count, BlockKind::ObjectData, 0)?;
+        if self.linear_payload_chunk.is_none()
+            && chunk.start_block() == reserved_metadata_blocks(self.num_blocks())?
+        {
+            self.linear_payload_chunk = Some(chunk);
+        }
+        Ok(chunk)
     }
 
     fn alloc_chunk_for_kind(
@@ -3616,6 +3779,18 @@ impl DaxPmemBlockRegion {
         <Self as PersistentGcRegion>::retire_linear_undo_chunks(self, chunk_starts)
     }
 
+    pub(crate) fn retire_linear_undo_chunk_generation(
+        &mut self,
+        chunk_start_block: u32,
+        expected_generation: u32,
+    ) -> Result<bool> {
+        <Self as PersistentGcRegion>::retire_linear_undo_chunk_generation(
+            self,
+            chunk_start_block,
+            expected_generation,
+        )
+    }
+
     pub(crate) fn retire_whole_dead_object_chunks(
         &mut self,
         reachable: &[PersistentRecoveredRecordLocation],
@@ -3626,6 +3801,11 @@ impl DaxPmemBlockRegion {
 
     fn read_header_bytes(&self, start_block: u32, len: usize) -> Result<Vec<u8>> {
         self.read(self.block_offset(start_block)?, len)
+    }
+
+    fn block_magic(&self, start_block: u32) -> Result<u32> {
+        let bytes = self.read_header_bytes(start_block, size_of::<u32>())?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     pub(crate) fn block_generation(&self, block: u32) -> Result<u32> {
@@ -3772,7 +3952,11 @@ impl DaxPmemBlockRegion {
                 mark: IMMIX_LINE_MARK_RESET_VALUE,
             },
         );
-        self.write_region_header(region_header_for_num_blocks(new_block_count)?)?;
+        let storage_incarnation = self.storage_incarnation()?;
+        self.write_region_header(region_header_for_num_blocks(
+            new_block_count,
+            storage_incarnation,
+        )?)?;
         self.flush_block_meta_range(old_block_count, additional_blocks)?;
         self.flush(0, size_of::<RegionHeader>())?;
         self.fence()?;
@@ -3890,10 +4074,15 @@ impl DaxPmemBlockRegion {
                 mark: IMMIX_LINE_MARK_RESET_VALUE,
             },
         );
-        self.write_region_header(region_header_for_num_blocks(new_block_count)?)?;
+        let storage_incarnation = self.storage_incarnation()?;
+        self.write_region_header(region_header_for_num_blocks(
+            new_block_count,
+            storage_incarnation,
+        )?)?;
         self.flush_block_meta_range(payload_start, new_payload_block_count)?;
         self.flush(0, size_of::<RegionHeader>())?;
         self.fence()?;
+        self.linear_payload_chunk = Some(RegionChunk::new(payload_start, new_payload_block_count));
 
         Ok(Some(RegionChunk {
             start_block: payload_start + old_payload_block_count,
@@ -3916,7 +4105,10 @@ impl DaxPmemBlockRegion {
             "transactional DAX PMEM region needs at least {reserved_metadata_blocks} blocks for metadata"
         );
         self.mark_blocks_used(0, reserved_metadata_blocks)?;
-        self.write_region_header(region_header_for_num_blocks(self.num_blocks())?)?;
+        self.write_region_header(region_header_for_num_blocks(
+            self.num_blocks(),
+            fresh_storage_incarnation(),
+        )?)?;
         for block in 0..self.num_blocks() {
             self.write_block_meta(block, BlockMeta::free())?;
         }
@@ -3940,7 +4132,50 @@ impl DaxPmemBlockRegion {
         self.validate_region_header(header)?;
         self.load_block_meta_table(header)?;
         self.validate_reserved_metadata_block_metas()?;
-        self.rebuild_entries_from_block_meta()
+        self.rebuild_state_from_image()
+    }
+
+    fn load_region_image_with_linear_payload(
+        &mut self,
+        minimum_payload_blocks: usize,
+    ) -> Result<()> {
+        let header = self.region_header()?;
+        self.validate_region_header(header)?;
+        self.load_block_meta_table(header)?;
+        self.validate_reserved_metadata_block_metas()?;
+        self.restore_linear_payload_chunk_from_metadata(minimum_payload_blocks)?;
+        self.rebuild_state_from_image()
+    }
+
+    fn restore_linear_payload_chunk_from_metadata(
+        &mut self,
+        minimum_payload_blocks: usize,
+    ) -> Result<()> {
+        let start = reserved_metadata_blocks(self.num_blocks())?;
+        if start >= self.num_blocks() || self.block_metas[start].state()? == BlockState::Free {
+            ensure!(
+                minimum_payload_blocks == 0,
+                "transactional DAX PMEM region image has no payload blocks"
+            );
+            self.linear_payload_chunk = None;
+            return Ok(());
+        }
+        let meta = self.block_metas[start];
+        let block_count = usize::try_from(meta.chunk_blocks)
+            .context("transactional DAX PMEM payload chunk block count overflow")?;
+        let chunk_start =
+            u32::try_from(start).context("transactional DAX PMEM payload chunk start overflow")?;
+        ensure!(
+            meta.state()? == BlockState::Active
+                && meta.kind()? == BlockKind::ObjectData
+                && meta.chunk_start == chunk_start
+                && block_count >= minimum_payload_blocks
+                && block_count > 0
+                && start + block_count <= self.num_blocks(),
+            "transactional DAX PMEM region image has malformed payload chunk metadata"
+        );
+        self.linear_payload_chunk = Some(RegionChunk::new(start, block_count));
+        Ok(())
     }
 
     fn validate_reserved_metadata_block_metas(&self) -> Result<()> {
@@ -3959,17 +4194,166 @@ impl DaxPmemBlockRegion {
         Ok(())
     }
 
-    fn rebuild_entries_from_block_meta(&mut self) -> Result<()> {
+    fn rebuild_state_from_image(&mut self) -> Result<()> {
+        self.reset_recovered_state();
+        let reserved_metadata_blocks = reserved_metadata_blocks(self.num_blocks())?;
+        self.mark_blocks_used(0, reserved_metadata_blocks)?;
+
+        let mut chunk_tails = BTreeMap::<u32, (u32, u32)>::new();
+        let mut log_tails = BTreeMap::<u32, (u32, u32)>::new();
+        let mut covered_blocks = vec![false; self.num_blocks()];
+        let mut block = reserved_metadata_blocks;
+        while block < self.num_blocks() {
+            let start_block = u32::try_from(block).context("transactional block index overflow")?;
+            let meta = self.block_metas[block];
+            if !meta.is_active_or_sealed()? {
+                block += 1;
+                continue;
+            }
+            if let Some(payload) = self
+                .linear_payload_chunk
+                .filter(|payload| payload.start_block() == block)
+            {
+                let chunk_start = u32::try_from(payload.start_block())
+                    .context("transactional DAX PMEM payload chunk start overflow")?;
+                let chunk_blocks = u32::try_from(payload.block_count())
+                    .context("transactional DAX PMEM payload chunk block count overflow")?;
+                ensure!(
+                    self.block_metas[block..block + payload.block_count()]
+                        .iter()
+                        .all(|meta| meta.state().ok() == Some(BlockState::Active)
+                            && meta.kind().ok() == Some(BlockKind::ObjectData)
+                            && meta.chunk_start == chunk_start
+                            && meta.chunk_blocks == chunk_blocks),
+                    "transactional DAX PMEM region image has malformed payload chunk metadata"
+                );
+                covered_blocks[block..block + payload.block_count()].fill(true);
+                self.mark_blocks_used(block, payload.block_count())?;
+                block += payload.block_count();
+                continue;
+            }
+            match self.block_magic(start_block)? {
+                LOG_BLOCK_MAGIC => {
+                    if meta.kind()? != BlockKind::Log {
+                        block += 1;
+                        continue;
+                    }
+                    let header = self.log_block_header(start_block)?;
+                    covered_blocks[block] = true;
+                    self.mark_blocks_used(block, 1)?;
+                    let state = self.streams.entry(header.stream_id).or_default();
+                    let next_log_seq = header
+                        .block_seq
+                        .checked_add(1)
+                        .context("transactional log block sequence overflow")?;
+                    state.next_log_block_seq = state.next_log_block_seq.max(next_log_seq);
+                    match log_tails.get(&header.stream_id) {
+                        Some((current_seq, _)) if *current_seq >= header.block_seq => {}
+                        _ => {
+                            log_tails.insert(header.stream_id, (header.block_seq, start_block));
+                        }
+                    }
+                    block += 1;
+                }
+                DATA_CHUNK_MAGIC => {
+                    if !matches!(meta.kind()?, BlockKind::ObjectData | BlockKind::LinearUndo) {
+                        block += 1;
+                        continue;
+                    }
+                    let header = self.data_chunk_header(start_block)?;
+                    let chunk_blocks = usize::try_from(header.chunk_blocks)
+                        .context("transactional data chunk block count overflow")?;
+                    ensure!(
+                        chunk_blocks > 0,
+                        "transactional data chunk at block {start_block} has zero blocks"
+                    );
+                    ensure!(
+                        block + chunk_blocks <= self.num_blocks(),
+                        "transactional data chunk at block {start_block} exceeds region"
+                    );
+                    covered_blocks[block..block + chunk_blocks].fill(true);
+                    self.mark_blocks_used(block, chunk_blocks)?;
+                    let state = self.streams.entry(header.stream_id).or_default();
+                    let next_chunk_seq = header
+                        .chunk_seq
+                        .checked_add(1)
+                        .context("transactional data chunk sequence overflow")?;
+                    state.next_data_chunk_seq = state.next_data_chunk_seq.max(next_chunk_seq);
+                    match chunk_tails.get(&header.stream_id) {
+                        Some((current_seq, _)) if *current_seq >= header.chunk_seq => {}
+                        _ => {
+                            chunk_tails.insert(header.stream_id, (header.chunk_seq, start_block));
+                        }
+                    }
+                    block += chunk_blocks;
+                }
+                _ => block += 1,
+            }
+        }
+
+        let mut repaired_runs = Vec::new();
+        let mut repair_start = None;
+        let mut repair_len = 0usize;
+        for (block, covered) in covered_blocks
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(reserved_metadata_blocks)
+        {
+            let meta = self.block_metas[block];
+            let state = meta.state()?;
+            let kind = meta.kind()?;
+            let orphaned_reservation = !covered
+                && kind != BlockKind::Metadata
+                && matches!(state, BlockState::Active | BlockState::Sealed);
+            if orphaned_reservation {
+                self.write_block_meta(block, BlockMeta::free())?;
+                self.block_entries[block] = BlockEntry::default();
+                if let Some(start) = repair_start {
+                    if start + repair_len == block {
+                        repair_len += 1;
+                    } else {
+                        repaired_runs.push((start, repair_len));
+                        repair_start = Some(block);
+                        repair_len = 1;
+                    }
+                } else {
+                    repair_start = Some(block);
+                    repair_len = 1;
+                }
+            }
+        }
+        if let Some(start) = repair_start {
+            repaired_runs.push((start, repair_len));
+        }
+        if !repaired_runs.is_empty() {
+            for (start, len) in repaired_runs {
+                self.flush_block_meta_range(start, len)?;
+            }
+            self.fence()?;
+        }
+
+        for (stream_id, (_, start_block)) in chunk_tails {
+            self.streams
+                .entry(stream_id)
+                .or_default()
+                .current_data_chunk_start = Some(start_block);
+        }
+        for (stream_id, (_, start_block)) in log_tails {
+            self.streams
+                .entry(stream_id)
+                .or_default()
+                .current_log_block_start = Some(start_block);
+        }
+
+        Ok(())
+    }
+
+    fn reset_recovered_state(&mut self) {
         for entry in &mut self.block_entries {
             *entry = BlockEntry::default();
         }
-        for (block, meta) in self.block_metas.iter().copied().enumerate() {
-            if meta.is_active_or_sealed()? {
-                self.block_entries[block].used = 1;
-                self.block_entries[block].list_num = ListKind::Used as i16;
-            }
-        }
-        Ok(())
+        self.streams.clear();
     }
 
     fn mark_blocks_used(&mut self, start: usize, block_count: usize) -> Result<()> {
@@ -4046,6 +4430,26 @@ impl DaxPmemBlockRegion {
         RegionHeader::from_bytes(self.mapping.read(0, size_of::<RegionHeader>())?)
     }
 
+    pub(crate) fn storage_incarnation(&self) -> Result<StorageIncarnation> {
+        let incarnation = self.region_header()?.storage_incarnation;
+        ensure!(
+            incarnation.is_valid(),
+            "transactional DAX PMEM region image has no storage incarnation"
+        );
+        Ok(incarnation)
+    }
+
+    pub(crate) fn storage_coordination_key(&self) -> Result<StorageCoordinationKey> {
+        self.mapping
+            .mapping
+            .storage_coordination_key()
+            .or_else(|_| {
+                Ok(StorageCoordinationKey::Incarnation(
+                    self.storage_incarnation()?,
+                ))
+            })
+    }
+
     fn write_region_header(&mut self, header: RegionHeader) -> Result<()> {
         self.mapping.write(0, &header.as_bytes())
     }
@@ -4106,7 +4510,9 @@ impl DaxPmemBlockRegion {
                 "transactional DAX PMEM region image has malformed payload chunk metadata"
             );
         }
-        Ok(Some(RegionChunk::new(start, chunk_blocks)))
+        let chunk = RegionChunk::new(start, chunk_blocks);
+        self.linear_payload_chunk = Some(chunk);
+        Ok(Some(chunk))
     }
 
     pub(crate) fn payload_chunk_from_image(
@@ -4121,6 +4527,10 @@ impl DaxPmemBlockRegion {
         ensure!(
             header.magic == REGION_MAGIC,
             "transactional DAX PMEM region image has invalid magic"
+        );
+        ensure!(
+            header.storage_incarnation.is_valid(),
+            "transactional DAX PMEM region image has no storage incarnation"
         );
         ensure!(
             usize::try_from(header.block_size).ok() == Some(BLOCK_SIZE),
@@ -4843,6 +5253,18 @@ impl FileBackedMemoryBlockRegion {
         <Self as PersistentGcRegion>::retire_linear_undo_chunks(self, chunk_starts)
     }
 
+    pub(crate) fn retire_linear_undo_chunk_generation(
+        &mut self,
+        chunk_start_block: u32,
+        expected_generation: u32,
+    ) -> Result<bool> {
+        <Self as PersistentGcRegion>::retire_linear_undo_chunk_generation(
+            self,
+            chunk_start_block,
+            expected_generation,
+        )
+    }
+
     pub(crate) fn retire_whole_dead_object_chunks(
         &mut self,
         reachable: &[PersistentRecoveredRecordLocation],
@@ -5002,7 +5424,11 @@ impl FileBackedMemoryBlockRegion {
                 mark: IMMIX_LINE_MARK_RESET_VALUE,
             },
         );
-        self.write_region_header(region_header_for_num_blocks(new_block_count)?)?;
+        let storage_incarnation = self.storage_incarnation()?;
+        self.write_region_header(region_header_for_num_blocks(
+            new_block_count,
+            storage_incarnation,
+        )?)?;
         self.flush_block_meta_range(old_block_count, additional_blocks)?;
         self.flush(0, size_of::<RegionHeader>())?;
         self.fence()?;
@@ -5029,7 +5455,10 @@ impl FileBackedMemoryBlockRegion {
             "transactional file-backed region needs at least {reserved_metadata_blocks} blocks for metadata"
         );
         self.mark_blocks_used(0, reserved_metadata_blocks)?;
-        self.write_region_header(region_header_for_num_blocks(self.num_blocks())?)?;
+        self.write_region_header(region_header_for_num_blocks(
+            self.num_blocks(),
+            fresh_storage_incarnation(),
+        )?)?;
         for block in 0..self.num_blocks() {
             self.write_block_meta(block, BlockMeta::free())?;
         }
@@ -5059,6 +5488,23 @@ impl FileBackedMemoryBlockRegion {
         RegionHeader::from_bytes(self.mapping.read(0, size_of::<RegionHeader>())?)
     }
 
+    pub(crate) fn storage_incarnation(&self) -> Result<StorageIncarnation> {
+        let incarnation = self.region_header()?.storage_incarnation;
+        ensure!(
+            incarnation.is_valid(),
+            "transactional file-backed region image has no storage incarnation"
+        );
+        Ok(incarnation)
+    }
+
+    pub(crate) fn storage_coordination_key(&self) -> Result<StorageCoordinationKey> {
+        self.mapping.storage_coordination_key().or_else(|_| {
+            Ok(StorageCoordinationKey::Incarnation(
+                self.storage_incarnation()?,
+            ))
+        })
+    }
+
     fn write_region_header(&mut self, header: RegionHeader) -> Result<()> {
         self.mapping.write(0, &header.as_bytes())
     }
@@ -5067,6 +5513,10 @@ impl FileBackedMemoryBlockRegion {
         ensure!(
             header.magic == REGION_MAGIC,
             "transactional file-backed region image has invalid magic"
+        );
+        ensure!(
+            header.storage_incarnation.is_valid(),
+            "transactional file-backed region image has no storage incarnation"
         );
         ensure!(
             usize::try_from(header.block_size).ok() == Some(BLOCK_SIZE),
@@ -5531,7 +5981,10 @@ fn type_layout_metadata_desc(num_blocks: usize) -> Result<MetaDataDesc> {
     })
 }
 
-fn region_header_for_num_blocks(num_blocks: usize) -> Result<RegionHeader> {
+fn region_header_for_num_blocks(
+    num_blocks: usize,
+    storage_incarnation: StorageIncarnation,
+) -> Result<RegionHeader> {
     Ok(RegionHeader {
         magic: REGION_MAGIC,
         block_size: u32::try_from(BLOCK_SIZE).unwrap(),
@@ -5542,7 +5995,34 @@ fn region_header_for_num_blocks(num_blocks: usize) -> Result<RegionHeader> {
         metadata_descs_start_block: metadata_desc_start_block(num_blocks)?,
         metadata_descs_block_count: METADATA_DESC_BLOCK_COUNT,
         num_descs: 1,
+        storage_incarnation,
     })
+}
+
+pub(crate) fn file_backed_region_storage_incarnation(path: &Path) -> Result<StorageIncarnation> {
+    let mut file = File::open(path).with_context(|| {
+        format!(
+            "failed to open transactional file-backed region {}",
+            path.display()
+        )
+    })?;
+    let mut bytes = vec![0; size_of::<RegionHeader>()];
+    file.read_exact(&mut bytes).with_context(|| {
+        format!(
+            "failed to read transactional file-backed region header {}",
+            path.display()
+        )
+    })?;
+    let header = RegionHeader::from_bytes(bytes)?;
+    ensure!(
+        header.magic == REGION_MAGIC && header.block_size == u32::try_from(BLOCK_SIZE).unwrap(),
+        "transactional file-backed region image has an invalid header"
+    );
+    ensure!(
+        header.storage_incarnation.is_valid(),
+        "transactional file-backed region image has no storage incarnation"
+    );
+    Ok(header.storage_incarnation)
 }
 
 fn validate_type_layout_metadata_desc(desc: MetaDataDesc, num_blocks: usize) -> Result<()> {
@@ -5638,7 +6118,7 @@ pub struct TransactionPersistenceRecoveredRegion {
 
 /// Creates a file-backed durable region image for restart smoke tests.
 pub fn create_file_backed_region_image(path: &Path, num_blocks: u32) -> Result<()> {
-    let _region = FileBackedMemoryBlockRegion::create_for_test(path, num_blocks)?;
+    let _log = crate::runtime::transaction::TxDurableLog::create_file_backed(path, num_blocks)?;
     Ok(())
 }
 
@@ -6602,6 +7082,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn dax_pmem_rebuild_never_interprets_linear_payload_magic_as_log_metadata() {
+        for magic in [LOG_BLOCK_MAGIC, DATA_CHUNK_MAGIC] {
+            let mut region = DaxPmemBlockRegion::new_for_test(2).unwrap();
+            let payload = region.alloc_chunk(2).unwrap();
+            region
+                .write(payload.start_block() * BLOCK_SIZE, &magic.to_le_bytes())
+                .unwrap();
+
+            region.load_region_image().unwrap();
+
+            for block in payload.start_block()..payload.start_block() + payload.block_count() {
+                let meta = region.block_meta(u32::try_from(block).unwrap()).unwrap();
+                assert_eq!(meta.state().unwrap(), BlockState::Active);
+                assert_eq!(meta.kind().unwrap(), BlockKind::ObjectData);
+                assert_eq!(region.block_entries[block].used, 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dax_pmem_payload_grow_extends_persisted_chunk_capacity() {
         let mut region = DaxPmemBlockRegion::new_for_test(1).unwrap();
         let original = region.alloc_chunk(1).unwrap();
@@ -7559,6 +8060,18 @@ mod tests {
                 .generation,
             old_generation + 1
         );
+
+        assert!(
+            !region
+                .retire_linear_undo_chunk_generation(retired_chunk, old_generation)
+                .unwrap()
+        );
+        let reused_meta = region
+            .block_meta_for_test(usize::try_from(location.data_block).unwrap())
+            .unwrap();
+        assert_eq!(reused_meta.kind().unwrap(), BlockKind::LinearUndo);
+        assert!(reused_meta.is_active_or_sealed().unwrap());
+        assert_eq!(reused_meta.generation, old_generation + 1);
     }
 
     #[cfg(unix)]
@@ -7927,7 +8440,7 @@ mod tests {
         let _guard = file_backed_temp_test_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let counter = FILE_BACKED_TEMP_COUNTER.load(AtomicOrdering::Relaxed);
+        let counter = FILE_BACKED_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         let stale_path = std::env::temp_dir().join(format!(
             "wasmtime-transaction-tmemory-{}-{counter}.bin",
             std::process::id()

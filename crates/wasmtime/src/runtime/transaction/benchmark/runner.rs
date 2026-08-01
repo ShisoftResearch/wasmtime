@@ -15,7 +15,7 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -248,12 +248,15 @@ impl MaintenanceGate {
         if state.write_commits < state.next_barrier {
             return Ok(());
         }
+        if !self.try_record_barrier(&mut state)? {
+            return Ok(());
+        }
         let crossed = state.write_commits / self.interval;
         state.next_barrier = crossed
             .checked_add(1)
             .and_then(|multiple| multiple.checked_mul(self.interval))
             .context("benchmark GC cadence overflow")?;
-        self.record_barrier(&mut state)
+        Ok(())
     }
 
     fn warmup_barrier(&self) -> Result<()> {
@@ -288,6 +291,19 @@ impl MaintenanceGate {
             .map_err(|_| crate::format_err!("benchmark maintenance gate is poisoned"))?;
         let observation = self.storage.run_gc_barrier()?;
         merge_gc_observation(state, &observation)
+    }
+
+    fn try_record_barrier(&self, state: &mut MaintenanceState) -> Result<bool> {
+        let _exclusive = match self.attempts.try_write() {
+            Ok(exclusive) => exclusive,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                bail!("benchmark maintenance gate is poisoned")
+            }
+        };
+        let observation = self.storage.run_gc_barrier()?;
+        merge_gc_observation(state, &observation)?;
+        Ok(true)
     }
 
     fn metrics(&self) -> Result<(GcMetrics, u64)> {
@@ -1506,6 +1522,39 @@ mod tests {
     }
 
     #[test]
+    fn cadence_barrier_defers_while_an_attempt_is_active() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let maintenance = Arc::new(MaintenanceGate::new(storage, 1).unwrap());
+        let attempt = maintenance.attempt_guard().unwrap();
+        let worker_maintenance = maintenance.clone();
+        let (done_tx, done_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(worker_maintenance.after_write_commit())
+                .unwrap();
+        });
+
+        let completed_while_attempt_active = match done_rx.recv_timeout(Duration::from_millis(100))
+        {
+            Ok(result) => Some(result),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => panic!("cadence-barrier worker disconnected"),
+        };
+        drop(attempt);
+        worker.join().unwrap();
+
+        completed_while_attempt_active
+            .expect("cadence barrier blocked behind an active attempt")
+            .unwrap();
+        assert_eq!(maintenance.metrics().unwrap().0.barriers, 0);
+
+        maintenance.after_write_commit().unwrap();
+        assert_eq!(maintenance.metrics().unwrap().0.barriers, 1);
+    }
+
+    #[test]
     fn write_skew_invariant_rejects_both_cleared() {
         assert!(validate_write_skew_pair(0, 0).is_err());
         validate_write_skew_pair(0, 1).unwrap();
@@ -1545,6 +1594,30 @@ mod tests {
         let restore = outcome.record.metrics.restore.as_ref().unwrap();
         assert_eq!(restore.counts.committed_operations, 20);
         assert!(outcome.record.metrics.gc.barriers >= 21);
+    }
+
+    #[test]
+    fn parallel_write_skew_pairs_preserve_invariant() {
+        let outcome = run_fixed_write_skew_cell(
+            &request(1_000_000_000),
+            &spec(WorkloadKind::WriteSkew, 4),
+            2_000,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.record.metrics.counts.committed_operations, 8_000);
+        assert_eq!(outcome.schedules, 4_000);
+        assert!(outcome.observed_pairs.iter().all(|pair| *pair != [0, 0]));
+        assert!(outcome.final_pairs.iter().all(|pair| *pair == [1, 1]));
+    }
+
+    #[test]
+    fn parallel_write_skew_survives_frequent_gc_barriers() {
+        let outcome =
+            run_fixed_write_skew_cell(&request(3), &spec(WorkloadKind::WriteSkew, 4), 40).unwrap();
+
+        assert_eq!(outcome.schedules, 80);
+        assert!(outcome.record.metrics.gc.barriers >= 2);
     }
 
     #[test]

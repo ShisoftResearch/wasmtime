@@ -1541,7 +1541,7 @@ mod tests {
             tail_block_delta: 1,
             tail_in_block: 96,
         };
-        assert_eq!(size_of::<RegionHeader>(), 32);
+        assert_eq!(size_of::<RegionHeader>(), 48);
         assert_eq!(size_of::<LogBlockHeader>(), 20);
         assert_eq!(size_of::<DataChunkHeader>(), 28);
         assert_eq!(size_of::<TxLogEntry>(), 32);
@@ -1560,6 +1560,7 @@ mod tests {
             metadata_descs_start_block: 3,
             metadata_descs_block_count: 4,
             num_descs: 9,
+            storage_incarnation: StorageIncarnation { high: 10, low: 11 },
         };
         let bytes = header.as_bytes();
         let decoded = RegionHeader::from_bytes(bytes).unwrap();

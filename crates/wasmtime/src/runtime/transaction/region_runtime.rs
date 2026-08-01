@@ -1,15 +1,19 @@
 use crate::prelude::*;
 use alloc::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::TryLockError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+#[cfg(test)]
 use std::thread::ThreadId;
 
 #[cfg(test)]
 use super::GcMvccMode;
+#[cfg(test)]
+use super::ObjectTable;
 #[cfg(all(
     test,
     feature = "transaction-mvcc",
@@ -22,18 +26,8 @@ use super::concurrency::CertificationMode;
 ))]
 use super::concurrency::MvccCertificationPermit;
 use super::concurrency::TransactionConflictAction;
-#[cfg(any(
-    feature = "transaction-cc-optimistic-validation",
-    feature = "transaction-cc-timestamp-ordering"
-))]
+#[cfg(not(feature = "transaction-cc-strict-2pl"))]
 use super::concurrency::{OptimisticCertificationAuthority, OptimisticCertificationPermit};
-#[cfg(not(all(
-    any(
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-timestamp-ordering"
-    ),
-    not(feature = "transaction-mvcc")
-)))]
 use super::granule_uses_transaction_state_version;
 #[cfg(all(
     feature = "transaction-mvcc",
@@ -41,6 +35,7 @@ use super::granule_uses_transaction_state_version;
 ))]
 use super::mvcc::MvccRuntime;
 use super::object_value::object_kind_from_u16;
+use super::persist::{DurableLogCleanupIdentity, LinearUndoChunkId};
 use super::state::PersistentRootDelta;
 use super::type_layout::TypeLayoutRegistry;
 #[cfg(all(
@@ -51,9 +46,9 @@ use super::visibility::CommitTimestamp;
 use super::visibility::SelectedTransactionVisibility;
 use super::{
     ConcurrencyControlState, CurrentStatePersistentGc, GranuleId, ObjectId, ObjectKind,
-    ObjectTable, PersistentObjectDirectoryEntry, PersistentObjectRecordLocation,
-    PersistentObjectRecordSource, PersistentRootKey, TMemoryFileBacking, TransactionConfig,
-    TransactionId, TransactionPersistentGc, TxDurableLog, persistent_root_key_from_logical_id,
+    PersistentObjectDirectoryEntry, PersistentObjectRecordLocation, PersistentObjectRecordSource,
+    PersistentRootKey, TMemoryFileBacking, TransactionConfig, TransactionId,
+    TransactionPersistentGc, TxDurableLog, persistent_root_key_from_logical_id,
 };
 
 const FIRST_DURABLE_LOG_SEGMENT_STREAM_ID: u32 = 0x2000_0000;
@@ -83,13 +78,7 @@ pub(crate) struct PersistentGcRegionPermit {
     runtime: TransactionRegionRuntime,
 }
 
-#[cfg(all(
-    test,
-    any(
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-timestamp-ordering"
-    )
-))]
+#[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
 #[derive(Debug)]
 pub(crate) struct TransactionTestGate {
     expected: usize,
@@ -97,26 +86,14 @@ pub(crate) struct TransactionTestGate {
     changed: std::sync::Condvar,
 }
 
-#[cfg(all(
-    test,
-    any(
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-timestamp-ordering"
-    )
-))]
+#[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
 #[derive(Debug, Default)]
 struct TransactionTestGateState {
     reached: usize,
     released: bool,
 }
 
-#[cfg(all(
-    test,
-    any(
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-timestamp-ordering"
-    )
-))]
+#[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
 impl TransactionTestGate {
     pub(crate) fn new(expected: usize) -> Self {
         Self {
@@ -276,27 +253,40 @@ struct TransactionRegionRuntimeInner {
     fail_allocate_transaction_id_once_for_test: std::sync::atomic::AtomicBool,
     visibility: SelectedTransactionVisibility,
     log_segments: Mutex<DurableLogSegmentRegistry>,
+    deferred_linear_undo_cleanup: Mutex<BTreeMap<u32, DeferredLinearUndoCleanup>>,
     lock_authority: Mutex<LockAuthorityState>,
     persistent_metadata: Mutex<PersistentMetadataState>,
     object_directory: Mutex<PersistentObjectDirectoryState>,
     file_backed_storage: Mutex<Option<SharedFileBackedStorageConfig>>,
+    file_backed_storage_configured: std::sync::atomic::AtomicBool,
     gc_state: Mutex<GcCoordinationState>,
     persistent_gc_policy: Mutex<Arc<dyn TransactionPersistentGc>>,
-    #[cfg(all(
-        test,
-        any(
-            feature = "transaction-cc-optimistic-validation",
-            feature = "transaction-cc-timestamp-ordering"
-        )
-    ))]
+    #[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
     optimistic_certification_gate_for_test: Mutex<Option<Arc<TransactionTestGate>>>,
 }
 
 #[derive(Debug)]
 struct DurableLogSegmentRegistry {
     next_log_segment_stream_id: u32,
-    thread_log_segments: HashMap<ThreadId, DurableLogSegment>,
+    assigned_log_segment_stream_ids: BTreeSet<u32>,
+    #[cfg(test)]
+    test_thread_log_segments: HashMap<ThreadId, DurableLogSegment>,
     free_log_segment_stream_ids: Vec<u32>,
+    retired_log_segment_stream_ids: BTreeSet<u32>,
+    reclaim_on_release_stream_ids: BTreeSet<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogSegmentRelease {
+    Reusable,
+    PendingCleanup,
+    Uncommitted,
+}
+
+#[derive(Debug)]
+struct DeferredLinearUndoCleanup {
+    durable_log: DurableLogCleanupIdentity,
+    chunks: BTreeSet<LinearUndoChunkId>,
 }
 
 #[derive(Debug, Default)]
@@ -346,8 +336,12 @@ impl Default for DurableLogSegmentRegistry {
     fn default() -> Self {
         Self {
             next_log_segment_stream_id: FIRST_DURABLE_LOG_SEGMENT_STREAM_ID,
-            thread_log_segments: HashMap::new(),
+            assigned_log_segment_stream_ids: BTreeSet::new(),
+            #[cfg(test)]
+            test_thread_log_segments: HashMap::new(),
             free_log_segment_stream_ids: Vec::new(),
+            retired_log_segment_stream_ids: BTreeSet::new(),
+            reclaim_on_release_stream_ids: BTreeSet::new(),
         }
     }
 }
@@ -360,19 +354,15 @@ impl Default for TransactionRegionRuntimeInner {
             fail_allocate_transaction_id_once_for_test: std::sync::atomic::AtomicBool::new(false),
             visibility: SelectedTransactionVisibility::default(),
             log_segments: Mutex::new(DurableLogSegmentRegistry::default()),
+            deferred_linear_undo_cleanup: Mutex::new(BTreeMap::new()),
             lock_authority: Mutex::new(LockAuthorityState::default()),
             persistent_metadata: Mutex::new(PersistentMetadataState::default()),
             object_directory: Mutex::new(PersistentObjectDirectoryState::default()),
             file_backed_storage: Mutex::new(None),
+            file_backed_storage_configured: std::sync::atomic::AtomicBool::new(false),
             gc_state: Mutex::new(GcCoordinationState::default()),
             persistent_gc_policy: Mutex::new(Arc::new(CurrentStatePersistentGc)),
-            #[cfg(all(
-                test,
-                any(
-                    feature = "transaction-cc-optimistic-validation",
-                    feature = "transaction-cc-timestamp-ordering"
-                )
-            ))]
+            #[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
             optimistic_certification_gate_for_test: Mutex::new(None),
         }
     }
@@ -441,6 +431,52 @@ impl TransactionRegionRuntime {
             .map_err(|_| crate::format_err!("transaction log segment registry lock poisoned"))
     }
 
+    fn lock_deferred_linear_undo_cleanup(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<u32, DeferredLinearUndoCleanup>>> {
+        self.0
+            .deferred_linear_undo_cleanup
+            .lock()
+            .map_err(|_| crate::format_err!("deferred linear undo cleanup lock poisoned"))
+    }
+
+    pub(crate) fn ensure_deferred_cleanup_matches_durable_log(
+        &self,
+        durable_log: &DurableLogCleanupIdentity,
+    ) -> Result<()> {
+        ensure!(
+            self.lock_deferred_linear_undo_cleanup()?
+                .values()
+                .all(|cleanup| &cleanup.durable_log == durable_log),
+            "cannot replace shared durable storage while cleanup for another backend is pending"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn ensure_no_deferred_cleanup_before_storage_creation(&self) -> Result<()> {
+        ensure!(
+            self.lock_deferred_linear_undo_cleanup()?.is_empty(),
+            "cannot replace shared durable storage while cleanup for another backend is pending"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn with_no_deferred_cleanup_during_storage_creation<T>(
+        &self,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        // Reuse the GC admission barrier: it excludes active/new commit
+        // regions while the cleanup map lock excludes direct cleanup handoff.
+        // Together they make check/create/install one atomic transition.
+        let _storage_replacement_permit = self.begin_persistent_gc()?;
+        let deferred_cleanup = self.lock_deferred_linear_undo_cleanup()?;
+        ensure!(
+            deferred_cleanup.is_empty(),
+            "cannot replace shared durable storage while cleanup for another backend is pending"
+        );
+        f()
+    }
+
     fn lock_authority(&self) -> Result<MutexGuard<'_, LockAuthorityState>> {
         self.0
             .lock_authority
@@ -490,7 +526,7 @@ impl TransactionRegionRuntime {
         let id = self
             .0
             .next_transaction_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| crate::format_err!("transaction id overflow"))?;
         Ok(TransactionId::from_raw(id))
     }
@@ -559,11 +595,8 @@ impl TransactionRegionRuntime {
     {
         let mut bumped_epoch = false;
         #[cfg(all(
-            any(
-                feature = "transaction-cc-optimistic-validation",
-                feature = "transaction-cc-timestamp-ordering"
-            ),
-            not(feature = "transaction-mvcc")
+            not(feature = "transaction-mvcc"),
+            not(feature = "transaction-cc-strict-2pl")
         ))]
         let mut changed_granules = BTreeSet::new();
         let installed = {
@@ -634,22 +667,16 @@ impl TransactionRegionRuntime {
                 installed.push(entry);
                 bumped_epoch = true;
                 #[cfg(all(
-                    any(
-                        feature = "transaction-cc-optimistic-validation",
-                        feature = "transaction-cc-timestamp-ordering"
-                    ),
-                    not(feature = "transaction-mvcc")
+                    not(feature = "transaction-mvcc"),
+                    not(feature = "transaction-cc-strict-2pl")
                 ))]
                 changed_granules.insert(GranuleId::Object { object_id });
             }
             installed
         };
         #[cfg(all(
-            any(
-                feature = "transaction-cc-optimistic-validation",
-                feature = "transaction-cc-timestamp-ordering"
-            ),
-            not(feature = "transaction-mvcc")
+            not(feature = "transaction-mvcc"),
+            not(feature = "transaction-cc-strict-2pl")
         ))]
         self.bump_versioned_granules(changed_granules)?;
         if bumped_epoch {
@@ -788,6 +815,12 @@ impl TransactionRegionRuntime {
         Ok(self.lock_file_backed_storage()?.clone())
     }
 
+    pub(crate) fn has_shared_file_backed_storage(&self) -> bool {
+        self.0
+            .file_backed_storage_configured
+            .load(Ordering::Acquire)
+    }
+
     pub(crate) fn shared_file_backed_storage_for_store_adoption(
         &self,
     ) -> Result<Option<SharedFileBackedStorageConfig>> {
@@ -848,17 +881,12 @@ impl TransactionRegionRuntime {
         tx_log_path: &Path,
         tx_log_blocks: u32,
     ) -> Result<()> {
-        let mut runtime = self.lock_file_backed_storage()?;
-        let existing = runtime.clone();
-        *runtime = Some(
-            SharedFileBackedStorageConfig::new(
-                TMemoryFileBacking::Path(tmemory_path.to_path_buf()),
-                tx_log_path.to_path_buf(),
-                tx_log_blocks,
-            )
-            .with_reused_locks_from(existing.as_ref()),
-        );
-        Ok(())
+        self.transition_to_created_file_backed_storage(
+            tmemory_path,
+            tx_log_path,
+            tx_log_blocks,
+            |_| Ok(()),
+        )
     }
 
     pub(crate) fn record_opened_file_backed_storage(
@@ -867,16 +895,66 @@ impl TransactionRegionRuntime {
         tx_log_path: &Path,
         tx_log_blocks: u32,
     ) -> Result<()> {
-        let mut runtime = self.lock_file_backed_storage()?;
-        let existing = runtime.clone();
-        let shared = SharedFileBackedStorageConfig::new(
-            TMemoryFileBacking::ExistingPath(tmemory_path.to_path_buf()),
-            tx_log_path.to_path_buf(),
+        self.transition_to_opened_file_backed_storage(
+            tmemory_path,
+            tx_log_path,
             tx_log_blocks,
+            |_| Ok(()),
         )
-        .with_reused_locks_from(existing.as_ref());
-        *runtime = Some(shared);
-        Ok(())
+    }
+
+    pub(crate) fn transition_to_created_file_backed_storage<T>(
+        &self,
+        tmemory_path: &Path,
+        tx_log_path: &Path,
+        tx_log_blocks: u32,
+        transition: impl FnOnce(&SharedFileBackedStorageConfig) -> Result<T>,
+    ) -> Result<T> {
+        self.transition_file_backed_storage(
+            TMemoryFileBacking::Path(tmemory_path.to_path_buf()),
+            tx_log_path,
+            tx_log_blocks,
+            transition,
+        )
+    }
+
+    pub(crate) fn transition_to_opened_file_backed_storage<T>(
+        &self,
+        tmemory_path: &Path,
+        tx_log_path: &Path,
+        tx_log_blocks: u32,
+        transition: impl FnOnce(&SharedFileBackedStorageConfig) -> Result<T>,
+    ) -> Result<T> {
+        self.transition_file_backed_storage(
+            TMemoryFileBacking::ExistingPath(tmemory_path.to_path_buf()),
+            tx_log_path,
+            tx_log_blocks,
+            transition,
+        )
+    }
+
+    fn transition_file_backed_storage<T>(
+        &self,
+        tmemory_file_backing: TMemoryFileBacking,
+        tx_log_path: &Path,
+        tx_log_blocks: u32,
+        transition: impl FnOnce(&SharedFileBackedStorageConfig) -> Result<T>,
+    ) -> Result<T> {
+        self.with_no_deferred_cleanup_during_storage_creation(|| {
+            let mut runtime = self.lock_file_backed_storage()?;
+            let shared = SharedFileBackedStorageConfig::new(
+                tmemory_file_backing,
+                tx_log_path.to_path_buf(),
+                tx_log_blocks,
+            )
+            .with_reused_locks_from(runtime.as_ref());
+            let output = transition(&shared)?;
+            *runtime = Some(shared);
+            self.0
+                .file_backed_storage_configured
+                .store(true, Ordering::Release);
+            Ok(output)
+        })
     }
 
     pub(crate) fn record_file_backed_tmemory_pages(&self, tmemory_pages: u64) -> Result<()> {
@@ -887,13 +965,8 @@ impl TransactionRegionRuntime {
         Ok(())
     }
 
-    pub(crate) fn current_thread_log_segment(&self) -> Result<DurableLogSegment> {
-        let thread_id = std::thread::current().id();
+    pub(crate) fn acquire_log_segment(&self) -> Result<DurableLogSegment> {
         let mut runtime = self.lock_log_segments()?;
-        if let Some(segment) = runtime.thread_log_segments.get(&thread_id).copied() {
-            return Ok(segment);
-        }
-
         let stream_id = if let Some(stream_id) = runtime.free_log_segment_stream_ids.pop() {
             stream_id
         } else {
@@ -909,27 +982,157 @@ impl TransactionRegionRuntime {
             stream_id
         };
         let segment = DurableLogSegment { stream_id };
-        runtime.thread_log_segments.insert(thread_id, segment);
+        ensure!(
+            runtime.assigned_log_segment_stream_ids.insert(stream_id),
+            "durable log segment stream id is already assigned"
+        );
         Ok(segment)
     }
 
-    pub(crate) fn release_current_thread_log_segment_reusable(&self) -> Result<()> {
-        self.release_current_thread_log_segment(true)
+    pub(crate) fn release_log_segment_reusable(&self, segment: DurableLogSegment) -> Result<()> {
+        self.release_log_segment(segment, LogSegmentRelease::Reusable)
     }
 
-    pub(crate) fn retire_current_thread_log_segment(&self) -> Result<()> {
-        self.release_current_thread_log_segment(false)
+    pub(crate) fn retire_log_segment_pending_cleanup(
+        &self,
+        segment: DurableLogSegment,
+    ) -> Result<()> {
+        self.release_log_segment(segment, LogSegmentRelease::PendingCleanup)
     }
 
-    fn release_current_thread_log_segment(&self, reusable: bool) -> Result<()> {
-        let thread_id = std::thread::current().id();
+    pub(crate) fn retire_log_segment(&self, segment: DurableLogSegment) -> Result<()> {
+        self.release_log_segment(segment, LogSegmentRelease::Uncommitted)
+    }
+
+    fn release_log_segment(
+        &self,
+        segment: DurableLogSegment,
+        release: LogSegmentRelease,
+    ) -> Result<()> {
         let mut runtime = self.lock_log_segments()?;
-        if let Some(segment) = runtime.thread_log_segments.remove(&thread_id) {
-            if reusable {
+        if runtime
+            .assigned_log_segment_stream_ids
+            .remove(&segment.stream_id())
+        {
+            let reclaim_on_release = runtime
+                .reclaim_on_release_stream_ids
+                .remove(&segment.stream_id());
+            if matches!(release, LogSegmentRelease::Reusable)
+                || (matches!(release, LogSegmentRelease::PendingCleanup) && reclaim_on_release)
+            {
                 runtime
                     .free_log_segment_stream_ids
                     .push(segment.stream_id());
+            } else {
+                runtime
+                    .retired_log_segment_stream_ids
+                    .insert(segment.stream_id());
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reclaim_retired_log_segment(&self, stream_id: u32) -> Result<()> {
+        let mut runtime = self.lock_log_segments()?;
+        if runtime.retired_log_segment_stream_ids.remove(&stream_id) {
+            runtime.free_log_segment_stream_ids.push(stream_id);
+        } else if runtime.assigned_log_segment_stream_ids.contains(&stream_id) {
+            // Cleanup can finish after clear_active decides to retire this
+            // still-assigned stream but before the release itself. Preserve
+            // the reclamation across that race so release cannot strand it.
+            runtime.reclaim_on_release_stream_ids.insert(stream_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn defer_linear_undo_cleanup(
+        &self,
+        stream_id: u32,
+        durable_log: DurableLogCleanupIdentity,
+        chunks: BTreeSet<LinearUndoChunkId>,
+    ) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        use alloc::collections::btree_map::Entry;
+        match self.lock_deferred_linear_undo_cleanup()?.entry(stream_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(DeferredLinearUndoCleanup {
+                    durable_log,
+                    chunks,
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                ensure!(
+                    entry.get().durable_log == durable_log,
+                    "deferred linear undo cleanup stream belongs to a different durable log"
+                );
+                entry.get_mut().chunks.extend(chunks);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn deferred_linear_undo_cleanup_for_stream(
+        &self,
+        stream_id: u32,
+        durable_log: &DurableLogCleanupIdentity,
+    ) -> Result<Option<BTreeSet<LinearUndoChunkId>>> {
+        Ok(self
+            .lock_deferred_linear_undo_cleanup()?
+            .get(&stream_id)
+            .filter(|cleanup| &cleanup.durable_log == durable_log)
+            .map(|cleanup| cleanup.chunks.clone()))
+    }
+
+    pub(crate) fn has_deferred_linear_undo_cleanup(&self, stream_id: u32) -> Result<bool> {
+        Ok(self
+            .lock_deferred_linear_undo_cleanup()?
+            .contains_key(&stream_id))
+    }
+
+    pub(crate) fn deferred_linear_undo_cleanup_streams(
+        &self,
+        durable_log: &DurableLogCleanupIdentity,
+    ) -> Result<Vec<u32>> {
+        Ok(self
+            .lock_deferred_linear_undo_cleanup()?
+            .iter()
+            .filter_map(|(stream_id, cleanup)| {
+                (&cleanup.durable_log == durable_log).then_some(*stream_id)
+            })
+            .collect())
+    }
+
+    pub(crate) fn acknowledge_linear_undo_cleanup_and_reclaim_stream(
+        &self,
+        stream_id: u32,
+        durable_log: &DurableLogCleanupIdentity,
+        chunk: LinearUndoChunkId,
+    ) -> Result<()> {
+        let mut cleanup = self.lock_deferred_linear_undo_cleanup()?;
+        let Some(stream_cleanup) = cleanup.get_mut(&stream_id) else {
+            return Ok(());
+        };
+        if &stream_cleanup.durable_log != durable_log
+            || !stream_cleanup.chunks.remove(&chunk)
+            || !stream_cleanup.chunks.is_empty()
+        {
+            return Ok(());
+        }
+        cleanup.remove(&stream_id);
+
+        // Keep the cleanup mutex held until the segment transition is
+        // recorded. This prevents the stream ID from being released and
+        // reassigned between last-item acknowledgement and reclamation.
+        let mut segments = self.lock_log_segments()?;
+        if segments.retired_log_segment_stream_ids.remove(&stream_id) {
+            segments.free_log_segment_stream_ids.push(stream_id);
+        } else if segments
+            .assigned_log_segment_stream_ids
+            .contains(&stream_id)
+        {
+            segments.reclaim_on_release_stream_ids.insert(stream_id);
         }
         Ok(())
     }
@@ -1027,10 +1230,7 @@ impl TransactionRegionRuntime {
         runtime.concurrency.commit_transaction_result(transaction)
     }
 
-    #[cfg(any(
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-timestamp-ordering"
-    ))]
+    #[cfg(not(feature = "transaction-cc-strict-2pl"))]
     pub(crate) fn acquire_optimistic_certification(
         &self,
         transaction: TransactionId,
@@ -1054,10 +1254,7 @@ impl TransactionRegionRuntime {
         Ok(permit)
     }
 
-    #[cfg(any(
-        feature = "transaction-cc-optimistic-validation",
-        feature = "transaction-cc-timestamp-ordering"
-    ))]
+    #[cfg(not(feature = "transaction-cc-strict-2pl"))]
     fn optimistic_certification_authority(&self) -> Result<Arc<OptimisticCertificationAuthority>> {
         Ok(self
             .lock_authority()?
@@ -1095,13 +1292,7 @@ impl TransactionRegionRuntime {
         self.optimistic_certification_authority()
     }
 
-    #[cfg(all(
-        test,
-        any(
-            feature = "transaction-cc-optimistic-validation",
-            feature = "transaction-cc-timestamp-ordering"
-        )
-    ))]
+    #[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
     pub(crate) fn optimistic_certification_counts_for_test(&self) -> Result<(usize, usize)> {
         self.optimistic_certification_authority()?
             .lifecycle_counts_for_test()
@@ -1167,26 +1358,29 @@ impl TransactionRegionRuntime {
         I: IntoIterator<Item = GranuleId>,
     {
         let mut runtime = self.lock_authority()?;
+        #[cfg(all(
+            not(feature = "transaction-mvcc"),
+            not(feature = "transaction-cc-strict-2pl")
+        ))]
+        let all_granules_use_shared_versions = cfg!(any(
+            feature = "transaction-cc-optimistic-validation",
+            feature = "transaction-cc-timestamp-ordering"
+        )) || self.has_shared_file_backed_storage();
         let updates = granules
             .into_iter()
             .filter(|granule| {
                 #[cfg(all(
-                    any(
-                        feature = "transaction-cc-optimistic-validation",
-                        feature = "transaction-cc-timestamp-ordering"
-                    ),
-                    not(feature = "transaction-mvcc")
+                    not(feature = "transaction-mvcc"),
+                    not(feature = "transaction-cc-strict-2pl")
                 ))]
                 {
-                    let _ = granule;
-                    true
+                    all_granules_use_shared_versions
+                        || granule_uses_transaction_state_version(*granule)
+                        || matches!(granule, GranuleId::Object { .. })
                 }
                 #[cfg(not(all(
-                    any(
-                        feature = "transaction-cc-optimistic-validation",
-                        feature = "transaction-cc-timestamp-ordering"
-                    ),
-                    not(feature = "transaction-mvcc")
+                    not(feature = "transaction-mvcc"),
+                    not(feature = "transaction-cc-strict-2pl")
                 )))]
                 {
                     granule_uses_transaction_state_version(*granule)
@@ -1580,24 +1774,12 @@ impl TransactionRegionRuntime {
             .contains(&transaction))
     }
 
-    #[cfg(all(
-        test,
-        any(
-            feature = "transaction-cc-optimistic-validation",
-            feature = "transaction-cc-timestamp-ordering"
-        )
-    ))]
+    #[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
     pub(crate) fn terminal_commit_count_for_test(&self) -> Result<usize> {
         Ok(self.lock_authority()?.terminal_commits.len())
     }
 
-    #[cfg(all(
-        test,
-        any(
-            feature = "transaction-cc-optimistic-validation",
-            feature = "transaction-cc-timestamp-ordering"
-        )
-    ))]
+    #[cfg(all(test, not(feature = "transaction-cc-strict-2pl")))]
     pub(crate) fn set_optimistic_certification_gate_for_test(
         &self,
         gate: Option<Arc<TransactionTestGate>>,
@@ -1622,22 +1804,69 @@ impl TransactionRegionRuntime {
 
     #[cfg(test)]
     pub(crate) fn current_thread_log_segment_for_test(&self) -> Result<DurableLogSegment> {
-        self.current_thread_log_segment()
+        let thread_id = std::thread::current().id();
+        if let Some(segment) = self
+            .lock_log_segments()?
+            .test_thread_log_segments
+            .get(&thread_id)
+            .copied()
+        {
+            return Ok(segment);
+        }
+        let segment = self.acquire_log_segment()?;
+        self.lock_log_segments()?
+            .test_thread_log_segments
+            .insert(thread_id, segment);
+        Ok(segment)
     }
 
     #[cfg(test)]
     pub(crate) fn release_current_thread_log_segment_for_test(&self) -> Result<()> {
-        self.release_current_thread_log_segment_reusable()
+        let thread_id = std::thread::current().id();
+        let segment = self
+            .lock_log_segments()?
+            .test_thread_log_segments
+            .remove(&thread_id);
+        if let Some(segment) = segment {
+            self.release_log_segment_reusable(segment)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_current_thread_log_segment(&self) -> Result<()> {
+        let thread_id = std::thread::current().id();
+        let segment = self
+            .lock_log_segments()?
+            .test_thread_log_segments
+            .remove(&thread_id);
+        if let Some(segment) = segment {
+            self.retire_log_segment_pending_cleanup(segment)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn thread_log_segment_count_for_test(&self) -> Result<usize> {
-        Ok(self.lock_log_segments()?.thread_log_segments.len())
+        Ok(self
+            .lock_log_segments()?
+            .assigned_log_segment_stream_ids
+            .len())
     }
 
     #[cfg(test)]
     pub(crate) fn free_log_segment_count_for_test(&self) -> Result<usize> {
         Ok(self.lock_log_segments()?.free_log_segment_stream_ids.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_log_segment_stream_ids_for_test(&self) -> Result<Vec<u32>> {
+        Ok(self
+            .lock_log_segments()?
+            .retired_log_segment_stream_ids
+            .iter()
+            .copied()
+            .collect())
     }
 
     #[cfg(test)]

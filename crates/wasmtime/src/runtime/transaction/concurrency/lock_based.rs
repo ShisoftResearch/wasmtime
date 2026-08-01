@@ -1,5 +1,7 @@
 use crate::prelude::*;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
+#[cfg(test)]
+use alloc::collections::BTreeSet;
 
 use super::super::{GranuleId, TransactionId};
 use super::{
@@ -144,18 +146,18 @@ impl LockBased {
         granule: GranuleId,
         version: u64,
     ) -> core::result::Result<Option<TransactionId>, LockBasedConflictKind> {
+        if self
+            .read_versions
+            .get(&(transaction, granule))
+            .is_some_and(|recorded| *recorded != version)
+        {
+            return Err(LockBasedConflictKind::ReadVersionMismatch);
+        }
         let aborted = self.resolve_writer_conflict_typed(transaction, granule, false)?;
 
-        match self.read_versions.entry((transaction, granule)) {
-            alloc::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(version);
-            }
-            alloc::collections::btree_map::Entry::Occupied(entry) => {
-                if *entry.get() != version {
-                    return Err(LockBasedConflictKind::ReadVersionMismatch);
-                }
-            }
-        }
+        self.read_versions
+            .entry((transaction, granule))
+            .or_insert(version);
 
         Ok(aborted)
     }
@@ -166,7 +168,6 @@ impl LockBased {
         granule: GranuleId,
         current_version: u64,
     ) -> core::result::Result<Option<TransactionId>, LockBasedConflictKind> {
-        let aborted = self.resolve_writer_conflict_typed(transaction, granule, true)?;
         if self
             .read_versions
             .get(&(transaction, granule))
@@ -174,6 +175,7 @@ impl LockBased {
         {
             return Err(LockBasedConflictKind::WriteVersionMismatch);
         }
+        let aborted = self.resolve_writer_conflict_typed(transaction, granule, true)?;
 
         self.owners.insert(granule, transaction);
         Ok(aborted)
@@ -444,10 +446,10 @@ impl TransactionConcurrencyControl for LockBased {
             .collect()
     }
 
-    fn commit_transaction_result(&mut self, transaction: TransactionId) -> Result<()> {
+    fn commit_transaction_result(&mut self, _transaction: TransactionId) -> Result<()> {
         #[cfg(test)]
         {
-            self.committed_transactions_for_test.insert(transaction);
+            self.committed_transactions_for_test.insert(_transaction);
             if core::mem::take(&mut self.fail_commit_transaction_once_for_test) {
                 bail!("injected commit transaction failure");
             }

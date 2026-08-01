@@ -8,18 +8,20 @@ use crate::runtime::transaction::type_layout::{
     PersistentTypeLayout, TypeLayoutId, TypeLayoutRegistry,
 };
 use crate::runtime::vm::block_region::{
-    BlockRegionBackendView, DaxPmemBlockRegion, FileBackedMemoryBlockRegion, StreamCursor,
+    BlockRegionBackendView, DaxPmemBlockRegion, FileBackedMemoryBlockRegion,
+    StorageCoordinationKey, StreamCursor,
 };
 #[cfg(test)]
 use crate::runtime::vm::unpack_object_granule_id;
 use crate::runtime::vm::{
-    PackedGranuleDomain, TMemory, TxLogEntry, TxLogEntryRole, pack_object_granule_id,
-    pack_tmemory_size_logical_id,
+    PackedGranuleDomain, StorageIncarnation, TMemory, TxLogEntry, TxLogEntryRole,
+    pack_object_granule_id, pack_tmemory_size_logical_id,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(test)]
 use super::persist_region_set::MultiRegionDurableLogBackend;
@@ -60,7 +62,207 @@ pub(crate) struct PendingCommitLogEntry {
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
     pub(crate) data_block_generation: u32,
+    pub(crate) durable_region_index: u32,
     pub(crate) role: TxLogEntryRole,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct LinearUndoChunkId {
+    pub(crate) chunk_start_block: u32,
+    pub(crate) generation: u32,
+    pub(crate) durable_region_index: u32,
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DurableLogCleanupIdentity {
+    Instance(u64),
+    SharedFileBacked(StorageIncarnation),
+    Reopenable {
+        backend: DurableLogCleanupBackend,
+        storage_incarnations: Vec<StorageIncarnation>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DurableLogCleanupBackend {
+    DaxPmem,
+    DaxPmemRegions,
+    FileBackedRegions,
+}
+
+static NEXT_DURABLE_LOG_CLEANUP_IDENTITY: AtomicU64 = AtomicU64::new(1);
+static SHARED_DURABLE_ALLOCATOR_LOCKS: OnceLock<
+    Mutex<BTreeMap<StorageCoordinationKey, Weak<Mutex<()>>>>,
+> = OnceLock::new();
+
+fn shared_allocator_lock_for_storage(
+    storage_key: StorageCoordinationKey,
+    preferred: Option<Arc<Mutex<()>>>,
+) -> Result<Arc<Mutex<()>>> {
+    let registry = SHARED_DURABLE_ALLOCATOR_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry
+        .lock()
+        .map_err(|_| crate::format_err!("shared durable allocator registry lock poisoned"))?;
+    if let Some(lock) = registry.get(&storage_key).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = preferred.unwrap_or_else(|| Arc::new(Mutex::new(())));
+    registry.insert(storage_key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+const STORAGE_BIND_RETRY_LIMIT: usize = 8;
+
+pub(super) fn bind_region_allocator_lock<R>(
+    region: R,
+    preferred: Option<Arc<Mutex<()>>>,
+) -> Result<DurableRegionLog<R>>
+where
+    R: DurableRegionStorage,
+{
+    for _ in 0..STORAGE_BIND_RETRY_LIMIT {
+        let storage_key = region.storage_coordination_key()?;
+        let allocator_lock =
+            shared_allocator_lock_for_storage(storage_key.clone(), preferred.clone())?;
+        let guard = allocator_lock
+            .lock()
+            .map_err(|_| crate::format_err!("shared durable log allocator lock poisoned"))?;
+        if region.storage_coordination_key()? != storage_key {
+            continue;
+        }
+        let storage_incarnation = region.storage_incarnation()?;
+        drop(guard);
+        return Ok(DurableRegionLog::new_bound(
+            region,
+            storage_incarnation,
+            allocator_lock,
+        ));
+    }
+    bail!("durable storage identity changed repeatedly while binding its operation lock")
+}
+
+pub(super) fn bind_opened_file_backed_region(
+    mut region: FileBackedMemoryBlockRegion,
+    preferred: Option<Arc<Mutex<()>>>,
+) -> Result<DurableRegionLog<FileBackedMemoryBlockRegion>> {
+    for _ in 0..STORAGE_BIND_RETRY_LIMIT {
+        let storage_key = region.storage_coordination_key()?;
+        let storage_incarnation = region.storage_incarnation()?;
+        let allocator_lock =
+            shared_allocator_lock_for_storage(storage_key.clone(), preferred.clone())?;
+        let guard = allocator_lock
+            .lock()
+            .map_err(|_| crate::format_err!("shared durable log allocator lock poisoned"))?;
+        if region.storage_coordination_key()? != storage_key
+            || region.storage_incarnation()? != storage_incarnation
+        {
+            continue;
+        }
+        region.refresh_from_image()?;
+        crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
+        if region.storage_coordination_key()? != storage_key
+            || region.storage_incarnation()? != storage_incarnation
+        {
+            continue;
+        }
+        drop(guard);
+        return Ok(DurableRegionLog::new_bound(
+            region,
+            storage_incarnation,
+            allocator_lock,
+        ));
+    }
+    bail!("durable storage identity changed repeatedly while opening the transaction log")
+}
+
+pub(super) fn create_bound_file_backed_region<R>(
+    path: &Path,
+    preferred: Option<Arc<Mutex<()>>>,
+    create: impl FnOnce() -> Result<R>,
+) -> Result<DurableRegionLog<R>>
+where
+    R: DurableRegionStorage,
+{
+    let mut create = Some(create);
+    for _ in 0..STORAGE_BIND_RETRY_LIMIT {
+        let observed_key =
+            crate::runtime::vm::block_region::file_backed_region_storage_coordination_key(path)?;
+        let operation_lock =
+            shared_allocator_lock_for_storage(observed_key.clone(), preferred.clone())?;
+        let guard = operation_lock
+            .lock()
+            .map_err(|_| crate::format_err!("shared durable log operation lock poisoned"))?;
+        if crate::runtime::vm::block_region::file_backed_region_storage_coordination_key(path)?
+            != observed_key
+        {
+            continue;
+        }
+        let region = create
+            .take()
+            .expect("file-backed durable region creator consumed more than once")(
+        )?;
+        let actual_key = region.storage_coordination_key()?;
+        let actual_lock =
+            shared_allocator_lock_for_storage(actual_key, Some(operation_lock.clone()))?;
+        ensure!(
+            Arc::ptr_eq(&actual_lock, &operation_lock),
+            "new durable storage was concurrently bound to a different operation lock"
+        );
+        let storage_incarnation = region.storage_incarnation()?;
+        drop(guard);
+        return Ok(DurableRegionLog::new_bound(
+            region,
+            storage_incarnation,
+            operation_lock,
+        ));
+    }
+    bail!("durable storage identity changed repeatedly while creating the transaction log")
+}
+
+impl DurableLogCleanupIdentity {
+    fn unique_instance() -> Self {
+        Self::Instance(NEXT_DURABLE_LOG_CLEANUP_IDENTITY.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub(super) fn shared_file_backed(storage_incarnation: StorageIncarnation) -> Self {
+        Self::SharedFileBacked(storage_incarnation)
+    }
+
+    pub(super) fn shared_file_backed_path(path: &Path) -> Result<Self> {
+        Ok(Self::shared_file_backed(
+            crate::runtime::vm::block_region::file_backed_region_storage_incarnation(path)?,
+        ))
+    }
+
+    fn reopenable_path(
+        backend: DurableLogCleanupBackend,
+        storage_incarnation: StorageIncarnation,
+    ) -> Self {
+        Self::Reopenable {
+            backend,
+            storage_incarnations: vec![storage_incarnation],
+        }
+    }
+
+    fn reopenable_regions(
+        backend: DurableLogCleanupBackend,
+        storage_incarnations: Vec<StorageIncarnation>,
+    ) -> Self {
+        Self::Reopenable {
+            backend,
+            storage_incarnations,
+        }
+    }
+}
+
+impl LinearUndoChunkId {
+    pub(crate) fn from_marker(marker: PendingCommitLogEntry) -> Self {
+        Self {
+            chunk_start_block: marker.chunk_start_block,
+            generation: marker.data_block_generation,
+            durable_region_index: marker.durable_region_index,
+        }
+    }
 }
 
 pub(crate) fn encode_undo_data_record(undo: &PendingGranuleUndo) -> Result<Vec<u8>> {
@@ -243,6 +445,7 @@ pub(crate) struct DurableDataRecordPointer {
     pub(crate) data_block: u32,
     pub(crate) data_offset: u32,
     pub(crate) data_block_generation: u32,
+    pub(crate) durable_region_index: u32,
 }
 
 pub(crate) trait DurableSink {
@@ -266,7 +469,7 @@ pub(crate) trait DurableSink {
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
-    fn retire_committed_linear_undo_chunk(&mut self, _chunk_start_block: u32) -> Result<()> {
+    fn retire_committed_linear_undo_chunk(&mut self, _chunk: LinearUndoChunkId) -> Result<()> {
         Ok(())
     }
 }
@@ -274,6 +477,7 @@ pub(crate) trait DurableSink {
 #[derive(Debug)]
 pub(crate) struct TxDurableLog {
     storage: Box<dyn TxDurableLogBackend>,
+    cleanup_identity: DurableLogCleanupIdentity,
 }
 
 /// Storage backend for the transaction-owned durable log.
@@ -300,7 +504,7 @@ pub(crate) trait TxDurableLogBackend: core::fmt::Debug + Send + Sync {
     fn flush_data(&mut self) -> Result<()>;
     fn flush_log(&mut self) -> Result<()>;
     fn fence(&mut self) -> Result<()>;
-    fn retire_committed_linear_undo_chunk(&mut self, _chunk_start_block: u32) -> Result<()> {
+    fn retire_committed_linear_undo_chunk(&mut self, _chunk: LinearUndoChunkId) -> Result<()> {
         Ok(())
     }
     fn with_recovered_region_snapshot(
@@ -396,6 +600,8 @@ pub(crate) struct MultiRegionRecoveryTimingForTest {
 }
 
 pub(super) trait DurableRegionStorage: core::fmt::Debug + Send + Sync {
+    fn storage_incarnation(&self) -> Result<StorageIncarnation>;
+    fn storage_coordination_key(&self) -> Result<StorageCoordinationKey>;
     fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor;
     fn refresh_from_image(&mut self) -> Result<()>;
     fn append_type_layout_metadata(&mut self, layout: &PersistentTypeLayout) -> Result<()>;
@@ -423,6 +629,11 @@ pub(super) trait DurableRegionStorage: core::fmt::Debug + Send + Sync {
     fn retire_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<Vec<u32>>
     where
         I: IntoIterator<Item = u32>;
+    fn retire_linear_undo_chunk_generation(
+        &mut self,
+        chunk_start_block: u32,
+        expected_generation: u32,
+    ) -> Result<bool>;
     fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion>;
     fn recover_region_snapshot_with_options(
         &self,
@@ -456,11 +667,12 @@ struct TxDurableStreamState {
 #[derive(Debug)]
 pub(super) struct DurableRegionLog<R> {
     region: R,
+    storage_incarnation: StorageIncarnation,
     streams: BTreeMap<u32, StreamCursor>,
     pending_data_chunks: BTreeSet<u32>,
     pending_log_blocks: BTreeSet<u32>,
-    // Protects shared free-block allocation and region-metadata refresh across
-    // independent file mappings. It is not a per-stream publication lock.
+    // Serializes durable image mutations across independent mappings and
+    // storage recreation. Allocation additionally refreshes shared metadata.
     shared_allocator_lock: Option<Arc<Mutex<()>>>,
 }
 
@@ -482,6 +694,7 @@ impl TxDurableLog {
     {
         Self {
             storage: Box::new(backend),
+            cleanup_identity: DurableLogCleanupIdentity::unique_instance(),
         }
     }
 
@@ -492,15 +705,20 @@ impl TxDurableLog {
         }
     }
 
-    pub(crate) fn retire_committed_linear_undo_chunks<I>(&mut self, chunk_starts: I) -> Result<()>
-    where
-        I: IntoIterator<Item = u32>,
-    {
-        for chunk_start_block in chunk_starts {
-            self.storage
-                .retire_committed_linear_undo_chunk(chunk_start_block)?;
-        }
-        Ok(())
+    pub(crate) fn retire_committed_linear_undo_chunk(
+        &mut self,
+        chunk: LinearUndoChunkId,
+    ) -> Result<()> {
+        self.storage.retire_committed_linear_undo_chunk(chunk)
+    }
+
+    pub(crate) fn cleanup_identity(&self) -> &DurableLogCleanupIdentity {
+        &self.cleanup_identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cleanup_identity_for_test(&mut self, identity: DurableLogCleanupIdentity) {
+        self.cleanup_identity = identity;
     }
 
     // This returns recovered metadata and may carry a mapped source when the
@@ -622,8 +840,10 @@ impl TxDurableLog {
         num_blocks: u32,
         shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Result<Self> {
-        let region = FileBackedMemoryBlockRegion::create_for_test(path, num_blocks)?;
-        Ok(Self::from_file_backed_region(region, shared_allocator_lock))
+        let backend = create_bound_file_backed_region(path, shared_allocator_lock, || {
+            FileBackedMemoryBlockRegion::create_for_test(path, num_blocks)
+        })?;
+        Ok(Self::from_file_backed_backend(backend))
     }
 
     pub(crate) fn open_file_backed(path: &Path) -> Result<Self> {
@@ -637,28 +857,61 @@ impl TxDurableLog {
         Self::open_file_backed_with_shared_allocator_lock(path, Some(shared_allocator_lock))
     }
 
+    pub(crate) fn open_file_backed_with_allocator_lock_during_transition<T>(
+        path: &Path,
+        shared_allocator_lock: Arc<Mutex<()>>,
+        transition: impl FnOnce(
+            Self,
+            &crate::runtime::vm::RecoveredRegion,
+            Arc<dyn crate::runtime::vm::block_region::MappedRegionSource>,
+            u32,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+        let mut backend = bind_opened_file_backed_region(region, Some(shared_allocator_lock))?;
+        let operation_lock = backend
+            .shared_allocator_lock
+            .clone()
+            .context("file-backed durable log has no shared operation lock")?;
+        let _guard = operation_lock
+            .lock()
+            .map_err(|_| crate::format_err!("shared durable log operation lock poisoned"))?;
+        backend.ensure_storage_incarnation()?;
+        backend.region.refresh_from_image()?;
+        let recovered =
+            crate::runtime::vm::block_region::recover_file_backed_region_snapshot(&backend.region)?;
+        let mapped_source = backend
+            .region
+            .view()
+            .mapped_region_source()
+            .context("recovered file-backed region does not expose a mapped region source")?;
+        let mapped_blocks = backend.mapped_block_len()?;
+        let log = Self::from_file_backed_backend(backend);
+        transition(log, &recovered, mapped_source, mapped_blocks)
+    }
+
     fn open_file_backed_with_shared_allocator_lock(
         path: &Path,
         shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Result<Self> {
-        if let Some(lock) = shared_allocator_lock.clone() {
-            let _guard = lock
-                .lock()
-                .map_err(|_| crate::format_err!("shared durable log allocator lock poisoned"))?;
-            let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
-            crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
-            return Ok(Self::from_file_backed_region(region, shared_allocator_lock));
-        }
-        let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
-        crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
-        Ok(Self::from_file_backed_region(region, shared_allocator_lock))
+        let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+        let backend = bind_opened_file_backed_region(region, shared_allocator_lock)?;
+        Ok(Self::from_file_backed_backend(backend))
     }
 
     fn from_file_backed_region(
         region: FileBackedMemoryBlockRegion,
         shared_allocator_lock: Option<Arc<Mutex<()>>>,
-    ) -> Self {
-        Self::with_backend(DurableRegionLog::new(region, shared_allocator_lock))
+    ) -> Result<Self> {
+        let backend = bind_region_allocator_lock(region, shared_allocator_lock)?;
+        Ok(Self::from_file_backed_backend(backend))
+    }
+
+    fn from_file_backed_backend(backend: DurableRegionLog<FileBackedMemoryBlockRegion>) -> Self {
+        let storage_incarnation = backend.storage_incarnation;
+        let mut log = Self::with_backend(backend);
+        log.cleanup_identity = DurableLogCleanupIdentity::shared_file_backed(storage_incarnation);
+        log
     }
 
     #[cfg(test)]
@@ -671,7 +924,7 @@ impl TxDurableLog {
     #[cfg(test)]
     pub(crate) fn create_dax_pmem_research_for_test(payload_blocks: usize) -> Result<Self> {
         let region = DaxPmemBlockRegion::new_for_test(payload_blocks)?;
-        Ok(Self::with_backend(DurableRegionLog::new(region, None)))
+        Ok(Self::with_backend(DurableRegionLog::new(region, None)?))
     }
 
     #[cfg(test)]
@@ -679,50 +932,85 @@ impl TxDurableLog {
         path: &Path,
         payload_blocks: usize,
     ) -> Result<Self> {
-        let region = DaxPmemBlockRegion::create_fsdax_path(path.to_path_buf(), payload_blocks)?;
-        Ok(Self::with_backend(DurableRegionLog::new(region, None)))
+        let backend = create_bound_file_backed_region(path, None, || {
+            DaxPmemBlockRegion::create_fsdax_path(path.to_path_buf(), payload_blocks)
+        })?;
+        let storage_incarnation = backend.storage_incarnation;
+        let mut log = Self::with_backend(backend);
+        log.cleanup_identity = DurableLogCleanupIdentity::reopenable_path(
+            DurableLogCleanupBackend::DaxPmem,
+            storage_incarnation,
+        );
+        Ok(log)
     }
 
     #[cfg(test)]
     pub(crate) fn open_dax_pmem_fsdax_for_test(path: &Path, payload_blocks: usize) -> Result<Self> {
         let region = DaxPmemBlockRegion::open_fsdax_path(path.to_path_buf(), payload_blocks)?;
-        Ok(Self::with_backend(DurableRegionLog::new(region, None)))
+        let backend = bind_region_allocator_lock(region, None)?;
+        let storage_incarnation = backend.storage_incarnation;
+        let mut log = Self::with_backend(backend);
+        log.cleanup_identity = DurableLogCleanupIdentity::reopenable_path(
+            DurableLogCleanupBackend::DaxPmem,
+            storage_incarnation,
+        );
+        Ok(log)
     }
 
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn create_dax_pmem_fsdax_regions_for_test(
         regions: Vec<TMemoryRegionConfig>,
     ) -> Result<Self> {
-        Ok(Self::with_backend(
-            MultiRegionDurableLogBackend::create_fsdax_regions_for_test(regions)?,
-        ))
+        let backend = MultiRegionDurableLogBackend::create_fsdax_regions_for_test(regions)?;
+        let cleanup_identity = DurableLogCleanupIdentity::reopenable_regions(
+            DurableLogCleanupBackend::DaxPmemRegions,
+            backend.storage_incarnations()?,
+        );
+        let mut log = Self::with_backend(backend);
+        log.cleanup_identity = cleanup_identity;
+        Ok(log)
     }
 
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn open_dax_pmem_fsdax_regions_for_test(
         regions: Vec<TMemoryRegionConfig>,
     ) -> Result<Self> {
-        Ok(Self::with_backend(
-            MultiRegionDurableLogBackend::open_fsdax_regions_for_test(regions)?,
-        ))
+        let backend = MultiRegionDurableLogBackend::open_fsdax_regions_for_test(regions)?;
+        let cleanup_identity = DurableLogCleanupIdentity::reopenable_regions(
+            DurableLogCleanupBackend::DaxPmemRegions,
+            backend.storage_incarnations()?,
+        );
+        let mut log = Self::with_backend(backend);
+        log.cleanup_identity = cleanup_identity;
+        Ok(log)
     }
 
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn create_file_backed_regions_for_test(
         regions: Vec<TMemoryRegionConfig>,
     ) -> Result<Self> {
-        Ok(Self::with_backend(
-            MultiRegionDurableLogBackend::create_file_backed_regions_for_test(regions)?,
-        ))
+        let backend = MultiRegionDurableLogBackend::create_file_backed_regions_for_test(regions)?;
+        let cleanup_identity = DurableLogCleanupIdentity::reopenable_regions(
+            DurableLogCleanupBackend::FileBackedRegions,
+            backend.storage_incarnations()?,
+        );
+        let mut log = Self::with_backend(backend);
+        log.cleanup_identity = cleanup_identity;
+        Ok(log)
     }
 
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn open_file_backed_regions_for_test(
         regions: Vec<TMemoryRegionConfig>,
     ) -> Result<Self> {
-        Ok(Self::with_backend(
-            MultiRegionDurableLogBackend::open_file_backed_regions_for_test(regions)?,
-        ))
+        let backend = MultiRegionDurableLogBackend::open_file_backed_regions_for_test(regions)?;
+        let cleanup_identity = DurableLogCleanupIdentity::reopenable_regions(
+            DurableLogCleanupBackend::FileBackedRegions,
+            backend.storage_incarnations()?,
+        );
+        let mut log = Self::with_backend(backend);
+        log.cleanup_identity = cleanup_identity;
+        Ok(log)
     }
 
     #[cfg(test)]
@@ -800,6 +1088,7 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
             data_block,
             data_offset: 0,
             data_block_generation: 0,
+            durable_region_index: 0,
         })
     }
 
@@ -862,6 +1151,14 @@ impl TxDurableLogBackend for InMemoryTxDurableLog {
 }
 
 impl DurableRegionStorage for FileBackedMemoryBlockRegion {
+    fn storage_incarnation(&self) -> Result<StorageIncarnation> {
+        FileBackedMemoryBlockRegion::storage_incarnation(self)
+    }
+
+    fn storage_coordination_key(&self) -> Result<StorageCoordinationKey> {
+        FileBackedMemoryBlockRegion::storage_coordination_key(self)
+    }
+
     fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
         FileBackedMemoryBlockRegion::stream_cursor(self, stream_id)
     }
@@ -892,6 +1189,7 @@ impl DurableRegionStorage for FileBackedMemoryBlockRegion {
                 self,
                 location.data_block,
             )?,
+            durable_region_index: 0,
         })
     }
 
@@ -947,6 +1245,18 @@ impl DurableRegionStorage for FileBackedMemoryBlockRegion {
         FileBackedMemoryBlockRegion::retire_linear_undo_chunks(self, chunk_starts)
     }
 
+    fn retire_linear_undo_chunk_generation(
+        &mut self,
+        chunk_start_block: u32,
+        expected_generation: u32,
+    ) -> Result<bool> {
+        FileBackedMemoryBlockRegion::retire_linear_undo_chunk_generation(
+            self,
+            chunk_start_block,
+            expected_generation,
+        )
+    }
+
     fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion> {
         crate::runtime::vm::block_region::recover_file_backed_region_snapshot(self)
     }
@@ -978,6 +1288,14 @@ impl DurableRegionStorage for FileBackedMemoryBlockRegion {
 }
 
 impl DurableRegionStorage for DaxPmemBlockRegion {
+    fn storage_incarnation(&self) -> Result<StorageIncarnation> {
+        DaxPmemBlockRegion::storage_incarnation(self)
+    }
+
+    fn storage_coordination_key(&self) -> Result<StorageCoordinationKey> {
+        DaxPmemBlockRegion::storage_coordination_key(self)
+    }
+
     fn stream_cursor(&mut self, stream_id: u32) -> StreamCursor {
         DaxPmemBlockRegion::stream_cursor(self, stream_id)
     }
@@ -1005,6 +1323,7 @@ impl DurableRegionStorage for DaxPmemBlockRegion {
             data_block: location.data_block,
             data_offset: location.data_offset,
             data_block_generation: DaxPmemBlockRegion::block_generation(self, location.data_block)?,
+            durable_region_index: 0,
         })
     }
 
@@ -1060,6 +1379,18 @@ impl DurableRegionStorage for DaxPmemBlockRegion {
         DaxPmemBlockRegion::retire_linear_undo_chunks(self, chunk_starts)
     }
 
+    fn retire_linear_undo_chunk_generation(
+        &mut self,
+        chunk_start_block: u32,
+        expected_generation: u32,
+    ) -> Result<bool> {
+        DaxPmemBlockRegion::retire_linear_undo_chunk_generation(
+            self,
+            chunk_start_block,
+            expected_generation,
+        )
+    }
+
     fn recover_region_snapshot(&self) -> Result<crate::runtime::vm::RecoveredRegion> {
         crate::runtime::vm::block_region::recover_dax_pmem_region_snapshot(self)
     }
@@ -1094,14 +1425,39 @@ impl<R> DurableRegionLog<R>
 where
     R: DurableRegionStorage,
 {
-    pub(super) fn new(region: R, shared_allocator_lock: Option<Arc<Mutex<()>>>) -> Self {
-        Self {
+    pub(super) fn new(region: R, shared_allocator_lock: Option<Arc<Mutex<()>>>) -> Result<Self> {
+        let storage_incarnation = region.storage_incarnation()?;
+        Ok(Self {
             region,
+            storage_incarnation,
             streams: BTreeMap::new(),
             pending_data_chunks: BTreeSet::new(),
             pending_log_blocks: BTreeSet::new(),
             shared_allocator_lock,
+        })
+    }
+
+    fn new_bound(
+        region: R,
+        storage_incarnation: StorageIncarnation,
+        shared_allocator_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            region,
+            storage_incarnation,
+            streams: BTreeMap::new(),
+            pending_data_chunks: BTreeSet::new(),
+            pending_log_blocks: BTreeSet::new(),
+            shared_allocator_lock: Some(shared_allocator_lock),
         }
+    }
+
+    fn ensure_storage_incarnation(&self) -> Result<()> {
+        ensure!(
+            self.region.storage_incarnation()? == self.storage_incarnation,
+            "durable storage incarnation changed while the log was open"
+        );
+        Ok(())
     }
 
     fn stream_cursor(&mut self, stream_id: u32) -> Result<StreamCursor> {
@@ -1114,19 +1470,43 @@ where
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        self.with_shared_storage_lock(|this| {
+            this.region.refresh_from_image()?;
+            f(this)
+        })
+    }
+
+    fn with_shared_storage_lock<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let shared_allocator_lock = self.shared_allocator_lock.clone();
         if let Some(lock) = shared_allocator_lock {
             let _guard = lock
                 .lock()
-                .map_err(|_| crate::format_err!("shared durable log allocator lock poisoned"))?;
-            self.region.refresh_from_image()?;
+                .map_err(|_| crate::format_err!("shared durable log operation lock poisoned"))?;
+            self.ensure_storage_incarnation()?;
             return f(self);
         }
+        self.ensure_storage_incarnation()?;
+        f(self)
+    }
+
+    fn with_shared_storage_lock_ref<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if let Some(lock) = self.shared_allocator_lock.as_ref() {
+            let _guard = lock
+                .lock()
+                .map_err(|_| crate::format_err!("shared durable log operation lock poisoned"))?;
+            self.ensure_storage_incarnation()?;
+            return f(self);
+        }
+        self.ensure_storage_incarnation()?;
         f(self)
     }
 
     pub(super) fn mapped_len_bytes(&self) -> usize {
         self.region.view().bytes_len()
+    }
+
+    pub(super) fn storage_incarnation(&self) -> Result<StorageIncarnation> {
+        Ok(self.storage_incarnation)
     }
 
     pub(super) fn mapped_block_len(&self) -> Result<u32> {
@@ -1150,15 +1530,17 @@ where
         &self,
         options: crate::runtime::vm::RecoveryOptions,
     ) -> Result<crate::runtime::vm::RecoveredRegionInput> {
-        let recovered = self.region.recover_region_snapshot_with_options(options)?;
-        let view = self.region.view();
-        let mapped_source = view
-            .mapped_region_source()
-            .context("durable region recovery requires mapped source")?;
-        Ok(crate::runtime::vm::RecoveredRegionInput {
-            recovered,
-            mapped_source,
-            mapped_len: view.bytes_len(),
+        self.with_shared_storage_lock_ref(|this| {
+            let recovered = this.region.recover_region_snapshot_with_options(options)?;
+            let view = this.region.view();
+            let mapped_source = view
+                .mapped_region_source()
+                .context("durable region recovery requires mapped source")?;
+            Ok(crate::runtime::vm::RecoveredRegionInput {
+                recovered,
+                mapped_source,
+                mapped_len: view.bytes_len(),
+            })
         })
     }
 }
@@ -1172,7 +1554,9 @@ where
     }
 
     fn has_type_layout(&self, id: TypeLayoutId) -> Result<bool> {
-        Ok(self.region.load_type_layout_metadata()?.contains(id))
+        self.with_shared_storage_lock_ref(|this| {
+            Ok(this.region.load_type_layout_metadata()?.contains(id))
+        })
     }
 
     fn append_data_record(
@@ -1182,34 +1566,32 @@ where
         record: &[u8],
     ) -> Result<DurableDataRecordPointer> {
         let data_stream_id = data_stream.file_backed_stream_id(transaction_stream_id)?;
-        let stream = self.stream_cursor(data_stream_id)?;
-        let append = |this: &mut Self| {
+        self.with_shared_storage_lock(|this| {
+            let stream = this.stream_cursor(data_stream_id)?;
+            if this
+                .region
+                .append_data_record_requires_allocation(stream, record)?
+            {
+                this.region.refresh_from_image()?;
+            }
             let stream = this.stream_cursor(data_stream_id)?;
             let pointer = this.region.append_data_record(stream, record)?;
             this.pending_data_chunks.insert(pointer.chunk_start_block);
             Ok(pointer)
-        };
-        if self
-            .region
-            .append_data_record_requires_allocation(stream, record)?
-        {
-            return self.with_shared_allocator_lock(append);
-        }
-        append(self)
+        })
     }
 
     fn append_log_entry(&mut self, transaction_stream_id: u32, entry: TxLogEntry) -> Result<()> {
-        let stream = self.stream_cursor(transaction_stream_id)?;
-        let append = |this: &mut Self| {
+        self.with_shared_storage_lock(|this| {
+            let stream = this.stream_cursor(transaction_stream_id)?;
+            if this.region.append_log_entry_requires_allocation(stream)? {
+                this.region.refresh_from_image()?;
+            }
             let stream = this.stream_cursor(transaction_stream_id)?;
             let log_block = this.region.append_log_entry(stream, entry)?;
             this.pending_log_blocks.insert(log_block);
             Ok(())
-        };
-        if self.region.append_log_entry_requires_allocation(stream)? {
-            return self.with_shared_allocator_lock(append);
-        }
-        append(self)
+        })
     }
 
     fn mark_last_log_entry_committed(
@@ -1217,34 +1599,47 @@ where
         transaction_stream_id: u32,
         marker: PendingCommitLogEntry,
     ) -> Result<()> {
-        let stream = self.stream_cursor(transaction_stream_id)?;
-        let log_block = self.region.mark_last_log_entry_committed(stream, marker)?;
-        self.pending_log_blocks.insert(log_block);
-        Ok(())
+        self.with_shared_storage_lock(|this| {
+            let stream = this.stream_cursor(transaction_stream_id)?;
+            let log_block = this.region.mark_last_log_entry_committed(stream, marker)?;
+            this.pending_log_blocks.insert(log_block);
+            Ok(())
+        })
     }
 
     fn flush_data(&mut self) -> Result<()> {
-        for chunk in core::mem::take(&mut self.pending_data_chunks) {
-            self.region.flush_data_chunk(chunk)?;
-        }
-        Ok(())
+        self.with_shared_storage_lock(|this| {
+            for chunk in core::mem::take(&mut this.pending_data_chunks) {
+                this.region.flush_data_chunk(chunk)?;
+            }
+            Ok(())
+        })
     }
 
     fn flush_log(&mut self) -> Result<()> {
-        for block in core::mem::take(&mut self.pending_log_blocks) {
-            self.region.flush_log_block(block)?;
-        }
-        Ok(())
+        self.with_shared_storage_lock(|this| {
+            for block in core::mem::take(&mut this.pending_log_blocks) {
+                this.region.flush_log_block(block)?;
+            }
+            Ok(())
+        })
     }
 
     fn fence(&mut self) -> Result<()> {
-        self.region.fence()
+        self.with_shared_storage_lock(|this| this.region.fence())
     }
 
-    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
-        self.region
-            .retire_linear_undo_chunks(core::iter::once(chunk_start_block))?;
-        Ok(())
+    fn retire_committed_linear_undo_chunk(&mut self, chunk: LinearUndoChunkId) -> Result<()> {
+        self.with_shared_allocator_lock(|this| {
+            ensure!(
+                this.region.retire_linear_undo_chunk_generation(
+                    chunk.chunk_start_block,
+                    chunk.generation,
+                )?,
+                "linear undo cleanup target generation no longer matches durable storage"
+            );
+            this.region.refresh_from_image()
+        })
     }
 
     fn with_recovered_region_snapshot(
@@ -1260,11 +1655,13 @@ where
     }
 
     fn recover_region_snapshot(&self) -> Result<Option<crate::runtime::vm::RecoveredRegion>> {
-        Ok(Some(self.region.recover_region_snapshot()?))
+        self.with_shared_storage_lock_ref(|this| Ok(Some(this.region.recover_region_snapshot()?)))
     }
 
     fn object_data_chunk_start_for_block(&self, data_block: u32) -> Result<Option<u32>> {
-        self.region.object_data_chunk_start_for_block(data_block)
+        self.with_shared_storage_lock_ref(|this| {
+            this.region.object_data_chunk_start_for_block(data_block)
+        })
     }
 
     fn cloned_mapped_region_source(
@@ -1278,8 +1675,13 @@ where
         reachable: &[PersistentRecoveredRecordLocation],
         unreachable: &[PersistentRecoveredRecordLocation],
     ) -> Result<Vec<u32>> {
-        self.region
-            .retire_whole_dead_object_chunks(reachable, unreachable)
+        self.with_shared_allocator_lock(|this| {
+            let retired = this
+                .region
+                .retire_whole_dead_object_chunks(reachable, unreachable)?;
+            this.region.refresh_from_image()?;
+            Ok(retired)
+        })
     }
 
     #[cfg(test)]
@@ -1377,10 +1779,8 @@ impl DurableSink for TxDurableLogSink<'_> {
         self.log.storage.fence()
     }
 
-    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
-        self.log
-            .storage
-            .retire_committed_linear_undo_chunk(chunk_start_block)
+    fn retire_committed_linear_undo_chunk(&mut self, chunk: LinearUndoChunkId) -> Result<()> {
+        self.log.storage.retire_committed_linear_undo_chunk(chunk)
     }
 }
 
@@ -1436,6 +1836,7 @@ where
             data_block: pointer.data_block,
             data_offset: pointer.data_offset,
             data_block_generation: pointer.data_block_generation,
+            durable_region_index: pointer.durable_region_index,
             role: TxLogEntryRole::TMemoryUndo,
         })
     }
@@ -1474,6 +1875,7 @@ where
             data_block: pointer.data_block,
             data_offset: pointer.data_offset,
             data_block_generation: pointer.data_block_generation,
+            durable_region_index: pointer.durable_region_index,
             role: TxLogEntryRole::TObjectPub,
         })
     }
@@ -1528,6 +1930,7 @@ where
                 data_block: pointer.data_block,
                 data_offset: pointer.data_offset,
                 data_block_generation: pointer.data_block_generation,
+                durable_region_index: pointer.durable_region_index,
                 role: TxLogEntryRole::TObjectPub,
             });
         }
@@ -1537,15 +1940,23 @@ where
     }
 
     pub(crate) fn publish_commit_lp(&mut self, marker: PendingCommitLogEntry) -> Result<()> {
-        self.sink.mark_last_log_entry_committed(marker)?;
-        self.sink.flush_log()?;
-        self.sink.fence()?;
+        self.publish_commit_lp_deferred_retirement(marker)?;
         if marker.role == TxLogEntryRole::TMemoryUndo {
             let _ = self
                 .sink
-                .retire_committed_linear_undo_chunk(marker.chunk_start_block);
+                .retire_committed_linear_undo_chunk(LinearUndoChunkId::from_marker(marker));
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn publish_commit_lp_deferred_retirement(
+        &mut self,
+        marker: PendingCommitLogEntry,
+    ) -> Result<()> {
+        self.sink.mark_last_log_entry_committed(marker)?;
+        self.sink.flush_log()?;
+        self.sink.fence()?;
         Ok(())
     }
 
@@ -1646,6 +2057,7 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
             data_block,
             data_offset: 0,
             data_block_generation: 0,
+            durable_region_index: 0,
         })
     }
 
@@ -1681,14 +2093,14 @@ impl TxDurableLogBackend for RecordingTxDurableLogBackend {
         Ok(())
     }
 
-    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
+    fn retire_committed_linear_undo_chunk(&mut self, chunk: LinearUndoChunkId) -> Result<()> {
         self.push_event(RecordingBackendEvent::RetireCommittedLinearUndoChunk(
-            chunk_start_block,
+            chunk.chunk_start_block,
         ));
         if self.retire_committed_linear_undo_failures_remaining > 0 {
             self.retire_committed_linear_undo_failures_remaining -= 1;
             self.push_event(RecordingBackendEvent::RetireCommittedLinearUndoChunkFailed(
-                chunk_start_block,
+                chunk.chunk_start_block,
             ));
             bail!("recording backend post-LP cleanup failure")
         }
@@ -1812,8 +2224,8 @@ impl DurableSink for RetirementFailingDurability {
         self.inner.fence()
     }
 
-    fn retire_committed_linear_undo_chunk(&mut self, chunk_start_block: u32) -> Result<()> {
-        self.retired_chunks.push(chunk_start_block);
+    fn retire_committed_linear_undo_chunk(&mut self, chunk: LinearUndoChunkId) -> Result<()> {
+        self.retired_chunks.push(chunk.chunk_start_block);
         bail!("post-LP cleanup failure")
     }
 }
@@ -1836,6 +2248,7 @@ impl DurableSink for RecordingDurability {
             data_block,
             data_offset: 0,
             data_block_generation: 0,
+            durable_region_index: 0,
         })
     }
 
@@ -2483,6 +2896,39 @@ mod tests {
                 .type_layouts
                 .contains(test_struct_type_layout().id())
         );
+    }
+
+    #[test]
+    fn dax_pmem_log_rebuilds_stream_cursor_after_retiring_undo_chunk() {
+        let mut log = TxDurableLog::create_dax_pmem_research_for_test(32).unwrap();
+        let mut locations = BTreeSet::new();
+
+        for iteration in 0..2u64 {
+            let undo = PendingGranuleUndo::tmemory(
+                0x1000_0000_0000_5000 + iteration,
+                u32::try_from(iteration).unwrap(),
+                vec![u8::try_from(iteration).unwrap(); 64],
+            );
+            let marker = {
+                let mut sink = log.stream_sink(14);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 14, 14);
+                publisher
+                    .publish_tmemory_undo_before_in_place_write(&undo)
+                    .unwrap()
+            };
+            {
+                let mut sink = log.stream_sink(14);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 14, 14);
+                publisher.publish_commit_lp(marker).unwrap();
+            }
+            assert!(
+                locations.insert((marker.chunk_start_block, marker.data_block_generation)),
+                "retired DAX undo chunk generation was reused: {marker:?}"
+            );
+        }
+
+        let recovered = log.recover_region_snapshot().unwrap().unwrap();
+        assert!(recovered.tmemory_undo_rollbacks.is_empty());
     }
 
     #[test]
@@ -4652,6 +5098,240 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
         assert_eq!(recovered.tmemory_undo_rollbacks.len(), 2);
     }
 
+    #[test]
+    fn file_backed_cleanup_identity_follows_storage_across_path_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let alias = dir.path().join("tx-log-alias.bin");
+        let original = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let identity = original.cleanup_identity().clone();
+        drop(original);
+
+        std::fs::hard_link(&path, &alias).unwrap();
+        let aliased = TxDurableLog::open_file_backed(&alias).unwrap();
+        assert_eq!(aliased.cleanup_identity(), &identity);
+    }
+
+    #[test]
+    fn file_backed_cleanup_identity_changes_when_path_is_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let original = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let original_identity = original.cleanup_identity().clone();
+        drop(original);
+
+        let replacement = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        assert_ne!(replacement.cleanup_identity(), &original_identity);
+    }
+
+    #[test]
+    fn file_backed_recreation_waits_for_the_existing_image_operation_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let _original = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let storage_key =
+            crate::runtime::vm::block_region::file_backed_region_storage_coordination_key(&path)
+                .unwrap();
+        let operation_lock = shared_allocator_lock_for_storage(storage_key, None).unwrap();
+        let guard = operation_lock.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let replacement_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let replacement = TxDurableLog::create_file_backed(&replacement_path, 32).unwrap();
+            finished_tx
+                .send(replacement.cleanup_identity().clone())
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+
+        drop(guard);
+        let replacement_identity = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        worker.join().unwrap();
+        assert_ne!(&replacement_identity, _original.cleanup_identity());
+    }
+
+    #[test]
+    fn separately_opened_file_backed_logs_coordinate_parallel_allocation() {
+        const WORKERS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        drop(TxDurableLog::create_file_backed(&path, 128).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+        let mut workers = Vec::new();
+
+        for worker in 0..WORKERS {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut log = TxDurableLog::open_file_backed(&path).unwrap();
+                barrier.wait();
+                let stream_id = u32::try_from(worker + 1).unwrap();
+                let undo = PendingGranuleUndo::tmemory(
+                    0x1000_0000_0000_1000 + u64::try_from(worker).unwrap(),
+                    stream_id,
+                    vec![u8::try_from(worker).unwrap(); 64],
+                );
+                let mut sink = log.stream_sink(stream_id);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, stream_id, stream_id);
+                publisher
+                    .publish_tmemory_undo_before_in_place_write(&undo)
+                    .unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let reopened = TxDurableLog::open_file_backed(&path).unwrap();
+        let data_blocks = (1..=WORKERS)
+            .map(|stream_id| {
+                reopened.log_entries_for_test(u32::try_from(stream_id).unwrap())[0].data_block
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(data_blocks.len(), WORKERS);
+        let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+        assert_eq!(recovered.tmemory_undo_rollbacks.len(), WORKERS);
+    }
+
+    #[test]
+    fn generation_mismatch_does_not_acknowledge_linear_undo_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let mut log = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_2000, 1, vec![1; 64]);
+        let marker = {
+            let mut sink = log.stream_sink(1);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 1, 1);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap()
+        };
+        let mut chunk = LinearUndoChunkId::from_marker(marker);
+        chunk.generation = chunk.generation.wrapping_add(1);
+        assert!(
+            log.retire_committed_linear_undo_chunk(chunk).is_err(),
+            "generation mismatch must keep deferred cleanup pending"
+        );
+    }
+
+    #[test]
+    fn stale_file_backed_handle_refuses_cleanup_after_path_recreation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let mut stale = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        let undo = PendingGranuleUndo::tmemory(0x1000_0000_0000_3000, 1, vec![1; 64]);
+        let marker = {
+            let mut sink = stale.stream_sink(1);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 1, 1);
+            publisher
+                .publish_tmemory_undo_before_in_place_write(&undo)
+                .unwrap()
+        };
+
+        let replacement = TxDurableLog::create_file_backed(&path, 32).unwrap();
+        assert_ne!(replacement.cleanup_identity(), stale.cleanup_identity());
+        let lp_err = {
+            let mut sink = stale.stream_sink(1);
+            let mut publisher = StreamPublisher::new_for_test(&mut sink, 1, 1);
+            publisher.publish_commit_lp(marker).unwrap_err()
+        };
+        assert!(lp_err.to_string().contains("storage incarnation changed"));
+        let err = stale
+            .retire_committed_linear_undo_chunk(LinearUndoChunkId::from_marker(marker))
+            .unwrap_err();
+        assert!(err.to_string().contains("storage incarnation changed"));
+    }
+
+    #[test]
+    fn shared_file_backed_logs_do_not_reuse_retired_undo_chunk_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let allocator_lock = Arc::new(Mutex::new(()));
+        let mut first =
+            TxDurableLog::create_file_backed_with_allocator_lock(&path, 64, allocator_lock.clone())
+                .unwrap();
+        let mut second =
+            TxDurableLog::open_file_backed_with_allocator_lock(&path, allocator_lock).unwrap();
+        let mut locations = BTreeSet::new();
+
+        for iteration in 0..8u64 {
+            let log = if iteration % 2 == 0 {
+                &mut first
+            } else {
+                &mut second
+            };
+            let undo = PendingGranuleUndo::tmemory(
+                0x1000_0000_0000_0100 + iteration,
+                u32::try_from(iteration).unwrap(),
+                vec![u8::try_from(iteration).unwrap(); 64],
+            );
+            let marker = {
+                let mut sink = log.stream_sink(12);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+                publisher
+                    .publish_tmemory_undo_before_in_place_write(&undo)
+                    .unwrap()
+            };
+            {
+                let mut sink = log.stream_sink(12);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 12, 12);
+                publisher.publish_commit_lp(marker).unwrap();
+            }
+            assert!(
+                locations.insert((marker.chunk_start_block, marker.data_block_generation)),
+                "retired undo chunk generation was reused: {marker:?}"
+            );
+        }
+
+        let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
+        assert!(recovered.tmemory_undo_rollbacks.is_empty());
+    }
+
+    #[test]
+    fn file_backed_log_invalidates_its_cursor_after_retiring_an_undo_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-log.bin");
+        let allocator_lock = Arc::new(Mutex::new(()));
+        let mut log =
+            TxDurableLog::create_file_backed_with_allocator_lock(&path, 64, allocator_lock)
+                .unwrap();
+        let mut locations = BTreeSet::new();
+
+        for iteration in 0..2u64 {
+            let undo = PendingGranuleUndo::tmemory(
+                0x1000_0000_0000_0200 + iteration,
+                u32::try_from(iteration).unwrap(),
+                vec![u8::try_from(iteration).unwrap(); 64],
+            );
+            let marker = {
+                let mut sink = log.stream_sink(13);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+                publisher
+                    .publish_tmemory_undo_before_in_place_write(&undo)
+                    .unwrap()
+            };
+            {
+                let mut sink = log.stream_sink(13);
+                let mut publisher = StreamPublisher::new_for_test(&mut sink, 13, 13);
+                publisher.publish_commit_lp(marker).unwrap();
+            }
+            assert!(
+                locations.insert((marker.chunk_start_block, marker.data_block_generation)),
+                "retired undo chunk generation was reused: {marker:?}"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn file_backed_multi_region_durable_log_test_constructors_expose_region_count() {
@@ -4672,10 +5352,12 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
 
         let log = TxDurableLog::create_file_backed_regions_for_test(regions.clone()).unwrap();
         assert_eq!(log.region_count_for_test(), 2);
+        let cleanup_identity = log.cleanup_identity().clone();
         drop(log);
 
         let reopened = TxDurableLog::open_file_backed_regions_for_test(regions).unwrap();
         assert_eq!(reopened.region_count_for_test(), 2);
+        assert_eq!(reopened.cleanup_identity(), &cleanup_identity);
     }
 
     #[test]
