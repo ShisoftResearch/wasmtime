@@ -1,8 +1,15 @@
+#[cfg(feature = "transaction-cc-optimistic-validation")]
+use super::concurrency::CertificationMode;
 #[cfg(all(
     feature = "transaction-mvcc",
     feature = "transaction-cc-optimistic-validation"
 ))]
-use super::concurrency::{CertificationMode, MvccCertificationAuthority};
+use super::concurrency::MvccCertificationAuthority;
+#[cfg(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+use super::concurrency::OptimisticCertificationAuthority;
 use super::config::TMemoryRegionConfig;
 #[cfg(all(
     feature = "transaction-mvcc",
@@ -27473,6 +27480,77 @@ fn optimistic_validation_rejects_changed_write_version() {
         error,
         OptimisticValidationConflictKindForTest::WriteVersionMismatch
     );
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn optimistic_certification_disjoint_permits_coexist() -> Result<()> {
+    let authority = Arc::new(OptimisticCertificationAuthority::default());
+    let first = mvcc_certification_granule_for_single_version_test(10);
+    let second = mvcc_certification_granule_for_single_version_test(11);
+    let first_permit = authority.acquire(
+        TransactionId::from_raw(1),
+        &BTreeSet::from([first]),
+        &BTreeSet::from([first]),
+    )?;
+    let second_permit = authority.acquire(
+        TransactionId::from_raw(2),
+        &BTreeSet::from([second]),
+        &BTreeSet::from([second]),
+    )?;
+    assert_eq!(authority.lifecycle_counts_for_test()?, (2, 2));
+    drop((first_permit, second_permit));
+    assert_eq!(authority.lifecycle_counts_for_test()?, (2, 0));
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    feature = "transaction-cc-optimistic-validation",
+    not(feature = "transaction-mvcc")
+))]
+fn optimistic_certification_write_skew_sets_block_atomically() -> Result<()> {
+    use std::time::Duration;
+
+    let authority = Arc::new(OptimisticCertificationAuthority::default());
+    let a = mvcc_certification_granule_for_single_version_test(20);
+    let b = mvcc_certification_granule_for_single_version_test(21);
+    let first = authority.acquire(
+        TransactionId::from_raw(1),
+        &BTreeSet::from([a, b]),
+        &BTreeSet::from([a]),
+    )?;
+    let waiting_authority = authority.clone();
+    let waiter = std::thread::Builder::new()
+        .name("optimistic-certification-write-skew".into())
+        .spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            waiting_authority.acquire(
+                TransactionId::from_raw(2),
+                &BTreeSet::from([a, b]),
+                &BTreeSet::from([b]),
+            )
+        })?;
+
+    assert!(
+        authority
+            .wait_until_blocked_for_test(TransactionId::from_raw(2), Duration::from_secs(1))?
+    );
+    drop(first);
+    let second = waiter
+        .join()
+        .map_err(|_| crate::format_err!("optimistic certification worker panicked"))??;
+    assert_eq!(
+        second.reservations_for_test(),
+        &[
+            (a, CertificationMode::Shared),
+            (b, CertificationMode::Exclusive),
+        ]
+    );
+    Ok(())
 }
 
 #[test]

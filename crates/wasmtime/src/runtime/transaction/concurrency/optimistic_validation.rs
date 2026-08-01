@@ -1,33 +1,16 @@
 use crate::prelude::*;
-use alloc::collections::BTreeMap;
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
-use alloc::collections::BTreeSet;
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 
 use super::super::{GranuleId, TransactionId};
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
-use super::{MvccCertificationAuthority, MvccCertificationPermit};
+use super::{OptimisticCertificationAuthority, OptimisticCertificationPermit};
 use super::{TransactionConcurrencyControl, TransactionConflictAction};
 
 #[derive(Debug, Default)]
 pub(crate) struct OptimisticValidation {
     pub(crate) read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
     pub(crate) write_versions: BTreeMap<(TransactionId, GranuleId), u64>,
-    #[cfg(all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
-    ))]
-    mvcc_certification: Arc<MvccCertificationAuthority>,
+    commit_certification: Arc<OptimisticCertificationAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +36,20 @@ impl OptimisticValidationConflictKind {
 pub(crate) use self::OptimisticValidationConflictKind as OptimisticValidationConflictKindForTest;
 
 impl OptimisticValidation {
+    pub(crate) fn acquire_commit_certification(
+        &self,
+        transaction: TransactionId,
+        reads: &BTreeSet<GranuleId>,
+        writes: &BTreeSet<GranuleId>,
+    ) -> Result<OptimisticCertificationPermit> {
+        self.commit_certification
+            .acquire(transaction, reads, writes)
+    }
+
+    pub(crate) fn commit_certification_authority(&self) -> Arc<OptimisticCertificationAuthority> {
+        self.commit_certification.clone()
+    }
+
     #[cfg(all(
         feature = "transaction-mvcc",
         feature = "transaction-cc-optimistic-validation"
@@ -62,16 +59,16 @@ impl OptimisticValidation {
         transaction: TransactionId,
         reads: &BTreeSet<GranuleId>,
         writes: &BTreeSet<GranuleId>,
-    ) -> Result<MvccCertificationPermit> {
-        self.mvcc_certification.acquire(transaction, reads, writes)
+    ) -> Result<OptimisticCertificationPermit> {
+        self.acquire_commit_certification(transaction, reads, writes)
     }
 
     #[cfg(all(
         feature = "transaction-mvcc",
         feature = "transaction-cc-optimistic-validation"
     ))]
-    pub(crate) fn mvcc_certification_authority(&self) -> Arc<MvccCertificationAuthority> {
-        self.mvcc_certification.clone()
+    pub(crate) fn mvcc_certification_authority(&self) -> Arc<OptimisticCertificationAuthority> {
+        self.commit_certification_authority()
     }
 
     pub(crate) fn record_read(

@@ -71,18 +71,18 @@ struct CertificationState {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct MvccCertificationAuthority {
+pub(crate) struct OptimisticCertificationAuthority {
     state: Mutex<CertificationState>,
     changed: Condvar,
 }
 
-impl MvccCertificationAuthority {
+impl OptimisticCertificationAuthority {
     pub(crate) fn acquire(
         self: &Arc<Self>,
         transaction: TransactionId,
         reads: &BTreeSet<GranuleId>,
         writes: &BTreeSet<GranuleId>,
-    ) -> Result<MvccCertificationPermit> {
+    ) -> Result<OptimisticCertificationPermit> {
         let reservations = sorted_reservations(reads, writes);
         let mut state = self.lock()?;
         while !reservations.iter().all(|(granule, mode)| {
@@ -96,10 +96,9 @@ impl MvccCertificationAuthority {
                 state.blocked_transactions.insert(transaction);
                 self.changed.notify_all();
             }
-            state = self
-                .changed
-                .wait(state)
-                .map_err(|_| crate::format_err!("MVCC certification authority lock is poisoned"))?;
+            state = self.changed.wait(state).map_err(|_| {
+                crate::format_err!("optimistic certification authority lock is poisoned")
+            })?;
             #[cfg(test)]
             state.blocked_transactions.remove(&transaction);
         }
@@ -118,7 +117,7 @@ impl MvccCertificationAuthority {
             state.last_reservations = reservations.clone();
         }
         drop(state);
-        Ok(MvccCertificationPermit {
+        Ok(OptimisticCertificationPermit {
             authority: self.clone(),
             transaction,
             reservations,
@@ -137,7 +136,9 @@ impl MvccCertificationAuthority {
             .wait_timeout_while(state, timeout, |state| {
                 !state.blocked_transactions.contains(&transaction)
             })
-            .map_err(|_| crate::format_err!("MVCC certification authority lock is poisoned"))?;
+            .map_err(|_| {
+                crate::format_err!("optimistic certification authority lock is poisoned")
+            })?;
         Ok(state.blocked_transactions.contains(&transaction))
     }
 
@@ -155,7 +156,7 @@ impl MvccCertificationAuthority {
     fn lock(&self) -> Result<MutexGuard<'_, CertificationState>> {
         self.state
             .lock()
-            .map_err(|_| crate::format_err!("MVCC certification authority lock is poisoned"))
+            .map_err(|_| crate::format_err!("optimistic certification authority lock is poisoned"))
     }
 }
 
@@ -174,20 +175,20 @@ fn sorted_reservations(
 }
 
 #[derive(Debug)]
-pub(crate) struct MvccCertificationPermit {
-    authority: Arc<MvccCertificationAuthority>,
+pub(crate) struct OptimisticCertificationPermit {
+    authority: Arc<OptimisticCertificationAuthority>,
     transaction: TransactionId,
     reservations: Vec<(GranuleId, CertificationMode)>,
 }
 
-impl MvccCertificationPermit {
+impl OptimisticCertificationPermit {
     #[cfg(test)]
     pub(crate) fn reservations_for_test(&self) -> &[(GranuleId, CertificationMode)] {
         &self.reservations
     }
 }
 
-impl Drop for MvccCertificationPermit {
+impl Drop for OptimisticCertificationPermit {
     fn drop(&mut self) {
         let mut state = match self.authority.state.lock() {
             Ok(state) => state,
