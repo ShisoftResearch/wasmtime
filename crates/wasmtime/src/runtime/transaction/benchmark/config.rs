@@ -182,14 +182,18 @@ pub(super) fn compiled_policy_name() -> &'static str {
         return "mvcc-optimistic";
     }
 
-    match ConcurrencyControl::default_for_build() {
+    single_version_policy_name(ConcurrencyControl::default_for_build())
+}
+
+fn single_version_policy_name(policy: ConcurrencyControl) -> &'static str {
+    match policy {
         ConcurrencyControl::LockBased => "lockbased",
-        ConcurrencyControl::NoWaitAbort => "nowait-abort",
+        ConcurrencyControl::NoWaitAbort => "no-wait",
         ConcurrencyControl::StrictTwoPhaseLocking => "strict-2pl",
         ConcurrencyControl::WoundWait => "wound-wait",
         ConcurrencyControl::WaitDie => "wait-die",
-        ConcurrencyControl::OptimisticValidation => "optimistic-validation",
-        ConcurrencyControl::TimestampOrdering => "timestamp-ordering",
+        ConcurrencyControl::OptimisticValidation => "optimistic",
+        ConcurrencyControl::TimestampOrdering => "timestamp",
     }
 }
 
@@ -209,7 +213,10 @@ pub(super) fn compiled_transaction_features() -> &'static [&'static str] {
         return &["transaction-cc-nowait-abort"];
     }
 
-    #[cfg(feature = "transaction-cc-optimistic-validation")]
+    #[cfg(all(
+        not(feature = "transaction-mvcc"),
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     {
         return &["transaction-cc-optimistic-validation"];
     }
@@ -268,4 +275,36 @@ fn request_rejects_a_policy_other_than_the_compiled_policy() {
     assert!(error.contains("requested policy"), "{error}");
     request.expected_policy = compiled_policy_name().into();
     request.validate().unwrap();
+}
+
+#[test]
+fn approved_single_version_policy_names_match_the_orchestrator_contract() {
+    assert_eq!(
+        single_version_policy_name(ConcurrencyControl::LockBased),
+        "lockbased"
+    );
+    assert_eq!(
+        single_version_policy_name(ConcurrencyControl::NoWaitAbort),
+        "no-wait"
+    );
+    assert_eq!(
+        single_version_policy_name(ConcurrencyControl::StrictTwoPhaseLocking),
+        "strict-2pl"
+    );
+    assert_eq!(
+        single_version_policy_name(ConcurrencyControl::WoundWait),
+        "wound-wait"
+    );
+    assert_eq!(
+        single_version_policy_name(ConcurrencyControl::WaitDie),
+        "wait-die"
+    );
+    assert_eq!(
+        single_version_policy_name(ConcurrencyControl::OptimisticValidation),
+        "optimistic"
+    );
+    assert_eq!(
+        single_version_policy_name(ConcurrencyControl::TimestampOrdering),
+        "timestamp"
+    );
 }
