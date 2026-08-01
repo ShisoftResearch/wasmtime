@@ -166,19 +166,33 @@ impl BenchmarkStorage {
         )))]
         let staged_versions = 0;
 
-        let wrote = state.commit_single_tmemory_for_benchmark(&self.tmemory)?;
+        let commit = state.commit_single_tmemory_for_benchmark(&self.tmemory);
+        #[cfg(all(
+            feature = "transaction-mvcc",
+            feature = "transaction-cc-optimistic-validation"
+        ))]
+        self.record_mvcc_versions_created(
+            state.take_benchmark_committed_mvcc_versions_after_error(),
+        )?;
+        let wrote = commit?;
         let mvcc_versions_created = if wrote { staged_versions } else { 0 };
-        if mvcc_versions_created != 0 {
-            self.mvcc_versions_created
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current.checked_add(mvcc_versions_created)
-                })
-                .map_err(|_| crate::format_err!("benchmark MVCC created-version overflow"))?;
-        }
+        self.record_mvcc_versions_created(mvcc_versions_created)?;
         Ok(CommitObservation {
             wrote,
             mvcc_versions_created,
         })
+    }
+
+    fn record_mvcc_versions_created(&self, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.mvcc_versions_created
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(count)
+            })
+            .map_err(|_| crate::format_err!("benchmark MVCC created-version overflow"))?;
+        Ok(())
     }
 
     pub(super) fn finish_attempt<T>(
@@ -187,8 +201,15 @@ impl BenchmarkStorage {
         result: Result<T>,
     ) -> Result<AttemptOutcome<T>> {
         let result = result.and_then(|value| self.commit(state).map(|_| value));
+        let internal_cleanup_failed = state.take_benchmark_cleanup_failure_for_test();
         match result {
-            Ok(value) => Ok(AttemptOutcome::Committed(value)),
+            Ok(value) => {
+                ensure!(
+                    !internal_cleanup_failed,
+                    "benchmark transaction cleanup failed before attempt completion"
+                );
+                Ok(AttemptOutcome::Committed(value))
+            }
             Err(error) => {
                 let is_conflict = {
                     let message = format!("{error:#}");
@@ -197,7 +218,10 @@ impl BenchmarkStorage {
                         .any(|marker| message.contains(marker))
                 };
                 let cleanup = self.abort_if_active(state);
-                if is_conflict && cleanup.is_ok() {
+                let outer_cleanup_failed = state.take_benchmark_cleanup_failure_for_test();
+                let cleanup_failed =
+                    internal_cleanup_failed || cleanup.is_err() || outer_cleanup_failed;
+                if is_conflict && !cleanup_failed {
                     return Ok(AttemptOutcome::Conflict);
                 }
                 combine_operation_and_cleanup_results(
@@ -363,6 +387,47 @@ mod tests {
         feature = "transaction-cc-optimistic-validation"
     ))]
     #[test]
+    fn conflict_cleanup_failure_is_an_unexpected_attempt_error() {
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
+        let mut stale = storage.new_transaction_state().unwrap();
+        storage.begin(&mut stale).unwrap();
+        assert_eq!(storage.read_u64(&mut stale, 0).unwrap(), 0);
+
+        let committing_storage = storage.clone();
+        std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut state = committing_storage.new_transaction_state()?;
+            committing_storage.begin(&mut state)?;
+            committing_storage.stage_u64(&mut state, 0, 1)?;
+            committing_storage.commit(&mut state)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+
+        storage.stage_u64(&mut stale, 0, 2).unwrap();
+        storage
+            .runtime
+            .visibility_for_test()
+            .fail_finish_snapshot_once_for_test()
+            .unwrap();
+
+        let result = storage.finish_attempt(&mut stale, Ok(()));
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a conflict with failed snapshot cleanup was classified as Conflict"),
+        };
+        assert_eq!(stale.active_transaction(), None);
+        assert!(format!("{error:#}").contains("injected snapshot finish failure"));
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    #[test]
     fn real_gc_barrier_removes_mvcc_versions_and_leaves_no_snapshots() {
         let _cleanup = clear_current_thread_transaction_on_drop_for_test();
         let storage = BenchmarkStorage::new(BackendKind::Vmemory).unwrap();
@@ -511,6 +576,114 @@ mod tests {
         feature = "transaction-cc-optimistic-validation"
     ))]
     #[test]
+    fn shared_file_backed_write_lock_excludes_mvcc_install_and_rollback() {
+        use crate::runtime::transaction::MvccCommitFaultPoint;
+        use crate::runtime::transaction::mvcc::MvccCommitTestHook;
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Duration;
+
+        let install_storage = BenchmarkStorage::new(BackendKind::FileBacked).unwrap();
+        let install_hook = Arc::new(MvccCommitTestHook::new(1));
+        install_storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .set_commit_hooks_for_test(None, None, Some(install_hook.clone()))
+            .unwrap();
+        let committing_storage = install_storage.clone();
+        let committing = std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut state = committing_storage.new_transaction_state()?;
+            committing_storage.begin(&mut state)?;
+            committing_storage.stage_u64(&mut state, 0, 1)?;
+            committing_storage.commit(&mut state)
+        });
+        assert!(install_hook.wait_until_reached(Duration::from_secs(5)));
+
+        let (writer_ready_tx, writer_ready_rx) = channel();
+        let (writer_done_tx, writer_done_rx) = channel();
+        let writer_runtime = install_storage.runtime.clone();
+        let writer = std::thread::spawn(move || -> Result<()> {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            writer_ready_tx.send(()).unwrap();
+            writer_runtime.with_shared_file_backed_tmemory_commit_write_lock(|| Ok(()))?;
+            writer_done_tx.send(()).unwrap();
+            Ok(())
+        });
+        writer_ready_rx.recv().unwrap();
+        assert_eq!(
+            writer_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        install_hook.release();
+        assert!(committing.join().unwrap().unwrap().wrote);
+        writer_done_rx.recv().unwrap();
+        writer.join().unwrap().unwrap();
+        install_storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .set_commit_hooks_for_test(None, None, None)
+            .unwrap();
+
+        let rollback_storage = BenchmarkStorage::new(BackendKind::FileBacked).unwrap();
+        let rollback_hook = Arc::new(MvccCommitTestHook::new(1));
+        rollback_storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .set_benchmark_rollback_hook_for_test(Some(rollback_hook.clone()))
+            .unwrap();
+        rollback_storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .fail_commit_once_for_test(MvccCommitFaultPoint::AfterMemoryInstall)
+            .unwrap();
+        let committing_storage = rollback_storage.clone();
+        let committing = std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            let mut state = committing_storage.new_transaction_state()?;
+            committing_storage.begin(&mut state)?;
+            committing_storage.stage_u64(&mut state, 0, 1)?;
+            committing_storage.commit(&mut state)
+        });
+        assert!(rollback_hook.wait_until_reached(Duration::from_secs(5)));
+
+        let (writer_ready_tx, writer_ready_rx) = channel();
+        let (writer_done_tx, writer_done_rx) = channel();
+        let writer_runtime = rollback_storage.runtime.clone();
+        let writer = std::thread::spawn(move || -> Result<()> {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            writer_ready_tx.send(()).unwrap();
+            writer_runtime.with_shared_file_backed_tmemory_commit_write_lock(|| Ok(()))?;
+            writer_done_tx.send(()).unwrap();
+            Ok(())
+        });
+        writer_ready_rx.recv().unwrap();
+        assert_eq!(
+            writer_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        rollback_hook.release();
+        let error = committing.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("AfterMemoryInstall"));
+        writer_done_rx.recv().unwrap();
+        writer.join().unwrap().unwrap();
+        rollback_storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .set_benchmark_rollback_hook_for_test(None)
+            .unwrap();
+        assert_eq!(committed_u64(&rollback_storage, 0), 0);
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    #[test]
     fn mvcc_pre_lp_install_failure_rolls_back_current_value_for_both_backends() {
         use crate::runtime::transaction::MvccCommitFaultPoint;
 
@@ -564,12 +737,44 @@ mod tests {
         let error = storage.commit(&mut state).unwrap_err();
         assert!(format!("{error:#}").contains("committed durably"));
         assert!(state.has_benchmark_mvcc_terminal_for_test());
+        assert_eq!(storage.mvcc_versions_created.load(Ordering::Relaxed), 0);
 
         let observation = storage.commit(&mut state).unwrap();
         assert!(observation.wrote);
         assert_eq!(observation.mvcc_versions_created, 1);
+        assert_eq!(storage.mvcc_versions_created.load(Ordering::Relaxed), 1);
         assert!(!state.has_benchmark_mvcc_terminal_for_test());
         assert_eq!(state.active_transaction(), None);
         assert_eq!(committed_u64(&storage, 0), 1);
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    #[test]
+    fn mvcc_synchronous_post_lp_force_completion_counts_versions_once() {
+        use crate::runtime::transaction::MvccCommitFaultPoint;
+
+        let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+        let storage = BenchmarkStorage::new(BackendKind::FileBacked).unwrap();
+        storage
+            .runtime
+            .visibility_for_test()
+            .runtime()
+            .fail_commit_once_for_test(MvccCommitFaultPoint::AfterDurableLp)
+            .unwrap();
+        let mut state = storage.new_transaction_state().unwrap();
+        storage.begin(&mut state).unwrap();
+        storage.stage_u64(&mut state, 0, 1).unwrap();
+
+        let error = storage.commit(&mut state).unwrap_err();
+
+        assert!(format!("{error:#}").contains("committed durably"));
+        assert_eq!(state.active_transaction(), None);
+        assert!(!state.has_benchmark_mvcc_terminal_for_test());
+        assert_eq!(storage.mvcc_versions_created.load(Ordering::Relaxed), 1);
+        assert_eq!(committed_u64(&storage, 0), 1);
+        assert_eq!(storage.mvcc_versions_created.load(Ordering::Relaxed), 1);
     }
 }

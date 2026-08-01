@@ -58,6 +58,14 @@ pub(crate) struct TransactionState {
     pub(super) durable_log: TxDurableLog,
     #[cfg(feature = "transaction-mvcc")]
     pub(super) mvcc_terminal_commit: Option<MvccTerminalCommitState>,
+    #[cfg(test)]
+    pub(super) benchmark_cleanup_failed: bool,
+    #[cfg(all(
+        test,
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(super) benchmark_committed_mvcc_versions_after_error: u64,
     #[cfg(all(
         test,
         feature = "transaction-mvcc",
@@ -143,6 +151,14 @@ impl Default for TransactionState {
             durable_log: TxDurableLog::default(),
             #[cfg(feature = "transaction-mvcc")]
             mvcc_terminal_commit: None,
+            #[cfg(test)]
+            benchmark_cleanup_failed: false,
+            #[cfg(all(
+                test,
+                feature = "transaction-mvcc",
+                feature = "transaction-cc-optimistic-validation"
+            ))]
+            benchmark_committed_mvcc_versions_after_error: 0,
             #[cfg(all(
                 test,
                 feature = "transaction-mvcc",
@@ -4525,6 +4541,10 @@ impl TransactionState {
             "failed to finish transaction visibility snapshot",
         );
         self.install_workspace(TransactionWorkspace::default());
+        #[cfg(test)]
+        if result.is_err() {
+            self.benchmark_cleanup_failed = true;
+        }
         result
     }
 
@@ -4820,6 +4840,22 @@ impl TransactionState {
         }
     }
 
+    pub(crate) fn take_benchmark_cleanup_failure_for_test(&mut self) -> bool {
+        mem::take(&mut self.benchmark_cleanup_failed)
+    }
+
+    fn record_benchmark_cleanup_failure_for_test(&mut self, result: &Result<()>) {
+        self.benchmark_cleanup_failed |= result.is_err();
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    pub(crate) fn take_benchmark_committed_mvcc_versions_after_error(&mut self) -> u64 {
+        mem::take(&mut self.benchmark_committed_mvcc_versions_after_error)
+    }
+
     #[cfg(all(
         feature = "transaction-mvcc",
         feature = "transaction-cc-optimistic-validation"
@@ -4861,6 +4897,7 @@ impl TransactionState {
                 } else {
                     Ok(())
                 };
+                self.record_benchmark_cleanup_failure_for_test(&cleanup);
                 return combine_operation_and_cleanup_results(
                     Err(error),
                     cleanup,
@@ -4876,6 +4913,7 @@ impl TransactionState {
                 } else {
                     Ok(())
                 };
+                self.record_benchmark_cleanup_failure_for_test(&cleanup);
                 return combine_operation_and_cleanup_results(
                     Err(error),
                     cleanup,
@@ -5121,17 +5159,23 @@ impl TransactionState {
                     "committed irrevocably"
                 };
                 if self.active_transaction().is_none() {
+                    self.record_benchmark_committed_mvcc_versions_after_error(&terminal)?;
                     return Err(crate::format_err!(
                         "benchmark transaction {outcome} but completion/cleanup failed: {original}"
                     ));
                 }
                 match self.force_complete_benchmark_mvcc_commit(&mut terminal) {
-                    Ok(()) => Err(crate::format_err!(
-                        "benchmark transaction {outcome} but completion/cleanup failed: {original}"
-                    )),
+                    Ok(()) => {
+                        self.record_benchmark_committed_mvcc_versions_after_error(&terminal)?;
+                        Err(crate::format_err!(
+                            "benchmark transaction {outcome} but completion/cleanup failed: {original}"
+                        ))
+                    }
                     Err(completion_error) => {
                         if self.active_transaction().is_some() {
                             self.benchmark_mvcc_terminal_commit = Some(terminal);
+                        } else {
+                            self.record_benchmark_committed_mvcc_versions_after_error(&terminal)?;
                         }
                         Err(crate::format_err!(
                             "benchmark transaction {outcome} but completion/cleanup failed: {original}; force-completion also failed: {completion_error:#}"
@@ -5146,7 +5190,46 @@ impl TransactionState {
         feature = "transaction-mvcc",
         feature = "transaction-cc-optimistic-validation"
     ))]
+    fn record_benchmark_committed_mvcc_versions_after_error(
+        &mut self,
+        terminal: &BenchmarkMvccTerminalCommitState,
+    ) -> Result<()> {
+        ensure!(
+            terminal.pending.is_none(),
+            "benchmark committed-error MVCC versions are not published"
+        );
+        let created = u64::try_from(terminal.prepared.memories.len())
+            .context("benchmark MVCC created-version count does not fit u64")?;
+        self.benchmark_committed_mvcc_versions_after_error = self
+            .benchmark_committed_mvcc_versions_after_error
+            .checked_add(created)
+            .context("benchmark committed-error MVCC created-version overflow")?;
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
     fn install_benchmark_mvcc_current_values(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        terminal: &mut BenchmarkMvccTerminalCommitState,
+    ) -> Result<()> {
+        let region = self.shared_region_runtime_for_publication().cloned();
+        if let Some(region) = region {
+            return region.with_shared_file_backed_tmemory_commit_read_lock(|| {
+                self.install_benchmark_mvcc_current_values_inner(tmemory, terminal)
+            });
+        }
+        self.install_benchmark_mvcc_current_values_inner(tmemory, terminal)
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn install_benchmark_mvcc_current_values_inner(
         &mut self,
         tmemory: &std::sync::Mutex<TMemory>,
         terminal: &mut BenchmarkMvccTerminalCommitState,
@@ -5202,6 +5285,7 @@ impl TransactionState {
                 .visibility
                 .inject_commit_fault_for_test(MvccCommitFaultPoint::AfterMemoryInstall)?;
         }
+        terminal.visibility.run_inside_install_hook_for_test()?;
         Ok(())
     }
 
@@ -5292,6 +5376,7 @@ impl TransactionState {
         match cleanup {
             Ok(()) => Err(crate::format_err!("{original}")),
             Err(cleanup_error) => {
+                self.benchmark_cleanup_failed = true;
                 if retry_required && self.active_transaction().is_some() {
                     self.benchmark_mvcc_terminal_commit = Some(terminal);
                     Err(crate::format_err!(
@@ -5315,10 +5400,31 @@ impl TransactionState {
         tmemory: &std::sync::Mutex<TMemory>,
         terminal: &mut BenchmarkMvccTerminalCommitState,
     ) -> Result<()> {
+        let region = self.shared_region_runtime_for_publication().cloned();
+        if let Some(region) = region {
+            return region.with_shared_file_backed_tmemory_commit_read_lock(|| {
+                self.rollback_benchmark_mvcc_current_values_inner(tmemory, terminal)
+            });
+        }
+        self.rollback_benchmark_mvcc_current_values_inner(tmemory, terminal)
+    }
+
+    #[cfg(all(
+        feature = "transaction-mvcc",
+        feature = "transaction-cc-optimistic-validation"
+    ))]
+    fn rollback_benchmark_mvcc_current_values_inner(
+        &mut self,
+        tmemory: &std::sync::Mutex<TMemory>,
+        terminal: &mut BenchmarkMvccTerminalCommitState,
+    ) -> Result<()> {
         let installed = terminal.installed.iter().rev().copied().collect::<Vec<_>>();
         let mut tmemory = tmemory
             .lock()
             .map_err(|_| crate::format_err!("benchmark tmemory lock poisoned"))?;
+        if !installed.is_empty() {
+            terminal.visibility.run_benchmark_rollback_hook_for_test()?;
+        }
         for granule in installed {
             let predecessor = terminal
                 .prepared

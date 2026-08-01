@@ -254,6 +254,18 @@ impl MvccRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_benchmark_rollback_hook_for_test(
+        &self,
+        hook: Option<Arc<MvccCommitTestHook>>,
+    ) -> Result<()> {
+        self.commit_hooks
+            .lock()
+            .map_err(|_| crate::format_err!("MVCC commit test hook lock is poisoned"))?
+            .benchmark_rollback = hook;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn run_before_publish_hook_for_test(&self) -> Result<()> {
         self.commit_hook_for_test(|hooks| hooks.before_publish.clone())
     }
@@ -271,6 +283,11 @@ impl MvccRuntime {
     #[cfg(test)]
     pub(crate) fn run_predecessor_collected_hook_for_test(&self) -> Result<()> {
         self.commit_hook_for_test(|hooks| hooks.predecessor_collected.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_benchmark_rollback_hook_for_test(&self) -> Result<()> {
+        self.commit_hook_for_test(|hooks| hooks.benchmark_rollback.clone())
     }
 
     #[cfg(test)]
@@ -526,6 +543,7 @@ struct MvccCommitHooks {
     after_publish: Option<Arc<MvccCommitTestHook>>,
     inside_install: Option<Arc<MvccCommitTestHook>>,
     predecessor_collected: Option<Arc<MvccCommitTestHook>>,
+    benchmark_rollback: Option<Arc<MvccCommitTestHook>>,
 }
 
 #[cfg(test)]
