@@ -2613,7 +2613,14 @@ impl VMemoryBlockRegion {
                 && entry.data_offset == data_offset
                 && entry.data_block_generation() == data_block_generation
                 && entry.role()? == role,
-            "transactional commit LP marker does not match the last log entry"
+            "transactional commit LP marker does not match the last log entry for stream {} in block {}: expected logical_id={}, version={}, data=({}, {}, generation {}), role={role:?}; found {entry:?}",
+            stream.stream_id,
+            log_block,
+            logical_id,
+            version,
+            data_block,
+            data_offset,
+            data_block_generation,
         );
         entry.tx_meta |= 1;
         self.write(entry_offset, &encode_tx_log_entry(entry))?;
@@ -3630,7 +3637,14 @@ impl DaxPmemBlockRegion {
                 && entry.data_offset == data_offset
                 && entry.data_block_generation() == data_block_generation
                 && entry.role()? == role,
-            "transactional commit LP marker does not match the last log entry"
+            "transactional commit LP marker does not match the last log entry for stream {} in block {}: expected logical_id={}, version={}, data=({}, {}, generation {}), role={role:?}; found {entry:?}",
+            stream.stream_id,
+            log_block,
+            logical_id,
+            version,
+            data_block,
+            data_offset,
+            data_block_generation,
         );
         entry.tx_meta |= 1;
         self.write(entry_offset, &encode_tx_log_entry(entry))?;
@@ -5213,7 +5227,14 @@ impl FileBackedMemoryBlockRegion {
                 && entry.data_offset == data_offset
                 && entry.data_block_generation() == data_block_generation
                 && entry.role()? == role,
-            "transactional commit LP marker does not match the last log entry"
+            "transactional commit LP marker does not match the last log entry for stream {} in block {}: expected logical_id={}, version={}, data=({}, {}, generation {}), role={role:?}; found {entry:?}",
+            stream.stream_id,
+            log_block,
+            logical_id,
+            version,
+            data_block,
+            data_offset,
+            data_block_generation,
         );
         entry.tx_meta |= 1;
         self.write(entry_offset, &encode_tx_log_entry(entry))?;

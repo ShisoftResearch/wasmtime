@@ -219,6 +219,46 @@ where
     bail!("durable storage identity changed repeatedly while creating the transaction log")
 }
 
+fn open_bound_file_backed_region(
+    path: &Path,
+    preferred: Option<Arc<Mutex<()>>>,
+) -> Result<DurableRegionLog<FileBackedMemoryBlockRegion>> {
+    for _ in 0..STORAGE_BIND_RETRY_LIMIT {
+        let observed_key =
+            crate::runtime::vm::block_region::file_backed_region_storage_coordination_key(path)?;
+        let operation_lock =
+            shared_allocator_lock_for_storage(observed_key.clone(), preferred.clone())?;
+        let guard = operation_lock
+            .lock()
+            .map_err(|_| crate::format_err!("shared durable log operation lock poisoned"))?;
+        if crate::runtime::vm::block_region::file_backed_region_storage_coordination_key(path)?
+            != observed_key
+        {
+            continue;
+        }
+
+        // Opening reconstructs stream cursors and repairs orphaned block
+        // reservations. It must run under the same lock as live publishers or
+        // it can mistake an in-flight allocation for a recovery-time orphan.
+        let mut region = FileBackedMemoryBlockRegion::open_for_test(path)?;
+        let actual_key = region.storage_coordination_key()?;
+        let actual_lock =
+            shared_allocator_lock_for_storage(actual_key.clone(), Some(operation_lock.clone()))?;
+        if actual_key != observed_key || !Arc::ptr_eq(&actual_lock, &operation_lock) {
+            continue;
+        }
+        let storage_incarnation = region.storage_incarnation()?;
+        crate::runtime::vm::block_region::retire_completed_linear_undo_chunks(&mut region)?;
+        drop(guard);
+        return Ok(DurableRegionLog::new_bound(
+            region,
+            storage_incarnation,
+            operation_lock,
+        ));
+    }
+    bail!("durable storage identity changed repeatedly while opening the transaction log")
+}
+
 impl DurableLogCleanupIdentity {
     fn unique_instance() -> Self {
         Self::Instance(NEXT_DURABLE_LOG_CLEANUP_IDENTITY.fetch_add(1, Ordering::Relaxed))
@@ -867,8 +907,7 @@ impl TxDurableLog {
             u32,
         ) -> Result<T>,
     ) -> Result<T> {
-        let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
-        let mut backend = bind_opened_file_backed_region(region, Some(shared_allocator_lock))?;
+        let mut backend = open_bound_file_backed_region(path, Some(shared_allocator_lock))?;
         let operation_lock = backend
             .shared_allocator_lock
             .clone()
@@ -894,8 +933,7 @@ impl TxDurableLog {
         path: &Path,
         shared_allocator_lock: Option<Arc<Mutex<()>>>,
     ) -> Result<Self> {
-        let region = FileBackedMemoryBlockRegion::open_for_test(path)?;
-        let backend = bind_opened_file_backed_region(region, shared_allocator_lock)?;
+        let backend = open_bound_file_backed_region(path, shared_allocator_lock)?;
         Ok(Self::from_file_backed_backend(backend))
     }
 
@@ -5160,18 +5198,20 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
     }
 
     #[test]
-    fn separately_opened_file_backed_logs_coordinate_parallel_allocation() {
+    fn separately_opened_file_backed_logs_coordinate_parallel_publication_and_commit() {
         const WORKERS: usize = 8;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tx-log.bin");
         drop(TxDurableLog::create_file_backed(&path, 128).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+        let commit_barrier = Arc::new(std::sync::Barrier::new(WORKERS));
         let mut workers = Vec::new();
 
         for worker in 0..WORKERS {
             let path = path.clone();
             let barrier = barrier.clone();
+            let commit_barrier = commit_barrier.clone();
             workers.push(std::thread::spawn(move || {
                 let mut log = TxDurableLog::open_file_backed(&path).unwrap();
                 barrier.wait();
@@ -5183,9 +5223,11 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
                 );
                 let mut sink = log.stream_sink(stream_id);
                 let mut publisher = StreamPublisher::new_for_test(&mut sink, stream_id, stream_id);
-                publisher
+                let marker = publisher
                     .publish_tmemory_undo_before_in_place_write(&undo)
                     .unwrap();
+                commit_barrier.wait();
+                publisher.publish_commit_lp(marker).unwrap();
             }));
         }
         for worker in workers {
@@ -5200,7 +5242,7 @@ total_recovery_mibps={:.1} total_recovered={}MiB total_recovery_elapsed={:.3}s",
             .collect::<BTreeSet<_>>();
         assert_eq!(data_blocks.len(), WORKERS);
         let recovered = TxDurableLog::recover_file_backed_for_test(&path).unwrap();
-        assert_eq!(recovered.tmemory_undo_rollbacks.len(), WORKERS);
+        assert!(recovered.tmemory_undo_rollbacks.is_empty());
     }
 
     #[test]

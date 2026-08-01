@@ -1,11 +1,8 @@
 #[cfg(any(
+    feature = "transaction-mvcc",
     all(
         not(feature = "transaction-mvcc"),
         not(feature = "transaction-cc-strict-2pl")
-    ),
-    all(
-        feature = "transaction-mvcc",
-        feature = "transaction-cc-optimistic-validation"
     )
 ))]
 use super::concurrency::CertificationMode;
@@ -18,16 +15,12 @@ use super::concurrency::MvccCertificationAuthority;
 use super::concurrency::OptimisticCertificationAuthority;
 use super::config::TMemoryRegionConfig;
 #[cfg(feature = "transaction-mvcc")]
-use super::mvcc::MvccCommitTestHook;
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
 use super::mvcc::{
-    CommitRecord, CommitState, ModelCommitOutcome, ModelOperation, ModelTransaction,
-    MvccPruneBudget, MvccRuntime, SerializableMvccModel, SnapshotRegistration,
-    generate_model_schedules,
+    CommitRecord, ModelCommitOutcome, ModelOperation, ModelTransaction, MvccPruneBudget,
+    MvccRuntime, SerializableMvccModel, SnapshotRegistration, generate_model_schedules,
 };
+#[cfg(feature = "transaction-mvcc")]
+use super::mvcc::{CommitState, MvccCommitTestHook};
 #[cfg(feature = "transaction-mvcc")]
 use super::visibility::SelectedTransactionVisibility;
 #[cfg(feature = "transaction-mvcc")]
@@ -35,6 +28,25 @@ use super::visibility::TransactionVisibility;
 use super::*;
 use crate::runtime::store::AsStoreOpaque;
 use alloc::sync::Arc;
+
+#[cfg(feature = "transaction-mvcc")]
+fn assert_mvcc_selected_policy_released(
+    runtime: &TransactionRegionRuntime,
+    transaction: TransactionId,
+) {
+    assert_eq!(
+        runtime
+            .selected_policy_read_granules_for_test(transaction)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+    assert_eq!(
+        runtime
+            .selected_policy_write_granules_for_test(transaction)
+            .unwrap(),
+        Vec::<GranuleId>::new()
+    );
+}
 
 #[test]
 #[cfg(feature = "transaction-mvcc")]
@@ -733,10 +745,7 @@ fn mvcc_gc_policy_callback_errors_release_both_permits_for_all_entries() {
     assert_eq!(*calls.lock().unwrap(), all_persistent_gc_policy_calls());
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 #[test]
 fn mvcc_gc_policy_rebases_before_callback_and_sees_only_current_object_slots() {
     let mut state = TransactionState::default();
@@ -785,10 +794,7 @@ fn mvcc_gc_policy_rebases_before_callback_and_sees_only_current_object_slots() {
     assert_eq!(callback_count.load(std::sync::atomic::Ordering::Relaxed), 4);
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 #[test]
 fn mvcc_gc_policy_current_state_mode_still_rebases_before_callback() {
     let mut state = TransactionState::default();
@@ -1458,10 +1464,7 @@ fn mvcc_certification_granule(granule_index: u64) -> GranuleId {
     }
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_install_committed_memory_version(
     visibility: &MvccRuntime,
     granule: GranuleId,
@@ -1476,10 +1479,7 @@ fn mvcc_certification_install_committed_memory_version(
     commit.commit(timestamp).unwrap();
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_commit_memory(runtime: &MvccRuntime, granule: GranuleId, value: u8) -> u64 {
     let (commit, mut pending) = runtime.begin_pending_commit().unwrap();
     let mut prepare = runtime.begin_prepare(commit).unwrap();
@@ -1490,10 +1490,7 @@ fn mvcc_gc_commit_memory(runtime: &MvccRuntime, granule: GranuleId, value: u8) -
     pending.publish().unwrap()
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_commit_six_domains(runtime: &MvccRuntime, objects: &mut ObjectTable) -> (u64, ObjectId) {
     let memory = GranuleId::TMemory {
         instance: Some(7),
@@ -1553,10 +1550,7 @@ fn mvcc_gc_commit_six_domains(runtime: &MvccRuntime, objects: &mut ObjectTable) 
     (pending.publish().unwrap(), object)
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_commit_object(
     runtime: &MvccRuntime,
     object: ObjectId,
@@ -1573,10 +1567,7 @@ fn mvcc_gc_commit_object(
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_admitted_barrier_rejects_snapshots_and_pending_registration() {
     let visibility = SelectedTransactionVisibility::default();
     let barrier = visibility.begin_gc_barrier_for_test().unwrap();
@@ -1601,10 +1592,7 @@ fn mvcc_gc_admitted_barrier_rejects_snapshots_and_pending_registration() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_no_active_capture_keeps_snapshot_racing_before_domain_prune() {
     let runtime = Arc::new(MvccRuntime::default());
     let visibility = SelectedTransactionVisibility::new(runtime.clone());
@@ -1631,10 +1619,7 @@ fn mvcc_gc_no_active_capture_keeps_snapshot_racing_before_domain_prune() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_opportunistic_prune_retains_aborted_object_until_rollback_cleanup() {
     let runtime = Arc::new(MvccRuntime::default());
     let visibility = SelectedTransactionVisibility::new(runtime.clone());
@@ -1672,10 +1657,7 @@ fn mvcc_gc_opportunistic_prune_retains_aborted_object_until_rollback_cleanup() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_active_horizon_retains_one_predecessor_and_every_newer_commit() {
     let runtime = Arc::new(MvccRuntime::default());
     let visibility = SelectedTransactionVisibility::new(runtime.clone());
@@ -1714,10 +1696,7 @@ fn mvcc_gc_active_horizon_retains_one_predecessor_and_every_newer_commit() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_budget_is_bounded_and_round_robin_visits_all_six_tables_then_wraps() {
     let runtime = MvccRuntime::default();
     let mut objects = ObjectTable::default();
@@ -1744,10 +1723,7 @@ fn mvcc_gc_budget_is_bounded_and_round_robin_visits_all_six_tables_then_wraps() 
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_exact_barrier_rebase_exposes_objects_then_clears_cursors_and_advances_baseline() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -1790,10 +1766,7 @@ fn mvcc_gc_exact_barrier_rebase_exposes_objects_then_clears_cursors_and_advances
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_barrier_rebase_purges_residual_aborted_only_object_chain() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -1822,10 +1795,7 @@ fn mvcc_gc_barrier_rebase_purges_residual_aborted_only_object_chain() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_object_validation_rejects_payload_equal_volatile_slot() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -1858,10 +1828,7 @@ fn mvcc_gc_object_validation_rejects_payload_equal_volatile_slot() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_object_validation_rejects_payload_mismatch_without_mutation() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -1909,10 +1876,7 @@ fn mvcc_gc_object_validation_rejects_payload_mismatch_without_mutation() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_object_validation_requires_aborted_only_new_object_to_be_absent() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -1952,10 +1916,7 @@ fn mvcc_gc_object_validation_requires_aborted_only_new_object_to_be_absent() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_rebase_rejects_validated_token_from_a_prior_barrier_epoch() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -2001,10 +1962,7 @@ fn mvcc_gc_rebase_rejects_validated_token_from_a_prior_barrier_epoch() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_rebase_rejects_validated_token_from_another_coordinator() {
     let first = SelectedTransactionVisibility::default();
     let second = SelectedTransactionVisibility::default();
@@ -2041,10 +1999,7 @@ fn mvcc_gc_rebase_rejects_validated_token_from_another_coordinator() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_rebase_revalidates_object_sidecars_after_current_object_validation() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -2091,10 +2046,7 @@ fn mvcc_gc_rebase_revalidates_object_sidecars_after_current_object_validation() 
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_rebase_rejects_second_validated_token_after_baseline_changes() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -2133,10 +2085,7 @@ fn mvcc_gc_rebase_rejects_second_validated_token_after_baseline_changes() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_rebase_rejects_barrier_from_another_coordinator() {
     let first = SelectedTransactionVisibility::default();
     let second = SelectedTransactionVisibility::default();
@@ -2159,10 +2108,7 @@ fn mvcc_gc_rebase_rejects_barrier_from_another_coordinator() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_metadata_tracks_oldest_active_visible_and_baseline() {
     let runtime = Arc::new(MvccRuntime::default());
     let visibility = SelectedTransactionVisibility::new(runtime.clone());
@@ -2190,10 +2136,7 @@ fn mvcc_gc_metadata_tracks_oldest_active_visible_and_baseline() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_full_rebase_rejects_an_unregistered_pending_chain() {
     let visibility = SelectedTransactionVisibility::default();
     let runtime = visibility.runtime();
@@ -2218,10 +2161,7 @@ fn mvcc_gc_full_rebase_rejects_an_unregistered_pending_chain() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_successful_finish_runs_best_effort_pruning_but_failed_finish_does_not() {
     let runtime = Arc::new(MvccRuntime::default());
     let visibility = SelectedTransactionVisibility::new(runtime.clone());
@@ -2252,10 +2192,7 @@ fn mvcc_gc_successful_finish_runs_best_effort_pruning_but_failed_finish_does_not
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_gc_rebase_holds_coordinator_before_waiting_for_domains() {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
@@ -2320,10 +2257,7 @@ fn mvcc_gc_rebase_holds_coordinator_before_waiting_for_domains() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_prepare_read_only_skips_certification_and_pending_record() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -2336,6 +2270,7 @@ fn mvcc_commit_prepare_read_only_skips_certification_and_pending_record() {
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let mut store = crate::Store::new(&engine, ());
     store.set_transaction_region_runtime_for_test(runtime.clone());
     let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
@@ -2356,13 +2291,11 @@ fn mvcc_commit_prepare_read_only_skips_certification_and_pending_record() {
         runtime.mvcc_certification_counts_for_test().unwrap(),
         (0, 0)
     );
+    assert_mvcc_selected_policy_released(&runtime, transaction);
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_pre_lp_memory_install_restores_predecessor_and_aborts_record() {
     use std::time::Duration;
 
@@ -2379,6 +2312,7 @@ fn mvcc_commit_fault_pre_lp_memory_install_restores_predecessor_and_aborts_recor
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let visibility = runtime.visibility_for_test();
     let fail_after_memory_install = Arc::new(MvccCommitTestHook::new_with_timeout_for_test(
         1,
@@ -2443,13 +2377,11 @@ fn mvcc_commit_fault_pre_lp_memory_install_restores_predecessor_and_aborts_recor
         visibility.snapshot_lifecycle_counts_for_test().unwrap(),
         (0, 2, 2, 0)
     );
+    assert_mvcc_selected_policy_released(&runtime, transaction);
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_post_lp_cleanup_error_force_completes_and_reports_durable_commit() {
     use std::time::Duration;
 
@@ -2470,6 +2402,7 @@ fn mvcc_commit_fault_post_lp_cleanup_error_force_completes_and_reports_durable_c
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let visibility = runtime.visibility_for_test();
     let fail_after_record_transition = Arc::new(MvccCommitTestHook::new_with_timeout_for_test(
         1,
@@ -2518,14 +2451,12 @@ fn mvcc_commit_fault_post_lp_cleanup_error_force_completes_and_reports_durable_c
         visibility.snapshot_lifecycle_counts_for_test().unwrap(),
         (0, 2, 2, 0)
     );
+    assert_mvcc_selected_policy_released(&runtime, transaction);
     clear_current_thread_transaction_for_test();
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_genuine_cleanup_failure_does_not_retain_inactive_terminal_state() {
     clear_current_thread_transaction_for_test();
     let dir = tempfile::tempdir().unwrap();
@@ -2544,10 +2475,11 @@ fn mvcc_commit_fault_genuine_cleanup_failure_does_not_retain_inactive_terminal_s
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let visibility = runtime.visibility_for_test();
     visibility.fail_finish_snapshot_once_for_test().unwrap();
     let mut store = crate::Store::new(&engine, ());
-    store.set_transaction_region_runtime_for_test(runtime);
+    store.set_transaction_region_runtime_for_test(runtime.clone());
     store
         .transaction_create_file_backed_storage_for_test(tmemory_path, tx_log_path, 64)
         .unwrap();
@@ -2567,15 +2499,13 @@ fn mvcc_commit_fault_genuine_cleanup_failure_does_not_retain_inactive_terminal_s
     );
     assert_eq!(store.transaction_state().active_transaction(), None);
     assert!(!store.transaction_state().has_mvcc_terminal_commit());
+    assert_mvcc_selected_policy_released(&runtime, transaction);
     assert_eq!(read.call(&mut store, ()).unwrap(), 13);
     clear_current_thread_transaction_for_test();
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_markerless_cleanup_reports_irrevocable_not_durable() {
     use std::time::Duration;
 
@@ -2592,6 +2522,7 @@ fn mvcc_commit_fault_markerless_cleanup_reports_irrevocable_not_durable() {
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let visibility = runtime.visibility_for_test();
     visibility
         .runtime()
@@ -2605,7 +2536,7 @@ fn mvcc_commit_fault_markerless_cleanup_reports_irrevocable_not_durable() {
         )
         .unwrap();
     let mut store = crate::Store::new(&engine, ());
-    store.set_transaction_region_runtime_for_test(runtime);
+    store.set_transaction_region_runtime_for_test(runtime.clone());
     let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
 
     let error = format!(
@@ -2621,6 +2552,7 @@ fn mvcc_commit_fault_markerless_cleanup_reports_irrevocable_not_durable() {
         "{error}"
     );
     assert!(!error.contains("committed durably"), "{error}");
+    assert_mvcc_selected_policy_released(&runtime, transaction);
     assert_eq!(
         instance
             .get_typed_func::<(), i32>(&mut store, "read")
@@ -2632,10 +2564,7 @@ fn mvcc_commit_fault_markerless_cleanup_reports_irrevocable_not_durable() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_markerless_vmemory_record_publication_failure_rolls_back() {
     clear_current_thread_transaction_for_test();
     let engine = crate::Engine::default();
@@ -2651,6 +2580,7 @@ fn mvcc_commit_fault_markerless_vmemory_record_publication_failure_rolls_back() 
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let visibility = runtime.visibility_for_test();
     visibility
         .runtime()
@@ -2733,6 +2663,7 @@ fn mvcc_commit_fault_markerless_vmemory_record_publication_failure_rolls_back() 
         visibility.snapshot_lifecycle_counts_for_test().unwrap(),
         (0, 1, 1, 0)
     );
+    assert_mvcc_selected_policy_released(&runtime, transaction);
     drop(visibility.begin_gc_barrier_for_test().unwrap());
     drop(runtime.begin_persistent_gc_for_test().unwrap());
 
@@ -2748,10 +2679,7 @@ fn mvcc_commit_fault_markerless_vmemory_record_publication_failure_rolls_back() 
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_retained_terminal_freezes_staging_until_retry() {
     clear_current_thread_transaction_for_test();
     let mut config = crate::Config::new();
@@ -2770,6 +2698,7 @@ fn mvcc_commit_fault_retained_terminal_freezes_staging_until_retry() {
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let visibility = runtime.visibility_for_test();
     visibility
         .runtime()
@@ -2807,6 +2736,7 @@ fn mvcc_commit_fault_retained_terminal_freezes_staging_until_retry() {
         .call(&mut store, ())
         .unwrap();
     assert!(!store.transaction_state().has_mvcc_terminal_commit());
+    assert_mvcc_selected_policy_released(&runtime, transaction);
     assert!(runtime.begin_persistent_gc_for_test().is_ok());
     assert!(matches!(
         visibility
@@ -2821,10 +2751,7 @@ fn mvcc_commit_fault_retained_terminal_freezes_staging_until_retry() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_rollback_failure_retains_progress_for_explicit_retry() {
     use crate::Ref;
 
@@ -2849,6 +2776,7 @@ fn mvcc_commit_fault_rollback_failure_retains_progress_for_explicit_retry() {
         "#,
     );
     let runtime = TransactionRegionRuntime::new_for_test();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let visibility = runtime.visibility_for_test();
     visibility
         .runtime()
@@ -2943,15 +2871,13 @@ fn mvcc_commit_fault_rollback_failure_retains_progress_for_explicit_retry() {
         visibility.snapshot_lifecycle_counts_for_test().unwrap(),
         (0, 2, 2, 0)
     );
+    assert_mvcc_selected_policy_released(&runtime, transaction);
     drop(visibility.begin_gc_barrier_for_test().unwrap());
     drop(runtime.begin_persistent_gc_for_test().unwrap());
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_host_selected_commit_drives_retained_retry() {
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
@@ -3036,6 +2962,7 @@ fn mvcc_commit_fault_host_selected_commit_drives_retained_retry() {
     );
     drop(errors);
     assert!(!store.transaction_state().transaction_is_open(selected));
+    assert_mvcc_selected_policy_released(&runtime, selected);
     assert!(matches!(
         instance
             .get_global(&mut store, "g")
@@ -3054,10 +2981,7 @@ fn mvcc_commit_fault_host_selected_commit_drives_retained_retry() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_abortable_cut_points_restore_mixed_domain_predecessors() {
     use crate::Ref;
 
@@ -3096,6 +3020,7 @@ fn mvcc_commit_fault_abortable_cut_points_restore_mixed_domain_predecessors() {
             "#,
         );
         let runtime = TransactionRegionRuntime::new_for_test();
+        let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
         let visibility = runtime.visibility_for_test();
         visibility
             .runtime()
@@ -3236,6 +3161,7 @@ fn mvcc_commit_fault_abortable_cut_points_restore_mixed_domain_predecessors() {
             (0, 1, 1, 0),
             "{point:?}"
         );
+        assert_mvcc_selected_policy_released(&runtime, transaction);
         drop(visibility.begin_gc_barrier_for_test().unwrap());
         drop(runtime.begin_persistent_gc_for_test().unwrap());
         assert_eq!(
@@ -3262,10 +3188,7 @@ fn mvcc_commit_fault_abortable_cut_points_restore_mixed_domain_predecessors() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_durable_pre_lp_cut_points_abort_without_leaking_publications() {
     for point in [Some(MvccCommitFaultPoint::AfterDurablePublication), None] {
         clear_current_thread_transaction_for_test();
@@ -3291,6 +3214,7 @@ fn mvcc_commit_fault_durable_pre_lp_cut_points_abort_without_leaking_publication
             "#,
         );
         let runtime = TransactionRegionRuntime::new_for_test();
+        let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
         let visibility = runtime.visibility_for_test();
         let mut store = crate::Store::new(&engine, ());
         store.set_transaction_region_runtime_for_test(runtime.clone());
@@ -3412,6 +3336,7 @@ fn mvcc_commit_fault_durable_pre_lp_cut_points_abort_without_leaking_publication
             (0, 1, 1, 0),
             "{point:?}"
         );
+        assert_mvcc_selected_policy_released(&runtime, transaction);
         drop(visibility.begin_gc_barrier_for_test().unwrap());
         drop(runtime.begin_persistent_gc_for_test().unwrap());
         assert_eq!(
@@ -3428,10 +3353,7 @@ fn mvcc_commit_fault_durable_pre_lp_cut_points_abort_without_leaking_publication
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_fault_post_lp_cut_points_force_complete_all_domains() {
     use crate::Ref;
 
@@ -3486,6 +3408,7 @@ fn mvcc_commit_fault_post_lp_cut_points_force_complete_all_domains() {
             "#,
         );
         let runtime = TransactionRegionRuntime::new_for_test();
+        let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
         let visibility = runtime.visibility_for_test();
         visibility
             .runtime()
@@ -3617,6 +3540,7 @@ fn mvcc_commit_fault_post_lp_cut_points_force_complete_all_domains() {
             (0, 3, 3, 0),
             "{point:?}"
         );
+        assert_mvcc_selected_policy_released(&runtime, transaction);
         drop(visibility.begin_gc_barrier_for_test().unwrap());
         drop(runtime.begin_persistent_gc_for_test().unwrap());
         clear_current_thread_transaction_for_test();
@@ -3624,10 +3548,7 @@ fn mvcc_commit_fault_post_lp_cut_points_force_complete_all_domains() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_prepare_unpromoted_volatile_object_creates_no_sidecar_chain() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);
@@ -3668,10 +3589,7 @@ fn mvcc_commit_prepare_unpromoted_volatile_object_creates_no_sidecar_chain() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_prepare_writer_certifies_union_and_shares_one_record() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -3771,11 +3689,8 @@ fn mvcc_commit_prepare_writer_certifies_union_and_shares_one_record() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
-fn mvcc_commit_prepare_transition_is_atomic_and_keeps_latches() {
+#[cfg(feature = "transaction-mvcc")]
+fn mvcc_commit_prepare_transition_is_atomic_and_keeps_terminal_reservations() {
     use std::time::Duration;
 
     let engine = crate::Engine::default();
@@ -3785,10 +3700,12 @@ fn mvcc_commit_prepare_transition_is_atomic_and_keeps_latches() {
             (module
               (tmemory 1)
               (tglobal $g (mut i32) (i32.const 3))
+              (tglobal $read-only (mut i32) (i32.const 5))
               (func $target)
               (elem declare func $target)
               (ttable $t 1 funcref)
               (tfunc (export "write")
+                (drop (tglobal.get $read-only))
                 (i32.tstore (i32.const 0) (i32.const 2))
                 (tglobal.set $g (i32.const 4))
                 (ttable.set $t (i32.const 0) (ref.func $target))))
@@ -3806,6 +3723,7 @@ fn mvcc_commit_prepare_transition_is_atomic_and_keeps_latches() {
     store.set_transaction_region_runtime_for_test(runtime.clone());
     let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
     let owner = instance.id().as_u32();
+    let transaction = TransactionId::from_raw(runtime.next_transaction_id_for_test());
     let write = instance
         .get_typed_func::<(), ()>(&mut store, "write")
         .unwrap();
@@ -3830,6 +3748,24 @@ fn mvcc_commit_prepare_transition_is_atomic_and_keeps_latches() {
         table_index: 0,
         granule_index: 0,
     };
+    let read_only = GranuleId::TGlobal {
+        instance: Some(owner),
+        global_index: 1,
+    };
+    let selected_writes = runtime
+        .selected_policy_write_granules_for_test(transaction)
+        .unwrap();
+    assert_eq!(selected_writes.len(), 3);
+    for granule in [memory, global, table] {
+        assert!(selected_writes.contains(&granule), "missing {granule:?}");
+    }
+    assert!(!selected_writes.contains(&read_only));
+    assert!(
+        !runtime
+            .selected_policy_read_granules_for_test(transaction)
+            .unwrap()
+            .contains(&read_only)
+    );
     assert_eq!(
         visibility
             .runtime()
@@ -3859,6 +3795,13 @@ fn mvcc_commit_prepare_transition_is_atomic_and_keeps_latches() {
         runtime.mvcc_certification_counts_for_test().unwrap(),
         (1, 1)
     );
+    let selected_writes = runtime
+        .selected_policy_write_granules_for_test(transaction)
+        .unwrap();
+    assert_eq!(selected_writes.len(), 3);
+    for granule in [memory, global, table] {
+        assert!(selected_writes.contains(&granule), "missing {granule:?}");
+    }
     assert_eq!(
         visibility
             .runtime()
@@ -3887,13 +3830,11 @@ fn mvcc_commit_prepare_transition_is_atomic_and_keeps_latches() {
         runtime.mvcc_certification_counts_for_test().unwrap(),
         (1, 0)
     );
+    assert_mvcc_selected_policy_released(&runtime, transaction);
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_prepare_disjoint_installations_overlap() {
     use std::time::Duration;
 
@@ -3949,10 +3890,7 @@ fn mvcc_commit_prepare_disjoint_installations_overlap() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_prepare_collects_physical_predecessors_without_domain_lock() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -4009,10 +3947,7 @@ fn mvcc_commit_prepare_collects_physical_predecessors_without_domain_lock() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_assigns_shared_reads_and_exclusive_writes() {
     let policy = ConcurrencyControlState::default();
     let transaction = TransactionId::from_raw(1);
@@ -4053,10 +3988,7 @@ fn mvcc_certification_lifecycle_is_available_for_selected_cc() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_shared_and_disjoint_reservations_coexist() {
     let authority = Arc::new(MvccCertificationAuthority::default());
     let shared = mvcc_certification_granule(0);
@@ -4099,10 +4031,7 @@ fn mvcc_certification_shared_and_disjoint_reservations_coexist() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_shared_exclusive_waits_until_shared_drops() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -4149,10 +4078,7 @@ fn mvcc_certification_shared_exclusive_waits_until_shared_drops() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_exclusive_exclusive_waits_until_permit_drops() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -4192,10 +4118,7 @@ fn mvcc_certification_exclusive_exclusive_waits_until_permit_drops() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_reserves_complete_sorted_set_without_partial_deadlock() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -4262,10 +4185,7 @@ fn mvcc_certification_reserves_complete_sorted_set_without_partial_deadlock() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_write_skew_access_sets_do_not_overlap() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -4303,10 +4223,7 @@ fn mvcc_certification_write_skew_access_sets_do_not_overlap() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_certification_validates_read_and_blind_write_union_after_reservation() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -4793,7 +4710,8 @@ fn mvcc_serializable_assert_one_commit_one_conflict(outcomes: &[std::result::Res
         conflicts[0].contains("transaction MVCC certification conflict")
             || conflicts[0].contains("transaction read conflict")
             || conflicts[0].contains("transaction write conflict")
-            || conflicts[0].contains("transaction conflict would wait"),
+            || conflicts[0].contains("transaction conflict would wait")
+            || conflicts[0].contains("transaction was conflict-aborted by another transaction"),
         "unexpected serializable MVCC conflict: {}",
         conflicts[0]
     );
@@ -5379,10 +5297,7 @@ fn mvcc_serializable_disjoint_writers_overlap_terminal_publication() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_reader_never_mixes_pending_commit_domains() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -5545,10 +5460,7 @@ fn mvcc_serializable_reader_never_mixes_pending_commit_domains() {
     clear_current_thread_transaction_for_test();
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 #[derive(Debug)]
 struct RealModelTransaction {
     id: TransactionId,
@@ -5560,10 +5472,7 @@ struct RealModelTransaction {
     operations: Vec<ObservedModelOperation>,
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 #[derive(Clone, Debug)]
 enum ObservedModelOperation {
     Read {
@@ -5577,10 +5486,7 @@ enum ObservedModelOperation {
     },
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 #[derive(Clone, Debug)]
 struct ObservedModelTransaction {
     snapshot: u64,
@@ -5590,10 +5496,7 @@ struct ObservedModelTransaction {
     outcome: ModelCommitOutcome,
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 #[derive(Clone, Copy, Debug, Default)]
 struct ModelScheduleCoverage {
     conflicts: usize,
@@ -5602,10 +5505,7 @@ struct ModelScheduleCoverage {
     read_your_own_write_reads: usize,
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 impl ModelScheduleCoverage {
     fn add(&mut self, other: Self) {
         self.conflicts += other.conflicts;
@@ -5615,20 +5515,14 @@ impl ModelScheduleCoverage {
     }
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_model_bytes(value: i64) -> Vec<u8> {
     let mut bytes = vec![0; TMEMORY_GRANULE_SIZE];
     bytes[..8].copy_from_slice(&value.to_le_bytes());
     bytes
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_model_value(bytes: &[u8]) -> Result<i64> {
     Ok(i64::from_le_bytes(
         bytes
@@ -5639,10 +5533,7 @@ fn mvcc_serializable_model_value(bytes: &[u8]) -> Result<i64> {
     ))
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_replay_accepted_transaction(
     model: &mut SerializableMvccModel,
     observed: &ObservedModelTransaction,
@@ -5685,10 +5576,7 @@ fn mvcc_serializable_replay_accepted_transaction(
     Ok(())
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_compare_model_schedule(
     operations: &[ModelOperation],
 ) -> Result<ModelScheduleCoverage> {
@@ -6010,10 +5898,7 @@ fn mvcc_serializable_compare_model_schedule(
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_serializable_fixed_seed_model_matches_runtime() {
     const CASES_PER_SEED: usize = 24;
     const SEEDS: [u64; 2] = [0x5eed_cafe_d00d_f00d, 0xc001_d00d_1234_5678];
@@ -6043,10 +5928,7 @@ fn mvcc_serializable_fixed_seed_model_matches_runtime() {
     );
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_install_committed_payload(
     runtime: &MvccRuntime,
     objects: &mut ObjectTable,
@@ -6067,10 +5949,7 @@ fn mvcc_object_install_committed_payload(
         .unwrap();
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_prepare_promoted_payloads(
     runtime: &MvccRuntime,
     commit: Arc<CommitRecord>,
@@ -6135,10 +6014,7 @@ fn mvcc_object_mapped_directory_entry(
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_struct_payload_remains_stable_after_newer_commit() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -6185,10 +6061,7 @@ fn mvcc_object_struct_payload_remains_stable_after_newer_commit() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_array_payload_remains_stable_and_staged_element_is_first() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -6232,10 +6105,7 @@ fn mvcc_object_array_payload_remains_stable_and_staged_element_is_first() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_history_keeps_one_current_slot_and_live_object() {
     let runtime = MvccRuntime::default();
     let mut objects = ObjectTable::default();
@@ -6283,10 +6153,7 @@ fn mvcc_object_history_keeps_one_current_slot_and_live_object() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_created_after_snapshot_is_missing() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -6356,10 +6223,7 @@ fn mvcc_object_read_materializes_remote_shared_entry_before_metadata() -> Result
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_volatile_id_reuse_bypasses_stale_sidecar_chain() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -6391,10 +6255,7 @@ fn mvcc_object_volatile_id_reuse_bypasses_stale_sidecar_chain() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_absent_logical_id_reports_snapshot_missing() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -6470,10 +6331,7 @@ fn mvcc_object_shared_install_rejects_local_update_and_refreshes_newer_directory
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_prepare_transaction_local_promotion_is_pending_only() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -6529,10 +6387,7 @@ fn mvcc_commit_prepare_transaction_local_promotion_is_pending_only() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_commit_prepare_transaction_local_promotions_share_one_record() {
     clear_current_thread_transaction_for_test();
     let runtime = TransactionRegionRuntime::new_for_test();
@@ -6620,10 +6475,7 @@ fn mvcc_commit_prepare_transaction_local_promotions_share_one_record() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_object_gc_traces_only_current_object_table_payloads() {
     let runtime = MvccRuntime::default();
     let mut objects = ObjectTable::default();
@@ -6714,10 +6566,7 @@ fn mvcc_object_current_snapshot_refreshes_shared_directory() -> Result<()> {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_repeated_tmemory_loads_remain_stable() {
     use crate::AsContextMut;
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -6800,10 +6649,7 @@ fn mvcc_visibility_repeated_tmemory_loads_remain_stable() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_partial_and_cross_granule_tmemory_stores_use_one_snapshot() {
     use crate::AsContextMut;
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -6906,10 +6752,7 @@ fn mvcc_visibility_partial_and_cross_granule_tmemory_stores_use_one_snapshot() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_tmemory_size_controls_bounds_and_staged_growth() {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -7003,10 +6846,7 @@ fn mvcc_visibility_tmemory_size_controls_bounds_and_staged_growth() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_tmemory_staged_growth_reads_zero_then_staged_overlay() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7080,10 +6920,7 @@ fn mvcc_visibility_tmemory_staged_growth_reads_zero_then_staged_overlay() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_tglobal_reads_snapshot_and_staged_value_first() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7154,10 +6991,7 @@ fn mvcc_visibility_tglobal_reads_snapshot_and_staged_value_first() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_tglobal_reference_snapshot_is_stable() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7229,10 +7063,7 @@ fn mvcc_visibility_tglobal_reference_snapshot_is_stable() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_reads_complete_granule_and_snapshot_size_for_growth() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7321,10 +7152,7 @@ fn mvcc_visibility_ttable_reads_complete_granule_and_snapshot_size_for_growth() 
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_nonzero_granule_offset_selects_requested_element() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7402,10 +7230,7 @@ fn mvcc_visibility_ttable_nonzero_granule_offset_selects_requested_element() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_historical_gc_ref_becomes_usable_transaction_handle() {
     use crate::AsContextMut;
     use crate::runtime::vm::VMStore;
@@ -7527,10 +7352,7 @@ fn mvcc_visibility_ttable_historical_gc_ref_becomes_usable_transaction_handle() 
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_staged_growth_keeps_snapshot_granule_truncation() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -7559,10 +7381,7 @@ fn mvcc_visibility_ttable_staged_growth_keeps_snapshot_granule_truncation() {
     store.transaction_state_mut().abort().unwrap();
 }
 
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_assert_malformed_table_history_is_rejected(
     table_size: u64,
     index: u64,
@@ -7639,28 +7458,19 @@ fn mvcc_visibility_assert_malformed_table_history_is_rejected(
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_rejects_hole_in_full_granule_payload() {
     mvcc_visibility_assert_malformed_table_history_is_rejected(17, 0, 0, 15, 16);
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_rejects_oversized_edge_granule_payload() {
     mvcc_visibility_assert_malformed_table_history_is_rejected(17, 16, 1, 2, 1);
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_fill_copy_and_ranges_record_data_and_size_granules() {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -7783,10 +7593,7 @@ fn mvcc_visibility_ttable_fill_copy_and_ranges_record_data_and_size_granules() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_ranges_handle_zero_exact_boundary_and_overflow() {
     let mut state = TransactionState::new_for_test(TransactionId::from_raw(9001));
     state.acquire_table_size_read_owned(None, 7, 0).unwrap();
@@ -7854,10 +7661,7 @@ fn mvcc_visibility_ttable_ranges_handle_zero_exact_boundary_and_overflow() {
 }
 
 #[test]
-#[cfg(all(
-    feature = "transaction-mvcc",
-    feature = "transaction-cc-optimistic-validation"
-))]
+#[cfg(feature = "transaction-mvcc")]
 fn mvcc_visibility_ttable_oob_range_traps_before_data_granules() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
