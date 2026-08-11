@@ -37,3 +37,5 @@ testcase*.json
 perf.data*
 miri-wast/
 report/
+/check_cpuid
+/check_matches
