@@ -419,6 +419,42 @@ fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<(
     result
 }
 
+fn transaction_commit_structured(store: &mut dyn VMStore, instance: InstanceId) -> Result<u32> {
+    const CONFLICT_MARKERS: &[&str] = &[
+        "transaction read conflict",
+        "transaction write conflict",
+        "transaction conflict would wait",
+        "transaction was conflict-aborted",
+        "transaction MVCC certification conflict",
+    ];
+
+    let result = transaction_commit_impl(store, instance);
+    let conflict = result.as_ref().is_err_and(|error| {
+        let mut conflict = false;
+        for cause in error.chain() {
+            let message = cause.to_string();
+            if message.contains("failed to abort") {
+                return false;
+            }
+            conflict |= CONFLICT_MARKERS
+                .iter()
+                .any(|marker| message.contains(marker));
+        }
+        conflict
+    });
+    let cleanup = abort_active_transaction_on_error(store, &result);
+    if conflict {
+        cleanup.context("failed to abort structured transaction after commit conflict")?;
+        return Ok(1);
+    }
+    combine_operation_and_cleanup_results(
+        result,
+        cleanup,
+        "failed to abort structured transaction after commit failure",
+    )?;
+    Ok(0)
+}
+
 pub(crate) fn transaction_commit_selected_for_host(
     store: &mut dyn VMStore,
     instance: InstanceId,

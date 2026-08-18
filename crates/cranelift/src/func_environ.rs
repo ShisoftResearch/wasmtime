@@ -5231,10 +5231,28 @@ impl FuncEnvironment<'_> {
 
         builder.switch_to_block(commit);
         builder.seal_block(commit);
-        self.translate_transaction_lifecycle_builtin(
-            builder,
-            BuiltinFunctionIndex::transaction_commit(),
-        )?;
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_commit_structured(),
+        );
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let call = builder.ins().call(callee, &[vmctx]);
+        let status = builder.func.dfg.inst_results(call)[0];
+        let conflicted = builder.ins().icmp_imm_s(IntCC::NotEqual, status, 0);
+        let conflict = builder.create_block();
+        let committed = builder.create_block();
+        builder
+            .ins()
+            .brif(conflicted, conflict, &[], committed, &[]);
+
+        builder.switch_to_block(conflict);
+        builder.seal_block(conflict);
+        let code = builder.ins().iconst(I32, 0);
+        self.translate_transaction_failure_transfer(builder, code)?;
+
+        builder.switch_to_block(committed);
+        builder.seal_block(committed);
+        self.stacks.reachable = true;
         let began_var = self.ensure_transaction_began_in_function_var(builder);
         let zero = builder.ins().iconst(I8, 0);
         builder.def_var(began_var, zero);

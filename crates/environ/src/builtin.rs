@@ -199,6 +199,10 @@ macro_rules! foreach_builtin_function {
             transaction_ttry_end(vmctx: vmctx) -> bool;
             // Commits a transactional WebAssembly transaction.
             transaction_commit(vmctx: vmctx) -> bool;
+            // Commits an owning structured transaction, returning one for a
+            // transaction conflict that must enter the owner's handler and
+            // zero for success. Other failures trap.
+            transaction_commit_structured(vmctx: vmctx) -> u64;
             // Fails and aborts a transactional WebAssembly transaction.
             transaction_fail(vmctx: vmctx) -> bool;
             // Fails and aborts a transactional WebAssembly transaction with a structured code.
@@ -515,6 +519,7 @@ impl BuiltinFunctionIndex {
             (@get get_interned_func_ref pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_enter_tfunc u64) => (TrapSentinel::NegativeOne);
             (@get transaction_enter_tblock u64) => (TrapSentinel::NegativeOne);
+            (@get transaction_commit_structured u64) => (TrapSentinel::NegativeOne);
             (@get transaction_transfer_tfunc_ownership bool) => (TrapSentinel::Falsy);
             (@get transaction_start_tfunc_tail bool) => (TrapSentinel::Falsy);
             (@get transaction_claim_tfunc_tail u64) => (TrapSentinel::NegativeOne);

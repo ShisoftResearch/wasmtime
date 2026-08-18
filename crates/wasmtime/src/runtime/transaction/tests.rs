@@ -4460,6 +4460,203 @@ fn single_version_tfunc_certification_prevents_write_skew() {
 #[cfg(all(
     unix,
     has_virtual_memory,
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
+))]
+fn single_version_tblock_commit_conflicts_route_all_exits_to_handler() {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn run(exit_name: &str, exit: &str) {
+        clear_current_thread_transaction_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = TransactionRegionRuntime::create_file_backed_for_test(
+            &dir.path().join("tmemory.bin"),
+            &dir.path().join("tx-log.bin"),
+            64,
+        )
+        .unwrap();
+        let engine = crate::Engine::default();
+        let module = transaction_test_module(
+            &engine,
+            &format!(
+                r#"
+                    (module
+                      (import "host" "sync" (tfunc $sync))
+                      (tmemory 1)
+                      (func (export "conflict-a") (result i32)
+                        (local $seen i64)
+                        (tblock $done (result i32)
+                          ((local.set $seen (i64.tload (i32.const 64)))
+                           (tcall $sync)
+                           (i64.tstore
+                             (i32.const 0)
+                             (i64.add (local.get $seen) (i64.const 1)))
+                           {exit})
+                          (else)))
+                      (func (export "conflict-b") (result i32)
+                        (local $seen i64)
+                        (tblock $done (result i32)
+                          ((local.set $seen (i64.tload (i32.const 0)))
+                           (tcall $sync)
+                           (i64.tstore
+                             (i32.const 64)
+                             (i64.add (local.get $seen) (i64.const 1)))
+                           {exit})
+                          (else))))
+                "#,
+            ),
+        );
+
+        let read_gate = Arc::new(super::region_runtime::TransactionTestGate::new(2));
+        let second_exit_gate = Arc::new(super::region_runtime::TransactionTestGate::new(1));
+
+        let mut first_linker = crate::Linker::new(&engine);
+        let first_read_gate = read_gate.clone();
+        first_linker
+            .func_wrap("host", "sync", move || first_read_gate.wait())
+            .unwrap();
+        let mut first_store = crate::Store::new(&engine, ());
+        first_store.set_transaction_region_runtime_for_test(runtime.clone());
+        let first_instance = first_linker.instantiate(&mut first_store, &module).unwrap();
+        let first = first_instance
+            .get_typed_func::<(), i32>(&mut first_store, "conflict-a")
+            .unwrap();
+
+        let mut second_linker = crate::Linker::new(&engine);
+        let second_read_gate = read_gate.clone();
+        let second_worker_exit_gate = second_exit_gate.clone();
+        second_linker
+            .func_wrap("host", "sync", move || {
+                second_read_gate.wait()?;
+                second_worker_exit_gate.wait()
+            })
+            .unwrap();
+        let mut second_store = crate::Store::new(&engine, ());
+        second_store.set_transaction_region_runtime_for_test(runtime.clone());
+        let second_instance = second_linker
+            .instantiate(&mut second_store, &module)
+            .unwrap();
+        let second = second_instance
+            .get_typed_func::<(), i32>(&mut second_store, "conflict-b")
+            .unwrap();
+
+        let (outcome_tx, outcome_rx) = mpsc::sync_channel(2);
+        let first_outcome_tx = outcome_tx.clone();
+        let first_worker = std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            first_outcome_tx
+                .send(
+                    first
+                        .call(&mut first_store, ())
+                        .map_err(|error| format!("{error:#}")),
+                )
+                .unwrap();
+        });
+        let second_worker = std::thread::spawn(move || {
+            let _cleanup = clear_current_thread_transaction_on_drop_for_test();
+            outcome_tx
+                .send(
+                    second
+                        .call(&mut second_store, ())
+                        .map_err(|error| format!("{error:#}")),
+                )
+                .unwrap();
+        });
+
+        assert!(
+            read_gate
+                .wait_until_reached(Duration::from_secs(5))
+                .unwrap(),
+            "{exit_name}: tblock conflict gate did not reach both workers"
+        );
+        read_gate.release().unwrap();
+        let first_outcome = outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first_outcome, Ok(1), "{exit_name}");
+        assert!(
+            second_exit_gate
+                .wait_until_reached(Duration::from_secs(5))
+                .unwrap(),
+            "{exit_name}: second tblock worker did not reach its exit gate"
+        );
+        second_exit_gate.release().unwrap();
+        let second_outcome = outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        first_worker.join().unwrap();
+        second_worker.join().unwrap();
+
+        assert_eq!(
+            second_outcome,
+            Ok(0),
+            "{exit_name}: tblock commit conflict trapped instead of running its handler"
+        );
+        single_version_certification_assert_runtime_quiescent(&runtime);
+        clear_current_thread_transaction_for_test();
+    }
+
+    for (exit_name, exit) in [
+        ("fallthrough", "(i32.const 1)"),
+        ("br", "(i32.const 1) (br $done)"),
+        (
+            "br_if",
+            "(i32.const 1) (i32.const 1) (br_if $done) (unreachable)",
+        ),
+        ("br_table", "(i32.const 1) (i32.const 0) (br_table $done)"),
+        ("return", "(i32.const 1) (return)"),
+    ] {
+        run(exit_name, exit);
+    }
+}
+
+#[test]
+#[cfg(all(unix, has_virtual_memory))]
+fn tblock_non_conflict_commit_failure_still_traps() {
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = TransactionRegionRuntime::new_for_test();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (func (export "write") (result i32)
+                (tblock (result i32)
+                  ((i32.tstore (i32.const 0) (i32.const 42))
+                   (i32.const 1))
+                  (else))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    store.set_transaction_region_runtime_for_test(runtime);
+    store
+        .transaction_create_file_backed_storage_for_test(
+            dir.path().join("tmemory.bin"),
+            dir.path().join("tx-log.bin"),
+            64,
+        )
+        .unwrap();
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let write = instance
+        .get_typed_func::<(), i32>(&mut store, "write")
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .fail_next_commit_before_lp_for_test();
+    let error = format!("{:#}", write.call(&mut store, ()).unwrap_err());
+    assert!(
+        error.contains("transaction test failure before commit LP"),
+        "{error}"
+    );
+    assert_eq!(current_thread_transaction_for_test(), None);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(all(
+    unix,
+    has_virtual_memory,
     feature = "transaction-cc-optimistic-validation",
     not(feature = "transaction-mvcc")
 ))]
@@ -29779,6 +29976,15 @@ fn native_structured_transaction_controls_execute_handlers_and_exits() {
                   ((i32.const 13) (br $done))
                   (else (drop) (i32.const 14))))
 
+              (func (export "br-cleanup") (result i32)
+                (drop
+                  (tblock $done (result i32)
+                    ((i32.const 15) (br $done))
+                    (else (drop) (i32.const 16))))
+                (tblock (result i32)
+                  ((tfail (i32.const 17)))
+                  (else)))
+
               (func (export "br-if-cleanup") (result i32)
                 (drop
                   (tblock $done (result i32)
@@ -29792,6 +29998,15 @@ fn native_structured_transaction_controls_execute_handlers_and_exits() {
                   ((tfail (i32.const 33)))
                   (else)))
 
+              (func (export "br-if-not-taken") (result i32)
+                (tblock $done (result i32)
+                  ((i32.const 35)
+                   (i32.const 0)
+                   (br_if $done)
+                   (drop)
+                   (tfail (i32.const 36)))
+                  (else)))
+
               (func (export "br-table-cleanup") (result i32)
                 (drop
                   (tblock $done (result i32)
@@ -29801,6 +30016,17 @@ fn native_structured_transaction_controls_execute_handlers_and_exits() {
                     (else (drop) (i32.const 42))))
                 (tblock (result i32)
                   ((tfail (i32.const 43)))
+                  (else)))
+
+              (func (export "br-table-mixed-targets") (param i32) (result i32)
+                (tblock $done
+                  ((block $inner
+                     (local.get 0)
+                     (br_table $inner $done))
+                   (tfail (i32.const 81)))
+                  (else (return)))
+                (tblock (result i32)
+                  ((tfail (i32.const 82)))
                   (else)))
 
               (func (export "return") (result i32)
@@ -29824,7 +30050,9 @@ fn native_structured_transaction_controls_execute_handlers_and_exits() {
         ("active-tblock-bypasses-handler", 71),
         ("ttry-does-not-start", 62),
         ("branch", 13),
+        ("br-cleanup", 17),
         ("br-if-cleanup", 33),
+        ("br-if-not-taken", 36),
         ("br-table-cleanup", 43),
         ("return", 17),
     ] {
@@ -29838,6 +30066,12 @@ fn native_structured_transaction_controls_execute_handlers_and_exits() {
         .get_typed_func::<(), i64>(&mut store, "parameter-abort")
         .unwrap();
     assert_eq!(parameter_abort.call(&mut store, ()).unwrap(), 55);
+
+    let br_table_mixed_targets = instance
+        .get_typed_func::<i32, i32>(&mut store, "br-table-mixed-targets")
+        .unwrap();
+    assert_eq!(br_table_mixed_targets.call(&mut store, 0).unwrap(), 81);
+    assert_eq!(br_table_mixed_targets.call(&mut store, 1).unwrap(), 82);
 }
 
 #[test]
