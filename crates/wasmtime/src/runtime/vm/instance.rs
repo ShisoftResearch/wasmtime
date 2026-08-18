@@ -503,6 +503,17 @@ impl Instance {
         }
     }
 
+    /// Returns the store-local identity of the instance that owns `vmctx`.
+    ///
+    /// # Safety
+    ///
+    /// `vmctx` must point at a live core Wasm instance in this store.
+    pub(crate) unsafe fn vmctx_instance_id(vmctx: NonNull<VMContext>) -> InstanceId {
+        // SAFETY: upheld by the caller; `from_vmctx` recovers the allocation
+        // header immediately preceding the supplied VMContext.
+        unsafe { Self::from_vmctx(vmctx).as_ref().id }
+    }
+
     /// Encapsulated entrypoint to the host from WebAssembly, converting a raw
     /// `VMContext` pointer into a `VMStore` plus an `InstanceId`.
     ///
@@ -954,34 +965,18 @@ impl Instance {
     /// Lookup a transactional memory by its native index.
     pub fn get_exported_tmemory(&self, store: StoreId, index: TMemoryIndex) -> ExportMemory {
         let module = self.env_module();
-        if module.tmemories[index].shared {
-            let (memory, import) = if let Some(def_index) = module.defined_tmemory_index(index) {
-                let def_index = module.runtime_defined_tmemory_index(def_index);
-                (
-                    self.get_defined_memory(def_index),
-                    self.get_defined_memory_vmimport(def_index),
-                )
-            } else {
-                let import = self.imported_tmemory(index);
-                // SAFETY: instance import records contain a valid sibling vmctx.
-                let instance = unsafe { self.sibling_vmctx(import.vmctx.as_non_null()) };
-                (instance.get_defined_memory(import.index), *import)
-            };
-            let vm = memory.as_shared_memory().unwrap().clone();
-            ExportMemory::Shared(vm, import)
+        let (id, def_index) = if let Some(def_index) = module.defined_tmemory_index(index) {
+            (self.id, module.runtime_defined_tmemory_index(def_index))
         } else {
-            let (id, def_index) = if let Some(def_index) = module.defined_tmemory_index(index) {
-                (self.id, module.runtime_defined_tmemory_index(def_index))
-            } else {
-                let import = self.imported_tmemory(index);
-                // SAFETY: instance import records contain a valid sibling vmctx.
-                let id = unsafe { self.sibling_vmctx(import.vmctx.as_non_null()).id };
-                (id, import.index)
-            };
-            let store_id = StoreInstanceId::new(store, id);
-            // SAFETY: the memory type was checked to be unshared above.
-            ExportMemory::Unshared(unsafe { crate::Memory::from_raw(store_id, def_index) })
-        }
+            let import = self.imported_tmemory(index);
+            // SAFETY: instance import records contain a valid sibling vmctx.
+            let id = unsafe { self.sibling_vmctx(import.vmctx.as_non_null()).id };
+            (id, import.index)
+        };
+        ExportMemory::Transactional(crate::TransactionalMemory::from_raw(
+            StoreInstanceId::new(store, id),
+            def_index,
+        ))
     }
 
     /// Lookup a global by index.
@@ -1962,10 +1957,11 @@ impl Instance {
             EntityIndex::Memory(i) => match self.get_exported_memory(store, i) {
                 ExportMemory::Unshared(m) => Export::Memory(m),
                 ExportMemory::Shared(m, i) => Export::SharedMemory(m, i),
+                ExportMemory::Transactional(_) => unreachable!(),
             },
             EntityIndex::TMemory(i) => match self.get_exported_tmemory(store, i) {
-                ExportMemory::Unshared(m) => Export::Memory(m),
-                ExportMemory::Shared(m, i) => Export::SharedMemory(m, i),
+                ExportMemory::Transactional(m) => Export::TransactionalMemory(m),
+                ExportMemory::Unshared(_) | ExportMemory::Shared(..) => unreachable!(),
             },
             EntityIndex::Tag(i) => Export::Tag(self.get_exported_tag(store, i)),
         }

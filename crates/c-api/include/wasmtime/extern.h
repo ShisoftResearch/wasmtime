@@ -70,6 +70,22 @@ typedef struct wasmtime_memory {
   uint32_t __private2;
 } wasmtime_memory_t;
 
+/// \brief Representation of a transactional memory in Wasmtime.
+///
+/// Transactional memories are deliberately distinct from #wasmtime_memory_t:
+/// their backing storage is copy-oriented and does not expose a stable data
+/// pointer.
+typedef struct wasmtime_transactional_memory {
+  struct {
+    /// Internal identifier of what store this belongs to, never zero.
+    uint64_t store_id;
+    /// Private field for Wasmtime.
+    uint32_t __private1;
+  };
+  /// Private field for Wasmtime.
+  uint32_t __private2;
+} wasmtime_transactional_memory_t;
+
 /// \brief Representation of a global in Wasmtime.
 ///
 /// Globals in Wasmtime are represented as an index into a store and don't
@@ -109,6 +125,9 @@ typedef uint8_t wasmtime_extern_kind_t;
 /// \brief Value of #wasmtime_extern_kind_t meaning that #wasmtime_extern_t is a
 /// tag
 #define WASMTIME_EXTERN_TAG 5
+/// \brief Value of #wasmtime_extern_kind_t meaning that #wasmtime_extern_t is a
+/// transactional memory
+#define WASMTIME_EXTERN_TRANSACTIONAL_MEMORY 6
 
 /**
  * \typedef wasmtime_extern_union_t
@@ -133,6 +152,9 @@ typedef union wasmtime_extern_union {
   struct wasmtime_sharedmemory *sharedmemory;
   /// Field used if #wasmtime_extern_t::kind is #WASMTIME_EXTERN_TAG
   wasmtime_tag_t tag;
+  /// Field used if #wasmtime_extern_t::kind is
+  /// #WASMTIME_EXTERN_TRANSACTIONAL_MEMORY
+  wasmtime_transactional_memory_t transactional_memory;
 } wasmtime_extern_union_t;
 
 /**

@@ -1202,7 +1202,7 @@ impl<'a> Inliner<'a> {
                         for (module, name, _ty) in self.nested_modules[*idx].module.imports() {
                             let instance = args[module];
                             defs.push(
-                                self.core_def_of_module_instance_export(frame, instance, name),
+                                self.core_def_of_module_instance_export(frame, instance, name)?,
                             );
                         }
                         (
@@ -1215,7 +1215,7 @@ impl<'a> Inliner<'a> {
                         for ((module, name), _) in types[*ty].imports.iter() {
                             let instance = args[module.as_str()];
                             let def =
-                                self.core_def_of_module_instance_export(frame, instance, name);
+                                self.core_def_of_module_instance_export(frame, instance, name)?;
                             defs.entry(module.to_string())
                                 .or_insert(IndexMap::new())
                                 .insert(name.to_string(), def);
@@ -1358,7 +1358,7 @@ impl<'a> Inliner<'a> {
 
             AliasExportTable(instance, name) => {
                 frame.tables.push(
-                    match self.core_def_of_module_instance_export(frame, *instance, *name) {
+                    match self.core_def_of_module_instance_export(frame, *instance, *name)? {
                         dfg::CoreDef::Export(e) => e,
                         _ => unreachable!(),
                     },
@@ -1367,7 +1367,7 @@ impl<'a> Inliner<'a> {
 
             AliasExportGlobal(instance, name) => {
                 frame.globals.push(
-                    match self.core_def_of_module_instance_export(frame, *instance, *name) {
+                    match self.core_def_of_module_instance_export(frame, *instance, *name)? {
                         dfg::CoreDef::Export(e) => e,
                         _ => unreachable!(),
                     },
@@ -1376,7 +1376,7 @@ impl<'a> Inliner<'a> {
 
             AliasExportMemory(instance, name) => {
                 frame.memories.push(
-                    match self.core_def_of_module_instance_export(frame, *instance, *name) {
+                    match self.core_def_of_module_instance_export(frame, *instance, *name)? {
                         dfg::CoreDef::Export(e) => e,
                         _ => unreachable!(),
                     },
@@ -1385,7 +1385,7 @@ impl<'a> Inliner<'a> {
 
             AliasExportTag(instance, name) => {
                 frame.tags.push(
-                    match self.core_def_of_module_instance_export(frame, *instance, *name) {
+                    match self.core_def_of_module_instance_export(frame, *instance, *name)? {
                         dfg::CoreDef::Export(e) => e,
                         _ => unreachable!(),
                     },
@@ -1483,8 +1483,8 @@ impl<'a> Inliner<'a> {
         frame: &InlinerFrame<'a>,
         instance: ModuleInstanceIndex,
         name: &'a str,
-    ) -> dfg::CoreDef {
-        match &frame.module_instances[instance] {
+    ) -> Result<dfg::CoreDef> {
+        Ok(match &frame.module_instances[instance] {
             // Instantiations of a statically known module means that we can
             // refer to the exported item by a precise index, skipping name
             // lookups at runtime.
@@ -1521,10 +1521,14 @@ impl<'a> Inliner<'a> {
                 EntityIndex::Memory(i) => frame.memories[i].clone().into(),
                 EntityIndex::Tag(i) => frame.tags[i].clone().into(),
                 EntityIndex::TTable(_) | EntityIndex::TMemory(_) | EntityIndex::TGlobal(_) => {
-                    panic!("transactional core exports in synthetic components are not implemented")
+                    return Err(crate::WasmError::Unsupported(
+                        "transactional core exports in synthetic components are not supported"
+                            .into(),
+                    )
+                    .into());
                 }
             },
-        }
+        })
     }
 
     fn memory(

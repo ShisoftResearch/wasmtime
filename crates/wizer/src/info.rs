@@ -108,9 +108,7 @@ impl<'a> ModuleContext<'a> {
     }
 
     /// Push a new import into this module.
-    pub(crate) fn push_import(&mut self, import: wasmparser::Import<'a>) {
-        self.imports.push(import);
-
+    pub(crate) fn push_import(&mut self, import: wasmparser::Import<'a>) -> wasmtime::Result<()> {
         // Add the import to the appropriate index space for our current module.
         match import.ty {
             wasmparser::TypeRef::Memory(ty) => {
@@ -131,7 +129,15 @@ impl<'a> ModuleContext<'a> {
             wasmparser::TypeRef::FuncExact(_) => {
                 unreachable!("custom-descriptors are unsupported; checked in validation")
             }
+            wasmparser::TypeRef::TTable(_)
+            | wasmparser::TypeRef::TMemory(_)
+            | wasmparser::TypeRef::TGlobal(_) => {
+                wasmtime::bail!("transactional imports are not supported")
+            }
         }
+
+        self.imports.push(import);
+        Ok(())
     }
 
     /// Push an export into this module.

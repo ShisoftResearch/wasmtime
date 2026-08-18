@@ -35,6 +35,9 @@ pub(crate) enum CodeGenError {
     /// Unsupported eager initialization of tables.
     #[error("Unsupported eager initialization of tables")]
     UnsupportedTableEagerInit,
+    /// Unsupported `call_indirect` table namespace or flags.
+    #[error("Winch only supports ordinary call_indirect table operands")]
+    UnsupportedCallIndirectTableOperand,
     /// An internal error.
     ///
     /// This error means that an internal invariant was not met and usually
@@ -109,6 +112,10 @@ impl CodeGenError {
 
     pub(crate) const fn unsupported_table_eager_init() -> Self {
         Self::UnsupportedTableEagerInit
+    }
+
+    pub(crate) const fn unsupported_call_indirect_table_operand() -> Self {
+        Self::UnsupportedCallIndirectTableOperand
     }
 
     pub(crate) const fn unimplemented_wasm_instruction() -> Self {

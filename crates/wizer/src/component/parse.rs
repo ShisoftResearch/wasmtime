@@ -111,6 +111,16 @@ fn parse_into<'a>(
                 for alias in reader {
                     match alias? {
                         ComponentAlias::CoreInstanceExport { kind, .. } => {
+                            if matches!(
+                                kind,
+                                wasmparser::ExternalKind::TTable
+                                    | wasmparser::ExternalKind::TMemory
+                                    | wasmparser::ExternalKind::TGlobal
+                            ) {
+                                bail!(
+                                    "wizer does not currently support transactional core aliases"
+                                );
+                            }
                             if let Some(component) = &mut cx {
                                 component.inc_core(kind);
                             }

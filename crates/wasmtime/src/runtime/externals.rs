@@ -1,5 +1,5 @@
 use crate::store::StoreOpaque;
-use crate::{AsContext, Engine, ExternType, Func, Memory, SharedMemory};
+use crate::{AsContext, Engine, ExternType, Func, Memory, SharedMemory, TransactionalMemory};
 
 mod global;
 mod table;
@@ -32,6 +32,8 @@ pub enum Extern {
     /// A WebAssembly shared memory; these are handled separately from
     /// [`Memory`].
     SharedMemory(SharedMemory),
+    /// A transactional WebAssembly memory with a copy-oriented host API.
+    TransactionalMemory(TransactionalMemory),
     /// A WebAssembly exception or control tag which can be referenced
     /// when raising an exception or stack switching.
     Tag(Tag),
@@ -94,6 +96,15 @@ impl Extern {
         }
     }
 
+    /// Returns the underlying transactional memory, if this external is one.
+    #[inline]
+    pub fn into_transactional_memory(self) -> Option<TransactionalMemory> {
+        match self {
+            Extern::TransactionalMemory(memory) => Some(memory),
+            _ => None,
+        }
+    }
+
     /// Returns the underlying `Tag`, if this external is a tag.
     ///
     /// Returns `None` if this is not a tag.
@@ -119,6 +130,7 @@ impl Extern {
             Extern::Func(ft) => ExternType::Func(ft.ty(store)),
             Extern::Memory(ft) => ExternType::Memory(ft.ty(store)),
             Extern::SharedMemory(ft) => ExternType::Memory(ft.ty()),
+            Extern::TransactionalMemory(ft) => ExternType::Memory(ft.ty(store)),
             Extern::Table(tt) => ExternType::Table(tt.ty(store)),
             Extern::Global(gt) => ExternType::Global(gt.ty(store)),
             Extern::Tag(tt) => ExternType::Tag(tt.ty(store)),
@@ -135,6 +147,7 @@ impl Extern {
             crate::runtime::vm::Export::SharedMemory(m, _) => {
                 Extern::SharedMemory(crate::SharedMemory::from_raw(m, engine.clone()))
             }
+            crate::runtime::vm::Export::TransactionalMemory(m) => Extern::TransactionalMemory(m),
             crate::runtime::vm::Export::Global(g) => Extern::Global(g),
             crate::runtime::vm::Export::Table(t) => Extern::Table(t),
             crate::runtime::vm::Export::Tag(t) => Extern::Tag(t),
@@ -147,6 +160,7 @@ impl Extern {
             Extern::Global(g) => g.comes_from_same_store(store),
             Extern::Memory(m) => m.comes_from_same_store(store),
             Extern::SharedMemory(m) => Engine::same(m.engine(), store.engine()),
+            Extern::TransactionalMemory(m) => m.comes_from_same_store(store),
             Extern::Table(t) => t.comes_from_same_store(store),
             Extern::Tag(t) => t.comes_from_same_store(store),
         }
@@ -174,6 +188,12 @@ impl From<Memory> for Extern {
 impl From<SharedMemory> for Extern {
     fn from(r: SharedMemory) -> Self {
         Extern::SharedMemory(r)
+    }
+}
+
+impl From<TransactionalMemory> for Extern {
+    fn from(r: TransactionalMemory) -> Self {
+        Extern::TransactionalMemory(r)
     }
 }
 
@@ -253,6 +273,11 @@ impl<'instance> Export<'instance> {
     /// a shared memory, or `None` otherwise.
     pub fn into_shared_memory(self) -> Option<SharedMemory> {
         self.definition.into_shared_memory()
+    }
+
+    /// Consume this export and return its transactional memory, if any.
+    pub fn into_transactional_memory(self) -> Option<TransactionalMemory> {
+        self.definition.into_transactional_memory()
     }
 
     /// Consume this `Export` and return the contained `Global`, if it's a global,

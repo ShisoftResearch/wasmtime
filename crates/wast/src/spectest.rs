@@ -143,7 +143,7 @@ pub fn link_spectest<T>(
         )?;
         let transaction_memory = Instance::new(&mut *store, &transaction_memory, &[])?;
         let transaction_memory = transaction_memory
-            .get_memory(&mut *store, "tmemory")
+            .get_transactional_memory(&mut *store, "tmemory")
             .expect("transaction memory module exports tmemory");
         linker.define(&mut *store, "spectest", "tmemory", transaction_memory)?;
     }

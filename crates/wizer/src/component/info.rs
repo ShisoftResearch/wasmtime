@@ -121,6 +121,11 @@ impl<'a> ComponentContext<'a> {
             wasmparser::ExternalKind::Table
             | wasmparser::ExternalKind::Global
             | wasmparser::ExternalKind::Tag => {}
+            wasmparser::ExternalKind::TTable
+            | wasmparser::ExternalKind::TMemory
+            | wasmparser::ExternalKind::TGlobal => {
+                unreachable!("transactional core aliases are rejected while parsing")
+            }
         }
     }
 

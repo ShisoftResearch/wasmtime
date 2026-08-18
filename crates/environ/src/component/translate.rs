@@ -1354,7 +1354,7 @@ impl<'a, 'data> Translator<'a, 'data> {
                             name,
                         } => {
                             let instance = ModuleInstanceIndex::from_u32(instance_index);
-                            self.alias_module_instance_export(kind, instance, name)
+                            self.alias_module_instance_export(kind, instance, name)?
                         }
                     };
                     self.result.initializers.push(init);
@@ -1511,8 +1511,8 @@ impl<'a, 'data> Translator<'a, 'data> {
         kind: wasmparser::ExternalKind,
         instance: ModuleInstanceIndex,
         name: &'data str,
-    ) -> LocalInitializer<'data> {
-        match kind {
+    ) -> Result<LocalInitializer<'data>> {
+        Ok(match kind {
             wasmparser::ExternalKind::Func | wasmparser::ExternalKind::FuncExact => {
                 LocalInitializer::AliasExportFunc(instance, name)
             }
@@ -1523,9 +1523,12 @@ impl<'a, 'data> Translator<'a, 'data> {
             wasmparser::ExternalKind::TTable
             | wasmparser::ExternalKind::TMemory
             | wasmparser::ExternalKind::TGlobal => {
-                panic!("transactional core aliases in components are not implemented")
+                return Err(crate::WasmError::Unsupported(
+                    "transactional core aliases in components are not supported".into(),
+                )
+                .into());
             }
-        }
+        })
     }
 
     fn alias_component_outer(

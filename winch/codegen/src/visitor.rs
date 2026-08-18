@@ -23,8 +23,8 @@ use crate::{Result, bail, format_err};
 use regalloc2::RegClass;
 use smallvec::{SmallVec, smallvec};
 use wasmparser::{
-    BlockType, BrTable, HeapType, Ieee32, Ieee64, MemArg, V128, ValType, VisitOperator,
-    VisitSimdOperator,
+    BlockType, BrTable, EntityNamespace, HeapType, Ieee32, Ieee64, MemArg, V128, ValType,
+    VisitOperator, VisitSimdOperator,
 };
 use wasmtime_cranelift::TRAP_INDIRECT_CALL_TO_NULL;
 use wasmtime_environ::{
@@ -1683,7 +1683,19 @@ where
         Ok(())
     }
 
-    fn visit_call_indirect(&mut self, type_index: u32, table_index: u32) -> Self::Output {
+    fn visit_call_indirect(
+        &mut self,
+        type_index: u32,
+        table_index: u32,
+        table_namespace: EntityNamespace,
+        flags: Option<u32>,
+    ) -> Self::Output {
+        // Transactional indirect calls require their own lowering, which is
+        // intentionally separate from the ordinary table path below.
+        if table_namespace != EntityNamespace::Ordinary || flags.is_some_and(|flags| flags != 0) {
+            bail!(CodeGenError::unsupported_call_indirect_table_operand());
+        }
+
         // Spill now because `emit_table_get` and the `FnCall::emit`
         // invocations will both trigger spills since they both call functions.
         // However, the machine instructions for the spill emitted by

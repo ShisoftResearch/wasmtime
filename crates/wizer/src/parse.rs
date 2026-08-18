@@ -59,7 +59,7 @@ fn import_section<'a>(
             );
         }
 
-        module.push_import(imp);
+        module.push_import(imp)?;
     }
     Ok(())
 }
@@ -79,7 +79,11 @@ fn table_section<'a>(
     tables: wasmparser::TableSectionReader<'a>,
 ) -> wasmtime::Result<()> {
     for table in tables {
-        module.push_table(table?.ty);
+        let table = table?.ty;
+        if table.namespace == wasmparser::EntityNamespace::Transactional {
+            bail!("transactional tables are not supported");
+        }
+        module.push_table(table);
     }
     Ok(())
 }
@@ -89,7 +93,11 @@ fn memory_section<'a>(
     mems: wasmparser::MemorySectionReader<'a>,
 ) -> wasmtime::Result<()> {
     for m in mems {
-        module.push_defined_memory(m?);
+        let memory = m?;
+        if memory.namespace == wasmparser::EntityNamespace::Transactional {
+            bail!("transactional memories are not supported");
+        }
+        module.push_defined_memory(memory);
     }
     Ok(())
 }
@@ -99,7 +107,11 @@ fn global_section<'a>(
     globals: wasmparser::GlobalSectionReader<'a>,
 ) -> wasmtime::Result<()> {
     for g in globals {
-        module.push_defined_global(g?.ty);
+        let global = g?.ty;
+        if global.namespace == wasmparser::EntityNamespace::Transactional {
+            bail!("transactional globals are not supported");
+        }
+        module.push_defined_global(global);
     }
     Ok(())
 }
@@ -125,6 +137,11 @@ fn export_section<'a>(
             | wasmparser::ExternalKind::Memory
             | wasmparser::ExternalKind::Global => {
                 module.push_export(export);
+            }
+            wasmparser::ExternalKind::TTable
+            | wasmparser::ExternalKind::TMemory
+            | wasmparser::ExternalKind::TGlobal => {
+                bail!("transactional exports are not supported");
             }
         }
     }

@@ -1469,11 +1469,14 @@ impl Definition {
             Definition::Extern(Extern::Memory(m), DefinitionType::Memory(_, size)) => {
                 *size = m.internal_size(store);
             }
-            Definition::Extern(Extern::Memory(m), DefinitionType::TMemory(_, size)) => {
-                *size = m.internal_size(store);
-            }
             Definition::Extern(Extern::SharedMemory(m), DefinitionType::Memory(_, size)) => {
                 *size = m.size();
+            }
+            Definition::Extern(
+                Extern::TransactionalMemory(m),
+                DefinitionType::TMemory(_, size),
+            ) => {
+                *size = m.internal_size(store);
             }
             Definition::Extern(Extern::Table(m), DefinitionType::Table(_, size)) => {
                 *size = m.size_(store);
@@ -1498,13 +1501,13 @@ impl DefinitionType {
                 DefinitionType::TGlobal(*t.wasmtime_ty(store))
             }
             Extern::Global(t) => DefinitionType::Global(*t.wasmtime_ty(store)),
-            Extern::Memory(t) if t.is_transactional(store) => {
-                DefinitionType::TMemory(*t.wasmtime_ty(store), t.internal_size(store))
-            }
             Extern::Memory(t) => {
                 DefinitionType::Memory(*t.wasmtime_ty(store), t.internal_size(store))
             }
             Extern::SharedMemory(t) => DefinitionType::Memory(*t.ty().wasmtime_memory(), t.size()),
+            Extern::TransactionalMemory(t) => {
+                DefinitionType::TMemory(*t.wasmtime_ty(store), t.internal_size(store))
+            }
             Extern::Tag(t) => DefinitionType::Tag(*t.wasmtime_ty(store)),
         }
     }

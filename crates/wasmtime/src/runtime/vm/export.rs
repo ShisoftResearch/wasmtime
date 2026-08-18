@@ -14,6 +14,9 @@ pub enum Export {
     /// A shared memory export value.
     SharedMemory(SharedMemory, VMMemoryImport),
 
+    /// A transactional memory export value.
+    TransactionalMemory(crate::TransactionalMemory),
+
     /// A global export value.
     Global(crate::Global),
 
@@ -24,6 +27,7 @@ pub enum Export {
 pub enum ExportMemory {
     Unshared(crate::Memory),
     Shared(SharedMemory, VMMemoryImport),
+    Transactional(crate::TransactionalMemory),
 }
 
 impl ExportMemory {
@@ -31,12 +35,21 @@ impl ExportMemory {
         match self {
             ExportMemory::Unshared(m) => Some(m),
             ExportMemory::Shared(..) => None,
+            ExportMemory::Transactional(_) => None,
         }
     }
     pub fn shared(self) -> Option<SharedMemory> {
         match self {
             ExportMemory::Unshared(_) => None,
             ExportMemory::Shared(m, _) => Some(m),
+            ExportMemory::Transactional(_) => None,
+        }
+    }
+
+    pub fn transactional(self) -> Option<crate::TransactionalMemory> {
+        match self {
+            ExportMemory::Transactional(m) => Some(m),
+            ExportMemory::Unshared(_) | ExportMemory::Shared(..) => None,
         }
     }
 }

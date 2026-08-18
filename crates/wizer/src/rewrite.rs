@@ -184,7 +184,8 @@ impl Wizer {
                             // for the snapshot all active data segments, which
                             // are already applied, are all turned into empty
                             // passive segments instead.
-                            wasmparser::DataKind::Active { .. } => {
+                            wasmparser::DataKind::Active { .. }
+                            | wasmparser::DataKind::ActiveWithMemoryIndex { .. } => {
                                 section.passive([]);
                             }
 

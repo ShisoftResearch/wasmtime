@@ -224,7 +224,7 @@ macro_rules! foreach_builtin_function {
             // Stages a transactional memory fill.
             transaction_tmemory_fill(vmctx: vmctx, memory: u32, dst: u64, val: u32, len: u64) -> bool;
             // Stages a transactional memory copy.
-            transaction_tmemory_copy(vmctx: vmctx, dst_memory: u32, src_memory: u32, dst: u64, src: u64, len: u64) -> bool;
+            transaction_tmemory_copy(vmctx: vmctx, dst_memory: u32, src_vmctx: pointer, src_memory: u32, dst: u64, src: u64, len: u64) -> bool;
             // Stages a transactional memory initialization from runtime data bytes.
             transaction_tmemory_init(vmctx: vmctx, memory: u32, dst: u64, src: u64, len: u64, data: pointer, data_len: u64) -> bool;
             // Initializes committed transactional memory from active data during module startup.

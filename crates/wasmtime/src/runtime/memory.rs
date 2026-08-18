@@ -3,7 +3,7 @@ use crate::prelude::*;
 use crate::runtime::vm::{self, ExportMemory};
 use crate::store::{StoreInstanceId, StoreOpaque, StoreResourceLimiter};
 use crate::trampoline::generate_memory_export;
-#[cfg(feature = "async")]
+#[cfg(any(feature = "async", feature = "transaction"))]
 use crate::vm::VMStore;
 use crate::{AsContext, AsContextMut, Engine, MemoryType, StoreContext, StoreContextMut};
 use core::cell::UnsafeCell;
@@ -508,23 +508,7 @@ impl Memory {
     }
 
     pub(crate) fn internal_data_size(&self, store: &StoreOpaque) -> usize {
-        #[cfg(has_virtual_memory)]
-        if let Some(size) = self.internal_tmemory_data_size(store) {
-            return size;
-        }
         store[self.instance].memory(self.index).current_length()
-    }
-
-    #[cfg(has_virtual_memory)]
-    fn internal_tmemory_data_size(&self, store: &StoreOpaque) -> Option<usize> {
-        let instance = &store[self.instance];
-        let module = instance.env_module();
-        let memory_index = module
-            .defined_tmemory_index_from_runtime(self.index)
-            .map(|index| module.tmemory_index(index))?;
-        instance
-            .get_tmemory(memory_index)
-            .map(crate::runtime::vm::TMemory::byte_len)
     }
 
     /// Returns the size, in units of pages, of this Wasm memory.
@@ -709,18 +693,8 @@ impl Memory {
 
     pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Memory {
         let module = store[self.instance].env_module();
-        if let Some(index) = module.defined_tmemory_index_from_runtime(self.index) {
-            return &module.tmemories[module.tmemory_index(index)];
-        }
         let index = module.memory_index(self.index);
         &module.memories[index]
-    }
-
-    pub(crate) fn is_transactional(&self, store: &StoreOpaque) -> bool {
-        let module = store[self.instance].env_module();
-        module
-            .defined_tmemory_index_from_runtime(self.index)
-            .is_some()
     }
 
     pub(crate) fn vmimport(&self, store: &StoreOpaque) -> crate::runtime::vm::VMMemoryImport {
@@ -746,8 +720,175 @@ impl Memory {
     /// `StoreData` multiple times and becomes multiple `wasmtime::Memory`s,
     /// this hash key will be consistent across all of these memories.
     #[cfg(feature = "coredump")]
-    pub(crate) fn hash_key(&self, store: &StoreOpaque) -> impl core::hash::Hash + Eq + use<> {
+    pub(crate) fn hash_key(&self, store: &StoreOpaque) -> usize {
         store[self.instance].memory_ptr(self.index).as_ptr().addr()
+    }
+}
+
+/// A transactional WebAssembly memory.
+///
+/// Transactional memories may use chunked or persistent backing stores and do
+/// not necessarily have one stable contiguous host address. Consequently this
+/// API is deliberately copy-oriented and does not expose borrowed slices or a
+/// raw data pointer.
+#[derive(Copy, Clone, Debug)]
+#[repr(C)] // here for the C API
+pub struct TransactionalMemory {
+    instance: StoreInstanceId,
+    index: DefinedMemoryIndex,
+}
+
+// Double-check that the C representation in `extern.h` matches our in-Rust
+// representation here in terms of size/alignment/etc.
+const _: () = {
+    #[repr(C)]
+    struct Tmp(u64, u32);
+    #[repr(C)]
+    struct C(Tmp, u32);
+    assert!(core::mem::size_of::<C>() == core::mem::size_of::<TransactionalMemory>());
+    assert!(core::mem::align_of::<C>() == core::mem::align_of::<TransactionalMemory>());
+    assert!(core::mem::offset_of!(TransactionalMemory, instance) == 0);
+};
+
+impl TransactionalMemory {
+    /// Returns the type of this transactional memory.
+    pub fn ty(&self, store: impl AsContext) -> MemoryType {
+        MemoryType::from_wasmtime_memory(self.wasmtime_ty(store.as_context().0))
+    }
+
+    /// Copies committed bytes into `buffer`.
+    pub fn read(&self, store: impl AsContext, offset: usize, buffer: &mut [u8]) -> Result<()> {
+        let store = store.as_context();
+        let end = offset
+            .checked_add(buffer.len())
+            .context("transactional memory read range overflow")?;
+        ensure!(
+            end <= self.data_size(&store),
+            "out of bounds transactional memory read"
+        );
+        let bytes = crate::runtime::vm::libcalls::transactional_memory_host_read(
+            store.0,
+            self.instance.instance(),
+            self.index,
+            offset..end,
+        )?;
+        buffer.copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    /// Applies a host write through the transactional commit machinery.
+    pub fn write(&self, mut store: impl AsContextMut, offset: usize, buffer: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(buffer.len())
+            .context("transactional memory write range overflow")?;
+        let store = store.as_context_mut();
+        ensure!(
+            end <= self.data_size(&store),
+            "out of bounds transactional memory write"
+        );
+        crate::runtime::vm::libcalls::transactional_memory_host_write(
+            store.0,
+            self.instance.instance(),
+            self.index,
+            u64::try_from(offset).context("transactional memory write offset overflow")?,
+            buffer,
+        )
+    }
+
+    /// Returns the committed byte length.
+    pub fn data_size(&self, store: impl AsContext) -> usize {
+        let store = store.as_context();
+        let instance = &store[self.instance];
+        let module = instance.env_module();
+        let defined = module
+            .defined_tmemory_index_from_runtime(self.index)
+            .expect("transactional memory handle refers to an ordinary memory slot");
+        instance
+            .get_tmemory(module.tmemory_index(defined))
+            .expect("transactional memory handle has no sidecar storage")
+            .byte_len()
+    }
+
+    /// Returns the committed size in WebAssembly pages.
+    pub fn size(&self, store: impl AsContext) -> u64 {
+        self.internal_size(store.as_context().0)
+    }
+
+    pub(crate) fn internal_size(&self, store: &StoreOpaque) -> u64 {
+        let page_size = usize::try_from(self.wasmtime_ty(store).page_size()).unwrap();
+        let instance = &store[self.instance];
+        let module = instance.env_module();
+        let defined = module
+            .defined_tmemory_index_from_runtime(self.index)
+            .expect("transactional memory handle refers to an ordinary memory slot");
+        let bytes = instance
+            .get_tmemory(module.tmemory_index(defined))
+            .expect("transactional memory handle has no sidecar storage")
+            .byte_len();
+        u64::try_from(bytes / page_size).unwrap()
+    }
+
+    /// Grows this transactional memory by `delta` pages.
+    pub fn grow(&self, mut store: impl AsContextMut, delta: u64) -> Result<u64> {
+        let store = store.as_context_mut();
+        let current_pages = self.size(&store);
+        let ty = self.ty(&store);
+        let page_size = usize::try_from(ty.page_size()).unwrap();
+        let current = self.data_size(&store);
+        let desired_pages = current_pages
+            .checked_add(delta)
+            .context("transactional memory size overflow")?;
+        let desired = usize::try_from(desired_pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(page_size))
+            .context("transactional memory byte size overflow")?;
+        let maximum = ty
+            .maximum()
+            .and_then(|pages| usize::try_from(pages).ok())
+            .and_then(|pages| pages.checked_mul(page_size));
+        {
+            let (mut limiter, _) = store.0.validate_sync_resource_limiter_and_store_opaque()?;
+            if let Some(limiter) = limiter.as_mut()
+                && !vm::assert_ready(limiter.memory_growing(current, desired, maximum))?
+            {
+                bail!("failed to grow transactional memory by `{delta}`");
+            }
+        }
+        crate::runtime::vm::libcalls::transactional_memory_host_grow(
+            store.0,
+            self.instance.instance(),
+            self.index,
+            delta,
+        )?
+        .ok_or_else(|| crate::format_err!("failed to grow transactional memory by `{delta}`"))
+    }
+
+    pub(crate) fn from_raw(
+        instance: StoreInstanceId,
+        index: DefinedMemoryIndex,
+    ) -> TransactionalMemory {
+        TransactionalMemory { instance, index }
+    }
+
+    pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Memory {
+        let module = store[self.instance].env_module();
+        let defined = module
+            .defined_tmemory_index_from_runtime(self.index)
+            .expect("transactional memory handle refers to an ordinary memory slot");
+        &module.tmemories[module.tmemory_index(defined)]
+    }
+
+    pub(crate) fn vmimport(&self, store: &StoreOpaque) -> crate::runtime::vm::VMMemoryImport {
+        store[self.instance].get_defined_memory_vmimport(self.index)
+    }
+
+    pub(crate) fn comes_from_same_store(&self, store: &StoreOpaque) -> bool {
+        store.id() == self.instance.store_id()
+    }
+
+    #[cfg(feature = "coredump")]
+    pub(crate) fn hash_key(&self) -> (u32, u32) {
+        (self.instance.instance().as_u32(), self.index.as_u32())
     }
 }
 
@@ -1106,6 +1247,7 @@ impl SharedMemory {
         match memory {
             ExportMemory::Unshared(_) => unreachable!(),
             ExportMemory::Shared(_shared, vmimport) => vmimport,
+            ExportMemory::Transactional(_) => unreachable!(),
         }
     }
 

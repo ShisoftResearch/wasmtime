@@ -1,8 +1,8 @@
 use crate::hash_map::HashMap;
 use crate::prelude::*;
 use crate::{
-    AsContextMut, FrameInfo, Global, HeapType, Instance, Memory, Module, StoreContextMut, Val,
-    ValType, WasmBacktrace, store::StoreOpaque,
+    AsContextMut, FrameInfo, Global, HeapType, Instance, Memory, Module, StoreContextMut,
+    TransactionalMemory, Val, ValType, WasmBacktrace, store::StoreOpaque,
 };
 use std::fmt;
 
@@ -33,6 +33,7 @@ pub struct WasmCoreDump {
     modules: Vec<Module>,
     instances: Vec<Instance>,
     memories: Vec<Memory>,
+    transactional_memories: Vec<TransactionalMemory>,
     globals: Vec<Global>,
     backtrace: WasmBacktrace,
 }
@@ -43,6 +44,10 @@ impl WasmCoreDump {
         let instances: Vec<Instance> = store.all_instances().collect();
         let store_memories: Vec<Memory> =
             store.all_memories().filter_map(|m| m.unshared()).collect();
+        let transactional_memories = store
+            .all_memories()
+            .filter_map(|m| m.transactional())
+            .collect();
 
         let mut store_globals: Vec<Global> = vec![];
         store.for_each_global(|_store, global| store_globals.push(global));
@@ -52,6 +57,7 @@ impl WasmCoreDump {
             modules,
             instances,
             memories: store_memories,
+            transactional_memories,
             globals: store_globals,
             backtrace,
         }
@@ -88,6 +94,11 @@ impl WasmCoreDump {
         self.memories.as_ref()
     }
 
+    /// All transactional memories captured in this dump.
+    pub fn transactional_memories(&self) -> &[TransactionalMemory] {
+        self.transactional_memories.as_ref()
+    }
+
     /// Serialize this core dump into [the standard core dump binary
     /// format][spec].
     ///
@@ -111,6 +122,11 @@ impl WasmCoreDump {
 
         // A map from each memory to its index in the core dump's memories
         // section.
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        enum MemoryKey {
+            Ordinary(usize),
+            Transactional((u32, u32)),
+        }
         let mut memory_to_idx = HashMap::new();
 
         let mut data = wasm_encoder::DataSection::new();
@@ -119,7 +135,7 @@ impl WasmCoreDump {
             let mut memories = wasm_encoder::MemorySection::new();
             for mem in self.memories() {
                 let memory_idx = memories.len();
-                memory_to_idx.insert(mem.hash_key(&store.0), memory_idx);
+                memory_to_idx.insert(MemoryKey::Ordinary(mem.hash_key(&store.0)), memory_idx);
                 let ty = mem.ty(&store);
                 memories.memory(wasm_encoder::MemoryType {
                     namespace: wasm_encoder::EntityNamespace::Ordinary,
@@ -141,7 +157,7 @@ impl WasmCoreDump {
                 // into reasonably-sized chunks and then trim runs of zeroes
                 // from the start and end of each chunk.
                 const CHUNK_SIZE: usize = 4096;
-                for (i, chunk) in mem.data(&store).chunks_exact(CHUNK_SIZE).enumerate() {
+                for (i, chunk) in mem.data(&store).chunks(CHUNK_SIZE).enumerate() {
                     if let Some(start) = chunk.iter().position(|byte| *byte != 0) {
                         let end = chunk.iter().rposition(|byte| *byte != 0).unwrap() + 1;
                         let offset = i * CHUNK_SIZE + start;
@@ -153,6 +169,44 @@ impl WasmCoreDump {
                             wasm_encoder::ConstExpr::i32_const(offset as i32)
                         };
                         data.active(memory_idx, &offset, chunk[start..end].iter().copied());
+                    }
+                }
+            }
+
+            for (memory_idx, mem) in self.transactional_memories().iter().enumerate() {
+                let memory_idx = u32::try_from(memory_idx).unwrap();
+                memory_to_idx.insert(MemoryKey::Transactional(mem.hash_key()), memory_idx);
+                let ty = mem.ty(&store);
+                memories.memory(wasm_encoder::MemoryType {
+                    namespace: wasm_encoder::EntityNamespace::Transactional,
+                    minimum: mem.size(&store),
+                    maximum: ty.maximum(),
+                    memory64: ty.is_64(),
+                    shared: ty.is_shared(),
+                    page_size_log2: None,
+                });
+
+                let mut bytes = vec![0; mem.data_size(&store)];
+                mem.read(&store, 0, &mut bytes)
+                    .expect("captured transactional memory must remain readable");
+                const CHUNK_SIZE: usize = 4096;
+                for (i, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+                    if let Some(start) = chunk.iter().position(|byte| *byte != 0) {
+                        let end = chunk.iter().rposition(|byte| *byte != 0).unwrap() + 1;
+                        let offset = i * CHUNK_SIZE + start;
+                        let offset = if ty.is_64() {
+                            wasm_encoder::ConstExpr::i64_const(i64::try_from(offset).unwrap())
+                        } else {
+                            wasm_encoder::ConstExpr::i32_const(i32::try_from(offset).unwrap())
+                        };
+                        data.segment(wasm_encoder::DataSegment {
+                            namespace: wasm_encoder::EntityNamespace::Transactional,
+                            mode: wasm_encoder::DataSegmentMode::Active {
+                                memory_index: memory_idx,
+                                offset: &offset,
+                            },
+                            data: chunk[start..end].iter().copied(),
+                        });
                     }
                 }
             }
@@ -269,12 +323,20 @@ impl WasmCoreDump {
 
                 let memories = instance
                     .all_memories(store.0)
-                    .filter_map(|(_, m)| m.unshared())
-                    .map(|memory| {
-                        memory_to_idx
-                            .get(&memory.hash_key(&store.0))
-                            .copied()
-                            .unwrap_or(u32::MAX)
+                    .filter_map(|(_, memory)| match memory {
+                        crate::runtime::vm::ExportMemory::Unshared(memory) => Some(
+                            memory_to_idx
+                                .get(&MemoryKey::Ordinary(memory.hash_key(&store.0)))
+                                .copied()
+                                .unwrap_or(u32::MAX),
+                        ),
+                        crate::runtime::vm::ExportMemory::Transactional(memory) => Some(
+                            memory_to_idx
+                                .get(&MemoryKey::Transactional(memory.hash_key()))
+                                .copied()
+                                .unwrap_or(u32::MAX),
+                        ),
+                        crate::runtime::vm::ExportMemory::Shared(..) => None,
                     })
                     .collect::<Vec<_>>();
 
@@ -335,6 +397,9 @@ impl fmt::Display for WasmCoreDump {
 
         writeln!(f, "memories:")?;
         for memory in self.memories.iter() {
+            writeln!(f, "  {memory:?}")?;
+        }
+        for memory in self.transactional_memories.iter() {
             writeln!(f, "  {memory:?}")?;
         }
 

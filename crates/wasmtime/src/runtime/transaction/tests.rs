@@ -26,6 +26,7 @@ use super::visibility::SelectedTransactionVisibility;
 #[cfg(feature = "transaction-mvcc")]
 use super::visibility::TransactionVisibility;
 use super::*;
+use crate::AsContextMut;
 use crate::runtime::store::AsStoreOpaque;
 use alloc::sync::Arc;
 
@@ -1108,7 +1109,7 @@ fn mvcc_backend_assert_snapshot_history(
         &engine,
         r#"
             (module
-              (tmemory $m 1)
+              (tmemory $m (export "m") 1)
               (func (export "read-open-snapshot") (result i32)
                 (i32.tload $m (i32.const 0)))
               (tfunc (export "write") (param i32)
@@ -10169,6 +10170,45 @@ fn mock_transaction_global_imported_tglobal_commits_to_backing_global() {
 }
 
 #[test]
+fn mock_transaction_global_aliases_share_staged_identity() {
+    let engine = crate::Engine::default();
+    let provider = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tglobal $g (export "g") (mut i32) (i32.const 5))
+              (tfunc (export "read") (result i32)
+                (tglobal.get $g)))
+            "#,
+    );
+    let consumer = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "env" "a" (tglobal $a (mut i32)))
+              (import "env" "b" (tglobal $b (mut i32)))
+              (tfunc (export "write_then_read_alias") (result i32)
+                (tglobal.set $a (i32.const 11))
+                (tglobal.get $b)))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
+    let global = provider.get_global(&mut store, "g").unwrap();
+    let consumer =
+        crate::Instance::new(&mut store, &consumer, &[global.into(), global.into()]).unwrap();
+    let write_then_read_alias = consumer
+        .get_typed_func::<(), i32>(&mut store, "write_then_read_alias")
+        .unwrap();
+    let read = provider
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    assert_eq!(write_then_read_alias.call(&mut store, ()).unwrap(), 11);
+    assert_eq!(read.call(&mut store, ()).unwrap(), 11);
+}
+
+#[test]
 fn mock_transaction_global_float_sets_commit_bitwise() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -10769,6 +10809,231 @@ fn native_runtime_enumeration_includes_transactional_physical_slots() {
 }
 
 #[test]
+fn native_exported_tmemory_copy_api_tracks_active_data_and_commits() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory $m (export "m") 1 2)
+              (tdata (tmemory $m) (i32.const 0) "INIT")
+              (tfunc (export "write")
+                (i32.tstore $m (i32.const 0) (i32.const 0x44434241))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    assert!(instance.get_memory(&mut store, "m").is_none());
+    let memory = instance.get_transactional_memory(&mut store, "m").unwrap();
+    let mut bytes = [0; 4];
+
+    memory.read(&store, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"INIT");
+
+    instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    memory.read(&store, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"ABCD");
+
+    // Host mutations join an already-active transaction rather than directly
+    // changing the sidecar. The copy API continues to expose committed bytes,
+    // and abort discards both the staged bytes and staged size.
+    {
+        let store = store.as_context_mut().0;
+        let region = store.transaction_region_runtime().clone();
+        store
+            .transaction_state_mut()
+            .begin_with_region_runtime(&region)
+            .unwrap();
+    }
+    memory.write(&mut store, 0, b"DROP").unwrap();
+    assert_eq!(memory.grow(&mut store, 1).unwrap(), 1);
+    memory.read(&store, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"ABCD");
+    assert_eq!(memory.size(&store), 1);
+    {
+        let store = store.as_context_mut().0;
+        let (state, objects) = store.transaction_state_and_object_table_mut();
+        state.abort_allocated_objects(objects).unwrap();
+    }
+    memory.read(&store, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"ABCD");
+    assert_eq!(memory.size(&store), 1);
+
+    memory.write(&mut store, 4, b"HOST").unwrap();
+    memory.read(&store, 4, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"HOST");
+    assert_eq!(memory.grow(&mut store, 1).unwrap(), 1);
+    assert_eq!(memory.size(&store), 2);
+}
+
+#[test]
+#[cfg(feature = "coredump")]
+fn native_tmemory_coredump_serializes_committed_sidecar_bytes() {
+    let mut config = crate::Config::new();
+    config.coredump_on_trap(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory $m (export "m") 1)
+              (tdata (tmemory $m) (i32.const 0) "INIT")
+              (tfunc (export "write")
+                (i32.tstore $m (i32.const 0) (i32.const 0x44434241)))
+            )
+            "#,
+    );
+    let consumer = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "env" "a" (tmemory 1))
+              (import "env" "b" (tmemory 1))
+              (func (export "trap") unreachable))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    instance
+        .get_typed_func::<(), ()>(&mut store, "write")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    let memory = instance.get_transactional_memory(&mut store, "m").unwrap();
+    let consumer =
+        crate::Instance::new(&mut store, &consumer, &[memory.into(), memory.into()]).unwrap();
+    let error = consumer
+        .get_typed_func::<(), ()>(&mut store, "trap")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap_err();
+    let dump = error.downcast_ref::<crate::WasmCoreDump>().unwrap();
+    assert_eq!(dump.transactional_memories().len(), 1);
+    let bytes = dump.serialize(&mut store, "transactional-memory");
+
+    let mut saw_tmemory = false;
+    let mut saw_committed_tdata = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        match payload.unwrap() {
+            wasmparser::Payload::MemorySection(section) => {
+                saw_tmemory |= section.into_iter().any(|memory| {
+                    memory.unwrap().namespace == wasmparser::EntityNamespace::Transactional
+                });
+            }
+            wasmparser::Payload::DataSection(section) => {
+                saw_committed_tdata |= section.into_iter().any(|data| {
+                    let data = data.unwrap();
+                    data.namespace == wasmparser::EntityNamespace::Transactional
+                        && data.data == b"ABCD"
+                });
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_tmemory);
+    assert!(saw_committed_tdata);
+}
+
+#[test]
+#[cfg(feature = "threads")]
+fn native_shared_tmemory_preserves_namespace_during_linking() {
+    let mut config = crate::Config::new();
+    config.wasm_threads(true);
+    config.shared_memory(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let transactional_provider =
+        transaction_test_module(&engine, r#"(module (tmemory (export "m") 1 1 shared))"#);
+    let ordinary_provider =
+        transaction_test_module(&engine, r#"(module (memory (export "m") 1 1 shared))"#);
+    let transactional_consumer = transaction_test_module(
+        &engine,
+        r#"(module (import "env" "m" (tmemory 1 1 shared)))"#,
+    );
+    let ordinary_consumer = transaction_test_module(
+        &engine,
+        r#"(module (import "env" "m" (memory 1 1 shared)))"#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let transactional = crate::Instance::new(&mut store, &transactional_provider, &[]).unwrap();
+    let ordinary = crate::Instance::new(&mut store, &ordinary_provider, &[]).unwrap();
+    let transactional_memory = transactional
+        .get_transactional_memory(&mut store, "m")
+        .unwrap();
+    assert!(transactional.get_shared_memory(&mut store, "m").is_none());
+    let ordinary_memory = ordinary.get_shared_memory(&mut store, "m").unwrap();
+
+    crate::Instance::new(
+        &mut store,
+        &transactional_consumer,
+        &[transactional_memory.clone().into()],
+    )
+    .unwrap();
+    assert!(
+        crate::Instance::new(
+            &mut store,
+            &ordinary_consumer,
+            &[transactional_memory.into()]
+        )
+        .is_err()
+    );
+    assert!(
+        crate::Instance::new(
+            &mut store,
+            &transactional_consumer,
+            &[ordinary_memory.into()]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+#[cfg(feature = "component-model")]
+fn component_transactional_core_alias_returns_structured_error() {
+    let mut module = wasm_encoder::Module::new();
+    let mut memories = wasm_encoder::MemorySection::new();
+    memories.memory(wasm_encoder::MemoryType {
+        namespace: wasm_encoder::EntityNamespace::Transactional,
+        minimum: 0,
+        maximum: None,
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+    module.section(&memories);
+    let mut exports = wasm_encoder::ExportSection::new();
+    exports.export("m", wasm_encoder::ExportKind::TMemory, 0);
+    module.section(&exports);
+
+    let mut component = wasm_encoder::Component::new();
+    component.section(&wasm_encoder::ModuleSection(&module));
+    let mut instances = wasm_encoder::InstanceSection::new();
+    instances.instantiate(0, core::iter::empty::<(&str, wasm_encoder::ModuleArg)>());
+    component.section(&instances);
+    let mut aliases = wasm_encoder::ComponentAliasSection::new();
+    aliases.alias(wasm_encoder::Alias::CoreInstanceExport {
+        instance: 0,
+        kind: wasm_encoder::ExportKind::TMemory,
+        name: "m",
+    });
+    component.section(&aliases);
+
+    let engine = crate::Engine::default();
+    let error = match crate::component::Component::new(&engine, component.finish()) {
+        Ok(_) => panic!("transactional core alias unexpectedly compiled"),
+        Err(error) => error,
+    };
+    let error = format!("{error:?}");
+    assert!(
+        error.contains("transactional core aliases in components are not supported"),
+        "{error}"
+    );
+}
+
+#[test]
 fn mock_transaction_read_after_write_uses_pending_store_scratch() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -10943,7 +11208,7 @@ fn mock_transaction_store_uses_imported_tmemory_vmctx() {
     );
     let mut store = crate::Store::new(&engine, ());
     let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
-    let tx = provider.get_memory(&mut store, "tx").unwrap();
+    let tx = provider.get_transactional_memory(&mut store, "tx").unwrap();
     let instance = crate::Instance::new(&mut store, &module, &[tx.into()]).unwrap();
     let write = instance
         .get_typed_func::<(), ()>(&mut store, "write")
@@ -10955,6 +11220,76 @@ fn mock_transaction_store_uses_imported_tmemory_vmctx() {
     write.call(&mut store, ()).unwrap();
 
     assert_eq!(read_tx.call(&mut store, ()).unwrap(), 66);
+}
+
+#[test]
+fn mock_transaction_tmemory_copy_preserves_distinct_import_vmctxs() {
+    let engine = crate::Engine::default();
+    let provider = |initial: i32| {
+        transaction_test_module(
+            &engine,
+            &format!(
+                r#"
+                    (module
+                      (tmemory $m (export "m") 1)
+                      (tfunc (export "initialize")
+                        (i32.tstore $m (i32.const 0) (i32.const {initial})))
+                      (tfunc (export "read") (result i32)
+                        (i32.tload $m (i32.const 0))))
+                "#
+            ),
+        )
+    };
+    let source_module = provider(17);
+    let destination_module = provider(34);
+    let consumer = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "env" "dst" (tmemory $dst 1))
+              (import "env" "src" (tmemory $src 1))
+              (tfunc (export "copy")
+                (tmemory.copy $dst $src (i32.const 0) (i32.const 0) (i32.const 4))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let source = crate::Instance::new(&mut store, &source_module, &[]).unwrap();
+    let destination = crate::Instance::new(&mut store, &destination_module, &[]).unwrap();
+    source
+        .get_typed_func::<(), ()>(&mut store, "initialize")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    destination
+        .get_typed_func::<(), ()>(&mut store, "initialize")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    let source_memory = source.get_transactional_memory(&mut store, "m").unwrap();
+    let destination_memory = destination
+        .get_transactional_memory(&mut store, "m")
+        .unwrap();
+    let consumer = crate::Instance::new(
+        &mut store,
+        &consumer,
+        &[destination_memory.into(), source_memory.into()],
+    )
+    .unwrap();
+
+    consumer
+        .get_typed_func::<(), ()>(&mut store, "copy")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+
+    assert_eq!(
+        destination
+            .get_typed_func::<(), i32>(&mut store, "read")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        17
+    );
 }
 
 #[test]
@@ -10985,7 +11320,7 @@ fn mock_transaction_distinguishes_imported_and_local_tmemory_overlays() {
     );
     let mut store = crate::Store::new(&engine, ());
     let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
-    let tx = provider.get_memory(&mut store, "tx").unwrap();
+    let tx = provider.get_transactional_memory(&mut store, "tx").unwrap();
     let instance = crate::Instance::new(&mut store, &module, &[tx.into()]).unwrap();
     let write_both = instance
         .get_typed_func::<(), ()>(&mut store, "write_both")

@@ -92,6 +92,7 @@ fn build_raw_intrinsics() -> Vec<u8> {
     globals.global(
         GlobalType {
             val_type: ValType::I32,
+            namespace: EntityNamespace::Ordinary,
             mutable: true,
             shared: false,
         },
@@ -101,6 +102,7 @@ fn build_raw_intrinsics() -> Vec<u8> {
     globals.global(
         GlobalType {
             val_type: ValType::I32,
+            namespace: EntityNamespace::Ordinary,
             mutable: true,
             shared: false,
         },

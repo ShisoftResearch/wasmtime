@@ -2539,16 +2539,16 @@ fn transaction_tglobal_get_impl(
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store, instance)?;
 
-    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    let (owner, global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let (staged, visibility) = {
         let state = store.store_opaque_mut().transaction_state_mut();
         ensure!(
             state.active_transaction().is_some(),
             "transaction operation requires an active transaction"
         );
-        state.acquire_global_read_owned(Some(instance), global_index.as_u32())?;
+        state.acquire_global_read_owned(Some(owner), global_index.as_u32())?;
         (
-            state.staged_global_owned(Some(instance), global_index.as_u32()),
+            state.staged_global_owned(Some(owner), global_index.as_u32()),
             state.active_visibility_read_context()?,
         )
     };
@@ -2556,10 +2556,10 @@ fn transaction_tglobal_get_impl(
         Some(snapshot) => snapshot,
         None => visibility.read_global(
             GranuleId::TGlobal {
-                instance: Some(instance.as_u32()),
+                instance: Some(owner.as_u32()),
                 global_index: global_index.as_u32(),
             },
-            || read_global_snapshot(store, instance, global_index, wasm_ty),
+            || read_global_snapshot(store, owner, global_index, wasm_ty),
         )?,
     };
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
@@ -2581,10 +2581,10 @@ fn transaction_tglobal_set_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    let (owner, global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = global_snapshot_from_tag(tag, value)?;
     ensure_active_transaction(store, instance)?;
-    stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
+    stage_transaction_global_snapshot(store, owner, global_index, wasm_ty, snapshot)
 }
 
 fn transaction_tglobal_startup_set(
@@ -2608,9 +2608,9 @@ fn transaction_tglobal_startup_set_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    let (owner, global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = global_snapshot_from_tag(tag, value)?;
-    write_or_stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
+    write_or_stage_transaction_global_snapshot(store, owner, global_index, wasm_ty, snapshot)
 }
 
 fn stage_transaction_global_snapshot(
@@ -2695,10 +2695,10 @@ fn transaction_tglobal_set_v128_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    let (owner, global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = GlobalSnapshot::V128(unsafe { *value.cast::<[u8; 16]>() });
     ensure_active_transaction(store, instance)?;
-    stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
+    stage_transaction_global_snapshot(store, owner, global_index, wasm_ty, snapshot)
 }
 
 fn transaction_tglobal_startup_set_v128(
@@ -2720,22 +2720,44 @@ fn transaction_tglobal_startup_set_v128_impl(
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
 
-    let (global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    let (owner, global_index, wasm_ty) = transaction_global(store, instance, global)?;
     let snapshot = GlobalSnapshot::V128(unsafe { *value.cast::<[u8; 16]>() });
-    write_or_stage_transaction_global_snapshot(store, instance, global_index, wasm_ty, snapshot)
+    write_or_stage_transaction_global_snapshot(store, owner, global_index, wasm_ty, snapshot)
 }
 
 fn transaction_global(
     store: &mut dyn VMStore,
     instance: InstanceId,
     global: u32,
-) -> Result<(TGlobalIndex, WasmValType)> {
+) -> Result<(InstanceId, TGlobalIndex, WasmValType)> {
     let global = TGlobalIndex::from_u32(global);
-    let instance_ref = store.instance_mut(instance);
-    let instance_ref = instance_ref.as_ref();
-    let module = instance_ref.env_module();
-    let wasm_ty = module.tglobals[global].wasm_ty;
-    Ok((global, wasm_ty))
+    let import = {
+        let instance_ref = store.instance_mut(instance);
+        let instance_ref = instance_ref.as_ref();
+        let module = instance_ref.env_module();
+        if module.defined_tglobal_index(global).is_some() {
+            return Ok((instance, global, module.tglobals[global].wasm_ty));
+        }
+        *instance_ref.imported_tglobal(global)
+    };
+
+    let vm::VMGlobalKind::Instance(physical_index) = import.kind else {
+        bail!("transactional globals must be backed by a core Wasm instance")
+    };
+    let vmctx = import
+        .vmctx
+        .context("transactional global import is missing its owning VMContext")?;
+    // SAFETY: validated instance imports contain the live VMContext of their
+    // provider in the same store.
+    let owner =
+        unsafe { vm::Instance::vmctx_instance_id(vm::VMContext::from_opaque(vmctx.as_non_null())) };
+    let owner_instance = store.instance(owner);
+    let owner_module = owner_instance.env_module();
+    let defined = owner_module
+        .defined_tglobal_index_from_runtime(physical_index)
+        .context("transactional global import refers to an ordinary global slot")?;
+    let global = owner_module.tglobal_index(defined);
+    Ok((owner, global, owner_module.tglobals[global].wasm_ty))
 }
 
 fn global_snapshot_from_tag(tag: u32, value: u64) -> Result<GlobalSnapshot> {
@@ -3088,34 +3110,50 @@ fn transaction_tmemory_fill_impl(
 
 fn transaction_tmemory_copy(
     store: &mut dyn VMStore,
-    instance: InstanceId,
+    dst_instance: InstanceId,
     dst_memory: u32,
+    src_vmctx: *mut u8,
     src_memory: u32,
     dst: u64,
     src: u64,
     len: u64,
 ) -> Result<()> {
-    let result =
-        transaction_tmemory_copy_impl(store, instance, dst_memory, src_memory, dst, src, len);
+    let result = transaction_tmemory_copy_impl(
+        store,
+        dst_instance,
+        dst_memory,
+        src_vmctx,
+        src_memory,
+        dst,
+        src,
+        len,
+    );
     let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
 fn transaction_tmemory_copy_impl(
     store: &mut dyn VMStore,
-    instance: InstanceId,
+    dst_instance: InstanceId,
     dst_memory: u32,
+    src_vmctx: *mut u8,
     src_memory: u32,
     dst: u64,
     src: u64,
     len: u64,
 ) -> Result<()> {
-    flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store, instance)?;
+    flush_pending_tmemory_store(store, dst_instance)?;
+    ensure_active_transaction(store, dst_instance)?;
+    let src_vmctx = NonNull::new(src_vmctx.cast::<vm::VMContext>())
+        .context("tmemory.copy source VMContext is null")?;
+    // SAFETY: compiled Wasm passes the live VMContext selected by the source
+    // transactional-memory operand.
+    let src_instance = unsafe { vm::Instance::vmctx_instance_id(src_vmctx) };
     let len = usize::try_from(len).context("tmemory copy length overflow")?;
     let (src_memory_index, src_snapshot) =
-        collect_defined_tmemory_snapshot(store, instance, src_memory, src, len)?;
-    let src_owner_instance_key = tmemory_transaction_owner_key(store, instance, src_memory_index)?;
+        collect_defined_tmemory_snapshot(store, src_instance, src_memory, src, len)?;
+    let src_owner_instance_key =
+        tmemory_transaction_owner_key(store, src_instance, src_memory_index)?;
     let bytes = store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -3127,8 +3165,9 @@ fn transaction_tmemory_copy_impl(
             &src_snapshot,
         )?;
     let (dst_memory_index, dst_snapshot) =
-        collect_defined_tmemory_snapshot(store, instance, dst_memory, dst, len)?;
-    let dst_owner_instance_key = tmemory_transaction_owner_key(store, instance, dst_memory_index)?;
+        collect_defined_tmemory_snapshot(store, dst_instance, dst_memory, dst, len)?;
+    let dst_owner_instance_key =
+        tmemory_transaction_owner_key(store, dst_instance, dst_memory_index)?;
     store
         .store_opaque_mut()
         .transaction_state_mut()
@@ -3223,6 +3262,89 @@ fn transaction_tmemory_static_init(
         bail!("transactional memory operation targeted non-transactional memory");
     };
     tmemory.commit_range(dst, bytes)
+}
+
+/// Copies committed transactional-memory bytes for host APIs and diagnostics.
+pub(crate) fn transactional_memory_host_read(
+    store: &StoreOpaque,
+    instance: InstanceId,
+    memory: DefinedMemoryIndex,
+    range: core::ops::Range<usize>,
+) -> Result<Vec<u8>> {
+    let instance_ref = store.instance(instance);
+    let module = instance_ref.env_module();
+    let defined = module
+        .defined_tmemory_index_from_runtime(memory)
+        .context("transactional memory handle refers to an ordinary memory slot")?;
+    let memory = module.tmemory_index(defined);
+    let tmemory = instance_ref
+        .get_tmemory(memory)
+        .context("transactional memory handle has no sidecar storage")?;
+    tmemory.read_committed(range)
+}
+
+/// Applies a host write through the same staging and commit path as `tstore`.
+pub(crate) fn transactional_memory_host_write(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: DefinedMemoryIndex,
+    dst: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let began = begin_transaction_constructor_boundary(store)?;
+    let operation = (|| {
+        let (memory_index, snapshot) =
+            collect_defined_tmemory_snapshot(store, instance, memory.as_u32(), dst, bytes.len())?;
+        let owner = tmemory_transaction_owner_key(store, instance, memory_index)?;
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .stage_tmemory_write_owned_from_snapshot(
+                owner,
+                memory_index.as_u32(),
+                dst,
+                bytes,
+                &snapshot,
+            )
+    })();
+    if operation.is_err() {
+        let _ = abort_active_transaction_on_error(store, &operation);
+    }
+    operation?;
+    if began {
+        let result = transaction_commit_impl(store, instance);
+        let _ = abort_active_transaction_on_error(store, &result);
+        result?;
+    }
+    Ok(())
+}
+
+/// Applies a host grow through the same staged size and commit path as
+/// `tmemory.grow`.
+pub(crate) fn transactional_memory_host_grow(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory: DefinedMemoryIndex,
+    delta: u64,
+) -> Result<Option<u64>> {
+    let began = begin_transaction_constructor_boundary(store)?;
+    let operation = transaction_tmemory_grow_impl(store, instance, memory.as_u32(), delta)
+        .and_then(|size| {
+            size.map(|size| {
+                u64::try_from(size.0).context("transactional memory page count overflow")
+            })
+            .transpose()
+        });
+    if operation.is_err() {
+        let _ = abort_active_transaction_on_error(store, &operation);
+    }
+    let previous = operation?;
+    if began {
+        let result = transaction_commit_impl(store, instance);
+        let _ = abort_active_transaction_on_error(store, &result);
+        result?;
+    }
+    Ok(previous)
 }
 
 fn transaction_tdata_drop(store: &mut dyn VMStore, instance: InstanceId, _data: u32) -> Result<()> {

@@ -5580,7 +5580,8 @@ impl FuncEnvironment<'_> {
         let mut pos = builder.cursor();
         let (dst_vmctx, defined_dst_memory) =
             self.tmemory_vmctx_and_defined_index(&mut pos, dst_memory);
-        let (_, defined_src_memory) = self.tmemory_vmctx_and_defined_index(&mut pos, src_memory);
+        let (src_vmctx, defined_src_memory) =
+            self.tmemory_vmctx_and_defined_index(&mut pos, src_memory);
         let dst = self.cast_index_to_i64(&mut pos, dst, dst_index_type);
         let src = self.cast_index_to_i64(&mut pos, src, src_index_type);
         let len = cast_index_value_to_i64(&mut pos, len);
@@ -5589,6 +5590,7 @@ impl FuncEnvironment<'_> {
             &[
                 dst_vmctx,
                 defined_dst_memory,
+                src_vmctx,
                 defined_src_memory,
                 dst,
                 src,

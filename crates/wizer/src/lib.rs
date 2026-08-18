@@ -212,6 +212,11 @@ impl Wizer {
                 wasmparser::TypeRef::Memory(_) => {
                     bail!("imported memories are not supported")
                 }
+                wasmparser::TypeRef::TGlobal(_)
+                | wasmparser::TypeRef::TTable(_)
+                | wasmparser::TypeRef::TMemory(_) => {
+                    bail!("transactional imports are not supported")
+                }
                 wasmparser::TypeRef::Func(_) => {}
                 wasmparser::TypeRef::FuncExact(_) => {}
                 wasmparser::TypeRef::Tag(_) => {}
@@ -364,6 +369,13 @@ impl Wizer {
                             wasmparser::ValType::Ref(_) => {
                                 bail!("unsupported mutable global containing a reference type")
                             }
+                        }
+                    }
+                }
+                wasmparser::Payload::DataSection(data) => {
+                    for data in data {
+                        if data?.namespace == wasmparser::EntityNamespace::Transactional {
+                            bail!("transactional data segments are not supported")
                         }
                     }
                 }

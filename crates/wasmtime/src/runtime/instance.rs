@@ -10,7 +10,7 @@ use crate::store::{
 use crate::types::matching;
 use crate::{
     AsContextMut, Engine, Export, Extern, Func, Global, Memory, Module, ModuleExport, SharedMemory,
-    StoreContext, StoreContextMut, Table, Tag, TypedFunc,
+    StoreContext, StoreContextMut, Table, Tag, TransactionalMemory, TypedFunc,
 };
 use alloc::sync::Arc;
 use core::ptr::NonNull;
@@ -571,6 +571,15 @@ impl Instance {
         self.get_export(&mut store, name)?.into_shared_memory()
     }
 
+    /// Looks up an exported [`TransactionalMemory`] value by name.
+    pub fn get_transactional_memory(
+        &self,
+        store: impl AsContextMut,
+        name: &str,
+    ) -> Option<TransactionalMemory> {
+        self.get_export(store, name)?.into_transactional_memory()
+    }
+
     /// Looks up an exported [`Global`] value by name.
     ///
     /// Returns `None` if there was no export named `name`, or if there was but
@@ -729,13 +738,10 @@ impl OwnedImports {
             (Extern::Memory(i), EntityType::Memory(_)) => {
                 self.memories.push(i.vmimport(store))?;
             }
-            (Extern::Memory(i), EntityType::TMemory(_)) => {
-                self.tmemories.push(i.vmimport(store))?;
-            }
             (Extern::SharedMemory(i), EntityType::Memory(_)) => {
                 self.memories.push(i.vmimport(store))?;
             }
-            (Extern::SharedMemory(i), EntityType::TMemory(_)) => {
+            (Extern::TransactionalMemory(i), EntityType::TMemory(_)) => {
                 self.tmemories.push(i.vmimport(store))?;
             }
             (Extern::Tag(i), EntityType::Tag(_)) => {
@@ -774,14 +780,11 @@ impl OwnedImports {
             (crate::runtime::vm::Export::Memory(m), EntityType::Memory(_)) => {
                 self.memories.push(m.vmimport(store))?;
             }
-            (crate::runtime::vm::Export::Memory(m), EntityType::TMemory(_)) => {
-                self.tmemories.push(m.vmimport(store))?;
-            }
             (crate::runtime::vm::Export::SharedMemory(_, vmimport), EntityType::Memory(_)) => {
                 self.memories.push(*vmimport)?;
             }
-            (crate::runtime::vm::Export::SharedMemory(_, vmimport), EntityType::TMemory(_)) => {
-                self.tmemories.push(*vmimport)?;
+            (crate::runtime::vm::Export::TransactionalMemory(memory), EntityType::TMemory(_)) => {
+                self.tmemories.push(memory.vmimport(store))?;
             }
             (crate::runtime::vm::Export::Tag(t), EntityType::Tag(_)) => {
                 self.tags.push(t.vmimport(store))?;
