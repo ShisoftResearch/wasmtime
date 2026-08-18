@@ -844,10 +844,6 @@ pub mod _internal {
             Ok(extern_ref)
         }
 
-        pub fn enable_live_wast_reference_fallbacks_for_test<T>(store: &mut crate::Store<T>) {
-            store.transaction_enable_live_wast_reference_fallbacks_for_test();
-        }
-
         #[derive(Clone, Copy, Debug)]
         pub enum TransactionWastRefExpectation {
             Any,
@@ -856,25 +852,77 @@ pub mod _internal {
             Struct,
             Array,
             Extern,
+            Func,
+            Null,
+        }
+
+        pub fn transaction_wast_tany_null() -> crate::Val {
+            crate::Val::default_for_ty(&crate::ValType::Ref(crate::RefType::new_transactional(
+                true,
+                crate::HeapType::Any,
+            )))
+            .expect("nullable transaction-any reference has a default value")
+        }
+
+        pub fn transaction_wast_ref_expectation_for_type(
+            ty: &crate::ValType,
+        ) -> Option<TransactionWastRefExpectation> {
+            let crate::ValType::Ref(ref_ty) = ty else {
+                return None;
+            };
+            if !ref_ty.is_transactional_ref() {
+                return None;
+            }
+            Some(match ref_ty.heap_type().top() {
+                crate::HeapType::Any => TransactionWastRefExpectation::Any,
+                crate::HeapType::Extern => TransactionWastRefExpectation::Extern,
+                crate::HeapType::Func => TransactionWastRefExpectation::Func,
+                other => unreachable!("unsupported transactional reference hierarchy: {other}"),
+            })
         }
 
         pub fn transaction_wast_ref_matches<T>(
             store: &crate::Store<T>,
-            raw: i32,
+            value: &crate::Val,
             expected: TransactionWastRefExpectation,
         ) -> bool {
-            use crate::runtime::transaction::{ObjectKind, ObjectTable};
+            use crate::runtime::transaction::ObjectKind;
 
-            let raw = u32::from_ne_bytes(raw.to_ne_bytes());
-            if ObjectTable::is_raw_i31_ref(u64::from(raw)) {
+            let is_transaction_ref = matches!(
+                value,
+                crate::Val::TransactionRef(_)
+                    | crate::Val::TransactionExternRef(_)
+                    | crate::Val::TransactionFuncRef(_)
+            );
+            if matches!(expected, TransactionWastRefExpectation::Any) {
+                return is_transaction_ref;
+            }
+            if matches!(expected, TransactionWastRefExpectation::Null) {
+                return match value {
+                    crate::Val::TransactionRef(reference) => reference.is_null(),
+                    crate::Val::TransactionExternRef(reference) => reference.is_none(),
+                    crate::Val::TransactionFuncRef(reference) => reference.is_none(),
+                    _ => false,
+                };
+            }
+            if matches!(value, crate::Val::TransactionExternRef(_)) {
+                return matches!(expected, TransactionWastRefExpectation::Extern);
+            }
+            if matches!(value, crate::Val::TransactionFuncRef(_)) {
+                return matches!(expected, TransactionWastRefExpectation::Func);
+            }
+            let crate::Val::TransactionRef(reference) = value else {
+                return false;
+            };
+            if reference.is_i31() {
                 return matches!(
                     expected,
-                    TransactionWastRefExpectation::Any
-                        | TransactionWastRefExpectation::Eq
-                        | TransactionWastRefExpectation::I31
+                    TransactionWastRefExpectation::Eq | TransactionWastRefExpectation::I31
                 );
             }
-
+            let Some(raw) = reference.object_raw() else {
+                return false;
+            };
             let object_table = store.transaction_object_table();
             let Some(object_id) = object_table.known_object_id_for_transaction_ref_handle(raw)
             else {
@@ -884,7 +932,6 @@ pub mod _internal {
                 return false;
             };
             match expected {
-                TransactionWastRefExpectation::Any => true,
                 TransactionWastRefExpectation::Eq => {
                     matches!(
                         kind,
@@ -894,11 +941,27 @@ pub mod _internal {
                 TransactionWastRefExpectation::I31 => kind == ObjectKind::I31,
                 TransactionWastRefExpectation::Struct => kind == ObjectKind::Struct,
                 TransactionWastRefExpectation::Array => kind == ObjectKind::Array,
-                // SHISOFT-TWASM-MOCK: pre-`TRefType` proposal WAST sometimes
-                // observes transaction object handles through externref-shaped
-                // helper boundaries.
-                TransactionWastRefExpectation::Extern => true,
+                TransactionWastRefExpectation::Extern
+                | TransactionWastRefExpectation::Func
+                | TransactionWastRefExpectation::Null => false,
+                TransactionWastRefExpectation::Any => unreachable!(),
             }
+        }
+
+        pub fn transaction_wast_extern_ref_host_matches<T>(
+            store: &crate::Store<T>,
+            value: &crate::Val,
+            expected: u32,
+        ) -> bool {
+            let crate::Val::TransactionExternRef(Some(reference)) = value else {
+                return false;
+            };
+            reference
+                .data(store)
+                .ok()
+                .flatten()
+                .and_then(|data| data.downcast_ref::<u32>().copied())
+                == Some(expected)
         }
 
         pub fn fail_next_commit_before_lp_for_test<T>(store: &mut crate::Store<T>) {

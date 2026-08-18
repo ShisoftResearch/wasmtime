@@ -303,10 +303,7 @@ fn memory_grow(
 }
 
 // Transaction libcalls execute compiled transactional operators against
-// store-local transaction state and per-instance `tmemory` sidecars. Remaining
-// `SHISOFT-TWASM-MOCK` tags mark explicit research boundaries such as live-only
-// reference bridge fallbacks; committed object/root and linear-memory paths use
-// the durable transaction machinery.
+// store-local transaction state and per-instance `tmemory` sidecars.
 fn transaction_enter_tfunc(store: &mut dyn VMStore, instance: InstanceId) -> Result<u32> {
     #[cfg(feature = "transaction-mvcc")]
     if store
@@ -417,6 +414,27 @@ fn transaction_commit(store: &mut dyn VMStore, instance: InstanceId) -> Result<(
     let result = transaction_commit_impl(store, instance);
     let _ = abort_active_transaction_on_error(store, &result);
     result
+}
+
+fn transaction_preserve_tref_result(
+    store: &mut dyn VMStore,
+    _instance: InstanceId,
+    raw_ref: u32,
+) -> Result<()> {
+    if raw_ref == 0 || ObjectTable::is_raw_i31_ref(u64::from(raw_ref)) {
+        return Ok(());
+    }
+
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
+    let Some(object_id) = state.known_object_id_for_transaction_ref_handle(object_table, raw_ref)
+    else {
+        // Transactional external identities share the `tany` hierarchy but
+        // are not backed by transaction object records.
+        return Ok(());
+    };
+    state.promote_transaction_object_graph(object_table, object_id)?;
+    Ok(())
 }
 
 fn transaction_commit_structured(store: &mut dyn VMStore, instance: InstanceId) -> Result<u32> {
@@ -2299,8 +2317,15 @@ fn install_mvcc_global_value(
     let owner = instance
         .map(InstanceId::from_u32)
         .unwrap_or(default_instance);
-    let mut global = global_definition_ptr(store, owner, TGlobalIndex::from_u32(global_index))?;
-    write_global_snapshot(store.store_opaque_mut(), unsafe { global.as_mut() }, value)
+    let global_index = TGlobalIndex::from_u32(global_index);
+    let (_, _, wasm_ty) = transaction_global(store, owner, global_index.as_u32())?;
+    let mut global = global_definition_ptr(store, owner, global_index)?;
+    write_transaction_global_snapshot(
+        store.store_opaque_mut(),
+        unsafe { global.as_mut() },
+        wasm_ty,
+        value,
+    )
 }
 
 #[cfg(feature = "transaction-mvcc")]
@@ -2372,6 +2397,7 @@ fn read_global_snapshot_like(
     global: TGlobalIndex,
     value: GlobalSnapshot,
 ) -> Result<GlobalSnapshot> {
+    let (_, _, wasm_ty) = transaction_global(store, instance, global.as_u32())?;
     let global = global_definition_ptr(store, instance, global)?;
     let global = unsafe { global.as_ref() };
     Ok(match value {
@@ -2384,7 +2410,13 @@ fn read_global_snapshot_like(
             GlobalSnapshot::FuncRef(unsafe { global.as_func_ref() as usize })
         }
         GlobalSnapshot::GcRef(_) => {
-            GlobalSnapshot::GcRef(unsafe { global.as_gc_ref().map_or(0, VMGcRef::as_raw_u32) })
+            let raw = match wasm_ty {
+                WasmValType::Ref(ref_ty) if ref_ty.is_transactional_ref() => unsafe {
+                    *global.as_u32()
+                },
+                _ => unsafe { global.as_gc_ref().map_or(0, VMGcRef::as_raw_u32) },
+            };
+            GlobalSnapshot::GcRef(raw)
         }
     })
 }
@@ -2781,9 +2813,10 @@ fn write_transaction_global_snapshot_direct(
 ) -> Result<()> {
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
     let mut global = global_definition_ptr(store, instance, global_index)?;
-    write_global_snapshot(
+    write_transaction_global_snapshot(
         store.store_opaque_mut(),
         unsafe { global.as_mut() },
+        wasm_ty,
         snapshot,
     )
 }
@@ -2935,9 +2968,12 @@ fn read_global_snapshot(
                 global.as_func_ref() as usize
             })),
             WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
-                Ok(GlobalSnapshot::GcRef(unsafe {
-                    global.as_gc_ref().map_or(0, VMGcRef::as_raw_u32)
-                }))
+                let raw = if ref_ty.is_transactional_ref() {
+                    unsafe { *global.as_u32() }
+                } else {
+                    unsafe { global.as_gc_ref().map_or(0, VMGcRef::as_raw_u32) }
+                };
+                Ok(GlobalSnapshot::GcRef(raw))
             }
             WasmHeapTopType::Cont => bail!("transactional contref global is not implemented yet"),
         },
@@ -2980,6 +3016,23 @@ fn write_global_snapshot(
         }
     }
     Ok(())
+}
+
+fn write_transaction_global_snapshot(
+    store: &mut StoreOpaque,
+    global: &mut vm::VMGlobalDefinition,
+    wasm_ty: WasmValType,
+    value: GlobalSnapshot,
+) -> Result<()> {
+    if let (GlobalSnapshot::GcRef(value), WasmValType::Ref(ref_ty)) = (value, wasm_ty)
+        && ref_ty.is_transactional_ref()
+    {
+        unsafe {
+            *global.as_u32_mut() = value;
+        }
+        return Ok(());
+    }
+    write_global_snapshot(store, global, value)
 }
 
 fn ensure_global_snapshot_type(value: GlobalSnapshot, ty: WasmValType) -> Result<()> {
@@ -5786,9 +5839,10 @@ fn apply_staged_transaction_record(
         } => {
             let owner = owner_instance.unwrap_or(instance);
             let global_index = TGlobalIndex::from_u32(*global_index);
+            let (_, _, wasm_ty) = transaction_global(store, owner, global_index.as_u32())?;
             let mut global = global_definition_ptr(store, owner, global_index)?;
             let global = unsafe { global.as_mut() };
-            write_global_snapshot(store.store_opaque_mut(), global, *value)?;
+            write_transaction_global_snapshot(store.store_opaque_mut(), global, wasm_ty, *value)?;
         }
         StagedRecord::MemorySize {
             owner_instance,

@@ -4,8 +4,80 @@ use std::fmt::{Display, LowerHex};
 use wasmtime::{Result, Store, Val, bail, error::Context as _, format_err};
 
 /// Translate from a `script::Value` to a `RuntimeValue`.
-pub fn val(ctx: &mut WastContext, v: &CoreConst) -> Result<Val> {
+pub fn val(ctx: &mut WastContext, v: &CoreConst, expected: &wasmtime::ValType) -> Result<Val> {
     use CoreConst::*;
+
+    #[cfg(feature = "transaction")]
+    if let Some(expected) =
+        wasmtime::_internal::transaction_persistence::transaction_wast_ref_expectation_for_type(
+            expected,
+        )
+    {
+        use wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation;
+        match (expected, v) {
+            (
+                TransactionWastRefExpectation::Any,
+                AnyRef {
+                    value: None | Some(json_from_wast::AnyRef::Null),
+                }
+                | TAnyRef {
+                    value: None | Some(json_from_wast::AnyRef::Null),
+                }
+                | NullRef
+                | TNullRef,
+            ) => {
+                return Ok(
+                    wasmtime::_internal::transaction_persistence::transaction_wast_tany_null(),
+                );
+            }
+            (
+                TransactionWastRefExpectation::Extern,
+                ExternRef {
+                    value: None | Some(json_from_wast::ExternRef::Null),
+                }
+                | TExternRef {
+                    value: None | Some(json_from_wast::ExternRef::Null),
+                }
+                | TNullExternRef,
+            ) => return Ok(Val::TransactionExternRef(None)),
+            (
+                TransactionWastRefExpectation::Func,
+                FuncRef {
+                    value: None | Some(json_from_wast::FuncRef::Null),
+                }
+                | TFuncRef {
+                    value: None | Some(json_from_wast::FuncRef::Null),
+                }
+                | TNullFuncRef,
+            ) => return Ok(Val::TransactionFuncRef(None)),
+            (
+                TransactionWastRefExpectation::Extern,
+                ExternRef {
+                    value: Some(json_from_wast::ExternRef::Host(x)),
+                }
+                | TExternRef {
+                    value: Some(json_from_wast::ExternRef::Host(x)),
+                },
+            )
+            | (
+                TransactionWastRefExpectation::Any,
+                AnyRef {
+                    value: Some(json_from_wast::AnyRef::Host(x)),
+                }
+                | TAnyRef {
+                    value: Some(json_from_wast::AnyRef::Host(x)),
+                },
+            ) => {
+                let reference = if let Some(rt) = ctx.async_runtime.as_ref() {
+                    rt.block_on(wasmtime::ExternRef::new_async(&mut ctx.core_store, x.0))?
+                } else {
+                    wasmtime::ExternRef::new(&mut ctx.core_store, x.0)?
+                };
+                return Ok(Val::TransactionExternRef(Some(reference)));
+            }
+            _ => {}
+        }
+    }
 
     Ok(match v {
         I32 { value } => Val::I32(value.0),
@@ -17,12 +89,30 @@ pub fn val(ctx: &mut WastContext, v: &CoreConst) -> Result<Val> {
             value: None | Some(json_from_wast::FuncRef::Null),
         } => Val::FuncRef(None),
 
+        #[cfg(feature = "transaction")]
+        TFuncRef {
+            value: None | Some(json_from_wast::FuncRef::Null),
+        } => Val::TransactionFuncRef(None),
+
         ExternRef {
             value: None | Some(json_from_wast::ExternRef::Null),
         } => Val::ExternRef(None),
         ExternRef {
             value: Some(json_from_wast::ExternRef::Host(x)),
         } => Val::ExternRef(if let Some(rt) = ctx.async_runtime.as_ref() {
+            Some(rt.block_on(wasmtime::ExternRef::new_async(&mut ctx.core_store, x.0))?)
+        } else {
+            Some(wasmtime::ExternRef::new(&mut ctx.core_store, x.0)?)
+        }),
+
+        #[cfg(feature = "transaction")]
+        TExternRef {
+            value: None | Some(json_from_wast::ExternRef::Null),
+        } => Val::TransactionExternRef(None),
+        #[cfg(feature = "transaction")]
+        TExternRef {
+            value: Some(json_from_wast::ExternRef::Host(x)),
+        } => Val::TransactionExternRef(if let Some(rt) = ctx.async_runtime.as_ref() {
             Some(rt.block_on(wasmtime::ExternRef::new_async(&mut ctx.core_store, x.0))?)
         } else {
             Some(wasmtime::ExternRef::new(&mut ctx.core_store, x.0)?)
@@ -42,6 +132,18 @@ pub fn val(ctx: &mut WastContext, v: &CoreConst) -> Result<Val> {
             let x = wasmtime::AnyRef::convert_extern(&mut ctx.core_store, x)?;
             Val::AnyRef(Some(x))
         }
+        #[cfg(feature = "transaction")]
+        TAnyRef {
+            value: None | Some(json_from_wast::AnyRef::Null),
+        } => wasmtime::_internal::transaction_persistence::transaction_wast_tany_null(),
+        #[cfg(feature = "transaction")]
+        TAnyRef {
+            value: Some(json_from_wast::AnyRef::Host(x)),
+        } => Val::TransactionExternRef(if let Some(rt) = ctx.async_runtime.as_ref() {
+            Some(rt.block_on(wasmtime::ExternRef::new_async(&mut ctx.core_store, x.0))?)
+        } else {
+            Some(wasmtime::ExternRef::new(&mut ctx.core_store, x.0)?)
+        }),
         NullRef => Val::AnyRef(None),
         other => bail!("couldn't convert {other:?} to a runtime value"),
     })
@@ -150,65 +252,150 @@ pub fn match_val(store: &mut Store<()>, actual: &Val, expected: &CoreConst) -> R
         }
 
         #[cfg(feature = "transaction")]
-        (Val::I32(raw), CoreConst::AnyRef { value: None })
+        (actual, CoreConst::AnyRef { value: None } | CoreConst::TAnyRef { value: None })
             if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
                 &*store,
-                *raw,
+                actual,
                 wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Any,
             ) =>
         {
             Ok(())
         }
         #[cfg(feature = "transaction")]
-        (Val::I32(raw), CoreConst::ExternRef { value: None })
+        (
+            actual,
+            CoreConst::ExternRef { value: None } | CoreConst::TExternRef { value: None },
+        )
             if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
                 &*store,
-                *raw,
+                actual,
                 wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Extern,
             ) =>
         {
             Ok(())
         }
         #[cfg(feature = "transaction")]
-        (Val::I32(raw), CoreConst::EqRef)
+        (
+            actual,
+            CoreConst::FuncRef { value: None } | CoreConst::TFuncRef { value: None },
+        )
             if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
                 &*store,
-                *raw,
+                actual,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Func,
+            ) =>
+        {
+            Ok(())
+        }
+        #[cfg(feature = "transaction")]
+        (actual, CoreConst::EqRef | CoreConst::TEqRef)
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                actual,
                 wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Eq,
             ) =>
         {
             Ok(())
         }
         #[cfg(feature = "transaction")]
-        (Val::I32(raw), CoreConst::I31Ref)
+        (actual, CoreConst::I31Ref | CoreConst::TI31Ref)
             if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
                 &*store,
-                *raw,
+                actual,
                 wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::I31,
             ) =>
         {
             Ok(())
         }
         #[cfg(feature = "transaction")]
-        (Val::I32(raw), CoreConst::StructRef)
+        (actual, CoreConst::StructRef | CoreConst::TStructRef)
             if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
                 &*store,
-                *raw,
+                actual,
                 wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Struct,
             ) =>
         {
             Ok(())
         }
         #[cfg(feature = "transaction")]
-        (Val::I32(raw), CoreConst::ArrayRef)
+        (actual, CoreConst::ArrayRef | CoreConst::TArrayRef)
             if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
                 &*store,
-                *raw,
+                actual,
                 wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Array,
             ) =>
         {
             Ok(())
         }
+
+        #[cfg(feature = "transaction")]
+        (
+            actual,
+            CoreConst::ExternRef {
+                value: Some(json_from_wast::ExternRef::Host(expected)),
+            }
+            | CoreConst::TExternRef {
+                value: Some(json_from_wast::ExternRef::Host(expected)),
+            },
+        ) if wasmtime::_internal::transaction_persistence::transaction_wast_extern_ref_host_matches(
+            &*store,
+            actual,
+            expected.0,
+        ) => Ok(()),
+
+        #[cfg(feature = "transaction")]
+        (
+            actual,
+            CoreConst::FuncRef {
+                value: Some(json_from_wast::FuncRef::Index(_)),
+            }
+            | CoreConst::TFuncRef {
+                value: Some(json_from_wast::FuncRef::Index(_)),
+            },
+        ) if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+            &*store,
+            actual,
+            wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Func,
+        ) => Ok(()),
+
+        #[cfg(feature = "transaction")]
+        (
+            actual,
+            CoreConst::RefNull
+                | CoreConst::NullRef
+                | CoreConst::TNullRef
+                | CoreConst::TNullFuncRef
+                | CoreConst::TNullExternRef
+                | CoreConst::TAnyRef {
+                    value: Some(json_from_wast::AnyRef::Null),
+                }
+                | CoreConst::TFuncRef {
+                    value: Some(json_from_wast::FuncRef::Null),
+                }
+                | CoreConst::TExternRef {
+                    value: Some(json_from_wast::ExternRef::Null),
+                },
+        )
+            if wasmtime::_internal::transaction_persistence::transaction_wast_ref_matches(
+                &*store,
+                actual,
+                wasmtime::_internal::transaction_persistence::TransactionWastRefExpectation::Null,
+            ) => Ok(()),
+
+        #[cfg(feature = "transaction")]
+        (
+            actual,
+            CoreConst::AnyRef {
+                value: Some(json_from_wast::AnyRef::Host(expected)),
+            }
+            | CoreConst::TAnyRef {
+                value: Some(json_from_wast::AnyRef::Host(expected)),
+            },
+        ) if wasmtime::_internal::transaction_persistence::transaction_wast_extern_ref_host_matches(
+            &*store,
+            actual,
+            expected.0,
+        ) => Ok(()),
 
         (Val::AnyRef(Some(x)), CoreConst::EqRef) => {
             if x.is_eqref(store)? {

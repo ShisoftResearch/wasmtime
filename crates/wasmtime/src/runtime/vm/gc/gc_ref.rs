@@ -537,6 +537,10 @@ impl VMGcRef {
                     "initializing continuation references in struct fields not yet supported"
                 );
             }
+            #[cfg(feature = "transaction")]
+            Val::TransactionRef(_) | Val::TransactionExternRef(_) | Val::TransactionFuncRef(_) => {
+                bail_bug!("transactional references cannot initialize ordinary GC fields");
+            }
         }
     }
 
@@ -618,6 +622,10 @@ impl VMGcRef {
             Val::ContRef(_) => {
                 // TODO(#10248): Implement struct continuation reference field handling
                 bail_bug!("setting continuation references in struct fields not yet supported");
+            }
+            #[cfg(feature = "transaction")]
+            Val::TransactionRef(_) | Val::TransactionExternRef(_) | Val::TransactionFuncRef(_) => {
+                bail_bug!("transactional references cannot be written to ordinary GC fields");
             }
         }
     }

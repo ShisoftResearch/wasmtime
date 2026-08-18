@@ -108,7 +108,7 @@ impl OrdinaryGcPromotionAdapter for NoOrdinaryGcPromotionAdapter {
 }
 
 impl TransactionState {
-    pub(super) fn promote_transaction_object_graph(
+    pub(crate) fn promote_transaction_object_graph(
         &mut self,
         object_table: &mut ObjectTable,
         source: ObjectId,

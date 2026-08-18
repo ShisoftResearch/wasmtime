@@ -1,3 +1,5 @@
+#[cfg(feature = "transaction")]
+use crate::store::StoreId;
 use crate::store::{AutoAssertNoGc, StoreOpaque};
 use crate::{
     AnyRef, ArrayRef, AsContext, AsContextMut, ExnRef, ExternRef, Func, HeapType, RefType, Rooted,
@@ -13,6 +15,171 @@ pub use crate::runtime::vm::ValRaw;
 /// with the GC system (see #10248).
 #[derive(Debug, Clone, Copy)]
 pub struct ContRef;
+
+/// Internal embedder representation for a transactional Wasm reference in
+/// the `tany` hierarchy.
+///
+/// This type is public only because it is carried by the public [`Val`] enum;
+/// transactional external and function references are separate inline `Val`
+/// variants so `Val` retains its existing size. The contents are intentionally
+/// opaque: transactional references originate from typed Wasm boundaries and
+/// cannot be forged from integer bits.
+#[cfg(feature = "transaction")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct TransactionRef {
+    store: Option<StoreId>,
+    inner: TransactionRefInner,
+}
+
+#[cfg(feature = "transaction")]
+#[derive(Debug, Clone, Copy)]
+enum TransactionRefInner {
+    Null,
+    Object(crate::runtime::transaction::TransactionObjectRefRaw),
+    I31(u32),
+}
+
+#[cfg(feature = "transaction")]
+impl TransactionRef {
+    fn null(ref_ty: &RefType) -> Self {
+        debug_assert!(ref_ty.is_transactional_ref());
+        debug_assert!(matches!(ref_ty.heap_type().top(), HeapType::Any));
+        Self {
+            store: None,
+            inner: TransactionRefInner::Null,
+        }
+    }
+
+    unsafe fn from_raw(store: &mut AutoAssertNoGc<'_>, raw: ValRaw, ref_ty: &RefType) -> Val {
+        debug_assert!(ref_ty.is_transactional_ref());
+        match ref_ty.heap_type().top() {
+            HeapType::Func => {
+                let raw = raw.get_funcref();
+                Val::TransactionFuncRef(match core::ptr::NonNull::new(raw) {
+                    Some(raw) => Some(unsafe { Func::from_vm_func_ref(store.id(), raw.cast()) }),
+                    None => None,
+                })
+            }
+            HeapType::Extern => {
+                let raw = raw.get_externref();
+                Val::TransactionExternRef(ExternRef::_from_raw(store, raw))
+            }
+            HeapType::Any => {
+                let raw = raw.get_anyref();
+                let inner = if raw == 0 {
+                    TransactionRefInner::Null
+                } else if crate::runtime::transaction::ObjectTable::is_raw_i31_ref(u64::from(raw)) {
+                    TransactionRefInner::I31(raw)
+                } else if store
+                    .transaction_state()
+                    .known_object_id_for_transaction_ref_handle(
+                        store.transaction_object_table(),
+                        raw,
+                    )
+                    .is_some()
+                {
+                    TransactionRefInner::Object(
+                        crate::runtime::transaction::TransactionObjectRefRaw::from_raw(raw),
+                    )
+                } else {
+                    return Val::TransactionExternRef(Some(
+                        ExternRef::_from_raw(store, raw)
+                            .expect("non-object transactional anyref must be an external identity"),
+                    ));
+                };
+                Val::TransactionRef(Self {
+                    store: (!matches!(inner, TransactionRefInner::Null)).then(|| store.id()),
+                    inner,
+                })
+            }
+            other => unreachable!("unsupported transactional reference hierarchy: {other}"),
+        }
+    }
+
+    fn to_raw(self, store: &mut AutoAssertNoGc<'_>) -> Result<ValRaw> {
+        ensure!(
+            self.store.is_none_or(|id| id == store.id()),
+            "transactional reference used with wrong store"
+        );
+        Ok(match self.inner {
+            TransactionRefInner::Null => ValRaw::null(),
+            TransactionRefInner::Object(raw) => ValRaw::anyref(raw.as_raw()),
+            TransactionRefInner::I31(raw) => ValRaw::anyref(raw),
+        })
+    }
+
+    fn actual_heap_type(self, store: &StoreOpaque) -> Result<HeapType> {
+        ensure!(
+            self.store.is_none_or(|id| id == store.id()),
+            "transactional reference used with wrong store"
+        );
+        Ok(match self.inner {
+            TransactionRefInner::Null => HeapType::None,
+            TransactionRefInner::I31(_) => HeapType::I31,
+            TransactionRefInner::Object(raw) => {
+                let object_table = store.transaction_object_table();
+                let transaction_state = store.transaction_state();
+                let object_id = transaction_state
+                    .known_object_id_for_transaction_ref_handle(object_table, raw.as_raw())
+                    .context("unknown transaction object reference handle")?;
+                match (
+                    transaction_state.object_kind(object_table, object_id)?,
+                    transaction_state.runtime_type_index(object_table, object_id)?,
+                ) {
+                    (crate::runtime::transaction::ObjectKind::Struct, Some(index)) => {
+                        HeapType::ConcreteStruct(crate::StructType::from_shared_type_index(
+                            store.engine(),
+                            index,
+                        ))
+                    }
+                    (crate::runtime::transaction::ObjectKind::Struct, None) => HeapType::Struct,
+                    (crate::runtime::transaction::ObjectKind::Array, Some(index)) => {
+                        HeapType::ConcreteArray(crate::ArrayType::from_shared_type_index(
+                            store.engine(),
+                            index,
+                        ))
+                    }
+                    (crate::runtime::transaction::ObjectKind::Array, None) => HeapType::Array,
+                    (crate::runtime::transaction::ObjectKind::I31, _) => HeapType::I31,
+                    (crate::runtime::transaction::ObjectKind::Extern, _) => HeapType::Extern,
+                    (crate::runtime::transaction::ObjectKind::Func, Some(index)) => {
+                        HeapType::ConcreteFunc(crate::FuncType::from_shared_type_index(
+                            store.engine(),
+                            index,
+                        ))
+                    }
+                    (crate::runtime::transaction::ObjectKind::Func, None) => HeapType::Func,
+                }
+            }
+        })
+    }
+
+    fn matches_ty(self, store: &StoreOpaque, ref_ty: &RefType) -> Result<bool> {
+        if !ref_ty.is_transactional_ref()
+            || self.store.is_some_and(|id| id != store.id())
+            || matches!(self.inner, TransactionRefInner::Null) && !ref_ty.is_nullable()
+        {
+            return Ok(false);
+        }
+        Ok(self.actual_heap_type(store)?.matches(ref_ty.heap_type()))
+    }
+
+    pub(crate) fn object_raw(self) -> Option<u32> {
+        match self.inner {
+            TransactionRefInner::Object(raw) => Some(raw.as_raw()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_i31(self) -> bool {
+        matches!(self.inner, TransactionRefInner::I31(_))
+    }
+
+    pub(crate) fn is_null(self) -> bool {
+        matches!(self.inner, TransactionRefInner::Null)
+    }
+}
 
 /// Possible runtime values that a WebAssembly module can either consume or
 /// produce.
@@ -62,6 +229,21 @@ pub enum Val {
     /// Note: This is currently a stub implementation as continuation objects
     /// are not yet fully integrated with the GC system. See #10248.
     ContRef(Option<ContRef>),
+
+    /// A typed transactional internal reference.
+    #[cfg(feature = "transaction")]
+    #[doc(hidden)]
+    TransactionRef(TransactionRef),
+
+    /// A typed transactional external reference.
+    #[cfg(feature = "transaction")]
+    #[doc(hidden)]
+    TransactionExternRef(Option<Rooted<ExternRef>>),
+
+    /// A typed transactional function reference.
+    #[cfg(feature = "transaction")]
+    #[doc(hidden)]
+    TransactionFuncRef(Option<Func>),
 }
 
 macro_rules! accessors {
@@ -137,6 +319,17 @@ impl Val {
             ValType::V128 => Some(Val::V128(V128::from(0))),
             ValType::Ref(ref_ty) => {
                 if ref_ty.is_nullable() {
+                    #[cfg(feature = "transaction")]
+                    if ref_ty.is_transactional_ref() {
+                        return Some(match ref_ty.heap_type().top() {
+                            HeapType::Any => Val::TransactionRef(TransactionRef::null(ref_ty)),
+                            HeapType::Extern => Val::TransactionExternRef(None),
+                            HeapType::Func => Val::TransactionFuncRef(None),
+                            other => unreachable!(
+                                "unsupported transactional reference hierarchy: {other}"
+                            ),
+                        });
+                    }
                     Some(Val::null_ref(ref_ty.heap_type()))
                 } else {
                     None
@@ -185,6 +378,28 @@ impl Val {
                     "continuation references not yet supported in embedder API"
                 ));
             }
+            #[cfg(feature = "transaction")]
+            Val::TransactionRef(reference) => ValType::Ref(RefType::new_transactional(
+                matches!(reference.inner, TransactionRefInner::Null),
+                reference.actual_heap_type(store)?,
+            )),
+            #[cfg(feature = "transaction")]
+            Val::TransactionExternRef(reference) => ValType::Ref(RefType::new_transactional(
+                reference.is_none(),
+                if reference.is_some() {
+                    HeapType::Extern
+                } else {
+                    HeapType::NoExtern
+                },
+            )),
+            #[cfg(feature = "transaction")]
+            Val::TransactionFuncRef(reference) => ValType::Ref(RefType::new_transactional(
+                reference.is_none(),
+                match reference {
+                    Some(func) => HeapType::ConcreteFunc(func.load_ty(store)),
+                    None => HeapType::NoFunc,
+                },
+            )),
         })
     }
 
@@ -202,6 +417,15 @@ impl Val {
     pub(crate) fn _matches_ty(&self, store: &StoreOpaque, ty: &ValType) -> Result<bool> {
         assert!(self.comes_from_same_store(store));
         assert!(ty.comes_from_same_engine(store.engine()));
+        #[cfg(feature = "transaction")]
+        if matches!(ty, ValType::Ref(ref_ty) if ref_ty.is_transactional_ref())
+            && !matches!(
+                self,
+                Val::TransactionRef(_) | Val::TransactionExternRef(_) | Val::TransactionFuncRef(_)
+            )
+        {
+            return Ok(false);
+        }
         Ok(match (self, ty) {
             (Val::I32(_), ValType::I32)
             | (Val::I64(_), ValType::I64)
@@ -215,6 +439,39 @@ impl Val {
             }
             (Val::AnyRef(a), ValType::Ref(ref_ty)) => Ref::from(*a)._matches_ty(store, ref_ty)?,
             (Val::ExnRef(e), ValType::Ref(ref_ty)) => Ref::from(*e)._matches_ty(store, ref_ty)?,
+            #[cfg(feature = "transaction")]
+            (Val::TransactionRef(reference), ValType::Ref(ref_ty)) => {
+                reference.matches_ty(store, ref_ty)?
+            }
+            #[cfg(feature = "transaction")]
+            (Val::TransactionExternRef(reference), ValType::Ref(ref_ty)) => {
+                ref_ty.is_transactional_ref()
+                    && reference.is_none_or(|reference| reference.comes_from_same_store(store))
+                    && (reference.is_some() || ref_ty.is_nullable())
+                    && match ref_ty.heap_type().top() {
+                        HeapType::Extern => true,
+                        // `tany.convert_textern` preserves the external
+                        // identity while moving it into the transaction-any
+                        // hierarchy.
+                        HeapType::Any => reference.is_some(),
+                        HeapType::Func => false,
+                        other => {
+                            unreachable!("unsupported transactional reference hierarchy: {other}")
+                        }
+                    }
+            }
+            #[cfg(feature = "transaction")]
+            (Val::TransactionFuncRef(reference), ValType::Ref(ref_ty)) => {
+                ref_ty.is_transactional_ref()
+                    && reference.is_none_or(|reference| reference.comes_from_same_store(store))
+                    && (reference.is_some() || ref_ty.is_nullable())
+                    && match reference {
+                        Some(func) => {
+                            HeapType::ConcreteFunc(func.load_ty(store)).matches(ref_ty.heap_type())
+                        }
+                        None => HeapType::NoFunc.matches(ref_ty.heap_type()),
+                    }
+            }
 
             (Val::I32(_), _)
             | (Val::I64(_), _)
@@ -226,6 +483,10 @@ impl Val {
             | (Val::AnyRef(_), _)
             | (Val::ExnRef(_), _)
             | (Val::ContRef(_), _) => false,
+            #[cfg(feature = "transaction")]
+            (Val::TransactionRef(_), _)
+            | (Val::TransactionExternRef(_), _)
+            | (Val::TransactionFuncRef(_), _) => false,
         })
     }
 
@@ -288,6 +549,12 @@ impl Val {
                     "continuation references not yet supported in to_raw conversion"
                 ))
             }
+            #[cfg(feature = "transaction")]
+            Val::TransactionRef(_) | Val::TransactionExternRef(_) | Val::TransactionFuncRef(_) => {
+                bail!(
+                    "transactional references require a typed Wasm function boundary for raw conversion"
+                )
+            }
         }
     }
 
@@ -299,7 +566,12 @@ impl Val {
     /// [`Func::from_raw`] are unsafe. Additionally there's no guarantee
     /// otherwise that `raw` should have the type `ty` specified.
     pub unsafe fn from_raw(mut store: impl AsContextMut, raw: ValRaw, ty: ValType) -> Val {
-        let mut store = AutoAssertNoGc::new(store.as_context_mut().0);
+        let store = store.as_context_mut().0;
+        #[cfg(feature = "transaction")]
+        if let Some(value) = unsafe { Self::transaction_ref_from_raw(store, raw, &ty) } {
+            return value;
+        }
+        let mut store = AutoAssertNoGc::new(store);
         // SAFETY: `_from_raw` has the same contract as this function.
         unsafe { Self::_from_raw(&mut store, raw, &ty) }
     }
@@ -310,6 +582,11 @@ impl Val {
         raw: ValRaw,
         ty: &ValType,
     ) -> Val {
+        #[cfg(feature = "transaction")]
+        assert!(
+            !matches!(ty, ValType::Ref(ref_ty) if ref_ty.is_transactional_ref()),
+            "transactional references must be decoded before generic Val::from_raw"
+        );
         match ty {
             ValType::I32 => Val::I32(raw.get_i32()),
             ValType::I64 => Val::I64(raw.get_i64()),
@@ -362,6 +639,59 @@ impl Val {
         }
     }
 
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_ref_to_raw(
+        &self,
+        store: &mut StoreOpaque,
+        ty: &ValType,
+    ) -> Result<Option<ValRaw>> {
+        let ValType::Ref(ref_ty) = ty else {
+            return Ok(None);
+        };
+        if !ref_ty.is_transactional_ref() {
+            return Ok(None);
+        }
+        self.ensure_matches_ty(store, ty)?;
+        let mut store = AutoAssertNoGc::new(store);
+        Ok(Some(match self {
+            Val::TransactionRef(reference) => reference.to_raw(&mut store)?,
+            Val::TransactionExternRef(reference) => ValRaw::externref(match reference {
+                Some(reference) => reference._to_raw(&mut store)?,
+                None => 0,
+            }),
+            Val::TransactionFuncRef(reference) => ValRaw::funcref(match reference {
+                Some(reference) => reference.to_raw_(&mut store),
+                None => ptr::null_mut(),
+            }),
+            _ => {
+                unreachable!("transactional reference type check accepted a non-transaction value")
+            }
+        }))
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) unsafe fn transaction_ref_from_raw(
+        store: &mut StoreOpaque,
+        raw: ValRaw,
+        ty: &ValType,
+    ) -> Option<Val> {
+        let ValType::Ref(ref_ty) = ty else {
+            return None;
+        };
+        if !ref_ty.is_transactional_ref() {
+            return None;
+        }
+        let mut store = AutoAssertNoGc::new(store);
+        let reference = unsafe { TransactionRef::from_raw(&mut store, raw, ref_ty) };
+        assert!(
+            reference
+                ._matches_ty(&store, &ValType::Ref(ref_ty.clone()))
+                .unwrap(),
+            "raw transactional reference does not match its function type"
+        );
+        Some(reference)
+    }
+
     accessors! {
         e
         (I32(i32) i32 unwrap_i32 *e)
@@ -384,6 +714,10 @@ impl Val {
             Val::ExnRef(e) => Some(Ref::Exn(e)),
             Val::I32(_) | Val::I64(_) | Val::F32(_) | Val::F64(_) | Val::V128(_) => None,
             Val::ContRef(_) => None, // TODO(#10248): Return proper Ref::Cont when available
+            #[cfg(feature = "transaction")]
+            Val::TransactionRef(_) | Val::TransactionExternRef(_) | Val::TransactionFuncRef(_) => {
+                None
+            }
         }
     }
 
@@ -533,6 +867,17 @@ impl Val {
 
             // Continuation references are not yet associated with stores
             Val::ContRef(_) => true, // TODO(#10248): Proper store association when implemented
+
+            #[cfg(feature = "transaction")]
+            Val::TransactionRef(reference) => reference.store.is_none_or(|id| id == store.id()),
+            #[cfg(feature = "transaction")]
+            Val::TransactionExternRef(reference) => reference
+                .as_ref()
+                .is_none_or(|reference| reference.comes_from_same_store(store)),
+            #[cfg(feature = "transaction")]
+            Val::TransactionFuncRef(reference) => reference
+                .as_ref()
+                .is_none_or(|reference| reference.comes_from_same_store(store)),
         }
     }
 }

@@ -317,6 +317,12 @@ impl Global {
                         "setting non-null continuation references in globals not yet supported"
                     ));
                 }
+                #[cfg(feature = "transaction")]
+                Val::TransactionRef(_)
+                | Val::TransactionExternRef(_)
+                | Val::TransactionFuncRef(_) => {
+                    bail!("transactional references cannot initialize an ordinary global")
+                }
             }
         }
         Ok(())

@@ -225,7 +225,8 @@ impl ValType {
             self,
             ValType::Ref(RefType {
                 is_nullable: true,
-                heap_type: HeapType::Func
+                heap_type: HeapType::Func,
+                is_transactional: false,
             })
         )
     }
@@ -237,7 +238,8 @@ impl ValType {
             self,
             ValType::Ref(RefType {
                 is_nullable: true,
-                heap_type: HeapType::Extern
+                heap_type: HeapType::Extern,
+                is_transactional: false,
             })
         )
     }
@@ -249,7 +251,8 @@ impl ValType {
             self,
             ValType::Ref(RefType {
                 is_nullable: true,
-                heap_type: HeapType::Any
+                heap_type: HeapType::Any,
+                is_transactional: false,
             })
         )
     }
@@ -261,7 +264,8 @@ impl ValType {
             self,
             ValType::Ref(RefType {
                 is_nullable: true,
-                heap_type: HeapType::Cont
+                heap_type: HeapType::Cont,
+                is_transactional: false,
             })
         )
     }
@@ -412,6 +416,7 @@ impl ValType {
 pub struct RefType {
     is_nullable: bool,
     heap_type: HeapType,
+    is_transactional: bool,
 }
 
 impl fmt::Debug for RefType {
@@ -422,7 +427,11 @@ impl fmt::Debug for RefType {
 
 impl fmt::Display for RefType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "(ref ")?;
+        write!(
+            f,
+            "({} ",
+            if self.is_transactional { "tref" } else { "ref" }
+        )?;
         if self.is_nullable() {
             write!(f, "null ")?;
         }
@@ -435,84 +444,98 @@ impl RefType {
     pub const EXTERNREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Extern,
+        is_transactional: false,
     };
 
     /// The `nullexternref` type, aka `(ref null noextern)`.
     pub const NULLEXTERNREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::NoExtern,
+        is_transactional: false,
     };
 
     /// The `funcref` type, aka `(ref null func)`.
     pub const FUNCREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Func,
+        is_transactional: false,
     };
 
     /// The `nullfuncref` type, aka `(ref null nofunc)`.
     pub const NULLFUNCREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::NoFunc,
+        is_transactional: false,
     };
 
     /// The `anyref` type, aka `(ref null any)`.
     pub const ANYREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Any,
+        is_transactional: false,
     };
 
     /// The `eqref` type, aka `(ref null eq)`.
     pub const EQREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Eq,
+        is_transactional: false,
     };
 
     /// The `i31ref` type, aka `(ref null i31)`.
     pub const I31REF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::I31,
+        is_transactional: false,
     };
 
     /// The `arrayref` type, aka `(ref null array)`.
     pub const ARRAYREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Array,
+        is_transactional: false,
     };
 
     /// The `structref` type, aka `(ref null struct)`.
     pub const STRUCTREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Struct,
+        is_transactional: false,
     };
 
     /// The `nullref` type, aka `(ref null none)`.
     pub const NULLREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::None,
+        is_transactional: false,
     };
 
     /// The `contref` type, aka `(ref null cont)`.
     pub const CONTREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Cont,
+        is_transactional: false,
     };
 
     /// The `nullcontref` type, aka `(ref null nocont)`.
     pub const NULLCONTREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::NoCont,
+        is_transactional: false,
     };
 
     /// The `exnref` type, aka `(ref null exn)`.
     pub const EXNREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::Exn,
+        is_transactional: false,
     };
 
     /// The `nullexnref` type, aka `(ref null noexn)`.
     pub const NULLEXNREF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::NoExn,
+        is_transactional: false,
     };
 
     /// Construct a new reference type.
@@ -520,7 +543,20 @@ impl RefType {
         RefType {
             is_nullable,
             heap_type,
+            is_transactional: false,
         }
+    }
+
+    pub(crate) fn new_transactional(is_nullable: bool, heap_type: HeapType) -> RefType {
+        RefType {
+            is_nullable,
+            heap_type,
+            is_transactional: true,
+        }
+    }
+
+    pub(crate) fn is_transactional_ref(&self) -> bool {
+        self.is_transactional
     }
 
     /// Can this type of reference be null?
@@ -543,6 +579,9 @@ impl RefType {
     /// Panics if either type is associated with a different engine from the
     /// other.
     pub fn matches(&self, other: &RefType) -> bool {
+        if self.is_transactional != other.is_transactional {
+            return false;
+        }
         if self.is_nullable() && !other.is_nullable() {
             return false;
         }
@@ -580,6 +619,7 @@ impl RefType {
         WasmRefType {
             nullable: self.is_nullable(),
             heap_type: self.heap_type().to_wasm_type(),
+            transactional: self.is_transactional,
         }
     }
 
@@ -587,6 +627,7 @@ impl RefType {
         RefType {
             is_nullable: ty.nullable,
             heap_type: HeapType::from_wasm_type(engine, &ty.heap_type),
+            is_transactional: ty.transactional,
         }
     }
 

@@ -1157,14 +1157,6 @@ impl Func {
         }
 
         for (ty, arg) in ty.params().zip(params) {
-            #[cfg(feature = "transaction")]
-            if store
-                .0
-                .transaction_wast_result_raw_from_val(arg, &ty)
-                .is_some()
-            {
-                continue;
-            }
             arg.ensure_matches_ty(store.0, &ty)
                 .context("argument type mismatch")?;
             if !arg.comes_from_same_store(store.0) {
@@ -1196,7 +1188,7 @@ impl Func {
         values_vec.resize_with(values_vec_size, || ValRaw::v128(0))?;
         for ((arg, slot), ty) in params.iter().cloned().zip(&mut values_vec).zip(ty.params()) {
             #[cfg(feature = "transaction")]
-            if let Some(transaction_ref) = store.0.transaction_wast_result_raw_from_val(&arg, &ty) {
+            if let Some(transaction_ref) = arg.transaction_ref_to_raw(store.0, &ty)? {
                 *slot = transaction_ref;
                 continue;
             }
@@ -1213,7 +1205,9 @@ impl Func {
         for ((i, slot), val) in results.iter_mut().enumerate().zip(&values_vec) {
             let ty = ty.results().nth(i).unwrap();
             #[cfg(feature = "transaction")]
-            if let Some(transaction_ref) = store.0.transaction_wast_result_val_from_raw(*val, &ty) {
+            if let Some(transaction_ref) =
+                unsafe { Val::transaction_ref_from_raw(store.0, *val, &ty) }
+            {
                 *slot = transaction_ref;
                 continue;
             }
@@ -2609,7 +2603,8 @@ impl HostFunc {
         for (i, ty) in ty.params().enumerate() {
             let raw = unsafe { params[i].assume_init() };
             #[cfg(feature = "transaction")]
-            if let Some(transaction_ref) = store.transaction_wast_result_val_from_raw(raw, &ty) {
+            if let Some(transaction_ref) = unsafe { Val::transaction_ref_from_raw(store, raw, &ty) }
+            {
                 val_vec.push(transaction_ref)?;
                 continue;
             }
@@ -2637,7 +2632,7 @@ impl HostFunc {
         let results = &args_then_results[ty.params().len()..];
         for (i, (ret, ty)) in results.iter().zip(ty.results()).enumerate() {
             #[cfg(feature = "transaction")]
-            if let Some(transaction_ref) = store.0.transaction_wast_result_raw_from_val(ret, &ty) {
+            if let Some(transaction_ref) = ret.transaction_ref_to_raw(store.0, &ty)? {
                 storage[i].write(transaction_ref);
                 continue;
             }

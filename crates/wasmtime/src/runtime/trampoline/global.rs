@@ -80,6 +80,12 @@ pub fn generate_global_export(
                     "non-null continuation references in trampoline globals not yet supported"
                 ));
             }
+            #[cfg(feature = "transaction")]
+            Val::TransactionRef(_) | Val::TransactionExternRef(_) | Val::TransactionFuncRef(_) => {
+                return Err(crate::format_err!(
+                    "transactional references cannot initialize an ordinary trampoline global"
+                ));
+            }
         }
     }
 

@@ -1911,7 +1911,16 @@ pub fn translate_operator(
             let result = environ.translate_ref_null(builder.cursor(), hty)?;
             environ.stacks.push1(result);
         }
-        Operator::RefIsNull => {
+        Operator::TRefNull { hty } => {
+            // Transaction references use the same machine-level null bits as
+            // other references, but remain a distinct validated Wasm type.
+            // Lower the null directly rather than routing it through any GC
+            // allocation or object-table lookup.
+            let hty = environ.convert_heap_type(*hty)?;
+            let result = environ.translate_ref_null(builder.cursor(), hty)?;
+            environ.stacks.push1(result);
+        }
+        Operator::RefIsNull | Operator::TRefIsNull => {
             let value = environ.stacks.pop1();
             let [WasmValType::Ref(ty)] = operand_types else {
                 unreachable!("validation")
@@ -3315,6 +3324,15 @@ pub fn translate_operator(
             environ.trapnz(builder, is_null, crate::TRAP_NULL_REFERENCE);
             environ.stacks.push1(r);
         }
+        Operator::TRefAsNonNull => {
+            let r = environ.stacks.pop1();
+            let [.., WasmValType::Ref(r_ty)] = operand_types else {
+                unreachable!("validation")
+            };
+            let is_null = environ.translate_ref_is_null(builder.cursor(), r, *r_ty)?;
+            environ.trapnz(builder, is_null, crate::TRAP_NULL_REFERENCE);
+            environ.stacks.push1(r);
+        }
         Operator::TRefCastRead => {
             let r = environ.stacks.pop1();
             environ.translate_transaction_tref_cast_read(builder, r)?;
@@ -3854,6 +3872,7 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: false,
+                    transactional: false,
                 },
                 r,
                 *r_ty,
@@ -3871,6 +3890,7 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: true,
+                    transactional: false,
                 },
                 r,
                 *r_ty,
@@ -3888,6 +3908,7 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: false,
+                    transactional: false,
                 },
                 r,
                 *r_ty,
@@ -3906,6 +3927,7 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: true,
+                    transactional: false,
                 },
                 r,
                 *r_ty,
@@ -3914,6 +3936,11 @@ pub fn translate_operator(
             environ.stacks.push1(r);
         }
         Operator::BrOnCast {
+            relative_depth,
+            to_ref_type,
+            from_ref_type: _,
+        }
+        | Operator::TBrOnCast {
             relative_depth,
             to_ref_type,
             from_ref_type: _,
@@ -3969,6 +3996,11 @@ pub fn translate_operator(
             }
         }
         Operator::BrOnCastFail {
+            relative_depth,
+            to_ref_type,
+            from_ref_type: _,
+        }
+        | Operator::TBrOnCastFail {
             relative_depth,
             to_ref_type,
             from_ref_type: _,

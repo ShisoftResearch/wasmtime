@@ -36,6 +36,10 @@ impl WasmValue for crate::Val {
             Self::F32(_) => WasmTypeKind::F32,
             Self::F64(_) => WasmTypeKind::F64,
             Self::V128(_) => WasmTypeKind::Tuple,
+            #[cfg(feature = "transaction")]
+            Self::TransactionRef(_)
+            | Self::TransactionExternRef(_)
+            | Self::TransactionFuncRef(_) => WasmTypeKind::Unsupported,
             Self::FuncRef(_) => WasmTypeKind::Unsupported,
             Self::ExternRef(_) => WasmTypeKind::Unsupported,
             Self::AnyRef(_) => WasmTypeKind::Unsupported,

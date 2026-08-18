@@ -30347,6 +30347,359 @@ fn transaction_object_tstruct_get_ref_roundtrips_into_object_operation() {
 }
 
 #[test]
+fn transaction_boundary_tarray_result_feeds_next_native_operation_without_gc() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $array (tarray i32))
+              (tfunc (export "make") (result (tref $array))
+                (tarray.new_default $array (i32.const 3)))
+              (tfunc (export "len") (param (tref $array)) (result i32)
+                (tarray.len (local.get 0))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let make = instance.get_func(&mut store, "make").unwrap();
+    let len = instance.get_func(&mut store, "len").unwrap();
+
+    let mut reference = [crate::Val::I32(0)];
+    make.call(&mut store, &[], &mut reference).unwrap();
+    let mut result = [crate::Val::I32(0)];
+    len.call(&mut store, &reference, &mut result).unwrap();
+
+    assert_eq!(result[0].unwrap_i32(), 3);
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
+fn transaction_boundary_tstruct_result_feeds_next_native_operation_without_gc() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $struct (tstruct (field i32)))
+              (tfunc (export "make") (result (tref $struct))
+                (tstruct.new $struct (i32.const 37)))
+              (tfunc (export "get") (param (tref $struct)) (result i32)
+                (tstruct.get $struct 0 (tref.cast_read (local.get 0)))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let make = instance.get_func(&mut store, "make").unwrap();
+    let get = instance.get_func(&mut store, "get").unwrap();
+
+    let mut reference = [crate::Val::I32(0)];
+    make.call(&mut store, &[], &mut reference).unwrap();
+    let mut result = [crate::Val::I32(0)];
+    get.call(&mut store, &reference, &mut result).unwrap();
+
+    assert_eq!(result[0].unwrap_i32(), 37);
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
+fn transaction_boundary_conflict_style_host_bounce_preserves_object_without_gc() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $struct (tstruct (field i32)))
+              (tfunc $bounce (import "host" "bounce")
+                (param (tref $struct)) (result (tref $struct)))
+              (tfunc (export "run") (result i32)
+                (tstruct.get $struct 0
+                  (tref.cast_read
+                    (tcall $bounce (tstruct.new $struct (i32.const 91)))))))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let bounce = crate::Func::new(&mut store, import_ty, |_caller, params, results| {
+        results[0] = params[0];
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[bounce.into()]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 91);
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
+fn transaction_reference_local_is_not_an_ordinary_gc_stack_root() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $array (tarray i32))
+              (tfunc $collect (import "host" "collect"))
+              (tfunc (export "run") (result i32)
+                (local $array (tref null $array))
+                (local.set $array
+                  (select (result (tref null $array))
+                    (tarray.new_default $array (i32.const 2))
+                    (tref.null $array)
+                    (i32.const 1)))
+                (tcall $collect)
+                (tarray.len (local.get $array))))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let collect = crate::Func::new(&mut store, import_ty, |mut caller, _params, _results| {
+        caller.gc(None)?;
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[collect.into()]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 2);
+}
+
+#[test]
+fn transaction_reference_global_is_not_an_ordinary_gc_root() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $array (tarray i32))
+              (tfunc $collect (import "host" "collect"))
+              (tglobal $array (mut (tref null $array)) (tref.null $array))
+              (tfunc (export "run") (result i32)
+                (tglobal.set $array (tarray.new_default $array (i32.const 4)))
+                (tcall $collect)
+                (tarray.len (tglobal.get $array))))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let collect = crate::Func::new(&mut store, import_ty, |mut caller, _params, _results| {
+        caller.gc(None)?;
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[collect.into()]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 4);
+}
+
+#[test]
+fn transaction_boundary_textern_null_roundtrips_without_gc() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tfunc (export "make") (result texterntref)
+                (tref.null textern))
+              (tfunc (export "is-null") (param texterntref) (result i32)
+                (tref.is_null (local.get 0))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let make = instance.get_func(&mut store, "make").unwrap();
+    let is_null = instance.get_func(&mut store, "is-null").unwrap();
+
+    let mut reference = [crate::Val::I32(0)];
+    make.call(&mut store, &[], &mut reference).unwrap();
+    let mut result = [crate::Val::I32(0)];
+    is_null.call(&mut store, &reference, &mut result).unwrap();
+
+    assert_eq!(result[0].unwrap_i32(), 1);
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
+fn transaction_boundary_textern_host_identity_roundtrips_through_native_calls() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tfunc $bounce (import "host" "bounce")
+                (param texterntref) (result texterntref))
+              (tfunc (export "roundtrip") (param texterntref) (result texterntref)
+                (tcall $bounce (local.get 0)))
+              (tfunc (export "is-null") (param texterntref) (result i32)
+                (tref.is_null (local.get 0))))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let reference = crate::ExternRef::new(&mut store, 73_u32).unwrap();
+    let raw = crate::ValRaw::externref(reference.to_raw(&mut store).unwrap());
+    let value = unsafe { crate::Val::from_raw(&mut store, raw, import_ty.param(0).unwrap()) };
+    let bounce = crate::Func::new(&mut store, import_ty, |_caller, params, results| {
+        results[0] = params[0];
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[bounce.into()]).unwrap();
+    let roundtrip = instance.get_func(&mut store, "roundtrip").unwrap();
+    let is_null = instance.get_func(&mut store, "is-null").unwrap();
+
+    let mut returned = [crate::Val::I32(0)];
+    roundtrip.call(&mut store, &[value], &mut returned).unwrap();
+    assert!(
+        crate::_internal::transaction_persistence::transaction_wast_extern_ref_host_matches(
+            &store,
+            &returned[0],
+            73,
+        )
+    );
+    let mut result = [crate::Val::I32(0)];
+    is_null.call(&mut store, &returned, &mut result).unwrap();
+    assert_eq!(result[0].unwrap_i32(), 0);
+}
+
+#[test]
+fn transaction_boundary_tfuncref_result_feeds_next_transaction_operation_without_gc() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $sig (tfunc (result i32)))
+              (tfunc $target (type $sig) (i32.const 52))
+              (telem declare tfunc $target)
+              (tfunc (export "make") (result (tref $sig))
+                (tref.tfunc $target))
+              (tfunc (export "is-null") (param (tref $sig)) (result i32)
+                (tref.is_null (local.get 0))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let make = instance.get_func(&mut store, "make").unwrap();
+    let is_null = instance.get_func(&mut store, "is-null").unwrap();
+
+    let mut reference = [crate::Val::I32(0)];
+    make.call(&mut store, &[], &mut reference).unwrap();
+    let mut result = [crate::Val::I32(0)];
+    is_null.call(&mut store, &reference, &mut result).unwrap();
+
+    assert_eq!(result[0].unwrap_i32(), 0);
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
+fn transaction_boundary_ti31_result_roundtrips_without_gc() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tfunc $make (import "host" "make") (result tanyref))
+              (tfunc (export "read") (result i32)
+                (tcall $make)
+                (block $cast (param tanyref) (result (tref ti31))
+                  (br_on_tcast $cast tanyref (tref ti31))
+                  unreachable)
+                (drop)
+                (i32.const 29)))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let result_ty = import_ty.result(0).unwrap();
+    let raw = crate::ValRaw::anyref(u32::try_from(ObjectTable::encode_raw_i31_ref(29)).unwrap());
+    let value = unsafe { crate::Val::from_raw(&mut store, raw, result_ty) };
+    let make = crate::Func::new(&mut store, import_ty, move |_caller, _params, results| {
+        results[0] = value;
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[make.into()]).unwrap();
+    let read = instance.get_func(&mut store, "read").unwrap();
+
+    let mut result = [crate::Val::I32(0)];
+    read.call(&mut store, &[], &mut result).unwrap();
+
+    assert_eq!(result[0].unwrap_i32(), 29);
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
+fn transaction_boundary_rejects_wrong_object_type_and_nullability() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $array (tarray i32))
+              (type $struct (tstruct (field i32)))
+              (tfunc (export "make-array") (result (tref $array))
+                (tarray.new_default $array (i32.const 1)))
+              (tfunc (export "make-null") (result (tref null $struct))
+                (tref.null $struct))
+              (tfunc (export "take-struct") (param (tref $struct))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let make_array = instance.get_func(&mut store, "make-array").unwrap();
+    let make_null = instance.get_func(&mut store, "make-null").unwrap();
+    let take_struct = instance.get_func(&mut store, "take-struct").unwrap();
+
+    let mut array = [crate::Val::I32(0)];
+    make_array.call(&mut store, &[], &mut array).unwrap();
+    let mut null = [crate::Val::I32(0)];
+    make_null.call(&mut store, &[], &mut null).unwrap();
+
+    assert!(take_struct.call(&mut store, &array, &mut []).is_err());
+    assert!(take_struct.call(&mut store, &null, &mut []).is_err());
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
 fn transaction_object_tstruct_tfail_frees_new_object_record() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);

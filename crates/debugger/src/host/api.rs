@@ -56,6 +56,7 @@ impl WasmValue {
             Val::I32(_) | Val::I64(_) | Val::F32(_) | Val::F64(_) | Val::V128(_) => {
                 WasmValue::Primitive(val)
             }
+            _ => return Err(wit::Error::UnsupportedType.into()),
         })
     }
 

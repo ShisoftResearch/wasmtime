@@ -104,8 +104,6 @@ use crate::trampoline::VMHostGlobalContext;
 use crate::{BreakpointState, DebugHandler, FrameDataCache};
 use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
 use crate::{Global, Instance, Table};
-#[cfg(feature = "transaction")]
-use crate::{HeapType, ValType};
 use core::convert::Infallible;
 use core::fmt;
 #[cfg(any(feature = "async", feature = "gc"))]
@@ -1053,12 +1051,6 @@ impl<T> Store<T> {
     ) -> Option<u32> {
         self.inner
             .transaction_resolve_durable_extern_ref_for_test(identity)
-    }
-
-    #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_enable_live_wast_reference_fallbacks_for_test(&mut self) {
-        self.inner
-            .transaction_enable_live_wast_reference_fallbacks_for_test();
     }
 
     /// Access the underlying `T` data owned by this `Store`.
@@ -2050,139 +2042,6 @@ impl StoreOpaque {
     ) -> Option<u32> {
         self.transaction_durable_refs
             .resolve_extern_identity(identity)
-    }
-
-    #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_enable_live_wast_reference_fallbacks_for_test(&mut self) {
-        self.transaction_durable_refs
-            .enable_live_wast_reference_fallbacks_for_test();
-    }
-
-    #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_live_wast_reference_fallbacks_enabled(&self) -> bool {
-        self.transaction_durable_refs
-            .live_wast_reference_fallbacks_enabled()
-    }
-
-    #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_wast_result_val_from_raw(
-        &self,
-        raw: ValRaw,
-        ty: &ValType,
-    ) -> Option<Val> {
-        if !self.transaction_live_wast_reference_fallbacks_enabled() {
-            return None;
-        }
-        let ValType::Ref(ref_ty) = ty else {
-            return None;
-        };
-        if !matches!(
-            ref_ty.heap_type(),
-            HeapType::Any
-                | HeapType::Eq
-                | HeapType::I31
-                | HeapType::Array
-                | HeapType::ConcreteArray(_)
-                | HeapType::Struct
-                | HeapType::ConcreteStruct(_)
-                | HeapType::None
-                | HeapType::Extern
-                | HeapType::NoExtern
-        ) {
-            return None;
-        }
-
-        let raw = raw.get_anyref();
-        if !self.transaction_wast_raw_ref_matches_heap_type(raw, ref_ty.heap_type()) {
-            return None;
-        }
-        Some(Val::I32(i32::from_ne_bytes(raw.to_ne_bytes())))
-    }
-
-    #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_wast_result_raw_from_val(
-        &self,
-        val: &Val,
-        ty: &ValType,
-    ) -> Option<ValRaw> {
-        if !self.transaction_live_wast_reference_fallbacks_enabled() {
-            return None;
-        }
-        let ValType::Ref(ref_ty) = ty else {
-            return None;
-        };
-        if !matches!(
-            ref_ty.heap_type(),
-            HeapType::Any
-                | HeapType::Eq
-                | HeapType::I31
-                | HeapType::Array
-                | HeapType::ConcreteArray(_)
-                | HeapType::Struct
-                | HeapType::ConcreteStruct(_)
-                | HeapType::None
-                | HeapType::Extern
-                | HeapType::NoExtern
-        ) {
-            return None;
-        }
-
-        let Val::I32(raw) = val else {
-            return None;
-        };
-        let raw = u32::from_ne_bytes(raw.to_ne_bytes());
-        if raw == 0 {
-            return ref_ty.is_nullable().then(ValRaw::null);
-        }
-
-        if !self.transaction_wast_raw_ref_matches_heap_type(raw, ref_ty.heap_type()) {
-            return None;
-        }
-
-        Some(match ref_ty.heap_type() {
-            HeapType::Extern | HeapType::NoExtern => ValRaw::externref(raw),
-            _ => ValRaw::anyref(raw),
-        })
-    }
-
-    #[cfg(feature = "transaction")]
-    fn transaction_wast_raw_ref_matches_heap_type(&self, raw: u32, heap_type: &HeapType) -> bool {
-        use crate::runtime::transaction::{ObjectKind, ObjectTable};
-
-        if ObjectTable::is_raw_i31_ref(u64::from(raw)) {
-            return matches!(heap_type, HeapType::Any | HeapType::Eq | HeapType::I31);
-        }
-
-        let Some(object_id) = self
-            .transaction_object_table
-            .known_object_id_for_transaction_ref_handle(raw)
-        else {
-            return false;
-        };
-        let Ok(kind) = self.transaction_object_table.kind(object_id) else {
-            return false;
-        };
-
-        match heap_type {
-            HeapType::Any => matches!(
-                kind,
-                ObjectKind::Struct | ObjectKind::Array | ObjectKind::I31
-            ),
-            HeapType::Eq => matches!(
-                kind,
-                ObjectKind::Struct | ObjectKind::Array | ObjectKind::I31
-            ),
-            HeapType::I31 => kind == ObjectKind::I31,
-            HeapType::Struct | HeapType::ConcreteStruct(_) => kind == ObjectKind::Struct,
-            HeapType::Array | HeapType::ConcreteArray(_) => kind == ObjectKind::Array,
-            // SHISOFT-TWASM-MOCK: until the final `TRefType` stack ABI exists,
-            // some proposal-WAST `texterntref` boundaries are still represented
-            // as `externref` even when the live value is a transaction object
-            // handle. Keep this gated to the WAST fallback path.
-            HeapType::Extern => true,
-            HeapType::NoExtern | HeapType::None => false,
-            _ => false,
-        }
     }
 
     pub(crate) fn transaction_promotion_context_mut(

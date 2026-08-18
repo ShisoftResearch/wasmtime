@@ -673,6 +673,8 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             | Operator::BrOnNonNull { .. }
             | Operator::BrOnCast { .. }
             | Operator::BrOnCastFail { .. }
+            | Operator::TBrOnCast { .. }
+            | Operator::TBrOnCastFail { .. }
 
             // Exiting a scope means that we need to update the fuel
             // consumption because there are multiple ways to exit a scope and
@@ -1551,7 +1553,9 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
     pub(crate) fn val_ty_needs_stack_map(&self, ty: WasmValType) -> bool {
         match ty {
-            WasmValType::Ref(r) => self.heap_ty_needs_stack_map(r.heap_type),
+            WasmValType::Ref(r) => {
+                !r.is_transactional_ref() && self.heap_ty_needs_stack_map(r.heap_type)
+            }
             _ => false,
         }
     }
@@ -3172,7 +3176,7 @@ impl FuncEnvironment<'_> {
 
     fn transaction_object_ref_type_supported(ref_ty: WasmRefType) -> bool {
         ref_ty.heap_type == WasmHeapType::I31
-            || ref_ty.is_vmgcref_type_and_not_i31()
+            || ref_ty.heap_type.is_vmgcref_type_and_not_i31()
             || matches!(ref_ty.heap_type.top(), WasmHeapTopType::Func)
     }
 
@@ -8314,7 +8318,7 @@ impl FuncEnvironment<'_> {
     }
 
     pub fn handle_before_return(&mut self, retvals: &[ir::Value], builder: &mut FunctionBuilder) {
-        self.translate_transaction_commit_before_return(builder);
+        self.translate_transaction_commit_before_return(retvals, builder);
 
         if self.compiler.wmemcheck {
             let func_name = self.current_func_name(builder);
@@ -8326,7 +8330,11 @@ impl FuncEnvironment<'_> {
         }
     }
 
-    fn translate_transaction_commit_before_return(&mut self, builder: &mut FunctionBuilder<'_>) {
+    fn translate_transaction_commit_before_return(
+        &mut self,
+        retvals: &[ir::Value],
+        builder: &mut FunctionBuilder<'_>,
+    ) {
         if !self.transaction_may_be_active_on_return {
             return;
         }
@@ -8342,6 +8350,24 @@ impl FuncEnvironment<'_> {
             .brif(should_commit, commit_block, &[], continuation_block, &[]);
 
         builder.switch_to_block(commit_block);
+        let result_types = self.wasm_func_ty.results();
+        debug_assert_eq!(result_types.len(), retvals.len());
+        for (result, ty) in retvals.iter().zip(result_types) {
+            let WasmValType::Ref(ref_ty) = ty else {
+                continue;
+            };
+            if !ref_ty.is_transactional_ref()
+                || !matches!(ref_ty.heap_type.top(), WasmHeapTopType::Any)
+            {
+                continue;
+            }
+            let callee = self.builtin_functions.load_builtin(
+                builder.func,
+                BuiltinFunctionIndex::transaction_preserve_tref_result(),
+            );
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            builder.ins().call(callee, &[vmctx, *result]);
+        }
         let callee = self
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_commit());

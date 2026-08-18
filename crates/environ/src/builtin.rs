@@ -199,6 +199,8 @@ macro_rules! foreach_builtin_function {
             transaction_ttry_end(vmctx: vmctx) -> bool;
             // Commits a transactional WebAssembly transaction.
             transaction_commit(vmctx: vmctx) -> bool;
+            // Promotes a transactional object result before an owning tfunc commits.
+            transaction_preserve_tref_result(vmctx: vmctx, raw_ref: u32) -> bool;
             // Commits an owning structured transaction, returning one for a
             // transaction conflict that must enter the owner's handler and
             // zero for success. Other failures trap.
@@ -587,6 +589,7 @@ mod tests {
             BuiltinFunctionIndex::transaction_begin(),
             BuiltinFunctionIndex::transaction_ttry_end(),
             BuiltinFunctionIndex::transaction_commit(),
+            BuiltinFunctionIndex::transaction_preserve_tref_result(),
             BuiltinFunctionIndex::transaction_fail(),
         ] {
             assert!(matches!(builtin.trap_sentinel(), Some(TrapSentinel::Falsy)));

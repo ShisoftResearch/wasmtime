@@ -272,6 +272,18 @@ impl WasmCoreDump {
                             ty: wasm_encoder::AbstractHeapType::Cont,
                         })
                     }
+                    #[cfg(feature = "transaction")]
+                    Val::TransactionRef(_) => {
+                        wasm_encoder::ConstExpr::ref_null(wasm_encoder::HeapType::ANY)
+                    }
+                    #[cfg(feature = "transaction")]
+                    Val::TransactionExternRef(_) => {
+                        wasm_encoder::ConstExpr::ref_null(wasm_encoder::HeapType::EXTERN)
+                    }
+                    #[cfg(feature = "transaction")]
+                    Val::TransactionFuncRef(_) => {
+                        wasm_encoder::ConstExpr::ref_null(wasm_encoder::HeapType::FUNC)
+                    }
                 };
                 globals.global(
                     wasm_encoder::GlobalType {

@@ -81,6 +81,7 @@ impl Default for wasm_val_t {
 
 impl wasm_val_t {
     pub fn from_val(val: Val) -> wasm_val_t {
+        #[allow(unreachable_patterns)]
         match val {
             Val::I32(i) => wasm_val_t {
                 kind: WASM_I32,
@@ -116,6 +117,7 @@ impl wasm_val_t {
             Val::ExnRef(_) => crate::abort("creating a wasm_val_t from  an exnref"),
             Val::V128(_) => crate::abort("creating a wasm_val_t from a v128"),
             Val::ContRef(_) => crate::abort("creating a wasm_val_t from a contref"),
+            _ => crate::abort("creating a wasm_val_t from a transactional reference"),
         }
     }
 
@@ -283,6 +285,7 @@ impl wasmtime_val_t {
     pub fn from_val_unscoped(cx: impl AsContextMut, val: Val) -> wasmtime_val_t {
         #[cfg(not(feature = "gc"))]
         let _ = cx;
+        #[allow(unreachable_patterns)]
         match val {
             Val::I32(i) => wasmtime_val_t {
                 kind: crate::WASMTIME_I32,
@@ -339,6 +342,7 @@ impl wasmtime_val_t {
                 },
             },
             Val::ContRef(_) => crate::abort("contrefs not yet supported in C API (#10248)"),
+            _ => crate::abort("transactional references are not supported in the C API"),
         }
     }
 

@@ -22,22 +22,9 @@ pub(crate) struct DurableReferenceRegistry {
     vm_func_refs_by_identity: BTreeMap<DurableFuncIdentity, usize>,
     externs_by_raw_gc_ref: BTreeMap<u32, DurableExternIdentity>,
     raw_gc_refs_by_extern_identity: BTreeMap<DurableExternIdentity, u32>,
-    next_live_func_identity_index: u32,
-    allow_live_wast_reference_fallbacks: bool,
 }
 
 impl DurableReferenceRegistry {
-    const LIVE_FUNC_FALLBACK_FINGERPRINT: u64 = 0xffff_ffff_5458_4655;
-    const LIVE_EXTERN_FALLBACK_NAMESPACE: u32 = u32::MAX;
-
-    pub(crate) fn enable_live_wast_reference_fallbacks_for_test(&mut self) {
-        self.allow_live_wast_reference_fallbacks = true;
-    }
-
-    pub(crate) fn live_wast_reference_fallbacks_enabled(&self) -> bool {
-        self.allow_live_wast_reference_fallbacks
-    }
-
     pub(crate) fn register_func_ref(
         &mut self,
         vm_func_ref_addr: usize,
@@ -81,27 +68,9 @@ impl DurableReferenceRegistry {
         if let Some(identity) = self.resolve_func_ref(vm_func_ref_addr) {
             return Ok(identity);
         }
-        ensure!(
-            self.allow_live_wast_reference_fallbacks,
+        bail!(
             "ordinary GC promotion cannot encode function reference without registered durable function identity"
-        );
-        let function_index = self.next_live_func_identity_index;
-        self.next_live_func_identity_index = self
-            .next_live_func_identity_index
-            .checked_add(1)
-            .context("live durable function fallback identity overflow")?;
-        let identity = DurableFuncIdentity {
-            module_fingerprint: Self::LIVE_FUNC_FALLBACK_FINGERPRINT,
-            function_index,
-            type_layout_id: TypeLayoutId::BUILTIN_FUNC,
-        };
-        // SHISOFT-TWASM-MOCK: this is a live-only fallback for internal
-        // proposal-WAST `tref.tfunc` values that do not yet have a
-        // module/function-index durable namespace at the helper boundary. It
-        // resolves inside this store only and must be replaced by the final
-        // symbolic function identity path before claiming funcref recovery.
-        self.register_func_ref(vm_func_ref_addr, identity)?;
-        Ok(identity)
+        )
     }
 
     pub(crate) fn register_extern_ref(
@@ -151,21 +120,9 @@ impl DurableReferenceRegistry {
         if let Some(identity) = self.resolve_extern_ref(raw_gc_ref) {
             return Ok(identity);
         }
-        ensure!(
-            self.allow_live_wast_reference_fallbacks,
+        bail!(
             "ordinary GC promotion cannot encode external reference without embedded durable external identity"
-        );
-        let identity = DurableExternIdentity {
-            namespace: Self::LIVE_EXTERN_FALLBACK_NAMESPACE,
-            handle: u64::from(raw_gc_ref),
-            type_layout_id: TypeLayoutId::BUILTIN_EXTERN,
-        };
-        // SHISOFT-TWASM-MOCK: proposal WAST `tref.textern` values are ordinary
-        // Wasmtime host externrefs, not persistent external objects. Register a
-        // store-local identity so live transactional tables/globals/arrays can
-        // roundtrip them. This is not a restart-stable external namespace.
-        self.register_extern_ref(raw_gc_ref, identity)?;
-        Ok(identity)
+        )
     }
 }
 
@@ -189,26 +146,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_wast_reference_fallbacks_are_disabled_by_default() {
+    fn unregistered_live_references_are_rejected() {
         let mut registry = DurableReferenceRegistry::default();
 
         assert!(registry.resolve_or_register_live_func_ref(0x1234).is_err());
         assert!(registry.resolve_or_register_live_extern_ref(0x55).is_err());
-    }
-
-    #[test]
-    fn live_wast_reference_fallbacks_require_explicit_opt_in() -> Result<()> {
-        let mut registry = DurableReferenceRegistry::default();
-        registry.enable_live_wast_reference_fallbacks_for_test();
-
-        let func = registry.resolve_or_register_live_func_ref(0x1234)?;
-        assert_eq!(registry.resolve_func_ref(0x1234), Some(func));
-        assert_eq!(registry.resolve_func_identity(func), Some(0x1234));
-
-        let extern_ = registry.resolve_or_register_live_extern_ref(0x55)?;
-        assert_eq!(registry.resolve_extern_ref(0x55), Some(extern_));
-        assert_eq!(registry.resolve_extern_identity(extern_), Some(0x55));
-
-        Ok(())
     }
 }

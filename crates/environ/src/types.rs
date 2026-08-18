@@ -236,6 +236,7 @@ impl WasmValType {
             WasmValType::Ref(r) => WasmValType::Ref(WasmRefType {
                 nullable: true,
                 heap_type: r.heap_type.top().into(),
+                transactional: r.transactional,
             }),
             WasmValType::I32
             | WasmValType::I64
@@ -274,6 +275,9 @@ pub struct WasmRefType {
     pub nullable: bool,
     /// The heap type that this reference contains.
     pub heap_type: WasmHeapType,
+    /// Whether this is a transactional reference rather than an ordinary
+    /// Wasm reference with the same heap-type shape.
+    pub transactional: bool,
 }
 
 impl TypeTrace for WasmRefType {
@@ -297,17 +301,25 @@ impl WasmRefType {
     pub const EXTERNREF: WasmRefType = WasmRefType {
         nullable: true,
         heap_type: WasmHeapType::Extern,
+        transactional: false,
     };
     /// Shorthand for `funcref`
     pub const FUNCREF: WasmRefType = WasmRefType {
         nullable: true,
         heap_type: WasmHeapType::Func,
+        transactional: false,
     };
+
+    /// Is this a transactional reference type?
+    #[inline]
+    pub fn is_transactional_ref(&self) -> bool {
+        self.transactional
+    }
 
     /// Is this a type that is represented as a `VMGcRef`?
     #[inline]
     pub fn is_vmgcref_type(&self) -> bool {
-        self.heap_type.is_vmgcref_type()
+        !self.transactional && self.heap_type.is_vmgcref_type()
     }
 
     /// Is this a type that is represented as a `VMGcRef` and is additionally
@@ -317,12 +329,18 @@ impl WasmRefType {
     /// GC heap?
     #[inline]
     pub fn is_vmgcref_type_and_not_i31(&self) -> bool {
-        self.heap_type.is_vmgcref_type_and_not_i31()
+        !self.transactional && self.heap_type.is_vmgcref_type_and_not_i31()
     }
 }
 
 impl fmt::Display for WasmRefType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.transactional {
+            if self.nullable {
+                return write!(f, "(tref null {})", self.heap_type);
+            }
+            return write!(f, "(tref {})", self.heap_type);
+        }
         match *self {
             Self::FUNCREF => write!(f, "funcref"),
             Self::EXTERNREF => write!(f, "externref"),
@@ -2705,6 +2723,7 @@ pub trait TypeConvert {
         Ok(WasmRefType {
             nullable: ty.is_nullable(),
             heap_type: self.convert_heap_type(ty.heap_type())?,
+            transactional: ty.is_transactional_ref(),
         })
     }
 
@@ -2761,6 +2780,7 @@ mod tests {
         let anyref = WasmValType::Ref(WasmRefType {
             nullable: true,
             heap_type: WasmHeapType::Any,
+            transactional: false,
         });
         let ty = WasmFuncType::new([i32, i32, anyref, anyref], [i32, anyref])?;
         assert_eq!(ty.params(), &[i32, i32, anyref, anyref]);
