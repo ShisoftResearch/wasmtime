@@ -29704,6 +29704,143 @@ fn module_compilation_accepts_lifecycle_transaction_opcodes() {
 }
 
 #[test]
+fn native_structured_transaction_controls_execute_handlers_and_exits() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $i64-block (func (param i64) (result i64)))
+
+              (tfunc $abort_tfunc
+                (tfail (i32.const 23)))
+
+              (tfunc $nested_tblock_abort
+                (tblock
+                  ((tfail (i32.const 71)))
+                  (else (drop))))
+
+              (func (export "success") (result i32)
+                (tblock (result i32)
+                  ((i32.const 1))
+                  (else (drop) (i32.const 2))))
+
+              (func (export "abort") (result i32)
+                (tblock (result i32)
+                  ((tfail (i32.const 7)))
+                  (else)))
+
+              (func (export "nested-abort") (result i32)
+                (tblock (result i32)
+                  ((tblock (result i32)
+                     ((tfail (i32.const 11)))
+                     (else (drop) (i32.const 99))))
+                  (else)))
+
+              (func (export "ttry-success") (result i32)
+                (ttry (result i32)
+                  ((i32.const 3))
+                  (else (drop) (i32.const 4))))
+
+              (func (export "ttry-abort") (result i32)
+                (ttry (result i32)
+                  ((tcall $abort_tfunc) (i32.const 5))
+                  (else)))
+
+              (func (export "nested-ttry-abort") (result i32)
+                (tblock (result i32)
+                  ((ttry (result i32)
+                     ((tfail (i32.const 51)))
+                     (else (drop) (i32.const 52))))
+                  (else)))
+
+              (func (export "active-tblock-bypasses-handler") (result i32)
+                (ttry (result i32)
+                  ((tcall $nested_tblock_abort) (i32.const 72))
+                  (else)))
+
+              (func (export "ttry-does-not-start") (result i32)
+                (drop
+                  (ttry (result i32)
+                    ((i32.const 61))
+                    (else (drop) (i32.const 63))))
+                (tblock (result i32)
+                  ((tfail (i32.const 62)))
+                  (else)))
+
+              (func (export "parameter-abort") (result i64)
+                (i64.const 55)
+                (tblock (type $i64-block)
+                  ((tfail (i32.const 7)))
+                  (else (drop))))
+
+              (func (export "branch") (result i32)
+                (tblock $done (result i32)
+                  ((i32.const 13) (br $done))
+                  (else (drop) (i32.const 14))))
+
+              (func (export "br-if-cleanup") (result i32)
+                (drop
+                  (tblock $done (result i32)
+                    ((i32.const 31)
+                     (i32.const 1)
+                     (br_if $done)
+                     (drop)
+                     (i32.const 32))
+                    (else (drop) (i32.const 34))))
+                (tblock (result i32)
+                  ((tfail (i32.const 33)))
+                  (else)))
+
+              (func (export "br-table-cleanup") (result i32)
+                (drop
+                  (tblock $done (result i32)
+                    ((i32.const 41)
+                     (i32.const 0)
+                     (br_table $done))
+                    (else (drop) (i32.const 42))))
+                (tblock (result i32)
+                  ((tfail (i32.const 43)))
+                  (else)))
+
+              (func (export "return") (result i32)
+                (tblock
+                  ((i32.const 17) return)
+                  (else (drop)))
+                (i32.const 18))
+            )
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    for (name, expected) in [
+        ("success", 1),
+        ("abort", 7),
+        ("nested-abort", 11),
+        ("ttry-success", 3),
+        ("ttry-abort", 23),
+        ("nested-ttry-abort", 51),
+        ("active-tblock-bypasses-handler", 71),
+        ("ttry-does-not-start", 62),
+        ("branch", 13),
+        ("br-if-cleanup", 33),
+        ("br-table-cleanup", 43),
+        ("return", 17),
+    ] {
+        let func = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(func.call(&mut store, ()).unwrap(), expected, "{name}");
+    }
+
+    let parameter_abort = instance
+        .get_typed_func::<(), i64>(&mut store, "parameter-abort")
+        .unwrap();
+    assert_eq!(parameter_abort.call(&mut store, ()).unwrap(), 55);
+}
+
+#[test]
 fn module_compilation_accepts_transaction_data_helper_lowering() {
     let engine = crate::Engine::default();
     transaction_test_module(

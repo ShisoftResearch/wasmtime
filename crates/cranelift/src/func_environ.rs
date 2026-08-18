@@ -80,13 +80,22 @@ const TRANSACTION_TREF_TEST_KIND_EQ: u32 = 1;
 const TRANSACTION_TREF_TEST_KIND_STRUCT: u32 = 3;
 const TRANSACTION_TREF_TEST_KIND_ARRAY: u32 = 4;
 
-#[derive(Copy, Clone, Debug)]
-struct TransactionTryFrame {
-    handler: Block,
-    end: Block,
-    original_stack_len: usize,
-    original_stack_shape_len: usize,
-    in_handler: bool,
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TransactionControlKind {
+    TBlock,
+    TTry,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransactionTryFrame {
+    pub(crate) kind: TransactionControlKind,
+    pub(crate) handler: Block,
+    pub(crate) handler_params: SmallVec<[ir::Value; 4]>,
+    pub(crate) handler_enabled: ir::Value,
+    pub(crate) started_here: ir::Value,
+    pub(crate) control_stack_depth: usize,
+    pub(crate) head_is_reachable: bool,
+    pub(crate) in_handler: bool,
 }
 
 /// A struct with an `Option<ir::FuncRef>` member for every builtin
@@ -298,7 +307,7 @@ pub struct FuncEnvironment<'module_environment> {
     local_types: Vec<ir::Type>,
 
     /// Structured transaction handlers currently active during translation.
-    transaction_try_stack: Vec<TransactionTryFrame>,
+    pub(crate) transaction_try_stack: Vec<TransactionTryFrame>,
 }
 
 impl<'module_environment> FuncEnvironment<'module_environment> {
@@ -5095,129 +5104,169 @@ impl FuncEnvironment<'_> {
         ))
     }
 
-    pub fn translate_transaction_begin(
+    pub(crate) fn translate_transaction_structured_start(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
+        kind: TransactionControlKind,
+        handler: Block,
+        handler_params: SmallVec<[ir::Value; 4]>,
+        control_stack_depth: usize,
     ) -> WasmResult<()> {
         self.transaction_may_be_active_on_return = true;
-        self.translate_transaction_lifecycle_builtin(
-            builder,
-            BuiltinFunctionIndex::transaction_begin(),
-        )?;
-        let began = builder.ins().iconst(I8, 1);
-        let transaction_began_in_function_var =
-            self.ensure_transaction_began_in_function_var(builder);
-        builder.def_var(transaction_began_in_function_var, began);
-        Ok(())
-    }
+        let zero = builder.ins().iconst(I8, 0);
+        let (handler_enabled, started_here) = match kind {
+            TransactionControlKind::TBlock => {
+                let callee = self.builtin_functions.load_builtin(
+                    builder.func,
+                    BuiltinFunctionIndex::transaction_enter_tblock(),
+                );
+                let vmctx = self.vmctx_val(&mut builder.cursor());
+                let call = builder.ins().call(callee, &[vmctx]);
+                let enter_code = builder.func.dfg.inst_results(call)[0];
+                let started = builder.ins().icmp_imm_s(IntCC::Equal, enter_code, 1);
 
-    pub fn translate_transaction_structured_try_start(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-    ) -> WasmResult<()> {
-        self.translate_transaction_begin(builder)?;
-        let handler = builder.create_block();
-        builder.append_block_param(handler, I32);
-        let end = builder.create_block();
+                let began_var = self.ensure_transaction_began_in_function_var(builder);
+                let already_began = builder.use_var(began_var);
+                let began = builder.ins().bor(already_began, started);
+                builder.def_var(began_var, began);
+                (started, started)
+            }
+            TransactionControlKind::TTry => {
+                let callee = self
+                    .builtin_functions
+                    .load_builtin(builder.func, BuiltinFunctionIndex::transaction_active());
+                let vmctx = self.vmctx_val(&mut builder.cursor());
+                let call = builder.ins().call(callee, &[vmctx]);
+                let active = builder.func.dfg.inst_results(call)[0];
+                let enabled = builder.ins().icmp_imm_s(IntCC::Equal, active, 0);
+                (enabled, zero)
+            }
+        };
+
         self.transaction_try_stack.push(TransactionTryFrame {
+            kind,
             handler,
-            end,
-            original_stack_len: self.stacks.stack.len(),
-            original_stack_shape_len: self.stacks.stack_shape.len(),
+            handler_params,
+            handler_enabled,
+            started_here,
+            control_stack_depth,
+            head_is_reachable: true,
             in_handler: false,
         });
         Ok(())
     }
 
-    pub fn translate_transaction_structured_try_else(
+    pub(crate) fn push_unreachable_transaction_control(
+        &mut self,
+        kind: TransactionControlKind,
+        control_stack_depth: usize,
+    ) {
+        self.transaction_try_stack.push(TransactionTryFrame {
+            kind,
+            handler: Block::reserved_value(),
+            handler_params: SmallVec::new(),
+            handler_enabled: ir::Value::reserved_value(),
+            started_here: ir::Value::reserved_value(),
+            control_stack_depth,
+            head_is_reachable: false,
+            in_handler: false,
+        });
+    }
+
+    pub(crate) fn transaction_control_is_top(&self) -> bool {
+        self.transaction_try_stack
+            .last()
+            .is_some_and(|frame| frame.control_stack_depth == self.stacks.control_stack.len())
+    }
+
+    pub(crate) fn translate_transaction_success_cleanup_at_depth(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
+        control_stack_depth: usize,
     ) -> WasmResult<()> {
-        let Some(frame) = self.transaction_try_stack.last_mut() else {
-            return Ok(());
-        };
-        let handler = frame.handler;
-        let end = frame.end;
-        let original_stack_len = frame.original_stack_len;
-        let original_stack_shape_len = frame.original_stack_shape_len;
+        let started = self
+            .transaction_try_stack
+            .iter()
+            .rev()
+            .find(|frame| frame.control_stack_depth == control_stack_depth)
+            .map(|frame| frame.started_here)
+            .expect("transaction control frame at depth");
+        self.translate_transaction_commit_if_started(builder, started)
+    }
 
-        if self.stacks.reachable {
-            self.translate_transaction_ttry_end(builder)?;
-            builder.ins().jump(end, &[]);
-        }
+    pub(crate) fn transaction_exit_requires_cleanup(&self, target_control_index: usize) -> bool {
+        self.transaction_try_stack
+            .iter()
+            .any(|frame| !frame.in_handler && frame.control_stack_depth - 1 >= target_control_index)
+    }
 
-        builder.switch_to_block(handler);
-        builder.seal_block(handler);
-        self.stacks.stack.truncate(original_stack_len);
-        self.stacks.stack_shape.truncate(original_stack_shape_len);
-        self.stacks.push1(builder.block_params(handler)[0]);
-        self.stacks.reachable = true;
-        if let Some(frame) = self.transaction_try_stack.last_mut() {
-            frame.in_handler = true;
+    pub(crate) fn translate_transaction_cleanup_for_control_exit(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        target_control_index: usize,
+    ) -> WasmResult<()> {
+        let owners = self
+            .transaction_try_stack
+            .iter()
+            .rev()
+            .filter(|frame| {
+                !frame.in_handler && frame.control_stack_depth - 1 >= target_control_index
+            })
+            .map(|frame| frame.started_here)
+            .collect::<SmallVec<[_; 4]>>();
+        for started in owners {
+            self.translate_transaction_commit_if_started(builder, started)?;
         }
         Ok(())
     }
 
-    pub fn translate_transaction_structured_try_end(
+    fn translate_transaction_commit_if_started(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
+        started: ir::Value,
     ) -> WasmResult<()> {
-        let Some(frame) = self.transaction_try_stack.pop() else {
-            return self.translate_transaction_ttry_end(builder);
-        };
+        let commit = builder.create_block();
+        let continuation = builder.create_block();
+        builder.ins().brif(started, commit, &[], continuation, &[]);
 
-        if self.stacks.reachable {
-            self.translate_transaction_ttry_end(builder)?;
-            builder.ins().jump(frame.end, &[]);
-        }
+        builder.switch_to_block(commit);
+        builder.seal_block(commit);
+        self.translate_transaction_lifecycle_builtin(
+            builder,
+            BuiltinFunctionIndex::transaction_commit(),
+        )?;
+        let began_var = self.ensure_transaction_began_in_function_var(builder);
+        let zero = builder.ins().iconst(I8, 0);
+        builder.def_var(began_var, zero);
+        builder.ins().jump(continuation, &[]);
 
-        if !frame.in_handler {
-            builder.switch_to_block(frame.handler);
-            builder.seal_block(frame.handler);
-            self.stacks.stack.truncate(frame.original_stack_len);
-            self.stacks
-                .stack_shape
-                .truncate(frame.original_stack_shape_len);
-            self.stacks.reachable = true;
-            self.translate_transaction_ttry_end(builder)?;
-            builder.ins().jump(frame.end, &[]);
-        }
-
-        builder.switch_to_block(frame.end);
-        builder.seal_block(frame.end);
-        self.stacks.stack.truncate(frame.original_stack_len);
-        self.stacks
-            .stack_shape
-            .truncate(frame.original_stack_shape_len);
-        self.stacks.reachable = true;
+        builder.switch_to_block(continuation);
+        builder.seal_block(continuation);
         Ok(())
     }
 
-    pub fn translate_transaction_ttry_end(
+    pub(crate) fn translate_transaction_begin_handler(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
     ) -> WasmResult<()> {
+        let kind = self
+            .transaction_try_stack
+            .last()
+            .expect("transaction handler frame")
+            .kind;
         self.translate_transaction_lifecycle_builtin(
             builder,
             BuiltinFunctionIndex::transaction_ttry_end(),
-        )
-    }
-
-    pub fn translate_transaction_fail(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-    ) -> WasmResult<()> {
-        self.translate_transaction_lifecycle_builtin(
-            builder,
-            BuiltinFunctionIndex::transaction_fail(),
         )?;
-        if let Some(frame) = self.transaction_try_stack.last() {
-            if !frame.in_handler {
-                let code = builder.ins().iconst(I32, 0);
-                builder.ins().jump(frame.handler, &[code.into()]);
-                self.stacks.reachable = false;
-            }
+        if kind == TransactionControlKind::TBlock {
+            let began_var = self.ensure_transaction_began_in_function_var(builder);
+            let zero = builder.ins().iconst(I8, 0);
+            builder.def_var(began_var, zero);
         }
+        self.transaction_try_stack
+            .last_mut()
+            .expect("transaction handler frame")
+            .in_handler = true;
         Ok(())
     }
 
@@ -5232,12 +5281,46 @@ impl FuncEnvironment<'_> {
         );
         let vmctx = self.vmctx_val(&mut builder.cursor());
         builder.ins().call(callee, &[vmctx, code]);
-        if let Some(frame) = self.transaction_try_stack.last() {
-            if !frame.in_handler {
-                builder.ins().jump(frame.handler, &[code.into()]);
-                self.stacks.reachable = false;
-            }
+        self.translate_transaction_failure_transfer(builder, code)
+    }
+
+    fn translate_transaction_failure_transfer(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        code: ir::Value,
+    ) -> WasmResult<()> {
+        let targets = self
+            .transaction_try_stack
+            .iter()
+            .rev()
+            .filter(|frame| !frame.in_handler && frame.head_is_reachable)
+            .map(|frame| {
+                (
+                    frame.handler,
+                    frame.handler_enabled,
+                    frame.handler_params.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (handler, enabled, mut params) in targets {
+            let next = builder.create_block();
+            let mut args = SmallVec::<[BlockArg; 8]>::new();
+            args.extend(params.drain(..).map(BlockArg::from));
+            args.push(code.into());
+            builder.ins().brif(enabled, handler, &args, next, &[]);
+            builder.switch_to_block(next);
+            builder.seal_block(next);
         }
+
+        let returns = self
+            .wasm_func_ty
+            .results()
+            .iter()
+            .map(|ty| self.default_wasm_value(builder, *ty))
+            .collect::<WasmResult<Vec<_>>>()?;
+        builder.ins().return_(&returns);
+        self.stacks.reachable = false;
         Ok(())
     }
 
@@ -5245,10 +5328,7 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
     ) -> WasmResult<()> {
-        let Some(frame) = self.transaction_try_stack.last().copied() else {
-            return Ok(());
-        };
-        if frame.in_handler || !self.stacks.reachable {
+        if !self.stacks.reachable {
             return Ok(());
         }
 
@@ -5268,16 +5348,19 @@ impl FuncEnvironment<'_> {
         let code = builder.func.dfg.inst_results(code_call)[0];
 
         let has_failure = builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
+        let failure_block = builder.create_block();
         let continue_block = builder.create_block();
-        builder.ins().brif(
-            has_failure,
-            frame.handler,
-            &[code.into()],
-            continue_block,
-            &[],
-        );
+        builder
+            .ins()
+            .brif(has_failure, failure_block, &[], continue_block, &[]);
+
+        builder.switch_to_block(failure_block);
+        builder.seal_block(failure_block);
+        self.translate_transaction_failure_transfer(builder, code)?;
+
         builder.switch_to_block(continue_block);
         builder.seal_block(continue_block);
+        self.stacks.reachable = true;
         Ok(())
     }
 

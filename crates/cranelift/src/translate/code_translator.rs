@@ -73,7 +73,9 @@
 
 use crate::Reachability;
 use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
-use crate::func_environ::{Extension, FuncEnvironment, TransactionCallTable};
+use crate::func_environ::{
+    Extension, FuncEnvironment, TransactionCallTable, TransactionControlKind,
+};
 use crate::translate::TargetEnvironment;
 use crate::translate::environ::StructFieldsVec;
 use crate::translate::stack::{ControlStackFrame, ElseData};
@@ -177,6 +179,13 @@ pub fn translate_operator(
     environ: &mut FuncEnvironment<'_>,
 ) -> WasmResult<()> {
     log::trace!("Translating Wasm opcode: {op:?}");
+
+    if matches!(op, Operator::Else) && environ.transaction_control_is_top() {
+        return translate_transaction_else(builder, environ);
+    }
+    if matches!(op, Operator::End) && environ.transaction_control_is_top() {
+        return translate_transaction_end(builder, environ);
+    }
 
     if !environ.is_reachable() {
         translate_unreachable_operator(validator, &op, builder, environ)?;
@@ -400,8 +409,38 @@ pub fn translate_operator(
         Operator::Nop => {
             // We do nothing
         }
-        Operator::TTry { blockty: _ } => {
-            environ.translate_transaction_structured_try_start(builder)?;
+        Operator::TBlock { blockty } | Operator::TTry { blockty } => {
+            let kind = if matches!(op, Operator::TBlock { .. }) {
+                TransactionControlKind::TBlock
+            } else {
+                TransactionControlKind::TTry
+            };
+            let (params, results) = blocktype_params_results(validator, *blockty)?;
+            let params = params.collect::<Vec<_>>();
+            let results = results.collect::<Vec<_>>();
+            let next = block_with_params(builder, results, environ)?;
+            let handler = block_with_params(builder, params.iter().copied(), environ)?;
+            builder.append_block_param(handler, I32);
+
+            let mut handler_params = SmallVec::new();
+            for value in environ.stacks.peekn(params.len()) {
+                handler_params.push(if builder.func.dfg.value_type(*value).is_vector() {
+                    optionally_bitcast_vector(*value, I8X16, builder)
+                } else {
+                    *value
+                });
+            }
+
+            environ
+                .stacks
+                .push_block(next, params.len(), builder.block_params(next).len());
+            environ.translate_transaction_structured_start(
+                builder,
+                kind,
+                handler,
+                handler_params,
+                environ.stacks.control_stack.len(),
+            )?;
         }
         Operator::TFail => {
             let code = environ.stacks.pop1();
@@ -723,17 +762,91 @@ pub fn translate_operator(
                 };
                 (return_count, frame.br_destination())
             };
-            let destination_args = environ.stacks.peekn_mut(return_count);
-            canonicalise_then_jump(builder, br_destination, destination_args);
+            let destination_args = environ.stacks.peekn(return_count).to_vec();
+            environ.translate_transaction_cleanup_for_control_exit(builder, i)?;
+            canonicalise_then_jump(builder, br_destination, &destination_args);
             environ.stacks.popn(return_count);
             environ.stacks.reachable = false;
         }
-        Operator::BrIf { relative_depth } => translate_br_if(*relative_depth, builder, environ),
+        Operator::BrIf { relative_depth } => {
+            let target = environ.stacks.control_stack.len() - 1 - (*relative_depth as usize);
+            if environ.transaction_exit_requires_cleanup(target) {
+                translate_transaction_br_if(*relative_depth, builder, environ)?;
+            } else {
+                translate_br_if(*relative_depth, builder, environ);
+            }
+        }
         Operator::BrTable { targets } => {
             let default = targets.default();
+            let target_depths = targets.targets().collect::<Result<Vec<_>, _>>()?;
+            let needs_transaction_cleanup =
+                target_depths
+                    .iter()
+                    .copied()
+                    .chain(Some(default))
+                    .any(|depth| {
+                        let target = environ.stacks.control_stack.len() - 1 - depth as usize;
+                        environ.transaction_exit_requires_cleanup(target)
+                    });
+            if needs_transaction_cleanup {
+                let min_depth = target_depths
+                    .iter()
+                    .copied()
+                    .chain(Some(default))
+                    .min()
+                    .unwrap();
+                let min_target = environ.stacks.control_stack.len() - 1 - min_depth as usize;
+                let return_count = {
+                    let frame = &environ.stacks.control_stack[min_target];
+                    if frame.is_loop() {
+                        frame.num_param_values()
+                    } else {
+                        frame.num_return_values()
+                    }
+                };
+                let selector = environ.stacks.pop1();
+                let args = environ.stacks.peekn(return_count).to_vec();
+                let mut edge_for_depth = HashMap::new();
+                let mut edge_sequence = Vec::new();
+                let mut edge = |depth: u32, builder: &mut FunctionBuilder| {
+                    *edge_for_depth.entry(depth).or_insert_with(|| {
+                        let block = builder.create_block();
+                        edge_sequence.push((depth, block));
+                        block
+                    })
+                };
+                let table_entries = target_depths
+                    .iter()
+                    .copied()
+                    .map(|depth| {
+                        let block = edge(depth, builder);
+                        builder.func.dfg.block_call(block, &[])
+                    })
+                    .collect::<Vec<_>>();
+                let default_edge = edge(default, builder);
+                let default_call = builder.func.dfg.block_call(default_edge, &[]);
+                let jump_table =
+                    builder.create_jump_table(JumpTableData::new(default_call, &table_entries));
+                builder.ins().br_table(selector, jump_table);
+
+                for (depth, edge) in edge_sequence {
+                    builder.switch_to_block(edge);
+                    builder.seal_block(edge);
+                    let target = environ.stacks.control_stack.len() - 1 - depth as usize;
+                    let destination = {
+                        let frame = &mut environ.stacks.control_stack[target];
+                        frame.set_branched_to_exit();
+                        frame.br_destination()
+                    };
+                    environ.translate_transaction_cleanup_for_control_exit(builder, target)?;
+                    canonicalise_then_jump(builder, destination, &args);
+                }
+                environ.stacks.popn(return_count);
+                environ.stacks.reachable = false;
+                return Ok(());
+            }
             let mut min_depth = default;
-            for depth in targets.targets() {
-                let depth = depth?;
+            for depth in target_depths.iter().copied() {
                 if depth < min_depth {
                     min_depth = depth;
                 }
@@ -751,8 +864,7 @@ pub fn translate_operator(
             let mut data = Vec::with_capacity(targets.len() as usize);
             if jump_args_count == 0 {
                 // No jump arguments
-                for depth in targets.targets() {
-                    let depth = depth?;
+                for depth in target_depths.iter().copied() {
                     let block = {
                         let i = environ.stacks.control_stack.len() - 1 - (depth as usize);
                         let frame = &mut environ.stacks.control_stack[i];
@@ -776,8 +888,7 @@ pub fn translate_operator(
                 let return_count = jump_args_count;
                 let mut dest_block_sequence = vec![];
                 let mut dest_block_map = HashMap::new();
-                for depth in targets.targets() {
-                    let depth = depth?;
+                for depth in target_depths.iter().copied() {
                     let branch_block = match dest_block_map.entry(depth as usize) {
                         hash_map::Entry::Occupied(entry) => *entry.get(),
                         hash_map::Entry::Vacant(entry) => {
@@ -822,6 +933,7 @@ pub fn translate_operator(
             };
             {
                 let mut return_args = environ.stacks.peekn(return_count).to_vec();
+                environ.translate_transaction_cleanup_for_control_exit(builder, 0)?;
                 environ.handle_before_return(&return_args, builder);
                 bitcast_wasm_returns(&mut return_args, builder);
                 builder.ins().return_(&return_args);
@@ -4141,6 +4253,125 @@ pub fn translate_operator(
     Ok(())
 }
 
+fn translate_transaction_else(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+) -> WasmResult<()> {
+    let control_depth = environ.stacks.control_stack.len();
+    let (head_is_reachable, handler) = {
+        let transaction = environ
+            .transaction_try_stack
+            .last()
+            .expect("transaction control frame");
+        debug_assert_eq!(transaction.control_stack_depth, control_depth);
+        (transaction.head_is_reachable, transaction.handler)
+    };
+
+    if !head_is_reachable {
+        let frame = environ.stacks.control_stack.last().unwrap();
+        frame.truncate_value_stack_to_original_size(
+            &mut environ.stacks.stack,
+            &mut environ.stacks.stack_shape,
+        );
+        environ.transaction_try_stack.last_mut().unwrap().in_handler = true;
+        return Ok(());
+    }
+
+    let destination = environ
+        .stacks
+        .control_stack
+        .last()
+        .expect("transaction wasm control frame")
+        .following_code();
+    let result_count = environ
+        .stacks
+        .control_stack
+        .last()
+        .unwrap()
+        .num_return_values();
+
+    if environ.stacks.reachable {
+        let results = environ.stacks.peekn(result_count).to_vec();
+        environ.translate_transaction_success_cleanup_at_depth(builder, control_depth)?;
+        canonicalise_then_jump(builder, destination, &results);
+        environ
+            .stacks
+            .control_stack
+            .last_mut()
+            .unwrap()
+            .set_branched_to_exit();
+    }
+
+    builder.switch_to_block(handler);
+    builder.seal_block(handler);
+    {
+        let frame = environ.stacks.control_stack.last().unwrap();
+        frame.truncate_value_stack_to_original_size(
+            &mut environ.stacks.stack,
+            &mut environ.stacks.stack_shape,
+        );
+    }
+    environ
+        .stacks
+        .stack
+        .extend_from_slice(builder.block_params(handler));
+    environ.stacks.reachable = !builder.is_unreachable();
+    if environ.stacks.reachable {
+        environ.translate_transaction_begin_handler(builder)?;
+    } else {
+        environ.transaction_try_stack.last_mut().unwrap().in_handler = true;
+    }
+    Ok(())
+}
+
+fn translate_transaction_end(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+) -> WasmResult<()> {
+    let transaction = environ
+        .transaction_try_stack
+        .pop()
+        .expect("transaction control frame");
+    let frame = environ
+        .stacks
+        .control_stack
+        .pop()
+        .expect("transaction wasm control frame");
+    debug_assert_eq!(
+        transaction.control_stack_depth,
+        environ.stacks.control_stack.len() + 1
+    );
+
+    if !transaction.head_is_reachable {
+        frame.truncate_value_stack_to_original_size(
+            &mut environ.stacks.stack,
+            &mut environ.stacks.stack_shape,
+        );
+        return Ok(());
+    }
+
+    let destination = frame.following_code();
+    if environ.stacks.reachable {
+        let results = environ.stacks.peekn(frame.num_return_values()).to_vec();
+        canonicalise_then_jump(builder, destination, &results);
+    }
+
+    builder.switch_to_block(destination);
+    builder.seal_block(destination);
+    frame.truncate_value_stack_to_original_size(
+        &mut environ.stacks.stack,
+        &mut environ.stacks.stack_shape,
+    );
+    environ.stacks.reachable = !builder.is_unreachable();
+    if environ.stacks.reachable {
+        environ
+            .stacks
+            .stack
+            .extend_from_slice(builder.block_params(destination));
+    }
+    Ok(())
+}
+
 /// Deals with a Wasm instruction located in an unreachable portion of the code. Most of them
 /// are dropped but special ones like `End` or `Else` signal the potential end of the unreachable
 /// portion so the translation state must be updated accordingly.
@@ -4171,6 +4402,15 @@ fn translate_unreachable_operator(
         | Operator::Block { blockty: _ }
         | Operator::TryTable { try_table: _ } => {
             environ.stacks.push_block(ir::Block::reserved_value(), 0, 0);
+        }
+        Operator::TBlock { blockty: _ } | Operator::TTry { blockty: _ } => {
+            let kind = if matches!(op, Operator::TBlock { .. }) {
+                TransactionControlKind::TBlock
+            } else {
+                TransactionControlKind::TTry
+            };
+            environ.stacks.push_block(ir::Block::reserved_value(), 0, 0);
+            environ.push_unreachable_transaction_control(kind, environ.stacks.control_stack.len());
         }
         Operator::Else => {
             let i = environ.stacks.control_stack.len() - 1;
@@ -4897,6 +5137,43 @@ fn translate_br_if(
 
     builder.seal_block(next_block); // The only predecessor is the current block.
     builder.switch_to_block(next_block);
+}
+
+fn translate_transaction_br_if(
+    relative_depth: u32,
+    builder: &mut FunctionBuilder,
+    env: &mut FuncEnvironment<'_>,
+) -> WasmResult<()> {
+    let branch_hint = env.take_branch_hint(builder.srcloc().bits() as usize);
+    let condition = env.stacks.pop1();
+    let target = env.stacks.control_stack.len() - 1 - relative_depth as usize;
+    let (return_count, destination) = {
+        let frame = &mut env.stacks.control_stack[target];
+        frame.set_branched_to_exit();
+        let return_count = if frame.is_loop() {
+            frame.num_param_values()
+        } else {
+            frame.num_return_values()
+        };
+        (return_count, frame.br_destination())
+    };
+    let args = env.stacks.peekn(return_count).to_vec();
+    let taken = builder.create_block();
+    let fallthrough = builder.create_block();
+
+    if let Some(hint) = branch_hint {
+        builder.set_cold_block(if hint.taken { fallthrough } else { taken });
+    }
+    builder.ins().brif(condition, taken, &[], fallthrough, &[]);
+
+    builder.switch_to_block(taken);
+    builder.seal_block(taken);
+    env.translate_transaction_cleanup_for_control_exit(builder, target)?;
+    canonicalise_then_jump(builder, destination, &args);
+
+    builder.switch_to_block(fallthrough);
+    builder.seal_block(fallthrough);
+    Ok(())
 }
 
 fn translate_br_if_args<'a>(

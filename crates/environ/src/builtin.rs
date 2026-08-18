@@ -180,6 +180,12 @@ macro_rules! foreach_builtin_function {
             // Begins a transactional WebAssembly transaction for `tfunc` entry
             // if no transaction is already active.
             transaction_enter_tfunc(vmctx: vmctx) -> u64;
+            // Begins a transaction for an outermost `tblock`, returning one
+            // when this boundary owns the new transaction and zero when a
+            // transaction was already active.
+            transaction_enter_tblock(vmctx: vmctx) -> u64;
+            // Returns whether a transaction is currently active.
+            transaction_active(vmctx: vmctx) -> u32;
             // Transfers ownership of the active transaction to the tfunc
             // entered by a transactional tail call.
             transaction_transfer_tfunc_ownership(vmctx: vmctx) -> bool;
@@ -508,6 +514,7 @@ impl BuiltinFunctionIndex {
             // Failure here indicates GC heap corruption.
             (@get get_interned_func_ref pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_enter_tfunc u64) => (TrapSentinel::NegativeOne);
+            (@get transaction_enter_tblock u64) => (TrapSentinel::NegativeOne);
             (@get transaction_transfer_tfunc_ownership bool) => (TrapSentinel::Falsy);
             (@get transaction_start_tfunc_tail bool) => (TrapSentinel::Falsy);
             (@get transaction_claim_tfunc_tail u64) => (TrapSentinel::NegativeOne);
@@ -522,6 +529,7 @@ impl BuiltinFunctionIndex {
             (@get transaction_tarray_len pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_failure_pending u32) => (return None);
             (@get transaction_failure_code u32) => (return None);
+            (@get transaction_active u32) => (return None);
             (@get transaction_helper_i31_for_ref u32) => (return None);
             (@get transaction_tref_test u32) => (return None);
 

@@ -332,6 +332,30 @@ fn transaction_enter_tfunc(store: &mut dyn VMStore, instance: InstanceId) -> Res
     Ok(1)
 }
 
+fn transaction_enter_tblock(store: &mut dyn VMStore, _instance: InstanceId) -> Result<u32> {
+    let store = store.store_opaque_mut();
+    let region = store.transaction_region_runtime().clone();
+    let state = store.transaction_state_mut();
+    if state.structured_failure_pending() {
+        return Ok(2);
+    }
+    if state.active_transaction().is_some() {
+        return Ok(0);
+    }
+    state.begin_with_region_runtime(&region)?;
+    Ok(1)
+}
+
+fn transaction_active(store: &mut dyn VMStore, _instance: InstanceId) -> u32 {
+    u32::from(
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .active_transaction()
+            .is_some(),
+    )
+}
+
 fn transaction_transfer_tfunc_ownership(
     store: &mut dyn VMStore,
     _instance: InstanceId,
