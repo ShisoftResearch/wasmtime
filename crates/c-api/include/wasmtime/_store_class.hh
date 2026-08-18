@@ -65,13 +65,16 @@ public:
   class Context {
     friend class Global;
     friend class Table;
+    friend class TransactionalTable;
     friend class Memory;
+    friend class TransactionalMemory;
     friend class Func;
     friend class Instance;
     friend class Linker;
     friend class Val;
     friend class Store;
     friend class Tag;
+    friend class TransactionalGlobal;
     wasmtime_context_t *ptr;
 
   public:

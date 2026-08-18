@@ -5,7 +5,7 @@ use crate::{
 #[cfg(feature = "gc")]
 use crate::{wasm_ref_t, wasm_store_t};
 use std::mem::MaybeUninit;
-use wasmtime::{Extern, Table, format_err};
+use wasmtime::{Extern, Table, TransactionalTable, format_err};
 #[cfg(feature = "gc")]
 use wasmtime::{Ref, RootScope, TableType};
 
@@ -212,4 +212,12 @@ pub unsafe extern "C" fn wasmtime_table_grow(
             .and_then(|val| table.grow(&mut store, delta, val)),
         |prev| *prev_size = prev,
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_transactional_table_type(
+    store: WasmtimeStoreContext<'_>,
+    table: &TransactionalTable,
+) -> Box<wasm_tabletype_t> {
+    Box::new(wasm_tabletype_t::new(table.ty(store)))
 }

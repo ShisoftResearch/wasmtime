@@ -86,6 +86,31 @@ typedef struct wasmtime_transactional_memory {
   uint32_t __private2;
 } wasmtime_transactional_memory_t;
 
+/// \brief Representation of a transactional table in Wasmtime.
+///
+/// Transactional tables are distinct from #wasmtime_table_t. Their operations
+/// participate in an active Wasm transaction and cannot use the ordinary table
+/// API.
+typedef struct wasmtime_transactional_table {
+  struct {
+    uint64_t store_id;
+    uint32_t __private1;
+  };
+  uint32_t __private2;
+} wasmtime_transactional_table_t;
+
+/// \brief Representation of a transactional global in Wasmtime.
+///
+/// Transactional globals are distinct from #wasmtime_global_t. Their
+/// operations participate in an active Wasm transaction and cannot use the
+/// ordinary global API.
+typedef struct wasmtime_transactional_global {
+  uint64_t store_id;
+  uint32_t __private1;
+  uint32_t __private2;
+  uint32_t __private3;
+} wasmtime_transactional_global_t;
+
 /// \brief Representation of a global in Wasmtime.
 ///
 /// Globals in Wasmtime are represented as an index into a store and don't
@@ -128,6 +153,19 @@ typedef uint8_t wasmtime_extern_kind_t;
 /// \brief Value of #wasmtime_extern_kind_t meaning that #wasmtime_extern_t is a
 /// transactional memory
 #define WASMTIME_EXTERN_TRANSACTIONAL_MEMORY 6
+/// \brief Value of #wasmtime_extern_kind_t meaning that #wasmtime_extern_t is a
+/// transactional table
+#define WASMTIME_EXTERN_TRANSACTIONAL_TABLE 7
+/// \brief Value of #wasmtime_extern_kind_t meaning that #wasmtime_extern_t is a
+/// transactional global
+#define WASMTIME_EXTERN_TRANSACTIONAL_GLOBAL 8
+
+/// \brief Value returned by #wasm_externtype_kind for a transactional global.
+#define WASMTIME_EXTERNTYPE_TRANSACTIONAL_GLOBAL 5
+/// \brief Value returned by #wasm_externtype_kind for a transactional memory.
+#define WASMTIME_EXTERNTYPE_TRANSACTIONAL_MEMORY 6
+/// \brief Value returned by #wasm_externtype_kind for a transactional table.
+#define WASMTIME_EXTERNTYPE_TRANSACTIONAL_TABLE 7
 
 /**
  * \typedef wasmtime_extern_union_t
@@ -155,6 +193,12 @@ typedef union wasmtime_extern_union {
   /// Field used if #wasmtime_extern_t::kind is
   /// #WASMTIME_EXTERN_TRANSACTIONAL_MEMORY
   wasmtime_transactional_memory_t transactional_memory;
+  /// Field used if #wasmtime_extern_t::kind is
+  /// #WASMTIME_EXTERN_TRANSACTIONAL_TABLE
+  wasmtime_transactional_table_t transactional_table;
+  /// Field used if #wasmtime_extern_t::kind is
+  /// #WASMTIME_EXTERN_TRANSACTIONAL_GLOBAL
+  wasmtime_transactional_global_t transactional_global;
 } wasmtime_extern_union_t;
 
 /**

@@ -15,6 +15,7 @@ namespace wasmtime {
  */
 class TableType {
   friend class Table;
+  friend class TransactionalTable;
 
   struct deleter {
     void operator()(wasm_tabletype_t *p) const { wasm_tabletype_delete(p); }

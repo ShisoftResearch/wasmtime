@@ -14,6 +14,7 @@ namespace wasmtime {
  */
 class GlobalType {
   friend class Global;
+  friend class TransactionalGlobal;
 
   struct deleter {
     void operator()(wasm_globaltype_t *p) const { wasm_globaltype_delete(p); }

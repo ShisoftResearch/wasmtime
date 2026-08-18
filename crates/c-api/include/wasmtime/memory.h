@@ -167,6 +167,52 @@ WASM_API_EXTERN uint64_t wasmtime_memory_page_size(
 WASM_API_EXTERN uint8_t wasmtime_memory_page_size_log2(
     wasmtime_context_t *store, const wasmtime_memory_t *memory);
 
+/**
+ * \brief Returns the type of a transactional memory.
+ */
+WASM_API_EXTERN wasm_memorytype_t *wasmtime_transactional_memory_type(
+    const wasmtime_context_t *store,
+    const wasmtime_transactional_memory_t *memory);
+
+/**
+ * \brief Returns the committed byte length of a transactional memory.
+ */
+WASM_API_EXTERN size_t wasmtime_transactional_memory_data_size(
+    const wasmtime_context_t *store,
+    const wasmtime_transactional_memory_t *memory);
+
+/**
+ * \brief Returns the committed size, in WebAssembly pages, of a transactional
+ * memory.
+ */
+WASM_API_EXTERN uint64_t wasmtime_transactional_memory_size(
+    const wasmtime_context_t *store,
+    const wasmtime_transactional_memory_t *memory);
+
+/**
+ * \brief Copies committed transactional-memory bytes into `buffer`.
+ *
+ * Transactional memories deliberately do not expose a stable data pointer;
+ * use this copy-oriented API instead. On error, `buffer` is unchanged.
+ */
+WASM_API_EXTERN wasmtime_error_t *wasmtime_transactional_memory_read(
+    wasmtime_context_t *store, const wasmtime_transactional_memory_t *memory,
+    size_t offset, uint8_t *buffer, size_t buffer_len);
+
+/**
+ * \brief Writes `buffer` to a transactional memory and commits the write.
+ */
+WASM_API_EXTERN wasmtime_error_t *wasmtime_transactional_memory_write(
+    wasmtime_context_t *store, const wasmtime_transactional_memory_t *memory,
+    size_t offset, const uint8_t *buffer, size_t buffer_len);
+
+/**
+ * \brief Grows a transactional memory and commits the growth.
+ */
+WASM_API_EXTERN wasmtime_error_t *wasmtime_transactional_memory_grow(
+    wasmtime_context_t *store, const wasmtime_transactional_memory_t *memory,
+    uint64_t delta, uint64_t *prev_size);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -12,6 +12,9 @@
 #include <wasmtime/memory.hh>
 #include <wasmtime/table.hh>
 #include <wasmtime/tag.hh>
+#include <wasmtime/transactional_global.hh>
+#include <wasmtime/transactional_memory.hh>
+#include <wasmtime/transactional_table.hh>
 
 namespace wasmtime {
 
@@ -30,6 +33,12 @@ static Extern cvt_extern(wasmtime_extern_t &e) {
     return Table(e.of.table);
   case WASMTIME_EXTERN_TAG:
     return Tag(e.of.tag);
+  case WASMTIME_EXTERN_TRANSACTIONAL_GLOBAL:
+    return TransactionalGlobal(e.of.transactional_global);
+  case WASMTIME_EXTERN_TRANSACTIONAL_MEMORY:
+    return TransactionalMemory(e.of.transactional_memory);
+  case WASMTIME_EXTERN_TRANSACTIONAL_TABLE:
+    return TransactionalTable(e.of.transactional_table);
   }
   std::abort();
 }
@@ -50,6 +59,15 @@ static void cvt_extern(const Extern &e, wasmtime_extern_t &raw) {
   } else if (const auto *tag = std::get_if<Tag>(&e)) {
     raw.kind = WASMTIME_EXTERN_TAG;
     raw.of.tag = tag->capi();
+  } else if (const auto *global = std::get_if<TransactionalGlobal>(&e)) {
+    raw.kind = WASMTIME_EXTERN_TRANSACTIONAL_GLOBAL;
+    raw.of.transactional_global = global->capi();
+  } else if (const auto *memory = std::get_if<TransactionalMemory>(&e)) {
+    raw.kind = WASMTIME_EXTERN_TRANSACTIONAL_MEMORY;
+    raw.of.transactional_memory = memory->capi();
+  } else if (const auto *table = std::get_if<TransactionalTable>(&e)) {
+    raw.kind = WASMTIME_EXTERN_TRANSACTIONAL_TABLE;
+    raw.of.transactional_table = table->capi();
   } else {
     std::abort();
   }

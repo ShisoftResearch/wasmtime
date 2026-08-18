@@ -5,8 +5,8 @@ mod global;
 mod table;
 mod tag;
 
-pub use global::Global;
-pub use table::Table;
+pub use global::{Global, TransactionalGlobal};
+pub use table::{Table, TransactionalTable};
 pub use tag::Tag;
 
 // Externals
@@ -25,8 +25,12 @@ pub enum Extern {
     /// A WebAssembly `global` which acts like a `Cell<T>` of sorts, supporting
     /// `get` and `set` operations.
     Global(Global),
+    /// A transactional WebAssembly global with transactional host semantics.
+    TransactionalGlobal(TransactionalGlobal),
     /// A WebAssembly `table` which is an array of `Val` reference types.
     Table(Table),
+    /// A transactional WebAssembly table with transactional host semantics.
+    TransactionalTable(TransactionalTable),
     /// A WebAssembly linear memory.
     Memory(Memory),
     /// A WebAssembly shared memory; these are handled separately from
@@ -62,6 +66,15 @@ impl Extern {
         }
     }
 
+    /// Returns the underlying transactional global, if this external is one.
+    #[inline]
+    pub fn into_transactional_global(self) -> Option<TransactionalGlobal> {
+        match self {
+            Extern::TransactionalGlobal(global) => Some(global),
+            _ => None,
+        }
+    }
+
     /// Returns the underlying `Table`, if this external is a table.
     ///
     /// Returns `None` if this is not a table.
@@ -69,6 +82,15 @@ impl Extern {
     pub fn into_table(self) -> Option<Table> {
         match self {
             Extern::Table(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// Returns the underlying transactional table, if this external is one.
+    #[inline]
+    pub fn into_transactional_table(self) -> Option<TransactionalTable> {
+        match self {
+            Extern::TransactionalTable(table) => Some(table),
             _ => None,
         }
     }
@@ -130,9 +152,11 @@ impl Extern {
             Extern::Func(ft) => ExternType::Func(ft.ty(store)),
             Extern::Memory(ft) => ExternType::Memory(ft.ty(store)),
             Extern::SharedMemory(ft) => ExternType::Memory(ft.ty()),
-            Extern::TransactionalMemory(ft) => ExternType::Memory(ft.ty(store)),
+            Extern::TransactionalMemory(ft) => ExternType::TransactionalMemory(ft.ty(store)),
             Extern::Table(tt) => ExternType::Table(tt.ty(store)),
+            Extern::TransactionalTable(tt) => ExternType::TransactionalTable(tt.ty(store)),
             Extern::Global(gt) => ExternType::Global(gt.ty(store)),
+            Extern::TransactionalGlobal(gt) => ExternType::TransactionalGlobal(gt.ty(store)),
             Extern::Tag(tt) => ExternType::Tag(tt.ty(store)),
         }
     }
@@ -150,6 +174,8 @@ impl Extern {
             crate::runtime::vm::Export::TransactionalMemory(m) => Extern::TransactionalMemory(m),
             crate::runtime::vm::Export::Global(g) => Extern::Global(g),
             crate::runtime::vm::Export::Table(t) => Extern::Table(t),
+            crate::runtime::vm::Export::TransactionalGlobal(g) => Extern::TransactionalGlobal(g),
+            crate::runtime::vm::Export::TransactionalTable(t) => Extern::TransactionalTable(t),
             crate::runtime::vm::Export::Tag(t) => Extern::Tag(t),
         }
     }
@@ -158,10 +184,12 @@ impl Extern {
         match self {
             Extern::Func(f) => f.comes_from_same_store(store),
             Extern::Global(g) => g.comes_from_same_store(store),
+            Extern::TransactionalGlobal(g) => g.comes_from_same_store(store),
             Extern::Memory(m) => m.comes_from_same_store(store),
             Extern::SharedMemory(m) => Engine::same(m.engine(), store.engine()),
             Extern::TransactionalMemory(m) => m.comes_from_same_store(store),
             Extern::Table(t) => t.comes_from_same_store(store),
+            Extern::TransactionalTable(t) => t.comes_from_same_store(store),
             Extern::Tag(t) => t.comes_from_same_store(store),
         }
     }
@@ -176,6 +204,12 @@ impl From<Func> for Extern {
 impl From<Global> for Extern {
     fn from(r: Global) -> Self {
         Extern::Global(r)
+    }
+}
+
+impl From<TransactionalGlobal> for Extern {
+    fn from(r: TransactionalGlobal) -> Self {
+        Extern::TransactionalGlobal(r)
     }
 }
 
@@ -200,6 +234,12 @@ impl From<TransactionalMemory> for Extern {
 impl From<Table> for Extern {
     fn from(r: Table) -> Self {
         Extern::Table(r)
+    }
+}
+
+impl From<TransactionalTable> for Extern {
+    fn from(r: TransactionalTable) -> Self {
+        Extern::TransactionalTable(r)
     }
 }
 

@@ -3,7 +3,7 @@ use crate::{
     wasm_store_t, wasmtime_error_t,
 };
 use std::convert::TryFrom;
-use wasmtime::{Extern, Memory};
+use wasmtime::{Extern, Memory, TransactionalMemory};
 
 #[derive(Clone)]
 #[repr(transparent)]
@@ -145,4 +145,62 @@ pub extern "C" fn wasmtime_memory_page_size_log2(
     mem: &Memory,
 ) -> u8 {
     mem.page_size_log2(store)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_transactional_memory_type(
+    store: WasmtimeStoreContext<'_>,
+    mem: &TransactionalMemory,
+) -> Box<wasm_memorytype_t> {
+    Box::new(wasm_memorytype_t::new(mem.ty(store)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_transactional_memory_data_size(
+    store: WasmtimeStoreContext<'_>,
+    mem: &TransactionalMemory,
+) -> usize {
+    mem.data_size(store)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_transactional_memory_size(
+    store: WasmtimeStoreContext<'_>,
+    mem: &TransactionalMemory,
+) -> u64 {
+    mem.size(store)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasmtime_transactional_memory_read(
+    store: WasmtimeStoreContextMut<'_>,
+    mem: &TransactionalMemory,
+    offset: usize,
+    buffer: *mut u8,
+    buffer_len: usize,
+) -> Option<Box<wasmtime_error_t>> {
+    let buffer = unsafe { crate::slice_from_raw_parts_mut(buffer, buffer_len) };
+    handle_result(mem.read(store, offset, buffer), |_| {})
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasmtime_transactional_memory_write(
+    store: WasmtimeStoreContextMut<'_>,
+    mem: &TransactionalMemory,
+    offset: usize,
+    buffer: *const u8,
+    buffer_len: usize,
+) -> Option<Box<wasmtime_error_t>> {
+    let buffer = unsafe { crate::slice_from_raw_parts(buffer, buffer_len) };
+    handle_result(mem.write(store, offset, buffer), |_| {})
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_transactional_memory_grow(
+    store: WasmtimeStoreContextMut<'_>,
+    mem: &TransactionalMemory,
+    delta: u64,
+    prev_size: &mut u64,
+) -> Option<Box<wasmtime_error_t>> {
+    handle_result(mem.grow(store, delta), |prev| *prev_size = prev)
 }

@@ -25,6 +25,50 @@ class ExternType {
   friend class ImportType;
 
 public:
+  /// \brief Type information for a native transactional global.
+  class TransactionalGlobalRef {
+    GlobalType::Ref type_;
+
+  public:
+    explicit TransactionalGlobalRef(const wasm_globaltype_t *type) : type_(type) {}
+    /// Returns whether this global is mutable.
+    bool is_mutable() const { return type_.is_mutable(); }
+    /// Returns the type of value stored within this global.
+    ValType::Ref content() const { return type_.content(); }
+  };
+
+  /// \brief Type information for a native transactional memory.
+  class TransactionalMemoryRef {
+    MemoryType::Ref type_;
+
+  public:
+    explicit TransactionalMemoryRef(const wasm_memorytype_t *type) : type_(type) {}
+    /// Returns the minimum size, in pages.
+    uint64_t min() const { return type_.min(); }
+    /// Returns the maximum size, if specified.
+    std::optional<uint64_t> max() const { return type_.max(); }
+    /// Returns whether this is a 64-bit memory.
+    bool is_64() const { return type_.is_64(); }
+    /// Returns whether this memory is shared.
+    bool is_shared() const { return type_.is_shared(); }
+    /// Returns its page size, in bytes.
+    uint64_t page_size() const { return type_.page_size(); }
+  };
+
+  /// \brief Type information for a native transactional table.
+  class TransactionalTableRef {
+    TableType::Ref type_;
+
+  public:
+    explicit TransactionalTableRef(const wasm_tabletype_t *type) : type_(type) {}
+    /// Returns the minimum table size.
+    uint32_t min() const { return type_.min(); }
+    /// Returns the maximum table size, if specified.
+    std::optional<uint32_t> max() const { return type_.max(); }
+    /// Returns the element type.
+    ValType::Ref element() const { return type_.element(); }
+  };
+
   /// \typedef Ref
   /// \brief Non-owning reference to an item's type
   ///
@@ -32,7 +76,8 @@ public:
   /// otherwise this is used to determine what the actual type of the outer item
   /// is.
   typedef std::variant<FuncType::Ref, GlobalType::Ref, TableType::Ref,
-                       MemoryType::Ref, TagType::Ref>
+                       MemoryType::Ref, TagType::Ref, TransactionalGlobalRef,
+                       TransactionalMemoryRef, TransactionalTableRef>
       Ref;
 
   /// Extract the type of the item imported by the provided type.
@@ -62,6 +107,12 @@ private:
       return wasm_externtype_as_memorytype_const(ptr);
     case WASM_EXTERN_TAG:
       return wasm_externtype_as_tagtype_const(ptr);
+    case WASMTIME_EXTERNTYPE_TRANSACTIONAL_GLOBAL:
+      return TransactionalGlobalRef(wasm_externtype_as_globaltype_const(ptr));
+    case WASMTIME_EXTERNTYPE_TRANSACTIONAL_MEMORY:
+      return TransactionalMemoryRef(wasm_externtype_as_memorytype_const(ptr));
+    case WASMTIME_EXTERNTYPE_TRANSACTIONAL_TABLE:
+      return TransactionalTableRef(wasm_externtype_as_tabletype_const(ptr));
     }
     std::abort();
   }

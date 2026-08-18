@@ -104,6 +104,16 @@ wasmtime_table_grow(wasmtime_context_t *store, const wasmtime_table_t *table,
                     uint64_t delta, const wasmtime_val_t *init,
                     uint64_t *prev_size);
 
+/**
+ * \brief Returns the type of a transactional table.
+ *
+ * Transactional tables are not compatible with the ordinary table operations
+ * in this header; use this function only to inspect their structural type.
+ */
+WASM_API_EXTERN wasm_tabletype_t *wasmtime_transactional_table_type(
+    const wasmtime_context_t *store,
+    const wasmtime_transactional_table_t *table);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -8,6 +8,9 @@ pub enum Export {
     /// A table export value.
     Table(crate::Table),
 
+    /// A transactional table export value.
+    TransactionalTable(crate::TransactionalTable),
+
     /// An unshared memory export value.
     Memory(crate::Memory),
 
@@ -19,6 +22,9 @@ pub enum Export {
 
     /// A global export value.
     Global(crate::Global),
+
+    /// A transactional global export value.
+    TransactionalGlobal(crate::TransactionalGlobal),
 
     /// A tag export value.
     Tag(crate::Tag),

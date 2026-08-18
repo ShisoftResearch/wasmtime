@@ -1447,10 +1447,16 @@ pub enum ExternType {
     Func(FuncType),
     /// This external type is the type of a WebAssembly global.
     Global(GlobalType),
+    /// This external type is the type of a transactional WebAssembly global.
+    TransactionalGlobal(GlobalType),
     /// This external type is the type of a WebAssembly table.
     Table(TableType),
+    /// This external type is the type of a transactional WebAssembly table.
+    TransactionalTable(TableType),
     /// This external type is the type of a WebAssembly memory.
     Memory(MemoryType),
+    /// This external type is the type of a transactional WebAssembly memory.
+    TransactionalMemory(MemoryType),
     /// This external type is the type of a WebAssembly tag.
     Tag(TagType),
 }
@@ -1483,8 +1489,11 @@ impl ExternType {
     extern_type_accessors! {
         (Func(FuncType) func unwrap_func)
         (Global(GlobalType) global unwrap_global)
+        (TransactionalGlobal(GlobalType) transactional_global unwrap_transactional_global)
         (Table(TableType) table unwrap_table)
+        (TransactionalTable(TableType) transactional_table unwrap_transactional_table)
         (Memory(MemoryType) memory unwrap_memory)
+        (TransactionalMemory(MemoryType) transactional_memory unwrap_transactional_memory)
         (Tag(TagType) tag unwrap_tag)
     }
 
@@ -1516,11 +1525,17 @@ impl ExternType {
                 EngineOrModuleTypeIndex::RecGroup(_) => unreachable!(),
             },
             EntityType::Global(ty) => GlobalType::from_wasmtime_global(engine, ty).into(),
-            EntityType::TGlobal(ty) => GlobalType::from_wasmtime_global(engine, ty).into(),
+            EntityType::TGlobal(ty) => {
+                ExternType::TransactionalGlobal(GlobalType::from_wasmtime_global(engine, ty))
+            }
             EntityType::Memory(ty) => MemoryType::from_wasmtime_memory(ty).into(),
-            EntityType::TMemory(ty) => MemoryType::from_wasmtime_memory(ty).into(),
+            EntityType::TMemory(ty) => {
+                ExternType::TransactionalMemory(MemoryType::from_wasmtime_memory(ty))
+            }
             EntityType::Table(ty) => TableType::from_wasmtime_table(engine, ty).into(),
-            EntityType::TTable(ty) => TableType::from_wasmtime_table(engine, ty).into(),
+            EntityType::TTable(ty) => {
+                ExternType::TransactionalTable(TableType::from_wasmtime_table(engine, ty))
+            }
             EntityType::Tag(ty) => TagType::from_wasmtime_tag(engine, ty).into(),
         }
     }
@@ -1529,8 +1544,17 @@ impl ExternType {
         match self {
             ExternType::Func(func_ty) => func_ty.default_value(store).map(Extern::Func),
             ExternType::Global(global_ty) => global_ty.default_value(store).map(Extern::Global),
+            ExternType::TransactionalGlobal(_) => {
+                bail!("transactional globals cannot be created as host defaults")
+            }
             ExternType::Table(table_ty) => table_ty.default_value(store).map(Extern::Table),
+            ExternType::TransactionalTable(_) => {
+                bail!("transactional tables cannot be created as host defaults")
+            }
             ExternType::Memory(mem_ty) => mem_ty.default_value(store),
+            ExternType::TransactionalMemory(_) => {
+                bail!("transactional memories cannot be created as host defaults")
+            }
             ExternType::Tag(tag_ty) => tag_ty.default_value(store).map(Extern::Tag),
         }
     }

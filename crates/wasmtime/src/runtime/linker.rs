@@ -1481,7 +1481,7 @@ impl Definition {
             Definition::Extern(Extern::Table(m), DefinitionType::Table(_, size)) => {
                 *size = m.size_(store);
             }
-            Definition::Extern(Extern::Table(m), DefinitionType::TTable(_, size)) => {
+            Definition::Extern(Extern::TransactionalTable(m), DefinitionType::TTable(_, size)) => {
                 *size = m.size_(store);
             }
             _ => {}
@@ -1493,14 +1493,12 @@ impl DefinitionType {
     pub(crate) fn from(store: &StoreOpaque, item: &Extern) -> DefinitionType {
         match item {
             Extern::Func(f) => DefinitionType::Func(f.type_index(store)),
-            Extern::Table(t) if t.is_transactional(store) => {
+            Extern::Table(t) => DefinitionType::Table(*t.wasmtime_ty(store), t.size_(store)),
+            Extern::TransactionalTable(t) => {
                 DefinitionType::TTable(*t.wasmtime_ty(store), t.size_(store))
             }
-            Extern::Table(t) => DefinitionType::Table(*t.wasmtime_ty(store), t.size_(store)),
-            Extern::Global(t) if t.is_transactional(store) => {
-                DefinitionType::TGlobal(*t.wasmtime_ty(store))
-            }
             Extern::Global(t) => DefinitionType::Global(*t.wasmtime_ty(store)),
+            Extern::TransactionalGlobal(t) => DefinitionType::TGlobal(*t.wasmtime_ty(store)),
             Extern::Memory(t) => {
                 DefinitionType::Memory(*t.wasmtime_ty(store), t.internal_size(store))
             }

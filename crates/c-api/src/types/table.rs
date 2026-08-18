@@ -26,14 +26,16 @@ impl wasm_tabletype_t {
 
     pub(crate) fn try_from(e: &wasm_externtype_t) -> Option<&wasm_tabletype_t> {
         match &e.which {
-            CExternType::Table(_) => Some(unsafe { &*(e as *const _ as *const _) }),
+            CExternType::Table(_) | CExternType::TransactionalTable(_) => {
+                Some(unsafe { &*(e as *const _ as *const _) })
+            }
             _ => None,
         }
     }
 
     pub(crate) fn ty(&self) -> &CTableType {
         match &self.ext.which {
-            CExternType::Table(f) => &f,
+            CExternType::Table(f) | CExternType::TransactionalTable(f) => &f,
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }

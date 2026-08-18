@@ -757,12 +757,12 @@ impl Instance {
             .globals
             .keys()
             .map(move |idx| (idx.into(), self.get_exported_global(store, idx)))
-            .chain(
-                module
-                    .tglobals
-                    .keys()
-                    .map(move |idx| (idx.into(), self.get_exported_tglobal(store, idx))),
-            )
+            .chain(module.tglobals.keys().map(move |idx| {
+                (
+                    idx.into(),
+                    self.get_exported_tglobal(store, idx).physical_global(),
+                )
+            }))
     }
 
     /// Get the globals defined in this instance (not imported).
@@ -897,7 +897,11 @@ impl Instance {
     }
 
     /// Lookup a transactional table by its native index.
-    pub fn get_exported_ttable(&self, store: StoreId, index: TTableIndex) -> crate::Table {
+    pub fn get_exported_ttable(
+        &self,
+        store: StoreId,
+        index: TTableIndex,
+    ) -> crate::TransactionalTable {
         let (id, def_index) = if let Some(def_index) = self.env_module().defined_ttable_index(index)
         {
             (
@@ -910,7 +914,7 @@ impl Instance {
             let id = unsafe { self.sibling_vmctx(import.vmctx.as_non_null()).id };
             (id, import.index)
         };
-        crate::Table::from_raw(StoreInstanceId::new(store, id), def_index)
+        crate::TransactionalTable::from_raw(StoreInstanceId::new(store, id), def_index)
     }
 
     /// Lookup a memory by index.
@@ -1043,22 +1047,30 @@ impl Instance {
         &self,
         store: StoreId,
         index: TGlobalIndex,
-    ) -> crate::Global {
+    ) -> crate::TransactionalGlobal {
         if let Some(def_index) = self.env_module().defined_tglobal_index(index) {
             let def_index = self.env_module().runtime_defined_tglobal_index(def_index);
-            return crate::Global::from_core(StoreInstanceId::new(store, self.id), def_index);
+            return crate::TransactionalGlobal::from_global(crate::Global::from_core(
+                StoreInstanceId::new(store, self.id),
+                def_index,
+            ));
         }
 
         let import = self.imported_tglobal(index);
         match import.kind {
-            VMGlobalKind::Host(index) => crate::Global::from_host(store, index),
+            VMGlobalKind::Host(index) => {
+                crate::TransactionalGlobal::from_global(crate::Global::from_host(store, index))
+            }
             VMGlobalKind::Instance(index) => {
                 // SAFETY: instance import records contain a valid sibling vmctx.
                 let id = unsafe {
                     let vmctx = VMContext::from_opaque(import.vmctx.unwrap().as_non_null());
                     self.sibling_vmctx(vmctx).id
                 };
-                crate::Global::from_core(StoreInstanceId::new(store, id), index)
+                crate::TransactionalGlobal::from_global(crate::Global::from_core(
+                    StoreInstanceId::new(store, id),
+                    index,
+                ))
             }
             #[cfg(feature = "component-model")]
             VMGlobalKind::ComponentFlags(index) => {
@@ -1070,10 +1082,10 @@ impl Instance {
                     );
                     super::component::ComponentInstance::vmctx_instance_id(vmctx)
                 };
-                crate::Global::from_component_flags(
+                crate::TransactionalGlobal::from_global(crate::Global::from_component_flags(
                     crate::component::store::StoreComponentInstanceId::new(store, id),
                     index,
-                )
+                ))
             }
             #[cfg(feature = "component-model")]
             VMGlobalKind::TaskMayBlock => {
@@ -1085,9 +1097,9 @@ impl Instance {
                     );
                     super::component::ComponentInstance::vmctx_instance_id(vmctx)
                 };
-                crate::Global::from_task_may_block(
+                crate::TransactionalGlobal::from_global(crate::Global::from_task_may_block(
                     crate::component::store::StoreComponentInstanceId::new(store, id),
-                )
+                ))
             }
         }
     }
@@ -1951,9 +1963,13 @@ impl Instance {
                 Export::Function(unsafe { self.get_exported_func(registry, store, i) })
             }
             EntityIndex::Global(i) => Export::Global(self.get_exported_global(store, i)),
-            EntityIndex::TGlobal(i) => Export::Global(self.get_exported_tglobal(store, i)),
+            EntityIndex::TGlobal(i) => {
+                Export::TransactionalGlobal(self.get_exported_tglobal(store, i))
+            }
             EntityIndex::Table(i) => Export::Table(self.get_exported_table(store, i)),
-            EntityIndex::TTable(i) => Export::Table(self.get_exported_ttable(store, i)),
+            EntityIndex::TTable(i) => {
+                Export::TransactionalTable(self.get_exported_ttable(store, i))
+            }
             EntityIndex::Memory(i) => match self.get_exported_memory(store, i) {
                 ExportMemory::Unshared(m) => Export::Memory(m),
                 ExportMemory::Shared(m, i) => Export::SharedMemory(m, i),

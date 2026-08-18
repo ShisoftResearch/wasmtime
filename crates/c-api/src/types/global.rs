@@ -28,14 +28,16 @@ impl wasm_globaltype_t {
 
     pub(crate) fn try_from(e: &wasm_externtype_t) -> Option<&wasm_globaltype_t> {
         match &e.which {
-            CExternType::Global(_) => Some(unsafe { &*(e as *const _ as *const _) }),
+            CExternType::Global(_) | CExternType::TransactionalGlobal(_) => {
+                Some(unsafe { &*(e as *const _ as *const _) })
+            }
             _ => None,
         }
     }
 
     pub(crate) fn ty(&self) -> &CGlobalType {
         match &self.ext.which {
-            CExternType::Global(f) => &f,
+            CExternType::Global(f) | CExternType::TransactionalGlobal(f) => &f,
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }

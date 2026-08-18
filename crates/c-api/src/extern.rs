@@ -3,7 +3,10 @@ use crate::{
     wasm_global_t, wasm_memory_t, wasm_table_t,
 };
 use std::mem::ManuallyDrop;
-use wasmtime::{Extern, Func, Global, Memory, SharedMemory, Table, Tag, TransactionalMemory};
+use wasmtime::{
+    Extern, Func, Global, Memory, SharedMemory, Table, Tag, TransactionalGlobal,
+    TransactionalMemory, TransactionalTable,
+};
 
 #[derive(Clone)]
 pub struct wasm_extern_t {
@@ -18,7 +21,13 @@ pub extern "C" fn wasm_extern_kind(e: &wasm_extern_t) -> wasm_externkind_t {
     match e.which {
         Extern::Func(_) => crate::WASM_EXTERN_FUNC,
         Extern::Global(_) => crate::WASM_EXTERN_GLOBAL,
+        Extern::TransactionalGlobal(_) => panic!(
+            "Transactional Global is not implemented for wasm_* types. Please use wasmtime_* types instead"
+        ),
         Extern::Table(_) => crate::WASM_EXTERN_TABLE,
+        Extern::TransactionalTable(_) => panic!(
+            "Transactional Table is not implemented for wasm_* types. Please use wasmtime_* types instead"
+        ),
         Extern::Memory(_) => crate::WASM_EXTERN_MEMORY,
         Extern::SharedMemory(_) => panic!(
             "Shared Memory no implemented for wasm_* types. Please use wasmtime_* types instead"
@@ -91,6 +100,8 @@ pub const WASMTIME_EXTERN_MEMORY: wasmtime_extern_kind_t = 3;
 pub const WASMTIME_EXTERN_SHAREDMEMORY: wasmtime_extern_kind_t = 4;
 pub const WASMTIME_EXTERN_TAG: wasmtime_extern_kind_t = 5;
 pub const WASMTIME_EXTERN_TRANSACTIONAL_MEMORY: wasmtime_extern_kind_t = 6;
+pub const WASMTIME_EXTERN_TRANSACTIONAL_TABLE: wasmtime_extern_kind_t = 7;
+pub const WASMTIME_EXTERN_TRANSACTIONAL_GLOBAL: wasmtime_extern_kind_t = 8;
 
 #[repr(C)]
 pub union wasmtime_extern_union {
@@ -101,6 +112,8 @@ pub union wasmtime_extern_union {
     pub sharedmemory: ManuallyDrop<Box<SharedMemory>>,
     pub tag: Tag,
     pub transactional_memory: TransactionalMemory,
+    pub transactional_table: TransactionalTable,
+    pub transactional_global: TransactionalGlobal,
 }
 
 impl Drop for wasmtime_extern_t {
@@ -118,7 +131,13 @@ impl wasmtime_extern_t {
         match self.kind {
             WASMTIME_EXTERN_FUNC => Extern::Func(self.of.func),
             WASMTIME_EXTERN_GLOBAL => Extern::Global(self.of.global),
+            WASMTIME_EXTERN_TRANSACTIONAL_GLOBAL => {
+                Extern::TransactionalGlobal(self.of.transactional_global)
+            }
             WASMTIME_EXTERN_TABLE => Extern::Table(self.of.table),
+            WASMTIME_EXTERN_TRANSACTIONAL_TABLE => {
+                Extern::TransactionalTable(self.of.transactional_table)
+            }
             WASMTIME_EXTERN_MEMORY => Extern::Memory(self.of.memory),
             WASMTIME_EXTERN_SHAREDMEMORY => Extern::SharedMemory((**self.of.sharedmemory).clone()),
             WASMTIME_EXTERN_TAG => Extern::Tag(self.of.tag),
@@ -141,9 +160,21 @@ impl From<Extern> for wasmtime_extern_t {
                 kind: WASMTIME_EXTERN_GLOBAL,
                 of: wasmtime_extern_union { global },
             },
+            Extern::TransactionalGlobal(transactional_global) => wasmtime_extern_t {
+                kind: WASMTIME_EXTERN_TRANSACTIONAL_GLOBAL,
+                of: wasmtime_extern_union {
+                    transactional_global,
+                },
+            },
             Extern::Table(table) => wasmtime_extern_t {
                 kind: WASMTIME_EXTERN_TABLE,
                 of: wasmtime_extern_union { table },
+            },
+            Extern::TransactionalTable(transactional_table) => wasmtime_extern_t {
+                kind: WASMTIME_EXTERN_TRANSACTIONAL_TABLE,
+                of: wasmtime_extern_union {
+                    transactional_table,
+                },
             },
             Extern::Memory(memory) => wasmtime_extern_t {
                 kind: WASMTIME_EXTERN_MEMORY,

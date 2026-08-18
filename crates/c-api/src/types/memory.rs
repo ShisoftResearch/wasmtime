@@ -26,14 +26,16 @@ impl wasm_memorytype_t {
 
     pub(crate) fn try_from(e: &wasm_externtype_t) -> Option<&wasm_memorytype_t> {
         match &e.which {
-            CExternType::Memory(_) => Some(unsafe { &*(e as *const _ as *const _) }),
+            CExternType::Memory(_) | CExternType::TransactionalMemory(_) => {
+                Some(unsafe { &*(e as *const _ as *const _) })
+            }
             _ => None,
         }
     }
 
     pub(crate) fn ty(&self) -> &CMemoryType {
         match &self.ext.which {
-            CExternType::Memory(f) => &f,
+            CExternType::Memory(f) | CExternType::TransactionalMemory(f) => &f,
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }

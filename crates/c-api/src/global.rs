@@ -5,7 +5,7 @@ use crate::{
 use std::mem::MaybeUninit;
 #[cfg(feature = "gc")]
 use wasmtime::RootScope;
-use wasmtime::{Extern, Global};
+use wasmtime::{Extern, Global, TransactionalGlobal};
 
 #[derive(Clone)]
 #[repr(transparent)]
@@ -127,4 +127,12 @@ pub unsafe extern "C" fn wasmtime_global_set(
 
     let val = val.to_val(&mut store);
     handle_result(global.set(&mut store, val), |()| {})
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_transactional_global_type(
+    store: WasmtimeStoreContext<'_>,
+    global: &TransactionalGlobal,
+) -> Box<wasm_globaltype_t> {
+    Box::new(wasm_globaltype_t::new(global.ty(store)))
 }

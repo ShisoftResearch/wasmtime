@@ -30,6 +30,26 @@ pub struct Table {
     index: DefinedTableIndex,
 }
 
+/// A transactional WebAssembly table.
+///
+/// This is intentionally distinct from [`Table`]. Transactional table
+/// operations participate in the active transaction, whereas the ordinary
+/// table host API directly accesses its physical backing. A transactional
+/// table can be used as a native transactional import or inspected for its
+/// type, but it is not interchangeable with an ordinary [`Table`].
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)] // here for the C API
+pub struct TransactionalTable(Table);
+
+const _: () = {
+    #[repr(C)]
+    struct Tmp(u64, u32);
+    #[repr(C)]
+    struct C(Tmp, u32);
+    assert!(core::mem::size_of::<C>() == core::mem::size_of::<TransactionalTable>());
+    assert!(core::mem::align_of::<C>() == core::mem::align_of::<TransactionalTable>());
+};
+
 // Double-check that the C representation in `extern.h` matches our in-Rust
 // representation here in terms of size/alignment/etc.
 const _: () = {
@@ -522,13 +542,6 @@ impl Table {
         &module.tables[index]
     }
 
-    pub(crate) fn is_transactional(&self, store: &StoreOpaque) -> bool {
-        let module = store[self.instance].env_module();
-        module
-            .defined_ttable_index_from_runtime(self.index)
-            .is_some()
-    }
-
     pub(crate) fn vmimport(&self, store: &StoreOpaque) -> vm::VMTableImport {
         let instance = &store[self.instance];
         vm::VMTableImport {
@@ -562,6 +575,37 @@ impl Table {
     )]
     pub(crate) fn hash_key(&self, store: &StoreOpaque) -> impl core::hash::Hash + Eq + use<'_> {
         store[self.instance].table_ptr(self.index).as_ptr().addr()
+    }
+}
+
+impl TransactionalTable {
+    /// Returns the type of this transactional table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this table.
+    pub fn ty(&self, store: impl AsContext) -> TableType {
+        self.0.ty(store)
+    }
+
+    pub(crate) fn from_raw(instance: StoreInstanceId, index: DefinedTableIndex) -> Self {
+        Self(Table::from_raw(instance, index))
+    }
+
+    pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Table {
+        self.0.wasmtime_ty(store)
+    }
+
+    pub(crate) fn size_(&self, store: &StoreOpaque) -> u64 {
+        self.0.size_(store)
+    }
+
+    pub(crate) fn vmimport(&self, store: &StoreOpaque) -> vm::VMTableImport {
+        self.0.vmimport(store)
+    }
+
+    pub(crate) fn comes_from_same_store(&self, store: &StoreOpaque) -> bool {
+        self.0.comes_from_same_store(store)
     }
 }
 

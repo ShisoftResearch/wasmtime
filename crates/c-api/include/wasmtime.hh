@@ -54,6 +54,9 @@
 #include <wasmtime/structref.hh>
 #include <wasmtime/table.hh>
 #include <wasmtime/tag.hh>
+#include <wasmtime/transactional_global.hh>
+#include <wasmtime/transactional_memory.hh>
+#include <wasmtime/transactional_table.hh>
 #include <wasmtime/trap.hh>
 #include <wasmtime/types.hh>
 #include <wasmtime/val.hh>

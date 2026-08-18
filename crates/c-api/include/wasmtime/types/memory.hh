@@ -18,6 +18,7 @@ namespace wasmtime {
  */
 class MemoryType {
   friend class Memory;
+  friend class TransactionalMemory;
 
   struct deleter {
     void operator()(wasm_memorytype_t *p) const {

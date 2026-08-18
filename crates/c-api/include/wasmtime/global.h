@@ -77,6 +77,17 @@ WASM_API_EXTERN wasmtime_error_t *
 wasmtime_global_set(wasmtime_context_t *store, const wasmtime_global_t *global,
                     const wasmtime_val_t *val);
 
+/**
+ * \brief Returns the type of a transactional global.
+ *
+ * Transactional globals are not compatible with the ordinary global
+ * operations in this header; use this function only to inspect their
+ * structural type.
+ */
+WASM_API_EXTERN wasm_globaltype_t *wasmtime_transactional_global_type(
+    const wasmtime_context_t *store,
+    const wasmtime_transactional_global_t *global);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

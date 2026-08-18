@@ -10,7 +10,8 @@ use crate::store::{
 use crate::types::matching;
 use crate::{
     AsContextMut, Engine, Export, Extern, Func, Global, Memory, Module, ModuleExport, SharedMemory,
-    StoreContext, StoreContextMut, Table, Tag, TransactionalMemory, TypedFunc,
+    StoreContext, StoreContextMut, Table, Tag, TransactionalGlobal, TransactionalMemory,
+    TransactionalTable, TypedFunc,
 };
 use alloc::sync::Arc;
 use core::ptr::NonNull;
@@ -580,6 +581,15 @@ impl Instance {
         self.get_export(store, name)?.into_transactional_memory()
     }
 
+    /// Looks up an exported [`TransactionalTable`] value by name.
+    pub fn get_transactional_table(
+        &self,
+        store: impl AsContextMut,
+        name: &str,
+    ) -> Option<TransactionalTable> {
+        self.get_export(store, name)?.into_transactional_table()
+    }
+
     /// Looks up an exported [`Global`] value by name.
     ///
     /// Returns `None` if there was no export named `name`, or if there was but
@@ -590,6 +600,15 @@ impl Instance {
     /// Panics if `store` does not own this instance.
     pub fn get_global(&self, store: impl AsContextMut, name: &str) -> Option<Global> {
         self.get_export(store, name)?.into_global()
+    }
+
+    /// Looks up an exported [`TransactionalGlobal`] value by name.
+    pub fn get_transactional_global(
+        &self,
+        store: impl AsContextMut,
+        name: &str,
+    ) -> Option<TransactionalGlobal> {
+        self.get_export(store, name)?.into_transactional_global()
     }
 
     /// Looks up a tag [`Tag`] by name.
@@ -726,13 +745,13 @@ impl OwnedImports {
             (Extern::Global(i), EntityType::Global(_)) => {
                 self.globals.push(i.vmimport(store))?;
             }
-            (Extern::Global(i), EntityType::TGlobal(_)) => {
+            (Extern::TransactionalGlobal(i), EntityType::TGlobal(_)) => {
                 self.tglobals.push(i.vmimport(store))?;
             }
             (Extern::Table(i), EntityType::Table(_)) => {
                 self.tables.push(i.vmimport(store))?;
             }
-            (Extern::Table(i), EntityType::TTable(_)) => {
+            (Extern::TransactionalTable(i), EntityType::TTable(_)) => {
                 self.ttables.push(i.vmimport(store))?;
             }
             (Extern::Memory(i), EntityType::Memory(_)) => {
@@ -768,13 +787,13 @@ impl OwnedImports {
             (crate::runtime::vm::Export::Global(g), EntityType::Global(_)) => {
                 self.globals.push(g.vmimport(store))?;
             }
-            (crate::runtime::vm::Export::Global(g), EntityType::TGlobal(_)) => {
+            (crate::runtime::vm::Export::TransactionalGlobal(g), EntityType::TGlobal(_)) => {
                 self.tglobals.push(g.vmimport(store))?;
             }
             (crate::runtime::vm::Export::Table(t), EntityType::Table(_)) => {
                 self.tables.push(t.vmimport(store))?;
             }
-            (crate::runtime::vm::Export::Table(t), EntityType::TTable(_)) => {
+            (crate::runtime::vm::Export::TransactionalTable(t), EntityType::TTable(_)) => {
                 self.ttables.push(t.vmimport(store))?;
             }
             (crate::runtime::vm::Export::Memory(m), EntityType::Memory(_)) => {

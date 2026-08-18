@@ -34,6 +34,25 @@ pub struct Global {
     kind: VMGlobalKind,
 }
 
+/// A transactional WebAssembly global.
+///
+/// This is intentionally distinct from [`Global`]. Transactional global
+/// reads and writes participate in the active transaction, while the ordinary
+/// global host API directly accesses its physical definition. A
+/// transactional global can be used as a native transactional import or
+/// inspected for its type, but it is not interchangeable with an ordinary
+/// [`Global`].
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)] // here for the C API
+pub struct TransactionalGlobal(Global);
+
+const _: () = {
+    #[repr(C)]
+    struct C(u64, u32, u32, u32);
+    assert!(core::mem::size_of::<C>() == core::mem::size_of::<TransactionalGlobal>());
+    assert!(core::mem::align_of::<C>() == core::mem::align_of::<TransactionalGlobal>());
+};
+
 // Double-check that the C representation in `extern.h` matches our in-Rust
 // representation here in terms of size/alignment/etc.
 const _: () = {
@@ -381,19 +400,6 @@ impl Global {
         }
     }
 
-    pub(crate) fn is_transactional(&self, store: &StoreOpaque) -> bool {
-        self.store.assert_belongs_to(store.id());
-        let VMGlobalKind::Instance(index) = self.kind else {
-            return false;
-        };
-        let instance = InstanceId::from_u32(self.instance);
-        store
-            .instance(instance)
-            .env_module()
-            .defined_tglobal_index_from_runtime(index)
-            .is_some()
-    }
-
     pub(crate) fn vmimport(&self, store: &StoreOpaque) -> vm::VMGlobalImport {
         let vmctx = match self.kind {
             VMGlobalKind::Instance(_) => {
@@ -474,6 +480,37 @@ impl Global {
                 ))
                 .task_may_block(),
         }
+    }
+}
+
+impl TransactionalGlobal {
+    /// Returns the type of this transactional global.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this global.
+    pub fn ty(&self, store: impl AsContext) -> GlobalType {
+        self.0.ty(store)
+    }
+
+    pub(crate) fn from_global(global: Global) -> Self {
+        Self(global)
+    }
+
+    pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Global {
+        self.0.wasmtime_ty(store)
+    }
+
+    pub(crate) fn vmimport(&self, store: &StoreOpaque) -> vm::VMGlobalImport {
+        self.0.vmimport(store)
+    }
+
+    pub(crate) fn comes_from_same_store(&self, store: &StoreOpaque) -> bool {
+        self.0.comes_from_same_store(store)
+    }
+
+    pub(crate) fn physical_global(&self) -> Global {
+        self.0
     }
 }
 

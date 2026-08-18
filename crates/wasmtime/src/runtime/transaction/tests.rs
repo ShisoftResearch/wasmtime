@@ -10155,7 +10155,7 @@ fn mock_transaction_global_imported_tglobal_commits_to_backing_global() {
     );
     let mut store = crate::Store::new(&engine, ());
     let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
-    let global = provider.get_global(&mut store, "g").unwrap();
+    let global = provider.get_transactional_global(&mut store, "g").unwrap();
     let consumer = crate::Instance::new(&mut store, &consumer, &[global.into()]).unwrap();
     let write = consumer
         .get_typed_func::<(), ()>(&mut store, "write")
@@ -10194,7 +10194,7 @@ fn mock_transaction_global_aliases_share_staged_identity() {
     );
     let mut store = crate::Store::new(&engine, ());
     let provider = crate::Instance::new(&mut store, &provider, &[]).unwrap();
-    let global = provider.get_global(&mut store, "g").unwrap();
+    let global = provider.get_transactional_global(&mut store, "g").unwrap();
     let consumer =
         crate::Instance::new(&mut store, &consumer, &[global.into(), global.into()]).unwrap();
     let write_then_read_alias = consumer
@@ -10868,6 +10868,76 @@ fn native_exported_tmemory_copy_api_tracks_active_data_and_commits() {
     assert_eq!(&bytes, b"HOST");
     assert_eq!(memory.grow(&mut store, 1).unwrap(), 1);
     assert_eq!(memory.size(&store), 2);
+}
+
+#[test]
+fn native_transactional_exports_keep_public_type_identity() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tglobal (export "g") i32 (i32.const 0))
+              (ttable (export "t") 0 tfuncref)
+              (tmemory (export "m") 1))
+        "#,
+    );
+
+    for export in module.exports() {
+        match export.name() {
+            "g" => assert!(matches!(
+                export.ty(),
+                crate::ExternType::TransactionalGlobal(_)
+            )),
+            "t" => assert!(matches!(
+                export.ty(),
+                crate::ExternType::TransactionalTable(_)
+            )),
+            "m" => assert!(matches!(
+                export.ty(),
+                crate::ExternType::TransactionalMemory(_)
+            )),
+            name => panic!("unexpected export {name}"),
+        }
+    }
+
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    assert!(instance.get_global(&mut store, "g").is_none());
+    assert!(instance.get_table(&mut store, "t").is_none());
+    assert!(instance.get_memory(&mut store, "m").is_none());
+    assert!(instance.get_transactional_global(&mut store, "g").is_some());
+    assert!(instance.get_transactional_table(&mut store, "t").is_some());
+    assert!(instance.get_transactional_memory(&mut store, "m").is_some());
+
+    for export in module.exports() {
+        assert!(export.ty().default_value(&mut store).is_err());
+    }
+
+    let importer = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (import "provider" "g" (tglobal i32))
+              (import "provider" "t" (ttable 0 tfuncref))
+              (import "provider" "m" (tmemory 1)))
+        "#,
+    );
+    let imports = [
+        instance
+            .get_transactional_global(&mut store, "g")
+            .unwrap()
+            .into(),
+        instance
+            .get_transactional_table(&mut store, "t")
+            .unwrap()
+            .into(),
+        instance
+            .get_transactional_memory(&mut store, "m")
+            .unwrap()
+            .into(),
+    ];
+    crate::Instance::new(&mut store, &importer, &imports).unwrap();
 }
 
 #[test]
@@ -30280,7 +30350,7 @@ fn active_startup_transaction_roots_abort_without_publication() {
 
 #[test]
 fn native_active_telem_initializes_imported_ttable() {
-    use crate::{Linker, Ref};
+    use crate::Linker;
 
     let engine = crate::Engine::default();
     let owner_module = transaction_test_module(
@@ -30301,16 +30371,12 @@ fn native_active_telem_initializes_imported_ttable() {
     );
     let mut store = crate::Store::new(&engine, ());
     let owner = crate::Instance::new(&mut store, &owner_module, &[]).unwrap();
-    let table = owner.get_table(&mut store, "t").unwrap();
+    let table = owner.get_transactional_table(&mut store, "t").unwrap();
     let mut linker = Linker::new(&engine);
     linker.define(&mut store, "", "t", table).unwrap();
     linker.instantiate(&mut store, &nested_module).unwrap();
 
-    assert_eq!(table.size(&mut store), 1);
-    assert!(matches!(
-        table.get(&mut store, 0).unwrap(),
-        Ref::Func(Some(_))
-    ));
+    assert_eq!(table.ty(&store).minimum(), 1);
 }
 
 #[test]
