@@ -73,7 +73,7 @@
 
 use crate::Reachability;
 use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
-use crate::func_environ::{Extension, FuncEnvironment};
+use crate::func_environ::{Extension, FuncEnvironment, TransactionCallTable};
 use crate::translate::TargetEnvironment;
 use crate::translate::environ::StructFieldsVec;
 use crate::translate::stack::{ControlStackFrame, ElseData};
@@ -93,7 +93,7 @@ use itertools::Itertools;
 use smallvec::{SmallVec, ToSmallVec};
 use std::collections::{HashMap, hash_map};
 use std::vec::Vec;
-use wasmparser::{FuncValidator, MemArg, Operator, WasmModuleResources};
+use wasmparser::{EntityNamespace, FuncValidator, MemArg, Operator, WasmModuleResources};
 use wasmtime_environ::{
     DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TDataIndex, TElemIndex,
     TGlobalIndex, TMemoryIndex, TTableIndex, TableIndex, TagIndex, TypeConvert, TypeIndex,
@@ -157,6 +157,15 @@ fn is_func_ref_operand(ty: WasmValType) -> bool {
         ref_ty.heap_type,
         WasmHeapType::Func | WasmHeapType::ConcreteFunc(_) | WasmHeapType::NoFunc
     )
+}
+
+fn transaction_call_table(namespace: EntityNamespace, index: u32) -> TransactionCallTable {
+    match namespace {
+        EntityNamespace::Ordinary => TransactionCallTable::Ordinary(TableIndex::from_u32(index)),
+        EntityNamespace::Transactional => {
+            TransactionCallTable::Transactional(TTableIndex::from_u32(index))
+        }
+    }
 }
 
 /// Translates wasm operators into Cranelift IR instructions.
@@ -918,6 +927,34 @@ pub fn translate_operator(
             environ.stacks.pushn(&inst_results);
             environ.translate_transaction_branch_if_failure_pending(builder)?;
         }
+        Operator::TCall { function_index } => {
+            let function_index = FuncIndex::from_u32(*function_index);
+            let ty = environ.module.functions[function_index]
+                .signature
+                .unwrap_module_type_index();
+            let sig_ref = environ.get_or_create_interned_sig_ref(builder.func, ty);
+            let num_args = environ.num_params_for_func(function_index);
+
+            let mut args = environ.stacks.peekn(num_args).to_vec();
+            bitcast_wasm_params(environ, sig_ref, &mut args, builder);
+
+            let inst_results = environ.translate_transaction_call(
+                builder,
+                environ.next_srcloc,
+                function_index,
+                sig_ref,
+                &args,
+            )?;
+
+            debug_assert_eq!(
+                inst_results.len(),
+                builder.func.dfg.signatures[sig_ref].returns.len(),
+                "translate_transaction_call results should match the call signature"
+            );
+            environ.stacks.popn(num_args);
+            environ.stacks.pushn(&inst_results);
+            environ.translate_transaction_branch_if_failure_pending(builder)?;
+        }
         Operator::CallIndirect {
             type_index,
             table_index,
@@ -962,6 +999,47 @@ pub fn translate_operator(
             environ.stacks.pushn(&inst_results);
             environ.translate_transaction_branch_if_failure_pending(builder)?;
         }
+        Operator::TCallIndirect {
+            type_index,
+            table_index,
+            table_namespace,
+            flags: _,
+        } => {
+            let type_index = TypeIndex::from_u32(*type_index);
+            let table = transaction_call_table(*table_namespace, *table_index);
+            let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
+            let num_args = environ.num_params_for_function_type(type_index);
+            let callee = environ.stacks.pop1();
+
+            let mut args = environ.stacks.peekn(num_args).to_vec();
+            bitcast_wasm_params(environ, sigref, &mut args, builder);
+
+            let inst_results = environ.translate_transaction_call_indirect(
+                builder,
+                environ.next_srcloc,
+                table,
+                type_index,
+                sigref,
+                callee,
+                &args,
+            )?;
+            let inst_results = match inst_results {
+                Some(results) => results,
+                None => {
+                    environ.stacks.reachable = false;
+                    return Ok(());
+                }
+            };
+
+            debug_assert_eq!(
+                inst_results.len(),
+                builder.func.dfg.signatures[sigref].returns.len(),
+                "translate_transaction_call_indirect results should match the call signature"
+            );
+            environ.stacks.popn(num_args);
+            environ.stacks.pushn(&inst_results);
+            environ.translate_transaction_branch_if_failure_pending(builder)?;
+        }
         /******************************* Tail Calls ******************************************
          * The tail call instructions pop their arguments from the stack and
          * then permanently transfer control to their callee. The indirect
@@ -982,6 +1060,28 @@ pub fn translate_operator(
             bitcast_wasm_params(environ, sig_ref, &mut args, builder);
 
             environ.translate_return_call(builder, srcloc, function_index, sig_ref, &args)?;
+
+            environ.stacks.popn(num_args);
+            environ.stacks.reachable = false;
+        }
+        Operator::ReturnTCall { function_index } => {
+            let function_index = FuncIndex::from_u32(*function_index);
+            let ty = environ.module.functions[function_index]
+                .signature
+                .unwrap_module_type_index();
+            let sig_ref = environ.get_or_create_interned_sig_ref(builder.func, ty);
+            let num_args = environ.num_params_for_func(function_index);
+
+            let mut args = environ.stacks.peekn(num_args).to_vec();
+            bitcast_wasm_params(environ, sig_ref, &mut args, builder);
+
+            environ.translate_return_transaction_call(
+                builder,
+                srcloc,
+                function_index,
+                sig_ref,
+                &args,
+            )?;
 
             environ.stacks.popn(num_args);
             environ.stacks.reachable = false;
@@ -1012,6 +1112,28 @@ pub fn translate_operator(
                 sigref,
                 callee,
                 &args,
+            )?;
+
+            environ.stacks.popn(num_args);
+            environ.stacks.reachable = false;
+        }
+        Operator::ReturnTCallIndirect {
+            type_index,
+            table_index,
+            table_namespace,
+            flags: _,
+        } => {
+            let type_index = TypeIndex::from_u32(*type_index);
+            let table = transaction_call_table(*table_namespace, *table_index);
+            let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
+            let num_args = environ.num_params_for_function_type(type_index);
+            let callee = environ.stacks.pop1();
+
+            let mut args = environ.stacks.peekn(num_args).to_vec();
+            bitcast_wasm_params(environ, sigref, &mut args, builder);
+
+            environ.translate_return_transaction_call_indirect(
+                builder, srcloc, table, type_index, sigref, callee, &args,
             )?;
 
             environ.stacks.popn(num_args);
@@ -1685,7 +1807,7 @@ pub fn translate_operator(
             let result = environ.translate_ref_is_null(builder.cursor(), value, *ty)?;
             environ.stacks.push1(result);
         }
-        Operator::RefFunc { function_index } => {
+        Operator::RefFunc { function_index } | Operator::TRefFunc { function_index } => {
             let index = FuncIndex::from_u32(*function_index);
             let result = environ.translate_ref_func(builder.cursor(), index)?;
             environ.stacks.push1(result);

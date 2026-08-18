@@ -230,6 +230,27 @@ impl Compiler {
             caller_vmctx,
             wasmtime_environ::VMCONTEXT_MAGIC,
         );
+        // A `return_tcall` to a host function reaches this Wasm-to-array
+        // trampoline instead of a compiled tfunc prologue. Claim a pending
+        // tail transition here so this trampoline becomes the transaction
+        // owner and can finish it after the host call returns.
+        let builtin_sigs = BuiltinFunctionSignatures::new(self);
+        let claim_tail = self.call_builtin(
+            &mut builder,
+            &mut alias_regions,
+            caller_vmctx,
+            &[caller_vmctx],
+            BuiltinFunctionIndex::transaction_claim_tfunc_tail(),
+            builtin_sigs.host_signature(BuiltinFunctionIndex::transaction_claim_tfunc_tail()),
+        );
+        let tail_owner = builder.func.dfg.inst_results(claim_tail)[0];
+        let claim_succeeded = builder.ins().icmp_imm_s(IntCC::NotEqual, tail_owner, -1);
+        self.raise_if_host_trapped(
+            &mut builder,
+            &mut alias_regions,
+            caller_vmctx,
+            claim_succeeded,
+        );
         let ptr = isa.pointer_bytes();
         let vm_store_context =
             alias_regions.vmctx_store_context(&mut builder.cursor(), caller_vmctx);
@@ -278,6 +299,32 @@ impl Compiler {
         // Invoke `raise` if the callee (host) returned an error.
         let succeeded = builder.func.dfg.inst_results(call)[0];
         self.raise_if_host_trapped(&mut builder, &mut alias_regions, caller_vmctx, succeeded);
+
+        let commit_tail = builder.create_block();
+        let continue_after_tail = builder.create_block();
+        builder
+            .ins()
+            .brif(tail_owner, commit_tail, &[], continue_after_tail, &[]);
+        builder.switch_to_block(commit_tail);
+        let commit = self.call_builtin(
+            &mut builder,
+            &mut alias_regions,
+            caller_vmctx,
+            &[caller_vmctx],
+            BuiltinFunctionIndex::transaction_commit(),
+            builtin_sigs.host_signature(BuiltinFunctionIndex::transaction_commit()),
+        );
+        let commit_succeeded = builder.func.dfg.inst_results(commit)[0];
+        self.raise_if_host_trapped(
+            &mut builder,
+            &mut alias_regions,
+            caller_vmctx,
+            commit_succeeded,
+        );
+        builder.ins().jump(continue_after_tail, &[]);
+        builder.seal_block(commit_tail);
+        builder.switch_to_block(continue_after_tail);
+        builder.seal_block(continue_after_tail);
 
         // Return results from the array as native return values.
         let results =

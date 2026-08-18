@@ -1991,6 +1991,16 @@ enum CheckIndirectCallTypeSignature {
 
 type CallRets = SmallVec<[ir::Value; 4]>;
 
+/// The table namespace selected by a transactional indirect call.
+///
+/// Keeping the two index types separate prevents an index in one entity space
+/// from being accidentally used to access the other one.
+#[derive(Clone, Copy)]
+pub(crate) enum TransactionCallTable {
+    Ordinary(TableIndex),
+    Transactional(TTableIndex),
+}
+
 impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
     /// Create a new `Call` site that will do regular, non-tail calls.
     pub fn new(
@@ -2144,44 +2154,65 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
     /// Do a Wasm-level indirect call through the given funcref table.
     pub fn indirect_call(
         mut self,
-        table_index: TableIndex,
+        table: TransactionCallTable,
         ty_index: TypeIndex,
         sig_ref: ir::SigRef,
         callee: ir::Value,
         call_args: &[ir::Value],
-        use_transaction_table_overlay: bool,
     ) -> WasmResult<Option<CallRets>> {
-        let (code_ptr, callee_vmctx) = match self.check_and_load_code_and_callee_vmctx(
-            table_index,
-            ty_index,
-            callee,
-            false,
-            use_transaction_table_overlay,
-        )? {
-            Some(pair) => pair,
-            None => return Ok(None),
-        };
+        let (code_ptr, callee_vmctx) =
+            match self.check_and_load_code_and_callee_vmctx(table, ty_index, callee, false)? {
+                Some(pair) => pair,
+                None => return Ok(None),
+            };
 
         self.unchecked_call_impl(sig_ref, code_ptr, callee_vmctx, call_args)
             .map(Some)
     }
 
+    /// Do a transactional Wasm-level indirect tail call.
+    ///
+    /// The table lookup occurs before the one-shot transaction transition is
+    /// handed to the callee's tfunc entry or host-call trampoline.
+    pub fn transaction_indirect_tail_call(
+        mut self,
+        table: TransactionCallTable,
+        ty_index: TypeIndex,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> WasmResult<()> {
+        let Some((code_ptr, callee_vmctx)) =
+            self.check_and_load_code_and_callee_vmctx(table, ty_index, callee, false)?
+        else {
+            return Ok(());
+        };
+        self.env
+            .translate_transaction_transfer_tail_ownership(self.builder)?;
+        self.unchecked_call_impl(sig_ref, code_ptr, callee_vmctx, call_args)?;
+        Ok(())
+    }
+
     fn check_and_load_code_and_callee_vmctx(
         &mut self,
-        table_index: TableIndex,
+        table: TransactionCallTable,
         ty_index: TypeIndex,
         callee: ir::Value,
         cold_blocks: bool,
-        use_transaction_table_overlay: bool,
     ) -> WasmResult<Option<(ir::Value, ir::Value)>> {
         // Get the funcref pointer from the table.
-        debug_assert!(!use_transaction_table_overlay);
-        let funcref_ptr =
-            self.env
-                .table_get_funcref(self.builder, table_index, callee, cold_blocks);
+        let funcref_ptr = match table {
+            TransactionCallTable::Ordinary(table_index) => {
+                self.env
+                    .table_get_funcref(self.builder, table_index, callee, cold_blocks)
+            }
+            TransactionCallTable::Transactional(table_index) => self
+                .env
+                .translate_transaction_ttable_get(self.builder, table_index, callee)?,
+        };
 
         // If necessary, check the signature.
-        let check = self.check_indirect_call_type_signature(table_index, ty_index, funcref_ptr);
+        let check = self.check_indirect_call_type_signature(table, ty_index, funcref_ptr);
 
         let trap_code = match check {
             // `funcref_ptr` is checked at runtime that its type matches,
@@ -2215,11 +2246,14 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
 
     fn check_indirect_call_type_signature(
         &mut self,
-        table_index: TableIndex,
+        table_index: TransactionCallTable,
         ty_index: TypeIndex,
         funcref_ptr: ir::Value,
     ) -> CheckIndirectCallTypeSignature {
-        let table = &self.env.module.tables[table_index];
+        let table = match table_index {
+            TransactionCallTable::Ordinary(index) => &self.env.module.tables[index],
+            TransactionCallTable::Transactional(index) => &self.env.module.ttables[index],
+        };
 
         // Test if a type check is necessary for this table. If this table is a
         // table of typed functions and that type matches `ty_index`, then
@@ -4760,15 +4794,26 @@ impl FuncEnvironment<'_> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<Option<CallRets>> {
-        let use_transaction_table_overlay = false;
         Call::new(builder, self, srcloc).indirect_call(
-            table_index,
+            TransactionCallTable::Ordinary(table_index),
             ty_index,
             sig_ref,
             callee,
             call_args,
-            use_transaction_table_overlay,
         )
+    }
+
+    pub fn translate_transaction_call_indirect<'a>(
+        &mut self,
+        builder: &'a mut FunctionBuilder,
+        srcloc: ir::SourceLoc,
+        table: TransactionCallTable,
+        ty_index: TypeIndex,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> WasmResult<Option<CallRets>> {
+        Call::new(builder, self, srcloc).indirect_call(table, ty_index, sig_ref, callee, call_args)
     }
 
     pub fn translate_call<'a>(
@@ -4780,6 +4825,81 @@ impl FuncEnvironment<'_> {
         call_args: &[ir::Value],
     ) -> WasmResult<CallRets> {
         Call::new(builder, self, srcloc).direct_call(callee_index, sig_ref, call_args)
+    }
+
+    pub fn translate_transaction_call<'a>(
+        &mut self,
+        builder: &'a mut FunctionBuilder,
+        srcloc: ir::SourceLoc,
+        callee_index: FuncIndex,
+        sig_ref: ir::SigRef,
+        call_args: &[ir::Value],
+    ) -> WasmResult<CallRets> {
+        Call::new(builder, self, srcloc).direct_call(callee_index, sig_ref, call_args)
+    }
+
+    pub fn translate_return_transaction_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        srcloc: ir::SourceLoc,
+        callee_index: FuncIndex,
+        sig_ref: ir::SigRef,
+        call_args: &[ir::Value],
+    ) -> WasmResult<()> {
+        self.translate_transaction_transfer_tail_ownership(builder)?;
+        Call::new_tail(builder, self, srcloc).direct_call(callee_index, sig_ref, call_args)?;
+        Ok(())
+    }
+
+    pub fn translate_return_transaction_call_indirect(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        srcloc: ir::SourceLoc,
+        table: TransactionCallTable,
+        ty_index: TypeIndex,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> WasmResult<()> {
+        Call::new_tail(builder, self, srcloc)
+            .transaction_indirect_tail_call(table, ty_index, sig_ref, callee, call_args)
+    }
+
+    fn translate_transaction_transfer_tail_ownership(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        if !self.transaction_may_be_active_on_return {
+            let callee = self.builtin_functions.load_builtin(
+                builder.func,
+                BuiltinFunctionIndex::transaction_start_tfunc_tail(),
+            );
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            builder.ins().call(callee, &[vmctx]);
+            return Ok(());
+        }
+
+        let began_var = self.ensure_transaction_began_in_function_var(builder);
+        let began = builder.use_var(began_var);
+        let owns_transaction = builder.ins().icmp_imm_s(IntCC::NotEqual, began, 0);
+        let handoff = builder.create_block();
+        let continuation = builder.create_block();
+        builder
+            .ins()
+            .brif(owns_transaction, handoff, &[], continuation, &[]);
+
+        builder.switch_to_block(handoff);
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_transfer_tfunc_ownership(),
+        );
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        builder.ins().call(callee, &[vmctx]);
+        builder.ins().jump(continuation, &[]);
+        builder.seal_block(handoff);
+        builder.switch_to_block(continuation);
+        builder.seal_block(continuation);
+        Ok(())
     }
 
     pub fn translate_call_ref<'a>(
@@ -4815,14 +4935,12 @@ impl FuncEnvironment<'_> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<()> {
-        let use_transaction_table_overlay = false;
         Call::new_tail(builder, self, srcloc).indirect_call(
-            table_index,
+            TransactionCallTable::Ordinary(table_index),
             ty_index,
             sig_ref,
             callee,
             call_args,
-            use_transaction_table_overlay,
         )?;
         Ok(())
     }
@@ -9091,7 +9209,7 @@ impl FuncEnvironment<'_> {
                 ConstOp::RefNull(ty) => {
                     stack.push(self.translate_ref_null(builder.cursor(), *ty)?);
                 }
-                ConstOp::RefFunc(i) => {
+                ConstOp::RefFunc(i) | ConstOp::TRefFunc(i) => {
                     stack.push(self.translate_ref_func(builder.cursor(), *i)?);
                 }
                 ConstOp::I32Add | ConstOp::I64Add => {

@@ -13,9 +13,17 @@ use super::*;
 
 const TRANSACTION_LOCAL_OBJECT_ID_BASE: u64 = 1u64 << 63;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PendingTfuncTailEntry {
+    Start,
+    Owner,
+}
+
 #[derive(Debug)]
 pub(crate) struct TransactionState {
     pub(super) active: Option<TransactionId>,
+    /// A tfunc tail target must either start or own the transaction.
+    pub(super) pending_tfunc_tail_entry: Option<PendingTfuncTailEntry>,
     pub(super) failed: bool,
     pub(super) failure_code: u32,
     pub(super) fail_next_commit_before_lp_for_test: bool,
@@ -168,6 +176,7 @@ impl Default for TransactionState {
     fn default() -> Self {
         Self {
             active: None,
+            pending_tfunc_tail_entry: None,
             failed: false,
             failure_code: 0,
             fail_next_commit_before_lp_for_test: false,
@@ -685,6 +694,7 @@ impl TransactionState {
 
     fn activate_transaction(&mut self, id: TransactionId) {
         self.active = Some(id);
+        self.pending_tfunc_tail_entry = None;
         replace_current_thread_transaction(Some(id));
     }
 
@@ -978,6 +988,57 @@ impl TransactionState {
 
     pub(crate) fn active_transaction(&self) -> Option<TransactionId> {
         self.active
+    }
+
+    pub(crate) fn transfer_active_tfunc_ownership(&mut self) -> Result<()> {
+        self.ensure_active()?;
+        ensure!(
+            self.pending_tfunc_tail_entry.is_none(),
+            "transactional tail-call ownership handoff is already pending"
+        );
+        self.pending_tfunc_tail_entry = Some(PendingTfuncTailEntry::Owner);
+        Ok(())
+    }
+
+    pub(crate) fn request_tfunc_tail_start(&mut self) -> Result<()> {
+        ensure!(
+            self.active.is_none(),
+            "transactional tail target is already active"
+        );
+        ensure!(
+            self.pending_tfunc_tail_entry.is_none(),
+            "transactional tail-call transition is already pending"
+        );
+        self.pending_tfunc_tail_entry = Some(PendingTfuncTailEntry::Start);
+        Ok(())
+    }
+
+    pub(crate) fn take_active_tfunc_ownership(&mut self) -> bool {
+        if self.active.is_some()
+            && self.pending_tfunc_tail_entry == Some(PendingTfuncTailEntry::Owner)
+        {
+            self.pending_tfunc_tail_entry = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn claim_tfunc_tail_for_host(
+        &mut self,
+        region: &TransactionRegionRuntime,
+    ) -> Result<bool> {
+        match self.pending_tfunc_tail_entry.take() {
+            Some(PendingTfuncTailEntry::Owner) => {
+                self.ensure_active()?;
+                Ok(true)
+            }
+            Some(PendingTfuncTailEntry::Start) => {
+                self.begin_with_region_runtime(region)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     pub(crate) fn fail_next_commit_before_lp_for_test(&mut self) {
@@ -4805,6 +4866,7 @@ impl TransactionState {
             }
         }
         self.active = None;
+        self.pending_tfunc_tail_entry = None;
         self.terminal_commit_active = false;
         replace_current_thread_transaction(None);
         let finish_snapshot = match (visibility, snapshot) {

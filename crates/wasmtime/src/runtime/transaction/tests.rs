@@ -10696,6 +10696,217 @@ fn native_ordinary_and_transactional_index_zero_initialize_independently() {
 }
 
 #[test]
+fn native_indirect_calls_keep_ordinary_and_transactional_table_zero_distinct() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $ordinary-sig (func (result i32)))
+              (type $transaction-sig (tfunc (result i32)))
+              (tmemory 1)
+              (func $ordinary-target (type $ordinary-sig) (i32.const 11))
+              (tfunc $transaction-target (type $transaction-sig)
+                (i32.tstore (i32.const 0) (i32.const 22))
+                (i32.tload (i32.const 0)))
+              (table $ordinary-table 1 funcref)
+              (ttable $transaction-table 1 tfuncref)
+              (table $prestart-table 1 tfuncref)
+              (elem (table $ordinary-table) (i32.const 0) func $ordinary-target)
+              (telem (ttable $transaction-table) (i32.const 0)
+                tfuncref (tref.tfunc $transaction-target))
+              (elem (table $prestart-table) (i32.const 0)
+                tfuncref (tref.tfunc $transaction-target))
+              (func (export "ordinary") (result i32)
+                (i32.const 0)
+                (call_indirect $ordinary-table (type $ordinary-sig)))
+              (tfunc (export "transactional") (result i32)
+                (i32.const 0)
+                (tcall_indirect $transaction-table (type $transaction-sig)))
+              (func (export "prestart") (result i32)
+                (i32.const 0)
+                (tcall_indirect flags=0 $prestart-table (type $transaction-sig)))
+              (func (export "prestart-direct") (result i32)
+                (tcall $transaction-target))
+              (tfunc (export "transactional-tail") (result i32)
+                (i32.const 0)
+                (return_tcall_indirect $transaction-table (type $transaction-sig)))
+              (func (export "prestart-tail") (result i32)
+                (i32.const 0)
+                (return_tcall_indirect flags=0 $prestart-table (type $transaction-sig)))
+              (tfunc (export "transactional-direct-tail") (result i32)
+                (return_tcall $transaction-target)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    for (name, expected) in [
+        ("ordinary", 11),
+        ("transactional", 22),
+        ("prestart", 22),
+        ("prestart-direct", 22),
+        ("transactional-tail", 22),
+        ("prestart-tail", 22),
+        ("transactional-direct-tail", 22),
+    ] {
+        let function = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(function.call(&mut store, ()).unwrap(), expected, "{name}");
+        assert_eq!(current_thread_transaction_for_test(), None, "{name}");
+    }
+}
+
+#[test]
+fn native_return_tcall_eliminates_transactional_call_frames() {
+    let mut config = crate::Config::new();
+    config.max_wasm_stack(32 * 1024);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $sig (tfunc (param i32) (result i32)))
+              (tfunc $recur (type $sig)
+                (local.get 0)
+                (i32.eqz)
+                (if (result i32)
+                  (then (i32.const 0))
+                  (else
+                    (local.get 0)
+                    (i32.const 1)
+                    (i32.sub)
+                    (return_tcall $recur))))
+              (tfunc (export "recur") (param i32) (result i32)
+                (local.get 0)
+                (return_tcall $recur)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let recur = instance
+        .get_typed_func::<i32, i32>(&mut store, "recur")
+        .unwrap();
+
+    assert_eq!(recur.call(&mut store, 10_000).unwrap(), 0);
+    assert_eq!(current_thread_transaction_for_test(), None);
+}
+
+#[test]
+fn native_return_tcall_indirect_eliminates_transactional_call_frames() {
+    let mut config = crate::Config::new();
+    config.max_wasm_stack(32 * 1024);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $sig (tfunc (param i32) (result i32)))
+              (ttable $table 1 tfuncref)
+              (tfunc $recur (type $sig)
+                (local.get 0)
+                (i32.eqz)
+                (if (result i32)
+                  (then (i32.const 0))
+                  (else
+                    (local.get 0)
+                    (i32.const 1)
+                    (i32.sub)
+                    (i32.const 0)
+                    (return_tcall_indirect $table (type $sig)))))
+              (telem (ttable $table) (i32.const 0)
+                tfuncref (tref.tfunc $recur))
+              (tfunc (export "recur") (param i32) (result i32)
+                (local.get 0)
+                (i32.const 0)
+                (return_tcall_indirect $table (type $sig))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let recur = instance
+        .get_typed_func::<i32, i32>(&mut store, "recur")
+        .unwrap();
+
+    assert_eq!(recur.call(&mut store, 10_000).unwrap(), 0);
+    assert_eq!(current_thread_transaction_for_test(), None);
+}
+
+#[test]
+fn native_return_tcall_preserves_transaction_owner_across_tail_transfer() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tfunc $abort-tail
+                (i32.tstore offset=4 (i32.const 0) (i32.const 2))
+                (unreachable))
+              (tfunc (export "abort")
+                (i32.tstore (i32.const 0) (i32.const 1))
+                (return_tcall $abort-tail))
+              (tfunc $success-tail
+                (i32.tstore offset=4 (i32.const 0) (i32.const 4)))
+              (tfunc (export "success")
+                (i32.tstore (i32.const 0) (i32.const 3))
+                (return_tcall $success-tail))
+              (tfunc (export "read-first") (result i32)
+                (i32.tload (i32.const 0)))
+              (tfunc (export "read-second") (result i32)
+                (i32.tload offset=4 (i32.const 0))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let abort = instance
+        .get_typed_func::<(), ()>(&mut store, "abort")
+        .unwrap();
+    let success = instance
+        .get_typed_func::<(), ()>(&mut store, "success")
+        .unwrap();
+    let read_first = instance
+        .get_typed_func::<(), i32>(&mut store, "read-first")
+        .unwrap();
+    let read_second = instance
+        .get_typed_func::<(), i32>(&mut store, "read-second")
+        .unwrap();
+
+    assert!(abort.call(&mut store, ()).is_err());
+    assert_eq!(read_first.call(&mut store, ()).unwrap(), 0);
+    assert_eq!(read_second.call(&mut store, ()).unwrap(), 0);
+    assert_eq!(current_thread_transaction_for_test(), None);
+
+    success.call(&mut store, ()).unwrap();
+    assert_eq!(read_first.call(&mut store, ()).unwrap(), 3);
+    assert_eq!(read_second.call(&mut store, ()).unwrap(), 4);
+    assert_eq!(current_thread_transaction_for_test(), None);
+}
+
+#[test]
+fn native_tglobal_initializers_observe_prior_transactional_globals() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tglobal $first i32 (i32.const 17))
+              (tglobal $second i32 (tglobal.get $first))
+              (tfunc (export "read") (result i32)
+                (tglobal.get $second)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    assert_eq!(read.call(&mut store, ()).unwrap(), 17);
+}
+
+#[test]
 fn native_direct_linking_rejects_cross_namespace_entity_imports() {
     let engine = crate::Engine::default();
     let producer = transaction_test_module(

@@ -326,10 +326,36 @@ fn transaction_enter_tfunc(store: &mut dyn VMStore, instance: InstanceId) -> Res
         return Ok(2);
     }
     if state.active_transaction().is_some() {
-        return Ok(0);
+        return Ok(u32::from(state.take_active_tfunc_ownership()));
     }
     state.begin_with_region_runtime(&region)?;
     Ok(1)
+}
+
+fn transaction_transfer_tfunc_ownership(
+    store: &mut dyn VMStore,
+    _instance: InstanceId,
+) -> Result<()> {
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .transfer_active_tfunc_ownership()
+}
+
+fn transaction_start_tfunc_tail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .request_tfunc_tail_start()
+}
+
+fn transaction_claim_tfunc_tail(store: &mut dyn VMStore, _instance: InstanceId) -> Result<u32> {
+    let store = store.store_opaque_mut();
+    let region = store.transaction_region_runtime().clone();
+    store
+        .transaction_state_mut()
+        .claim_tfunc_tail_for_host(&region)
+        .map(u32::from)
 }
 
 fn transaction_begin(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
@@ -2537,9 +2563,24 @@ fn transaction_tglobal_get_impl(
     global: u32,
 ) -> Result<*mut u8> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store, instance)?;
 
     let (owner, global_index, wasm_ty) = transaction_global(store, instance, global)?;
+    if store
+        .store_opaque()
+        .transaction_state()
+        .active_transaction()
+        .is_none()
+    {
+        let snapshot = read_global_snapshot(store, owner, global_index, wasm_ty)?;
+        ensure_global_snapshot_type(snapshot, wasm_ty)?;
+        let snapshot = live_transaction_global_snapshot_for_read(store, snapshot)?;
+        let bytes = global_snapshot_bytes(snapshot);
+        return Ok(store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .set_scratch(bytes));
+    }
+
     let (staged, visibility) = {
         let state = store.store_opaque_mut().transaction_state_mut();
         ensure!(

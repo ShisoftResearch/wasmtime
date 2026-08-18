@@ -2042,7 +2042,9 @@ impl ConstExpr {
 
             // Track any functions that appear in `ref.func` so that callers can
             // make sure to flag them as escaping.
-            if let wasmparser::Operator::RefFunc { function_index } = &op {
+            if let wasmparser::Operator::RefFunc { function_index }
+            | wasmparser::Operator::TRefFunc { function_index } = &op
+            {
                 escaped.push(FuncIndex::from_u32(*function_index));
             }
 
@@ -2116,6 +2118,7 @@ pub enum ConstOp {
     RefI31,
     RefNull(WasmHeapType),
     RefFunc(FuncIndex),
+    TRefFunc(FuncIndex),
     I32Add,
     I32Sub,
     I32Mul,
@@ -2174,6 +2177,7 @@ impl ConstOp {
             O::V128Const { value } => Self::V128Const(u128::from_le_bytes(*value.bytes())),
             O::RefNull { hty } | O::TRefNull { hty } => Self::RefNull(env.convert_heap_type(hty)?),
             O::RefFunc { function_index } => Self::RefFunc(FuncIndex::from_u32(function_index)),
+            O::TRefFunc { function_index } => Self::TRefFunc(FuncIndex::from_u32(function_index)),
             O::GlobalGet { global_index } => Self::GlobalGet(GlobalIndex::from_u32(global_index)),
             O::TGlobalGet { global_index } => {
                 Self::TGlobalGet(TGlobalIndex::from_u32(global_index))

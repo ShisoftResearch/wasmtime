@@ -180,6 +180,13 @@ macro_rules! foreach_builtin_function {
             // Begins a transactional WebAssembly transaction for `tfunc` entry
             // if no transaction is already active.
             transaction_enter_tfunc(vmctx: vmctx) -> u64;
+            // Transfers ownership of the active transaction to the tfunc
+            // entered by a transactional tail call.
+            transaction_transfer_tfunc_ownership(vmctx: vmctx) -> bool;
+            // Requests that a host tfunc tail target begin a transaction.
+            transaction_start_tfunc_tail(vmctx: vmctx) -> bool;
+            // Claims a pending tfunc tail transition in a host trampoline.
+            transaction_claim_tfunc_tail(vmctx: vmctx) -> u64;
             // Begins a transactional WebAssembly transaction.
             transaction_begin(vmctx: vmctx) -> bool;
             // Ends a structured transactional `ttry` body.
@@ -501,6 +508,9 @@ impl BuiltinFunctionIndex {
             // Failure here indicates GC heap corruption.
             (@get get_interned_func_ref pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_enter_tfunc u64) => (TrapSentinel::NegativeOne);
+            (@get transaction_transfer_tfunc_ownership bool) => (TrapSentinel::Falsy);
+            (@get transaction_start_tfunc_tail bool) => (TrapSentinel::Falsy);
+            (@get transaction_claim_tfunc_tail u64) => (TrapSentinel::NegativeOne);
             (@get transaction_tglobal_get pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_load pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_store pointer) => (TrapSentinel::NegativeOne);
