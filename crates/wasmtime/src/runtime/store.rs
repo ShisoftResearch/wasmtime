@@ -103,6 +103,8 @@ use crate::trampoline::VMHostGlobalContext;
 #[cfg(feature = "debug")]
 use crate::{BreakpointState, DebugHandler, FrameDataCache};
 use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
+#[cfg(feature = "transaction")]
+use crate::{ExternRef, OwnedRooted, Rooted};
 use crate::{Global, Instance, Table};
 use core::convert::Infallible;
 use core::fmt;
@@ -493,6 +495,8 @@ pub struct StoreOpaque {
     transaction_object_table: ObjectTable,
     transaction_region_runtime: TransactionRegionRuntime,
     transaction_durable_refs: DurableReferenceRegistry,
+    #[cfg(feature = "transaction")]
+    transaction_live_extern_roots: Vec<OwnedRooted<ExternRef>>,
     // GC-related fields.
     gc_store: Option<GcStore>,
     gc_roots: RootSet,
@@ -791,6 +795,8 @@ impl<T> Store<T> {
             transaction_object_table: ObjectTable::default(),
             transaction_region_runtime: TransactionRegionRuntime::default(),
             transaction_durable_refs: DurableReferenceRegistry::default(),
+            #[cfg(feature = "transaction")]
+            transaction_live_extern_roots: Vec::new(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
             memory_count: 0,
@@ -1990,6 +1996,16 @@ impl StoreOpaque {
             &mut self.transaction_durable_refs,
             &mut self.transaction_object_table,
         )
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_retain_extern_ref(
+        &mut self,
+        reference: Rooted<ExternRef>,
+    ) -> Result<()> {
+        let owned = reference._to_owned_rooted(self)?;
+        self.transaction_live_extern_roots.push(owned);
+        Ok(())
     }
 
     pub(crate) fn transaction_durable_refs_state_and_object_table_mut(

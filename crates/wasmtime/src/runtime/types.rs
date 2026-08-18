@@ -555,7 +555,8 @@ impl RefType {
         }
     }
 
-    pub(crate) fn is_transactional_ref(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_transactional_ref(&self) -> bool {
         self.is_transactional
     }
 
@@ -632,7 +633,7 @@ impl RefType {
     }
 
     pub(crate) fn is_vmgcref_type_and_points_to_object(&self) -> bool {
-        self.heap_type().is_vmgcref_type_and_points_to_object()
+        !self.is_transactional_ref() && self.heap_type().is_vmgcref_type_and_points_to_object()
     }
 
     pub(crate) fn into_registered_type(self) -> Option<RegisteredType> {

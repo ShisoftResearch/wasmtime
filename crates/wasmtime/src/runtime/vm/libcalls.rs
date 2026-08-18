@@ -421,20 +421,40 @@ fn transaction_preserve_tref_result(
     _instance: InstanceId,
     raw_ref: u32,
 ) -> Result<()> {
-    if raw_ref == 0 || ObjectTable::is_raw_i31_ref(u64::from(raw_ref)) {
-        return Ok(());
-    }
+    transaction_preserve_tref_result_impl(store.store_opaque_mut(), raw_ref)
+}
 
-    let store = store.store_opaque_mut();
-    let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let Some(object_id) = state.known_object_id_for_transaction_ref_handle(object_table, raw_ref)
-    else {
-        // Transactional external identities share the `tany` hierarchy but
-        // are not backed by transaction object records.
-        return Ok(());
+pub(crate) fn transaction_preserve_tref_result_impl(
+    store: &mut StoreOpaque,
+    raw_ref: u32,
+) -> Result<()> {
+    let result = (|| {
+        if raw_ref == 0 || ObjectTable::is_raw_i31_ref(u64::from(raw_ref)) {
+            return Ok(());
+        }
+
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        let Some(object_id) =
+            state.known_object_id_for_transaction_ref_handle(object_table, raw_ref)
+        else {
+            // Transactional external identities share the `tany` hierarchy but
+            // are not backed by transaction object records.
+            return Ok(());
+        };
+        state.promote_transaction_object_graph(object_table, object_id)?;
+        Ok(())
+    })();
+    let cleanup = if result.is_err() && store.transaction_state().active_transaction().is_some() {
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state.abort_allocated_objects(object_table)
+    } else {
+        Ok(())
     };
-    state.promote_transaction_object_graph(object_table, object_id)?;
-    Ok(())
+    combine_operation_and_cleanup_results(
+        result,
+        cleanup,
+        "failed to abort transaction after result promotion failure",
+    )
 }
 
 fn transaction_commit_structured(store: &mut dyn VMStore, instance: InstanceId) -> Result<u32> {
@@ -2487,7 +2507,6 @@ fn transaction_helper_i31_for_ref(
     (value as u32).wrapping_shl(1) | 1
 }
 
-const TRANSACTION_TREF_TEST_NOT_TRANSACTION: u32 = u32::MAX;
 const TRANSACTION_TREF_TEST_KIND_EQ: u32 = 1;
 const TRANSACTION_TREF_TEST_KIND_STRUCT: u32 = 3;
 const TRANSACTION_TREF_TEST_KIND_ARRAY: u32 = 4;
@@ -2533,15 +2552,23 @@ fn transaction_tref_test(
         return u32::from(nullable != 0);
     }
 
+    if ObjectTable::is_raw_i31_ref(u64::from(raw_ref)) {
+        return u32::from(test_kind == TRANSACTION_TREF_TEST_KIND_EQ);
+    }
+
     let store = store.store_opaque();
     let state = store.transaction_state();
     let object_table = store.transaction_object_table();
     let Some(object_id) = state.known_object_id_for_transaction_ref_handle(object_table, raw_ref)
     else {
-        return TRANSACTION_TREF_TEST_NOT_TRANSACTION;
+        // Non-object identities in the transaction-any hierarchy are
+        // converted transactional extern references. They cannot satisfy an
+        // eq/struct/array test, and must never be passed to the ordinary GC
+        // reference machinery.
+        return 0;
     };
     let Ok(kind) = state.object_kind(object_table, object_id) else {
-        return TRANSACTION_TREF_TEST_NOT_TRANSACTION;
+        return 0;
     };
 
     let abstract_match = match test_kind {
@@ -2553,7 +2580,7 @@ fn transaction_tref_test(
         }
         TRANSACTION_TREF_TEST_KIND_STRUCT => kind == ObjectKind::Struct,
         TRANSACTION_TREF_TEST_KIND_ARRAY => kind == ObjectKind::Array,
-        _ => return TRANSACTION_TREF_TEST_NOT_TRANSACTION,
+        _ => return 0,
     };
     if !abstract_match {
         return 0;

@@ -176,6 +176,19 @@ impl Global {
                 ValType::F64 => Val::F64(*definition.as_u64()),
                 ValType::V128 => Val::V128(definition.get_u128().into()),
                 ValType::Ref(ref_ty) => {
+                    #[cfg(feature = "transaction")]
+                    if ref_ty.is_transactional_ref() {
+                        let raw = match ref_ty.heap_type().top() {
+                            HeapType::Func => vm::ValRaw::funcref(definition.as_func_ref().cast()),
+                            HeapType::Extern => vm::ValRaw::externref(*definition.as_u32()),
+                            HeapType::Any => vm::ValRaw::anyref(*definition.as_u32()),
+                            other => unreachable!(
+                                "unsupported transactional reference hierarchy: {other}"
+                            ),
+                        };
+                        return Val::transaction_ref_from_raw_no_gc(store, raw, ref_ty)
+                            .expect("transactional global must decode through transactional ABI");
+                    }
                     let reference: Ref = match ref_ty.heap_type() {
                         HeapType::Func | HeapType::ConcreteFunc(_) => {
                             Func::_from_raw(store, definition.as_func_ref().cast()).into()
@@ -331,6 +344,18 @@ impl Global {
     #[cfg(feature = "gc")]
     pub(crate) fn trace_root(&self, store: &mut StoreOpaque, gc_roots_list: &mut vm::GcRootsList) {
         if let Some(ref_ty) = self._ty(store).content().as_ref() {
+            #[cfg(feature = "transaction")]
+            if ref_ty.is_transactional_ref() {
+                if matches!(ref_ty.heap_type().top(), HeapType::Extern)
+                    && let Some(gc_ref) = unsafe { self.definition(store).as_mut().as_gc_ref_mut() }
+                {
+                    unsafe {
+                        gc_roots_list
+                            .add_vmgcref_root(gc_ref.into(), "transactional extern global");
+                    }
+                }
+                return;
+            }
             if !ref_ty.is_vmgcref_type_and_points_to_object() {
                 return;
             }

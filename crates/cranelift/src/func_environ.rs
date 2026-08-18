@@ -74,7 +74,6 @@ const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_INDEX_OFFSET: i32 = 0;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_FIELD_OFFSET_OFFSET: i32 = 4;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_VALUE_SIZE_OFFSET: i32 = 8;
 const TRANSACTION_PERSISTENT_FIELD_LAYOUT_ABI_IS_REF_OFFSET: i32 = 12;
-const TRANSACTION_TREF_TEST_NOT_TRANSACTION: i64 = -1;
 const TRANSACTION_TREF_TEST_EXPECTED_TYPE_NONE: i64 = -1;
 const TRANSACTION_TREF_TEST_KIND_EQ: u32 = 1;
 const TRANSACTION_TREF_TEST_KIND_STRUCT: u32 = 3;
@@ -1553,9 +1552,10 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
     pub(crate) fn val_ty_needs_stack_map(&self, ty: WasmValType) -> bool {
         match ty {
-            WasmValType::Ref(r) => {
-                !r.is_transactional_ref() && self.heap_ty_needs_stack_map(r.heap_type)
+            WasmValType::Ref(r) if r.is_transactional_ref() => {
+                r.heap_type.top() == WasmHeapTopType::Extern && !r.heap_type.is_bottom()
             }
+            WasmValType::Ref(r) => self.heap_ty_needs_stack_map(r.heap_type),
             _ => false,
         }
     }
@@ -4520,10 +4520,9 @@ impl FuncEnvironment<'_> {
         gc_ref: ir::Value,
         gc_ref_ty: WasmRefType,
     ) -> WasmResult<ir::Value> {
-        if let Some(result) =
-            self.translate_transaction_tref_test(builder, test_ty, gc_ref, gc_ref_ty)?
-        {
-            return Ok(result);
+        if test_ty.is_transactional_ref() || gc_ref_ty.is_transactional_ref() {
+            debug_assert!(test_ty.is_transactional_ref() && gc_ref_ty.is_transactional_ref());
+            return self.translate_transaction_tref_test(builder, test_ty, gc_ref, gc_ref_ty);
         }
         gc::translate_ref_test(self, builder, test_ty, gc_ref, gc_ref_ty)
     }
@@ -4534,17 +4533,72 @@ impl FuncEnvironment<'_> {
         test_ty: WasmRefType,
         gc_ref: ir::Value,
         gc_ref_ty: WasmRefType,
-    ) -> WasmResult<Option<ir::Value>> {
-        if !self.is_current_tfunc && !self.transaction_may_be_active_on_return {
-            return Ok(None);
+    ) -> WasmResult<ir::Value> {
+        debug_assert!(test_ty.is_transactional_ref());
+        debug_assert!(gc_ref_ty.is_transactional_ref());
+
+        if test_ty.heap_type.is_bottom() {
+            return if test_ty.nullable {
+                self.translate_ref_is_null(builder.cursor(), gc_ref, gc_ref_ty)
+            } else {
+                Ok(builder.ins().iconst(I32, 0))
+            };
         }
-        if builder.func.dfg.value_type(gc_ref) != I32 {
-            return Ok(None);
+        if test_ty.heap_type.is_top() {
+            return if test_ty.nullable {
+                Ok(builder.ins().iconst(I32, 1))
+            } else {
+                let is_null = self.translate_ref_is_null(builder.cursor(), gc_ref, gc_ref_ty)?;
+                let zero = builder.ins().iconst(I32, 0);
+                let one = builder.ins().iconst(I32, 1);
+                Ok(builder.ins().select(is_null, zero, one))
+            };
         }
-        let Some((test_kind, expected_interned_ty)) = Self::transaction_tref_test_kind(&test_ty)
-        else {
-            return Ok(None);
-        };
+        if test_ty.heap_type == WasmHeapType::I31 {
+            let mask = builder
+                .ins()
+                .iconst(I32, i64::from(wasmtime_environ::I31_DISCRIMINANT));
+            let is_i31 = builder.ins().band(gc_ref, mask);
+            return if test_ty.nullable {
+                let is_null = self.translate_ref_is_null(builder.cursor(), gc_ref, gc_ref_ty)?;
+                Ok(builder.ins().bor(is_null, is_i31))
+            } else {
+                Ok(is_i31)
+            };
+        }
+
+        if let WasmHeapType::ConcreteFunc(ty) = test_ty.heap_type {
+            let non_null = builder.create_block();
+            let done = builder.create_block();
+            let is_null = self.translate_ref_is_null(builder.cursor(), gc_ref, gc_ref_ty)?;
+            let null_result = builder.ins().iconst(I32, test_ty.nullable as i64);
+            builder
+                .ins()
+                .brif(is_null, done, &[null_result.into()], non_null, &[]);
+            builder.switch_to_block(non_null);
+            let expected_interned_ty = ty.unwrap_module_type_index();
+            let expected_shared_ty =
+                self.module_interned_to_shared_ty(&mut builder.cursor(), expected_interned_ty);
+            let flags = ir::MemFlagsData::trusted().with_readonly();
+            let actual_shared_ty =
+                self.load_funcref_type_index(&mut builder.cursor(), flags, gc_ref);
+            let result = self.is_subtype(
+                builder,
+                actual_shared_ty,
+                expected_shared_ty,
+                expected_interned_ty,
+            );
+            builder.ins().jump(done, &[result.into()]);
+            builder.switch_to_block(done);
+            let result = builder.append_block_param(done, I32);
+            builder.seal_block(non_null);
+            builder.seal_block(done);
+            return Ok(result);
+        }
+
+        let (test_kind, expected_interned_ty) = Self::transaction_tref_test_kind(&test_ty)
+            .expect("all non-trivial transactional ref tests must use transaction identities");
+        debug_assert_eq!(builder.func.dfg.value_type(gc_ref), I32);
 
         let callee = self
             .builtin_functions
@@ -4563,34 +4617,7 @@ impl FuncEnvironment<'_> {
         let call = builder
             .ins()
             .call(callee, &[vmctx, gc_ref, test_kind, nullable, expected_type]);
-        let helper_result = builder.func.dfg.inst_results(call)[0];
-        let is_not_transaction = builder.ins().icmp_imm_s(
-            IntCC::Equal,
-            helper_result,
-            TRANSACTION_TREF_TEST_NOT_TRANSACTION,
-        );
-
-        let ordinary_block = builder.create_block();
-        let continue_block = builder.create_block();
-        builder.ins().brif(
-            is_not_transaction,
-            ordinary_block,
-            &[],
-            continue_block,
-            &[helper_result.into()],
-        );
-
-        builder.switch_to_block(ordinary_block);
-        let ordinary_result = gc::translate_ref_test(self, builder, test_ty, gc_ref, gc_ref_ty)?;
-        builder
-            .ins()
-            .jump(continue_block, &[ordinary_result.into()]);
-
-        builder.switch_to_block(continue_block);
-        let result = builder.append_block_param(continue_block, I32);
-        builder.seal_block(ordinary_block);
-        builder.seal_block(continue_block);
-        Ok(Some(result))
+        Ok(builder.func.dfg.inst_results(call)[0])
     }
 
     fn transaction_tref_test_kind(

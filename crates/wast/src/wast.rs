@@ -304,6 +304,12 @@ impl WastContext {
                         .ok_or_else(|| format_err!("no function named `{field}`"))?;
                     let func_ty = func.ty(&self.core_store);
                     let param_types = func_ty.params().collect::<Vec<_>>();
+                    ensure!(
+                        args.len() == param_types.len(),
+                        "function `{field}` expected {} arguments, found {}",
+                        param_types.len(),
+                        args.len()
+                    );
                     let values = args
                         .iter()
                         .zip(&param_types)

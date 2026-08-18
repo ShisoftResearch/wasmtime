@@ -353,6 +353,16 @@ pub unsafe extern "C" fn wasmtime_func_call(
     nresults: usize,
     trap_ret: &mut *mut wasm_trap_t,
 ) -> Option<Box<wasmtime_error_t>> {
+    let ty = func.ty(&store);
+    if ty
+        .params()
+        .chain(ty.results())
+        .any(|ty| ty.as_ref().is_some_and(|ty| ty.is_transactional_ref()))
+    {
+        return Some(Box::new(wasmtime_error_t::from(wasmtime::format_err!(
+            "transactional reference parameters and results are unsupported by the C API"
+        ))));
+    }
     #[cfg(feature = "gc")]
     let mut store = RootScope::new(&mut store);
     let mut params = mem::take(&mut store.as_context_mut().data_mut().wasm_val_storage);

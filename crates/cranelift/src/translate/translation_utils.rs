@@ -64,7 +64,13 @@ pub fn block_with_params<PE: TargetEnvironment + ?Sized>(
             }
             wasmparser::ValType::Ref(rt) => {
                 let hty = environ.convert_heap_type(rt.heap_type())?;
-                let (ty, needs_stack_map) = environ.reference_type(hty);
+                let (ty, ordinary_needs_stack_map) = environ.reference_type(hty);
+                let needs_stack_map = if rt.is_transactional_ref() {
+                    matches!(hty.top(), wasmtime_environ::WasmHeapTopType::Extern)
+                        && !hty.is_bottom()
+                } else {
+                    ordinary_needs_stack_map
+                };
                 let val = builder.append_block_param(block, ty);
                 if needs_stack_map {
                     builder.declare_value_needs_stack_map(val);

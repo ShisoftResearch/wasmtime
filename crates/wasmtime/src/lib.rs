@@ -888,14 +888,11 @@ pub mod _internal {
         ) -> bool {
             use crate::runtime::transaction::ObjectKind;
 
-            let is_transaction_ref = matches!(
-                value,
-                crate::Val::TransactionRef(_)
-                    | crate::Val::TransactionExternRef(_)
-                    | crate::Val::TransactionFuncRef(_)
-            );
             if matches!(expected, TransactionWastRefExpectation::Any) {
-                return is_transaction_ref;
+                return matches!(
+                    value,
+                    crate::Val::TransactionRef(_) | crate::Val::TransactionExternRef(Some(_))
+                );
             }
             if matches!(expected, TransactionWastRefExpectation::Null) {
                 return match value {

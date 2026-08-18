@@ -6,6 +6,8 @@ use crate::{
     AsContext, AsContextMut, Engine, Func, FuncType, HeapType, NoFunc, RefType, StoreContextMut,
     ValRaw, ValType,
 };
+#[cfg(feature = "transaction")]
+use crate::{ExternRef, TransactionAnyRef, TransactionExternRef, TransactionFuncRef};
 use core::ffi::c_void;
 use core::marker;
 use core::mem::{self, MaybeUninit};
@@ -619,6 +621,227 @@ unsafe impl WasmTy for Option<Func> {
         // SAFETY: it's an unsafe contract of `load` that it's only provided
         // valid wasm values owned by `store`.
         unsafe { Some(Func::from_vm_func_ref(store.id(), ptr)) }
+    }
+}
+
+#[cfg(feature = "transaction")]
+unsafe impl WasmTy for TransactionAnyRef {
+    fn valtype() -> ValType {
+        ValType::Ref(RefType::new_transactional(false, HeapType::Any))
+    }
+
+    fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
+        (*self).compatible_with_store(store)
+    }
+
+    fn dynamic_concrete_type_check(
+        &self,
+        store: &StoreOpaque,
+        _nullable: bool,
+        expected: &HeapType,
+    ) -> Result<()> {
+        (*self).ensure_matches(store, expected)
+    }
+
+    fn is_vmgcref_and_points_to_object(&self) -> bool {
+        (*self).is_vmgcref()
+    }
+
+    fn store(self, store: &mut AutoAssertNoGc<'_>, ptr: &mut MaybeUninit<ValRaw>) -> Result<()> {
+        ptr.write(self.to_raw(store)?);
+        Ok(())
+    }
+
+    unsafe fn load(store: &mut AutoAssertNoGc<'_>, ptr: &ValRaw) -> Self {
+        unsafe { TransactionAnyRef::from_raw(store, ptr) }
+            .expect("non-null transactional any result")
+    }
+}
+
+#[cfg(feature = "transaction")]
+unsafe impl WasmTy for Option<TransactionAnyRef> {
+    fn valtype() -> ValType {
+        ValType::Ref(RefType::new_transactional(true, HeapType::Any))
+    }
+
+    fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
+        self.is_none_or(|reference| reference.compatible_with_store(store))
+    }
+
+    fn dynamic_concrete_type_check(
+        &self,
+        store: &StoreOpaque,
+        nullable: bool,
+        expected: &HeapType,
+    ) -> Result<()> {
+        match self {
+            Some(reference) => reference.ensure_matches(store, expected),
+            None if nullable => Ok(()),
+            None => bail!("expected a non-null transactional reference"),
+        }
+    }
+
+    fn is_vmgcref_and_points_to_object(&self) -> bool {
+        self.is_some_and(|reference| reference.is_vmgcref())
+    }
+
+    fn store(self, store: &mut AutoAssertNoGc<'_>, ptr: &mut MaybeUninit<ValRaw>) -> Result<()> {
+        ptr.write(match self {
+            Some(reference) => reference.to_raw(store)?,
+            None => ValRaw::anyref(0),
+        });
+        Ok(())
+    }
+
+    unsafe fn load(store: &mut AutoAssertNoGc<'_>, ptr: &ValRaw) -> Self {
+        if ptr.get_anyref() == 0 {
+            None
+        } else {
+            unsafe { TransactionAnyRef::from_raw(store, ptr) }
+        }
+    }
+}
+
+#[cfg(feature = "transaction")]
+unsafe impl WasmTy for TransactionExternRef {
+    fn valtype() -> ValType {
+        ValType::Ref(RefType::new_transactional(false, HeapType::Extern))
+    }
+
+    fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
+        (*self).compatible_with_store(store)
+    }
+
+    fn dynamic_concrete_type_check(&self, _: &StoreOpaque, _: bool, _: &HeapType) -> Result<()> {
+        unreachable!()
+    }
+
+    fn is_vmgcref_and_points_to_object(&self) -> bool {
+        true
+    }
+
+    fn store(self, store: &mut AutoAssertNoGc<'_>, ptr: &mut MaybeUninit<ValRaw>) -> Result<()> {
+        ptr.write(ValRaw::externref(self.get()._to_raw(store)?));
+        Ok(())
+    }
+
+    unsafe fn load(store: &mut AutoAssertNoGc<'_>, ptr: &ValRaw) -> Self {
+        TransactionExternRef::new(
+            ExternRef::_from_raw(store, ptr.get_externref())
+                .expect("non-null transactional external result"),
+        )
+    }
+}
+
+#[cfg(feature = "transaction")]
+unsafe impl WasmTy for Option<TransactionExternRef> {
+    fn valtype() -> ValType {
+        ValType::Ref(RefType::new_transactional(true, HeapType::Extern))
+    }
+
+    fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
+        self.is_none_or(|reference| reference.compatible_with_store(store))
+    }
+
+    fn dynamic_concrete_type_check(&self, _: &StoreOpaque, _: bool, _: &HeapType) -> Result<()> {
+        unreachable!()
+    }
+
+    fn is_vmgcref_and_points_to_object(&self) -> bool {
+        self.is_some()
+    }
+
+    fn store(self, store: &mut AutoAssertNoGc<'_>, ptr: &mut MaybeUninit<ValRaw>) -> Result<()> {
+        ptr.write(ValRaw::externref(match self {
+            Some(reference) => reference.get()._to_raw(store)?,
+            None => 0,
+        }));
+        Ok(())
+    }
+
+    unsafe fn load(store: &mut AutoAssertNoGc<'_>, ptr: &ValRaw) -> Self {
+        ExternRef::_from_raw(store, ptr.get_externref()).map(TransactionExternRef::new)
+    }
+}
+
+#[cfg(feature = "transaction")]
+unsafe impl WasmTy for TransactionFuncRef {
+    fn valtype() -> ValType {
+        ValType::Ref(RefType::new_transactional(false, HeapType::Func))
+    }
+
+    fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
+        (*self).compatible_with_store(store)
+    }
+
+    fn dynamic_concrete_type_check(
+        &self,
+        store: &StoreOpaque,
+        _nullable: bool,
+        expected: &HeapType,
+    ) -> Result<()> {
+        self.get()
+            .ensure_matches_ty(store, expected.unwrap_concrete_func())
+    }
+
+    fn is_vmgcref_and_points_to_object(&self) -> bool {
+        false
+    }
+
+    fn store(self, store: &mut AutoAssertNoGc<'_>, ptr: &mut MaybeUninit<ValRaw>) -> Result<()> {
+        ptr.write(ValRaw::funcref(
+            self.get().vm_func_ref(store).as_ptr().cast::<c_void>(),
+        ));
+        Ok(())
+    }
+
+    unsafe fn load(store: &mut AutoAssertNoGc<'_>, ptr: &ValRaw) -> Self {
+        let ptr = NonNull::new(ptr.get_funcref()).expect("non-null transactional func result");
+        TransactionFuncRef::new(unsafe { Func::from_vm_func_ref(store.id(), ptr.cast()) })
+    }
+}
+
+#[cfg(feature = "transaction")]
+unsafe impl WasmTy for Option<TransactionFuncRef> {
+    fn valtype() -> ValType {
+        ValType::Ref(RefType::new_transactional(true, HeapType::Func))
+    }
+
+    fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
+        self.is_none_or(|reference| reference.compatible_with_store(store))
+    }
+
+    fn dynamic_concrete_type_check(
+        &self,
+        store: &StoreOpaque,
+        nullable: bool,
+        expected: &HeapType,
+    ) -> Result<()> {
+        match self {
+            Some(reference) => reference
+                .get()
+                .ensure_matches_ty(store, expected.unwrap_concrete_func()),
+            None if nullable => Ok(()),
+            None => bail!("expected a non-null transactional function reference"),
+        }
+    }
+
+    fn is_vmgcref_and_points_to_object(&self) -> bool {
+        false
+    }
+
+    fn store(self, store: &mut AutoAssertNoGc<'_>, ptr: &mut MaybeUninit<ValRaw>) -> Result<()> {
+        ptr.write(ValRaw::funcref(match self {
+            Some(reference) => reference.get().vm_func_ref(store).as_ptr().cast::<c_void>(),
+            None => ptr::null_mut(),
+        }));
+        Ok(())
+    }
+
+    unsafe fn load(store: &mut AutoAssertNoGc<'_>, ptr: &ValRaw) -> Self {
+        NonNull::new(ptr.get_funcref()).map(|ptr| {
+            TransactionFuncRef::new(unsafe { Func::from_vm_func_ref(store.id(), ptr.cast()) })
+        })
     }
 }
 

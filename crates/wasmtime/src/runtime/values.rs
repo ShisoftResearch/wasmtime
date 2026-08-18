@@ -176,8 +176,149 @@ impl TransactionRef {
         matches!(self.inner, TransactionRefInner::I31(_))
     }
 
+    #[cfg(test)]
+    pub(crate) fn i31_value(self) -> Option<i32> {
+        match self.inner {
+            TransactionRefInner::I31(raw) => {
+                crate::runtime::transaction::ObjectTable::decode_raw_i31_ref(u64::from(raw)).ok()
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_null(self) -> bool {
         matches!(self.inner, TransactionRefInner::Null)
+    }
+}
+
+/// A non-null reference in the transactional `tany` hierarchy.
+#[cfg(feature = "transaction")]
+#[derive(Debug, Clone, Copy)]
+pub struct TransactionAnyRef(TransactionAnyRefInner);
+
+#[cfg(feature = "transaction")]
+#[derive(Debug, Clone, Copy)]
+enum TransactionAnyRefInner {
+    Any(TransactionRef),
+    Extern(Rooted<ExternRef>),
+}
+
+#[cfg(feature = "transaction")]
+impl TransactionAnyRef {
+    /// Wraps an external reference converted into the transactional-any hierarchy.
+    pub fn from_extern(reference: Rooted<ExternRef>) -> Self {
+        Self(TransactionAnyRefInner::Extern(reference))
+    }
+
+    /// Returns the carried external reference, if this is a converted external identity.
+    pub fn as_extern(&self) -> Option<Rooted<ExternRef>> {
+        match self.0 {
+            TransactionAnyRefInner::Extern(reference) => Some(reference),
+            TransactionAnyRefInner::Any(_) => None,
+        }
+    }
+
+    pub(crate) fn from_val(value: Val) -> Option<Self> {
+        match value {
+            Val::TransactionRef(reference) if !reference.is_null() => {
+                Some(Self(TransactionAnyRefInner::Any(reference)))
+            }
+            Val::TransactionExternRef(Some(reference)) => {
+                Some(Self(TransactionAnyRefInner::Extern(reference)))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_val(self) -> Val {
+        match self.0 {
+            TransactionAnyRefInner::Any(reference) => Val::TransactionRef(reference),
+            TransactionAnyRefInner::Extern(reference) => Val::TransactionExternRef(Some(reference)),
+        }
+    }
+
+    pub(crate) fn compatible_with_store(self, store: &StoreOpaque) -> bool {
+        self.into_val().comes_from_same_store(store)
+    }
+
+    pub(crate) fn ensure_matches(self, store: &StoreOpaque, expected: &HeapType) -> Result<()> {
+        let actual = match self.0 {
+            TransactionAnyRefInner::Any(reference) => reference.actual_heap_type(store)?,
+            TransactionAnyRefInner::Extern(_) => HeapType::Extern,
+        };
+        ensure!(
+            actual.matches(expected),
+            "argument type mismatch: transactional {actual} does not match {expected}"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn is_vmgcref(self) -> bool {
+        matches!(self.0, TransactionAnyRefInner::Extern(_))
+    }
+
+    pub(crate) fn to_raw(self, store: &mut AutoAssertNoGc<'_>) -> Result<ValRaw> {
+        match self.0 {
+            TransactionAnyRefInner::Any(reference) => reference.to_raw(store),
+            TransactionAnyRefInner::Extern(reference) => {
+                store.transaction_retain_extern_ref(reference)?;
+                Ok(ValRaw::anyref(reference._to_raw(store)?))
+            }
+        }
+    }
+
+    pub(crate) unsafe fn from_raw(store: &mut AutoAssertNoGc<'_>, raw: &ValRaw) -> Option<Self> {
+        Self::from_val(unsafe {
+            TransactionRef::from_raw(
+                store,
+                ValRaw::anyref(raw.get_anyref()),
+                &RefType::new_transactional(false, HeapType::Any),
+            )
+        })
+    }
+}
+
+/// A non-null transactional external reference.
+#[cfg(feature = "transaction")]
+#[derive(Debug, Clone, Copy)]
+pub struct TransactionExternRef(Rooted<ExternRef>);
+
+#[cfg(feature = "transaction")]
+impl TransactionExternRef {
+    /// Creates a transactional external reference from an ordinary rooted external identity.
+    pub fn new(reference: Rooted<ExternRef>) -> Self {
+        Self(reference)
+    }
+
+    /// Returns the underlying rooted external identity.
+    pub fn get(self) -> Rooted<ExternRef> {
+        self.0
+    }
+
+    pub(crate) fn compatible_with_store(self, store: &StoreOpaque) -> bool {
+        self.0.comes_from_same_store(store)
+    }
+}
+
+/// A non-null transactional function reference.
+#[cfg(feature = "transaction")]
+#[derive(Debug, Clone, Copy)]
+pub struct TransactionFuncRef(Func);
+
+#[cfg(feature = "transaction")]
+impl TransactionFuncRef {
+    /// Creates a transactional function reference.
+    pub fn new(func: Func) -> Self {
+        Self(func)
+    }
+
+    /// Returns the underlying function identity.
+    pub fn get(self) -> Func {
+        self.0
+    }
+
+    pub(crate) fn compatible_with_store(self, store: &StoreOpaque) -> bool {
+        self.0.comes_from_same_store(store)
     }
 }
 
@@ -448,16 +589,14 @@ impl Val {
                 ref_ty.is_transactional_ref()
                     && reference.is_none_or(|reference| reference.comes_from_same_store(store))
                     && (reference.is_some() || ref_ty.is_nullable())
-                    && match ref_ty.heap_type().top() {
+                    && match ref_ty.heap_type() {
                         HeapType::Extern => true,
                         // `tany.convert_textern` preserves the external
                         // identity while moving it into the transaction-any
                         // hierarchy.
                         HeapType::Any => reference.is_some(),
-                        HeapType::Func => false,
-                        other => {
-                            unreachable!("unsupported transactional reference hierarchy: {other}")
-                        }
+                        HeapType::NoExtern => reference.is_none(),
+                        _ => false,
                     }
             }
             #[cfg(feature = "transaction")]
@@ -652,6 +791,15 @@ impl Val {
             return Ok(None);
         }
         self.ensure_matches_ty(store, ty)?;
+        if matches!(ref_ty.heap_type(), HeapType::Any)
+            && let Val::TransactionExternRef(Some(reference)) = self
+        {
+            // Transaction-any values use the same raw bits as externrefs but
+            // cannot be conservatively placed in GC stack maps because the
+            // hierarchy also carries transaction object handles and i31s.
+            // Retain the actual external root in its proper GC domain.
+            store.transaction_retain_extern_ref(*reference)?;
+        }
         let mut store = AutoAssertNoGc::new(store);
         Ok(Some(match self {
             Val::TransactionRef(reference) => reference.to_raw(&mut store)?,
@@ -682,10 +830,22 @@ impl Val {
             return None;
         }
         let mut store = AutoAssertNoGc::new(store);
-        let reference = unsafe { TransactionRef::from_raw(&mut store, raw, ref_ty) };
+        unsafe { Self::transaction_ref_from_raw_no_gc(&mut store, raw, ref_ty) }
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) unsafe fn transaction_ref_from_raw_no_gc(
+        store: &mut AutoAssertNoGc<'_>,
+        raw: ValRaw,
+        ref_ty: &RefType,
+    ) -> Option<Val> {
+        if !ref_ty.is_transactional_ref() {
+            return None;
+        }
+        let reference = unsafe { TransactionRef::from_raw(store, raw, ref_ty) };
         assert!(
             reference
-                ._matches_ty(&store, &ValType::Ref(ref_ty.clone()))
+                ._matches_ty(store, &ValType::Ref(ref_ty.clone()))
                 .unwrap(),
             "raw transactional reference does not match its function type"
         );

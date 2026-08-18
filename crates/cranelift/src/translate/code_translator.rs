@@ -3861,7 +3861,8 @@ pub fn translate_operator(
             let eq = builder.ins().uextend(ir::types::I32, eq);
             environ.stacks.push1(eq);
         }
-        Operator::RefTestNonNull { hty } => {
+        Operator::RefTestNonNull { hty } | Operator::TRefTestNonNull { hty } => {
+            let transactional = matches!(op, Operator::TRefTestNonNull { .. });
             let r = environ.stacks.pop1();
             let [.., WasmValType::Ref(r_ty)] = operand_types else {
                 unreachable!("validation")
@@ -3872,14 +3873,15 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: false,
-                    transactional: false,
+                    transactional,
                 },
                 r,
                 *r_ty,
             )?;
             environ.stacks.push1(result);
         }
-        Operator::RefTestNullable { hty } => {
+        Operator::RefTestNullable { hty } | Operator::TRefTestNullable { hty } => {
+            let transactional = matches!(op, Operator::TRefTestNullable { .. });
             let r = environ.stacks.pop1();
             let [.., WasmValType::Ref(r_ty)] = operand_types else {
                 unreachable!("validation")
@@ -3890,14 +3892,15 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: true,
-                    transactional: false,
+                    transactional,
                 },
                 r,
                 *r_ty,
             )?;
             environ.stacks.push1(result);
         }
-        Operator::RefCastNonNull { hty } => {
+        Operator::RefCastNonNull { hty } | Operator::TRefCastNonNull { hty } => {
+            let transactional = matches!(op, Operator::TRefCastNonNull { .. });
             let r = environ.stacks.pop1();
             let [.., WasmValType::Ref(r_ty)] = operand_types else {
                 unreachable!("validation")
@@ -3908,7 +3911,7 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: false,
-                    transactional: false,
+                    transactional,
                 },
                 r,
                 *r_ty,
@@ -3916,7 +3919,8 @@ pub fn translate_operator(
             environ.trapz(builder, cast_okay, crate::TRAP_CAST_FAILURE);
             environ.stacks.push1(r);
         }
-        Operator::RefCastNullable { hty } => {
+        Operator::RefCastNullable { hty } | Operator::TRefCastNullable { hty } => {
+            let transactional = matches!(op, Operator::TRefCastNullable { .. });
             let r = environ.stacks.pop1();
             let [.., WasmValType::Ref(r_ty)] = operand_types else {
                 unreachable!("validation")
@@ -3927,7 +3931,7 @@ pub fn translate_operator(
                 WasmRefType {
                     heap_type,
                     nullable: true,
-                    transactional: false,
+                    transactional,
                 },
                 r,
                 *r_ty,
