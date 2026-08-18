@@ -54,6 +54,8 @@
 //! }
 //! ```
 
+#[cfg(all(feature = "gc", feature = "transaction"))]
+use crate::ExternRef;
 use crate::bail_bug;
 use crate::prelude::*;
 use crate::runtime::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque};
@@ -63,19 +65,20 @@ use crate::runtime::transaction::DurableExternRefHostData;
 use crate::runtime::transaction::MvccCommitFaultPoint;
 #[cfg(not(feature = "transaction-mvcc"))]
 use crate::runtime::transaction::PendingCommitLogEntry;
+#[cfg(all(feature = "gc", feature = "transaction"))]
+use crate::runtime::transaction::TransactionExternalizedRefHostData;
 #[cfg(not(feature = "transaction-mvcc"))]
 use crate::runtime::transaction::collect_tmemory_access_versions;
 use crate::runtime::transaction::{
     DurableReferenceRegistry, GlobalSnapshot, GranuleId, OBJECT_VALUE_ABI_LIVE_REF_KIND_EXTERN,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_FUNC, OBJECT_VALUE_ABI_LIVE_REF_KIND_GC,
     OBJECT_VALUE_ABI_LIVE_REF_KIND_I31, OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT,
-    OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED, OBJECT_VALUE_ABI_TAG_REF, ObjectKind, ObjectPayload,
-    ObjectTable, ObjectValue, ObjectValueAbi, OrdinaryGcPromotionAdapter,
-    OrdinaryGcPromotionSource, OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE,
-    StagedRecord, TMemoryAccessSnapshot, TMemoryBackend, TableElementSnapshot,
-    TableGranuleSnapshot, TransactionId, TransactionState, WasmtimePersistentFieldLayout,
-    WasmtimePersistentFieldLayoutAbi, collect_tmemory_access_snapshot,
-    combine_operation_and_cleanup_results,
+    OBJECT_VALUE_ABI_LIVE_REF_KIND_UNTYPED, OBJECT_VALUE_ABI_TAG_REF, ObjectKind, ObjectTable,
+    ObjectValue, ObjectValueAbi, OrdinaryGcPromotionAdapter, OrdinaryGcPromotionSource,
+    OrdinaryGcPromotionValue, PERSISTENT_OBJECT_ABI_SLOT_SIZE, StagedRecord, TMemoryAccessSnapshot,
+    TMemoryBackend, TableElementSnapshot, TableGranuleSnapshot, TransactionId, TransactionState,
+    WasmtimePersistentFieldLayout, WasmtimePersistentFieldLayoutAbi,
+    collect_tmemory_access_snapshot, combine_operation_and_cleanup_results,
 };
 #[cfg(feature = "transaction-mvcc")]
 use crate::runtime::transaction::{
@@ -422,6 +425,110 @@ fn transaction_preserve_tref_result(
     raw_ref: u32,
 ) -> Result<()> {
     transaction_preserve_tref_result_impl(store.store_opaque_mut(), raw_ref)
+}
+
+fn transaction_preserve_textern_result(
+    store: &mut dyn VMStore,
+    _instance: InstanceId,
+    raw_ref: u32,
+) -> Result<()> {
+    let result = (|| {
+        if raw_ref == 0 {
+            return Ok(());
+        }
+        #[cfg(all(feature = "gc", feature = "transaction"))]
+        if let Some(raw_ref) = transaction_externalized_ref_raw(store.store_opaque(), raw_ref)? {
+            return transaction_preserve_tref_result_impl(store.store_opaque_mut(), raw_ref);
+        }
+        Ok(())
+    })();
+    let cleanup = abort_active_transaction_on_error(store, &result);
+    combine_operation_and_cleanup_results(
+        result,
+        cleanup,
+        "failed to abort transaction after externalized result promotion failure",
+    )
+}
+
+#[cfg(all(feature = "gc", feature = "transaction"))]
+fn transaction_externalized_ref_raw(store: &StoreOpaque, raw_ref: u32) -> Result<Option<u32>> {
+    let gc_ref = VMGcRef::from_raw_u32(raw_ref).context("invalid transactional externref")?;
+    let gc_store = store.require_gc_store()?;
+    let extern_ref = gc_ref
+        .as_externref(&*gc_store.gc_heap)
+        .context("transactional extern value is not an externref")?;
+    Ok(gc_store
+        .externref_host_data(extern_ref)?
+        .downcast_ref::<TransactionExternalizedRefHostData>()
+        .map(TransactionExternalizedRefHostData::raw_ref))
+}
+
+fn transaction_textern_convert_tany(
+    store: &mut dyn VMStore,
+    _instance: InstanceId,
+    raw_ref: u32,
+) -> Result<u32> {
+    #[cfg(not(all(feature = "gc", feature = "transaction")))]
+    let _ = &store;
+    if raw_ref == 0 {
+        return Ok(0);
+    }
+
+    #[cfg(feature = "transaction")]
+    if let Some(reference) = store
+        .store_opaque_mut()
+        .transaction_extern_for_handle(raw_ref)
+    {
+        let mut no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
+        return reference._to_raw(&mut no_gc);
+    }
+
+    #[cfg(not(all(feature = "gc", feature = "transaction")))]
+    bail!("transactional external conversion requires GC support");
+    #[cfg(all(feature = "gc", feature = "transaction"))]
+    {
+        let (mut limiter, store) = store.resource_limiter_and_store_opaque();
+        let reference = block_on!(store, async |store, asyncness| {
+            ExternRef::_new_async(
+                store,
+                limiter.as_mut(),
+                TransactionExternalizedRefHostData::new(raw_ref),
+                asyncness,
+            )
+            .await
+        })??;
+        let mut no_gc = AutoAssertNoGc::new(store);
+        reference._to_raw(&mut no_gc)
+    }
+}
+
+fn transaction_tany_convert_textern(
+    store: &mut dyn VMStore,
+    _instance: InstanceId,
+    raw_ref: u32,
+) -> Result<u32> {
+    #[cfg(not(all(feature = "gc", feature = "transaction")))]
+    let _ = &store;
+    if raw_ref == 0 {
+        return Ok(0);
+    }
+
+    #[cfg(not(all(feature = "gc", feature = "transaction")))]
+    bail!("transactional external conversion requires GC support");
+    #[cfg(all(feature = "gc", feature = "transaction"))]
+    {
+        if let Some(raw) = transaction_externalized_ref_raw(store.store_opaque(), raw_ref)? {
+            return Ok(raw);
+        }
+        let reference = {
+            let mut no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
+            ExternRef::_from_raw(&mut no_gc, raw_ref).context("null transactional externref")?
+        };
+        let handle = store
+            .store_opaque_mut()
+            .transaction_extern_handle(reference)?;
+        Ok(handle)
+    }
 }
 
 pub(crate) fn transaction_preserve_tref_result_impl(
@@ -2438,6 +2545,17 @@ fn read_global_snapshot_like(
             };
             GlobalSnapshot::GcRef(raw)
         }
+        GlobalSnapshot::ExternalizedRef { .. } => {
+            #[cfg(not(all(feature = "gc", feature = "transaction")))]
+            bail!("transactional external conversion requires GC support");
+            #[cfg(all(feature = "gc", feature = "transaction"))]
+            {
+                let wrapper = unsafe { *global.as_u32() };
+                let inner = transaction_externalized_ref_raw(store.store_opaque(), wrapper)?
+                    .context("transactional external wrapper lost its native identity")?;
+                GlobalSnapshot::ExternalizedRef { wrapper, inner }
+            }
+        }
     })
 }
 
@@ -2471,40 +2589,6 @@ fn transaction_failure_code(store: &mut dyn VMStore, _instance: InstanceId) -> u
         .store_opaque_mut()
         .transaction_state_mut()
         .structured_failure_code()
-}
-
-fn transaction_helper_i31_for_ref(
-    store: &mut dyn VMStore,
-    _instance: InstanceId,
-    gc_ref: u32,
-) -> u32 {
-    let store = store.store_opaque_mut();
-    let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let Ok(object_id) = state.object_id_for_live_bridge_transaction_ref_raw(object_table, gc_ref)
-    else {
-        return 0;
-    };
-    let Ok(ObjectPayload::Struct(fields)) = state.read_object_payload(object_table, object_id)
-    else {
-        return 0;
-    };
-    let Some(value) = fields.get(1) else {
-        return 0;
-    };
-    let value = match value {
-        ObjectValue::I31(value) => *value,
-        ObjectValue::I32(value) => *value,
-        ObjectValue::I64(value) => *value as i32,
-        ObjectValue::F32(value) => *value as i32,
-        ObjectValue::F64(value) => *value as i32,
-        // Generated proposal fixtures sometimes route a vector payload through
-        // a `ti31` helper extraction. There is no scalar-preserving conversion
-        // for that shape, so keep the compatibility path deterministic.
-        ObjectValue::V128(_) => 0,
-        ObjectValue::FuncRef(_) | ObjectValue::ExternRef(_) => 0,
-        ObjectValue::Ref(_) => return 0,
-    };
-    (value as u32).wrapping_shl(1) | 1
 }
 
 const TRANSACTION_TREF_TEST_KIND_EQ: u32 = 1;
@@ -2781,6 +2865,30 @@ fn stage_transaction_global_snapshot(
     snapshot: GlobalSnapshot,
 ) -> Result<()> {
     ensure_global_snapshot_type(snapshot, wasm_ty)?;
+    #[cfg(feature = "transaction")]
+    if let (GlobalSnapshot::GcRef(wrapper), WasmValType::Ref(ref_ty)) = (snapshot, wasm_ty)
+        && ref_ty.is_transactional_ref()
+        && ref_ty.heap_type.top() == WasmHeapTopType::Extern
+        && wrapper != 0
+        && let Some(inner) = transaction_externalized_ref_raw(store.store_opaque(), wrapper)?
+    {
+        let rooted = {
+            let mut no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
+            ExternRef::_from_raw(&mut no_gc, wrapper)
+                .context("transactional external wrapper is null")?
+        };
+        let _ = store.store_opaque_mut().transaction_extern_handle(rooted)?;
+        transaction_preserve_tref_result_impl(store.store_opaque_mut(), inner)?;
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .stage_global_owned(
+                Some(instance),
+                global_index.as_u32(),
+                GlobalSnapshot::ExternalizedRef { wrapper, inner },
+            )?;
+        return Ok(());
+    }
     if let GlobalSnapshot::GcRef(gc_ref) = snapshot {
         let abi = ObjectValueAbi::from_live_parts(
             OBJECT_VALUE_ABI_TAG_REF,
@@ -2937,12 +3045,12 @@ fn live_transaction_global_snapshot_for_read(
     store: &mut dyn VMStore,
     snapshot: GlobalSnapshot,
 ) -> Result<GlobalSnapshot> {
-    let GlobalSnapshot::GcRef(gc_ref) = snapshot else {
-        return Ok(snapshot);
-    };
-    Ok(GlobalSnapshot::GcRef(live_transaction_gc_ref_for_read(
-        store, gc_ref,
-    )?))
+    match snapshot {
+        GlobalSnapshot::GcRef(gc_ref) => Ok(GlobalSnapshot::GcRef(
+            live_transaction_gc_ref_for_read(store, gc_ref)?,
+        )),
+        other => Ok(other),
+    }
 }
 
 fn live_transaction_gc_ref_for_read(store: &mut dyn VMStore, gc_ref: u32) -> Result<u32> {
@@ -3037,6 +3145,10 @@ fn write_global_snapshot(
                 let value = VMGcRef::from_raw_u32(value);
                 global.write_gc_ref(store, value.as_ref())?;
             }
+            GlobalSnapshot::ExternalizedRef { wrapper, .. } => {
+                let value = VMGcRef::from_raw_u32(wrapper);
+                global.write_gc_ref(store, value.as_ref())?;
+            }
             GlobalSnapshot::FuncRef(value) => {
                 *global.as_func_ref_mut() = core::ptr::with_exposed_provenance_mut(value);
             }
@@ -3051,13 +3163,20 @@ fn write_transaction_global_snapshot(
     wasm_ty: WasmValType,
     value: GlobalSnapshot,
 ) -> Result<()> {
-    if let (GlobalSnapshot::GcRef(value), WasmValType::Ref(ref_ty)) = (value, wasm_ty)
+    if let WasmValType::Ref(ref_ty) = wasm_ty
         && ref_ty.is_transactional_ref()
     {
-        unsafe {
-            *global.as_u32_mut() = value;
+        let raw = match value {
+            GlobalSnapshot::GcRef(value) => Some(value),
+            GlobalSnapshot::ExternalizedRef { wrapper, .. } => Some(wrapper),
+            _ => None,
+        };
+        if let Some(raw) = raw {
+            unsafe {
+                *global.as_u32_mut() = raw;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     write_global_snapshot(store, global, value)
 }
@@ -3076,6 +3195,9 @@ fn ensure_global_snapshot_type(value: GlobalSnapshot, ty: WasmValType) -> Result
             ref_ty.heap_type.top(),
             WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn
         ),
+        (GlobalSnapshot::ExternalizedRef { .. }, WasmValType::Ref(ref_ty)) => {
+            ref_ty.is_transactional_ref() && ref_ty.heap_type.top() == WasmHeapTopType::Extern
+        }
         _ => false,
     };
     ensure!(
@@ -3093,6 +3215,7 @@ fn global_snapshot_bytes(value: GlobalSnapshot) -> Vec<u8> {
         GlobalSnapshot::F64(value) => value.to_ne_bytes().to_vec(),
         GlobalSnapshot::V128(value) => value.to_vec(),
         GlobalSnapshot::GcRef(value) => value.to_ne_bytes().to_vec(),
+        GlobalSnapshot::ExternalizedRef { wrapper, .. } => wrapper.to_ne_bytes().to_vec(),
         GlobalSnapshot::FuncRef(value) => value.to_ne_bytes().to_vec(),
     }
 }
@@ -7355,9 +7478,25 @@ mod tests {
     use super::*;
     use crate::AsContextMut;
     use crate::runtime::transaction::{
-        OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, ObjectId, ObjectKind,
+        OBJECT_VALUE_ABI_LIVE_REF_KIND_PERSISTENT_OBJECT, ObjectId, ObjectKind, ObjectPayload,
         encode_object_record_for_recovery, type_layout::TypeLayoutRegistry,
     };
+
+    #[cfg(all(feature = "gc", feature = "transaction"))]
+    #[test]
+    fn malformed_externalized_result_aborts_active_transaction() {
+        let engine = crate::Engine::default();
+        let mut store = crate::Store::new(&engine, ());
+        store.transaction_state_mut().begin().unwrap();
+
+        let context = store.as_context_mut();
+        let error =
+            transaction_preserve_textern_result(context.0, InstanceId::from_u32(0), u32::MAX)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("GC heap"), "{error:?}");
+        assert_eq!(store.transaction_state().active_transaction(), None);
+    }
 
     #[cfg(feature = "transaction-mvcc")]
     #[test]

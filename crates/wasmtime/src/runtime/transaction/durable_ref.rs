@@ -131,6 +131,26 @@ pub(crate) struct DurableExternRefHostData {
     identity: DurableExternIdentity,
 }
 
+/// Host data for the GC-managed wrapper created by `textern.convert_tany`.
+///
+/// The wrapped word is a native transactional reference identity, not a GC
+/// reference. It is only interpreted again by `tany.convert_textern` or by
+/// transactional result promotion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransactionExternalizedRefHostData {
+    raw_ref: u32,
+}
+
+impl TransactionExternalizedRefHostData {
+    pub(crate) fn new(raw_ref: u32) -> Self {
+        Self { raw_ref }
+    }
+
+    pub(crate) fn raw_ref(&self) -> u32 {
+        self.raw_ref
+    }
+}
+
 impl DurableExternRefHostData {
     pub(crate) fn new(identity: DurableExternIdentity) -> Self {
         Self { identity }

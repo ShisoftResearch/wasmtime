@@ -69,6 +69,8 @@ impl TransactionRef {
                 let raw = raw.get_anyref();
                 let inner = if raw == 0 {
                     TransactionRefInner::Null
+                } else if let Some(reference) = store.transaction_extern_for_handle(raw) {
+                    return Val::TransactionExternRef(Some(reference));
                 } else if crate::runtime::transaction::ObjectTable::is_raw_i31_ref(u64::from(raw)) {
                     TransactionRefInner::I31(raw)
                 } else if store
@@ -254,15 +256,15 @@ impl TransactionAnyRef {
     }
 
     pub(crate) fn is_vmgcref(self) -> bool {
-        matches!(self.0, TransactionAnyRefInner::Extern(_))
+        false
     }
 
     pub(crate) fn to_raw(self, store: &mut AutoAssertNoGc<'_>) -> Result<ValRaw> {
         match self.0 {
             TransactionAnyRefInner::Any(reference) => reference.to_raw(store),
             TransactionAnyRefInner::Extern(reference) => {
-                store.transaction_retain_extern_ref(reference)?;
-                Ok(ValRaw::anyref(reference._to_raw(store)?))
+                let handle = store.transaction_extern_handle(reference)?;
+                Ok(ValRaw::anyref(handle))
             }
         }
     }
@@ -791,22 +793,19 @@ impl Val {
             return Ok(None);
         }
         self.ensure_matches_ty(store, ty)?;
-        if matches!(ref_ty.heap_type(), HeapType::Any)
-            && let Val::TransactionExternRef(Some(reference)) = self
-        {
-            // Transaction-any values use the same raw bits as externrefs but
-            // cannot be conservatively placed in GC stack maps because the
-            // hierarchy also carries transaction object handles and i31s.
-            // Retain the actual external root in its proper GC domain.
-            store.transaction_retain_extern_ref(*reference)?;
-        }
         let mut store = AutoAssertNoGc::new(store);
         Ok(Some(match self {
             Val::TransactionRef(reference) => reference.to_raw(&mut store)?,
-            Val::TransactionExternRef(reference) => ValRaw::externref(match reference {
-                Some(reference) => reference._to_raw(&mut store)?,
-                None => 0,
-            }),
+            Val::TransactionExternRef(reference) => {
+                let raw = match reference {
+                    Some(reference) if matches!(ref_ty.heap_type().top(), HeapType::Any) => {
+                        store.transaction_extern_handle(*reference)?
+                    }
+                    Some(reference) => reference._to_raw(&mut store)?,
+                    None => 0,
+                };
+                ValRaw::externref(raw)
+            }
             Val::TransactionFuncRef(reference) => ValRaw::funcref(match reference {
                 Some(reference) => reference.to_raw_(&mut store),
                 None => ptr::null_mut(),

@@ -170,58 +170,66 @@ where
             }
         }
 
-        // Validate that all runtime values flowing into this store indeed
-        // belong within this store, otherwise it would be unsafe for store
-        // values to cross each other.
+        #[cfg(feature = "transaction")]
+        store.0.transaction_enter_extern_scope();
+        let result = (|| {
+            // Validate that all runtime values flowing into this store indeed
+            // belong within this store, otherwise it would be unsafe for store
+            // values to cross each other.
 
-        union Storage<T: Copy, U: Copy> {
-            params: MaybeUninit<T>,
-            results: U,
-        }
+            union Storage<T: Copy, U: Copy> {
+                params: MaybeUninit<T>,
+                results: U,
+            }
 
-        let mut storage = Storage::<Params::ValRawStorage, Results::ValRawStorage> {
-            params: MaybeUninit::uninit(),
-        };
+            let mut storage = Storage::<Params::ValRawStorage, Results::ValRawStorage> {
+                params: MaybeUninit::uninit(),
+            };
 
-        {
+            {
+                let mut store = AutoAssertNoGc::new(store.0);
+                // SAFETY: it's safe to use a union field here as the field itself
+                // is `MaybeUninit<_>` meaning nothing is accidentally considered
+                // initialized.
+                let dst: &mut MaybeUninit<_> = unsafe { &mut storage.params };
+                params.store(&mut store, ty, dst)?;
+            }
+
+            // Try to capture only a single variable (a tuple) in the closure below.
+            // This means the size of the closure is one pointer and is much more
+            // efficient to move in memory. This closure is actually invoked on the
+            // other side of a C++ shim, so it can never be inlined enough to make
+            // the memory go away, so the size matters here for performance.
+            let mut captures = (func, storage);
+
+            let result = invoke_wasm_and_catch_traps(store, |caller, vm| {
+                let (func_ref, storage) = &mut captures;
+                let storage_len =
+                    mem::size_of_val::<Storage<_, _>>(storage) / mem::size_of::<ValRaw>();
+                let storage: *mut Storage<_, _> = storage;
+                let storage = storage.cast::<ValRaw>();
+                let storage = core::ptr::slice_from_raw_parts_mut(storage, storage_len);
+                let storage = NonNull::new(storage).unwrap();
+
+                // SAFETY: this function's own contract is that `func_ref` is safe
+                // to call and additionally that the params/results are correctly
+                // ascribed for this function call to be safe.
+                unsafe { VMFuncRef::array_call(*func_ref, vm, caller, storage) }
+            });
+
+            let (_, storage) = captures;
+            result?;
+
             let mut store = AutoAssertNoGc::new(store.0);
-            // SAFETY: it's safe to use a union field here as the field itself
-            // is `MaybeUninit<_>` meaning nothing is accidentally considered
-            // initialized.
-            let dst: &mut MaybeUninit<_> = unsafe { &mut storage.params };
-            params.store(&mut store, ty, dst)?;
-        }
-
-        // Try to capture only a single variable (a tuple) in the closure below.
-        // This means the size of the closure is one pointer and is much more
-        // efficient to move in memory. This closure is actually invoked on the
-        // other side of a C++ shim, so it can never be inlined enough to make
-        // the memory go away, so the size matters here for performance.
-        let mut captures = (func, storage);
-
-        let result = invoke_wasm_and_catch_traps(store, |caller, vm| {
-            let (func_ref, storage) = &mut captures;
-            let storage_len = mem::size_of_val::<Storage<_, _>>(storage) / mem::size_of::<ValRaw>();
-            let storage: *mut Storage<_, _> = storage;
-            let storage = storage.cast::<ValRaw>();
-            let storage = core::ptr::slice_from_raw_parts_mut(storage, storage_len);
-            let storage = NonNull::new(storage).unwrap();
-
-            // SAFETY: this function's own contract is that `func_ref` is safe
-            // to call and additionally that the params/results are correctly
-            // ascribed for this function call to be safe.
-            unsafe { VMFuncRef::array_call(*func_ref, vm, caller, storage) }
-        });
-
-        let (_, storage) = captures;
-        result?;
-
-        let mut store = AutoAssertNoGc::new(store.0);
-        // SAFETY: this function is itself unsafe to ensure that the result type
-        // ascription is correct for `Results` and matches the actual function.
-        // Additionally given the correct type ascription all of the `results`
-        // accessed here should be validly initialized.
-        unsafe { Ok(Results::load(&mut store, &storage.results)) }
+            // SAFETY: this function is itself unsafe to ensure that the result type
+            // ascription is correct for `Results` and matches the actual function.
+            // Additionally given the correct type ascription all of the `results`
+            // accessed here should be validly initialized.
+            unsafe { Ok(Results::load(&mut store, &storage.results)) }
+        })();
+        #[cfg(feature = "transaction")]
+        store.0.transaction_exit_extern_scope();
+        result
     }
 
     /// Purely a debug-mode assertion, not actually used in release builds.

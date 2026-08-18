@@ -30525,6 +30525,305 @@ fn transaction_function_concrete_test_uses_native_function_identity() {
 }
 
 #[test]
+fn transaction_native_external_wrapper_roundtrips_object_and_i31() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (tfunc $collect (import "host" "collect"))
+              (tfunc (export "object") (result i32)
+                (local $external texterntref)
+                (local.set $external
+                  (textern.convert_tany
+                    (tstruct.new $s (i32.const 619))))
+                (tcall $collect)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tref.cast (tref $s)
+                      (tany.convert_textern
+                        (local.get $external))))))
+              (tfunc (export "i31") (result i32)
+                (local $external texterntref)
+                (local.set $external
+                  (textern.convert_tany
+                    (tref.ti31 (i32.const 41))))
+                (tcall $collect)
+                (ti31.get_s
+                  (tref.cast (tref ti31)
+                    (tany.convert_textern
+                      (local.get $external)))))
+              (tfunc (export "operand-stack") (result i32)
+                (textern.convert_tany
+                  (tstruct.new $s (i32.const 623)))
+                (tcall $collect)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tref.cast (tref $s)
+                      (tany.convert_textern))))))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let collect = crate::Func::new(&mut store, import_ty, |mut caller, _params, _results| {
+        let ordinary = crate::ExternRef::new(&mut caller, 620_u32)?;
+        caller.gc(None)?;
+        assert_eq!(
+            *ordinary
+                .data(&caller)?
+                .unwrap()
+                .downcast_ref::<u32>()
+                .unwrap(),
+            620
+        );
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[collect.into()]).unwrap();
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "object")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        619
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "i31")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        41
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "operand-stack")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        623
+    );
+}
+
+#[test]
+fn transaction_externalized_results_decode_dynamically_and_typed() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (tfunc (export "make-object") (result (tref textern))
+                (textern.convert_tany (tstruct.new $s (i32.const 631))))
+              (tfunc (export "read-object") (param (tref textern)) (result i32)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tref.cast (tref $s)
+                      (tany.convert_textern (local.get 0))))))
+              (tfunc (export "make-i31") (result (tref textern))
+                (textern.convert_tany (tref.ti31 (i32.const 43))))
+              (tfunc (export "read-i31") (param (tref textern)) (result i32)
+                (ti31.get_s
+                  (tref.cast (tref ti31)
+                    (tany.convert_textern (local.get 0))))))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    let mut externalized = [crate::Val::I32(0)];
+    instance
+        .get_func(&mut store, "make-object")
+        .unwrap()
+        .call(&mut store, &[], &mut externalized)
+        .unwrap();
+    let mut value = [crate::Val::I32(0)];
+    instance
+        .get_func(&mut store, "read-object")
+        .unwrap()
+        .call(&mut store, &externalized, &mut value)
+        .unwrap();
+    assert_eq!(value[0].unwrap_i32(), 631);
+
+    let make_i31 = instance
+        .get_typed_func::<(), crate::TransactionExternRef>(&mut store, "make-i31")
+        .unwrap();
+    let read_i31 = instance
+        .get_typed_func::<crate::TransactionExternRef, i32>(&mut store, "read-i31")
+        .unwrap();
+    let externalized = make_i31.call(&mut store, ()).unwrap();
+    assert_eq!(read_i31.call(&mut store, externalized).unwrap(), 43);
+}
+
+#[test]
+fn transaction_exact_external_parameter_and_call_result_are_gc_roots() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (tfunc $collect (import "host" "collect"))
+              (tfunc $use (param texterntref) (result i32)
+                (tcall $collect)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tref.cast (tref $s)
+                      (tany.convert_textern (local.get 0))))))
+              (tfunc $make (result texterntref)
+                (textern.convert_tany (tstruct.new $s (i32.const 641))))
+              (tfunc (export "parameter") (result i32)
+                (tcall $use
+                  (textern.convert_tany (tstruct.new $s (i32.const 639)))))
+              (tfunc (export "result") (result i32)
+                (local $external texterntref)
+                (local.set $external (tcall $make))
+                (tcall $collect)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tref.cast (tref $s)
+                      (tany.convert_textern (local.get $external)))))))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let collect = crate::Func::new(&mut store, import_ty, |mut caller, _params, _results| {
+        let ordinary = crate::ExternRef::new(&mut caller, 640_u32)?;
+        caller.gc(None)?;
+        assert_eq!(
+            *ordinary
+                .data(&caller)?
+                .unwrap()
+                .downcast_ref::<u32>()
+                .unwrap(),
+            640
+        );
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[collect.into()]).unwrap();
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "parameter")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        639
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "result")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        641
+    );
+}
+
+#[test]
+fn transaction_externalized_global_snapshot_is_the_only_gc_root() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (tfunc $collect (import "host" "collect"))
+              (tglobal $external (mut texterntref) (tref.null textern))
+              (tfunc (export "run") (result i32)
+                (tglobal.set $external
+                  (textern.convert_tany (tstruct.new $s (i32.const 647))))
+                (tcall $collect)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tref.cast (tref $s)
+                      (tany.convert_textern (tglobal.get $external)))))))
+            "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, ());
+    let collect = crate::Func::new(&mut store, import_ty, |mut caller, _params, _results| {
+        caller.gc(None)?;
+        Ok(())
+    });
+    let instance = crate::Instance::new(&mut store, &module, &[collect.into()]).unwrap();
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "run")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        647
+    );
+}
+
+#[test]
+fn transaction_failed_object_to_i31_cast_does_not_coerce_numeric_field() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (type $cast-result (func (result (tref ti31))))
+              (tfunc (export "object") (result i32)
+                (local $any tanyref)
+                (local.set $any (tstruct.new $s (i32.const 29)))
+                (block $cast (type $cast-result)
+                  (br_on_tcast $cast tanyref (tref ti31)
+                    (local.get $any))
+                  (return (i32.const -1)))
+                (ti31.get_s))
+              (tfunc (export "i31") (result i32)
+                (local $any tanyref)
+                (local.set $any (tref.ti31 (i32.const 29)))
+                (block $cast (type $cast-result)
+                  (br_on_tcast $cast tanyref (tref ti31)
+                    (local.get $any))
+                  (return (i32.const -1)))
+                (ti31.get_s)))
+            "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "object")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        -1
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<(), i32>(&mut store, "i31")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        29
+    );
+}
+
+#[test]
 fn transaction_boundary_tstruct_result_feeds_next_native_operation_without_gc() {
     let mut config = crate::Config::new();
     config.wasm_gc(true);
@@ -31083,6 +31382,7 @@ fn transaction_external_identity_survives_local_select_block_and_real_gc() {
             .unwrap(),
         307
     );
+    assert_eq!(store.transaction_extern_root_count_for_test(), 0);
 }
 
 #[test]
@@ -31250,6 +31550,7 @@ fn typed_transaction_any_external_result_is_retained_across_real_gc() {
             .unwrap(),
         509
     );
+    assert_eq!(store.transaction_extern_root_count_for_test(), 0);
 }
 
 #[test]

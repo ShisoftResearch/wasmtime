@@ -132,6 +132,13 @@ pub(crate) fn translate_args<'a>(
     (a, b)
 }
 
+pub(crate) fn has_transaction_ref_signature(func: &Func, store: impl AsContext) -> bool {
+    let ty = func.ty(store);
+    ty.params()
+        .chain(ty.results())
+        .any(|ty| ty.as_ref().is_some_and(|ty| ty.is_transactional_ref()))
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasm_func_call(
     func: &mut wasm_func_t,
@@ -139,6 +146,11 @@ pub unsafe extern "C" fn wasm_func_call(
     results: *mut wasm_val_vec_t,
 ) -> *mut wasm_trap_t {
     let f = func.func();
+    if has_transaction_ref_signature(&f, func.ext.store.context()) {
+        return Box::into_raw(Box::new(wasm_trap_t::new(wasmtime::format_err!(
+            "transactional reference parameters and results are unsupported by the C API"
+        ))));
+    }
     let results = (*results).as_uninit_slice();
     let args = (*args).as_slice();
     let mut dst = Vec::new();
@@ -353,12 +365,7 @@ pub unsafe extern "C" fn wasmtime_func_call(
     nresults: usize,
     trap_ret: &mut *mut wasm_trap_t,
 ) -> Option<Box<wasmtime_error_t>> {
-    let ty = func.ty(&store);
-    if ty
-        .params()
-        .chain(ty.results())
-        .any(|ty| ty.as_ref().is_some_and(|ty| ty.is_transactional_ref()))
-    {
+    if has_transaction_ref_signature(func, &store) {
         return Some(Box::new(wasmtime_error_t::from(wasmtime::format_err!(
             "transactional reference parameters and results are unsupported by the C API"
         ))));

@@ -10,10 +10,10 @@ use std::{ptr, str};
 use wasmtime::{AsContextMut, Func, Instance, Result, StackCreator, StackMemory, Trap, Val};
 
 use crate::{
-    WASMTIME_I32, WasmtimeCaller, WasmtimeStoreContextMut, bad_utf8, handle_result, to_str,
-    translate_args, wasm_config_t, wasm_functype_t, wasm_trap_t, wasmtime_caller_t,
-    wasmtime_error_t, wasmtime_instance_pre_t, wasmtime_linker_t, wasmtime_module_t,
-    wasmtime_val_t, wasmtime_val_union,
+    WASMTIME_I32, WasmtimeCaller, WasmtimeStoreContextMut, bad_utf8, handle_result,
+    has_transaction_ref_signature, to_str, translate_args, wasm_config_t, wasm_functype_t,
+    wasm_trap_t, wasmtime_caller_t, wasmtime_error_t, wasmtime_instance_pre_t, wasmtime_linker_t,
+    wasmtime_module_t, wasmtime_val_t, wasmtime_val_union,
 };
 
 #[unsafe(no_mangle)]
@@ -256,6 +256,13 @@ pub unsafe extern "C" fn wasmtime_func_call_async<'a>(
     trap_ret: &'a mut *mut wasm_trap_t,
     err_ret: &'a mut *mut wasmtime_error_t,
 ) -> Box<wasmtime_call_future_t<'a>> {
+    if has_transaction_ref_signature(func, &store) {
+        *trap_ret = ptr::null_mut();
+        *err_ret = Box::into_raw(Box::new(wasmtime_error_t::from(wasmtime::format_err!(
+            "transactional reference parameters and results are unsupported by the C API"
+        ))));
+        return Box::new(wasmtime_call_future_t::new(Box::pin(async {})));
+    }
     let _ = &mut store;
     #[cfg(feature = "gc")]
     let mut store = wasmtime::RootScope::new(store);

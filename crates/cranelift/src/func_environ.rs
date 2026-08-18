@@ -2646,12 +2646,12 @@ impl FuncEnvironment<'_> {
             return false;
         }
 
-        self.wasm_func_ty.params()[index - 2].is_vmgcref_type_and_not_i31()
+        self.val_ty_needs_stack_map(self.wasm_func_ty.params()[index - 2])
     }
 
     pub fn sig_ref_result_needs_stack_map(&self, sig_ref: ir::SigRef, index: usize) -> bool {
         let wasm_func_ty = self.sig_ref_to_ty[sig_ref].as_ref().unwrap();
-        wasm_func_ty.results()[index].is_vmgcref_type_and_not_i31()
+        self.val_ty_needs_stack_map(wasm_func_ty.results()[index])
     }
 
     pub fn translate_table_grow(
@@ -5413,18 +5413,61 @@ impl FuncEnvironment<'_> {
         Ok(())
     }
 
-    pub fn translate_transaction_helper_i31_for_ref(
+    pub fn translate_transaction_textern_convert_tany(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        gc_ref: ir::Value,
+        raw_ref: ir::Value,
     ) -> WasmResult<ir::Value> {
-        let callee = self.builtin_functions.load_builtin(
-            builder.func,
-            BuiltinFunctionIndex::transaction_helper_i31_for_ref(),
-        );
+        self.translate_transaction_ref_conversion(
+            builder,
+            raw_ref,
+            BuiltinFunctionIndex::transaction_textern_convert_tany(),
+        )
+    }
+
+    pub fn translate_transaction_tany_convert_textern(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        raw_ref: ir::Value,
+    ) -> WasmResult<ir::Value> {
+        self.translate_transaction_ref_conversion(
+            builder,
+            raw_ref,
+            BuiltinFunctionIndex::transaction_tany_convert_textern(),
+        )
+    }
+
+    fn translate_transaction_ref_conversion(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        raw_ref: ir::Value,
+        builtin: BuiltinFunctionIndex,
+    ) -> WasmResult<ir::Value> {
+        let null = builder.ins().icmp_imm_u(IntCC::Equal, raw_ref, 0);
+        let null_block = builder.create_block();
+        let convert_block = builder.create_block();
+        let continuation = builder.create_block();
+        builder.append_block_param(continuation, ir::types::I32);
+        builder
+            .ins()
+            .brif(null, null_block, &[], convert_block, &[]);
+
+        builder.switch_to_block(null_block);
+        builder.ins().jump(continuation, &[raw_ref.into()]);
+        builder.seal_block(null_block);
+
+        builder.switch_to_block(convert_block);
+        let callee = self.builtin_functions.load_builtin(builder.func, builtin);
         let vmctx = self.vmctx_val(&mut builder.cursor());
-        let call = builder.ins().call(callee, &[vmctx, gc_ref]);
-        Ok(builder.func.dfg.inst_results(call)[0])
+        let call = builder.ins().call(callee, &[vmctx, raw_ref]);
+        let raw = builder.func.dfg.inst_results(call)[0];
+        let raw = builder.ins().ireduce(ir::types::I32, raw);
+        builder.ins().jump(continuation, &[raw.into()]);
+        builder.seal_block(convert_block);
+
+        builder.switch_to_block(continuation);
+        builder.seal_block(continuation);
+        Ok(builder.block_params(continuation)[0])
     }
 
     fn translate_transaction_enter_tfunc(
@@ -8383,15 +8426,17 @@ impl FuncEnvironment<'_> {
             let WasmValType::Ref(ref_ty) = ty else {
                 continue;
             };
-            if !ref_ty.is_transactional_ref()
-                || !matches!(ref_ty.heap_type.top(), WasmHeapTopType::Any)
-            {
+            if !ref_ty.is_transactional_ref() {
                 continue;
             }
-            let callee = self.builtin_functions.load_builtin(
-                builder.func,
-                BuiltinFunctionIndex::transaction_preserve_tref_result(),
-            );
+            let builtin = match ref_ty.heap_type.top() {
+                WasmHeapTopType::Any => BuiltinFunctionIndex::transaction_preserve_tref_result(),
+                WasmHeapTopType::Extern => {
+                    BuiltinFunctionIndex::transaction_preserve_textern_result()
+                }
+                WasmHeapTopType::Func | WasmHeapTopType::Exn | WasmHeapTopType::Cont => continue,
+            };
+            let callee = self.builtin_functions.load_builtin(builder.func, builtin);
             let vmctx = self.vmctx_val(&mut builder.cursor());
             builder.ins().call(callee, &[vmctx, *result]);
         }

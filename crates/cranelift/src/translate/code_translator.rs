@@ -3978,26 +3978,6 @@ pub fn translate_operator(
             // The next Wasm instruction is executed when the cast failed and we
             // did not branch away.
             builder.switch_to_block(cast_fails_block);
-
-            if to_ref_type.heap_type == WasmHeapType::I31 {
-                let helper_i31 = environ.translate_transaction_helper_i31_for_ref(builder, r)?;
-                let helper_succeeded = builder.ins().icmp_imm_s(IntCC::NotEqual, helper_i31, 0);
-                let helper_fails_block = builder.create_block();
-                let mut helper_inputs = inputs;
-                if let Some(input) = helper_inputs.last_mut() {
-                    *input = helper_i31;
-                }
-                canonicalise_brif(
-                    builder,
-                    helper_succeeded,
-                    cast_succeeds_block,
-                    &helper_inputs,
-                    helper_fails_block,
-                    &[],
-                );
-                builder.seal_block(helper_fails_block);
-                builder.switch_to_block(helper_fails_block);
-            }
         }
         Operator::BrOnCastFail {
             relative_depth,
@@ -4039,13 +4019,23 @@ pub fn translate_operator(
             builder.switch_to_block(cast_succeeds_block);
         }
 
-        Operator::AnyConvertExtern | Operator::TAnyConvertTExtern => {
+        Operator::AnyConvertExtern => {
             // Pop an `externref`, push an `anyref`. But they have the same
             // representation, so we don't actually need to do anything.
         }
-        Operator::ExternConvertAny | Operator::TExternConvertTAny => {
+        Operator::ExternConvertAny => {
             // Pop an `anyref`, push an `externref`. But they have the same
             // representation, so we don't actually need to do anything.
+        }
+        Operator::TAnyConvertTExtern => {
+            let raw_ref = environ.stacks.pop1();
+            let converted = environ.translate_transaction_tany_convert_textern(builder, raw_ref)?;
+            environ.stacks.push1(converted);
+        }
+        Operator::TExternConvertTAny => {
+            let raw_ref = environ.stacks.pop1();
+            let converted = environ.translate_transaction_textern_convert_tany(builder, raw_ref)?;
+            environ.stacks.push1(converted);
         }
 
         Operator::ContNew { cont_type_index } => {

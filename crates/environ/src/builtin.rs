@@ -201,6 +201,12 @@ macro_rules! foreach_builtin_function {
             transaction_commit(vmctx: vmctx) -> bool;
             // Promotes a transactional object result before an owning tfunc commits.
             transaction_preserve_tref_result(vmctx: vmctx, raw_ref: u32) -> bool;
+            // Promotes the native identity carried by an externalized transactional result.
+            transaction_preserve_textern_result(vmctx: vmctx, raw_ref: u32) -> bool;
+            // Wraps a native transaction-any identity as an exact transactional externref.
+            transaction_textern_convert_tany(vmctx: vmctx, raw_ref: u32) -> u64;
+            // Restores a transaction-any identity from an exact transactional externref.
+            transaction_tany_convert_textern(vmctx: vmctx, raw_ref: u32) -> u64;
             // Commits an owning structured transaction, returning one for a
             // transaction conflict that must enter the owner's handler and
             // zero for success. Other failures trap.
@@ -213,8 +219,6 @@ macro_rules! foreach_builtin_function {
             transaction_failure_pending(vmctx: vmctx) -> u32;
             // Returns the pending structured transactional failure code.
             transaction_failure_code(vmctx: vmctx) -> u32;
-            // Compatibility helper for generated transaction fixtures that route scalar payloads through ti31.
-            transaction_helper_i31_for_ref(vmctx: vmctx, gc_ref: u32) -> u32;
             // Tests a transaction object ref handle against a reference type.
             // Returns u32::MAX if the raw ref is not a transaction handle.
             transaction_tref_test(vmctx: vmctx, raw_ref: u32, test_kind: u32, nullable: u32, expected_engine_type: u32) -> u32;
@@ -525,6 +529,8 @@ impl BuiltinFunctionIndex {
             (@get transaction_transfer_tfunc_ownership bool) => (TrapSentinel::Falsy);
             (@get transaction_start_tfunc_tail bool) => (TrapSentinel::Falsy);
             (@get transaction_claim_tfunc_tail u64) => (TrapSentinel::NegativeOne);
+            (@get transaction_textern_convert_tany u64) => (TrapSentinel::NegativeOne);
+            (@get transaction_tany_convert_textern u64) => (TrapSentinel::NegativeOne);
             (@get transaction_tglobal_get pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_load pointer) => (TrapSentinel::NegativeOne);
             (@get transaction_tmemory_store pointer) => (TrapSentinel::NegativeOne);
@@ -537,7 +543,6 @@ impl BuiltinFunctionIndex {
             (@get transaction_failure_pending u32) => (return None);
             (@get transaction_failure_code u32) => (return None);
             (@get transaction_active u32) => (return None);
-            (@get transaction_helper_i31_for_ref u32) => (return None);
             (@get transaction_tref_test u32) => (return None);
 
             // These libcalls can't trap

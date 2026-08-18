@@ -106,6 +106,8 @@ use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
 #[cfg(feature = "transaction")]
 use crate::{ExternRef, OwnedRooted, Rooted};
 use crate::{Global, Instance, Table};
+#[cfg(feature = "transaction")]
+use alloc::collections::BTreeMap;
 use core::convert::Infallible;
 use core::fmt;
 #[cfg(any(feature = "async", feature = "gc"))]
@@ -496,7 +498,13 @@ pub struct StoreOpaque {
     transaction_region_runtime: TransactionRegionRuntime,
     transaction_durable_refs: DurableReferenceRegistry,
     #[cfg(feature = "transaction")]
-    transaction_live_extern_roots: Vec<OwnedRooted<ExternRef>>,
+    transaction_extern_roots_by_handle: BTreeMap<u32, OwnedRooted<ExternRef>>,
+    #[cfg(feature = "transaction")]
+    transaction_extern_handles_by_raw: BTreeMap<u32, u32>,
+    #[cfg(feature = "transaction")]
+    transaction_extern_scope_depth: u32,
+    #[cfg(feature = "transaction")]
+    next_transaction_extern_handle: u32,
     // GC-related fields.
     gc_store: Option<GcStore>,
     gc_roots: RootSet,
@@ -796,7 +804,13 @@ impl<T> Store<T> {
             transaction_region_runtime: TransactionRegionRuntime::default(),
             transaction_durable_refs: DurableReferenceRegistry::default(),
             #[cfg(feature = "transaction")]
-            transaction_live_extern_roots: Vec::new(),
+            transaction_extern_roots_by_handle: BTreeMap::new(),
+            #[cfg(feature = "transaction")]
+            transaction_extern_handles_by_raw: BTreeMap::new(),
+            #[cfg(feature = "transaction")]
+            transaction_extern_scope_depth: 0,
+            #[cfg(feature = "transaction")]
+            next_transaction_extern_handle: 2,
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
             memory_count: 0,
@@ -905,6 +919,11 @@ impl<T> Store<T> {
         &mut self,
     ) -> (&mut TransactionState, &mut ObjectTable) {
         self.inner.transaction_state_and_object_table_mut()
+    }
+
+    #[cfg(all(feature = "transaction", test))]
+    pub(crate) fn transaction_extern_root_count_for_test(&self) -> usize {
+        self.inner.transaction_extern_root_count_for_test()
     }
 
     #[cfg(feature = "transaction")]
@@ -1999,13 +2018,82 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_retain_extern_ref(
+    pub(crate) fn transaction_enter_extern_scope(&mut self) {
+        self.transaction_extern_scope_depth = self
+            .transaction_extern_scope_depth
+            .checked_add(1)
+            .expect("transaction external-reference scope depth overflow");
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_exit_extern_scope(&mut self) {
+        self.transaction_extern_scope_depth = self
+            .transaction_extern_scope_depth
+            .checked_sub(1)
+            .expect("unbalanced transaction external-reference scope");
+        if self.transaction_extern_scope_depth == 0 {
+            self.transaction_extern_roots_by_handle.clear();
+            self.transaction_extern_handles_by_raw.clear();
+        }
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_extern_handle(
         &mut self,
         reference: Rooted<ExternRef>,
-    ) -> Result<()> {
+    ) -> Result<u32> {
+        let raw = {
+            let mut no_gc = AutoAssertNoGc::new(self);
+            reference._to_raw(&mut no_gc)?
+        };
+        if let Some(handle) = self.transaction_extern_handles_by_raw.get(&raw).copied() {
+            return Ok(handle);
+        }
+
+        ensure!(
+            self.transaction_extern_scope_depth != 0,
+            "transactional external reference escaped its call scope"
+        );
         let owned = reference._to_owned_rooted(self)?;
-        self.transaction_live_extern_roots.push(owned);
-        Ok(())
+        let start = self.next_transaction_extern_handle;
+        let handle = loop {
+            let candidate = self.next_transaction_extern_handle;
+            self.next_transaction_extern_handle = match candidate.checked_add(2) {
+                Some(next) if next < 0x8000_0000 => next,
+                _ => 2,
+            };
+            if !self
+                .transaction_extern_roots_by_handle
+                .contains_key(&candidate)
+            {
+                break candidate;
+            }
+            ensure!(
+                self.next_transaction_extern_handle != start,
+                "transactional external reference handle space exhausted"
+            );
+        };
+        self.transaction_extern_roots_by_handle
+            .insert(handle, owned);
+        self.transaction_extern_handles_by_raw.insert(raw, handle);
+        Ok(handle)
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_extern_for_handle(
+        &mut self,
+        handle: u32,
+    ) -> Option<Rooted<ExternRef>> {
+        let owned = self
+            .transaction_extern_roots_by_handle
+            .get(&handle)?
+            .clone();
+        Some(owned._to_rooted(self))
+    }
+
+    #[cfg(all(feature = "transaction", test))]
+    pub(crate) fn transaction_extern_root_count_for_test(&self) -> usize {
+        self.transaction_extern_roots_by_handle.len()
     }
 
     pub(crate) fn transaction_durable_refs_state_and_object_table_mut(

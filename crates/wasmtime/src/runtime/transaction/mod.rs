@@ -116,6 +116,8 @@ pub(crate) type PersistentMarkSweepReport = object_gc::PersistentMarkSweepReport
 pub(crate) type PersistentVolatileSweepReport = object_gc::PersistentVolatileSweepReport;
 #[cfg(feature = "gc")]
 pub(crate) use durable_ref::DurableExternRefHostData;
+#[cfg(all(feature = "gc", feature = "transaction"))]
+pub(crate) use durable_ref::TransactionExternalizedRefHostData;
 pub(crate) use durable_ref::{
     DurableExternIdentity, DurableFuncIdentity, DurableReferenceRegistry,
 };

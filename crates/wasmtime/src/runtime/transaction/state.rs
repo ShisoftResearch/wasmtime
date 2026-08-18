@@ -575,10 +575,14 @@ pub(crate) enum GlobalSnapshot {
     F32(u32),
     F64(u64),
     V128([u8; 16]),
-    /// SHISOFT-TWASM-MOCK: live reference snapshots still use raw Wasmtime
-    /// reference words at some helper boundaries. Durable object/root records
-    /// use `ObjectId`; final live `tref` lowering must remove this bridge.
     GcRef(u32),
+    /// A GC-managed exact `textern` wrapper and the native transactional
+    /// identity it externalizes. The wrapper is stored in the live global;
+    /// the inner identity supplies durable object-root reachability.
+    ExternalizedRef {
+        wrapper: u32,
+        inner: u32,
+    },
     FuncRef(usize),
 }
 
@@ -3500,7 +3504,8 @@ impl TransactionState {
             };
             let roots = delta.roots.entry(root_key).or_default();
             let root = match value {
-                GlobalSnapshot::GcRef(gc_ref) => self
+                GlobalSnapshot::GcRef(gc_ref)
+                | GlobalSnapshot::ExternalizedRef { inner: gc_ref, .. } => self
                     .persistent_object_id_for_live_bridge_after_completed_promotion(
                         object_table,
                         gc_ref,
@@ -3629,7 +3634,8 @@ impl TransactionState {
             || !publications.is_empty();
         for &value in self.staged_globals.values() {
             let root = match value {
-                GlobalSnapshot::GcRef(gc_ref) => self
+                GlobalSnapshot::GcRef(gc_ref)
+                | GlobalSnapshot::ExternalizedRef { inner: gc_ref, .. } => self
                     .persistent_object_id_for_live_bridge_after_completed_promotion(
                         object_table,
                         gc_ref,

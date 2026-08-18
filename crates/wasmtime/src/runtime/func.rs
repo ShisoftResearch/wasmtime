@@ -1180,42 +1180,51 @@ impl Func {
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        // Store the argument values into `values_vec`.
-        let ty = self.load_ty(store.0);
-        let values_vec_size = params.len().max(ty.results().len());
-        let mut values_vec = store.0.take_wasm_val_raw_storage();
-        debug_assert!(values_vec.is_empty());
-        values_vec.resize_with(values_vec_size, || ValRaw::v128(0))?;
-        for ((arg, slot), ty) in params.iter().cloned().zip(&mut values_vec).zip(ty.params()) {
-            #[cfg(feature = "transaction")]
-            if let Some(transaction_ref) = arg.transaction_ref_to_raw(store.0, &ty)? {
-                *slot = transaction_ref;
-                continue;
+        #[cfg(feature = "transaction")]
+        store.0.transaction_enter_extern_scope();
+        let result = (|| {
+            // Store the argument values into `values_vec`.
+            let ty = self.load_ty(store.0);
+            let values_vec_size = params.len().max(ty.results().len());
+            let mut values_vec = store.0.take_wasm_val_raw_storage();
+            debug_assert!(values_vec.is_empty());
+            values_vec.resize_with(values_vec_size, || ValRaw::v128(0))?;
+            for ((arg, slot), ty) in params.iter().cloned().zip(&mut values_vec).zip(ty.params()) {
+                #[cfg(not(feature = "transaction"))]
+                let _ = ty;
+                #[cfg(feature = "transaction")]
+                if let Some(transaction_ref) = arg.transaction_ref_to_raw(store.0, &ty)? {
+                    *slot = transaction_ref;
+                    continue;
+                }
+                *slot = arg.to_raw(&mut *store)?;
             }
-            *slot = arg.to_raw(&mut *store)?;
-        }
 
-        unsafe {
-            self.call_unchecked(
-                &mut *store,
-                core::ptr::slice_from_raw_parts_mut(values_vec.as_mut_ptr(), values_vec_size),
-            )?;
-        }
-
-        for ((i, slot), val) in results.iter_mut().enumerate().zip(&values_vec) {
-            let ty = ty.results().nth(i).unwrap();
-            #[cfg(feature = "transaction")]
-            if let Some(transaction_ref) =
-                unsafe { Val::transaction_ref_from_raw(store.0, *val, &ty) }
-            {
-                *slot = transaction_ref;
-                continue;
+            unsafe {
+                self.call_unchecked(
+                    &mut *store,
+                    core::ptr::slice_from_raw_parts_mut(values_vec.as_mut_ptr(), values_vec_size),
+                )?;
             }
-            *slot = unsafe { Val::from_raw(&mut *store, *val, ty) };
-        }
-        values_vec.truncate(0);
-        store.0.save_wasm_val_raw_storage(values_vec);
-        Ok(())
+
+            for ((i, slot), val) in results.iter_mut().enumerate().zip(&values_vec) {
+                let ty = ty.results().nth(i).unwrap();
+                #[cfg(feature = "transaction")]
+                if let Some(transaction_ref) =
+                    unsafe { Val::transaction_ref_from_raw(store.0, *val, &ty) }
+                {
+                    *slot = transaction_ref;
+                    continue;
+                }
+                *slot = unsafe { Val::from_raw(&mut *store, *val, ty) };
+            }
+            values_vec.truncate(0);
+            store.0.save_wasm_val_raw_storage(values_vec);
+            Ok(())
+        })();
+        #[cfg(feature = "transaction")]
+        store.0.transaction_exit_extern_scope();
+        result
     }
 
     #[inline]
