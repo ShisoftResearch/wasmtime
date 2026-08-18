@@ -298,7 +298,7 @@ impl MemoryPool {
 
     /// Validate whether this memory pool supports the given module.
     pub fn validate_memories(&self, module: &Module) -> Result<()> {
-        let memories = module.num_defined_memories();
+        let memories = module.num_runtime_defined_memories();
         if memories > self.memories_per_instance {
             bail!(
                 "defined memories count of {} exceeds the per-instance limit of {}",
@@ -311,6 +311,14 @@ impl MemoryPool {
             self.validate_memory(memory).with_context(|| {
                 format!(
                     "memory index {} is unsupported in this pooling allocator configuration",
+                    i.as_u32()
+                )
+            })?;
+        }
+        for (i, memory) in module.tmemories.iter().skip(module.num_imported_tmemories) {
+            self.validate_memory(memory).with_context(|| {
+                format!(
+                    "transactional memory index {} is unsupported in this pooling allocator configuration",
                     i.as_u32()
                 )
             })?;

@@ -4,8 +4,8 @@ use crate::component::*;
 use crate::prelude::*;
 use crate::{
     EngineOrModuleTypeIndex, EntityIndex, FuncKey, ModuleEnvironment, ModuleInternedTypeIndex,
-    ModuleTranslation, ModuleTypesBuilder, PrimaryMap, ScopeVec, TagIndex, Tunables, TypeConvert,
-    WasmHeapType, WasmResult, WasmValType,
+    ModuleTranslation, ModuleTypesBuilder, PrimaryMap, ScopeVec, TGlobalIndex, TMemoryIndex,
+    TTableIndex, TagIndex, Tunables, TypeConvert, WasmHeapType, WasmResult, WasmValType,
 };
 use core::str::FromStr;
 use cranelift_entity::SecondaryMap;
@@ -1415,13 +1415,22 @@ impl<'a, 'data> Translator<'a, 'data> {
                     let index = TableIndex::from_u32(export.index);
                     EntityIndex::Table(index)
                 }
+                wasmparser::ExternalKind::TTable => {
+                    EntityIndex::TTable(TTableIndex::from_u32(export.index))
+                }
                 wasmparser::ExternalKind::Memory => {
                     let index = MemoryIndex::from_u32(export.index);
                     EntityIndex::Memory(index)
                 }
+                wasmparser::ExternalKind::TMemory => {
+                    EntityIndex::TMemory(TMemoryIndex::from_u32(export.index))
+                }
                 wasmparser::ExternalKind::Global => {
                     let index = GlobalIndex::from_u32(export.index);
                     EntityIndex::Global(index)
+                }
+                wasmparser::ExternalKind::TGlobal => {
+                    EntityIndex::TGlobal(TGlobalIndex::from_u32(export.index))
                 }
                 wasmparser::ExternalKind::Tag => {
                     let index = TagIndex::from_u32(export.index);
@@ -1511,6 +1520,11 @@ impl<'a, 'data> Translator<'a, 'data> {
             wasmparser::ExternalKind::Table => LocalInitializer::AliasExportTable(instance, name),
             wasmparser::ExternalKind::Global => LocalInitializer::AliasExportGlobal(instance, name),
             wasmparser::ExternalKind::Tag => LocalInitializer::AliasExportTag(instance, name),
+            wasmparser::ExternalKind::TTable
+            | wasmparser::ExternalKind::TMemory
+            | wasmparser::ExternalKind::TGlobal => {
+                panic!("transactional core aliases in components are not implemented")
+            }
         }
     }
 

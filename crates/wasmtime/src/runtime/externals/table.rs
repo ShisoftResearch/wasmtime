@@ -515,8 +515,18 @@ impl Table {
 
     pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Table {
         let module = store[self.instance].env_module();
+        if let Some(index) = module.defined_ttable_index_from_runtime(self.index) {
+            return &module.ttables[module.ttable_index(index)];
+        }
         let index = module.table_index(self.index);
         &module.tables[index]
+    }
+
+    pub(crate) fn is_transactional(&self, store: &StoreOpaque) -> bool {
+        let module = store[self.instance].env_module();
+        module
+            .defined_ttable_index_from_runtime(self.index)
+            .is_some()
     }
 
     pub(crate) fn vmimport(&self, store: &StoreOpaque) -> vm::VMTableImport {

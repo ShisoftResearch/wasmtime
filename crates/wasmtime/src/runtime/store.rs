@@ -639,13 +639,7 @@ pub(crate) enum ExecutorRef<'a> {
 }
 
 fn count_defined_tmemories(module: &wasmtime_environ::Module) -> usize {
-    module
-        .transaction_objects
-        .memories
-        .iter()
-        .copied()
-        .filter(|memory_index| module.defined_memory_index(*memory_index).is_some())
-        .count()
+    module.num_defined_tmemories()
 }
 
 /// An RAII type to automatically mark a region of code as unsafe for GC.
@@ -1761,8 +1755,8 @@ impl StoreOpaque {
         }
 
         let module = module.env_module();
-        let memories = module.num_defined_memories();
-        let tables = module.num_defined_tables();
+        let memories = module.num_runtime_defined_memories();
+        let tables = module.num_runtime_defined_tables();
 
         bump(&mut self.instance_count, self.instance_limit, 1, "instance")?;
         bump(
@@ -2392,7 +2386,7 @@ impl StoreOpaque {
         // dummy instances) and getting each of their defined memories.
         for id in self.instances.keys() {
             let instance = StoreInstanceId::new(self.id(), id);
-            for table in 0..self.instance(id).env_module().num_defined_tables() {
+            for table in 0..self.instance(id).env_module().num_runtime_defined_tables() {
                 let table = DefinedTableIndex::new(table);
                 f(self, Table::from_raw(instance, table));
             }
@@ -2409,7 +2403,7 @@ impl StoreOpaque {
 
         // Then enumerate all instances' defined globals.
         for id in self.instances.keys() {
-            for index in 0..self.instance(id).env_module().num_defined_globals() {
+            for index in 0..self.instance(id).env_module().num_runtime_defined_globals() {
                 let index = DefinedGlobalIndex::new(index);
                 let global = Global::new_instance(self, id, index);
                 f(self, global);

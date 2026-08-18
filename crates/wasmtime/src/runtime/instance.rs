@@ -15,7 +15,8 @@ use crate::{
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use wasmtime_environ::{
-    EntityIndex, EntityType, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeTrace,
+    EntityIndex, EntityType, FuncIndex, GlobalIndex, MemoryIndex, TGlobalIndex, TMemoryIndex,
+    TTableIndex, TableIndex, TagIndex, TypeTrace,
 };
 
 /// An instantiated WebAssembly module.
@@ -239,8 +240,8 @@ impl Instance {
         funcrefs.fill(modules);
 
         let mut owned_imports = OwnedImports::new(module)?;
-        for import in imports {
-            owned_imports.push(import, store)?;
+        for ((_, _, expected), import) in module.compiled_module().module().imports().zip(imports) {
+            owned_imports.push(import, expected, store)?;
         }
         Ok(owned_imports)
     }
@@ -625,7 +626,7 @@ impl Instance {
     pub(crate) fn all_globals<'a>(
         &'a self,
         store: &'a mut StoreOpaque,
-    ) -> impl ExactSizeIterator<Item = (GlobalIndex, Global)> + 'a {
+    ) -> impl Iterator<Item = (EntityIndex, Global)> + 'a {
         let store_id = store.id();
         store[self.id].all_globals(store_id)
     }
@@ -641,7 +642,7 @@ impl Instance {
     pub(crate) fn all_memories<'a>(
         &'a self,
         store: &'a StoreOpaque,
-    ) -> impl ExactSizeIterator<Item = (MemoryIndex, vm::ExportMemory)> + 'a {
+    ) -> impl Iterator<Item = (EntityIndex, vm::ExportMemory)> + 'a {
         let store_id = store.id();
         store[self.id].all_memories(store_id)
     }
@@ -650,8 +651,11 @@ impl Instance {
 pub(crate) struct OwnedImports {
     functions: TryPrimaryMap<FuncIndex, VMFunctionImport>,
     tables: TryPrimaryMap<TableIndex, VMTableImport>,
+    ttables: TryPrimaryMap<TTableIndex, VMTableImport>,
     memories: TryPrimaryMap<MemoryIndex, VMMemoryImport>,
+    tmemories: TryPrimaryMap<TMemoryIndex, VMMemoryImport>,
     globals: TryPrimaryMap<GlobalIndex, VMGlobalImport>,
+    tglobals: TryPrimaryMap<TGlobalIndex, VMGlobalImport>,
     tags: TryPrimaryMap<TagIndex, VMTagImport>,
 }
 
@@ -666,8 +670,11 @@ impl OwnedImports {
         OwnedImports {
             functions: TryPrimaryMap::new(),
             tables: TryPrimaryMap::new(),
+            ttables: TryPrimaryMap::new(),
             memories: TryPrimaryMap::new(),
+            tmemories: TryPrimaryMap::new(),
             globals: TryPrimaryMap::new(),
+            tglobals: TryPrimaryMap::new(),
             tags: TryPrimaryMap::new(),
         }
     }
@@ -676,8 +683,11 @@ impl OwnedImports {
         let raw = module.compiled_module().module();
         self.functions.reserve(raw.num_imported_funcs)?;
         self.tables.reserve(raw.num_imported_tables)?;
+        self.ttables.reserve(raw.num_imported_ttables)?;
         self.memories.reserve(raw.num_imported_memories)?;
+        self.tmemories.reserve(raw.num_imported_tmemories)?;
         self.globals.reserve(raw.num_imported_globals)?;
+        self.tglobals.reserve(raw.num_imported_tglobals)?;
         self.tags.reserve(raw.num_imported_tags)?;
         Ok(())
     }
@@ -686,31 +696,52 @@ impl OwnedImports {
     pub(crate) fn clear(&mut self) {
         self.functions.clear();
         self.tables.clear();
+        self.ttables.clear();
         self.memories.clear();
+        self.tmemories.clear();
         self.globals.clear();
+        self.tglobals.clear();
         self.tags.clear();
     }
 
-    fn push(&mut self, item: &Extern, store: &mut StoreOpaque) -> Result<(), OutOfMemory> {
-        match item {
-            Extern::Func(i) => {
+    fn push(
+        &mut self,
+        item: &Extern,
+        expected: EntityType,
+        store: &mut StoreOpaque,
+    ) -> Result<(), OutOfMemory> {
+        match (item, expected) {
+            (Extern::Func(i), EntityType::Function(_)) => {
                 self.functions.push(i.vmimport(store))?;
             }
-            Extern::Global(i) => {
+            (Extern::Global(i), EntityType::Global(_)) => {
                 self.globals.push(i.vmimport(store))?;
             }
-            Extern::Table(i) => {
+            (Extern::Global(i), EntityType::TGlobal(_)) => {
+                self.tglobals.push(i.vmimport(store))?;
+            }
+            (Extern::Table(i), EntityType::Table(_)) => {
                 self.tables.push(i.vmimport(store))?;
             }
-            Extern::Memory(i) => {
+            (Extern::Table(i), EntityType::TTable(_)) => {
+                self.ttables.push(i.vmimport(store))?;
+            }
+            (Extern::Memory(i), EntityType::Memory(_)) => {
                 self.memories.push(i.vmimport(store))?;
             }
-            Extern::SharedMemory(i) => {
+            (Extern::Memory(i), EntityType::TMemory(_)) => {
+                self.tmemories.push(i.vmimport(store))?;
+            }
+            (Extern::SharedMemory(i), EntityType::Memory(_)) => {
                 self.memories.push(i.vmimport(store))?;
             }
-            Extern::Tag(i) => {
+            (Extern::SharedMemory(i), EntityType::TMemory(_)) => {
+                self.tmemories.push(i.vmimport(store))?;
+            }
+            (Extern::Tag(i), EntityType::Tag(_)) => {
                 self.tags.push(i.vmimport(store))?;
             }
+            _ => unreachable!("imports were typechecked before constructing VM imports"),
         }
         Ok(())
     }
@@ -722,26 +753,40 @@ impl OwnedImports {
         &mut self,
         store: &StoreOpaque,
         item: &crate::runtime::vm::Export,
+        expected: EntityType,
     ) -> Result<(), OutOfMemory> {
-        match item {
-            crate::runtime::vm::Export::Function(f) => {
+        match (item, expected) {
+            (crate::runtime::vm::Export::Function(f), EntityType::Function(_)) => {
                 self.functions.push(f.vmimport(store))?;
             }
-            crate::runtime::vm::Export::Global(g) => {
+            (crate::runtime::vm::Export::Global(g), EntityType::Global(_)) => {
                 self.globals.push(g.vmimport(store))?;
             }
-            crate::runtime::vm::Export::Table(t) => {
+            (crate::runtime::vm::Export::Global(g), EntityType::TGlobal(_)) => {
+                self.tglobals.push(g.vmimport(store))?;
+            }
+            (crate::runtime::vm::Export::Table(t), EntityType::Table(_)) => {
                 self.tables.push(t.vmimport(store))?;
             }
-            crate::runtime::vm::Export::Memory(m) => {
+            (crate::runtime::vm::Export::Table(t), EntityType::TTable(_)) => {
+                self.ttables.push(t.vmimport(store))?;
+            }
+            (crate::runtime::vm::Export::Memory(m), EntityType::Memory(_)) => {
                 self.memories.push(m.vmimport(store))?;
             }
-            crate::runtime::vm::Export::SharedMemory(_, vmimport) => {
+            (crate::runtime::vm::Export::Memory(m), EntityType::TMemory(_)) => {
+                self.tmemories.push(m.vmimport(store))?;
+            }
+            (crate::runtime::vm::Export::SharedMemory(_, vmimport), EntityType::Memory(_)) => {
                 self.memories.push(*vmimport)?;
             }
-            crate::runtime::vm::Export::Tag(t) => {
+            (crate::runtime::vm::Export::SharedMemory(_, vmimport), EntityType::TMemory(_)) => {
+                self.tmemories.push(*vmimport)?;
+            }
+            (crate::runtime::vm::Export::Tag(t), EntityType::Tag(_)) => {
                 self.tags.push(t.vmimport(store))?;
             }
+            _ => unreachable!("component core imports were validated before VM import creation"),
         }
         Ok(())
     }
@@ -749,8 +794,11 @@ impl OwnedImports {
     pub(crate) fn as_ref(&self) -> Imports<'_> {
         Imports {
             tables: self.tables.values().as_slice(),
+            ttables: self.ttables.values().as_slice(),
             globals: self.globals.values().as_slice(),
+            tglobals: self.tglobals.values().as_slice(),
             memories: self.memories.values().as_slice(),
+            tmemories: self.tmemories.values().as_slice(),
             functions: self.functions.values().as_slice(),
             tags: self.tags.values().as_slice(),
         }
@@ -993,6 +1041,7 @@ fn pre_instantiate_raw(
 
     let mut func_refs = func_refs.iter().map(|f| NonNull::from(f));
     let mut imports = OwnedImports::new(module)?;
+    let mut expected_imports = module.compiled_module().module().imports();
     for import in items.iter() {
         if !import.comes_from_same_store(store) {
             bail!("cross-`Store` instantiation is not currently supported");
@@ -1015,7 +1064,8 @@ fn pre_instantiate_raw(
                 .into()
             },
         };
-        imports.push(&item, store)?;
+        let (_, _, expected) = expected_imports.next().unwrap();
+        imports.push(&item, expected, store)?;
     }
 
     Ok(imports)

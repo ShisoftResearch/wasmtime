@@ -363,6 +363,9 @@ impl Global {
             VMGlobalKind::Instance(index) => {
                 let instance = InstanceId::from_u32(self.instance);
                 let module = store.instance(instance).env_module();
+                if let Some(index) = module.defined_tglobal_index_from_runtime(index) {
+                    return &module.tglobals[module.tglobal_index(index)];
+                }
                 let index = module.global_index(index);
                 &module.globals[index]
             }
@@ -376,6 +379,19 @@ impl Global {
                 &TY
             }
         }
+    }
+
+    pub(crate) fn is_transactional(&self, store: &StoreOpaque) -> bool {
+        self.store.assert_belongs_to(store.id());
+        let VMGlobalKind::Instance(index) = self.kind else {
+            return false;
+        };
+        let instance = InstanceId::from_u32(self.instance);
+        store
+            .instance(instance)
+            .env_module()
+            .defined_tglobal_index_from_runtime(index)
+            .is_some()
     }
 
     pub(crate) fn vmimport(&self, store: &StoreOpaque) -> vm::VMGlobalImport {

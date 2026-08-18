@@ -1,7 +1,7 @@
-use wasmparser::{BinaryReader, Parser, Payload};
+use wasmparser::{EntityNamespace, Parser, Payload, TypeRef};
 use wasmtime_transaction_tools::{RewriteReport, rewrite_module};
 
-const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
+const OBSOLETE_TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 
 #[derive(Debug, Default, Eq, PartialEq)]
 struct TransactionObjects {
@@ -19,54 +19,81 @@ fn rewrite_and_print(wat: &str) -> (Vec<u8>, RewriteReport, String) {
 }
 
 fn transaction_objects(bytes: &[u8]) -> (usize, TransactionObjects) {
-    let mut count = 0;
-    let mut metadata = TransactionObjects::default();
+    let mut obsolete_sections = 0;
+    let mut native = TransactionObjects::default();
+    let mut function_types = Vec::new();
+    let mut next_function = 0u32;
 
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.expect("parse payload");
-        if let Payload::CustomSection(section) = payload {
-            if section.name() == TRANSACTION_OBJECTS_CUSTOM_SECTION {
-                count += 1;
-                metadata = parse_transaction_objects(section.data());
+        match payload {
+            Payload::TypeSection(section) => {
+                function_types.extend(
+                    section
+                        .into_iter_err_on_gc_types()
+                        .map(|ty| ty.expect("function type").transaction()),
+                );
             }
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    match import.expect("import").ty {
+                        TypeRef::Func(ty) | TypeRef::FuncExact(ty) => {
+                            if function_types[ty as usize] {
+                                native.functions.push(next_function);
+                            }
+                            next_function += 1;
+                        }
+                        TypeRef::TMemory(_) => native.memories.push(native.memories.len() as u32),
+                        TypeRef::TGlobal(_) => native.globals.push(native.globals.len() as u32),
+                        TypeRef::TTable(_) => native.tables.push(native.tables.len() as u32),
+                        _ => {}
+                    }
+                }
+            }
+            Payload::FunctionSection(section) => {
+                for ty in section {
+                    let ty = ty.expect("function type index");
+                    if function_types[ty as usize] {
+                        native.functions.push(next_function);
+                    }
+                    next_function += 1;
+                }
+            }
+            Payload::MemorySection(section) => {
+                for ty in section {
+                    if ty.expect("memory type").namespace == EntityNamespace::Transactional {
+                        native.memories.push(native.memories.len() as u32);
+                    }
+                }
+            }
+            Payload::GlobalSection(section) => {
+                for global in section {
+                    if global.expect("global").ty.namespace == EntityNamespace::Transactional {
+                        native.globals.push(native.globals.len() as u32);
+                    }
+                }
+            }
+            Payload::TableSection(section) => {
+                for table in section {
+                    if table.expect("table").ty.namespace == EntityNamespace::Transactional {
+                        native.tables.push(native.tables.len() as u32);
+                    }
+                }
+            }
+            Payload::CustomSection(section)
+                if section.name() == OBSOLETE_TRANSACTION_OBJECTS_CUSTOM_SECTION =>
+            {
+                obsolete_sections += 1;
+            }
+            _ => {}
         }
     }
 
-    (count, metadata)
-}
-
-fn parse_transaction_objects(data: &[u8]) -> TransactionObjects {
-    let mut reader = BinaryReader::new(data, 0);
-    let version = reader.read_u8().expect("version");
-    assert_eq!(version, 1);
-
-    let memories = read_index_vec(&mut reader);
-    let globals = read_index_vec(&mut reader);
-    let functions = read_index_vec(&mut reader);
-    let tables = if reader.eof() {
-        Vec::new()
-    } else {
-        read_index_vec(&mut reader)
-    };
-
-    assert!(reader.eof(), "unexpected trailing metadata bytes");
-    TransactionObjects {
-        memories,
-        globals,
-        functions,
-        tables,
-    }
-}
-
-fn read_index_vec(reader: &mut BinaryReader<'_>) -> Vec<u32> {
-    let len = reader.read_var_u32().expect("vector length");
-    (0..len)
-        .map(|_| reader.read_var_u32().expect("vector item"))
-        .collect()
+    (obsolete_sections, native)
 }
 
 #[test]
-fn rewrite_lowers_scalar_tmemory_roots_and_emits_transaction_metadata() {
+fn rewrite_lowers_scalar_tmemory_roots_to_native_spaces() {
     let wat = r#"
         (module
           (import "twasm_intrinsics" "__twasm_persistent_addr_mut" (func $persistent_addr (param i64) (result i32)))
@@ -172,7 +199,7 @@ fn rewrite_lowers_scalar_tmemory_roots_and_emits_transaction_metadata() {
     assert!(printed.contains("f64.tstore"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
+    assert_eq!(section_count, 0);
     assert_eq!(
         metadata,
         TransactionObjects {
@@ -521,7 +548,7 @@ fn rewrite_taints_marked_persistent_parameters() {
     assert!(printed.contains("i32.tstore"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
+    assert_eq!(section_count, 0);
     assert_eq!(metadata.memories, vec![0]);
     assert_eq!(metadata.functions, vec![0]);
 }
@@ -635,7 +662,7 @@ fn rewrite_allows_persistent_pointer_to_marked_transaction_callee() {
     assert!(printed.contains("i32.tstore"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
+    assert_eq!(section_count, 0);
     assert_eq!(metadata.memories, vec![0]);
     assert_eq!(metadata.functions, vec![0, 1]);
 }
@@ -670,7 +697,7 @@ fn rewrite_propagates_persistent_pointer_return_from_marked_callee() {
     assert!(printed.contains("i32.tload"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
+    assert_eq!(section_count, 0);
     assert_eq!(metadata.functions, vec![0, 1]);
 }
 
@@ -704,7 +731,7 @@ fn rewrite_propagates_forward_persistent_pointer_return_from_marked_callee() {
     assert!(printed.contains("i32.tload"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
+    assert_eq!(section_count, 0);
     assert_eq!(metadata.functions, vec![0, 1]);
 }
 
@@ -825,7 +852,7 @@ fn rewrite_propagates_nested_forward_persistent_pointer_return() {
     assert!(printed.contains("i32.tload"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
+    assert_eq!(section_count, 0);
     assert_eq!(metadata.functions, vec![0, 1, 2]);
 }
 
@@ -865,7 +892,7 @@ fn rewrite_merges_persistent_pointer_return_taint_from_multiple_return_sites() {
     assert!(printed.contains("i32.tload"));
 
     let (section_count, metadata) = transaction_objects(&output);
-    assert_eq!(section_count, 1);
+    assert_eq!(section_count, 0);
     assert_eq!(metadata.functions, vec![0, 1]);
 }
 

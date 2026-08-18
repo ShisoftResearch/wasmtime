@@ -519,10 +519,9 @@ impl Memory {
     fn internal_tmemory_data_size(&self, store: &StoreOpaque) -> Option<usize> {
         let instance = &store[self.instance];
         let module = instance.env_module();
-        let memory_index = module.memory_index(self.index);
-        if !module.transaction_objects.is_tmemory(memory_index) {
-            return None;
-        }
+        let memory_index = module
+            .defined_tmemory_index_from_runtime(self.index)
+            .map(|index| module.tmemory_index(index))?;
         instance
             .get_tmemory(memory_index)
             .map(crate::runtime::vm::TMemory::byte_len)
@@ -710,8 +709,18 @@ impl Memory {
 
     pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Memory {
         let module = store[self.instance].env_module();
+        if let Some(index) = module.defined_tmemory_index_from_runtime(self.index) {
+            return &module.tmemories[module.tmemory_index(index)];
+        }
         let index = module.memory_index(self.index);
         &module.memories[index]
+    }
+
+    pub(crate) fn is_transactional(&self, store: &StoreOpaque) -> bool {
+        let module = store[self.instance].env_module();
+        module
+            .defined_tmemory_index_from_runtime(self.index)
+            .is_some()
     }
 
     pub(crate) fn vmimport(&self, store: &StoreOpaque) -> crate::runtime::vm::VMMemoryImport {

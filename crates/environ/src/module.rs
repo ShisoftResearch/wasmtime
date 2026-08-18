@@ -20,6 +20,17 @@ pub struct MemoryInitializer<'a> {
     pub data: &'a [u8],
 }
 
+/// A transactional WebAssembly linear-memory initializer.
+#[derive(Clone, Debug)]
+pub struct TMemoryInitializer<'a> {
+    /// The transactional memory to initialize.
+    pub memory_index: TMemoryIndex,
+    /// The base offset to start this segment at.
+    pub offset: ConstExpr,
+    /// The bytes to write into the transactional memory.
+    pub data: &'a [u8],
+}
+
 /// The type of WebAssembly linear memory initialization to use for a module.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MemoryInitialization {
@@ -90,6 +101,31 @@ impl MemoryInitialization {
     }
 }
 
+/// Transactional linear-memory initialization for a module.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TMemoryInitialization {
+    /// Initialization is performed from active segments at instantiation time.
+    Segmented,
+    /// Statically known initialization for each defined transactional memory.
+    Static {
+        /// Per-memory initialization offset and transactional runtime-data index.
+        map: TryPrimaryMap<TMemoryIndex, Option<(u64, RuntimeTDataIndex)>>,
+    },
+}
+
+impl Default for TMemoryInitialization {
+    fn default() -> Self {
+        Self::Segmented
+    }
+}
+
+impl TMemoryInitialization {
+    /// Returns whether this initialization uses active segments.
+    pub fn is_segmented(&self) -> bool {
+        matches!(self, Self::Segmented)
+    }
+}
+
 /// Table initialization data for all tables in the module.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TableInitialization {
@@ -112,6 +148,15 @@ pub struct TableInitialization {
     pub segments: TryVec<TableSegment>,
 }
 
+/// Table initialization data for transactional tables in the module.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct TTableInitialization {
+    /// Initial values for defined transactional tables.
+    pub initial_values: TryPrimaryMap<DefinedTTableIndex, TableInitialValue>,
+    /// Active transactional element segments.
+    pub segments: TryVec<TTableSegment>,
+}
+
 /// Initial value for all elements in a table.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TableInitialValue {
@@ -127,6 +172,17 @@ pub enum TableInitialValue {
 pub struct TableSegment {
     /// The index of a table to initialize.
     pub table_index: TableIndex,
+    /// The base offset to start this segment at.
+    pub offset: ConstExpr,
+    /// The values to write into the table elements.
+    pub elements: TableSegmentElements,
+}
+
+/// A transactional WebAssembly table initializer segment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TTableSegment {
+    /// The transactional table to initialize.
+    pub table_index: TTableIndex,
     /// The base offset to start this segment at.
     pub offset: ConstExpr,
     /// The values to write into the table elements.
@@ -201,12 +257,18 @@ pub struct Module {
     /// to be infallible as part of [`ModuleTranslation::finalize_table_init`].
     pub table_initialization: TryPrimaryMap<DefinedTableIndex, TryVec<FuncIndex>>,
 
+    /// Precomputed initialization images for transactional tables.
+    pub t_table_initialization: TryPrimaryMap<DefinedTTableIndex, TryVec<FuncIndex>>,
+
     /// WebAssembly linear memory initializer.
     ///
     /// This will track how memory is initialized, either exclusively via
     /// segments or if some memories can be initialized with static images. This
     /// is computed during [`ModuleTranslation::finalize_memory_init`].
     pub memory_initialization: MemoryInitialization,
+
+    /// Transactional linear-memory initialization.
+    pub t_memory_initialization: TMemoryInitialization,
 
     /// WebAssembly passive elements.
     ///
@@ -215,12 +277,18 @@ pub struct Module {
     /// initialized by compiled code.
     pub passive_elements: TryPrimaryMap<PassiveElemIndex, (WasmRefType, u64)>,
 
+    /// Passive transactional element segments.
+    pub passive_telements: TryPrimaryMap<PassiveTElemIndex, (WasmRefType, u64)>,
+
     /// Where runtime data segments are located in the module's image.
     ///
     /// Note that this does not directly correspond to either active or passive
     /// data segments. Those are massaged during
     /// [`ModuleTranslation::finalize_memory_init`] into the form used here.
     pub runtime_data: TryPrimaryMap<RuntimeDataIndex, Range<u32>>,
+
+    /// Transactional runtime data segments in the module image.
+    pub runtime_tdata: TryPrimaryMap<RuntimeTDataIndex, Range<u32>>,
 
     /// Types declared in the wasm module.
     pub types: TryPrimaryMap<TypeIndex, EngineOrModuleTypeIndex>,
@@ -231,11 +299,20 @@ pub struct Module {
     /// Number of imported or aliased tables in the module.
     pub num_imported_tables: usize,
 
+    /// Number of imported transactional tables.
+    pub num_imported_ttables: usize,
+
     /// Number of imported or aliased memories in the module.
     pub num_imported_memories: usize,
 
+    /// Number of imported transactional memories.
+    pub num_imported_tmemories: usize,
+
     /// Number of imported or aliased globals in the module.
     pub num_imported_globals: usize,
+
+    /// Number of imported transactional globals.
+    pub num_imported_tglobals: usize,
 
     /// Number of imported or aliased tags in the module.
     pub num_imported_tags: usize,
@@ -256,14 +333,20 @@ pub struct Module {
     /// WebAssembly tables.
     pub tables: TryPrimaryMap<TableIndex, Table>,
 
+    /// WebAssembly transactional tables.
+    pub ttables: TryPrimaryMap<TTableIndex, Table>,
+
     /// WebAssembly linear memory plans.
     pub memories: TryPrimaryMap<MemoryIndex, Memory>,
+
+    /// WebAssembly transactional linear memory plans.
+    pub tmemories: TryPrimaryMap<TMemoryIndex, Memory>,
 
     /// WebAssembly global variables.
     pub globals: TryPrimaryMap<GlobalIndex, Global>,
 
-    /// Transactional memories/globals declared through research text aliases.
-    pub transaction_objects: TransactionObjectMetadata,
+    /// WebAssembly transactional global variables.
+    pub tglobals: TryPrimaryMap<TGlobalIndex, Global>,
 
     /// "Simple" WebAssembly global initializers for locally-defined globals.
     ///
@@ -277,6 +360,9 @@ pub struct Module {
     /// which is processed in compiled code and initialized after the instance
     /// has been created.
     pub global_initializers: TryVec<(DefinedGlobalIndex, GlobalConstValue)>,
+
+    /// Simple initializers for defined transactional globals.
+    pub tglobal_initializers: TryVec<(DefinedTGlobalIndex, GlobalConstValue)>,
 
     /// WebAssembly exception and control tags.
     pub tags: TryPrimaryMap<TagIndex, Tag>,
@@ -309,23 +395,33 @@ impl Module {
             exports: Default::default(),
             startup: ModuleStartup::None,
             table_initialization: Default::default(),
+            t_table_initialization: Default::default(),
             memory_initialization: Default::default(),
+            t_memory_initialization: Default::default(),
             passive_elements: Default::default(),
+            passive_telements: Default::default(),
             runtime_data: Default::default(),
+            runtime_tdata: Default::default(),
             types: Default::default(),
             num_imported_funcs: Default::default(),
             num_imported_tables: Default::default(),
+            num_imported_ttables: Default::default(),
             num_imported_memories: Default::default(),
+            num_imported_tmemories: Default::default(),
             num_imported_globals: Default::default(),
+            num_imported_tglobals: Default::default(),
             num_imported_tags: Default::default(),
             needs_gc_heap: Default::default(),
             num_escaped_funcs: Default::default(),
             functions: Default::default(),
             tables: Default::default(),
+            ttables: Default::default(),
             memories: Default::default(),
+            tmemories: Default::default(),
             globals: Default::default(),
-            transaction_objects: Default::default(),
+            tglobals: Default::default(),
             global_initializers: Default::default(),
+            tglobal_initializers: Default::default(),
             tags: Default::default(),
         }
     }
@@ -386,6 +482,55 @@ impl Module {
         index.index() < self.num_imported_tables
     }
 
+    /// Convert a defined transactional-table index into its module index.
+    #[inline]
+    pub fn ttable_index(&self, table: DefinedTTableIndex) -> TTableIndex {
+        TTableIndex::new(self.num_imported_ttables + table.index())
+    }
+
+    /// Convert a transactional-table index into a defined index.
+    #[inline]
+    pub fn defined_ttable_index(&self, table: TTableIndex) -> Option<DefinedTTableIndex> {
+        if table.index() < self.num_imported_ttables {
+            None
+        } else {
+            Some(DefinedTTableIndex::new(
+                table.index() - self.num_imported_ttables,
+            ))
+        }
+    }
+
+    /// Test whether the transactional table is imported.
+    #[inline]
+    pub fn is_imported_ttable(&self, table: TTableIndex) -> bool {
+        table.index() < self.num_imported_ttables
+    }
+
+    /// Map a defined transactional table to its physical VMContext table slot.
+    #[inline]
+    pub fn runtime_defined_ttable_index(&self, table: DefinedTTableIndex) -> DefinedTableIndex {
+        DefinedTableIndex::new(self.num_defined_tables() + table.index())
+    }
+
+    /// Recover a logical defined transactional table from a physical slot.
+    pub fn defined_ttable_index_from_runtime(
+        &self,
+        table: DefinedTableIndex,
+    ) -> Option<DefinedTTableIndex> {
+        table
+            .index()
+            .checked_sub(self.num_defined_tables())
+            .filter(|index| *index < self.num_defined_ttables())
+            .map(DefinedTTableIndex::new)
+    }
+
+    /// Map an imported transactional table to its physical VMContext import slot.
+    #[inline]
+    pub fn runtime_imported_ttable_index(&self, table: TTableIndex) -> TableIndex {
+        assert!(self.is_imported_ttable(table));
+        TableIndex::new(self.num_imported_tables + table.index())
+    }
+
     /// Convert a `DefinedMemoryIndex` into a `MemoryIndex`.
     #[inline]
     pub fn memory_index(&self, defined_memory: DefinedMemoryIndex) -> MemoryIndex {
@@ -439,6 +584,55 @@ impl Module {
         index.index() < self.num_imported_memories
     }
 
+    /// Convert a defined transactional-memory index into its module index.
+    #[inline]
+    pub fn tmemory_index(&self, memory: DefinedTMemoryIndex) -> TMemoryIndex {
+        TMemoryIndex::new(self.num_imported_tmemories + memory.index())
+    }
+
+    /// Convert a transactional-memory index into a defined index.
+    #[inline]
+    pub fn defined_tmemory_index(&self, memory: TMemoryIndex) -> Option<DefinedTMemoryIndex> {
+        if memory.index() < self.num_imported_tmemories {
+            None
+        } else {
+            Some(DefinedTMemoryIndex::new(
+                memory.index() - self.num_imported_tmemories,
+            ))
+        }
+    }
+
+    /// Test whether the transactional memory is imported.
+    #[inline]
+    pub fn is_imported_tmemory(&self, memory: TMemoryIndex) -> bool {
+        memory.index() < self.num_imported_tmemories
+    }
+
+    /// Map a defined transactional memory to its physical VMContext memory slot.
+    #[inline]
+    pub fn runtime_defined_tmemory_index(&self, memory: DefinedTMemoryIndex) -> DefinedMemoryIndex {
+        DefinedMemoryIndex::new(self.num_defined_memories() + memory.index())
+    }
+
+    /// Recover a logical defined transactional memory from a physical slot.
+    pub fn defined_tmemory_index_from_runtime(
+        &self,
+        memory: DefinedMemoryIndex,
+    ) -> Option<DefinedTMemoryIndex> {
+        memory
+            .index()
+            .checked_sub(self.num_defined_memories())
+            .filter(|index| *index < self.num_defined_tmemories())
+            .map(DefinedTMemoryIndex::new)
+    }
+
+    /// Map an imported transactional memory to its physical VMContext import slot.
+    #[inline]
+    pub fn runtime_imported_tmemory_index(&self, memory: TMemoryIndex) -> MemoryIndex {
+        assert!(self.is_imported_tmemory(memory));
+        MemoryIndex::new(self.num_imported_memories + memory.index())
+    }
+
     /// Convert a `DefinedGlobalIndex` into a `GlobalIndex`.
     #[inline]
     pub fn global_index(&self, defined_global: DefinedGlobalIndex) -> GlobalIndex {
@@ -468,6 +662,90 @@ impl Module {
     #[inline]
     pub fn is_imported_global(&self, index: GlobalIndex) -> bool {
         index.index() < self.num_imported_globals
+    }
+
+    /// Convert a defined transactional-global index into its module index.
+    #[inline]
+    pub fn tglobal_index(&self, global: DefinedTGlobalIndex) -> TGlobalIndex {
+        TGlobalIndex::new(self.num_imported_tglobals + global.index())
+    }
+
+    /// Convert a transactional-global index into a defined index.
+    #[inline]
+    pub fn defined_tglobal_index(&self, global: TGlobalIndex) -> Option<DefinedTGlobalIndex> {
+        if global.index() < self.num_imported_tglobals {
+            None
+        } else {
+            Some(DefinedTGlobalIndex::new(
+                global.index() - self.num_imported_tglobals,
+            ))
+        }
+    }
+
+    /// Test whether the transactional global is imported.
+    #[inline]
+    pub fn is_imported_tglobal(&self, global: TGlobalIndex) -> bool {
+        global.index() < self.num_imported_tglobals
+    }
+
+    /// Map a defined transactional global to its physical VMContext global slot.
+    #[inline]
+    pub fn runtime_defined_tglobal_index(&self, global: DefinedTGlobalIndex) -> DefinedGlobalIndex {
+        DefinedGlobalIndex::new(self.num_defined_globals() + global.index())
+    }
+
+    /// Recover a logical defined transactional global from a physical slot.
+    pub fn defined_tglobal_index_from_runtime(
+        &self,
+        global: DefinedGlobalIndex,
+    ) -> Option<DefinedTGlobalIndex> {
+        global
+            .index()
+            .checked_sub(self.num_defined_globals())
+            .filter(|index| *index < self.num_defined_tglobals())
+            .map(DefinedTGlobalIndex::new)
+    }
+
+    /// Map an imported transactional global to its physical VMContext import slot.
+    #[inline]
+    pub fn runtime_imported_tglobal_index(&self, global: TGlobalIndex) -> GlobalIndex {
+        assert!(self.is_imported_tglobal(global));
+        GlobalIndex::new(self.num_imported_globals + global.index())
+    }
+
+    /// Number of physical imported table slots, across both namespaces.
+    pub fn num_runtime_imported_tables(&self) -> usize {
+        self.num_imported_tables + self.num_imported_ttables
+    }
+
+    /// Number of physical imported memory slots, across both namespaces.
+    pub fn num_runtime_imported_memories(&self) -> usize {
+        self.num_imported_memories + self.num_imported_tmemories
+    }
+
+    /// Number of physical imported global slots, across both namespaces.
+    pub fn num_runtime_imported_globals(&self) -> usize {
+        self.num_imported_globals + self.num_imported_tglobals
+    }
+
+    /// Number of physical defined table slots, across both namespaces.
+    pub fn num_runtime_defined_tables(&self) -> usize {
+        self.num_defined_tables() + self.num_defined_ttables()
+    }
+
+    /// Number of physical defined memory slots, across both namespaces.
+    pub fn num_runtime_defined_memories(&self) -> usize {
+        self.num_defined_memories() + self.num_defined_tmemories()
+    }
+
+    /// Number of physical defined global slots, across both namespaces.
+    pub fn num_runtime_defined_globals(&self) -> usize {
+        self.num_defined_globals() + self.num_defined_tglobals()
+    }
+
+    /// Map transactional runtime data to its physical VMContext runtime-data slot.
+    pub fn runtime_tdata_index(&self, data: RuntimeTDataIndex) -> RuntimeDataIndex {
+        RuntimeDataIndex::new(self.runtime_data.len() + data.index())
     }
 
     /// Test whether the given tag index is for an imported tag.
@@ -519,8 +797,11 @@ impl Module {
     pub fn type_of(&self, index: EntityIndex) -> EntityType {
         match index {
             EntityIndex::Global(i) => EntityType::Global(self.globals[i]),
+            EntityIndex::TGlobal(i) => EntityType::TGlobal(self.tglobals[i]),
             EntityIndex::Table(i) => EntityType::Table(self.tables[i]),
+            EntityIndex::TTable(i) => EntityType::TTable(self.ttables[i]),
             EntityIndex::Memory(i) => EntityType::Memory(self.memories[i]),
+            EntityIndex::TMemory(i) => EntityType::TMemory(self.tmemories[i]),
             EntityIndex::Function(i) => EntityType::Function(self.functions[i].signature),
             EntityIndex::Tag(i) => EntityType::Tag(self.tags[i]),
         }
@@ -546,13 +827,28 @@ impl Module {
     /// used for functions that either don't escape or aren't certain whether
     /// they escape yet.
     pub fn push_function(&mut self, signature: impl Into<EngineOrModuleTypeIndex>) -> FuncIndex {
+        self.push_function_with_transaction(signature, false)
+    }
+
+    /// Append a function and retain whether its signature is transactional.
+    pub fn push_function_with_transaction(
+        &mut self,
+        signature: impl Into<EngineOrModuleTypeIndex>,
+        is_transactional: bool,
+    ) -> FuncIndex {
         let signature = signature.into();
         self.functions
             .push(FunctionType {
                 signature,
                 func_ref: FuncRefIndex::reserved_value(),
+                is_transactional,
             })
             .panic_on_oom()
+    }
+
+    /// Returns whether a function has a native transactional function type.
+    pub fn is_tfunc(&self, func: FuncIndex) -> bool {
+        self.functions[func].is_transactional
     }
 
     /// Returns an iterator over all of the defined function indices in this
@@ -573,16 +869,31 @@ impl Module {
         self.tables.len() - self.num_imported_tables
     }
 
+    /// Number of defined transactional tables.
+    pub fn num_defined_ttables(&self) -> usize {
+        self.ttables.len() - self.num_imported_ttables
+    }
+
     /// Returns the number of memories defined by this module itself: all
     /// memories minus imported memories.
     pub fn num_defined_memories(&self) -> usize {
         self.memories.len() - self.num_imported_memories
     }
 
+    /// Number of defined transactional memories.
+    pub fn num_defined_tmemories(&self) -> usize {
+        self.tmemories.len() - self.num_imported_tmemories
+    }
+
     /// Returns the number of globals defined by this module itself: all
     /// globals minus imported globals.
     pub fn num_defined_globals(&self) -> usize {
         self.globals.len() - self.num_imported_globals
+    }
+
+    /// Number of defined transactional globals.
+    pub fn num_defined_tglobals(&self) -> usize {
+        self.tglobals.len() - self.num_imported_tglobals
     }
 
     /// Returns the number of tags defined by this module itself: all tags
@@ -596,8 +907,11 @@ impl Module {
         match index {
             EntityIndex::Function(i) => self.functions.is_valid(i),
             EntityIndex::Table(i) => self.tables.is_valid(i),
+            EntityIndex::TTable(i) => self.ttables.is_valid(i),
             EntityIndex::Memory(i) => self.memories.is_valid(i),
+            EntityIndex::TMemory(i) => self.tmemories.is_valid(i),
             EntityIndex::Global(i) => self.globals.is_valid(i),
+            EntityIndex::TGlobal(i) => self.tglobals.is_valid(i),
             EntityIndex::Tag(i) => self.tags.is_valid(i),
         }
     }
@@ -618,23 +932,33 @@ impl TypeTrace for Module {
             exports: _,
             startup,
             table_initialization: _,
+            t_table_initialization: _,
             memory_initialization: _,
+            t_memory_initialization: _,
             passive_elements: _,
+            passive_telements: _,
             runtime_data: _,
+            runtime_tdata: _,
             types,
             num_imported_funcs: _,
             num_imported_tables: _,
+            num_imported_ttables: _,
             num_imported_memories: _,
+            num_imported_tmemories: _,
             num_imported_globals: _,
+            num_imported_tglobals: _,
             num_imported_tags: _,
             num_escaped_funcs: _,
             needs_gc_heap: _,
             functions,
             tables,
+            ttables,
             memories: _,
+            tmemories: _,
             globals,
-            transaction_objects: _,
+            tglobals,
             global_initializers: _,
+            tglobal_initializers: _,
             tags,
         } = self;
 
@@ -647,7 +971,13 @@ impl TypeTrace for Module {
         for t in tables.values() {
             t.trace(func)?;
         }
+        for t in ttables.values() {
+            t.trace(func)?;
+        }
         for g in globals.values() {
+            g.trace(func)?;
+        }
+        for g in tglobals.values() {
             g.trace(func)?;
         }
         for t in tags.values() {
@@ -671,23 +1001,33 @@ impl TypeTrace for Module {
             exports: _,
             startup,
             table_initialization: _,
+            t_table_initialization: _,
             memory_initialization: _,
+            t_memory_initialization: _,
             passive_elements: _,
+            passive_telements: _,
             runtime_data: _,
+            runtime_tdata: _,
             types,
             num_imported_funcs: _,
             num_imported_tables: _,
+            num_imported_ttables: _,
             num_imported_memories: _,
+            num_imported_tmemories: _,
             num_imported_globals: _,
+            num_imported_tglobals: _,
             num_imported_tags: _,
             num_escaped_funcs: _,
             needs_gc_heap: _,
             functions,
             tables,
+            ttables,
             memories: _,
+            tmemories: _,
             globals,
-            transaction_objects: _,
+            tglobals,
             global_initializers: _,
+            tglobal_initializers: _,
             tags,
         } = self;
 
@@ -700,7 +1040,13 @@ impl TypeTrace for Module {
         for t in tables.values_mut() {
             t.trace_mut(func)?;
         }
+        for t in ttables.values_mut() {
+            t.trace_mut(func)?;
+        }
         for g in globals.values_mut() {
+            g.trace_mut(func)?;
+        }
+        for g in tglobals.values_mut() {
             g.trace_mut(func)?;
         }
         for t in tags.values_mut() {
@@ -742,6 +1088,8 @@ pub struct FunctionType {
     /// The index into the funcref table, if present. Note that this is
     /// `reserved_value()` if the function does not escape from a module.
     pub func_ref: FuncRefIndex,
+    /// Whether this function's type was encoded as a transactional function.
+    pub is_transactional: bool,
 }
 
 impl TypeTrace for FunctionType {

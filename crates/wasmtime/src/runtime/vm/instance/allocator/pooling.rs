@@ -586,8 +586,8 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
                     let layout = Instance::alloc_layout(&offsets);
                     self.validate_module(module, &offsets)?;
                     num_core_instances += 1;
-                    num_memories += module.num_defined_memories();
-                    num_tables += module.num_defined_tables();
+                    num_memories += module.num_runtime_defined_memories();
+                    num_tables += module.num_runtime_defined_tables();
                     core_instances_aggregate_size += layout.size();
                 }
                 LowerImport { .. }

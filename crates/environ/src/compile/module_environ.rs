@@ -1,17 +1,18 @@
 use crate::error::{OutOfMemory, Result, bail};
 use crate::module::{
-    FuncRefIndex, Initializer, MemoryInitialization, Module, TableSegment, TableSegmentElements,
+    FuncRefIndex, Initializer, MemoryInitialization, Module, TMemoryInitializer,
+    TTableInitialization, TTableSegment, TableSegment, TableSegmentElements,
 };
 use crate::prelude::*;
 use crate::{
-    ConstExpr, ConstOp, DataIndex, DefinedFuncIndex, DefinedGlobalIndex, ElemIndex,
-    EngineOrModuleTypeIndex, EntityIndex, EntityType, FuncIndex, FuncKey, GlobalIndex, IndexType,
-    MemoryIndex, MemoryInitializer, ModuleInternedTypeIndex, ModuleStartup, ModuleTypesBuilder,
-    PanicOnOom as _, PassiveElemIndex, PrimaryMap, RuntimeDataIndex, StaticModuleIndex,
-    TRANSACTION_OBJECTS_CUSTOM_SECTION, TableIndex, TableInitialValue, TableInitialization, Tag,
-    TagIndex, TransactionObjectMetadata, Tunables, TypeConvert, TypeIndex, WasmHeapTopType,
-    WasmHeapType, WasmResult, WasmValType, WasmparserTypeConverter,
-    decode_transaction_object_metadata,
+    ConstExpr, ConstOp, DataIndex, DefinedFuncIndex, DefinedGlobalIndex, DefinedTGlobalIndex,
+    ElemIndex, EngineOrModuleTypeIndex, EntityIndex, EntityType, FuncIndex, FuncKey, GlobalIndex,
+    IndexType, MemoryIndex, MemoryInitializer, ModuleInternedTypeIndex, ModuleStartup,
+    ModuleTypesBuilder, PanicOnOom as _, PassiveElemIndex, PassiveTElemIndex, PrimaryMap,
+    RuntimeDataIndex, RuntimeTDataIndex, StaticModuleIndex, TDataIndex, TElemIndex, TGlobalIndex,
+    TMemoryIndex, TTableIndex, TableIndex, TableInitialValue, TableInitialization, Tag, TagIndex,
+    Tunables, TypeConvert, TypeIndex, WasmHeapTopType, WasmHeapType, WasmResult, WasmValType,
+    WasmparserTypeConverter,
 };
 use alloc::borrow::Cow;
 use cranelift_entity::SecondaryMap;
@@ -21,9 +22,9 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmparser::{
-    CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
-    FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser, Payload, TypeRef,
-    Validator, ValidatorResources, types::Types,
+    CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, EntityNamespace,
+    ExternalKind, FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser,
+    Payload, TypeRef, Validator, ValidatorResources, types::Types,
 };
 
 /// Object containing the standalone environment information.
@@ -99,12 +100,21 @@ pub struct ModuleTranslation<'data> {
     /// Map from a data segment to whether it's a passive data segment or not.
     pub runtime_data_map: SecondaryMap<DataIndex, Option<RuntimeDataIndex>>,
 
+    /// Transactional data-segment to runtime-data mapping.
+    pub runtime_tdata_map: SecondaryMap<TDataIndex, Option<RuntimeTDataIndex>>,
+
     /// Map from an elem segment to whether it's a passive elem segment or not.
     pub passive_elem_map: SecondaryMap<ElemIndex, Option<PassiveElemIndex>>,
+
+    /// Transactional element-segment to passive-element mapping.
+    pub passive_telem_map: SecondaryMap<TElemIndex, Option<PassiveTElemIndex>>,
 
     /// List of passive element segments found in this module which will get
     /// concatenated for the final artifact.
     pub runtime_data: PrimaryMap<RuntimeDataIndex, Cow<'data, [u8]>>,
+
+    /// Transactional runtime data, kept separate from ordinary data.
+    pub runtime_tdata: PrimaryMap<RuntimeTDataIndex, Cow<'data, [u8]>>,
 
     /// Record of all passive data segments that this module contains.
     ///
@@ -112,6 +122,9 @@ pub struct ModuleTranslation<'data> {
     /// and eventually moved over into the `runtime_data` list above. Until
     /// then, however, their `RuntimeDataIndex` is not yet assigned.
     passive_data: Vec<(DataIndex, &'data [u8])>,
+
+    /// Passive transactional data segments awaiting finalization.
+    passive_tdata: Vec<(TDataIndex, &'data [u8])>,
 
     /// When we're parsing the code section this will be incremented so we know
     /// which function is currently being defined.
@@ -134,11 +147,17 @@ pub struct ModuleTranslation<'data> {
     /// These initializers are later compiled into a "module startup" function.
     pub global_initializers: Vec<(DefinedGlobalIndex, ConstExpr)>,
 
+    /// Complicated transactional-global initializers.
+    pub tglobal_initializers: Vec<(DefinedTGlobalIndex, ConstExpr)>,
+
     /// Definitions of all passive elements found within a module.
     ///
     /// This maps passive element segments to their definition, either functions
     /// or expressions-basd.
     pub passive_elements: PrimaryMap<PassiveElemIndex, TableSegmentElements>,
+
+    /// Definitions of passive transactional element segments.
+    pub passive_telements: PrimaryMap<PassiveTElemIndex, TableSegmentElements>,
 
     /// WebAssembly table initialization data, per table.
     ///
@@ -148,11 +167,17 @@ pub struct ModuleTranslation<'data> {
     /// translation.
     pub table_initialization: TableInitialization,
 
+    /// Transactional table initialization.
+    pub t_table_initialization: TTableInitialization,
+
     /// WebAssembly memory initialization.
     ///
     /// This is held here in an `Unprocessed` form during translation, and then
     /// this is later finished with [`ModuleTranslation::finalize_memory_init`].
     pub memory_init: MemoryInit<'data>,
+
+    /// Transactional memory initialization.
+    pub t_memory_init: TMemoryInit<'data>,
 }
 
 /// Different forms of memory initialization that happens for a module.
@@ -170,6 +195,14 @@ pub enum MemoryInit<'a> {
     /// active data segments which may have been merged from the `Unprocessed`
     /// list above, and may or may not have statically know offsets.
     Processed(Vec<(MemoryIndex, MemorySegmentOffset, RuntimeDataIndex)>),
+}
+
+/// Transactional counterpart of [`MemoryInit`].
+pub enum TMemoryInit<'a> {
+    /// Raw active transactional data segments.
+    Unprocessed(Vec<TMemoryInitializer<'a>>),
+    /// Finalized active transactional data segments.
+    Processed(Vec<(TMemoryIndex, MemorySegmentOffset, RuntimeTDataIndex)>),
 }
 
 /// Offset within [`MemoryInit::Processed`] which indicates the initial offset
@@ -202,17 +235,25 @@ impl<'data> ModuleTranslation<'data> {
             has_unparsed_debuginfo: false,
             data_align: None,
             runtime_data: Default::default(),
+            runtime_tdata: Default::default(),
             code_index: 0,
             types: None,
             runtime_data_map: Default::default(),
+            runtime_tdata_map: Default::default(),
             passive_elem_map: Default::default(),
+            passive_telem_map: Default::default(),
             branch_hints: HashMap::default(),
             start_func: None,
             global_initializers: Vec::new(),
+            tglobal_initializers: Vec::new(),
             passive_elements: Default::default(),
+            passive_telements: Default::default(),
             table_initialization: Default::default(),
+            t_table_initialization: Default::default(),
             memory_init: MemoryInit::Unprocessed(Vec::new()),
+            t_memory_init: TMemoryInit::Unprocessed(Vec::new()),
             passive_data: Default::default(),
+            passive_tdata: Default::default(),
         }
     }
 
@@ -433,9 +474,6 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 for entry in imports.into_imports() {
                     let import = entry?;
                     let mut transaction_func = false;
-                    let mut transaction_memory = false;
-                    let mut transaction_global = false;
-                    let mut transaction_table = false;
                     let ty = match import.ty {
                         TypeRef::Func(index) => {
                             let index = TypeIndex::from_u32(index);
@@ -446,19 +484,28 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                             EntityType::Function(interned_index)
                         }
                         TypeRef::Memory(ty) => {
-                            transaction_memory = ty.transaction;
                             self.result.module.num_imported_memories += 1;
                             EntityType::Memory(ty.into())
                         }
+                        TypeRef::TMemory(ty) => {
+                            self.result.module.num_imported_tmemories += 1;
+                            EntityType::TMemory(ty.into())
+                        }
                         TypeRef::Global(ty) => {
-                            transaction_global = ty.transaction;
                             self.result.module.num_imported_globals += 1;
                             EntityType::Global(self.convert_global_type(&ty)?)
                         }
+                        TypeRef::TGlobal(ty) => {
+                            self.result.module.num_imported_tglobals += 1;
+                            EntityType::TGlobal(self.convert_global_type(&ty)?)
+                        }
                         TypeRef::Table(ty) => {
-                            transaction_table = ty.transaction;
                             self.result.module.num_imported_tables += 1;
                             EntityType::Table(self.convert_table_type(&ty)?)
+                        }
+                        TypeRef::TTable(ty) => {
+                            self.result.module.num_imported_ttables += 1;
+                            EntityType::TTable(self.convert_table_type(&ty)?)
                         }
                         TypeRef::Tag(ty) => {
                             let index = TypeIndex::from_u32(ty.func_type_idx);
@@ -478,20 +525,11 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                         }
                     };
                     let index = self.declare_import(import.module, import.name, ty)?;
-                    match index {
-                        EntityIndex::Function(index) if transaction_func => {
-                            self.result.module.transaction_objects.add_tfunc(index);
-                        }
-                        EntityIndex::Memory(index) if transaction_memory => {
-                            self.result.module.transaction_objects.add_tmemory(index);
-                        }
-                        EntityIndex::Global(index) if transaction_global => {
-                            self.result.module.transaction_objects.add_tglobal(index);
-                        }
-                        EntityIndex::Table(index) if transaction_table => {
-                            self.result.module.transaction_objects.add_ttable(index);
-                        }
-                        _ => {}
+                    if transaction_func {
+                        let EntityIndex::Function(index) = index else {
+                            unreachable!()
+                        };
+                        self.result.module.functions[index].is_transactional = true;
                     }
                 }
             }
@@ -506,10 +544,10 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     let sigindex = entry?;
                     let ty = TypeIndex::from_u32(sigindex);
                     let interned_index = self.result.module.types[ty];
-                    let func_index = self.result.module.push_function(interned_index);
-                    if self.is_transactional_func_type(ty) {
-                        self.result.module.transaction_objects.add_tfunc(func_index);
-                    }
+                    self.result.module.push_function_with_transaction(
+                        interned_index,
+                        self.is_transactional_func_type(ty),
+                    );
                 }
             }
 
@@ -517,19 +555,12 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 self.validator.table_section(&tables)?;
                 let cnt = usize::try_from(tables.count()).unwrap();
                 self.result.module.tables.reserve_exact(cnt)?;
+                self.result.module.ttables.reserve_exact(cnt)?;
 
                 for entry in tables {
                     let wasmparser::Table { ty, init } = entry?;
-                    let is_transactional = ty.transaction;
                     let table = self.convert_table_type(&ty)?;
                     self.result.module.needs_gc_heap |= table.ref_type.is_vmgcref_type();
-                    let table_index = self.result.module.tables.push(table)?;
-                    if is_transactional {
-                        self.result
-                            .module
-                            .transaction_objects
-                            .add_ttable(table_index);
-                    }
                     let init = match init {
                         wasmparser::TableInit::RefNull => TableInitialValue::Null,
                         wasmparser::TableInit::Expr(expr) => {
@@ -540,11 +571,27 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                             TableInitialValue::Expr(init)
                         }
                     };
-                    self.result.table_initialization.initial_values.push(init)?;
-                    self.result
-                        .module
-                        .table_initialization
-                        .push(Default::default())?;
+                    match ty.namespace {
+                        EntityNamespace::Ordinary => {
+                            self.result.module.tables.push(table)?;
+                            self.result.table_initialization.initial_values.push(init)?;
+                            self.result
+                                .module
+                                .table_initialization
+                                .push(Default::default())?;
+                        }
+                        EntityNamespace::Transactional => {
+                            self.result.module.ttables.push(table)?;
+                            self.result
+                                .t_table_initialization
+                                .initial_values
+                                .push(init)?;
+                            self.result
+                                .module
+                                .t_table_initialization
+                                .push(Default::default())?;
+                        }
+                    }
                 }
             }
 
@@ -553,16 +600,17 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                 let cnt = usize::try_from(memories.count()).unwrap();
                 self.result.module.memories.reserve_exact(cnt)?;
+                self.result.module.tmemories.reserve_exact(cnt)?;
 
                 for entry in memories {
                     let memory = entry?;
-                    let is_transactional = memory.transaction;
-                    let memory_index = self.result.module.memories.push(memory.into())?;
-                    if is_transactional {
-                        self.result
-                            .module
-                            .transaction_objects
-                            .add_tmemory(memory_index);
+                    match memory.namespace {
+                        EntityNamespace::Ordinary => {
+                            self.result.module.memories.push(memory.into())?;
+                        }
+                        EntityNamespace::Transactional => {
+                            self.result.module.tmemories.push(memory.into())?;
+                        }
                     }
                 }
             }
@@ -586,34 +634,52 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                 let cnt = usize::try_from(globals.count()).unwrap();
                 self.result.module.globals.reserve_exact(cnt)?;
+                self.result.module.tglobals.reserve_exact(cnt)?;
 
                 for entry in globals {
                     let wasmparser::Global { ty, init_expr } = entry?;
-                    let is_transactional = ty.transaction;
+                    let namespace = ty.namespace;
                     let (initializer, escaped) = ConstExpr::from_wasmparser(self, init_expr)?;
                     for f in escaped {
                         self.flag_func_escaped(f);
                     }
                     let ty = self.convert_global_type(&ty)?;
-                    let index = self.result.module.globals.push(ty)?;
-                    if is_transactional {
-                        self.result.module.transaction_objects.add_tglobal(index);
-                    }
-                    let defined_index = self.result.module.defined_global_index(index).unwrap();
-                    match initializer.const_eval() {
-                        Some(val) => {
-                            self.result
-                                .module
-                                .global_initializers
-                                .push((defined_index, val))?;
+                    match namespace {
+                        EntityNamespace::Ordinary => {
+                            let index = self.result.module.globals.push(ty)?;
+                            let defined_index =
+                                self.result.module.defined_global_index(index).unwrap();
+                            match initializer.const_eval() {
+                                Some(val) => self
+                                    .result
+                                    .module
+                                    .global_initializers
+                                    .push((defined_index, val))?,
+                                None => {
+                                    self.require_startup_func();
+                                    self.result
+                                        .global_initializers
+                                        .push((defined_index, initializer));
+                                }
+                            }
                         }
-                        None => {
-                            // "Complicated" global initializers are deferred
-                            // to get evaluated in the startup function.
-                            self.require_startup_func();
-                            self.result
-                                .global_initializers
-                                .push((defined_index, initializer));
+                        EntityNamespace::Transactional => {
+                            let index = self.result.module.tglobals.push(ty)?;
+                            let defined_index =
+                                self.result.module.defined_tglobal_index(index).unwrap();
+                            match initializer.const_eval() {
+                                Some(val) => self
+                                    .result
+                                    .module
+                                    .tglobal_initializers
+                                    .push((defined_index, val))?,
+                                None => {
+                                    self.require_startup_func();
+                                    self.result
+                                        .tglobal_initializers
+                                        .push((defined_index, initializer));
+                                }
+                            }
                         }
                     }
                 }
@@ -634,8 +700,15 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                             EntityIndex::Function(index)
                         }
                         ExternalKind::Table => EntityIndex::Table(TableIndex::from_u32(index)),
+                        ExternalKind::TTable => EntityIndex::TTable(TTableIndex::from_u32(index)),
                         ExternalKind::Memory => EntityIndex::Memory(MemoryIndex::from_u32(index)),
+                        ExternalKind::TMemory => {
+                            EntityIndex::TMemory(TMemoryIndex::from_u32(index))
+                        }
                         ExternalKind::Global => EntityIndex::Global(GlobalIndex::from_u32(index)),
+                        ExternalKind::TGlobal => {
+                            EntityIndex::TGlobal(TGlobalIndex::from_u32(index))
+                        }
                         ExternalKind::Tag => EntityIndex::Tag(TagIndex::from_u32(index)),
                     };
                     let name = self.result.module.strings.insert(name)?;
@@ -658,8 +731,11 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
             Payload::ElementSection(elements) => {
                 self.validator.element_section(&elements)?;
 
-                for (index, entry) in elements.into_iter().enumerate() {
+                let mut ordinary_index = 0;
+                let mut transactional_index = 0;
+                for entry in elements {
                     let wasmparser::Element {
+                        namespace,
                         kind,
                         items,
                         range: _,
@@ -699,45 +775,82 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                         }
                     };
 
-                    let passive_index = match kind {
-                        ElementKind::Active {
-                            table_index,
-                            offset_expr,
-                        } => {
-                            let table_index = TableIndex::from_u32(table_index.unwrap_or(0));
-                            let (offset, escaped) = ConstExpr::from_wasmparser(self, offset_expr)?;
-                            debug_assert!(escaped.is_empty());
-
-                            self.result
-                                .table_initialization
-                                .segments
-                                .push(TableSegment {
+                    match namespace {
+                        EntityNamespace::Ordinary => {
+                            let passive_index = match kind {
+                                ElementKind::Active {
                                     table_index,
-                                    offset,
-                                    elements,
-                                })?;
-                            None
+                                    offset_expr,
+                                } => {
+                                    let table_index =
+                                        TableIndex::from_u32(table_index.unwrap_or(0));
+                                    let (offset, escaped) =
+                                        ConstExpr::from_wasmparser(self, offset_expr)?;
+                                    debug_assert!(escaped.is_empty());
+                                    self.result.table_initialization.segments.push(
+                                        TableSegment {
+                                            table_index,
+                                            offset,
+                                            elements,
+                                        },
+                                    )?;
+                                    None
+                                }
+                                ElementKind::Passive => {
+                                    let passive_index = self
+                                        .result
+                                        .module
+                                        .passive_elements
+                                        .push((elements.ty(), elements.len()))?;
+                                    self.result.passive_elements.push(elements);
+                                    self.require_startup_func();
+                                    Some(passive_index)
+                                }
+                                ElementKind::Declared => None,
+                            };
+                            self.result
+                                .passive_elem_map
+                                .insert(ElemIndex::from_u32(ordinary_index), passive_index);
+                            ordinary_index += 1;
                         }
-
-                        ElementKind::Passive => {
-                            let passive_index = self
-                                .result
-                                .module
-                                .passive_elements
-                                .push((elements.ty(), elements.len()))?;
-                            self.result.passive_elements.push(elements);
-                            // One-time initialization of passive element
-                            // segments is deferred to the startup function.
-                            self.require_startup_func();
-                            Some(passive_index)
+                        EntityNamespace::Transactional => {
+                            let passive_index = match kind {
+                                ElementKind::Active {
+                                    table_index,
+                                    offset_expr,
+                                } => {
+                                    let table_index =
+                                        TTableIndex::from_u32(table_index.unwrap_or(0));
+                                    let (offset, escaped) =
+                                        ConstExpr::from_wasmparser(self, offset_expr)?;
+                                    debug_assert!(escaped.is_empty());
+                                    self.result.t_table_initialization.segments.push(
+                                        TTableSegment {
+                                            table_index,
+                                            offset,
+                                            elements,
+                                        },
+                                    )?;
+                                    None
+                                }
+                                ElementKind::Passive => {
+                                    let passive_index = self
+                                        .result
+                                        .module
+                                        .passive_telements
+                                        .push((elements.ty(), elements.len()))?;
+                                    self.result.passive_telements.push(elements);
+                                    self.require_startup_func();
+                                    Some(passive_index)
+                                }
+                                ElementKind::Declared => None,
+                            };
+                            self.result
+                                .passive_telem_map
+                                .insert(TElemIndex::from_u32(transactional_index), passive_index);
+                            transactional_index += 1;
                         }
-
-                        ElementKind::Declared => None,
-                    };
-                    let elem_index = ElemIndex::from_u32(index as u32);
-                    self.result
-                        .passive_elem_map
-                        .insert(elem_index, passive_index);
+                    }
                 }
             }
 
@@ -790,34 +903,83 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 self.validator.data_section(&data)?;
 
                 assert!(self.result.module.memory_initialization.is_segmented());
+                assert!(self.result.module.t_memory_initialization.is_segmented());
 
-                for (index, entry) in data.into_iter().enumerate() {
+                let mut ordinary_index = 0;
+                let mut transactional_index = 0;
+                for entry in data {
                     let wasmparser::Data {
+                        namespace,
                         kind,
                         data,
                         range: _,
                     } = entry?;
-                    let data_index = DataIndex::from_u32(index.try_into().unwrap());
-                    match kind {
-                        DataKind::Active {
-                            memory_index,
-                            offset_expr,
-                        } => {
-                            let memory_index = MemoryIndex::from_u32(memory_index);
-                            let (offset, escaped) = ConstExpr::from_wasmparser(self, offset_expr)?;
-                            debug_assert!(escaped.is_empty());
-
-                            let MemoryInit::Unprocessed(list) = &mut self.result.memory_init else {
-                                panic!("memory initializers should be unprocessed at this point");
-                            };
-                            list.push(MemoryInitializer {
-                                memory_index,
-                                offset,
-                                data,
-                            });
+                    match namespace {
+                        EntityNamespace::Ordinary => {
+                            let data_index = DataIndex::from_u32(ordinary_index);
+                            ordinary_index += 1;
+                            match kind {
+                                DataKind::Active {
+                                    memory_index,
+                                    offset_expr,
+                                }
+                                | DataKind::ActiveWithMemoryIndex {
+                                    memory_index,
+                                    offset_expr,
+                                } => {
+                                    let memory_index = MemoryIndex::from_u32(memory_index);
+                                    let (offset, escaped) =
+                                        ConstExpr::from_wasmparser(self, offset_expr)?;
+                                    debug_assert!(escaped.is_empty());
+                                    let MemoryInit::Unprocessed(list) =
+                                        &mut self.result.memory_init
+                                    else {
+                                        panic!("memory initializers should be unprocessed")
+                                    };
+                                    list.push(MemoryInitializer {
+                                        memory_index,
+                                        offset,
+                                        data,
+                                    });
+                                }
+                                DataKind::Passive => {
+                                    self.result.passive_data.push((data_index, data));
+                                }
+                            }
                         }
-                        DataKind::Passive => {
-                            self.result.passive_data.push((data_index, data));
+                        EntityNamespace::Transactional => {
+                            let data_index = TDataIndex::from_u32(transactional_index);
+                            transactional_index += 1;
+                            match kind {
+                                DataKind::Active {
+                                    memory_index,
+                                    offset_expr,
+                                }
+                                | DataKind::ActiveWithMemoryIndex {
+                                    memory_index,
+                                    offset_expr,
+                                } => {
+                                    let memory_index = TMemoryIndex::from_u32(memory_index);
+                                    let (offset, escaped) =
+                                        ConstExpr::from_wasmparser(self, offset_expr)?;
+                                    debug_assert!(escaped.is_empty());
+                                    let TMemoryInit::Unprocessed(list) =
+                                        &mut self.result.t_memory_init
+                                    else {
+                                        panic!(
+                                            "transactional memory initializers should be unprocessed"
+                                        )
+                                    };
+                                    list.push(TMemoryInitializer {
+                                        memory_index,
+                                        offset,
+                                        data,
+                                    });
+                                }
+                                DataKind::Passive => {
+                                    self.result.passive_tdata.push((data_index, data));
+                                }
+                            }
                         }
                     }
                 }
@@ -868,10 +1030,10 @@ and for re-adding support for interface types you can see this issue:
     }
 
     fn register_custom_section(&mut self, section: &CustomSectionReader<'data>) -> Result<()> {
-        if section.name() == TRANSACTION_OBJECTS_CUSTOM_SECTION {
-            let metadata = decode_transaction_object_metadata(section.data())?;
-            self.merge_transaction_object_metadata(metadata);
-            return Ok(());
+        if section.name() == "shisoft.transaction.objects" {
+            bail!(
+                "obsolete custom section `shisoft.transaction.objects` is not valid in native transaction modules"
+            );
         }
 
         match section.as_known() {
@@ -916,21 +1078,6 @@ and for re-adding support for interface types you can see this issue:
             .get(ty)
             .copied()
             .unwrap_or(false)
-    }
-
-    fn merge_transaction_object_metadata(&mut self, metadata: TransactionObjectMetadata) {
-        for memory in metadata.memories {
-            self.result.module.transaction_objects.add_tmemory(memory);
-        }
-        for global in metadata.globals {
-            self.result.module.transaction_objects.add_tglobal(global);
-        }
-        for function in metadata.functions {
-            self.result.module.transaction_objects.add_tfunc(function);
-        }
-        for table in metadata.tables {
-            self.result.module.transaction_objects.add_ttable(table);
-        }
     }
 
     fn dwarf_section(&mut self, name: &str, section: &CustomSectionReader<'data>) {
@@ -1026,11 +1173,20 @@ and for re-adding support for interface types you can see this issue:
             EntityType::Table(ty) => {
                 EntityIndex::Table(self.result.module.tables.push(ty).panic_on_oom())
             }
+            EntityType::TTable(ty) => {
+                EntityIndex::TTable(self.result.module.ttables.push(ty).panic_on_oom())
+            }
             EntityType::Memory(ty) => {
                 EntityIndex::Memory(self.result.module.memories.push(ty).panic_on_oom())
             }
+            EntityType::TMemory(ty) => {
+                EntityIndex::TMemory(self.result.module.tmemories.push(ty).panic_on_oom())
+            }
             EntityType::Global(ty) => {
                 EntityIndex::Global(self.result.module.globals.push(ty).panic_on_oom())
+            }
+            EntityType::TGlobal(ty) => {
+                EntityIndex::TGlobal(self.result.module.tglobals.push(ty).panic_on_oom())
             }
             EntityType::Tag(ty) => {
                 EntityIndex::Tag(self.result.module.tags.push(ty).panic_on_oom())
@@ -1200,12 +1356,47 @@ impl ModuleTranslation<'_> {
                 .insert(*data_index, Some(runtime_index));
         }
 
+        // Transactional data has an independent segment space and runtime-data
+        // collection. Keep its dense indices separate even though the final
+        // VMContext stores the two collections contiguously.
+        if let TMemoryInit::Unprocessed(list) = &mut self.t_memory_init {
+            let segments = mem::take(list);
+            let mut new_initializers = Vec::new();
+            for segment in segments {
+                new_initializers.push((
+                    segment.memory_index,
+                    MemorySegmentOffset::Expr(segment.offset),
+                    self.runtime_tdata.push(segment.data.into()),
+                ));
+            }
+            if !new_initializers.is_empty() {
+                self.require_startup_func(types);
+            }
+            self.t_memory_init = TMemoryInit::Processed(new_initializers);
+        }
+        for (data_index, segment) in self.passive_tdata.iter() {
+            let runtime_index = self.runtime_tdata.push((*segment).into());
+            self.runtime_tdata_map
+                .insert(*data_index, Some(runtime_index));
+        }
+
         // And, finally, record all chunks from `self.runtime_data` within
         // `self.module.runtime_data` as well.
         let mut cur = 0;
         for (idx, data) in self.runtime_data.iter() {
             let len = u32::try_from(data.len()).unwrap();
             let i = self.module.runtime_data.push(cur..cur + len).panic_on_oom();
+            cur += len;
+            assert_eq!(idx, i);
+        }
+        let mut cur = 0;
+        for (idx, data) in self.runtime_tdata.iter() {
+            let len = u32::try_from(data.len()).unwrap();
+            let i = self
+                .module
+                .runtime_tdata
+                .push(cur..cur + len)
+                .panic_on_oom();
             cur += len;
             assert_eq!(idx, i);
         }
@@ -1462,6 +1653,15 @@ impl ModuleTranslation<'_> {
     /// `Self::try_func_table_init` to attempt to optimize initialization of
     /// tables into static precomputed images.
     pub fn finalize_table_init(&mut self, tunables: &Tunables, types: &mut ModuleTypesBuilder) {
+        if self
+            .t_table_initialization
+            .initial_values
+            .values()
+            .any(|init| !matches!(init, TableInitialValue::Null))
+            || !self.t_table_initialization.segments.is_empty()
+        {
+            self.require_startup_func(types);
+        }
         if tunables.table_lazy_init {
             self.try_func_table_init();
         }
@@ -1639,8 +1839,322 @@ impl ModuleTranslation<'_> {
 mod tests {
     use super::*;
 
+    fn translate_raw_module(wasm: &[u8]) -> Result<ModuleTranslation<'_>> {
+        let tunables = Tunables::default_u32();
+        let mut validator = Validator::new();
+        let mut types = ModuleTypesBuilder::new(&validator);
+        ModuleEnvironment::new(
+            &tunables,
+            &mut validator,
+            &mut types,
+            StaticModuleIndex::from_u32(0),
+        )
+        .translate(Parser::new(0), wasm)
+    }
+
     #[test]
-    fn translation_records_transaction_object_metadata_section() {
+    fn raw_native_namespaces_keep_entity_and_segment_index_zero_independent() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            // Ordinary table 0 and transactional table 0.
+            0x04, 0x07, 0x02, 0x70, 0x00, 0x00, 0x70, 0x40, 0x00,
+            // Ordinary memory 0 and transactional memory 0.
+            0x05, 0x05, 0x02, 0x00, 0x00, 0x40, 0x00,
+            // Ordinary global 0 and transactional global 0.
+            0x06, 0x0b, 0x02, 0x7f, 0x00, 0x41, 0x01, 0x0b, 0x7f, 0x40, 0x41, 0x02, 0x0b,
+            // Export index zero from each entity namespace.
+            0x07, 0x1f, 0x06, 0x02, b'o', b't', 0x01, 0x00, 0x02, b't', b't', 0x41, 0x00, 0x02,
+            b'o', b'm', 0x02, 0x00, 0x02, b't', b'm', 0x42, 0x00, 0x02, b'o', b'g', 0x03, 0x00,
+            0x02, b't', b'g', 0x43, 0x00,
+            // Ordinary elem 0 initializes ordinary table 0; transactional elem 0 initializes
+            // transactional table 0. Empty segments are sufficient to preserve the targets.
+            0x09, 0x0b, 0x02, 0x00, 0x41, 0x00, 0x0b, 0x00, 0x20, 0x41, 0x00, 0x0b, 0x00,
+            // Ordinary data 0 initializes ordinary memory 0; transactional data 0 initializes
+            // transactional memory 0.
+            0x0b, 0x0d, 0x02, 0x00, 0x41, 0x00, 0x0b, 0x01, b'o', 0x40, 0x41, 0x00, 0x0b, 0x01,
+            b't',
+        ];
+
+        let translation = translate_raw_module(&wasm).unwrap();
+
+        // Each native namespace owns index zero, rather than appending transactional entities
+        // to the ordinary maps and shifting them to index one.
+        assert_eq!(translation.module.tables.len(), 1);
+        assert_eq!(translation.module.ttables.len(), 1);
+        assert_eq!(translation.module.memories.len(), 1);
+        assert_eq!(translation.module.tmemories.len(), 1);
+        assert_eq!(translation.module.globals.len(), 1);
+        assert_eq!(translation.module.tglobals.len(), 1);
+        let offsets = crate::VMOffsets::new(8, &translation.module);
+        assert_eq!(offsets.num_defined_tables, 2);
+        assert_eq!(offsets.num_defined_memories, 2);
+        assert_eq!(offsets.num_defined_globals, 2);
+        assert_ne!(
+            offsets.vmctx_vmtable_definition(crate::DefinedTableIndex::from_u32(0)),
+            offsets.vmctx_vmtable_definition(
+                translation
+                    .module
+                    .runtime_defined_ttable_index(crate::DefinedTTableIndex::from_u32(0)),
+            )
+        );
+        assert_ne!(
+            offsets.vmctx_vmmemory_pointer(crate::DefinedMemoryIndex::from_u32(0)),
+            offsets.vmctx_vmmemory_pointer(
+                translation
+                    .module
+                    .runtime_defined_tmemory_index(crate::DefinedTMemoryIndex::from_u32(0)),
+            )
+        );
+        assert_ne!(
+            offsets.vmctx_vmglobal_definition(crate::DefinedGlobalIndex::from_u32(0)),
+            offsets.vmctx_vmglobal_definition(
+                translation
+                    .module
+                    .runtime_defined_tglobal_index(crate::DefinedTGlobalIndex::from_u32(0)),
+            )
+        );
+        assert_eq!(translation.table_initialization.segments.len(), 1);
+        assert_eq!(translation.t_table_initialization.segments.len(), 1);
+        assert_eq!(
+            translation.t_table_initialization.segments[0].table_index,
+            TTableIndex::from_u32(0)
+        );
+        let MemoryInit::Unprocessed(memory_init) = translation.memory_init else {
+            panic!("ordinary memory initialization was prematurely finalized")
+        };
+        assert_eq!(memory_init[0].memory_index, MemoryIndex::from_u32(0));
+        let TMemoryInit::Unprocessed(tmemory_init) = translation.t_memory_init else {
+            panic!("transactional memory initialization was prematurely finalized")
+        };
+        assert_eq!(tmemory_init[0].memory_index, TMemoryIndex::from_u32(0));
+        assert!(
+            translation
+                .module
+                .exports
+                .values()
+                .any(|e| *e == EntityIndex::TTable(TTableIndex::from_u32(0)))
+        );
+        assert!(
+            translation
+                .module
+                .exports
+                .values()
+                .any(|e| *e == EntityIndex::TMemory(TMemoryIndex::from_u32(0)))
+        );
+        assert!(
+            translation
+                .module
+                .exports
+                .values()
+                .any(|e| *e == EntityIndex::TGlobal(TGlobalIndex::from_u32(0)))
+        );
+    }
+
+    #[test]
+    fn raw_native_import_slots_keep_index_zero_independent() {
+        use wasm_encoder::{
+            EntityNamespace as Ns, EntityType as EncEntityType, GlobalType as EncGlobalType,
+            ImportSection, MemoryType as EncMemoryType, Module as EncModule, RefType,
+            TableType as EncTableType, ValType,
+        };
+
+        let table = |namespace| EncTableType {
+            element_type: RefType::FUNCREF,
+            namespace,
+            table64: false,
+            minimum: 0,
+            maximum: None,
+            shared: false,
+        };
+        let memory = |namespace| EncMemoryType {
+            namespace,
+            minimum: 0,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        };
+        let global = |namespace| EncGlobalType {
+            val_type: ValType::I32,
+            namespace,
+            mutable: false,
+            shared: false,
+        };
+        let mut imports = ImportSection::new();
+        imports.import("m", "ot", EncEntityType::Table(table(Ns::Ordinary)));
+        imports.import("m", "tt", EncEntityType::TTable(table(Ns::Transactional)));
+        imports.import("m", "om", EncEntityType::Memory(memory(Ns::Ordinary)));
+        imports.import("m", "tm", EncEntityType::TMemory(memory(Ns::Transactional)));
+        imports.import("m", "og", EncEntityType::Global(global(Ns::Ordinary)));
+        imports.import("m", "tg", EncEntityType::TGlobal(global(Ns::Transactional)));
+        let mut module = EncModule::new();
+        module.section(&imports);
+
+        let wasm = module.finish();
+        let translation = translate_raw_module(&wasm).unwrap();
+        assert_eq!(translation.module.num_imported_tables, 1);
+        assert_eq!(translation.module.num_imported_ttables, 1);
+        assert_eq!(translation.module.num_imported_memories, 1);
+        assert_eq!(translation.module.num_imported_tmemories, 1);
+        assert_eq!(translation.module.num_imported_globals, 1);
+        assert_eq!(translation.module.num_imported_tglobals, 1);
+        let offsets = crate::VMOffsets::new(8, &translation.module);
+        assert_eq!(offsets.num_imported_tables, 2);
+        assert_eq!(offsets.num_imported_memories, 2);
+        assert_eq!(offsets.num_imported_globals, 2);
+        let indices = translation
+            .module
+            .initializers
+            .iter()
+            .map(|init| match init {
+                Initializer::Import { index, .. } => *index,
+            });
+        assert_eq!(
+            indices.collect::<Vec<_>>(),
+            vec![
+                EntityIndex::Table(TableIndex::from_u32(0)),
+                EntityIndex::TTable(TTableIndex::from_u32(0)),
+                EntityIndex::Memory(MemoryIndex::from_u32(0)),
+                EntityIndex::TMemory(TMemoryIndex::from_u32(0)),
+                EntityIndex::Global(GlobalIndex::from_u32(0)),
+                EntityIndex::TGlobal(TGlobalIndex::from_u32(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_native_passive_segments_keep_index_zero_independent() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x04, 0x07, 0x02, 0x70, 0x00, 0x00, 0x70, 0x40, 0x00, // tables
+            0x05, 0x05, 0x02, 0x00, 0x00, 0x40, 0x00, // memories
+            0x09, 0x07, 0x02, 0x01, 0x00, 0x00, 0x21, 0x00, 0x00, // elem 0 / telem 0
+            0x0b, 0x07, 0x02, 0x01, 0x01, b'o', 0x41, 0x01, b't', // data 0 / tdata 0
+        ];
+        let translation = translate_raw_module(&wasm).unwrap();
+        assert_eq!(
+            translation.passive_elem_map[ElemIndex::from_u32(0)],
+            Some(PassiveElemIndex::from_u32(0))
+        );
+        assert_eq!(
+            translation.passive_telem_map[TElemIndex::from_u32(0)],
+            Some(PassiveTElemIndex::from_u32(0))
+        );
+        assert_eq!(translation.passive_data[0].0, DataIndex::from_u32(0));
+        assert_eq!(translation.passive_tdata[0].0, TDataIndex::from_u32(0));
+    }
+
+    #[test]
+    fn raw_active_segments_cannot_cross_entity_namespaces() {
+        let telem_without_ttable = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x04, 0x04, 0x01, 0x70, 0x00, 0x00, // only ordinary table 0
+            0x09, 0x06, 0x01, 0x20, 0x41, 0x00, 0x0b, 0x00, // telem -> ttable 0
+        ];
+        assert!(translate_raw_module(&telem_without_ttable).is_err());
+
+        let data_without_memory = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x05, 0x03, 0x01, 0x40, 0x00, // only transactional memory 0
+            0x0b, 0x06, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x00, // data -> ordinary memory 0
+        ];
+        assert!(translate_raw_module(&data_without_memory).is_err());
+    }
+
+    #[test]
+    fn tglobal_get_const_expr_uses_only_preceding_immutable_tglobals() {
+        let valid =
+            wat::parse_str("(module (tglobal i32 (i32.const 7)) (tglobal i32 (tglobal.get 0)))")
+                .unwrap();
+        let translation = translate_raw_module(&valid).unwrap();
+        assert_eq!(translation.module.tglobal_initializers.len(), 1);
+        assert_eq!(translation.tglobal_initializers.len(), 1);
+        assert!(matches!(
+            translation.tglobal_initializers[0].1.ops(),
+            [ConstOp::TGlobalGet(index)] if *index == TGlobalIndex::from_u32(0)
+        ));
+
+        for invalid in [
+            "(module (tglobal (mut i32) (i32.const 0)) (tglobal i32 (tglobal.get 0)))",
+            "(module (tglobal i32 (tglobal.get 1)) (tglobal i32 (i32.const 0)))",
+            "(module (global i32 (i32.const 0)) (tglobal i32 (tglobal.get 0)))",
+            "(module (tglobal i32 (i32.const 0)) (global i32 (global.get 0)))",
+        ] {
+            let wasm = wat::parse_str(invalid).unwrap();
+            assert!(translate_raw_module(&wasm).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn tref_null_const_expr_lowers_like_ordinary_ref_null() {
+        let ordinary =
+            wat::parse_str("(module (type $s (struct)) (global (ref null $s) (ref.null $s)))")
+                .unwrap();
+        let ordinary = translate_raw_module(&ordinary).unwrap();
+        assert!(matches!(
+            ordinary.global_initializers[0].1.ops(),
+            [ConstOp::RefNull(_)]
+        ));
+
+        let transaction =
+            wat::parse_str("(module (type $s (tstruct)) (tglobal (tref null $s) (tref.null $s)))")
+                .unwrap();
+        let transaction = translate_raw_module(&transaction).unwrap();
+        assert!(matches!(
+            transaction.tglobal_initializers[0].1.ops(),
+            [ConstOp::RefNull(_)]
+        ));
+    }
+
+    #[test]
+    fn old_transaction_metadata_custom_section_is_rejected() {
+        let name = b"shisoft.transaction.objects";
+        let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let payload_len = 1 + name.len() + 3;
+        wasm.push(u8::try_from(payload_len).unwrap());
+        wasm.push(u8::try_from(name.len()).unwrap());
+        wasm.extend_from_slice(name);
+        wasm.extend_from_slice(&[1, 0, 0]);
+
+        let error = match translate_raw_module(&wasm) {
+            Ok(_) => panic!("obsolete transaction metadata was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("shisoft.transaction.objects"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn historical_transaction_table_bytes_never_create_a_ttable() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            // Historically `f0 7d 00` acted as a ttable marker. In the native
+            // format it is a tref-tfunc element type with permission `none`.
+            0x04, 0x06, 0x01, 0xf0, 0x7d, 0x00, 0x00, 0x00,
+        ];
+        let translation = translate_raw_module(&wasm).unwrap();
+        assert_eq!(translation.module.tables.len(), 1);
+        assert_eq!(translation.module.ttables.len(), 0);
+    }
+
+    #[test]
+    fn ordinary_table_minimum_that_contains_legacy_marker_bytes_is_accepted() {
+        let wasm = wat::parse_str("(module (table 16112 funcref))").unwrap();
+        let translation = translate_raw_module(&wasm).unwrap();
+        assert_eq!(translation.module.tables.len(), 1);
+        assert_eq!(translation.module.ttables.len(), 0);
+        assert_eq!(
+            translation.module.tables[TableIndex::from_u32(0)]
+                .limits
+                .min,
+            16112
+        );
+    }
+
+    #[test]
+    fn translation_records_native_transaction_entities() {
         let wasm = wat::parse_str(
             r#"
             (module
@@ -1663,34 +2177,19 @@ mod tests {
         .translate(Parser::new(0), &wasm)
         .unwrap();
 
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_tmemory(MemoryIndex::from_u32(0))
-        );
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_tglobal(GlobalIndex::from_u32(0))
-        );
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_tfunc(FuncIndex::from_u32(0))
-        );
+        assert_eq!(translation.module.tmemories.len(), 1);
+        assert_eq!(translation.module.tglobals.len(), 1);
+        assert!(translation.module.is_tfunc(FuncIndex::from_u32(0)));
     }
 
     #[test]
-    fn translation_records_transactional_binary_metadata() {
+    fn translation_records_native_transactional_binary_sections() {
         let wasm = [
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
             0x01, 0x05, 0x01, 0xe0, 0x7d, 0x00, 0x00, // tfunc type
             0x03, 0x02, 0x01, 0x00, // one function with type 0
-            0x04, 0x06, 0x01, 0xf0, 0x7d, 0x00, 0x00, 0x00, // one ttable
-            0x05, 0x03, 0x01, 0x40, 0x00, // one tmemory
+            0x04, 0x04, 0x01, 0x70, 0x40, 0x00, // one native ttable
+            0x05, 0x03, 0x01, 0x40, 0x00, // one native tmemory
             0x06, 0x06, 0x01, 0x7f, 0x40, 0x41, 0x00, 0x0b, // one tglobal
             0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // empty function body
         ];
@@ -1706,30 +2205,10 @@ mod tests {
         .translate(Parser::new(0), &wasm)
         .unwrap();
 
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_tfunc(FuncIndex::from_u32(0))
-        );
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_ttable(TableIndex::from_u32(0))
-        );
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_tmemory(MemoryIndex::from_u32(0))
-        );
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_tglobal(GlobalIndex::from_u32(0))
-        );
+        assert!(translation.module.is_tfunc(FuncIndex::from_u32(0)));
+        assert_eq!(translation.module.ttables.len(), 1);
+        assert_eq!(translation.module.tmemories.len(), 1);
+        assert_eq!(translation.module.tglobals.len(), 1);
     }
 
     #[test]
@@ -1754,11 +2233,7 @@ mod tests {
         .translate(Parser::new(0), &wasm)
         .unwrap();
 
-        assert!(
-            translation
-                .module
-                .transaction_objects
-                .is_ttable(TableIndex::from_u32(0))
-        );
+        assert_eq!(translation.module.tables.len(), 1);
+        assert_eq!(translation.module.ttables.len(), 0);
     }
 }

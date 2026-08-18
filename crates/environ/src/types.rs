@@ -1589,10 +1589,20 @@ entity_impl_with_try_clone!(DefinedFuncIndex);
 pub struct DefinedTableIndex(u32);
 entity_impl_with_try_clone!(DefinedTableIndex);
 
+/// Index type of a defined transactional table inside the WebAssembly module.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct DefinedTTableIndex(u32);
+entity_impl_with_try_clone!(DefinedTTableIndex);
+
 /// Index type of a defined memory inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct DefinedMemoryIndex(u32);
 entity_impl_with_try_clone!(DefinedMemoryIndex);
+
+/// Index type of a defined transactional memory inside the WebAssembly module.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct DefinedTMemoryIndex(u32);
+entity_impl_with_try_clone!(DefinedTMemoryIndex);
 
 /// Index type of a defined memory inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
@@ -1604,20 +1614,40 @@ entity_impl_with_try_clone!(OwnedMemoryIndex);
 pub struct DefinedGlobalIndex(u32);
 entity_impl_with_try_clone!(DefinedGlobalIndex);
 
+/// Index type of a defined transactional global inside the WebAssembly module.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct DefinedTGlobalIndex(u32);
+entity_impl_with_try_clone!(DefinedTGlobalIndex);
+
 /// Index type of a table (imported or defined) inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct TableIndex(u32);
 entity_impl_with_try_clone!(TableIndex);
+
+/// Index type of a transactional table (imported or defined).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct TTableIndex(u32);
+entity_impl_with_try_clone!(TTableIndex);
 
 /// Index type of a global variable (imported or defined) inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct GlobalIndex(u32);
 entity_impl_with_try_clone!(GlobalIndex);
 
+/// Index type of a transactional global variable (imported or defined).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct TGlobalIndex(u32);
+entity_impl_with_try_clone!(TGlobalIndex);
+
 /// Index type of a linear memory (imported or defined) inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct MemoryIndex(u32);
 entity_impl_with_try_clone!(MemoryIndex);
+
+/// Index type of a transactional linear memory (imported or defined).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct TMemoryIndex(u32);
+entity_impl_with_try_clone!(TMemoryIndex);
 
 /// Index type of a canonicalized recursive type group inside a WebAssembly
 /// module (as opposed to canonicalized within the whole engine).
@@ -1699,6 +1729,11 @@ impl Default for VMSharedTypeIndex {
 pub struct DataIndex(u32);
 entity_impl_with_try_clone!(DataIndex);
 
+/// Index type of a transactional data segment inside the WebAssembly module.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct TDataIndex(u32);
+entity_impl_with_try_clone!(TDataIndex);
+
 /// Index into data segments needed at runtime by a module.
 ///
 /// This does not directly correspond to either active or passive data segments
@@ -1713,10 +1748,20 @@ entity_impl_with_try_clone!(DataIndex);
 pub struct RuntimeDataIndex(u32);
 entity_impl_with_try_clone!(RuntimeDataIndex);
 
+/// Dense runtime index for transactional data segments.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct RuntimeTDataIndex(u32);
+entity_impl_with_try_clone!(RuntimeTDataIndex);
+
 /// Index type of an element segment inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct ElemIndex(u32);
 entity_impl_with_try_clone!(ElemIndex);
+
+/// Index type of a transactional element segment inside the WebAssembly module.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct TElemIndex(u32);
+entity_impl_with_try_clone!(TElemIndex);
 
 /// Dense index space of the subset of element segments that are passive.
 ///
@@ -1725,6 +1770,11 @@ entity_impl_with_try_clone!(ElemIndex);
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct PassiveElemIndex(u32);
 entity_impl_with_try_clone!(PassiveElemIndex);
+
+/// Dense runtime index of passive transactional element segments.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct PassiveTElemIndex(u32);
+entity_impl_with_try_clone!(PassiveTElemIndex);
 
 /// Index type of a defined tag inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
@@ -1751,10 +1801,16 @@ pub enum EntityIndex {
     Function(FuncIndex),
     /// Table index.
     Table(TableIndex),
+    /// Transactional table index.
+    TTable(TTableIndex),
     /// Memory index.
     Memory(MemoryIndex),
+    /// Transactional memory index.
+    TMemory(TMemoryIndex),
     /// Global index.
     Global(GlobalIndex),
+    /// Transactional global index.
+    TGlobal(TGlobalIndex),
     /// Tag index.
     Tag(TagIndex),
 }
@@ -1771,15 +1827,33 @@ impl From<TableIndex> for EntityIndex {
     }
 }
 
+impl From<TTableIndex> for EntityIndex {
+    fn from(idx: TTableIndex) -> EntityIndex {
+        EntityIndex::TTable(idx)
+    }
+}
+
 impl From<MemoryIndex> for EntityIndex {
     fn from(idx: MemoryIndex) -> EntityIndex {
         EntityIndex::Memory(idx)
     }
 }
 
+impl From<TMemoryIndex> for EntityIndex {
+    fn from(idx: TMemoryIndex) -> EntityIndex {
+        EntityIndex::TMemory(idx)
+    }
+}
+
 impl From<GlobalIndex> for EntityIndex {
     fn from(idx: GlobalIndex) -> EntityIndex {
         EntityIndex::Global(idx)
+    }
+}
+
+impl From<TGlobalIndex> for EntityIndex {
+    fn from(idx: TGlobalIndex) -> EntityIndex {
+        EntityIndex::TGlobal(idx)
     }
 }
 
@@ -1795,12 +1869,18 @@ impl From<TagIndex> for EntityIndex {
 pub enum EntityType {
     /// A global variable with the specified content type
     Global(Global),
+    /// A transactional global variable with the specified content type.
+    TGlobal(Global),
     /// A linear memory with the specified limits
     Memory(Memory),
+    /// A transactional linear memory with the specified limits.
+    TMemory(Memory),
     /// An exception and control tag definition.
     Tag(Tag),
     /// A table with the specified element type and limits
     Table(Table),
+    /// A transactional table with the specified element type and limits.
+    TTable(Table),
     /// A function type where the index points to the type section and records a
     /// function signature.
     Function(EngineOrModuleTypeIndex),
@@ -1812,10 +1892,10 @@ impl TypeTrace for EntityType {
         F: FnMut(EngineOrModuleTypeIndex) -> Result<(), E>,
     {
         match self {
-            Self::Global(g) => g.trace(func),
-            Self::Table(t) => t.trace(func),
+            Self::Global(g) | Self::TGlobal(g) => g.trace(func),
+            Self::Table(t) | Self::TTable(t) => t.trace(func),
             Self::Function(idx) => func(*idx),
-            Self::Memory(_) => Ok(()),
+            Self::Memory(_) | Self::TMemory(_) => Ok(()),
             Self::Tag(t) => t.trace(func),
         }
     }
@@ -1825,10 +1905,10 @@ impl TypeTrace for EntityType {
         F: FnMut(&mut EngineOrModuleTypeIndex) -> Result<(), E>,
     {
         match self {
-            Self::Global(g) => g.trace_mut(func),
-            Self::Table(t) => t.trace_mut(func),
+            Self::Global(g) | Self::TGlobal(g) => g.trace_mut(func),
+            Self::Table(t) | Self::TTable(t) => t.trace_mut(func),
             Self::Function(idx) => func(idx),
-            Self::Memory(_) => Ok(()),
+            Self::Memory(_) | Self::TMemory(_) => Ok(()),
             Self::Tag(t) => t.trace_mut(func),
         }
     }
@@ -1838,7 +1918,7 @@ impl EntityType {
     /// Assert that this entity is a global
     pub fn unwrap_global(&self) -> &Global {
         match self {
-            EntityType::Global(g) => g,
+            EntityType::Global(g) | EntityType::TGlobal(g) => g,
             _ => panic!("not a global"),
         }
     }
@@ -1846,7 +1926,7 @@ impl EntityType {
     /// Assert that this entity is a memory
     pub fn unwrap_memory(&self) -> &Memory {
         match self {
-            EntityType::Memory(g) => g,
+            EntityType::Memory(g) | EntityType::TMemory(g) => g,
             _ => panic!("not a memory"),
         }
     }
@@ -1862,7 +1942,7 @@ impl EntityType {
     /// Assert that this entity is a table
     pub fn unwrap_table(&self) -> &Table {
         match self {
-            EntityType::Table(g) => g,
+            EntityType::Table(g) | EntityType::TTable(g) => g,
             _ => panic!("not a table"),
         }
     }
@@ -2032,6 +2112,7 @@ pub enum ConstOp {
     F64Const(u64),
     V128Const(u128),
     GlobalGet(GlobalIndex),
+    TGlobalGet(TGlobalIndex),
     RefI31,
     RefNull(WasmHeapType),
     RefFunc(FuncIndex),
@@ -2091,10 +2172,12 @@ impl ConstOp {
             O::F32Const { value } => Self::F32Const(value.bits()),
             O::F64Const { value } => Self::F64Const(value.bits()),
             O::V128Const { value } => Self::V128Const(u128::from_le_bytes(*value.bytes())),
-            O::RefNull { hty } => Self::RefNull(env.convert_heap_type(hty)?),
+            O::RefNull { hty } | O::TRefNull { hty } => Self::RefNull(env.convert_heap_type(hty)?),
             O::RefFunc { function_index } => Self::RefFunc(FuncIndex::from_u32(function_index)),
             O::GlobalGet { global_index } => Self::GlobalGet(GlobalIndex::from_u32(global_index)),
-            O::TGlobalGet { global_index } => Self::GlobalGet(GlobalIndex::from_u32(global_index)),
+            O::TGlobalGet { global_index } => {
+                Self::TGlobalGet(TGlobalIndex::from_u32(global_index))
+            }
             O::RefI31 | O::TRefI31 => Self::RefI31,
             O::I32Add => Self::I32Add,
             O::I32Sub => Self::I32Sub,
@@ -2530,10 +2613,12 @@ pub trait TypeConvert {
             wasmparser::CompositeInnerType::Func(f) => {
                 WasmCompositeInnerType::Func(self.convert_func_type(f)?)
             }
-            wasmparser::CompositeInnerType::Array(a) => {
+            wasmparser::CompositeInnerType::Array(a)
+            | wasmparser::CompositeInnerType::TArray(a) => {
                 WasmCompositeInnerType::Array(self.convert_array_type(a)?)
             }
-            wasmparser::CompositeInnerType::Struct(s) => {
+            wasmparser::CompositeInnerType::Struct(s)
+            | wasmparser::CompositeInnerType::TStruct(s) => {
                 WasmCompositeInnerType::Struct(self.convert_struct_type(s)?)
             }
             wasmparser::CompositeInnerType::Cont(c) => {
@@ -2638,6 +2723,16 @@ pub trait TypeConvert {
                 wasmparser::AbstractHeapType::NoCont => WasmHeapType::NoCont,
                 wasmparser::AbstractHeapType::Exn => WasmHeapType::Exn,
                 wasmparser::AbstractHeapType::NoExn => WasmHeapType::NoExn,
+                wasmparser::AbstractHeapType::TExtern => WasmHeapType::Extern,
+                wasmparser::AbstractHeapType::TNoExtern => WasmHeapType::NoExtern,
+                wasmparser::AbstractHeapType::TFunc => WasmHeapType::Func,
+                wasmparser::AbstractHeapType::TNoFunc => WasmHeapType::NoFunc,
+                wasmparser::AbstractHeapType::TAny => WasmHeapType::Any,
+                wasmparser::AbstractHeapType::TEq => WasmHeapType::Eq,
+                wasmparser::AbstractHeapType::TI31 => WasmHeapType::I31,
+                wasmparser::AbstractHeapType::TArray => WasmHeapType::Array,
+                wasmparser::AbstractHeapType::TStruct => WasmHeapType::Struct,
+                wasmparser::AbstractHeapType::TNone => WasmHeapType::None,
             },
             _ => return Err(wasm_unsupported!("unsupported heap type {ty:?}")),
         })

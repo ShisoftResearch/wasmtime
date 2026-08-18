@@ -1,13 +1,12 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
 use wasm_encoder::reencode::{Error as ReencodeError, Reencode, RoundtripReencoder};
 use wasm_encoder::{
-    CodeSection, CustomSection, Encode, Function, ImportSection, Instruction, Module, RawSection,
-    ValType,
+    CodeSection, CustomSection, DataSegment, DataSegmentMode, EntityNamespace, Function,
+    ImportSection, Instruction, Module, RawSection, ValType,
 };
 use wasmparser::{BinaryReader, CodeSectionReader, Operator, Parser, Payload, TypeRef};
 
@@ -16,8 +15,7 @@ const PERSISTENT_ADDR_MUT: &str = "__twasm_persistent_addr_mut";
 const MARK_TRANSACTION_FUNC: &str = "__twasm_mark_transaction_func";
 const MARK_PERSISTENT_ARG: &str = "__twasm_mark_persistent_arg";
 const NAME_CUSTOM_SECTION: &str = "name";
-const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
-const TRANSACTION_OBJECTS_VERSION: u8 = 1;
+const OBSOLETE_TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 const PERSISTENT_ADDR_MASK: i64 = 0x0fff_ffff_ffff_ffff;
 
 #[derive(Debug, Default, Serialize, Eq, PartialEq)]
@@ -50,15 +48,18 @@ struct FuncSig {
 #[derive(Debug, Default)]
 struct ModuleLayout {
     type_sigs: Vec<FuncSig>,
+    encoded_func_types: Vec<wasm_encoder::FuncType>,
     func_index_map: Vec<Option<u32>>,
     func_sigs: Vec<FuncSig>,
+    func_type_indices: Vec<u32>,
     intrinsic_imports: BTreeMap<u32, IntrinsicKind>,
     transaction_func_markers: BTreeSet<u32>,
     persistent_param_markers: BTreeMap<u32, BTreeSet<u32>>,
     function_return_taints: BTreeMap<u32, Vec<bool>>,
     function_param_store_taints: BTreeMap<u32, BTreeMap<ParamStoreSlot, bool>>,
     imported_function_count: u32,
-    has_memory_zero: bool,
+    memory_count: u32,
+    has_imported_memory: bool,
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +84,7 @@ impl PersistentArgMarker {
 
 struct IndexRemapper {
     func_index_map: Vec<Option<u32>>,
+    transaction_type_indices: BTreeMap<u32, u32>,
 }
 
 #[derive(Debug)]
@@ -97,8 +99,11 @@ impl fmt::Display for RemapError {
 impl StdError for RemapError {}
 
 impl IndexRemapper {
-    fn new(func_index_map: Vec<Option<u32>>) -> Self {
-        Self { func_index_map }
+    fn new(func_index_map: Vec<Option<u32>>, transaction_type_indices: BTreeMap<u32, u32>) -> Self {
+        Self {
+            func_index_map,
+            transaction_type_indices,
+        }
     }
 
     fn remap_function_index(
@@ -130,7 +135,35 @@ impl Reencode for IndexRemapper {
 
 pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
     let layout = analyze_module(input)?;
-    let mut remapper = IndexRemapper::new(layout.func_index_map.clone());
+    let native_rewrite = !layout.transaction_func_markers.is_empty()
+        || layout
+            .intrinsic_imports
+            .values()
+            .any(|kind| matches!(kind, IntrinsicKind::PersistentAddrMut));
+    if native_rewrite && layout.has_imported_memory {
+        bail!("native transaction rewrite does not support an imported source memory");
+    }
+    if native_rewrite && layout.memory_count != 1 {
+        bail!(
+            "native transaction rewrite requires exactly one source memory, found {}",
+            layout.memory_count
+        );
+    }
+    let mut transaction_source_types = BTreeSet::new();
+    for function in &layout.transaction_func_markers {
+        let ty = *layout
+            .func_type_indices
+            .get(*function as usize)
+            .context("transaction function referenced missing type")?;
+        transaction_source_types.insert(ty);
+    }
+    let mut transaction_type_indices = BTreeMap::new();
+    for (ordinal, ty) in transaction_source_types.into_iter().enumerate() {
+        let next = u32::try_from(layout.type_sigs.len() + ordinal)
+            .context("transaction function type index overflow")?;
+        transaction_type_indices.insert(ty, next);
+    }
+    let mut remapper = IndexRemapper::new(layout.func_index_map.clone(), transaction_type_indices);
     let mut module = Module::new();
     let mut report = RewriteReport::default();
     let mut transaction_functions = BTreeSet::new();
@@ -147,6 +180,19 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
             Payload::TypeSection(section) => {
                 let mut types = wasm_encoder::TypeSection::new();
                 remapper.parse_type_section(&mut types, section)?;
+                for (source, transaction) in &remapper.transaction_type_indices {
+                    let ty = layout
+                        .encoded_func_types
+                        .get(*source as usize)
+                        .context("transaction function referenced non-function type")?;
+                    debug_assert_eq!(u32::try_from(types.len()).unwrap(), *transaction);
+                    let ty = wasm_encoder::FuncType::new_with_transaction(
+                        ty.params().iter().copied(),
+                        ty.results().iter().copied(),
+                        true,
+                    );
+                    types.ty().func_type(&ty);
+                }
                 module.section(&types);
             }
             Payload::ImportSection(section) => {
@@ -158,7 +204,20 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
             }
             Payload::FunctionSection(section) => {
                 let mut functions = wasm_encoder::FunctionSection::new();
-                remapper.parse_function_section(&mut functions, section)?;
+                for (defined, ty) in section.into_iter().enumerate() {
+                    let ty = ty?;
+                    let old = layout.imported_function_count
+                        + u32::try_from(defined).context("defined function index overflow")?;
+                    let ty = if layout.transaction_func_markers.contains(&old) {
+                        *remapper
+                            .transaction_type_indices
+                            .get(&ty)
+                            .context("missing native transaction function type")?
+                    } else {
+                        remapper.type_index(ty)?
+                    };
+                    functions.function(ty);
+                }
                 module.section(&functions);
             }
             Payload::TableSection(section) => {
@@ -168,7 +227,15 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
             }
             Payload::MemorySection(section) => {
                 let mut memories = wasm_encoder::MemorySection::new();
+                let transactional = section.clone();
                 remapper.parse_memory_section(&mut memories, section)?;
+                if native_rewrite {
+                    for memory in transactional {
+                        let mut ty = remapper.memory_type(memory?)?;
+                        ty.namespace = EntityNamespace::Transactional;
+                        memories.memory(ty);
+                    }
+                }
                 module.section(&memories);
             }
             Payload::TagSection(section) => {
@@ -198,12 +265,59 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
             }
             Payload::DataCountSection { count, .. } => {
                 module.section(&wasm_encoder::DataCountSection {
-                    count: remapper.data_count(count)?,
+                    count: remapper.data_count(if native_rewrite {
+                        count.checked_mul(2).context("native data count overflow")?
+                    } else {
+                        count
+                    })?,
                 });
             }
             Payload::DataSection(section) => {
                 let mut data = wasm_encoder::DataSection::new();
+                let transactional = section.clone();
                 remapper.parse_data_section(&mut data, section)?;
+                if native_rewrite {
+                    for datum in transactional {
+                        let datum = datum?;
+                        match datum.kind {
+                            wasmparser::DataKind::Active {
+                                memory_index,
+                                offset_expr,
+                            } => {
+                                let offset = remapper.const_expr(offset_expr)?;
+                                data.segment(DataSegment {
+                                    namespace: EntityNamespace::Transactional,
+                                    mode: DataSegmentMode::Active {
+                                        memory_index: remapper.memory_index(memory_index)?,
+                                        offset: &offset,
+                                    },
+                                    data: datum.data.iter().copied(),
+                                });
+                            }
+                            wasmparser::DataKind::ActiveWithMemoryIndex {
+                                memory_index,
+                                offset_expr,
+                            } => {
+                                let offset = remapper.const_expr(offset_expr)?;
+                                data.segment(DataSegment {
+                                    namespace: EntityNamespace::Transactional,
+                                    mode: DataSegmentMode::ActiveWithMemoryIndex {
+                                        memory_index: remapper.memory_index(memory_index)?,
+                                        offset: &offset,
+                                    },
+                                    data: datum.data.iter().copied(),
+                                });
+                            }
+                            wasmparser::DataKind::Passive => {
+                                data.segment(DataSegment {
+                                    namespace: EntityNamespace::Transactional,
+                                    mode: DataSegmentMode::Passive,
+                                    data: datum.data.iter().copied(),
+                                });
+                            }
+                        }
+                    }
+                }
                 module.section(&data);
             }
             Payload::CodeSectionStart { range, .. } => {
@@ -234,7 +348,10 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
             Payload::CodeSectionEntry(_) => {}
             Payload::CustomSection(section) => {
                 let name = section.name();
-                if name == NAME_CUSTOM_SECTION || name == TRANSACTION_OBJECTS_CUSTOM_SECTION {
+                if name == OBSOLETE_TRANSACTION_OBJECTS_CUSTOM_SECTION {
+                    bail!("obsolete shisoft.transaction.objects metadata is not accepted");
+                }
+                if name == NAME_CUSTOM_SECTION {
                     continue;
                 }
                 module.section(&CustomSection::from(section));
@@ -252,30 +369,7 @@ pub fn rewrite_module(input: &[u8]) -> Result<(Vec<u8>, RewriteReport)> {
         }
     }
 
-    if layout.has_memory_zero && needs_transaction_metadata(&report, &transaction_functions) {
-        let metadata = encode_transaction_objects(&transaction_functions);
-        module.section(&CustomSection {
-            name: Cow::Borrowed(TRANSACTION_OBJECTS_CUSTOM_SECTION),
-            data: Cow::Owned(metadata),
-        });
-    }
-
     Ok((module.finish(), report))
-}
-
-fn needs_transaction_metadata(
-    report: &RewriteReport,
-    transaction_functions: &BTreeSet<u32>,
-) -> bool {
-    !transaction_functions.is_empty()
-        || report.i32_tloads != 0
-        || report.i64_tloads != 0
-        || report.f32_tloads != 0
-        || report.f64_tloads != 0
-        || report.i32_tstores != 0
-        || report.i64_tstores != 0
-        || report.f32_tstores != 0
-        || report.f64_tstores != 0
 }
 
 fn analyze_module(input: &[u8]) -> Result<ModuleLayout> {
@@ -289,8 +383,12 @@ fn analyze_module(input: &[u8]) -> Result<ModuleLayout> {
         let payload = payload.context("failed to parse wasm payload")?;
         match payload {
             Payload::TypeSection(section) => {
+                let mut reencoder = RoundtripReencoder;
                 for ty in section.into_iter_err_on_gc_types() {
                     let ty = ty?;
+                    layout
+                        .encoded_func_types
+                        .push(reencoder.func_type(ty.clone())?);
                     layout.type_sigs.push(FuncSig {
                         params: ty.params().len(),
                         results: ty.results().len(),
@@ -307,6 +405,7 @@ fn analyze_module(input: &[u8]) -> Result<ModuleLayout> {
                                 .get(type_index as usize)
                                 .context("function import referenced missing type")?;
                             layout.func_sigs.push(sig);
+                            layout.func_type_indices.push(type_index);
                             let intrinsic = intrinsic_kind(module, name);
                             if is_intrinsic_module(module) && intrinsic.is_none() {
                                 bail!("unsupported twasm_intrinsics function import {name}");
@@ -326,6 +425,7 @@ fn analyze_module(input: &[u8]) -> Result<ModuleLayout> {
                             next_old_func += 1;
                         } else if matches!(ty, TypeRef::Memory(_)) {
                             memory_count += 1;
+                            layout.has_imported_memory = true;
                         }
                         Ok(())
                     })?;
@@ -341,6 +441,7 @@ fn analyze_module(input: &[u8]) -> Result<ModuleLayout> {
                         .get(ty as usize)
                         .context("defined function referenced missing type")?;
                     layout.func_sigs.push(sig);
+                    layout.func_type_indices.push(ty);
                     layout.func_index_map.push(Some(next_new_func));
                     next_old_func += 1;
                     next_new_func += 1;
@@ -378,7 +479,7 @@ fn analyze_module(input: &[u8]) -> Result<ModuleLayout> {
         }
     }
 
-    layout.has_memory_zero = memory_count > 0;
+    layout.memory_count = memory_count;
     Ok(layout)
 }
 
@@ -555,6 +656,8 @@ fn rewrite_function_body(
             Operator::CallIndirect {
                 type_index,
                 table_index,
+                table_namespace,
+                flags,
             } => {
                 let callee_sig = type_sig(layout, type_index)?;
                 let table_index_tainted = pop_analysis_taint(&mut stack);
@@ -564,6 +667,15 @@ fn rewrite_function_body(
                 function.instruction(&Instruction::CallIndirect {
                     type_index: remapper.type_index(type_index)?,
                     table_index: remapper.table_index(table_index)?,
+                    table_namespace: match table_namespace {
+                        wasmparser::EntityNamespace::Ordinary => {
+                            wasm_encoder::EntityNamespace::Ordinary
+                        }
+                        wasmparser::EntityNamespace::Transactional => {
+                            wasm_encoder::EntityNamespace::Transactional
+                        }
+                    },
+                    flags,
                 });
                 for _ in 0..callee_sig.results {
                     stack.push(AnalysisValue::untainted());
@@ -572,6 +684,8 @@ fn rewrite_function_body(
             Operator::ReturnCallIndirect {
                 type_index,
                 table_index,
+                table_namespace,
+                flags,
             } => {
                 let callee_sig = type_sig(layout, type_index)?;
                 let table_index_tainted = pop_analysis_taint(&mut stack);
@@ -581,6 +695,15 @@ fn rewrite_function_body(
                 function.instruction(&Instruction::ReturnCallIndirect {
                     type_index: remapper.type_index(type_index)?,
                     table_index: remapper.table_index(table_index)?,
+                    table_namespace: match table_namespace {
+                        wasmparser::EntityNamespace::Ordinary => {
+                            wasm_encoder::EntityNamespace::Ordinary
+                        }
+                        wasmparser::EntityNamespace::Transactional => {
+                            wasm_encoder::EntityNamespace::Transactional
+                        }
+                    },
+                    flags,
                 });
                 stack.clear();
             }
@@ -2417,19 +2540,6 @@ fn reject_any_tainted_call_operand(
 
 fn call_is_immediately_unreachable(operators: &[Operator<'_>], call_index: usize) -> bool {
     matches!(operators.get(call_index + 1), Some(Operator::Unreachable))
-}
-
-fn encode_transaction_objects(transaction_functions: &BTreeSet<u32>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.push(TRANSACTION_OBJECTS_VERSION);
-    1u32.encode(&mut bytes);
-    0u32.encode(&mut bytes);
-    0u32.encode(&mut bytes);
-    (transaction_functions.len() as u32).encode(&mut bytes);
-    for function in transaction_functions {
-        function.encode(&mut bytes);
-    }
-    bytes
 }
 
 pub fn main() -> anyhow::Result<()> {

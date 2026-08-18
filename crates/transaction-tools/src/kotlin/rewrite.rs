@@ -1,20 +1,18 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
-use wasm_encoder::reencode::{Error as ReencodeError, Reencode, RoundtripReencoder};
+use wasm_encoder::reencode::{Error as ReencodeError, Reencode};
 use wasm_encoder::{
-    CodeSection, ConstExpr, Encode, Function, GlobalType as EncoderGlobalType,
-    HeapType as EncoderHeapType, ImportSection, Instruction, Module, RawSection,
-    RefType as EncoderRefType, TransactionRefPermission as EncoderTransactionRefPermission,
-    ValType as EncoderValType,
+    CodeSection, ConstExpr, Function, GlobalType as EncoderGlobalType, HeapType as EncoderHeapType,
+    ImportSection, Instruction, Module, RawSection, RefType as EncoderRefType,
+    TransactionRefPermission as EncoderTransactionRefPermission, ValType as EncoderValType,
 };
 use wasmparser::{
     AbstractHeapType, BinaryReader, BlockType, CodeSectionReader, CompositeInnerType, DataKind,
     ExternalKind, HeapType, KnownCustom, Name, Operator, Parser, Payload, StorageType, TypeRef,
-    ValType as ParserValType,
+    ValType as ParserValType, Validator,
 };
 
 use super::metadata::{
@@ -22,8 +20,7 @@ use super::metadata::{
     KotlinPersistentType, KotlinSidecar, validate_kotlin_sidecar,
 };
 
-const TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
-const TRANSACTION_OBJECTS_VERSION: u8 = 1;
+const OBSOLETE_TRANSACTION_OBJECTS_CUSTOM_SECTION: &str = "shisoft.transaction.objects";
 const KOTLIN_ROOT_GET_IMPORT_MODULE: &str = "twasm.root.get";
 const KOTLIN_ROOT_SET_IMPORT_MODULE: &str = "twasm.root.set";
 const NAME_CUSTOM_SECTION: &str = "name";
@@ -68,6 +65,16 @@ struct GcTypeInfo {
     copyable_array_elements: BTreeMap<u32, KotlinField>,
 }
 
+impl GcTypeInfo {
+    fn is_transaction_struct(&self, index: u32) -> bool {
+        self.persistent.structs.contains(&index) || self.copyable.structs.contains(&index)
+    }
+
+    fn is_transaction_array(&self, index: u32) -> bool {
+        self.persistent.arrays.contains(&index) || self.copyable.arrays.contains(&index)
+    }
+}
+
 #[derive(Default)]
 struct RequiredTemps {
     needs_i32: bool,
@@ -78,14 +85,6 @@ struct RequiredTemps {
 struct TempLocals {
     i32: Option<u32>,
     values: BTreeMap<ParserValType, u32>,
-}
-
-#[derive(Default)]
-struct TransactionObjects {
-    memories: BTreeSet<u32>,
-    globals: BTreeSet<u32>,
-    functions: BTreeSet<u32>,
-    tables: BTreeSet<u32>,
 }
 
 #[derive(Clone)]
@@ -182,6 +181,10 @@ impl StackValue {
 
 struct KotlinIndexRemapper {
     function_index_map: Vec<Option<u32>>,
+    transaction_type_indices: BTreeMap<u32, u32>,
+    transaction_function_indices: BTreeSet<u32>,
+    persistent_type_indices: BTreeSet<u32>,
+    next_type_index: u32,
 }
 
 #[derive(Debug)]
@@ -196,8 +199,19 @@ impl fmt::Display for KotlinRemapError {
 impl StdError for KotlinRemapError {}
 
 impl KotlinIndexRemapper {
-    fn new(function_index_map: Vec<Option<u32>>) -> Self {
-        Self { function_index_map }
+    fn new(
+        function_index_map: Vec<Option<u32>>,
+        transaction_type_indices: BTreeMap<u32, u32>,
+        transaction_function_indices: BTreeSet<u32>,
+        persistent_type_indices: BTreeSet<u32>,
+    ) -> Self {
+        Self {
+            function_index_map,
+            transaction_type_indices,
+            transaction_function_indices,
+            persistent_type_indices,
+            next_type_index: 0,
+        }
     }
 
     fn remap_function_index(&self, function_index: u32) -> Result<u32> {
@@ -223,6 +237,17 @@ impl KotlinIndexRemapper {
             })
     }
 
+    fn transaction_type_index(&self, source: u32) -> Result<u32> {
+        self.transaction_type_indices
+            .get(&source)
+            .copied()
+            .with_context(|| format!("missing native Kotlin transaction type for type {source}"))
+    }
+
+    fn is_transaction_function(&self, function: u32) -> bool {
+        self.transaction_function_indices.contains(&function)
+    }
+
     fn function_index_removed(&self, function_index: u32) -> bool {
         self.function_index_map
             .get(function_index as usize)
@@ -239,14 +264,43 @@ impl Reencode for KotlinIndexRemapper {
     ) -> std::result::Result<u32, ReencodeError<Self::Error>> {
         self.remap_function_index_for_reencode(function_index)
     }
-}
 
-impl TransactionObjects {
-    fn is_empty(&self) -> bool {
-        self.memories.is_empty()
-            && self.globals.is_empty()
-            && self.functions.is_empty()
-            && self.tables.is_empty()
+    fn ref_type(
+        &mut self,
+        ref_type: wasmparser::RefType,
+    ) -> std::result::Result<wasm_encoder::RefType, ReencodeError<Self::Error>> {
+        let mut encoded = wasm_encoder::reencode::utils::ref_type(self, ref_type)?;
+        if matches!(
+            ref_type.heap_type(),
+            wasmparser::HeapType::Concrete(index) | wasmparser::HeapType::Exact(index)
+                if index.as_module_index().is_some_and(|index| self.persistent_type_indices.contains(&index))
+        ) {
+            encoded.transactional = true;
+        }
+        Ok(encoded)
+    }
+
+    fn sub_type(
+        &mut self,
+        sub_type: wasmparser::SubType,
+    ) -> std::result::Result<wasm_encoder::SubType, ReencodeError<Self::Error>> {
+        let index = self.next_type_index;
+        self.next_type_index = self.next_type_index.checked_add(1).ok_or_else(|| {
+            ReencodeError::UserError(KotlinRemapError("Kotlin type index overflow".into()))
+        })?;
+        let mut encoded = wasm_encoder::reencode::utils::sub_type(self, sub_type)?;
+        if self.persistent_type_indices.contains(&index) {
+            encoded.composite_type.inner = match encoded.composite_type.inner {
+                wasm_encoder::CompositeInnerType::Struct(ty) => {
+                    wasm_encoder::CompositeInnerType::TStruct(ty)
+                }
+                wasm_encoder::CompositeInnerType::Array(ty) => {
+                    wasm_encoder::CompositeInnerType::TArray(ty)
+                }
+                other => other,
+            };
+        }
+        Ok(encoded)
     }
 }
 
@@ -265,11 +319,7 @@ fn root_lowering(
     sidecar: &KotlinSidecar,
     gc_type_info: &GcTypeInfo,
 ) -> Result<RootLowering> {
-    let imported_globals = imported_global_count(input)?;
-    let defined_globals = defined_global_count(input)?;
-    let first_root_global = imported_globals
-        .checked_add(defined_globals)
-        .context("Kotlin root global index overflow")?;
+    let first_root_global = transactional_global_count(input)?;
     let mut globals = Vec::new();
 
     for (ordinal, root) in sidecar.roots.iter().enumerate() {
@@ -333,12 +383,16 @@ fn append_root_globals(globals: &mut wasm_encoder::GlobalSection, root_lowering:
                 val_type: EncoderValType::Ref(EncoderRefType {
                     nullable: true,
                     heap_type: EncoderHeapType::Concrete(root.type_index),
+                    transactional: true,
                     transaction_permission: EncoderTransactionRefPermission::None,
                 }),
+                namespace: wasm_encoder::EntityNamespace::Transactional,
                 mutable: true,
                 shared: false,
             },
-            &ConstExpr::ref_null(EncoderHeapType::Concrete(root.type_index)),
+            &ConstExpr::extended([Instruction::TRefNull(EncoderHeapType::Concrete(
+                root.type_index,
+            ))]),
         );
     }
 }
@@ -363,6 +417,7 @@ pub fn rewrite_kotlin_module(
     sidecar: &KotlinSidecar,
 ) -> Result<(Vec<u8>, KotlinRewriteReport)> {
     validate_kotlin_sidecar(sidecar)?;
+    reject_obsolete_transaction_metadata(input)?;
 
     let transaction_function_indices = transaction_function_indices(input, sidecar)?;
     let imported_function_count = imported_function_count(input)?;
@@ -386,26 +441,11 @@ pub fn rewrite_kotlin_module(
     object_rewrite_function_indices.extend(persistent_accessor_function_indices.iter().copied());
     let txref_get_function_indices = txref_get_function_indices(input)?;
     let constructor_function_indices = kotlin_constructor_function_indices(input)?;
-    for index in &txref_get_function_indices {
-        object_rewrite_function_indices.remove(index);
-    }
-    let mut transaction_objects = transaction_objects(input)?;
-    let gc_type_info = gc_type_info(input, sidecar)?;
+    object_rewrite_function_indices.extend(txref_get_function_indices.iter().copied());
+    let mut gc_type_info = gc_type_info(input, sidecar)?;
     let root_lowering = root_lowering(input, sidecar, &gc_type_info)?;
     let stripped_marker_imports = root_lowering.marker_import_indices();
-    let mut index_remapper =
-        KotlinIndexRemapper::new(function_index_map(input, &stripped_marker_imports)?);
-    remap_transaction_objects(&mut transaction_objects, &index_remapper)?;
-    transaction_objects.functions.extend(
-        transaction_call_closure_function_indices
-            .iter()
-            .filter(|index| !persistent_accessor_function_indices.contains(index))
-            .map(|index| index_remapper.remap_function_index(*index))
-            .collect::<Result<Vec<_>>>()?,
-    );
-    transaction_objects
-        .globals
-        .extend(root_lowering.globals.iter().map(|root| root.global_index));
+    let type_signatures = function_type_signatures(input)?;
     let func_type_params = function_type_params(input)?;
     let function_signatures = function_signatures_by_index(input)?;
     let defined_function_types = defined_function_type_indices(input)?;
@@ -424,11 +464,89 @@ pub fn rewrite_kotlin_module(
     for index in &root_publisher_function_indices {
         object_rewrite_function_indices.remove(index);
     }
-    transaction_objects.functions.extend(
-        root_marker_function_indices
-            .keys()
-            .map(|index| index_remapper.remap_function_index(*index))
-            .collect::<Result<Vec<_>>>()?,
+    let mut persistent_type_indices = gc_type_info
+        .persistent
+        .structs
+        .iter()
+        .chain(gc_type_info.persistent.arrays.iter())
+        .chain(gc_type_info.copyable.structs.iter())
+        .chain(gc_type_info.copyable.arrays.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let persistent_operation_functions = persistent_operation_function_indices(
+        input,
+        imported_function_count,
+        &persistent_type_indices,
+    )?;
+    object_rewrite_function_indices.extend(persistent_operation_functions.iter().copied());
+    let mut native_transaction_functions = transaction_call_closure_function_indices.clone();
+    native_transaction_functions.extend(persistent_accessor_function_indices.iter().copied());
+    native_transaction_functions.extend(root_marker_function_indices.keys().copied());
+    native_transaction_functions.extend(persistent_operation_functions);
+    native_transaction_functions.extend(txref_get_function_indices.iter().copied());
+
+    let function_types = imported_function_type_indices(input)?
+        .into_iter()
+        .chain(defined_function_types.iter().copied())
+        .collect::<Vec<_>>();
+    (native_transaction_functions, persistent_type_indices) = native_kotlin_closure(
+        input,
+        imported_function_count,
+        native_transaction_functions,
+        persistent_type_indices,
+        &function_types,
+        &type_signatures,
+    )?;
+    for index in &persistent_type_indices {
+        if gc_type_info.struct_field_counts.contains_key(index) {
+            gc_type_info.copyable.structs.insert(*index);
+        }
+        if gc_type_info.array_elements.contains_key(index) {
+            gc_type_info.copyable.arrays.insert(*index);
+        }
+    }
+    object_rewrite_function_indices.extend(native_transaction_functions.iter().copied());
+    let mut transaction_source_types = BTreeSet::new();
+    for (function_index, type_index) in function_types.iter().copied().enumerate() {
+        let Some(signature) = type_signatures.get(&type_index) else {
+            continue;
+        };
+        if signature
+            .params
+            .iter()
+            .chain(signature.results.iter())
+            .any(|ty| val_type_references_any(*ty, &persistent_type_indices))
+        {
+            native_transaction_functions
+                .insert(u32::try_from(function_index).context("Kotlin function index overflow")?);
+        }
+    }
+    for function_index in &native_transaction_functions {
+        let type_index = function_types
+            .get(*function_index as usize)
+            .copied()
+            .with_context(|| {
+                format!("native Kotlin transaction function {function_index} has no type")
+            })?;
+        transaction_source_types.insert(type_index);
+    }
+    let first_transaction_type = module_type_count(input)?;
+    let transaction_type_indices = transaction_source_types
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, source)| {
+            let ordinal = u32::try_from(ordinal).context("Kotlin transaction type overflow")?;
+            let target = first_transaction_type
+                .checked_add(ordinal)
+                .context("Kotlin transaction type overflow")?;
+            Ok((source, target))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut index_remapper = KotlinIndexRemapper::new(
+        function_index_map(input, &stripped_marker_imports)?,
+        transaction_type_indices,
+        native_transaction_functions,
+        persistent_type_indices,
     );
     let txref_param_requirements = infer_txref_param_requirements(
         input,
@@ -443,7 +561,6 @@ pub fn rewrite_kotlin_module(
         &constructor_function_indices,
         &marker_literals,
     )?;
-
     let mut report = KotlinRewriteReport {
         transaction_functions: sidecar.transaction_functions.clone(),
         persistent_types: gc_type_info.persistent.structs.len()
@@ -469,6 +586,27 @@ pub fn rewrite_kotlin_module(
             Payload::TypeSection(section) => {
                 let mut types = wasm_encoder::TypeSection::new();
                 index_remapper.parse_type_section(&mut types, section)?;
+                for (source, target) in index_remapper.transaction_type_indices.clone() {
+                    debug_assert_eq!(types.len(), target);
+                    let signature = type_signatures.get(&source).cloned().with_context(|| {
+                        format!("native Kotlin transaction type {source} is not a function")
+                    })?;
+                    let params = signature
+                        .params
+                        .into_iter()
+                        .map(|ty| index_remapper.val_type(ty))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let results = signature
+                        .results
+                        .into_iter()
+                        .map(|ty| index_remapper.val_type(ty))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    types
+                        .ty()
+                        .func_type(&wasm_encoder::FuncType::new_with_transaction(
+                            params, results, true,
+                        ));
+                }
                 module.section(&types);
             }
             Payload::ImportSection(section) => {
@@ -480,7 +618,17 @@ pub fn rewrite_kotlin_module(
             }
             Payload::FunctionSection(section) => {
                 let mut functions = wasm_encoder::FunctionSection::new();
-                index_remapper.parse_function_section(&mut functions, section)?;
+                for (defined, type_index) in section.into_iter().enumerate() {
+                    let type_index = type_index?;
+                    let old_function_index = imported_function_count
+                        + u32::try_from(defined).context("Kotlin function index overflow")?;
+                    let type_index = if index_remapper.is_transaction_function(old_function_index) {
+                        index_remapper.transaction_type_index(type_index)?
+                    } else {
+                        index_remapper.type_index(type_index)?
+                    };
+                    functions.function(type_index);
+                }
                 module.section(&functions);
             }
             Payload::TableSection(section) => {
@@ -580,6 +728,7 @@ pub fn rewrite_kotlin_module(
                         .context("missing Kotlin rewrite function type parameters")?;
                     let function = rewrite_function_body(
                         &body,
+                        index_remapper.is_transaction_function(function_index),
                         object_rewrite_function_indices.contains(&function_index),
                         &gc_type_info,
                         &root_lowering,
@@ -603,10 +752,7 @@ pub fn rewrite_kotlin_module(
             }
             Payload::CodeSectionEntry(_) => {}
             Payload::CustomSection(section) => {
-                if section.name() != TRANSACTION_OBJECTS_CUSTOM_SECTION
-                    && !(section.name() == NAME_CUSTOM_SECTION
-                        && !stripped_marker_imports.is_empty())
-                {
+                if !(section.name() == NAME_CUSTOM_SECTION && !stripped_marker_imports.is_empty()) {
                     module.section(&wasm_encoder::CustomSection::from(section));
                 }
             }
@@ -623,18 +769,16 @@ pub fn rewrite_kotlin_module(
         }
     }
 
-    if !transaction_objects.is_empty() {
-        module.section(&wasm_encoder::CustomSection {
-            name: Cow::Borrowed(TRANSACTION_OBJECTS_CUSTOM_SECTION),
-            data: Cow::Owned(encode_transaction_objects(&transaction_objects)),
-        });
-    }
-
-    Ok((module.finish(), report))
+    let output = module.finish();
+    Validator::new().validate_all(&output).map_err(|error| {
+        anyhow::anyhow!("native Kotlin rewrite cannot encode a mixed transactional body: {error}")
+    })?;
+    Ok((output, report))
 }
 
 fn rewrite_function_body(
     body: &wasmparser::FunctionBody<'_>,
+    transaction_function: bool,
     rewrite_object_ops: bool,
     gc_type_info: &GcTypeInfo,
     root_lowering: &RootLowering,
@@ -648,11 +792,10 @@ fn rewrite_function_body(
     marker_literals: &KotlinMarkerLiterals,
     report: &mut KotlinRewriteReport,
 ) -> Result<Function> {
-    let mut type_reencoder = RoundtripReencoder;
     let local_types = local_types(body, params)?;
     let required_temps = required_temps(body, rewrite_object_ops, gc_type_info)?;
     let (local_decls, temp_locals) =
-        local_decls_with_temps(&mut type_reencoder, body, &local_types, required_temps)?;
+        local_decls_with_temps(index_remapper, body, &local_types, required_temps)?;
     let mut function = Function::new(local_decls);
     let mut value_stack = Vec::new();
     let mut local_values = initial_local_values(
@@ -682,15 +825,19 @@ fn rewrite_function_body(
                     .unwrap_or_else(StackValue::non_ref);
                 let mut validation = BoundaryValidation::Enforce;
                 validate_root_value_boundary(root, value, gc_type_info, &mut validation)?;
-                let unit_getter = root_lowering
+                let unit_getter_index = root_lowering
                     .unit_getter_func
                     .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
-                let unit_getter = index_remapper.remap_function_index(unit_getter)?;
+                let unit_getter = index_remapper.remap_function_index(unit_getter_index)?;
                 function.instruction(&Instruction::LocalGet(marker.value_local));
                 function.instruction(&Instruction::TGlobalSet {
                     global_index: root.global_index,
                 });
-                function.instruction(&Instruction::Call(unit_getter));
+                if index_remapper.is_transaction_function(unit_getter_index) {
+                    function.instruction(&Instruction::TCall(unit_getter));
+                } else {
+                    function.instruction(&Instruction::Call(unit_getter));
+                }
                 value_stack.push(StackValue::non_ref());
                 index = marker.next_index;
                 continue;
@@ -737,14 +884,18 @@ fn rewrite_function_body(
                         root.type_index
                     );
                 }
-                let unit_getter = root_lowering
+                let unit_getter_index = root_lowering
                     .unit_getter_func
                     .context("Kotlin setRoot marker lowering requires kotlin.Unit_getInstance")?;
-                let unit_getter = index_remapper.remap_function_index(unit_getter)?;
+                let unit_getter = index_remapper.remap_function_index(unit_getter_index)?;
                 function.instruction(&Instruction::TGlobalSet {
                     global_index: root.global_index,
                 });
-                function.instruction(&Instruction::Call(unit_getter));
+                if index_remapper.is_transaction_function(unit_getter_index) {
+                    function.instruction(&Instruction::TCall(unit_getter));
+                } else {
+                    function.instruction(&Instruction::Call(unit_getter));
+                }
                 value_stack.push(StackValue::non_ref());
                 index += 1;
                 continue;
@@ -758,8 +909,15 @@ fn rewrite_function_body(
                     None,
                     constructor_function_indices,
                 );
-                function
-                    .instruction(&index_remapper.instruction(Operator::Call { function_index })?);
+                if index_remapper.is_transaction_function(function_index) {
+                    function.instruction(&Instruction::TCall(
+                        index_remapper.remap_function_index(function_index)?,
+                    ));
+                } else {
+                    function.instruction(
+                        &index_remapper.instruction(Operator::Call { function_index })?,
+                    );
+                }
                 index += 1;
                 continue;
             }
@@ -798,12 +956,104 @@ fn rewrite_function_body(
             None
         };
         match op {
+            Operator::Throw { .. } if transaction_function => {
+                bail!("native Kotlin rewrite cannot encode transactional operator throw");
+            }
+            Operator::Call { function_index }
+                if index_remapper.is_transaction_function(function_index) =>
+            {
+                function.instruction(&Instruction::TCall(
+                    index_remapper.remap_function_index(function_index)?,
+                ));
+            }
+            Operator::ReturnCall { function_index }
+                if index_remapper.is_transaction_function(function_index) =>
+            {
+                function.instruction(&Instruction::ReturnTCall(
+                    index_remapper.remap_function_index(function_index)?,
+                ));
+            }
+            Operator::RefNull { hty } if transaction_function => {
+                let heap_type = if matches!(
+                    hty,
+                    HeapType::Abstract {
+                        ty: AbstractHeapType::None,
+                        ..
+                    }
+                ) {
+                    let type_index = operators
+                        .iter()
+                        .skip(index + 1)
+                        .find_map(|op| match op {
+                            Operator::Call { function_index }
+                                if constructor_function_indices.contains(function_index) =>
+                            {
+                                function_signatures
+                                    .get(function_index)
+                                    .and_then(|signature| signature.params.first().copied())
+                            }
+                            Operator::Call { .. } => None,
+                            Operator::Block { .. }
+                            | Operator::Loop { .. }
+                            | Operator::If { .. }
+                            | Operator::Else
+                            | Operator::End => Some(ParserValType::I32),
+                            _ => None,
+                        })
+                        .and_then(module_ref_type_index)
+                        .filter(|type_index| {
+                            gc_type_info.is_transaction_struct(*type_index)
+                                || gc_type_info.is_transaction_array(*type_index)
+                        })
+                        .context(
+                            "native Kotlin rewrite cannot infer concrete transactional type for ref.null none",
+                        )?;
+                    EncoderHeapType::Concrete(index_remapper.type_index(type_index)?)
+                } else {
+                    index_remapper.heap_type(hty)?
+                };
+                function.instruction(&Instruction::TRefNull(heap_type));
+            }
+            Operator::StructNew { struct_type_index }
+                if transaction_function
+                    && gc_type_info.is_transaction_struct(struct_type_index) =>
+            {
+                function.instruction(&Instruction::TStructNew(struct_type_index));
+                report.rewritten_object_ops += 1;
+            }
+            Operator::StructNewDefault { struct_type_index }
+                if transaction_function
+                    && gc_type_info.is_transaction_struct(struct_type_index) =>
+            {
+                function.instruction(&Instruction::TStructNewDefault(struct_type_index));
+                report.rewritten_object_ops += 1;
+            }
+            Operator::ArrayNew { array_type_index }
+                if transaction_function && gc_type_info.is_transaction_array(array_type_index) =>
+            {
+                function.instruction(&Instruction::TArrayNew(array_type_index));
+                report.rewritten_object_ops += 1;
+            }
+            Operator::ArrayNewDefault { array_type_index }
+                if transaction_function && gc_type_info.is_transaction_array(array_type_index) =>
+            {
+                function.instruction(&Instruction::TArrayNewDefault(array_type_index));
+                report.rewritten_object_ops += 1;
+            }
+            Operator::ArrayNewFixed {
+                array_type_index,
+                array_size,
+            } if transaction_function && gc_type_info.is_transaction_array(array_type_index) => {
+                function.instruction(&Instruction::TArrayNewFixed {
+                    array_type_index,
+                    array_size,
+                });
+                report.rewritten_object_ops += 1;
+            }
             Operator::StructGet {
                 struct_type_index,
                 field_index,
-            } if rewrite_object_ops
-                && gc_type_info.persistent.structs.contains(&struct_type_index) =>
-            {
+            } if rewrite_object_ops && gc_type_info.is_transaction_struct(struct_type_index) => {
                 function.instruction(&Instruction::TRefCastRead);
                 function.instruction(&Instruction::TStructGet {
                     struct_type_index,
@@ -814,9 +1064,7 @@ fn rewrite_function_body(
             Operator::StructGetS {
                 struct_type_index,
                 field_index,
-            } if rewrite_object_ops
-                && gc_type_info.persistent.structs.contains(&struct_type_index) =>
-            {
+            } if rewrite_object_ops && gc_type_info.is_transaction_struct(struct_type_index) => {
                 function.instruction(&Instruction::TRefCastRead);
                 function.instruction(&Instruction::TStructGetS {
                     struct_type_index,
@@ -827,9 +1075,7 @@ fn rewrite_function_body(
             Operator::StructGetU {
                 struct_type_index,
                 field_index,
-            } if rewrite_object_ops
-                && gc_type_info.persistent.structs.contains(&struct_type_index) =>
-            {
+            } if rewrite_object_ops && gc_type_info.is_transaction_struct(struct_type_index) => {
                 function.instruction(&Instruction::TRefCastRead);
                 function.instruction(&Instruction::TStructGetU {
                     struct_type_index,
@@ -840,9 +1086,7 @@ fn rewrite_function_body(
             Operator::StructSet {
                 struct_type_index,
                 field_index,
-            } if rewrite_object_ops
-                && gc_type_info.persistent.structs.contains(&struct_type_index) =>
-            {
+            } if rewrite_object_ops && gc_type_info.is_transaction_struct(struct_type_index) => {
                 let field_ty = *gc_type_info
                     .struct_fields
                     .get(&(struct_type_index, field_index))
@@ -862,32 +1106,28 @@ fn rewrite_function_body(
                 report.rewritten_object_ops += 1;
             }
             Operator::ArrayGet { array_type_index }
-                if rewrite_object_ops
-                    && gc_type_info.persistent.arrays.contains(&array_type_index) =>
+                if rewrite_object_ops && gc_type_info.is_transaction_array(array_type_index) =>
             {
                 emit_array_read_prefix(&mut function, &temp_locals)?;
                 function.instruction(&Instruction::TArrayGet(array_type_index));
                 report.rewritten_object_ops += 1;
             }
             Operator::ArrayGetS { array_type_index }
-                if rewrite_object_ops
-                    && gc_type_info.persistent.arrays.contains(&array_type_index) =>
+                if rewrite_object_ops && gc_type_info.is_transaction_array(array_type_index) =>
             {
                 emit_array_read_prefix(&mut function, &temp_locals)?;
                 function.instruction(&Instruction::TArrayGetS(array_type_index));
                 report.rewritten_object_ops += 1;
             }
             Operator::ArrayGetU { array_type_index }
-                if rewrite_object_ops
-                    && gc_type_info.persistent.arrays.contains(&array_type_index) =>
+                if rewrite_object_ops && gc_type_info.is_transaction_array(array_type_index) =>
             {
                 emit_array_read_prefix(&mut function, &temp_locals)?;
                 function.instruction(&Instruction::TArrayGetU(array_type_index));
                 report.rewritten_object_ops += 1;
             }
             Operator::ArraySet { array_type_index }
-                if rewrite_object_ops
-                    && gc_type_info.persistent.arrays.contains(&array_type_index) =>
+                if rewrite_object_ops && gc_type_info.is_transaction_array(array_type_index) =>
             {
                 let element_ty = *gc_type_info
                     .array_elements
@@ -912,7 +1152,7 @@ fn rewrite_function_body(
             Operator::ArrayLen
                 if rewrite_object_ops
                     && array_len_operand.is_some_and(|type_index| {
-                        gc_type_info.persistent.arrays.contains(&type_index)
+                        gc_type_info.is_transaction_array(type_index)
                     }) =>
             {
                 function.instruction(&Instruction::TArrayLen);
@@ -991,7 +1231,7 @@ fn required_temps(
             Operator::StructSet {
                 struct_type_index,
                 field_index,
-            } if gc_type_info.persistent.structs.contains(&struct_type_index) => {
+            } if gc_type_info.is_transaction_struct(struct_type_index) => {
                 temps.values.insert(
                     *gc_type_info
                         .struct_fields
@@ -1002,12 +1242,12 @@ fn required_temps(
             Operator::ArrayGet { array_type_index }
             | Operator::ArrayGetS { array_type_index }
             | Operator::ArrayGetU { array_type_index }
-                if gc_type_info.persistent.arrays.contains(&array_type_index) =>
+                if gc_type_info.is_transaction_array(array_type_index) =>
             {
                 temps.needs_i32 = true;
             }
             Operator::ArraySet { array_type_index }
-                if gc_type_info.persistent.arrays.contains(&array_type_index) =>
+                if gc_type_info.is_transaction_array(array_type_index) =>
             {
                 temps.needs_i32 = true;
                 temps.values.insert(
@@ -1025,7 +1265,7 @@ fn required_temps(
 }
 
 fn local_decls_with_temps(
-    reencoder: &mut RoundtripReencoder,
+    reencoder: &mut KotlinIndexRemapper,
     body: &wasmparser::FunctionBody<'_>,
     local_types: &[ParserValType],
     required_temps: RequiredTemps,
@@ -2132,58 +2372,16 @@ fn heap_type_index(heap_type: wasmparser::HeapType) -> Option<u32> {
     }
 }
 
-fn encode_transaction_objects(transaction_objects: &TransactionObjects) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.push(TRANSACTION_OBJECTS_VERSION);
-    encode_index_set(&transaction_objects.memories, &mut bytes);
-    encode_index_set(&transaction_objects.globals, &mut bytes);
-    encode_index_set(&transaction_objects.functions, &mut bytes);
-    encode_index_set(&transaction_objects.tables, &mut bytes);
-    bytes
-}
-
-fn encode_index_set(indices: &BTreeSet<u32>, bytes: &mut Vec<u8>) {
-    (indices.len() as u32).encode(bytes);
-    for index in indices {
-        index.encode(bytes);
-    }
-}
-
-fn transaction_objects(input: &[u8]) -> Result<TransactionObjects> {
-    let mut objects = TransactionObjects::default();
-
+fn reject_obsolete_transaction_metadata(input: &[u8]) -> Result<()> {
     for payload in Parser::new(0).parse_all(input) {
-        match payload.context("failed to parse Kotlin rewrite transaction metadata payload")? {
-            Payload::CustomSection(section)
-                if section.name() == TRANSACTION_OBJECTS_CUSTOM_SECTION =>
-            {
-                let mut reader = BinaryReader::new(section.data(), 0);
-                let version = reader
-                    .read_u8()
-                    .context("failed to parse transaction object metadata version")?;
-                if version != TRANSACTION_OBJECTS_VERSION {
-                    bail!(
-                        "unsupported transaction object metadata version: expected {}, found {}",
-                        TRANSACTION_OBJECTS_VERSION,
-                        version
-                    );
-                }
-
-                extend_index_set(&mut objects.memories, &mut reader, "memories")?;
-                extend_index_set(&mut objects.globals, &mut reader, "globals")?;
-                extend_index_set(&mut objects.functions, &mut reader, "functions")?;
-                if !reader.eof() {
-                    extend_index_set(&mut objects.tables, &mut reader, "tables")?;
-                }
-                if !reader.eof() {
-                    bail!("transaction object metadata has trailing bytes");
-                }
-            }
-            _ => {}
+        if let Payload::CustomSection(section) =
+            payload.context("failed to parse Kotlin rewrite custom sections")?
+            && section.name() == OBSOLETE_TRANSACTION_OBJECTS_CUSTOM_SECTION
+        {
+            bail!("obsolete shisoft.transaction.objects metadata is not accepted");
         }
     }
-
-    Ok(objects)
+    Ok(())
 }
 
 fn function_index_map(
@@ -2237,18 +2435,6 @@ fn function_index_map(
     Ok(function_index_map)
 }
 
-fn remap_transaction_objects(
-    transaction_objects: &mut TransactionObjects,
-    index_remapper: &KotlinIndexRemapper,
-) -> Result<()> {
-    transaction_objects.functions = transaction_objects
-        .functions
-        .iter()
-        .map(|index| index_remapper.remap_function_index(*index))
-        .collect::<Result<BTreeSet<_>>>()?;
-    Ok(())
-}
-
 fn rewrite_kotlin_import_section(
     index_remapper: &mut KotlinIndexRemapper,
     imports: &mut ImportSection,
@@ -2264,6 +2450,21 @@ fn rewrite_kotlin_import_section(
                 .checked_add(1)
                 .context("Kotlin rewrite function index overflow")?;
             if index_remapper.function_index_removed(old_function_index) {
+                continue;
+            }
+            if index_remapper.is_transaction_function(old_function_index) {
+                let source_type = match import.ty {
+                    TypeRef::Func(type_index) | TypeRef::FuncExact(type_index) => type_index,
+                    _ => unreachable!(),
+                };
+                let transaction_type = index_remapper.transaction_type_index(source_type)?;
+                let entity = match import.ty {
+                    TypeRef::FuncExact(_) => {
+                        wasm_encoder::EntityType::FunctionExact(transaction_type)
+                    }
+                    _ => wasm_encoder::EntityType::Function(transaction_type),
+                };
+                imports.import(import.module, import.name, entity);
                 continue;
             }
         }
@@ -2422,24 +2623,6 @@ fn nullable_concrete_module_ref_type_index(ty: ParserValType) -> Option<u32> {
         return None;
     }
     ref_type.type_index()?.unpack().as_module_index()
-}
-
-fn extend_index_set(
-    indices: &mut BTreeSet<u32>,
-    reader: &mut BinaryReader<'_>,
-    label: &str,
-) -> Result<()> {
-    let len = reader
-        .read_var_u32()
-        .with_context(|| format!("failed to parse transaction object {label} length"))?;
-    for _ in 0..len {
-        indices.insert(
-            reader
-                .read_var_u32()
-                .with_context(|| format!("failed to parse transaction object {label} index"))?,
-        );
-    }
-    Ok(())
 }
 
 fn exported_function_names(input: &[u8]) -> Result<BTreeMap<String, u32>> {
@@ -2882,40 +3065,39 @@ fn function_signature(input: &[u8], function_index: u32) -> Result<Option<Functi
     Ok(signatures.get(&type_index).cloned())
 }
 
-fn imported_global_count(input: &[u8]) -> Result<u32> {
+fn transactional_global_count(input: &[u8]) -> Result<u32> {
     let mut count = 0u32;
-
     for payload in Parser::new(0).parse_all(input) {
-        match payload.context("failed to parse Kotlin rewrite import payload")? {
+        match payload.context("failed to parse Kotlin transactional globals")? {
             Payload::ImportSection(section) => {
                 for import in section.into_imports() {
-                    let import = import.context("failed to parse Kotlin rewrite import")?;
-                    if matches!(import.ty, TypeRef::Global(_)) {
-                        count += 1;
+                    if matches!(
+                        import.context("failed to parse Kotlin import")?.ty,
+                        TypeRef::TGlobal(_)
+                    ) {
+                        count = count
+                            .checked_add(1)
+                            .context("Kotlin tglobal count overflow")?;
+                    }
+                }
+            }
+            Payload::GlobalSection(section) => {
+                for global in section {
+                    if global
+                        .context("failed to parse Kotlin global")?
+                        .ty
+                        .namespace
+                        == wasmparser::EntityNamespace::Transactional
+                    {
+                        count = count
+                            .checked_add(1)
+                            .context("Kotlin tglobal count overflow")?;
                     }
                 }
             }
             _ => {}
         }
     }
-
-    Ok(count)
-}
-
-fn defined_global_count(input: &[u8]) -> Result<u32> {
-    let mut count = 0u32;
-
-    for payload in Parser::new(0).parse_all(input) {
-        match payload.context("failed to parse Kotlin rewrite global payload")? {
-            Payload::GlobalSection(section) => {
-                count = count
-                    .checked_add(section.count())
-                    .context("Kotlin rewrite global count overflow")?;
-            }
-            _ => {}
-        }
-    }
-
     Ok(count)
 }
 
@@ -3062,6 +3244,229 @@ fn function_type_params(input: &[u8]) -> Result<BTreeMap<u32, Vec<ParserValType>
         .into_iter()
         .map(|(type_index, signature)| (type_index, signature.params))
         .collect())
+}
+
+fn module_type_count(input: &[u8]) -> Result<u32> {
+    let mut count = 0u32;
+    for payload in Parser::new(0).parse_all(input) {
+        if let Payload::TypeSection(section) =
+            payload.context("failed to parse Kotlin rewrite type count")?
+        {
+            for group in section {
+                let group = group.context("failed to parse Kotlin rewrite type group")?;
+                let len = u32::try_from(group.types().len())
+                    .context("Kotlin rewrite type count overflow")?;
+                count = count
+                    .checked_add(len)
+                    .context("Kotlin rewrite type count overflow")?;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn val_type_references_any(ty: ParserValType, types: &BTreeSet<u32>) -> bool {
+    let ParserValType::Ref(ty) = ty else {
+        return false;
+    };
+    heap_type_index(ty.heap_type()).is_some_and(|index| types.contains(&index))
+}
+
+fn operator_gc_type(op: &Operator<'_>) -> Option<u32> {
+    match *op {
+        Operator::StructNew { struct_type_index }
+        | Operator::StructNewDefault { struct_type_index }
+        | Operator::StructGet {
+            struct_type_index, ..
+        }
+        | Operator::StructGetS {
+            struct_type_index, ..
+        }
+        | Operator::StructGetU {
+            struct_type_index, ..
+        }
+        | Operator::StructSet {
+            struct_type_index, ..
+        } => Some(struct_type_index),
+        Operator::ArrayNew { array_type_index }
+        | Operator::ArrayNewDefault { array_type_index }
+        | Operator::ArrayNewFixed {
+            array_type_index, ..
+        }
+        | Operator::ArrayNewData {
+            array_type_index, ..
+        }
+        | Operator::ArrayNewElem {
+            array_type_index, ..
+        }
+        | Operator::ArrayGet { array_type_index }
+        | Operator::ArrayGetS { array_type_index }
+        | Operator::ArrayGetU { array_type_index }
+        | Operator::ArraySet { array_type_index }
+        | Operator::ArrayFill { array_type_index }
+        | Operator::ArrayInitData {
+            array_type_index, ..
+        }
+        | Operator::ArrayInitElem {
+            array_type_index, ..
+        } => Some(array_type_index),
+        Operator::RefNull { hty } => heap_type_index(hty),
+        _ => None,
+    }
+}
+
+fn native_kotlin_closure(
+    input: &[u8],
+    imported_function_count: u32,
+    mut functions: BTreeSet<u32>,
+    mut gc_types: BTreeSet<u32>,
+    function_types: &[u32],
+    type_signatures: &BTreeMap<u32, FunctionSignature>,
+) -> Result<(BTreeSet<u32>, BTreeSet<u32>)> {
+    loop {
+        let old_function_len = functions.len();
+        let old_type_len = gc_types.len();
+
+        for function in functions.clone() {
+            if let Some(signature) = function_types
+                .get(function as usize)
+                .and_then(|index| type_signatures.get(index))
+            {
+                for ty in signature.params.iter().chain(signature.results.iter()) {
+                    if let ParserValType::Ref(ty) = ty
+                        && let Some(index) = heap_type_index(ty.heap_type())
+                    {
+                        gc_types.insert(index);
+                    }
+                }
+            }
+        }
+
+        let mut next_defined = 0u32;
+        for payload in Parser::new(0).parse_all(input) {
+            let Payload::CodeSectionEntry(body) =
+                payload.context("failed to parse native Kotlin closure")?
+            else {
+                continue;
+            };
+            let function = imported_function_count
+                .checked_add(next_defined)
+                .context("Kotlin function index overflow")?;
+            next_defined = next_defined
+                .checked_add(1)
+                .context("Kotlin function index overflow")?;
+            let mut reader = body.get_operators_reader()?;
+            while !reader.eof() {
+                let op = reader.read()?;
+                if functions.contains(&function) {
+                    match op {
+                        Operator::Call { function_index }
+                        | Operator::ReturnCall { function_index } => {
+                            functions.insert(function_index);
+                        }
+                        _ => {}
+                    }
+                    if let Some(index) = operator_gc_type(&op) {
+                        gc_types.insert(index);
+                    }
+                }
+                if operator_gc_type(&op).is_some_and(|index| gc_types.contains(&index)) {
+                    functions.insert(function);
+                }
+            }
+        }
+
+        for (function, type_index) in function_types.iter().copied().enumerate() {
+            let Some(signature) = type_signatures.get(&type_index) else {
+                continue;
+            };
+            if signature
+                .params
+                .iter()
+                .chain(signature.results.iter())
+                .any(|ty| val_type_references_any(*ty, &gc_types))
+            {
+                functions
+                    .insert(u32::try_from(function).context("Kotlin function index overflow")?);
+            }
+        }
+
+        if functions.len() == old_function_len && gc_types.len() == old_type_len {
+            return Ok((functions, gc_types));
+        }
+    }
+}
+
+fn persistent_operation_function_indices(
+    input: &[u8],
+    imported_function_count: u32,
+    persistent_types: &BTreeSet<u32>,
+) -> Result<BTreeSet<u32>> {
+    let mut functions = BTreeSet::new();
+    let mut next_defined = 0u32;
+    for payload in Parser::new(0).parse_all(input) {
+        let Payload::CodeSectionEntry(body) =
+            payload.context("failed to parse Kotlin persistent operation scan")?
+        else {
+            continue;
+        };
+        let function = imported_function_count
+            .checked_add(next_defined)
+            .context("Kotlin function index overflow")?;
+        next_defined = next_defined
+            .checked_add(1)
+            .context("Kotlin function index overflow")?;
+        let mut reader = body.get_operators_reader()?;
+        while !reader.eof() {
+            let persistent = match reader.read()? {
+                Operator::StructNew { struct_type_index }
+                | Operator::StructNewDefault { struct_type_index }
+                | Operator::StructGet {
+                    struct_type_index, ..
+                }
+                | Operator::StructGetS {
+                    struct_type_index, ..
+                }
+                | Operator::StructGetU {
+                    struct_type_index, ..
+                }
+                | Operator::StructSet {
+                    struct_type_index, ..
+                } => persistent_types.contains(&struct_type_index),
+                Operator::ArrayNew { array_type_index }
+                | Operator::ArrayNewDefault { array_type_index }
+                | Operator::ArrayNewFixed {
+                    array_type_index, ..
+                }
+                | Operator::ArrayNewData {
+                    array_type_index, ..
+                }
+                | Operator::ArrayNewElem {
+                    array_type_index, ..
+                }
+                | Operator::ArrayGet { array_type_index }
+                | Operator::ArrayGetS { array_type_index }
+                | Operator::ArrayGetU { array_type_index }
+                | Operator::ArraySet { array_type_index }
+                | Operator::ArrayFill { array_type_index }
+                | Operator::ArrayInitData {
+                    array_type_index, ..
+                }
+                | Operator::ArrayInitElem {
+                    array_type_index, ..
+                } => persistent_types.contains(&array_type_index),
+                Operator::RefNull { hty } => {
+                    heap_type_index(hty).is_some_and(|index| persistent_types.contains(&index))
+                }
+                _ => false,
+            };
+            if persistent {
+                functions.insert(function);
+                break;
+            }
+        }
+    }
+    Ok(functions)
 }
 
 fn function_type_signatures(input: &[u8]) -> Result<BTreeMap<u32, FunctionSignature>> {

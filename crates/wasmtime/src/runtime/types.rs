@@ -1516,8 +1516,11 @@ impl ExternType {
                 EngineOrModuleTypeIndex::RecGroup(_) => unreachable!(),
             },
             EntityType::Global(ty) => GlobalType::from_wasmtime_global(engine, ty).into(),
+            EntityType::TGlobal(ty) => GlobalType::from_wasmtime_global(engine, ty).into(),
             EntityType::Memory(ty) => MemoryType::from_wasmtime_memory(ty).into(),
+            EntityType::TMemory(ty) => MemoryType::from_wasmtime_memory(ty).into(),
             EntityType::Table(ty) => TableType::from_wasmtime_table(engine, ty).into(),
+            EntityType::TTable(ty) => TableType::from_wasmtime_table(engine, ty).into(),
             EntityType::Tag(ty) => TagType::from_wasmtime_tag(engine, ty).into(),
         }
     }

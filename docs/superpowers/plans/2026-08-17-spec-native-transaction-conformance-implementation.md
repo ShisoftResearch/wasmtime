@@ -20,6 +20,17 @@
 - Follow the Bytecode Alliance AI Tool Use Policy. Do not open, review, or comment on Wasmtime pull requests or issues. Do not add an agent, model, or tool to commit authorship annotations.
 - Keep the user-owned untracked `.dropboxignore` and `reports/` untouched. Make commits only after a task's specified checks pass, with normal human Git identity and no push.
 
+### Historical Table-Encoding Collision Addendum (2026-08-18)
+
+The historical table bytes `f0 7d 00` are not distinguishable from the current
+native encoding of `(tref null tfunc)` with transaction permission `none`.
+Consequently, the native frontend must not reject that byte sequence: doing so
+would reject a valid current-format ordinary table. The no-compatibility rule
+means that these bytes never select the transactional *entity namespace* and
+never trigger metadata behavior; only the table limits namespace bit `0x40`
+creates a `ttable`. The distinguishable legacy custom section
+`shisoft.transaction.objects` remains rejected.
+
 ---
 
 ## File Structure

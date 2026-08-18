@@ -95,8 +95,9 @@ use std::collections::{HashMap, hash_map};
 use std::vec::Vec;
 use wasmparser::{FuncValidator, MemArg, Operator, WasmModuleResources};
 use wasmtime_environ::{
-    DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert,
-    TypeIndex, WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
+    DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TDataIndex, TElemIndex,
+    TGlobalIndex, TMemoryIndex, TTableIndex, TableIndex, TagIndex, TypeConvert, TypeIndex,
+    WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
 };
 
 /// Given a `Reachability<T>`, unwrap the inner `T` or, when unreachable, set
@@ -256,12 +257,12 @@ pub fn translate_operator(
             environ.translate_global_set(builder, global_index, val)?;
         }
         Operator::TGlobalGet { global_index } => {
-            let global_index = GlobalIndex::from_u32(*global_index);
+            let global_index = TGlobalIndex::from_u32(*global_index);
             let val = environ.translate_transaction_tglobal_get(builder, global_index)?;
             environ.stacks.push1(val);
         }
         Operator::TGlobalSet { global_index } => {
-            let global_index = GlobalIndex::from_u32(*global_index);
+            let global_index = TGlobalIndex::from_u32(*global_index);
             let mut val = environ.stacks.pop1();
             // Ensure SIMD values are cast to their default Cranelift type, I8x16.
             if builder.func.dfg.value_type(val).is_vector() {
@@ -270,26 +271,26 @@ pub fn translate_operator(
             environ.translate_transaction_tglobal_set(builder, global_index, val)?;
         }
         Operator::TMemorySize { mem } => {
-            let mem = MemoryIndex::from_u32(*mem);
+            let mem = TMemoryIndex::from_u32(*mem);
             let result = environ.translate_transaction_tmemory_size(builder, mem)?;
             environ.stacks.push1(result);
         }
         Operator::TMemoryGrow { mem } => {
-            let mem = MemoryIndex::from_u32(*mem);
+            let mem = TMemoryIndex::from_u32(*mem);
             let val = environ.stacks.pop1();
             let result = environ.translate_transaction_tmemory_grow(builder, mem, val)?;
             environ.stacks.push1(result);
         }
         Operator::TMemoryFill { mem } => {
-            let mem = MemoryIndex::from_u32(*mem);
+            let mem = TMemoryIndex::from_u32(*mem);
             let len = environ.stacks.pop1();
             let val = environ.stacks.pop1();
             let dest = environ.stacks.pop1();
             environ.translate_transaction_tmemory_fill(builder, mem, dest, val, len)?;
         }
         Operator::TMemoryCopy { dst_mem, src_mem } => {
-            let dst_mem = MemoryIndex::from_u32(*dst_mem);
-            let src_mem = MemoryIndex::from_u32(*src_mem);
+            let dst_mem = TMemoryIndex::from_u32(*dst_mem);
+            let src_mem = TMemoryIndex::from_u32(*src_mem);
             let len = environ.stacks.pop1();
             let src = environ.stacks.pop1();
             let dest = environ.stacks.pop1();
@@ -297,29 +298,29 @@ pub fn translate_operator(
                 .translate_transaction_tmemory_copy(builder, dst_mem, src_mem, dest, src, len)?;
         }
         Operator::TMemoryInit { data_index, mem } => {
-            let mem = MemoryIndex::from_u32(*mem);
+            let mem = TMemoryIndex::from_u32(*mem);
             let len = environ.stacks.pop1();
             let src = environ.stacks.pop1();
             let dest = environ.stacks.pop1();
             environ.translate_transaction_tmemory_init(
                 builder,
                 mem,
-                *data_index,
+                TDataIndex::from_u32(*data_index),
                 dest,
                 src,
                 len,
             )?;
         }
         Operator::TDataDrop { data_index } => {
-            environ.translate_transaction_tdata_drop(builder, *data_index)?;
+            environ.translate_transaction_tdata_drop(builder, TDataIndex::from_u32(*data_index))?;
         }
         Operator::TTableSize { table: index } => {
-            let result =
-                environ.translate_transaction_ttable_size(builder, TableIndex::from_u32(*index))?;
+            let result = environ
+                .translate_transaction_ttable_size(builder, TTableIndex::from_u32(*index))?;
             environ.stacks.push1(result);
         }
         Operator::TTableGrow { table: index } => {
-            let table_index = TableIndex::from_u32(*index);
+            let table_index = TTableIndex::from_u32(*index);
             let delta = environ.stacks.pop1();
             let init_value = environ.stacks.pop1();
             let result = environ.translate_transaction_ttable_grow(
@@ -331,19 +332,19 @@ pub fn translate_operator(
             environ.stacks.push1(result);
         }
         Operator::TTableGet { table: index } => {
-            let table_index = TableIndex::from_u32(*index);
+            let table_index = TTableIndex::from_u32(*index);
             let index = environ.stacks.pop1();
             let result = environ.translate_transaction_ttable_get(builder, table_index, index)?;
             environ.stacks.push1(result);
         }
         Operator::TTableSet { table: index } => {
-            let table_index = TableIndex::from_u32(*index);
+            let table_index = TTableIndex::from_u32(*index);
             let value = environ.stacks.pop1();
             let index = environ.stacks.pop1();
             environ.translate_transaction_ttable_set(builder, table_index, value, index)?;
         }
         Operator::TTableFill { table } => {
-            let table_index = TableIndex::from_u32(*table);
+            let table_index = TTableIndex::from_u32(*table);
             let len = environ.stacks.pop1();
             let val = environ.stacks.pop1();
             let dest = environ.stacks.pop1();
@@ -358,8 +359,8 @@ pub fn translate_operator(
             let dest = environ.stacks.pop1();
             environ.translate_transaction_ttable_copy(
                 builder,
-                TableIndex::from_u32(*dst_table_index),
-                TableIndex::from_u32(*src_table_index),
+                TTableIndex::from_u32(*dst_table_index),
+                TTableIndex::from_u32(*src_table_index),
                 dest,
                 src,
                 len,
@@ -374,8 +375,8 @@ pub fn translate_operator(
             let dest = environ.stacks.pop1();
             environ.translate_transaction_ttable_init(
                 builder,
-                *elem_index,
-                TableIndex::from_u32(*table_index),
+                TElemIndex::from_u32(*elem_index),
+                TTableIndex::from_u32(*table_index),
                 dest,
                 src,
                 len,
@@ -390,22 +391,10 @@ pub fn translate_operator(
         Operator::Nop => {
             // We do nothing
         }
-        Operator::TTry => {
-            environ.translate_transaction_begin(builder)?;
-        }
-        Operator::TTryStart => {
+        Operator::TTry { blockty: _ } => {
             environ.translate_transaction_structured_try_start(builder)?;
         }
-        Operator::TTryElse => {
-            environ.translate_transaction_structured_try_else(builder)?;
-        }
-        Operator::TTryEnd => {
-            environ.translate_transaction_structured_try_end(builder)?;
-        }
         Operator::TFail => {
-            environ.translate_transaction_fail(builder)?;
-        }
-        Operator::TFailCode => {
             let code = environ.stacks.pop1();
             environ.translate_transaction_fail_with_code(builder, code)?;
         }
@@ -932,6 +921,7 @@ pub fn translate_operator(
         Operator::CallIndirect {
             type_index,
             table_index,
+            ..
         } => {
             // `type_index` is the index of the function's signature and
             // `table_index` is the index of the table to search the function
@@ -999,6 +989,7 @@ pub fn translate_operator(
         Operator::ReturnCallIndirect {
             type_index,
             table_index,
+            ..
         } => {
             // `type_index` is the index of the function's signature and
             // `table_index` is the index of the table to search the function
@@ -4059,12 +4050,6 @@ fn translate_unreachable_operator(
         | Operator::TryTable { try_table: _ } => {
             environ.stacks.push_block(ir::Block::reserved_value(), 0, 0);
         }
-        Operator::TTryElse => {
-            environ.translate_transaction_structured_try_else(builder)?;
-        }
-        Operator::TTryEnd => {
-            environ.translate_transaction_structured_try_end(builder)?;
-        }
         Operator::Else => {
             let i = environ.stacks.control_stack.len() - 1;
             let reachable = environ.is_reachable();
@@ -4467,7 +4452,7 @@ fn translate_transaction_load_base(
     let addr = environ.stacks.pop1();
     environ.translate_transaction_tmemory_load(
         builder,
-        MemoryIndex::from_u32(memarg.memory),
+        TMemoryIndex::from_u32(memarg.memory),
         addr,
         memarg.offset,
         u32::from(access_size),
@@ -4486,7 +4471,7 @@ fn translate_transaction_store(
     let mem_op_size = mem_op_size(opcode, val_ty);
     let base = environ.translate_transaction_tmemory_store(
         builder,
-        MemoryIndex::from_u32(memarg.memory),
+        TMemoryIndex::from_u32(memarg.memory),
         addr,
         memarg.offset,
         u32::from(mem_op_size),

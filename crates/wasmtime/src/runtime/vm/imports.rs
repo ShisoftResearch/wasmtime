@@ -21,11 +21,20 @@ pub struct Imports<'a> {
     /// Resolved addresses for imported tables.
     pub tables: &'a [VMTableImport],
 
+    /// Resolved addresses for imported transactional tables.
+    pub ttables: &'a [VMTableImport],
+
     /// Resolved addresses for imported memories.
     pub memories: &'a [VMMemoryImport],
 
+    /// Resolved addresses for imported transactional memories.
+    pub tmemories: &'a [VMMemoryImport],
+
     /// Resolved addresses for imported globals.
     pub globals: &'a [VMGlobalImport],
+
+    /// Resolved addresses for imported transactional globals.
+    pub tglobals: &'a [VMGlobalImport],
 
     /// Resolved addresses for imported tags.
     pub tags: &'a [VMTagImport],

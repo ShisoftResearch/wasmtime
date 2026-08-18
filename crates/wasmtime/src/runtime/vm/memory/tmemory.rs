@@ -12,7 +12,7 @@ use crate::runtime::transaction::{
     TMemoryFileBacking, TMemoryPersistenceMode, TransactionConfig,
 };
 use alloc::collections::BTreeMap;
-use wasmtime_environ::MemoryIndex;
+use wasmtime_environ::TMemoryIndex;
 
 pub(crate) mod block_region;
 mod durable_log;
@@ -84,7 +84,7 @@ pub(crate) struct TMemory {
     storage: Box<dyn TMemoryBackendStorage>,
 }
 
-/// Per-instance transactional memories keyed by raw module-level `MemoryIndex`.
+/// Per-instance transactional memories keyed by native transactional-memory index.
 #[derive(Debug, Default)]
 pub(crate) struct TMemorySidecar {
     memories: TryBTreeMap<u32, TMemory>,
@@ -93,21 +93,21 @@ pub(crate) struct TMemorySidecar {
 impl TMemorySidecar {
     pub(crate) fn insert(
         &mut self,
-        memory: MemoryIndex,
+        memory: TMemoryIndex,
         tmemory: TMemory,
     ) -> core::result::Result<Option<TMemory>, OutOfMemory> {
         self.memories.insert(memory.as_u32(), tmemory)
     }
 
-    pub(crate) fn get(&self, memory: MemoryIndex) -> Option<&TMemory> {
+    pub(crate) fn get(&self, memory: TMemoryIndex) -> Option<&TMemory> {
         self.memories.get(memory.as_u32())
     }
 
-    pub(crate) fn get_mut(&mut self, memory: MemoryIndex) -> Option<&mut TMemory> {
+    pub(crate) fn get_mut(&mut self, memory: TMemoryIndex) -> Option<&mut TMemory> {
         self.memories.get_mut(memory.as_u32())
     }
 
-    pub(crate) fn contains(&self, memory: MemoryIndex) -> bool {
+    pub(crate) fn contains(&self, memory: TMemoryIndex) -> bool {
         self.memories.contains_key(memory.as_u32())
     }
 }
@@ -2620,8 +2620,8 @@ mod tests {
 
     #[test]
     fn transaction_memory_sidecar_resolves_by_memory_index() {
-        let memory0 = MemoryIndex::from_u32(0);
-        let memory2 = MemoryIndex::from_u32(2);
+        let memory0 = TMemoryIndex::from_u32(0);
+        let memory2 = TMemoryIndex::from_u32(2);
         let mut sidecar = TMemorySidecar::default();
 
         assert!(!sidecar.contains(memory0));

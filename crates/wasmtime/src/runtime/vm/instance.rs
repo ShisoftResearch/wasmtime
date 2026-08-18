@@ -40,9 +40,10 @@ use wasmtime_environ::error::OutOfMemory;
 use wasmtime_environ::{
     Abi, DefinedFuncIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex,
     DefinedTagIndex, EntityIndex, EntityRef, FuncIndex, FuncKey, GlobalConstValue, GlobalIndex,
-    HostPtr, MemoryIndex, MemoryInitialization, ModuleStartup, PassiveElemIndex, PtrSize,
-    RuntimeDataIndex, TableIndex, TagIndex, VMCONTEXT_MAGIC, VMOffsets, VMSharedTypeIndex,
-    WasmRefType, packed_option::ReservedValue,
+    HostPtr, MemoryIndex, MemoryInitialization, ModuleStartup, PassiveElemIndex, PassiveTElemIndex,
+    PtrSize, RuntimeDataIndex, RuntimeTDataIndex, TGlobalIndex, TMemoryIndex,
+    TMemoryInitialization, TTableIndex, TableIndex, TagIndex, VMCONTEXT_MAGIC, VMOffsets,
+    VMSharedTypeIndex, WasmRefType, packed_option::ReservedValue,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::Wmemcheck;
@@ -143,6 +144,9 @@ pub struct Instance {
     // but that type is currently footgun-y / isn't actually OOM-safe yet.
     passive_elements: TryVec<PassiveElementSegment>,
 
+    /// Evaluated passive transactional element segments.
+    passive_telements: TryVec<PassiveElementSegment>,
+
     // TODO: add support for multiple memories; `wmemcheck_state` corresponds to
     // memory 0.
     #[cfg(feature = "wmemcheck")]
@@ -186,6 +190,7 @@ impl Instance {
         let tmemory_sidecar = Self::build_tmemory_sidecar(module, req.store)
             .map_err(|_| OutOfMemory::new(usize::MAX))?;
         let mut passive_elements = TryVec::with_capacity(module.passive_elements.len())?;
+        let mut passive_telements = TryVec::with_capacity(module.passive_telements.len())?;
 
         #[cfg(feature = "wmemcheck")]
         let wmemcheck_state = if req.store.engine().config().wmemcheck {
@@ -207,6 +212,10 @@ impl Instance {
             let len = usize::try_from(*len).unwrap();
             passive_elements.push(PassiveElementSegment::new(*ty, len)?)?;
         }
+        for (_, (ty, len)) in req.runtime_info.env_module().passive_telements.iter() {
+            let len = usize::try_from(*len).unwrap();
+            passive_telements.push(PassiveElementSegment::new(*ty, len)?)?;
+        }
 
         // Allocate the instance and its `VMContext` with empty memory and table
         // maps. This is the final fallible allocation in this function; only
@@ -221,6 +230,7 @@ impl Instance {
             tmemory_sidecar,
             tables: TryPrimaryMap::default(),
             passive_elements,
+            passive_telements,
             #[cfg(feature = "wmemcheck")]
             wmemcheck_state,
             store: None,
@@ -265,13 +275,7 @@ impl Instance {
     ) -> Result<TMemorySidecar> {
         let transaction_config = store.transaction_config();
         let mut sidecar = TMemorySidecar::default();
-        let defined_tmemories = module
-            .transaction_objects
-            .memories
-            .iter()
-            .copied()
-            .filter(|memory_index| module.defined_memory_index(*memory_index).is_some())
-            .count();
+        let defined_tmemories = module.num_defined_tmemories();
         let single_path_backed_tmemory = transaction_config.tmemory_backend()
             == TMemoryBackend::FileBackedMemory
             || transaction_config.has_path_backed_dax_pmem_tmemory();
@@ -281,12 +285,10 @@ impl Instance {
             );
         }
 
-        for memory_index in module.transaction_objects.memories.iter().copied() {
-            if module.defined_memory_index(memory_index).is_none() {
+        for (memory_index, memory) in module.tmemories.iter() {
+            if module.defined_tmemory_index(memory_index).is_none() {
                 continue;
             }
-
-            let memory = &module.memories[memory_index];
             let min_bytes = memory
                 .minimum_byte_size()
                 .map_err(|_| OutOfMemory::new(usize::MAX))?;
@@ -331,21 +333,18 @@ impl Instance {
             return Ok(());
         }
         let module = self.runtime_info.env_module();
-        let MemoryInitialization::Static { map } = &module.memory_initialization else {
+        let TMemoryInitialization::Static { map } = &module.t_memory_initialization else {
             return Ok(());
         };
 
         let mut initializers = TryVec::new();
         for (memory_index, init) in map {
-            if !module.transaction_objects.is_tmemory(memory_index) {
-                continue;
-            }
             let Some((offset, data_index)) = init else {
                 continue;
             };
 
             let offset = usize::try_from(*offset).map_err(|_| OutOfMemory::new(usize::MAX))?;
-            let data = self.runtime_data(*data_index);
+            let data = self.runtime_tdata(*data_index);
             let mut copy = TryVec::with_capacity(data.len())?;
             for byte in data {
                 copy.push(*byte)?;
@@ -364,14 +363,14 @@ impl Instance {
     #[cfg(has_virtual_memory)]
     fn commit_tmemory_static_data(
         mut self: Pin<&mut Self>,
-        memory_index: MemoryIndex,
+        memory_index: TMemoryIndex,
         offset: usize,
         data: &[u8],
     ) -> Result<(), OutOfMemory> {
         if self
             .runtime_info
             .env_module()
-            .defined_memory_index(memory_index)
+            .defined_tmemory_index(memory_index)
             .is_some()
         {
             let Some(tmemory) = self.as_mut().tmemory_sidecar_mut().get_mut(memory_index) else {
@@ -382,17 +381,23 @@ impl Instance {
                 .map_err(|_| OutOfMemory::new(data.len()));
         }
 
-        let import = *self.as_ref().get_ref().imported_memory(memory_index);
+        let import = *self.as_ref().get_ref().imported_tmemory(memory_index);
         let vmctx = import.vmctx.as_non_null();
         // SAFETY: imported VM memory records are initialized before transactional
         // sidecar data is committed, and the import's `vmctx` belongs to the
         // same store as this instance.
         let mut foreign_instance = unsafe { self.as_mut().sibling_vmctx_mut(vmctx) };
+        let source_defined_memory = foreign_instance
+            .as_ref()
+            .get_ref()
+            .env_module()
+            .defined_tmemory_index_from_runtime(import.index)
+            .expect("transactional memory import must refer to a transactional definition");
         let source_memory_index = foreign_instance
             .as_ref()
             .get_ref()
             .env_module()
-            .memory_index(import.index);
+            .tmemory_index(source_defined_memory);
         let Some(tmemory) = foreign_instance
             .as_mut()
             .tmemory_sidecar_mut()
@@ -417,10 +422,10 @@ impl Instance {
     /// This instance must live for the duration of the associated GC cycle.
     #[cfg(feature = "gc")]
     pub(crate) unsafe fn trace_element_segment_roots(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         gc_roots: &mut crate::vm::GcRootsList,
     ) {
-        for segment in self.passive_elements_mut().iter_mut() {
+        for segment in self.as_mut().passive_elements_mut().iter_mut() {
             if segment.needs_gc_rooting {
                 for e in segment.elements_mut() {
                     if e.get_vmgcref().is_none() {
@@ -433,6 +438,23 @@ impl Instance {
                     // the lifetime is implied by our safety contract.
                     unsafe {
                         gc_roots.add_val_raw_root(root, "passive element segment");
+                    }
+                }
+            }
+        }
+        for segment in self.passive_telements_mut().iter_mut() {
+            if segment.needs_gc_rooting {
+                for e in segment.elements_mut() {
+                    if e.get_vmgcref().is_none() {
+                        continue;
+                    }
+
+                    let root: SendSyncPtr<ValRaw> = e.into();
+
+                    // Safety: We know this is a type that needs GC rooting and
+                    // the lifetime is implied by our safety contract.
+                    unsafe {
+                        gc_roots.add_val_raw_root(root, "passive transactional element segment");
                     }
                 }
             }
@@ -615,6 +637,24 @@ impl Instance {
         unsafe { self.vmctx_plus_offset(self.offsets().vmctx_vmmemory_import(index)) }
     }
 
+    /// Return the indexed transactional `VMMemoryImport`.
+    fn imported_tmemory(&self, index: TMemoryIndex) -> &VMMemoryImport {
+        let index = self.env_module().runtime_imported_tmemory_index(index);
+        unsafe { self.vmctx_plus_offset(self.offsets().vmctx_vmmemory_import(index)) }
+    }
+
+    /// Return the indexed transactional `VMTableImport`.
+    fn imported_ttable(&self, index: TTableIndex) -> &VMTableImport {
+        let index = self.env_module().runtime_imported_ttable_index(index);
+        unsafe { self.vmctx_plus_offset(self.offsets().vmctx_vmtable_import(index)) }
+    }
+
+    /// Return the indexed transactional `VMGlobalImport`.
+    pub(crate) fn imported_tglobal(&self, index: TGlobalIndex) -> &VMGlobalImport {
+        let index = self.env_module().runtime_imported_tglobal_index(index);
+        unsafe { self.vmctx_plus_offset(self.offsets().vmctx_vmglobal_import(index)) }
+    }
+
     /// Return the indexed `VMGlobalImport`.
     pub(crate) fn imported_global(&self, index: GlobalIndex) -> &VMGlobalImport {
         unsafe { self.vmctx_plus_offset(self.offsets().vmctx_vmglobal_import(index)) }
@@ -700,12 +740,18 @@ impl Instance {
     pub fn all_globals(
         &self,
         store: StoreId,
-    ) -> impl ExactSizeIterator<Item = (GlobalIndex, crate::Global)> + '_ {
+    ) -> impl Iterator<Item = (EntityIndex, crate::Global)> + '_ {
         let module = self.env_module();
         module
             .globals
             .keys()
-            .map(move |idx| (idx, self.get_exported_global(store, idx)))
+            .map(move |idx| (idx.into(), self.get_exported_global(store, idx)))
+            .chain(
+                module
+                    .tglobals
+                    .keys()
+                    .map(move |idx| (idx.into(), self.get_exported_tglobal(store, idx))),
+            )
     }
 
     /// Get the globals defined in this instance (not imported).
@@ -714,9 +760,11 @@ impl Instance {
         store: StoreId,
     ) -> impl ExactSizeIterator<Item = (DefinedGlobalIndex, crate::Global)> + '_ {
         let module = self.env_module();
-        self.all_globals(store)
-            .skip(module.num_imported_globals)
-            .map(move |(i, global)| (module.defined_global_index(i).unwrap(), global))
+        let instance = StoreInstanceId::new(store, self.id);
+        (0..module.num_runtime_defined_globals()).map(move |i| {
+            let i = DefinedGlobalIndex::new(i);
+            (i, crate::Global::from_core(instance, i))
+        })
     }
 
     /// Return a pointer to the interrupts structure
@@ -837,6 +885,23 @@ impl Instance {
         crate::Table::from_raw(StoreInstanceId::new(store, id), def_index)
     }
 
+    /// Lookup a transactional table by its native index.
+    pub fn get_exported_ttable(&self, store: StoreId, index: TTableIndex) -> crate::Table {
+        let (id, def_index) = if let Some(def_index) = self.env_module().defined_ttable_index(index)
+        {
+            (
+                self.id,
+                self.env_module().runtime_defined_ttable_index(def_index),
+            )
+        } else {
+            let import = self.imported_ttable(index);
+            // SAFETY: instance import records contain a valid sibling vmctx.
+            let id = unsafe { self.sibling_vmctx(import.vmctx.as_non_null()).id };
+            (id, import.index)
+        };
+        crate::Table::from_raw(StoreInstanceId::new(store, id), def_index)
+    }
+
     /// Lookup a memory by index.
     ///
     /// # Panics
@@ -886,6 +951,39 @@ impl Instance {
         }
     }
 
+    /// Lookup a transactional memory by its native index.
+    pub fn get_exported_tmemory(&self, store: StoreId, index: TMemoryIndex) -> ExportMemory {
+        let module = self.env_module();
+        if module.tmemories[index].shared {
+            let (memory, import) = if let Some(def_index) = module.defined_tmemory_index(index) {
+                let def_index = module.runtime_defined_tmemory_index(def_index);
+                (
+                    self.get_defined_memory(def_index),
+                    self.get_defined_memory_vmimport(def_index),
+                )
+            } else {
+                let import = self.imported_tmemory(index);
+                // SAFETY: instance import records contain a valid sibling vmctx.
+                let instance = unsafe { self.sibling_vmctx(import.vmctx.as_non_null()) };
+                (instance.get_defined_memory(import.index), *import)
+            };
+            let vm = memory.as_shared_memory().unwrap().clone();
+            ExportMemory::Shared(vm, import)
+        } else {
+            let (id, def_index) = if let Some(def_index) = module.defined_tmemory_index(index) {
+                (self.id, module.runtime_defined_tmemory_index(def_index))
+            } else {
+                let import = self.imported_tmemory(index);
+                // SAFETY: instance import records contain a valid sibling vmctx.
+                let id = unsafe { self.sibling_vmctx(import.vmctx.as_non_null()).id };
+                (id, import.index)
+            };
+            let store_id = StoreInstanceId::new(store, id);
+            // SAFETY: the memory type was checked to be unshared above.
+            ExportMemory::Unshared(unsafe { crate::Memory::from_raw(store_id, def_index) })
+        }
+    }
+
     /// Lookup a global by index.
     ///
     /// # Panics
@@ -907,6 +1005,60 @@ impl Instance {
             VMGlobalKind::Instance(index) => {
                 // SAFETY: validity of this `&Instance` means validity of its
                 // imports meaning we can read the id of the vmctx within.
+                let id = unsafe {
+                    let vmctx = VMContext::from_opaque(import.vmctx.unwrap().as_non_null());
+                    self.sibling_vmctx(vmctx).id
+                };
+                crate::Global::from_core(StoreInstanceId::new(store, id), index)
+            }
+            #[cfg(feature = "component-model")]
+            VMGlobalKind::ComponentFlags(index) => {
+                // SAFETY: validity of this `&Instance` means validity of its
+                // imports meaning we can read the id of the vmctx within.
+                let id = unsafe {
+                    let vmctx = super::component::VMComponentContext::from_opaque(
+                        import.vmctx.unwrap().as_non_null(),
+                    );
+                    super::component::ComponentInstance::vmctx_instance_id(vmctx)
+                };
+                crate::Global::from_component_flags(
+                    crate::component::store::StoreComponentInstanceId::new(store, id),
+                    index,
+                )
+            }
+            #[cfg(feature = "component-model")]
+            VMGlobalKind::TaskMayBlock => {
+                // SAFETY: validity of this `&Instance` means validity of its
+                // imports meaning we can read the id of the vmctx within.
+                let id = unsafe {
+                    let vmctx = super::component::VMComponentContext::from_opaque(
+                        import.vmctx.unwrap().as_non_null(),
+                    );
+                    super::component::ComponentInstance::vmctx_instance_id(vmctx)
+                };
+                crate::Global::from_task_may_block(
+                    crate::component::store::StoreComponentInstanceId::new(store, id),
+                )
+            }
+        }
+    }
+
+    /// Lookup a transactional global by its native index.
+    pub(crate) fn get_exported_tglobal(
+        &self,
+        store: StoreId,
+        index: TGlobalIndex,
+    ) -> crate::Global {
+        if let Some(def_index) = self.env_module().defined_tglobal_index(index) {
+            let def_index = self.env_module().runtime_defined_tglobal_index(def_index);
+            return crate::Global::from_core(StoreInstanceId::new(store, self.id), def_index);
+        }
+
+        let import = self.imported_tglobal(index);
+        match import.kind {
+            VMGlobalKind::Host(index) => crate::Global::from_host(store, index),
+            VMGlobalKind::Instance(index) => {
+                // SAFETY: instance import records contain a valid sibling vmctx.
                 let id = unsafe {
                     let vmctx = VMContext::from_opaque(import.vmctx.unwrap().as_non_null());
                     self.sibling_vmctx(vmctx).id
@@ -1198,6 +1350,31 @@ impl Instance {
         &mut unsafe { self.get_unchecked_mut() }.passive_elements
     }
 
+    /// Get a passive transactional element segment.
+    pub(crate) fn passive_telement_segment(
+        self: Pin<&mut Self>,
+        passive: PassiveTElemIndex,
+    ) -> &mut [ValRaw] {
+        self.passive_telements_mut()[passive.index()].elements_mut()
+    }
+
+    pub(crate) fn passive_telements_mut(
+        self: Pin<&mut Self>,
+    ) -> &mut TryVec<PassiveElementSegment> {
+        // SAFETY: Not moving data out of `self`.
+        &mut unsafe { self.get_unchecked_mut() }.passive_telements
+    }
+
+    /// Drop a passive transactional element segment.
+    pub(crate) fn passive_telem_drop(
+        self: Pin<&mut Self>,
+        gc_store: Option<&mut GcStore>,
+        passive_index: PassiveTElemIndex,
+    ) -> Result<(), OutOfMemory> {
+        self.passive_telements_mut()[passive_index.index()].clear(gc_store);
+        Ok(())
+    }
+
     /// Drop an element.
     pub(crate) fn passive_elem_drop(
         self: Pin<&mut Self>,
@@ -1220,7 +1397,7 @@ impl Instance {
 
     #[cfg(has_virtual_memory)]
     #[allow(dead_code)]
-    pub(crate) fn get_tmemory(&self, index: MemoryIndex) -> Option<&TMemory> {
+    pub(crate) fn get_tmemory(&self, index: TMemoryIndex) -> Option<&TMemory> {
         self.tmemory_sidecar.get(index)
     }
 
@@ -1228,7 +1405,7 @@ impl Instance {
     #[allow(dead_code)]
     pub(crate) fn get_tmemory_mut(
         self: Pin<&mut Self>,
-        index: MemoryIndex,
+        index: TMemoryIndex,
     ) -> Option<&mut TMemory> {
         self.tmemory_sidecar_mut().get_mut(index)
     }
@@ -1259,6 +1436,12 @@ impl Instance {
     /// Panics if `index` is out-of-bounds.
     fn runtime_data(&self, index: RuntimeDataIndex) -> &[u8] {
         let range = self.env_module().runtime_data[index].clone();
+        self.wasm_data(range)
+    }
+
+    /// Returns the bytes for a transactional runtime data segment.
+    fn runtime_tdata(&self, index: RuntimeTDataIndex) -> &[u8] {
+        let range = self.env_module().runtime_tdata[index].clone();
         self.wasm_data(range)
     }
 
@@ -1316,7 +1499,10 @@ impl Instance {
                 // that `i` may be outside the limits of the static
                 // initialization so it's a fallible `get` instead of an index.
                 let module = self.env_module();
-                let precomputed = &module.table_initialization[idx];
+                let precomputed = match module.defined_ttable_index_from_runtime(idx) {
+                    Some(idx) => &module.t_table_initialization[idx],
+                    None => &module.table_initialization[idx],
+                };
                 // Panicking here helps catch bugs rather than silently truncating by accident.
                 let func_index = precomputed.get(usize::try_from(i).unwrap()).cloned();
                 let func_ref = func_index
@@ -1438,6 +1624,15 @@ impl Instance {
                     .as_ptr(),
                 imports.tables.len(),
             );
+            debug_assert_eq!(imports.ttables.len(), module.num_imported_ttables);
+            ptr::copy_nonoverlapping(
+                imports.ttables.as_ptr(),
+                instance
+                    .vmctx_plus_offset_raw::<VMTableImport>(offsets.vmctx_imported_tables_begin())
+                    .as_ptr()
+                    .add(imports.tables.len()),
+                imports.ttables.len(),
+            );
             debug_assert_eq!(imports.memories.len(), module.num_imported_memories);
             ptr::copy_nonoverlapping(
                 imports.memories.as_ptr(),
@@ -1446,6 +1641,17 @@ impl Instance {
                     .as_ptr(),
                 imports.memories.len(),
             );
+            debug_assert_eq!(imports.tmemories.len(), module.num_imported_tmemories);
+            ptr::copy_nonoverlapping(
+                imports.tmemories.as_ptr(),
+                instance
+                    .vmctx_plus_offset_raw::<VMMemoryImport>(
+                        offsets.vmctx_imported_memories_begin(),
+                    )
+                    .as_ptr()
+                    .add(imports.memories.len()),
+                imports.tmemories.len(),
+            );
             debug_assert_eq!(imports.globals.len(), module.num_imported_globals);
             ptr::copy_nonoverlapping(
                 imports.globals.as_ptr(),
@@ -1453,6 +1659,15 @@ impl Instance {
                     .vmctx_plus_offset_raw(offsets.vmctx_imported_globals_begin())
                     .as_ptr(),
                 imports.globals.len(),
+            );
+            debug_assert_eq!(imports.tglobals.len(), module.num_imported_tglobals);
+            ptr::copy_nonoverlapping(
+                imports.tglobals.as_ptr(),
+                instance
+                    .vmctx_plus_offset_raw::<VMGlobalImport>(offsets.vmctx_imported_globals_begin())
+                    .as_ptr()
+                    .add(imports.globals.len()),
+                imports.tglobals.len(),
             );
             debug_assert_eq!(imports.tags.len(), module.num_imported_tags);
             ptr::copy_nonoverlapping(
@@ -1478,7 +1693,7 @@ impl Instance {
             let offsets = instance.runtime_info.offsets();
             let mut ptr = instance.vmctx_plus_offset_raw(offsets.vmctx_tables_begin());
             let tables = instance.as_mut().tables_mut();
-            for i in 0..module.num_defined_tables() {
+            for i in 0..module.num_runtime_defined_tables() {
                 ptr.write(tables[DefinedTableIndex::new(i)].1.vmtable());
                 ptr = ptr.add(1);
             }
@@ -1499,10 +1714,17 @@ impl Instance {
             let mut owned_ptr =
                 instance.vmctx_plus_offset_raw(offsets.vmctx_owned_memories_begin());
             let memories = instance.as_mut().memories_mut();
-            for i in 0..module.num_defined_memories() {
+            for i in 0..module.num_runtime_defined_memories() {
                 let defined_memory_index = DefinedMemoryIndex::new(i);
-                let memory_index = module.memory_index(defined_memory_index);
-                if module.memories[memory_index].shared {
+                let shared = if i < module.num_defined_memories() {
+                    module.memories[module.memory_index(defined_memory_index)].shared
+                } else {
+                    let tdefined = module
+                        .defined_tmemory_index_from_runtime(defined_memory_index)
+                        .unwrap();
+                    module.tmemories[module.tmemory_index(tdefined)].shared
+                };
+                if shared {
                     let def_ptr = memories[defined_memory_index]
                         .1
                         .as_shared_memory()
@@ -1530,7 +1752,7 @@ impl Instance {
         // after this, but if it's read then it'd hopefully crash faster than
         // leaving this undefined.
         unsafe {
-            for i in 0..module.num_defined_globals() {
+            for i in 0..module.num_runtime_defined_globals() {
                 let index = DefinedGlobalIndex::new(i);
                 instance.global_ptr(index).write(VMGlobalDefinition::new());
             }
@@ -1544,6 +1766,18 @@ impl Instance {
                     GlobalConstValue::V128(i) => def.set_u128(*i),
                 }
                 instance.global_ptr(*index).write(def);
+            }
+            for (index, val) in module.tglobal_initializers.iter() {
+                let mut def = VMGlobalDefinition::new();
+                match val {
+                    GlobalConstValue::I32(i) => *def.as_i32_mut() = *i,
+                    GlobalConstValue::I64(i) => *def.as_i64_mut() = *i,
+                    GlobalConstValue::F32(i) => *def.as_f32_bits_mut() = *i,
+                    GlobalConstValue::F64(i) => *def.as_f64_bits_mut() = *i,
+                    GlobalConstValue::V128(i) => def.set_u128(*i),
+                }
+                let index = module.runtime_defined_tglobal_index(*index);
+                instance.global_ptr(index).write(def);
             }
         }
 
@@ -1579,6 +1813,13 @@ impl Instance {
                 instance.vmctx_plus_offset_raw(offsets.vmctx_runtime_data_bases_begin());
             for i in module.runtime_data.keys() {
                 let data = instance.runtime_data(i);
+                lengths.write(u32::try_from(data.len()).unwrap());
+                lengths = lengths.add(1);
+                bases.write(VmPtr::from(NonNull::from(data).cast::<u8>()));
+                bases = bases.add(1);
+            }
+            for i in module.runtime_tdata.keys() {
+                let data = instance.runtime_tdata(i);
                 lengths.write(u32::try_from(data.len()).unwrap());
                 lengths = lengths.add(1);
                 bases.write(VmPtr::from(NonNull::from(data).cast::<u8>()));
@@ -1657,22 +1898,39 @@ impl Instance {
     pub fn all_memories(
         &self,
         store: StoreId,
-    ) -> impl ExactSizeIterator<Item = (MemoryIndex, ExportMemory)> + '_ {
-        self.env_module()
+    ) -> impl Iterator<Item = (EntityIndex, ExportMemory)> + '_ {
+        let module = self.env_module();
+        module
             .memories
             .iter()
-            .map(move |(i, _)| (i, self.get_exported_memory(store, i)))
+            .map(move |(i, _)| (i.into(), self.get_exported_memory(store, i)))
+            .chain(
+                module
+                    .tmemories
+                    .iter()
+                    .map(move |(i, _)| (i.into(), self.get_exported_tmemory(store, i))),
+            )
     }
 
     /// Return the memories defined in this instance (not imported).
     pub fn defined_memories<'a>(
         &'a self,
         store: StoreId,
-    ) -> impl ExactSizeIterator<Item = ExportMemory> + 'a {
+    ) -> impl Iterator<Item = ExportMemory> + 'a {
         let num_imported = self.env_module().num_imported_memories;
-        self.all_memories(store)
+        let num_imported_tmemories = self.env_module().num_imported_tmemories;
+        self.env_module()
+            .memories
+            .keys()
             .skip(num_imported)
-            .map(|(_i, memory)| memory)
+            .map(move |i| self.get_exported_memory(store, i))
+            .chain(
+                self.env_module()
+                    .tmemories
+                    .keys()
+                    .skip(num_imported_tmemories)
+                    .map(move |i| self.get_exported_tmemory(store, i)),
+            )
     }
 
     /// Lookup an item with the given index.
@@ -1698,8 +1956,14 @@ impl Instance {
                 Export::Function(unsafe { self.get_exported_func(registry, store, i) })
             }
             EntityIndex::Global(i) => Export::Global(self.get_exported_global(store, i)),
+            EntityIndex::TGlobal(i) => Export::Global(self.get_exported_tglobal(store, i)),
             EntityIndex::Table(i) => Export::Table(self.get_exported_table(store, i)),
+            EntityIndex::TTable(i) => Export::Table(self.get_exported_ttable(store, i)),
             EntityIndex::Memory(i) => match self.get_exported_memory(store, i) {
+                ExportMemory::Unshared(m) => Export::Memory(m),
+                ExportMemory::Shared(m, i) => Export::SharedMemory(m, i),
+            },
+            EntityIndex::TMemory(i) => match self.get_exported_tmemory(store, i) {
                 ExportMemory::Unshared(m) => Export::Memory(m),
                 ExportMemory::Shared(m, i) => Export::SharedMemory(m, i),
             },

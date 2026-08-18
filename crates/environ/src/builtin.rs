@@ -15,6 +15,12 @@ macro_rules! foreach_builtin_function {
             passive_elem_segment_base(vmctx: vmctx, elem: u32) -> pointer;
             // Guts of `elem.drop` for passive data segments.
             passive_elem_segment_drop(vmctx: vmctx, elem: u32) -> bool;
+            // Returns the current size of a passive transactional `elem` segment.
+            passive_telem_segment_len(vmctx: vmctx, elem: u32) -> size;
+            // Returns the base address of a passive transactional `elem` segment.
+            passive_telem_segment_base(vmctx: vmctx, elem: u32) -> pointer;
+            // Guts of `telem.drop` for passive transactional element segments.
+            passive_telem_segment_drop(vmctx: vmctx, elem: u32) -> bool;
             // Returns a value for wasm's `ref.func` instruction.
             ref_func(vmctx: vmctx, func: u32) -> pointer;
             // Returns a table entry after lazily initializing it.
@@ -239,6 +245,10 @@ macro_rules! foreach_builtin_function {
             transaction_ttable_read_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
             // Acquires a writable transactional table range.
             transaction_ttable_write_range(vmctx: vmctx, table: u32, start: u64, len: u64) -> bool;
+            // Copies a visible transactional table range into another transactional table.
+            transaction_ttable_copy(vmctx: vmctx, dst_table: u32, src_table: u32, dst: u64, src: u64, len: u64) -> bool;
+            // Initializes a transactional table from a passive transactional element segment.
+            transaction_ttable_init(vmctx: vmctx, table: u32, elem: u32, dst: u64, src: u64, len: u64) -> bool;
             // Returns the visible transactional table size.
             transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
             // Stages a transactional table grow and returns the previous visible size.
@@ -525,6 +535,8 @@ impl BuiltinFunctionIndex {
             (@get passive_data_segment_base pointer) => (return None);
             (@get passive_elem_segment_len size) => (return None);
             (@get passive_elem_segment_base pointer) => (return None);
+            (@get passive_telem_segment_len size) => (return None);
+            (@get passive_telem_segment_base pointer) => (return None);
 
             (@get cont_new pointer) => (TrapSentinel::Negative);
 
@@ -571,6 +583,8 @@ mod tests {
             BuiltinFunctionIndex::transaction_ttable_startup_check_range(),
             BuiltinFunctionIndex::transaction_ttable_read_range(),
             BuiltinFunctionIndex::transaction_ttable_write_range(),
+            BuiltinFunctionIndex::transaction_ttable_copy(),
+            BuiltinFunctionIndex::transaction_ttable_init(),
             BuiltinFunctionIndex::transaction_tstruct_new(),
             BuiltinFunctionIndex::transaction_tstruct_static_new(),
             BuiltinFunctionIndex::transaction_tstruct_set(),

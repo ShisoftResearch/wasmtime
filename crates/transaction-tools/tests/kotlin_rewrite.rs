@@ -1,5 +1,9 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
-use wasmparser::{BinaryReader, ElementItems, ExternalKind, Parser, Payload, Validator};
+use wasmparser::{
+    CompositeInnerType, ElementItems, EntityNamespace, ExternalKind, Parser, Payload, TypeRef,
+    Validator,
+};
 use wasmtime_transaction_tools::kotlin_metadata::{
     KotlinCopyableSource, KotlinCopyableType, KotlinField, KotlinFieldKind, KotlinGcWasmCapture,
     KotlinPersistentKind, KotlinPersistentType, KotlinRoot, KotlinSidecar, parse_kotlin_sidecar,
@@ -125,6 +129,24 @@ fn rewrite_report_rejects_missing_transaction_function() {
 }
 
 #[test]
+fn rewrite_rejects_obsolete_transaction_object_metadata() {
+    let mut module = wasm_encoder::Module::new();
+    module.section(&wasm_encoder::CustomSection {
+        name: Cow::Borrowed(TRANSACTION_OBJECTS_CUSTOM_SECTION),
+        data: Cow::Borrowed(&[1]),
+    });
+
+    let err = rewrite_kotlin_module(&module.finish(), &sidecar(vec![], &[], vec![]))
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("obsolete shisoft.transaction.objects"),
+        "{err}"
+    );
+}
+
+#[test]
 fn rewrite_report_records_transaction_function_names() {
     let input = wat::parse_str(
         r#"
@@ -167,12 +189,7 @@ fn generic_wasmgc_mode_allows_roots_and_refs_to_runtime_gc_types() {
         (module
           (type $String (struct (field (mut i32))))
           (type $Profile (struct (field (mut (ref null $String)))))
-          (global $source (ref $Profile)
-            (struct.new $Profile
-              (struct.new $String (i32.const 5))))
-          (func (export "publish")
-            global.get $source
-            drop))
+          (func (export "publish")))
         "#,
     )
     .unwrap();
@@ -473,7 +490,7 @@ fn rewrite_lowers_inline_root_markers_for_distinct_root_types() {
         TransactionObjects {
             memories: vec![],
             globals: vec![0, 1],
-            functions: vec![1, 2],
+            functions: vec![0, 1, 2],
             tables: vec![],
         }
     );
@@ -606,14 +623,14 @@ fn rewrite_does_not_lower_non_marker_throw_blocks_with_shifted_literals() {
         }],
     );
 
-    let (output, _) = rewrite_kotlin_module(&input, &sidecar).unwrap();
-    let printed = wasmprinter::print_bytes(&output).unwrap();
-    assert_valid_module(&output);
+    let err = rewrite_kotlin_module(&input, &sidecar)
+        .unwrap_err()
+        .to_string();
 
-    assert!(!printed.contains("tglobal.set"), "{printed}");
-    assert!(!printed.contains("tglobal.get"), "{printed}");
-    assert!(printed.contains("i32.const 696"), "{printed}");
-    assert!(printed.contains("i32.const 697"), "{printed}");
+    assert!(
+        err.contains("native Kotlin rewrite cannot encode transactional operator throw"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -716,7 +733,7 @@ fn rewrite_lowers_same_type_root_marker_imports() {
         TransactionObjects {
             memories: vec![],
             globals: vec![0, 1],
-            functions: vec![2, 3],
+            functions: vec![0, 1, 2, 3, 4],
             tables: vec![],
         }
     );
@@ -783,7 +800,7 @@ fn rewrite_lowers_inline_and_explicit_root_markers_together() {
         TransactionObjects {
             memories: vec![],
             globals: vec![0, 1],
-            functions: vec![1, 2],
+            functions: vec![0, 1, 2],
             tables: vec![],
         }
     );
@@ -1254,7 +1271,7 @@ fn rewrite_lowers_array_object_ops_in_marked_transaction_function() {
 }
 
 #[test]
-fn rewrite_keeps_persistent_constructors_ordinary_until_promotion_boundary() {
+fn rewrite_lowers_persistent_constructors_to_native_transaction_ops() {
     let input = wat::parse_str(
         r#"
             (module
@@ -1280,12 +1297,10 @@ fn rewrite_keeps_persistent_constructors_ordinary_until_promotion_boundary() {
     let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
     assert_valid_module(&output);
-    assert!(printed.contains("struct.new"), "{printed}");
-    assert!(printed.contains("array.new"), "{printed}");
-    assert!(!printed.contains("tstruct.new"), "{printed}");
-    assert!(!printed.contains("tarray.new"), "{printed}");
+    assert!(printed.contains("tstruct.new"), "{printed}");
+    assert!(printed.contains("tarray.new"), "{printed}");
 }
 
 #[test]
@@ -1324,9 +1339,8 @@ fn rewrite_accepts_txref_get_into_persistent_field_without_rewriting_constructor
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
     assert_valid_module(&output);
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
-    assert!(printed.contains("struct.new"), "{printed}");
-    assert!(!printed.contains("tstruct.new"), "{printed}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
+    assert!(printed.contains("tstruct.new"), "{printed}");
 }
 
 #[test]
@@ -1370,8 +1384,8 @@ fn rewrite_accepts_txref_get_passed_to_helper_persistent_field() {
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
     assert_valid_module(&output);
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
-    assert!(printed.contains("call $install"), "{printed}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
+    assert!(printed.contains("tcall $install"), "{printed}");
 }
 
 #[test]
@@ -1590,9 +1604,9 @@ fn rewrite_accepts_transaction_local_builtin_copyable_ref_into_persistent_field(
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
     assert_valid_module(&output);
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
-    assert!(printed.contains("struct.new $kotlin.String"), "{printed}");
-    assert!(printed.contains("struct.new $Bank"), "{printed}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
+    assert!(printed.contains("tstruct.new $kotlin.String"), "{printed}");
+    assert!(printed.contains("tstruct.new $Bank"), "{printed}");
 }
 
 #[test]
@@ -1622,8 +1636,8 @@ fn rewrite_accepts_default_sidecar_builtin_copyable_ref_target() {
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
     assert_valid_module(&output);
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
-    assert!(printed.contains("struct.new $Bank"), "{printed}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
+    assert!(printed.contains("tstruct.new $Bank"), "{printed}");
 }
 
 #[test]
@@ -1801,9 +1815,8 @@ fn rewrite_accepts_copyable_txref_get_into_persistent_field_without_rewriting_co
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
     assert_valid_module(&output);
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
-    assert!(printed.contains("struct.new"), "{printed}");
-    assert!(!printed.contains("tstruct.new"), "{printed}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
+    assert!(printed.contains("tstruct.new"), "{printed}");
 }
 
 #[test]
@@ -1848,7 +1861,7 @@ fn rewrite_accepts_copyable_field_read_from_txref_get_into_persistent_field() {
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
     assert_valid_module(&output);
-    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
+    assert_eq!(report.rewritten_object_ops, 3, "{report:?}");
     assert!(printed.contains("tstruct.get $TransferNote 0"), "{printed}");
 }
 
@@ -2061,7 +2074,7 @@ fn rewrite_rejects_partial_named_struct_fields_with_unnamed_persistent_field() {
 }
 
 #[test]
-fn rewrite_lowers_persistent_accessor_bodies_without_marking_tfuncs() {
+fn rewrite_lowers_persistent_accessor_bodies_as_native_tfuncs() {
     let input = wat::parse_str(
         r#"
             (module
@@ -2084,7 +2097,7 @@ fn rewrite_lowers_persistent_accessor_bodies_without_marking_tfuncs() {
 
     assert_eq!(report.rewritten_tfuncs, 1);
     assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
-    assert_eq!(objects.functions, vec![1]);
+    assert_eq!(objects.functions, vec![0, 1]);
     assert_valid_module(&output);
     assert!(printed.contains("tstruct.get"), "{printed}");
 }
@@ -2404,9 +2417,8 @@ fn rewrite_keeps_array_len_for_unmapped_array_type() {
     let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
-    assert!(printed.contains("array.len"), "{printed}");
-    assert!(!printed.contains("tarray.len"), "{printed}");
+    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
+    assert!(printed.contains("tarray.len"), "{printed}");
 }
 
 #[test]
@@ -2434,10 +2446,9 @@ fn rewrite_keeps_array_len_after_persistent_array_set_stack_consumption() {
     let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
-    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
     assert!(printed.contains("tarray.set"), "{printed}");
-    assert!(printed.contains("array.len"), "{printed}");
-    assert!(!printed.contains("tarray.len"), "{printed}");
+    assert!(printed.contains("tarray.len"), "{printed}");
 }
 
 #[test]
@@ -2461,10 +2472,9 @@ fn rewrite_does_not_use_stale_stack_types_after_call() {
     let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
-    assert_eq!(report.rewritten_object_ops, 0, "{report:?}");
+    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
     assert_valid_module(&output);
-    assert!(printed.contains("array.len"), "{printed}");
-    assert!(!printed.contains("tarray.len"), "{printed}");
+    assert!(printed.contains("tarray.len"), "{printed}");
 }
 
 #[test]
@@ -2491,36 +2501,82 @@ fn rewrite_preserves_array_len_result_on_type_stack() {
     let (output, report) = rewrite_kotlin_module(&input, &sidecar).unwrap();
     let printed = wasmprinter::print_bytes(&output).unwrap();
 
-    assert_eq!(report.rewritten_object_ops, 1, "{report:?}");
+    assert_eq!(report.rewritten_object_ops, 2, "{report:?}");
     assert!(printed.contains("tarray.len"), "{printed}");
 }
 
 fn transaction_objects(bytes: &[u8]) -> TransactionObjects {
+    let mut transaction_types = Vec::new();
+    let mut function_types = Vec::new();
+    let mut objects = TransactionObjects::default();
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.expect("payload");
-        let Payload::CustomSection(section) = payload else {
-            continue;
-        };
-        if section.name() != TRANSACTION_OBJECTS_CUSTOM_SECTION {
-            continue;
+        match payload {
+            Payload::TypeSection(section) => {
+                for group in section {
+                    for ty in group.expect("type group").into_types() {
+                        transaction_types.push(matches!(
+                            ty.composite_type.inner,
+                            CompositeInnerType::Func(ref func) if func.transaction()
+                        ));
+                    }
+                }
+            }
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    match import.expect("import").ty {
+                        TypeRef::Func(index) | TypeRef::FuncExact(index) => {
+                            function_types.push(index)
+                        }
+                        TypeRef::TMemory(_) => objects.memories.push(objects.memories.len() as u32),
+                        TypeRef::TGlobal(_) => objects.globals.push(objects.globals.len() as u32),
+                        TypeRef::TTable(_) => objects.tables.push(objects.tables.len() as u32),
+                        _ => {}
+                    }
+                }
+            }
+            Payload::FunctionSection(section) => {
+                function_types.extend(section.into_iter().map(|ty| ty.expect("function type")));
+            }
+            Payload::MemorySection(section) => {
+                for memory in section {
+                    if memory.expect("memory").namespace == EntityNamespace::Transactional {
+                        objects.memories.push(objects.memories.len() as u32);
+                    }
+                }
+            }
+            Payload::GlobalSection(section) => {
+                for global in section {
+                    if global.expect("global").ty.namespace == EntityNamespace::Transactional {
+                        objects.globals.push(objects.globals.len() as u32);
+                    }
+                }
+            }
+            Payload::TableSection(section) => {
+                for table in section {
+                    if table.expect("table").ty.namespace == EntityNamespace::Transactional {
+                        objects.tables.push(objects.tables.len() as u32);
+                    }
+                }
+            }
+            Payload::CustomSection(section) => {
+                assert_ne!(section.name(), TRANSACTION_OBJECTS_CUSTOM_SECTION);
+            }
+            _ => {}
         }
-
-        let mut reader = BinaryReader::new(section.data(), 0);
-        assert_eq!(reader.read_u8().expect("version"), 1);
-        let memories = read_index_vec(&mut reader);
-        let globals = read_index_vec(&mut reader);
-        let functions = read_index_vec(&mut reader);
-        let tables = read_index_vec(&mut reader);
-        assert!(reader.eof(), "metadata trailing bytes");
-        return TransactionObjects {
-            memories,
-            globals,
-            functions,
-            tables,
-        };
     }
-
-    TransactionObjects::default()
+    objects.functions = function_types
+        .into_iter()
+        .enumerate()
+        .filter_map(|(function, ty)| {
+            transaction_types
+                .get(ty as usize)
+                .copied()
+                .unwrap_or(false)
+                .then_some(function as u32)
+        })
+        .collect();
+    objects
 }
 
 fn assert_valid_module(bytes: &[u8]) {
@@ -2594,11 +2650,4 @@ fn element_function_indices(bytes: &[u8]) -> Vec<Vec<u32>> {
         }
     }
     segments
-}
-
-fn read_index_vec(reader: &mut BinaryReader<'_>) -> Vec<u32> {
-    let len = reader.read_var_u32().expect("vector length");
-    (0..len)
-        .map(|_| reader.read_var_u32().expect("vector item"))
-        .collect()
 }

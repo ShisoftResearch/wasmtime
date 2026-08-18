@@ -166,7 +166,7 @@ fn real_tfunc_promotes_tstruct_root_and_recovers() -> Result<()> {
             r#"
             (module
               (type $s (tstruct (field (mut i32))))
-              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tglobal $root (mut (tref null $s)) (tref.null $s))
               (tfunc (export "publish")
                 (tglobal.set $root (tstruct.new $s (i32.const 77)))))
             "#,
@@ -232,12 +232,13 @@ fn real_tfunc_promotes_ordinary_ref_array_with_i31_leaf_and_child_object() -> Re
             (module
               (type $s (struct (field i32)))
               (type $a (array (mut eqref)))
+              (global $source (ref $a)
+                (array.new_fixed $a 2
+                  (ref.i31 (i32.const 7))
+                  (struct.new $s (i32.const 9))))
               (tglobal $root (mut (ref null $a)) (ref.null $a))
               (tfunc (export "publish")
-                (tglobal.set $root
-                  (array.new_fixed $a 2
-                    (ref.i31 (i32.const 7))
-                    (struct.new $s (i32.const 9))))))
+                (tglobal.set $root (global.get $source))))
             "#,
         )?,
     )?;
@@ -355,13 +356,13 @@ fn real_tstruct_registered_funcref_leaf_roundtrips_through_get() -> Result<()> {
               (type $s (tstruct (field (mut funcref))))
               (func $target (export "target"))
               (elem declare func $target)
-              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tglobal $root (mut (tref null $s)) (tref.null $s))
               (tfunc (export "publish")
                 (tglobal.set $root (tstruct.new $s (ref.func $target))))
               (tfunc (export "leaf-is-null") (result i32)
                 (ref.is_null
                   (tstruct.get $s 0
-                    (tref.cast_read (ref.as_non_null (tglobal.get $root)))))))
+                    (tref.cast_read (tref.as_non_null (tglobal.get $root)))))))
             "#,
         )?,
     )?;
@@ -731,12 +732,12 @@ fn real_tstruct_registered_externref_leaf_roundtrips_through_get() -> Result<()>
             (module
               (import "" "source" (global $source externref))
               (type $s (tstruct (field (mut externref))))
-              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tglobal $root (mut (tref null $s)) (tref.null $s))
               (tfunc (export "publish")
                 (tglobal.set $root (tstruct.new $s (global.get $source))))
               (tfunc (export "leaf") (result externref)
                 (tstruct.get $s 0
-                  (tref.cast_read (ref.as_non_null (tglobal.get $root))))))
+                  (tref.cast_read (tref.as_non_null (tglobal.get $root))))))
             "#,
         )?,
     )?;
@@ -785,14 +786,14 @@ fn real_tstruct_registered_externref_as_anyref_roundtrips_through_get() -> Resul
             (module
               (import "" "source" (global $source externref))
               (type $s (tstruct (field (mut anyref))))
-              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tglobal $root (mut (tref null $s)) (tref.null $s))
               (tfunc (export "publish")
                 (tglobal.set $root
                   (tstruct.new $s (any.convert_extern (global.get $source)))))
               (tfunc (export "leaf") (result externref)
                 (extern.convert_any
                   (tstruct.get $s 0
-                    (tref.cast_read (ref.as_non_null (tglobal.get $root)))))))
+                    (tref.cast_read (tref.as_non_null (tglobal.get $root)))))))
             "#,
         )?,
     )?;
@@ -841,13 +842,13 @@ fn real_tarray_registered_externref_leaf_roundtrips_through_get() -> Result<()> 
             (module
               (import "" "source" (global $source externref))
               (type $a (tarray (mut externref)))
-              (tglobal $root (mut (ref null $a)) (ref.null $a))
+              (tglobal $root (mut (tref null $a)) (tref.null $a))
               (tfunc (export "publish")
                 (tglobal.set $root
                   (tarray.new $a (global.get $source) (i32.const 2))))
               (tfunc (export "leaf") (result externref)
                 (tarray.get $a
-                  (tref.cast_read (ref.as_non_null (tglobal.get $root)))
+                  (tref.cast_read (tref.as_non_null (tglobal.get $root)))
                   (i32.const 1))))
             "#,
         )?,
@@ -1847,10 +1848,10 @@ fn persistent_root_module(engine: &Engine) -> Result<Module> {
             r#"
             (module
               (type $s (tstruct (field (mut i32))))
-              (global $source (ref $s) (tstruct.new $s (i32.const 41)))
-              (tglobal $root (mut (ref null $s)) (ref.null $s))
+              (tglobal $source (tref $s) (tstruct.new $s (i32.const 41)))
+              (tglobal $root (mut (tref null $s)) (tref.null $s))
               (tfunc (export "publish")
-                (tglobal.set $root (global.get $source))))
+                (tglobal.set $root (tglobal.get $source))))
             "#,
         )?,
     )
@@ -1937,9 +1938,9 @@ fn two_root_object_graph_module(engine: &Engine) -> Result<Module> {
             r#"
             (module
               (type $leaf (tstruct (field (mut i32))))
-              (type $root (tstruct (field (mut (ref null $leaf)))))
-              (tglobal $left (mut (ref null $root)) (ref.null $root))
-              (tglobal $right (mut (ref null $root)) (ref.null $root))
+              (type $root (tstruct (field (mut (tref null $leaf)))))
+              (tglobal $left (mut (tref null $root)) (tref.null $root))
+              (tglobal $right (mut (tref null $root)) (tref.null $root))
               (tfunc (export "publish-left") (param $value i32)
                 (tglobal.set $left
                   (tstruct.new $root
@@ -1978,8 +1979,8 @@ fn blocking_single_root_object_module(engine: &Engine) -> Result<Module> {
             (module
               (import "" "pause" (func $pause))
               (type $leaf (tstruct (field (mut i32))))
-              (type $root (tstruct (field (mut (ref null $leaf)))))
-              (tglobal $root (mut (ref null $root)) (ref.null $root))
+              (type $root (tstruct (field (mut (tref null $leaf)))))
+              (tglobal $root (mut (tref null $root)) (tref.null $root))
               (tfunc (export "publish") (param $value i32)
                 (tglobal.set $root
                   (tstruct.new $root
@@ -1999,8 +2000,8 @@ fn blocking_mixed_tmemory_object_module(engine: &Engine) -> Result<Module> {
               (import "" "pause" (func $pause))
               (tmemory 1)
               (type $leaf (tstruct (field (mut i32))))
-              (type $root (tstruct (field (mut (ref null $leaf)))))
-              (tglobal $root (mut (ref null $root)) (ref.null $root))
+              (type $root (tstruct (field (mut (tref null $leaf)))))
+              (tglobal $root (mut (tref null $root)) (tref.null $root))
               (tfunc (export "publish") (param $value i32)
                 (i32.tstore (i32.const 0) (local.get $value))
                 (drop (tmemory.size))
@@ -2021,9 +2022,9 @@ fn mixed_tmemory_object_graph_module(engine: &Engine) -> Result<Module> {
             (module
               (tmemory 1)
               (type $leaf (tstruct (field (mut i32))))
-              (type $root (tstruct (field (mut (ref null $leaf)))))
-              (tglobal $left (mut (ref null $root)) (ref.null $root))
-              (tglobal $right (mut (ref null $root)) (ref.null $root))
+              (type $root (tstruct (field (mut (tref null $leaf)))))
+              (tglobal $left (mut (tref null $root)) (tref.null $root))
+              (tglobal $right (mut (tref null $root)) (tref.null $root))
               (tfunc (export "publish-left") (param $value i32)
                 (i32.tstore (i32.const 0) (local.get $value))
                 (tglobal.set $left

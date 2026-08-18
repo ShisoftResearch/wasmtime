@@ -1520,6 +1520,9 @@ impl<'a> Inliner<'a> {
                 EntityIndex::Global(i) => frame.globals[i].clone().into(),
                 EntityIndex::Memory(i) => frame.memories[i].clone().into(),
                 EntityIndex::Tag(i) => frame.tags[i].clone().into(),
+                EntityIndex::TTable(_) | EntityIndex::TMemory(_) | EntityIndex::TGlobal(_) => {
+                    panic!("transactional core exports in synthetic components are not implemented")
+                }
             },
         }
     }

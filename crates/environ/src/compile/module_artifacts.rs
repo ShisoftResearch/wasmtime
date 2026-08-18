@@ -119,6 +119,7 @@ impl<'a> ObjectBuilder<'a> {
             has_unparsed_debuginfo,
             data_align,
             runtime_data,
+            runtime_tdata,
             wasm,
             ..
         } = translation;
@@ -135,6 +136,9 @@ impl<'a> ObjectBuilder<'a> {
             // adjacent so it has alignment of 1.
             let align = if i == 0 { data_align.unwrap_or(1) } else { 1 };
             self.obj.append_section_data(self.data, data, align);
+        }
+        for (_, data) in runtime_tdata.iter() {
+            self.obj.append_section_data(self.data, data, 1);
         }
 
         // If any names are present in the module then the `ELF_NAME_DATA` section
@@ -173,6 +177,17 @@ impl<'a> ObjectBuilder<'a> {
         for (_, range) in module.runtime_data.iter_mut() {
             range.start = range.start.checked_add(data_offset).unwrap();
             range.end = range.end.checked_add(data_offset).unwrap();
+        }
+        let ordinary_data_len = runtime_data
+            .values()
+            .try_fold(0u32, |total, data| {
+                total.checked_add(u32::try_from(data.len()).unwrap())
+            })
+            .unwrap();
+        let tdata_offset = data_offset.checked_add(ordinary_data_len).unwrap();
+        for (_, range) in module.runtime_tdata.iter_mut() {
+            range.start = range.start.checked_add(tdata_offset).unwrap();
+            range.end = range.end.checked_add(tdata_offset).unwrap();
         }
 
         // Insert the wasm raw wasm-based debuginfo into the output, if

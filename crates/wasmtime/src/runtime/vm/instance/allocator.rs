@@ -323,8 +323,8 @@ impl dyn InstanceAllocator + '_ {
                 .expect("module should have already been validated before allocation");
         }
 
-        let num_defined_memories = module.num_defined_memories();
-        let num_defined_tables = module.num_defined_tables();
+        let num_defined_memories = module.num_runtime_defined_memories();
+        let num_defined_tables = module.num_runtime_defined_tables();
 
         let memories = TryPrimaryMap::with_capacity(num_defined_memories)?;
         let tables = TryPrimaryMap::with_capacity(num_defined_tables)?;
@@ -424,6 +424,17 @@ impl dyn InstanceAllocator + '_ {
             memories.push(memory)?;
         }
 
+        for (memory_index, ty) in module.tmemories.iter().skip(module.num_imported_tmemories) {
+            let defined = module
+                .defined_tmemory_index(memory_index)
+                .expect("should be a defined transactional memory since imports were skipped");
+            let memory_index = module.runtime_defined_tmemory_index(defined);
+            let memory = self
+                .allocate_memory(request, ty, Some(memory_index), MemoryKind::LinearMemory)
+                .await?;
+            memories.push(memory)?;
+        }
+
         Ok(())
     }
 
@@ -471,6 +482,15 @@ impl dyn InstanceAllocator + '_ {
                 .defined_table_index(index)
                 .expect("should be a defined table since we skipped imported ones");
 
+            let table = self.allocate_table(request, table, def_index).await?;
+            tables.push(table)?;
+        }
+
+        for (index, table) in module.ttables.iter().skip(module.num_imported_ttables) {
+            let defined = module
+                .defined_ttable_index(index)
+                .expect("should be a defined transactional table since imports were skipped");
+            let def_index = module.runtime_defined_ttable_index(defined);
             let table = self.allocate_table(request, table, def_index).await?;
             tables.push(table)?;
         }

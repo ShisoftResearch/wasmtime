@@ -363,6 +363,7 @@ impl<'a> Module<'a> {
             &format!("instance{}", instance.as_u32()),
             GlobalType {
                 val_type: ValType::I32,
+                namespace: wasm_encoder::EntityNamespace::Ordinary,
                 mutable: true,
                 shared: false,
             },
@@ -378,6 +379,7 @@ impl<'a> Module<'a> {
                             "memory",
                             &format!("m{}", self.imported_memories.len()),
                             MemoryType {
+                                namespace: wasm_encoder::EntityNamespace::Ordinary,
                                 minimum: 0,
                                 maximum: None,
                                 shared: ty.shared,
@@ -495,6 +497,7 @@ impl<'a> Module<'a> {
                 "task_may_block",
                 GlobalType {
                     val_type: ValType::I32,
+                    namespace: wasm_encoder::EntityNamespace::Ordinary,
                     mutable: true,
                     shared: false,
                 },

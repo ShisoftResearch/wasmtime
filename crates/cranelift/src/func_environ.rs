@@ -35,13 +35,15 @@ use wasmparser::{
 use wasmtime_core::math::f64_cvt_to_int_bounds;
 use wasmtime_environ::{
     BuiltinFunctionIndex, ComponentPC, ConstExpr, ConstOp, DataIndex, DefinedFuncIndex,
-    DefinedGlobalIndex, DefinedTableIndex, ElemIndex, EngineOrModuleTypeIndex,
-    FrameStateSlotBuilder, FrameValType, FuncIndex, FuncKey, GlobalConstValue, GlobalIndex,
-    IndexType, Memory, MemoryIndex, MemoryInit, MemorySegmentOffset, MemoryTunables, Module,
-    ModuleInternedTypeIndex, ModuleTranslation, ModuleTypesBuilder, PassiveElemIndex, PtrSize,
-    RuntimeDataIndex, Table, TableIndex, TableInitialValue, TableSegment, TableSegmentElements,
-    TagIndex, Tunables, TypeConvert, TypeIndex, VMOffsets, WasmCompositeInnerType, WasmFuncType,
-    WasmHeapTopType, WasmHeapType, WasmRefType, WasmResult, WasmStorageType, WasmValType,
+    DefinedGlobalIndex, DefinedTGlobalIndex, DefinedTTableIndex, DefinedTableIndex, ElemIndex,
+    EngineOrModuleTypeIndex, FrameStateSlotBuilder, FrameValType, FuncIndex, FuncKey,
+    GlobalConstValue, GlobalIndex, IndexType, Memory, MemoryIndex, MemoryInit, MemorySegmentOffset,
+    MemoryTunables, Module, ModuleInternedTypeIndex, ModuleTranslation, ModuleTypesBuilder,
+    PassiveElemIndex, PtrSize, RuntimeDataIndex, RuntimeTDataIndex, TDataIndex, TElemIndex,
+    TGlobalIndex, TMemoryIndex, TMemoryInit, TTableIndex, TTableSegment, Table, TableIndex,
+    TableInitialValue, TableSegment, TableSegmentElements, TagIndex, Tunables, TypeConvert,
+    TypeIndex, VMOffsets, WasmCompositeInnerType, WasmFuncType, WasmHeapTopType, WasmHeapType,
+    WasmRefType, WasmResult, WasmStorageType, WasmValType,
 };
 use wasmtime_environ::{FUNCREF_INIT_BIT, FUNCREF_MASK};
 
@@ -318,7 +320,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             .and_then(|func_index| translation.branch_hints(func_index))
             .map(|reader| reader.into_iter().peekable());
         let is_current_tfunc = func_index
-            .map(|func_index| translation.module.transaction_objects.is_tfunc(func_index))
+            .map(|func_index| translation.module.is_tfunc(func_index))
             .unwrap_or(false);
 
         // This isn't used during translation, so squash the warning about this
@@ -2173,13 +2175,10 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         use_transaction_table_overlay: bool,
     ) -> WasmResult<Option<(ir::Value, ir::Value)>> {
         // Get the funcref pointer from the table.
-        let funcref_ptr = if use_transaction_table_overlay {
+        debug_assert!(!use_transaction_table_overlay);
+        let funcref_ptr =
             self.env
-                .translate_transaction_ttable_get(self.builder, table_index, callee)?
-        } else {
-            self.env
-                .table_get_funcref(self.builder, table_index, callee, cold_blocks)
-        };
+                .table_get_funcref(self.builder, table_index, callee, cold_blocks);
 
         // If necessary, check the signature.
         let check = self.check_indirect_call_type_signature(table_index, ty_index, funcref_ptr);
@@ -4761,7 +4760,7 @@ impl FuncEnvironment<'_> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<Option<CallRets>> {
-        let use_transaction_table_overlay = self.module.transaction_objects.is_ttable(table_index);
+        let use_transaction_table_overlay = false;
         Call::new(builder, self, srcloc).indirect_call(
             table_index,
             ty_index,
@@ -4816,7 +4815,7 @@ impl FuncEnvironment<'_> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<()> {
-        let use_transaction_table_overlay = self.module.transaction_objects.is_ttable(table_index);
+        let use_transaction_table_overlay = false;
         Call::new_tail(builder, self, srcloc).indirect_call(
             table_index,
             ty_index,
@@ -4869,6 +4868,32 @@ impl FuncEnvironment<'_> {
         }
     }
 
+    /// Resolve a native transactional-memory operand to its runtime instance
+    /// and physical defined-memory slot.
+    fn tmemory_vmctx_and_defined_index(
+        &mut self,
+        pos: &mut FuncCursor,
+        index: TMemoryIndex,
+    ) -> (ir::Value, ir::Value) {
+        let cur_vmctx = self.vmctx_val(pos);
+        match self.module.defined_tmemory_index(index) {
+            Some(index) => {
+                let index = self.module.runtime_defined_tmemory_index(index);
+                (cur_vmctx, pos.ins().iconst(I32, i64::from(index.as_u32())))
+            }
+            None => {
+                let index = self.module.runtime_imported_tmemory_index(index);
+                let vmctx = self
+                    .alias_regions
+                    .vmctx_vmmemory_import_vmctx(pos, cur_vmctx, index);
+                let index = self
+                    .alias_regions
+                    .vmctx_vmmemory_import_index(pos, cur_vmctx, index);
+                (vmctx, index)
+            }
+        }
+    }
+
     /// Returns two `ir::Value`s, the first of which is the vmctx for the table
     /// `index` and the second of which is the `DefinedTableIndex` for `index`.
     ///
@@ -4884,6 +4909,32 @@ impl FuncEnvironment<'_> {
         match self.module.defined_table_index(index) {
             Some(index) => (cur_vmctx, pos.ins().iconst(I32, i64::from(index.as_u32()))),
             None => {
+                let vmctx = self
+                    .alias_regions
+                    .vmctx_vmtable_import_vmctx(pos, cur_vmctx, index);
+                let index = self
+                    .alias_regions
+                    .vmctx_vmtable_import_index(pos, cur_vmctx, index);
+                (vmctx, index)
+            }
+        }
+    }
+
+    /// Resolve a native transactional-table operand to its runtime instance
+    /// and physical defined-table slot.
+    fn ttable_vmctx_and_defined_index(
+        &mut self,
+        pos: &mut FuncCursor,
+        index: TTableIndex,
+    ) -> (ir::Value, ir::Value) {
+        let cur_vmctx = self.vmctx_val(pos);
+        match self.module.defined_ttable_index(index) {
+            Some(index) => {
+                let index = self.module.runtime_defined_ttable_index(index);
+                (cur_vmctx, pos.ins().iconst(I32, i64::from(index.as_u32())))
+            }
+            None => {
+                let index = self.module.runtime_imported_ttable_index(index);
                 let vmctx = self
                     .alias_regions
                     .vmctx_vmtable_import_vmctx(pos, cur_vmctx, index);
@@ -5203,10 +5254,10 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tglobal_get(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        global: GlobalIndex,
+        global: TGlobalIndex,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_global(global)?;
-        let wasm_ty = self.module.globals[global].wasm_ty;
+        let wasm_ty = self.module.tglobals[global].wasm_ty;
         let result_ty = self.transaction_global_value_type(wasm_ty)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
@@ -5228,7 +5279,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tglobal_set(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        global: GlobalIndex,
+        global: TGlobalIndex,
         val: ir::Value,
     ) -> WasmResult<()> {
         self.translate_transaction_tglobal_set_with_builtins(
@@ -5243,7 +5294,7 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_tglobal_startup_set(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        global: GlobalIndex,
+        global: TGlobalIndex,
         val: ir::Value,
     ) -> WasmResult<()> {
         self.translate_transaction_tglobal_set_with_builtins(
@@ -5258,13 +5309,13 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_tglobal_set_with_builtins(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        global: GlobalIndex,
+        global: TGlobalIndex,
         val: ir::Value,
         scalar_builtin: BuiltinFunctionIndex,
         v128_builtin: BuiltinFunctionIndex,
     ) -> WasmResult<()> {
         self.ensure_transaction_global(global)?;
-        let wasm_ty = self.module.globals[global].wasm_ty;
+        let wasm_ty = self.module.tglobals[global].wasm_ty;
         if wasm_ty.is_vmgcref_type() {
             self.needs_gc_heap = true;
         }
@@ -5362,7 +5413,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tmemory_load(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        memory: MemoryIndex,
+        memory: TMemoryIndex,
         addr: ir::Value,
         offset: u64,
         len: u32,
@@ -5372,11 +5423,11 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_load(),
         );
-        let index_type = self.memory(memory).idx_type;
+        let index_type = self.module.tmemories[memory].idx_type;
 
         let mut pos = builder.cursor();
         let (memory_vmctx, defined_memory_index) =
-            self.memory_vmctx_and_defined_index(&mut pos, memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, memory);
         let addr = self.cast_index_to_i64(&mut pos, addr, index_type);
         let offset = pos.ins().iconst(I64, offset as i64);
         let len = pos.ins().iconst(I32, i64::from(len));
@@ -5391,7 +5442,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tmemory_store(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        memory: MemoryIndex,
+        memory: TMemoryIndex,
         addr: ir::Value,
         offset: u64,
         len: u32,
@@ -5401,11 +5452,11 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_store(),
         );
-        let index_type = self.memory(memory).idx_type;
+        let index_type = self.module.tmemories[memory].idx_type;
 
         let mut pos = builder.cursor();
         let (memory_vmctx, defined_memory_index) =
-            self.memory_vmctx_and_defined_index(&mut pos, memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, memory);
         let addr = self.cast_index_to_i64(&mut pos, addr, index_type);
         let offset = pos.ins().iconst(I64, offset as i64);
         let len = pos.ins().iconst(I32, i64::from(len));
@@ -5420,23 +5471,23 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tmemory_size(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        memory: MemoryIndex,
+        memory: TMemoryIndex,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_size(),
         );
-        let index_type = self.memory(memory).idx_type;
+        let index_type = self.module.tmemories[memory].idx_type;
 
         let mut pos = builder.cursor();
         let (memory_vmctx, defined_memory_index) =
-            self.memory_vmctx_and_defined_index(&mut pos, memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, memory);
         let call = pos
             .ins()
             .call(callee, &[memory_vmctx, defined_memory_index]);
         let pages = pos.func.dfg.inst_results(call)[0];
-        let single_byte_pages = match self.memory(memory).page_size_log2 {
+        let single_byte_pages = match self.module.tmemories[memory].page_size_log2 {
             16 => false,
             0 => true,
             _ => unreachable!("only page sizes 2**0 and 2**16 are currently valid"),
@@ -5452,7 +5503,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tmemory_grow(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        memory: MemoryIndex,
+        memory: TMemoryIndex,
         delta: ir::Value,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_memory(memory)?;
@@ -5460,17 +5511,17 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_grow(),
         );
-        let index_type = self.memory(memory).idx_type;
+        let index_type = self.module.tmemories[memory].idx_type;
 
         let mut pos = builder.cursor();
         let (memory_vmctx, defined_memory_index) =
-            self.memory_vmctx_and_defined_index(&mut pos, memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, memory);
         let delta = self.cast_index_to_i64(&mut pos, delta, index_type);
         let call = pos
             .ins()
             .call(callee, &[memory_vmctx, defined_memory_index, delta]);
         let previous_pages = pos.func.dfg.inst_results(call)[0];
-        let single_byte_pages = match self.memory(memory).page_size_log2 {
+        let single_byte_pages = match self.module.tmemories[memory].page_size_log2 {
             16 => false,
             0 => true,
             _ => unreachable!("only page sizes 2**0 and 2**16 are currently valid"),
@@ -5486,7 +5537,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tmemory_fill(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        memory: MemoryIndex,
+        memory: TMemoryIndex,
         dst: ir::Value,
         val: ir::Value,
         len: ir::Value,
@@ -5496,11 +5547,11 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_fill(),
         );
-        let index_type = self.memory(memory).idx_type;
+        let index_type = self.module.tmemories[memory].idx_type;
 
         let mut pos = builder.cursor();
         let (memory_vmctx, defined_memory_index) =
-            self.memory_vmctx_and_defined_index(&mut pos, memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, memory);
         let dst = self.cast_index_to_i64(&mut pos, dst, index_type);
         let len = self.cast_index_to_i64(&mut pos, len, index_type);
         pos.ins()
@@ -5511,8 +5562,8 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tmemory_copy(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        dst_memory: MemoryIndex,
-        src_memory: MemoryIndex,
+        dst_memory: TMemoryIndex,
+        src_memory: TMemoryIndex,
         dst: ir::Value,
         src: ir::Value,
         len: ir::Value,
@@ -5523,13 +5574,13 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_copy(),
         );
-        let dst_index_type = self.memory(dst_memory).idx_type;
-        let src_index_type = self.memory(src_memory).idx_type;
+        let dst_index_type = self.module.tmemories[dst_memory].idx_type;
+        let src_index_type = self.module.tmemories[src_memory].idx_type;
 
         let mut pos = builder.cursor();
         let (dst_vmctx, defined_dst_memory) =
-            self.memory_vmctx_and_defined_index(&mut pos, dst_memory);
-        let (_, defined_src_memory) = self.memory_vmctx_and_defined_index(&mut pos, src_memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, dst_memory);
+        let (_, defined_src_memory) = self.tmemory_vmctx_and_defined_index(&mut pos, src_memory);
         let dst = self.cast_index_to_i64(&mut pos, dst, dst_index_type);
         let src = self.cast_index_to_i64(&mut pos, src, src_index_type);
         let len = cast_index_value_to_i64(&mut pos, len);
@@ -5550,8 +5601,8 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tmemory_init(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        memory: MemoryIndex,
-        seg_index: u32,
+        memory: TMemoryIndex,
+        seg_index: TDataIndex,
         dst: ir::Value,
         src: ir::Value,
         len: ir::Value,
@@ -5562,13 +5613,15 @@ impl FuncEnvironment<'_> {
                 "transactional tmemory.init for memory64 is not implemented yet".into(),
             ));
         }
-        let data_index = DataIndex::from_u32(seg_index);
         let pointer_type = self.pointer_type();
-        let (data, data_len) = match self.translation.runtime_data_map[data_index] {
-            Some(runtime_index) => (
-                self.load_runtime_data_base(builder, runtime_index),
-                self.load_runtime_data_length_as_pointer(builder, runtime_index),
-            ),
+        let (data, data_len) = match self.translation.runtime_tdata_map[seg_index] {
+            Some(runtime_index) => {
+                let runtime_index = self.module.runtime_tdata_index(runtime_index);
+                (
+                    self.load_runtime_data_base(builder, runtime_index),
+                    self.load_runtime_data_length_as_pointer(builder, runtime_index),
+                )
+            }
             None => (
                 builder.ins().iconst(pointer_type, 1),
                 builder.ins().iconst(pointer_type, 0),
@@ -5578,11 +5631,11 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_init(),
         );
-        let index_type = self.memory(memory).idx_type;
+        let index_type = self.module.tmemories[memory].idx_type;
 
         let mut pos = builder.cursor();
         let (memory_vmctx, defined_memory_index) =
-            self.memory_vmctx_and_defined_index(&mut pos, memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, memory);
         let dst = self.cast_index_to_i64(&mut pos, dst, index_type);
         let src = self.cast_index_to_i64(&mut pos, src, IndexType::I32);
         let len = self.cast_index_to_i64(&mut pos, len, IndexType::I32);
@@ -5605,23 +5658,24 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_tmemory_static_init(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        memory: MemoryIndex,
+        memory: TMemoryIndex,
         dst: ir::Value,
-        data_index: RuntimeDataIndex,
+        data_index: RuntimeTDataIndex,
         len: ir::Value,
     ) -> WasmResult<()> {
         self.ensure_transaction_memory(memory)?;
+        let data_index = self.module.runtime_tdata_index(data_index);
         let data = self.load_runtime_data_base(builder, data_index);
         let data_len = self.load_runtime_data_length_as_pointer(builder, data_index);
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_tmemory_static_init(),
         );
-        let index_type = self.memory(memory).idx_type;
+        let index_type = self.module.tmemories[memory].idx_type;
 
         let mut pos = builder.cursor();
         let (memory_vmctx, defined_memory_index) =
-            self.memory_vmctx_and_defined_index(&mut pos, memory);
+            self.tmemory_vmctx_and_defined_index(&mut pos, memory);
         let dst = self.cast_index_to_i64(&mut pos, dst, index_type);
         let len = self.cast_index_to_i64(&mut pos, len, IndexType::I32);
         let data_len = cast_index_value_to_i64(&mut pos, data_len);
@@ -5635,35 +5689,44 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_tdata_drop(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        seg_index: u32,
+        seg_index: TDataIndex,
     ) -> WasmResult<()> {
         let callee = self
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_tdata_drop());
         let vmctx = self.vmctx_val(&mut builder.cursor());
-        let data = builder.ins().iconst(I32, i64::from(seg_index));
+        let data = builder.ins().iconst(I32, i64::from(seg_index.as_u32()));
         builder.ins().call(callee, &[vmctx, data]);
-        // SHISOFT-TWASM-MOCK: `tdata.drop` is applied immediately through the
-        // ordinary runtime-data length slot. Wizard-style rollback of dropped
-        // data segments belongs with the later ttry/tfail rollback workstream.
-        self.translate_data_drop(builder.cursor(), seg_index)
+        if let Some(runtime_index) = self.translation.runtime_tdata_map[seg_index] {
+            let runtime_index = self.module.runtime_tdata_index(runtime_index);
+            let mut pos = builder.cursor();
+            let vmctx = self.vmctx_val(&mut pos);
+            let new_length = pos.ins().iconst(I32, 0);
+            self.alias_regions.store_vmctx_runtime_data_length(
+                &mut pos,
+                vmctx,
+                runtime_index,
+                new_length,
+            );
+        }
+        Ok(())
     }
 
     pub fn translate_transaction_ttable_size(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_table(table_index)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_ttable_size(),
         );
-        let index_type = self.table(table_index).idx_type;
+        let index_type = self.module.ttables[table_index].idx_type;
 
         let mut pos = builder.cursor();
         let (table_vmctx, defined_table_index) =
-            self.table_vmctx_and_defined_index(&mut pos, table_index);
+            self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let call = pos.ins().call(callee, &[table_vmctx, defined_table_index]);
         let size = pos.func.dfg.inst_results(call)[0];
         Ok(self.convert_pointer_to_index_type(builder.cursor(), size, index_type, false))
@@ -5672,7 +5735,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_ttable_grow(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         delta: ir::Value,
         init_value: ir::Value,
     ) -> WasmResult<ir::Value> {
@@ -5681,13 +5744,13 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_ttable_grow(),
         );
-        let index_type = self.table(table_index).idx_type;
+        let index_type = self.module.ttables[table_index].idx_type;
 
         let mut pos = builder.cursor();
         let (table_vmctx, defined_table_index) =
-            self.table_vmctx_and_defined_index(&mut pos, table_index);
+            self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let delta64 = self.cast_index_to_i64(&mut pos, delta, index_type);
-        let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
+        let ref_top = self.module.ttables[table_index].ref_type.heap_type.top();
         let init_value = match ref_top {
             WasmHeapTopType::Func => init_value,
             WasmHeapTopType::Any | WasmHeapTopType::Extern | WasmHeapTopType::Exn => {
@@ -5714,19 +5777,19 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_ttable_get(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         index: ir::Value,
     ) -> WasmResult<ir::Value> {
         self.ensure_transaction_table(table_index)?;
-        let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
+        let ref_top = self.module.ttables[table_index].ref_type.heap_type.top();
         let callee = self
             .builtin_functions
             .load_builtin(builder.func, BuiltinFunctionIndex::transaction_ttable_get());
-        let index_type = self.table(table_index).idx_type;
+        let index_type = self.module.ttables[table_index].idx_type;
 
         let mut pos = builder.cursor();
         let (table_vmctx, defined_table_index) =
-            self.table_vmctx_and_defined_index(&mut pos, table_index);
+            self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let index = self.cast_index_to_i64(&mut pos, index, index_type);
         let call = pos
             .ins()
@@ -5750,7 +5813,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_ttable_set(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         value: ir::Value,
         index: ir::Value,
     ) -> WasmResult<()> {
@@ -5766,7 +5829,7 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_ttable_startup_set(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         value: ir::Value,
         index: ir::Value,
     ) -> WasmResult<()> {
@@ -5782,19 +5845,19 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_ttable_set_with_builtin(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         value: ir::Value,
         index: ir::Value,
         builtin: BuiltinFunctionIndex,
     ) -> WasmResult<()> {
         self.ensure_transaction_table(table_index)?;
-        let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
+        let ref_top = self.module.ttables[table_index].ref_type.heap_type.top();
         let callee = self.builtin_functions.load_builtin(builder.func, builtin);
-        let index_type = self.table(table_index).idx_type;
+        let index_type = self.module.ttables[table_index].idx_type;
 
         let mut pos = builder.cursor();
         let (table_vmctx, defined_table_index) =
-            self.table_vmctx_and_defined_index(&mut pos, table_index);
+            self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let index = self.cast_index_to_i64(&mut pos, index, index_type);
         let value = match ref_top {
             WasmHeapTopType::Func => value,
@@ -5819,7 +5882,7 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_ttable_startup_check_range(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         start: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
@@ -5828,11 +5891,11 @@ impl FuncEnvironment<'_> {
             builder.func,
             BuiltinFunctionIndex::transaction_ttable_startup_check_range(),
         );
-        let index_type = self.table(table_index).idx_type;
+        let index_type = self.module.ttables[table_index].idx_type;
 
         let mut pos = builder.cursor();
         let (table_vmctx, defined_table_index) =
-            self.table_vmctx_and_defined_index(&mut pos, table_index);
+            self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let start = self.cast_index_to_i64(&mut pos, start, index_type);
         let len = self.cast_index_to_i64(&mut pos, len, index_type);
         pos.ins()
@@ -5843,7 +5906,7 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_ttable_startup_fill(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         dest: ir::Value,
         value: ir::Value,
         len: ir::Value,
@@ -5908,22 +5971,22 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_ttable_startup_fill_uninterruptible(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         dest: ir::Value,
         value: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
         self.ensure_transaction_table(table_index)?;
-        let ref_top = self.module.tables[table_index].ref_type.heap_type.top();
+        let ref_top = self.module.ttables[table_index].ref_type.heap_type.top();
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_ttable_startup_fill(),
         );
-        let index_type = self.table(table_index).idx_type;
+        let index_type = self.module.ttables[table_index].idx_type;
 
         let mut pos = builder.cursor();
         let (table_vmctx, defined_table_index) =
-            self.table_vmctx_and_defined_index(&mut pos, table_index);
+            self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let dest = self.cast_index_to_i64(&mut pos, dest, index_type);
         let len = self.cast_index_to_i64(&mut pos, len, index_type);
         let value = match ref_top {
@@ -5951,24 +6014,19 @@ impl FuncEnvironment<'_> {
     pub fn translate_transaction_ttable_fill(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         dest: ir::Value,
         value: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
-        self.ensure_transaction_table(table_index)?;
-        self.translate_transaction_ttable_write_range(builder, table_index, dest, len)?;
-        // SHISOFT-TWASM-MOCK: this acquires transactional table ownership but
-        // still applies through Wasmtime's ordinary table backing. Replace this
-        // with table-element COW when the real object/table workspace lands.
-        self.translate_table_fill(builder, table_index, dest, value, len)
+        self.translate_transaction_ttable_startup_fill(builder, table_index, dest, value, len)
     }
 
     pub fn translate_transaction_ttable_copy(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        dst_table_index: TableIndex,
-        src_table_index: TableIndex,
+        dst_table_index: TTableIndex,
+        src_table_index: TTableIndex,
         dst: ir::Value,
         src: ir::Value,
         len: ir::Value,
@@ -5977,34 +6035,58 @@ impl FuncEnvironment<'_> {
         self.ensure_transaction_table(src_table_index)?;
         self.ensure_transaction_table_funcref(dst_table_index)?;
         self.ensure_transaction_table_funcref(src_table_index)?;
-        self.translate_transaction_ttable_read_range(builder, src_table_index, src, len)?;
-        self.translate_transaction_ttable_write_range(builder, dst_table_index, dst, len)?;
-        // SHISOFT-TWASM-MOCK: ownership is transactional, data movement still
-        // reuses the ordinary Wasmtime table copy implementation.
-        self.translate_table_copy(builder, dst_table_index, src_table_index, dst, src, len)
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_ttable_copy(),
+        );
+        let mut pos = builder.cursor();
+        let (dst_vmctx, dst_table) = self.ttable_vmctx_and_defined_index(&mut pos, dst_table_index);
+        let (src_vmctx, src_table) = self.ttable_vmctx_and_defined_index(&mut pos, src_table_index);
+        if dst_vmctx != src_vmctx {
+            return Err(wasmtime_environ::WasmError::Unsupported(
+                "ttable.copy across different imported instances is not implemented yet".into(),
+            ));
+        }
+        let dst = cast_index_value_to_i64(&mut pos, dst);
+        let src = cast_index_value_to_i64(&mut pos, src);
+        let len = cast_index_value_to_i64(&mut pos, len);
+        pos.ins()
+            .call(callee, &[dst_vmctx, dst_table, src_table, dst, src, len]);
+        Ok(())
     }
 
     pub fn translate_transaction_ttable_init(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        seg_index: u32,
-        table_index: TableIndex,
+        seg_index: TElemIndex,
+        table_index: TTableIndex,
         dst: ir::Value,
         src: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
         self.ensure_transaction_table(table_index)?;
         self.ensure_transaction_table_funcref(table_index)?;
-        self.translate_transaction_ttable_write_range(builder, table_index, dst, len)?;
-        // SHISOFT-TWASM-MOCK: ownership is transactional, element initialization
-        // still reuses the ordinary Wasmtime table init implementation.
-        self.translate_table_init(builder, seg_index, table_index, dst, src, len)
+        let passive = self.translation.passive_telem_map[seg_index]
+            .map(|index| index.as_u32())
+            .unwrap_or(u32::MAX);
+        let callee = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_ttable_init(),
+        );
+        let mut pos = builder.cursor();
+        let (vmctx, table) = self.ttable_vmctx_and_defined_index(&mut pos, table_index);
+        let elem = pos.ins().iconst(I32, i64::from(passive));
+        let dst = cast_index_value_to_i64(&mut pos, dst);
+        let src = cast_index_value_to_i64(&mut pos, src);
+        let len = cast_index_value_to_i64(&mut pos, len);
+        pos.ins().call(callee, &[vmctx, table, elem, dst, src, len]);
+        Ok(())
     }
 
     fn translate_transaction_ttable_read_range(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         start: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
@@ -6020,7 +6102,7 @@ impl FuncEnvironment<'_> {
     fn translate_transaction_ttable_write_range(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         start: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
@@ -6037,14 +6119,14 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         builtin: BuiltinFunctionIndex,
-        table_index: TableIndex,
+        table_index: TTableIndex,
         start: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
         let callee = self.builtin_functions.load_builtin(builder.func, builtin);
         let mut pos = builder.cursor();
         let (table_vmctx, defined_table_index) =
-            self.table_vmctx_and_defined_index(&mut pos, table_index);
+            self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let start = cast_index_value_to_i64(&mut pos, start);
         let len = cast_index_value_to_i64(&mut pos, len);
         pos.ins()
@@ -6052,8 +6134,8 @@ impl FuncEnvironment<'_> {
         Ok(())
     }
 
-    fn ensure_transaction_memory(&self, memory: MemoryIndex) -> WasmResult<()> {
-        if self.module.transaction_objects.is_tmemory(memory) {
+    fn ensure_transaction_memory(&self, memory: TMemoryIndex) -> WasmResult<()> {
+        if self.module.tmemories.is_valid(memory) {
             return Ok(());
         }
         Err(wasmtime_environ::WasmError::InvalidWebAssembly {
@@ -6062,8 +6144,8 @@ impl FuncEnvironment<'_> {
         })
     }
 
-    fn ensure_transaction_global(&self, global: GlobalIndex) -> WasmResult<()> {
-        if self.module.transaction_objects.is_tglobal(global) {
+    fn ensure_transaction_global(&self, global: TGlobalIndex) -> WasmResult<()> {
+        if self.module.tglobals.is_valid(global) {
             return Ok(());
         }
         Err(wasmtime_environ::WasmError::InvalidWebAssembly {
@@ -6072,8 +6154,8 @@ impl FuncEnvironment<'_> {
         })
     }
 
-    fn ensure_transaction_table(&self, table: TableIndex) -> WasmResult<()> {
-        if self.module.transaction_objects.is_ttable(table) {
+    fn ensure_transaction_table(&self, table: TTableIndex) -> WasmResult<()> {
+        if self.module.ttables.is_valid(table) {
             return Ok(());
         }
         Err(wasmtime_environ::WasmError::InvalidWebAssembly {
@@ -6082,9 +6164,9 @@ impl FuncEnvironment<'_> {
         })
     }
 
-    fn ensure_transaction_table_funcref(&self, table: TableIndex) -> WasmResult<()> {
+    fn ensure_transaction_table_funcref(&self, table: TTableIndex) -> WasmResult<()> {
         if matches!(
-            self.module.tables[table].ref_type.heap_type.top(),
+            self.module.ttables[table].ref_type.heap_type.top(),
             WasmHeapTopType::Func
         ) {
             return Ok(());
@@ -8519,8 +8601,14 @@ impl FuncEnvironment<'_> {
         for (i, expr) in self.translation.global_initializers.iter() {
             self.module_initialize_global(builder, *i, expr)?;
         }
+        for (i, expr) in self.translation.tglobal_initializers.iter() {
+            self.module_initialize_tglobal(builder, *i, expr)?;
+        }
         for (i, exprs) in self.translation.passive_elements.iter() {
             self.module_initialize_passive_element(builder, i, exprs)?;
+        }
+        for (i, exprs) in self.translation.passive_telements.iter() {
+            self.module_initialize_passive_telement(builder, i, exprs)?;
         }
         for (i, init) in self.translation.table_initialization.initial_values.iter() {
             match init {
@@ -8533,11 +8621,35 @@ impl FuncEnvironment<'_> {
         for segment in self.translation.table_initialization.segments.iter() {
             self.module_initialize_table_with_segment(builder, segment)?;
         }
+        for (i, init) in self
+            .translation
+            .t_table_initialization
+            .initial_values
+            .iter()
+        {
+            match init {
+                TableInitialValue::Null => {}
+                TableInitialValue::Expr(expr) => {
+                    self.module_initialize_ttable_with_fill(builder, i, expr)?;
+                }
+            }
+        }
+        for segment in self.translation.t_table_initialization.segments.iter() {
+            self.module_initialize_ttable_with_segment(builder, segment)?;
+        }
         match &self.translation.memory_init {
             MemoryInit::Unprocessed(_) => unreachable!(),
             MemoryInit::Processed(segments) => {
                 for (memory, offset, data) in segments.iter() {
                     self.module_initialize_memory_segment(builder, *memory, offset, *data)?;
+                }
+            }
+        }
+        match &self.translation.t_memory_init {
+            TMemoryInit::Unprocessed(_) => unreachable!(),
+            TMemoryInit::Processed(segments) => {
+                for (memory, offset, data) in segments.iter() {
+                    self.module_initialize_tmemory_segment(builder, *memory, offset, *data)?;
                 }
             }
         }
@@ -8560,10 +8672,18 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<()> {
         let index = self.module.global_index(global);
         let val = self.translate_const_expr(builder, expr)?;
-        if self.module.transaction_objects.is_tglobal(index) {
-            return self.translate_transaction_tglobal_startup_set(builder, index, val);
-        }
         self.emit_global_set(builder, index, val, false)
+    }
+
+    fn module_initialize_tglobal(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        global: DefinedTGlobalIndex,
+        expr: &ConstExpr,
+    ) -> WasmResult<()> {
+        let index = self.module.tglobal_index(global);
+        let val = self.translate_const_expr(builder, expr)?;
+        self.translate_transaction_tglobal_startup_set(builder, index, val)
     }
 
     /// Initializes all passive element segments for a module.
@@ -8628,6 +8748,59 @@ impl FuncEnvironment<'_> {
         Ok(())
     }
 
+    fn module_initialize_passive_telement(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        elem: wasmtime_environ::PassiveTElemIndex,
+        exprs: &TableSegmentElements,
+    ) -> WasmResult<()> {
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let libcall = self
+            .builtin_functions
+            .passive_telem_segment_base(builder.func);
+        let idx = builder.ins().iconst(I32, i64::from(elem.as_u32()));
+        let call = builder.ins().call(libcall, &[vmctx, idx]);
+        let base = builder.func.dfg.first_result(call);
+        let flags = ir::MemFlagsData::trusted().with_endianness(Endianness::Little);
+
+        match exprs {
+            TableSegmentElements::Functions(indices) => {
+                for (i, func) in indices.iter().enumerate() {
+                    let func = self.translate_ref_func(builder.cursor(), *func)?;
+                    builder.ins().store(
+                        flags,
+                        func,
+                        base,
+                        i32::try_from(i.checked_mul(16).unwrap()).unwrap(),
+                    );
+                }
+            }
+            TableSegmentElements::Expressions { exprs, ty } => {
+                for (i, expr) in exprs.iter().enumerate() {
+                    let val = self.translate_const_expr(builder, expr)?;
+                    let dst = builder
+                        .ins()
+                        .iadd_imm_s(base, i64::try_from(i.checked_mul(16).unwrap()).unwrap());
+                    match ty.heap_type.top() {
+                        WasmHeapTopType::Extern | WasmHeapTopType::Any | WasmHeapTopType::Exn => {
+                            let ty = WasmStorageType::Val(WasmValType::Ref(*ty));
+                            gc::init_field_at_addr(self, builder, ty, dst, val)?;
+                        }
+                        WasmHeapTopType::Func | WasmHeapTopType::Cont => {
+                            builder.ins().store(
+                                flags,
+                                val,
+                                base,
+                                i32::try_from(i.checked_mul(16).unwrap()).unwrap(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Initializes all tables with non-null initializers.
     ///
     /// This function will morally execute a `table.fill` for the specified
@@ -8648,9 +8821,6 @@ impl FuncEnvironment<'_> {
             index_type_to_ir_type(ty.idx_type),
             ty.limits.min.cast_signed(),
         );
-        if self.module.transaction_objects.is_ttable(table) {
-            return self.translate_transaction_ttable_startup_fill(builder, table, dst, val, len);
-        }
         self.translate_entity_fill(
             builder,
             CheckedEntity::Table {
@@ -8680,31 +8850,15 @@ impl FuncEnvironment<'_> {
             i64::try_from(segment.elements.len()).unwrap(),
         );
 
-        // Check the bounds first before mutating anything. Transactional
-        // tables may have a staged size that is not visible in their backing
-        // table yet.
-        if self
-            .module
-            .transaction_objects
-            .is_ttable(segment.table_index)
-        {
-            self.translate_transaction_ttable_startup_check_range(
-                builder,
-                segment.table_index,
-                offset,
-                segment_len,
-            )?;
-        } else {
-            self.translate_entity_bounds_check(
-                builder,
-                CheckedEntity::Table {
-                    table: segment.table_index,
-                    initialized: true,
-                },
-                offset,
-                segment_len,
-            )?;
-        }
+        self.translate_entity_bounds_check(
+            builder,
+            CheckedEntity::Table {
+                table: segment.table_index,
+                initialized: true,
+            },
+            offset,
+            segment_len,
+        )?;
 
         // Re-use the `table.set` translation for making this a simple function
         // to define. That re-executes the bounds check which is a bit
@@ -8714,40 +8868,76 @@ impl FuncEnvironment<'_> {
                 for (i, func) in indices.iter().enumerate() {
                     let func = self.translate_ref_func(builder.cursor(), *func)?;
                     let index = builder.ins().iadd_imm_s(offset, i64::try_from(i).unwrap());
-                    if self
-                        .module
-                        .transaction_objects
-                        .is_ttable(segment.table_index)
-                    {
-                        self.translate_transaction_ttable_startup_set(
-                            builder,
-                            segment.table_index,
-                            func,
-                            index,
-                        )?;
-                    } else {
-                        self.translate_table_set(builder, segment.table_index, func, index)?;
-                    }
+                    self.translate_table_set(builder, segment.table_index, func, index)?;
                 }
             }
             TableSegmentElements::Expressions { exprs, ty: _ } => {
                 for (i, expr) in exprs.iter().enumerate() {
                     let val = self.translate_const_expr(builder, expr)?;
                     let index = builder.ins().iadd_imm_s(offset, i64::try_from(i).unwrap());
-                    if self
-                        .module
-                        .transaction_objects
-                        .is_ttable(segment.table_index)
-                    {
-                        self.translate_transaction_ttable_startup_set(
-                            builder,
-                            segment.table_index,
-                            val,
-                            index,
-                        )?;
-                    } else {
-                        self.translate_table_set(builder, segment.table_index, val, index)?;
-                    }
+                    self.translate_table_set(builder, segment.table_index, val, index)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn module_initialize_ttable_with_fill(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        table: DefinedTTableIndex,
+        init: &ConstExpr,
+    ) -> WasmResult<()> {
+        let table = self.module.ttable_index(table);
+        let ty = self.module.ttables[table];
+        let val = self.translate_const_expr(builder, init)?;
+        let dst = builder.ins().iconst(index_type_to_ir_type(ty.idx_type), 0);
+        let len = builder.ins().iconst(
+            index_type_to_ir_type(ty.idx_type),
+            ty.limits.min.cast_signed(),
+        );
+        self.translate_transaction_ttable_startup_fill(builder, table, dst, val, len)
+    }
+
+    fn module_initialize_ttable_with_segment(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        segment: &TTableSegment,
+    ) -> WasmResult<()> {
+        let offset = self.translate_const_expr(builder, &segment.offset)?;
+        let segment_len = builder.ins().iconst(
+            index_type_to_ir_type(self.module.ttables[segment.table_index].idx_type),
+            i64::try_from(segment.elements.len()).unwrap(),
+        );
+        self.translate_transaction_ttable_startup_check_range(
+            builder,
+            segment.table_index,
+            offset,
+            segment_len,
+        )?;
+        match &segment.elements {
+            TableSegmentElements::Functions(indices) => {
+                for (i, func) in indices.iter().enumerate() {
+                    let func = self.translate_ref_func(builder.cursor(), *func)?;
+                    let index = builder.ins().iadd_imm_s(offset, i64::try_from(i).unwrap());
+                    self.translate_transaction_ttable_startup_set(
+                        builder,
+                        segment.table_index,
+                        func,
+                        index,
+                    )?;
+                }
+            }
+            TableSegmentElements::Expressions { exprs, ty: _ } => {
+                for (i, expr) in exprs.iter().enumerate() {
+                    let val = self.translate_const_expr(builder, expr)?;
+                    let index = builder.ins().iadd_imm_s(offset, i64::try_from(i).unwrap());
+                    self.translate_transaction_ttable_startup_set(
+                        builder,
+                        segment.table_index,
+                        val,
+                        index,
+                    )?;
                 }
             }
         }
@@ -8800,13 +8990,9 @@ impl FuncEnvironment<'_> {
         };
 
         let len = self.load_runtime_data_length(builder, data);
-        if self.module.transaction_objects.is_tmemory(memory) {
-            self.translate_transaction_tmemory_static_init(builder, memory, offset, data, len)?;
-        } else {
-            // Model the initialization here as a `memory.init`.
-            let start = builder.ins().iconst(I32, 0);
-            self.translate_entity_copy(builder, memory, data, offset, start, len)?;
-        }
+        // Model the initialization here as a `memory.init`.
+        let start = builder.ins().iconst(I32, 0);
+        self.translate_entity_copy(builder, memory, data, offset, start, len)?;
 
         // Finalize control-flow for the `MemorySegmentOffset::Static` case
         // above.
@@ -8816,6 +9002,25 @@ impl FuncEnvironment<'_> {
             builder.seal_block(end);
         }
         Ok(())
+    }
+
+    fn module_initialize_tmemory_segment(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        memory: TMemoryIndex,
+        offset: &MemorySegmentOffset,
+        data: RuntimeTDataIndex,
+    ) -> WasmResult<()> {
+        let offset = match offset {
+            MemorySegmentOffset::Static(n) => {
+                let ty = index_type_to_ir_type(self.module.tmemories[memory].idx_type);
+                builder.ins().iconst(ty, n.cast_signed())
+            }
+            MemorySegmentOffset::Expr(expr) => self.translate_const_expr(builder, expr)?,
+        };
+        let runtime = self.module.runtime_tdata_index(data);
+        let len = self.load_runtime_data_length(builder, runtime);
+        self.translate_transaction_tmemory_static_init(builder, memory, offset, data, len)
     }
 
     /// Translates the final step of module initialization, executing the
@@ -8873,6 +9078,9 @@ impl FuncEnvironment<'_> {
                 }
                 ConstOp::GlobalGet(i) => {
                     stack.push(self.translate_global_get(builder, *i)?);
+                }
+                ConstOp::TGlobalGet(i) => {
+                    stack.push(self.translate_transaction_tglobal_get(builder, *i)?);
                 }
                 ConstOp::RefI31 => {
                     let val = stack.pop().unwrap();

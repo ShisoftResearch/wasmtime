@@ -141,12 +141,15 @@ impl TryClone for Definition {
 pub(crate) enum DefinitionType {
     Func(wasmtime_environ::VMSharedTypeIndex),
     Global(wasmtime_environ::Global),
+    TGlobal(wasmtime_environ::Global),
     // Note that tables and memories store not only the original type
     // information but additionally the current size of the table/memory, as
     // this is used during linking since the min size specified in the type may
     // no longer be the current size of the table/memory.
     Table(wasmtime_environ::Table, u64),
+    TTable(wasmtime_environ::Table, u64),
     Memory(wasmtime_environ::Memory, u64),
+    TMemory(wasmtime_environ::Memory, u64),
     Tag(wasmtime_environ::Tag),
 }
 
@@ -1466,10 +1469,16 @@ impl Definition {
             Definition::Extern(Extern::Memory(m), DefinitionType::Memory(_, size)) => {
                 *size = m.internal_size(store);
             }
+            Definition::Extern(Extern::Memory(m), DefinitionType::TMemory(_, size)) => {
+                *size = m.internal_size(store);
+            }
             Definition::Extern(Extern::SharedMemory(m), DefinitionType::Memory(_, size)) => {
                 *size = m.size();
             }
             Definition::Extern(Extern::Table(m), DefinitionType::Table(_, size)) => {
+                *size = m.size_(store);
+            }
+            Definition::Extern(Extern::Table(m), DefinitionType::TTable(_, size)) => {
                 *size = m.size_(store);
             }
             _ => {}
@@ -1481,8 +1490,17 @@ impl DefinitionType {
     pub(crate) fn from(store: &StoreOpaque, item: &Extern) -> DefinitionType {
         match item {
             Extern::Func(f) => DefinitionType::Func(f.type_index(store)),
+            Extern::Table(t) if t.is_transactional(store) => {
+                DefinitionType::TTable(*t.wasmtime_ty(store), t.size_(store))
+            }
             Extern::Table(t) => DefinitionType::Table(*t.wasmtime_ty(store), t.size_(store)),
+            Extern::Global(t) if t.is_transactional(store) => {
+                DefinitionType::TGlobal(*t.wasmtime_ty(store))
+            }
             Extern::Global(t) => DefinitionType::Global(*t.wasmtime_ty(store)),
+            Extern::Memory(t) if t.is_transactional(store) => {
+                DefinitionType::TMemory(*t.wasmtime_ty(store), t.internal_size(store))
+            }
             Extern::Memory(t) => {
                 DefinitionType::Memory(*t.wasmtime_ty(store), t.internal_size(store))
             }
@@ -1495,8 +1513,11 @@ impl DefinitionType {
         match self {
             DefinitionType::Func(_) => "function",
             DefinitionType::Table(..) => "table",
+            DefinitionType::TTable(..) => "transactional table",
             DefinitionType::Memory(..) => "memory",
+            DefinitionType::TMemory(..) => "transactional memory",
             DefinitionType::Global(_) => "global",
+            DefinitionType::TGlobal(_) => "transactional global",
             DefinitionType::Tag(_) => "tag",
         }
     }

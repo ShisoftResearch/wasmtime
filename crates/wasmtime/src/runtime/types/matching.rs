@@ -22,17 +22,33 @@ impl MatchCx<'_> {
                 DefinitionType::Global(actual) => global_ty(self.engine, expected, actual),
                 _ => bail!("expected global, but found {}", actual.desc()),
             },
+            EntityType::TGlobal(expected) => match actual {
+                DefinitionType::TGlobal(actual) => global_ty(self.engine, expected, actual),
+                _ => bail!("expected transactional global, but found {}", actual.desc()),
+            },
             EntityType::Table(expected) => match actual {
                 DefinitionType::Table(actual, cur_size) => {
                     table_ty(expected, actual, Some(*cur_size))
                 }
                 _ => bail!("expected table, but found {}", actual.desc()),
             },
+            EntityType::TTable(expected) => match actual {
+                DefinitionType::TTable(actual, cur_size) => {
+                    table_ty(expected, actual, Some(*cur_size))
+                }
+                _ => bail!("expected transactional table, but found {}", actual.desc()),
+            },
             EntityType::Memory(expected) => match actual {
                 DefinitionType::Memory(actual, cur_size) => {
                     memory_ty(expected, actual, Some(*cur_size))
                 }
                 _ => bail!("expected memory, but found {}", actual.desc()),
+            },
+            EntityType::TMemory(expected) => match actual {
+                DefinitionType::TMemory(actual, cur_size) => {
+                    memory_ty(expected, actual, Some(*cur_size))
+                }
+                _ => bail!("expected transactional memory, but found {}", actual.desc()),
             },
             EntityType::Function(expected) => match actual {
                 DefinitionType::Func(actual) => {
@@ -77,13 +93,31 @@ pub fn entity_ty(engine: &Engine, expected: &EntityType, actual: &EntityType) ->
             EntityType::Memory(actual) => memory_ty(expected, actual, None),
             _ => bail!("expected memory found {}", entity_desc(actual)),
         },
+        EntityType::TMemory(expected) => match actual {
+            EntityType::TMemory(actual) => memory_ty(expected, actual, None),
+            _ => bail!(
+                "expected transactional memory found {}",
+                entity_desc(actual)
+            ),
+        },
         EntityType::Global(expected) => match actual {
             EntityType::Global(actual) => global_ty(engine, expected, actual),
             _ => bail!("expected global found {}", entity_desc(actual)),
         },
+        EntityType::TGlobal(expected) => match actual {
+            EntityType::TGlobal(actual) => global_ty(engine, expected, actual),
+            _ => bail!(
+                "expected transactional global found {}",
+                entity_desc(actual)
+            ),
+        },
         EntityType::Table(expected) => match actual {
             EntityType::Table(actual) => table_ty(expected, actual, None),
             _ => bail!("expected table found {}", entity_desc(actual)),
+        },
+        EntityType::TTable(expected) => match actual {
+            EntityType::TTable(actual) => table_ty(expected, actual, None),
+            _ => bail!("expected transactional table found {}", entity_desc(actual)),
         },
         EntityType::Function(expected) => match actual {
             EntityType::Function(actual) => {
@@ -414,8 +448,11 @@ fn match_limits(
 fn entity_desc(ty: &EntityType) -> &'static str {
     match ty {
         EntityType::Global(_) => "global",
+        EntityType::TGlobal(_) => "transactional global",
         EntityType::Table(_) => "table",
+        EntityType::TTable(_) => "transactional table",
         EntityType::Memory(_) => "memory",
+        EntityType::TMemory(_) => "transactional memory",
         EntityType::Function(_) => "func",
         EntityType::Tag(_) => "tag",
     }

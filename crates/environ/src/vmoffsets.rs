@@ -647,22 +647,27 @@ impl<P: PtrSize> VMOffsets<P> {
             .skip(module.num_imported_memories)
             .filter(|p| !p.1.shared)
             .count()
-            .try_into()
-            .unwrap();
+            + module
+                .tmemories
+                .iter()
+                .skip(module.num_imported_tmemories)
+                .filter(|p| !p.1.shared)
+                .count();
+        let num_owned_memories = num_owned_memories.try_into().unwrap();
         VMOffsets::from(VMOffsetsFields {
             ptr,
             num_imported_functions: cast_to_u32(module.num_imported_funcs),
-            num_imported_tables: cast_to_u32(module.num_imported_tables),
-            num_imported_memories: cast_to_u32(module.num_imported_memories),
-            num_imported_globals: cast_to_u32(module.num_imported_globals),
+            num_imported_tables: cast_to_u32(module.num_runtime_imported_tables()),
+            num_imported_memories: cast_to_u32(module.num_runtime_imported_memories()),
+            num_imported_globals: cast_to_u32(module.num_runtime_imported_globals()),
             num_imported_tags: cast_to_u32(module.num_imported_tags),
-            num_defined_tables: cast_to_u32(module.num_defined_tables()),
-            num_defined_memories: cast_to_u32(module.num_defined_memories()),
+            num_defined_tables: cast_to_u32(module.num_runtime_defined_tables()),
+            num_defined_memories: cast_to_u32(module.num_runtime_defined_memories()),
             num_owned_memories,
-            num_defined_globals: cast_to_u32(module.globals.len() - module.num_imported_globals),
+            num_defined_globals: cast_to_u32(module.num_runtime_defined_globals()),
             num_defined_tags: cast_to_u32(module.tags.len() - module.num_imported_tags),
             num_escaped_funcs: cast_to_u32(module.num_escaped_funcs),
-            num_runtime_data: cast_to_u32(module.runtime_data.len()),
+            num_runtime_data: cast_to_u32(module.runtime_data.len() + module.runtime_tdata.len()),
             has_startup_func: !module.startup.is_none(),
         })
     }

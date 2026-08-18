@@ -958,21 +958,21 @@ impl<'a> Instantiator<'a> {
         let mut imports = module.compiled_module().module().imports();
 
         for arg in args {
+            let (imp_module, imp_name, expected) = imports.next().unwrap();
             // The general idea of Wasmtime is that at runtime type-checks for
             // core wasm instantiations internally within a component are
             // unnecessary and superfluous. Naturally though mistakes may be
             // made, so double-check this property of wasmtime in debug mode.
 
             if cfg!(debug_assertions) {
-                let (imp_module, imp_name, expected) = imports.next().unwrap();
-                self.assert_type_matches(store, module, arg, imp_module, imp_name, expected);
+                self.assert_type_matches(store, module, arg, imp_module, imp_name, &expected);
             }
 
             // The unsafety here should be ok since the `export` is loaded
             // directly from an instance which should only give us valid export
             // items.
             let export = lookup_vmdef(store, self.id, arg);
-            self.core_imports.push_export(store, &export)?;
+            self.core_imports.push_export(store, &export, expected)?;
         }
         debug_assert!(imports.next().is_none());
 
@@ -986,7 +986,7 @@ impl<'a> Instantiator<'a> {
         arg: &CoreDef,
         imp_module: &str,
         imp_name: &str,
-        expected: EntityType,
+        expected: &EntityType,
     ) {
         let export = lookup_vmdef(store, self.id, arg);
 
@@ -1016,7 +1016,7 @@ impl<'a> Instantiator<'a> {
         let val = crate::Extern::from_wasmtime_export(export, store.engine());
         let ty = DefinitionType::from(store, &val);
         crate::types::matching::MatchCx::new(module.engine())
-            .definition(&expected, &ty)
+            .definition(expected, &ty)
             .expect("unexpected typecheck failure");
     }
 

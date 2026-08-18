@@ -580,13 +580,15 @@ where
                     let wasmparser_ty = &wasmparser_types[id].composite_type;
                     assert!(!wasmparser_ty.shared);
                     match &wasmparser_ty.inner {
-                        wasmparser::CompositeInnerType::Array(_) => {
+                        wasmparser::CompositeInnerType::Array(_)
+                        | wasmparser::CompositeInnerType::TArray(_) => {
                             WasmHeapType::ConcreteArray(index)
                         }
                         wasmparser::CompositeInnerType::Func(_) => {
                             WasmHeapType::ConcreteFunc(index)
                         }
-                        wasmparser::CompositeInnerType::Struct(_) => {
+                        wasmparser::CompositeInnerType::Struct(_)
+                        | wasmparser::CompositeInnerType::TStruct(_) => {
                             WasmHeapType::ConcreteStruct(index)
                         }
                         wasmparser::CompositeInnerType::Cont(_) => {
@@ -626,13 +628,15 @@ where
                     let wasmparser_ty = &parser_types[id].composite_type;
                     assert!(!wasmparser_ty.shared);
                     match &wasmparser_ty.inner {
-                        wasmparser::CompositeInnerType::Array(_) => {
+                        wasmparser::CompositeInnerType::Array(_)
+                        | wasmparser::CompositeInnerType::TArray(_) => {
                             WasmHeapType::ConcreteArray(index)
                         }
                         wasmparser::CompositeInnerType::Func(_) => {
                             WasmHeapType::ConcreteFunc(index)
                         }
-                        wasmparser::CompositeInnerType::Struct(_) => {
+                        wasmparser::CompositeInnerType::Struct(_)
+                        | wasmparser::CompositeInnerType::TStruct(_) => {
                             WasmHeapType::ConcreteStruct(index)
                         }
                         wasmparser::CompositeInnerType::Cont(_) => {

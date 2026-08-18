@@ -60,7 +60,7 @@ impl TablePool {
 
     /// Validate whether this module's tables are allocatable by this pool.
     pub fn validate(&self, module: &Module) -> Result<()> {
-        let tables = module.num_defined_tables();
+        let tables = module.num_runtime_defined_tables();
 
         if tables > self.tables_per_instance {
             bail!(
@@ -82,6 +82,16 @@ impl TablePool {
             if table.limits.min > u64::try_from(self.nominal_table_elements)? {
                 bail!(
                     "table index {} has a minimum element size of {} which exceeds the limit of {}",
+                    i.as_u32(),
+                    table.limits.min,
+                    self.nominal_table_elements,
+                );
+            }
+        }
+        for (i, table) in module.ttables.iter().skip(module.num_imported_ttables) {
+            if table.limits.min > u64::try_from(self.nominal_table_elements)? {
+                bail!(
+                    "transactional table index {} has a minimum element size of {} which exceeds the limit of {}",
                     i.as_u32(),
                     table.limits.min,
                     self.nominal_table_elements,

@@ -102,8 +102,9 @@ use core::ptr::NonNull;
 use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
-    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, GlobalIndex, MemoryIndex,
-    PassiveElemIndex, TableIndex, Trap, VMGcKind, VMSharedTypeIndex, WasmHeapTopType, WasmValType,
+    CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, PassiveElemIndex,
+    PassiveTElemIndex, TGlobalIndex, TMemoryIndex, TableIndex, Trap, VMGcKind, VMSharedTypeIndex,
+    WasmHeapTopType, WasmValType,
 };
 #[cfg(feature = "gc")]
 use wasmtime_environ::{GcLayout, TypeIndex};
@@ -1098,7 +1099,7 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
                     memory_index: *memory_index,
                 };
                 let current =
-                    current_tmemory_pages(store, owner, MemoryIndex::from_u32(*memory_index))?;
+                    current_tmemory_pages(store, owner, TMemoryIndex::from_u32(*memory_index))?;
                 ensure!(
                     physical_values
                         .memory_sizes
@@ -1126,7 +1127,7 @@ fn transaction_commit_mvcc_impl(store: &mut dyn VMStore, instance: InstanceId) -
                 let current = read_global_snapshot_like(
                     store,
                     owner,
-                    GlobalIndex::from_u32(*global_index),
+                    TGlobalIndex::from_u32(*global_index),
                     *value,
                 )?;
                 ensure!(
@@ -1640,7 +1641,7 @@ fn publish_mvcc_memory_undo_if_needed(
     let owner = instance
         .map(InstanceId::from_u32)
         .unwrap_or(terminal.instance);
-    let memory = MemoryIndex::from_u32(memory_index);
+    let memory = TMemoryIndex::from_u32(memory_index);
     let undo = {
         let instance_ref = store.instance_mut(owner);
         let instance_ref = instance_ref.as_ref();
@@ -2103,7 +2104,7 @@ fn mvcc_memory_backend(
     let instance_ref = store.instance_mut(owner);
     let instance_ref = instance_ref.as_ref();
     let tmemory = instance_ref
-        .get_tmemory(MemoryIndex::from_u32(memory_index))
+        .get_tmemory(TMemoryIndex::from_u32(memory_index))
         .context("transactional memory operation targeted non-transactional memory")?;
     Ok(tmemory.backend())
 }
@@ -2138,7 +2139,7 @@ fn reserve_mvcc_memory_capacity(
     let mut instance_ref = store.instance_mut(owner);
     let tmemory = instance_ref
         .as_mut()
-        .get_tmemory_mut(MemoryIndex::from_u32(memory_index))
+        .get_tmemory_mut(TMemoryIndex::from_u32(memory_index))
         .context("transactional memory operation targeted non-transactional memory")?;
     tmemory.reserve_backing_capacity_to_pages_for_mvcc(target_pages)
 }
@@ -2164,7 +2165,7 @@ fn install_mvcc_memory_value(
     let mut instance_ref = store.instance_mut(owner);
     let tmemory = instance_ref
         .as_mut()
-        .get_tmemory_mut(MemoryIndex::from_u32(memory_index))
+        .get_tmemory_mut(TMemoryIndex::from_u32(memory_index))
         .context("transactional memory operation targeted non-transactional memory")?;
     tmemory.commit_staged_tmemory_granules_direct(&[(granule_index, value.to_vec())])
 }
@@ -2190,7 +2191,7 @@ fn install_mvcc_memory_value_within_capacity(
     let mut instance_ref = store.instance_mut(owner);
     let tmemory = instance_ref
         .as_mut()
-        .get_tmemory_mut(MemoryIndex::from_u32(memory_index))
+        .get_tmemory_mut(TMemoryIndex::from_u32(memory_index))
         .context("transactional memory operation targeted non-transactional memory")?;
     tmemory.commit_staged_tmemory_granule_within_capacity_for_mvcc(granule_index, value)
 }
@@ -2212,7 +2213,7 @@ fn install_mvcc_global_value(
     let owner = instance
         .map(InstanceId::from_u32)
         .unwrap_or(default_instance);
-    let mut global = global_definition_ptr(store, owner, GlobalIndex::from_u32(global_index))?;
+    let mut global = global_definition_ptr(store, owner, TGlobalIndex::from_u32(global_index))?;
     write_global_snapshot(store.store_opaque_mut(), unsafe { global.as_mut() }, value)
 }
 
@@ -2257,7 +2258,7 @@ fn current_tmemory_granule(
     let addr = granule_index
         .checked_mul(u64::try_from(crate::runtime::transaction::TMEMORY_GRANULE_SIZE).unwrap())
         .context("tmemory granule address overflow")?;
-    let memory_index = MemoryIndex::from_u32(memory_index);
+    let memory_index = TMemoryIndex::from_u32(memory_index);
     let pages = current_tmemory_pages(store, instance, memory_index)?;
     let byte_len = pages
         .checked_mul(u64::try_from(crate::runtime::vm::memory::tmemory::WASM_PAGE_SIZE).unwrap())
@@ -2282,7 +2283,7 @@ fn current_tmemory_granule(
 fn read_global_snapshot_like(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    global: GlobalIndex,
+    global: TGlobalIndex,
     value: GlobalSnapshot,
 ) -> Result<GlobalSnapshot> {
     let global = global_definition_ptr(store, instance, global)?;
@@ -2615,7 +2616,7 @@ fn transaction_tglobal_startup_set_impl(
 fn stage_transaction_global_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    global_index: GlobalIndex,
+    global_index: TGlobalIndex,
     wasm_ty: WasmValType,
     snapshot: GlobalSnapshot,
 ) -> Result<()> {
@@ -2655,7 +2656,7 @@ fn stage_transaction_global_snapshot(
 fn write_or_stage_transaction_global_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    global_index: GlobalIndex,
+    global_index: TGlobalIndex,
     wasm_ty: WasmValType,
     snapshot: GlobalSnapshot,
 ) -> Result<()> {
@@ -2673,7 +2674,7 @@ fn write_or_stage_transaction_global_snapshot(
 fn write_transaction_global_snapshot_direct(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    global_index: GlobalIndex,
+    global_index: TGlobalIndex,
     wasm_ty: WasmValType,
     snapshot: GlobalSnapshot,
 ) -> Result<()> {
@@ -2728,12 +2729,12 @@ fn transaction_global(
     store: &mut dyn VMStore,
     instance: InstanceId,
     global: u32,
-) -> Result<(GlobalIndex, WasmValType)> {
-    let global = GlobalIndex::from_u32(global);
+) -> Result<(TGlobalIndex, WasmValType)> {
+    let global = TGlobalIndex::from_u32(global);
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
     let module = instance_ref.env_module();
-    let wasm_ty = module.globals[global].wasm_ty;
+    let wasm_ty = module.tglobals[global].wasm_ty;
     Ok((global, wasm_ty))
 }
 
@@ -2795,7 +2796,7 @@ fn live_transaction_gc_ref_for_read(store: &mut dyn VMStore, gc_ref: u32) -> Res
 fn read_global_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    global: GlobalIndex,
+    global: TGlobalIndex,
     ty: WasmValType,
 ) -> Result<GlobalSnapshot> {
     let global = global_definition_ptr(store, instance, global)?;
@@ -2823,15 +2824,15 @@ fn read_global_snapshot(
 fn global_definition_ptr(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    global: GlobalIndex,
+    global: TGlobalIndex,
 ) -> Result<NonNull<vm::VMGlobalDefinition>> {
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
     let module = instance_ref.env_module();
-    if let Some(defined) = module.defined_global_index(global) {
-        return Ok(instance_ref.global_ptr(defined));
+    if let Some(defined) = module.defined_tglobal_index(global) {
+        return Ok(instance_ref.global_ptr(module.runtime_defined_tglobal_index(defined)));
     }
-    Ok(instance_ref.imported_global(global).from.as_non_null())
+    Ok(instance_ref.imported_tglobal(global).from.as_non_null())
 }
 
 fn write_global_snapshot(
@@ -3658,6 +3659,121 @@ fn transaction_ttable_write_range_impl(
         .store_opaque_mut()
         .transaction_state_mut()
         .acquire_table_granule_write_range_owned(Some(instance), table, start, len, 0)?;
+    Ok(())
+}
+
+fn transaction_ttable_copy(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    dst_table: u32,
+    src_table: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    let result = transaction_ttable_copy_impl(store, instance, dst_table, src_table, dst, src, len);
+    let _ = abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_copy_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    dst_table: u32,
+    src_table: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store, instance)?;
+    ensure_transaction_table_range_in_bounds(store, instance, src_table, src, len)?;
+    ensure_transaction_table_range_in_bounds(store, instance, dst_table, dst, len)?;
+    let mut values = Vec::with_capacity(usize::try_from(len)?);
+    for offset in 0..len {
+        values.push(transaction_ttable_get_impl(
+            store,
+            instance,
+            src_table,
+            src.checked_add(offset)
+                .context("ttable.copy source overflow")?,
+        )?);
+    }
+    for (offset, value) in values.into_iter().enumerate() {
+        transaction_ttable_set_impl(
+            store,
+            instance,
+            dst_table,
+            dst.checked_add(u64::try_from(offset)?)
+                .context("ttable.copy destination overflow")?,
+            value,
+        )?;
+    }
+    Ok(())
+}
+
+fn transaction_ttable_init(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    elem: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    let result = transaction_ttable_init_impl(store, instance, table, elem, dst, src, len);
+    let _ = abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_ttable_init_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table: u32,
+    elem: u32,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store, instance)?;
+    ensure_transaction_table_range_in_bounds(store, instance, table, dst, len)?;
+    let src = usize::try_from(src).context("ttable.init source does not fit host usize")?;
+    let len = usize::try_from(len).context("ttable.init length does not fit host usize")?;
+    if elem == u32::MAX {
+        ensure!(
+            src == 0 && len == 0,
+            "out of bounds transactional element segment access"
+        );
+        return Ok(());
+    }
+    let values = {
+        let mut instance_ref = store.instance_mut(instance);
+        let segment = instance_ref
+            .as_mut()
+            .passive_telement_segment(PassiveTElemIndex::from_u32(elem));
+        let end = src
+            .checked_add(len)
+            .context("ttable.init element range overflow")?;
+        ensure!(
+            end <= segment.len(),
+            "out of bounds transactional element segment access"
+        );
+        segment[src..end]
+            .iter()
+            .map(|value| value.get_funcref().cast::<u8>())
+            .collect::<Vec<_>>()
+    };
+    for (offset, value) in values.into_iter().enumerate() {
+        transaction_ttable_set_impl(
+            store,
+            instance,
+            table,
+            dst.checked_add(u64::try_from(offset)?)
+                .context("ttable.init destination overflow")?,
+            value,
+        )?;
+    }
     Ok(())
 }
 
@@ -5188,7 +5304,7 @@ fn flush_pending_tmemory_store(store: &mut dyn VMStore, _instance: InstanceId) -
     else {
         return Ok(());
     };
-    let memory_index = MemoryIndex::from_u32(memory);
+    let memory_index = TMemoryIndex::from_u32(memory);
     let snapshot =
         collect_tmemory_snapshot(store, owner, owner_instance_key, memory_index, addr, len)?;
     store
@@ -5332,7 +5448,7 @@ fn commit_staged_tmemory_records(
 
     let mut persistent_undos = Vec::new();
     for (participant, staged) in &participants {
-        let memory_index = MemoryIndex::from_u32(participant.memory_index);
+        let memory_index = TMemoryIndex::from_u32(participant.memory_index);
         let backend = {
             let instance_ref = store.instance_mut(participant.owner);
             let instance_ref = instance_ref.as_ref();
@@ -5372,7 +5488,7 @@ fn commit_staged_tmemory_records(
     }
 
     for (participant, staged) in &participants {
-        let memory_index = MemoryIndex::from_u32(participant.memory_index);
+        let memory_index = TMemoryIndex::from_u32(participant.memory_index);
         {
             let mut instance_ref = store.instance_mut(participant.owner);
             let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory_index) else {
@@ -5408,7 +5524,7 @@ fn apply_staged_transaction_record(
             ..
         } => {
             let owner = owner_instance.unwrap_or(instance);
-            let memory_index = MemoryIndex::from_u32(*memory_index);
+            let memory_index = TMemoryIndex::from_u32(*memory_index);
             let staged = {
                 let state = store.store_opaque_mut().transaction_state_mut();
                 state.staged_tmemory_granules_owned(Some(owner), memory_index.as_u32())?
@@ -5446,7 +5562,7 @@ fn apply_staged_transaction_record(
             value,
         } => {
             let owner = owner_instance.unwrap_or(instance);
-            let global_index = GlobalIndex::from_u32(*global_index);
+            let global_index = TGlobalIndex::from_u32(*global_index);
             let mut global = global_definition_ptr(store, owner, global_index)?;
             let global = unsafe { global.as_mut() };
             write_global_snapshot(store.store_opaque_mut(), global, *value)?;
@@ -5512,11 +5628,15 @@ fn resolve_defined_tmemory_index(
     store: &mut dyn VMStore,
     instance: InstanceId,
     memory: u32,
-) -> Result<MemoryIndex> {
+) -> Result<TMemoryIndex> {
     let defined = DefinedMemoryIndex::from_u32(memory);
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
-    let memory_index = instance_ref.env_module().memory_index(defined);
+    let module = instance_ref.env_module();
+    let defined = module
+        .defined_tmemory_index_from_runtime(defined)
+        .context("transactional memory builtin received an ordinary memory slot")?;
+    let memory_index = module.tmemory_index(defined);
     ensure!(
         instance_ref.get_tmemory(memory_index).is_some(),
         "transactional memory operation targeted non-transactional memory"
@@ -5527,7 +5647,7 @@ fn resolve_defined_tmemory_index(
 fn tmemory_transaction_owner_key(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    memory_index: MemoryIndex,
+    memory_index: TMemoryIndex,
 ) -> Result<Option<InstanceId>> {
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
@@ -5548,7 +5668,7 @@ fn grow_tmemory_to_pages(
 ) -> Result<()> {
     let runtime = store.store_opaque().transaction_region_runtime().clone();
     runtime.with_shared_file_backed_tmemory_commit_write_lock(|| {
-        let memory = MemoryIndex::from_u32(memory);
+        let memory = TMemoryIndex::from_u32(memory);
         let mut instance_ref = store.instance_mut(instance);
         let Some(tmemory) = instance_ref.as_mut().get_tmemory_mut(memory) else {
             bail!("transactional memory operation targeted non-transactional memory");
@@ -5748,7 +5868,7 @@ fn collect_defined_tmemory_snapshot(
     memory: u32,
     addr: u64,
     len: usize,
-) -> Result<(MemoryIndex, TMemoryAccessSnapshot)> {
+) -> Result<(TMemoryIndex, TMemoryAccessSnapshot)> {
     let memory_index = resolve_defined_tmemory_index(store, instance, memory)?;
     let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     let snapshot =
@@ -5759,7 +5879,7 @@ fn collect_defined_tmemory_snapshot(
 fn current_tmemory_pages(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    memory_index: MemoryIndex,
+    memory_index: TMemoryIndex,
 ) -> Result<u64> {
     let instance_ref = store.instance_mut(instance);
     let instance_ref = instance_ref.as_ref();
@@ -5773,7 +5893,7 @@ fn current_tmemory_pages(
 fn current_tmemory_granule_version(
     store: &mut dyn VMStore,
     instance: InstanceId,
-    memory_index: MemoryIndex,
+    memory_index: TMemoryIndex,
     granule_index: u64,
 ) -> Result<u64> {
     let granule_index =
@@ -5796,7 +5916,7 @@ fn snapshot_visible_tmemory_pages(
     store: &mut dyn VMStore,
     instance: InstanceId,
     owner_instance_key: Option<InstanceId>,
-    memory_index: MemoryIndex,
+    memory_index: TMemoryIndex,
 ) -> Result<u64> {
     let (visibility, granule) = {
         let state = store.store_opaque_mut().transaction_state_mut();
@@ -5818,7 +5938,7 @@ fn visible_tmemory_pages(
     store: &mut dyn VMStore,
     instance: InstanceId,
     owner_instance_key: Option<InstanceId>,
-    memory_index: MemoryIndex,
+    memory_index: TMemoryIndex,
 ) -> Result<u64> {
     let staged = store
         .store_opaque_mut()
@@ -5840,7 +5960,7 @@ fn collect_tmemory_snapshot(
     store: &mut dyn VMStore,
     instance: InstanceId,
     _owner_instance_key: Option<InstanceId>,
-    memory_index: MemoryIndex,
+    memory_index: TMemoryIndex,
     addr: u64,
     len: usize,
 ) -> Result<TMemoryAccessSnapshot> {
@@ -5988,7 +6108,7 @@ fn current_granule_version(
             granule_index,
         } => {
             let owner = owner_instance.map(InstanceId::from_u32).unwrap_or(instance);
-            let memory_index = MemoryIndex::from_u32(memory_index);
+            let memory_index = TMemoryIndex::from_u32(memory_index);
             current_tmemory_granule_version(store, owner, memory_index, granule_index)
         }
         GranuleId::Object { .. } => {
@@ -6097,6 +6217,42 @@ fn passive_elem_segment_drop(
     let elem_index = PassiveElemIndex::from_u32(elem_index);
     let (gc_store, instance) = store.optional_gc_store_and_instance_mut(instance);
     instance.passive_elem_drop(gc_store, elem_index)?;
+    Ok(())
+}
+
+fn passive_telem_segment_len(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    elem_index: u32,
+) -> usize {
+    let elem_index = PassiveTElemIndex::from_u32(elem_index);
+    store
+        .instance_mut(instance)
+        .passive_telement_segment(elem_index)
+        .len()
+}
+
+fn passive_telem_segment_base(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    elem_index: u32,
+) -> *mut u8 {
+    let elem_index = PassiveTElemIndex::from_u32(elem_index);
+    store
+        .instance_mut(instance)
+        .passive_telement_segment(elem_index)
+        .as_mut_ptr()
+        .cast()
+}
+
+fn passive_telem_segment_drop(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    elem_index: u32,
+) -> Result<()> {
+    let elem_index = PassiveTElemIndex::from_u32(elem_index);
+    let (gc_store, instance) = store.optional_gc_store_and_instance_mut(instance);
+    instance.passive_telem_drop(gc_store, elem_index)?;
     Ok(())
 }
 

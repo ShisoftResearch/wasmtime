@@ -122,6 +122,7 @@ impl WasmCoreDump {
                 memory_to_idx.insert(mem.hash_key(&store.0), memory_idx);
                 let ty = mem.ty(&store);
                 memories.memory(wasm_encoder::MemoryType {
+                    namespace: wasm_encoder::EntityNamespace::Ordinary,
                     minimum: mem.size(&store),
                     maximum: ty.maximum(),
                     memory64: ty.is_64(),
@@ -221,6 +222,7 @@ impl WasmCoreDump {
                 globals.global(
                     wasm_encoder::GlobalType {
                         val_type,
+                        namespace: wasm_encoder::EntityNamespace::Ordinary,
                         mutable,
                         shared: false,
                     },

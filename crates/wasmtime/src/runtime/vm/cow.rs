@@ -241,6 +241,13 @@ impl ModuleMemoryImages {
             assert_eq!(idx, defined_memory);
         }
 
+        // Transactional memories use the physical defined-memory slots after
+        // ordinary memories, but their initial bytes are committed through
+        // the transactional sidecar rather than an ordinary CoW image.
+        for _ in 0..module.num_defined_tmemories() {
+            memories.push(None)?;
+        }
+
         Ok(Some(ModuleMemoryImages { memories }))
     }
 }

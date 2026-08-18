@@ -1425,24 +1425,6 @@ fn mvcc_dax_research_temp_keeps_history_in_one_runtime_and_starts_fresh_in_anoth
     );
 }
 
-fn with_transaction_memory_metadata(wasm: &[u8]) -> Vec<u8> {
-    with_transaction_object_metadata(wasm, &[1, 1, 0, 0])
-}
-
-fn with_transaction_global_metadata(wasm: &[u8]) -> Vec<u8> {
-    with_transaction_object_metadata(wasm, &[1, 0, 1, 0])
-}
-
-fn with_transaction_object_metadata(wasm: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut wasm = wasm.to_vec();
-    wasm.extend_from_slice(&[
-        0x00, 0x20, 0x1b, b's', b'h', b'i', b's', b'o', b'f', b't', b'.', b't', b'r', b'a', b'n',
-        b's', b'a', b'c', b't', b'i', b'o', b'n', b'.', b'o', b'b', b'j', b'e', b'c', b't', b's',
-    ]);
-    wasm.extend_from_slice(payload);
-    wasm
-}
-
 fn transaction_cc_is_ownerless_multiwriter() -> bool {
     cfg!(feature = "transaction-cc-optimistic-validation")
         || cfg!(feature = "transaction-cc-timestamp-ordering")
@@ -2364,7 +2346,7 @@ fn mvcc_commit_fault_pre_lp_memory_install_restores_predecessor_and_aborts_recor
         let instance_ref = context.0.instance_mut(instance.id());
         let instance_ref = instance_ref.as_ref();
         let tmemory = instance_ref
-            .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+            .get_tmemory(wasmtime_environ::TMemoryIndex::from_u32(0))
             .unwrap();
         tmemory.read_committed(0..4).unwrap()
     };
@@ -2642,7 +2624,7 @@ fn mvcc_commit_fault_markerless_vmemory_record_publication_failure_rolls_back() 
         let instance_ref = context.0.instance_mut(instance.id());
         let instance_ref = instance_ref.as_ref();
         instance_ref
-            .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+            .get_tmemory(wasmtime_environ::TMemoryIndex::from_u32(0))
             .unwrap()
             .read_committed(0..4)
             .unwrap()
@@ -2839,7 +2821,7 @@ fn mvcc_commit_fault_rollback_failure_retains_progress_for_explicit_retry() {
         let instance_ref = context.0.instance_mut(instance.id());
         let instance_ref = instance_ref.as_ref();
         instance_ref
-            .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+            .get_tmemory(wasmtime_environ::TMemoryIndex::from_u32(0))
             .unwrap()
             .read_committed(0..4)
             .unwrap()
@@ -3106,7 +3088,7 @@ fn mvcc_commit_fault_abortable_cut_points_restore_mixed_domain_predecessors() {
             let instance_ref = context.0.instance_mut(instance.id());
             let instance_ref = instance_ref.as_ref();
             instance_ref
-                .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+                .get_tmemory(wasmtime_environ::TMemoryIndex::from_u32(0))
                 .unwrap()
                 .read_committed(0..4)
                 .unwrap()
@@ -3297,7 +3279,7 @@ fn mvcc_commit_fault_durable_pre_lp_cut_points_abort_without_leaking_publication
             let instance_ref = context.0.instance_mut(instance.id());
             let instance_ref = instance_ref.as_ref();
             instance_ref
-                .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+                .get_tmemory(wasmtime_environ::TMemoryIndex::from_u32(0))
                 .unwrap()
                 .read_committed(0..4)
                 .unwrap()
@@ -3486,7 +3468,7 @@ fn mvcc_commit_fault_post_lp_cut_points_force_complete_all_domains() {
             let instance_ref = context.0.instance_mut(instance.id());
             let instance_ref = instance_ref.as_ref();
             let tmemory = instance_ref
-                .get_tmemory(wasmtime_environ::MemoryIndex::from_u32(0))
+                .get_tmemory(wasmtime_environ::TMemoryIndex::from_u32(0))
                 .unwrap();
             (
                 tmemory.read_committed(0..4).unwrap(),
@@ -3558,7 +3540,7 @@ fn mvcc_commit_prepare_unpromoted_volatile_object_creates_no_sidecar_chain() {
         &engine,
         r#"
             (module
-              (type $s (struct (field (mut i32))))
+              (type $s (tstruct (field (mut i32))))
               (tmemory 1)
               (tfunc (export "create")
                 (drop (tstruct.new $s (i32.const 41)))
@@ -4360,7 +4342,7 @@ fn single_version_tfunc_certification_prevents_write_skew() {
         &engine,
         r#"
             (module
-              (import "host" "sync" (func $sync))
+              (import "host" "sync" (tfunc $sync))
               (tmemory 1)
               (tfunc (export "init")
                 (i64.tstore (i32.const 0) (i64.const 1))
@@ -4368,13 +4350,13 @@ fn single_version_tfunc_certification_prevents_write_skew() {
               (tfunc (export "write_skew_a")
                 (local $b i64)
                 (local.set $b (i64.tload (i32.const 64)))
-                (call $sync)
+                (tcall $sync)
                 (if (i64.eq (local.get $b) (i64.const 1))
                   (then (i64.tstore (i32.const 0) (i64.const 0)))))
               (tfunc (export "write_skew_b")
                 (local $a i64)
                 (local.set $a (i64.tload (i32.const 0)))
-                (call $sync)
+                (tcall $sync)
                 (if (i64.eq (local.get $a) (i64.const 1))
                   (then (i64.tstore (i32.const 64) (i64.const 0)))))
               (tfunc (export "read") (result i64 i64)
@@ -6620,7 +6602,7 @@ fn mvcc_visibility_repeated_tmemory_loads_remain_stable() {
                     .store
                     .0
                     .instance_mut(InstanceId::from_u32(owner))
-                    .get_tmemory_mut(wasmtime_environ::MemoryIndex::from_u32(0))
+                    .get_tmemory_mut(wasmtime_environ::TMemoryIndex::from_u32(0))
                     .context("missing transactional memory sidecar")?
                     .commit_range(0, &current[..4])?;
                 Ok(())
@@ -6633,7 +6615,7 @@ fn mvcc_visibility_repeated_tmemory_loads_remain_stable() {
         .as_context_mut()
         .0
         .instance_mut(instance.id())
-        .get_tmemory_mut(wasmtime_environ::MemoryIndex::from_u32(0))
+        .get_tmemory_mut(wasmtime_environ::TMemoryIndex::from_u32(0))
         .unwrap()
         .commit_range(0, &11_i32.to_le_bytes())
         .unwrap();
@@ -6716,7 +6698,7 @@ fn mvcc_visibility_partial_and_cross_granule_tmemory_stores_use_one_snapshot() {
                 let mut instance = caller.store.0.instance_mut(InstanceId::from_u32(owner));
                 let tmemory = instance
                     .as_mut()
-                    .get_tmemory_mut(wasmtime_environ::MemoryIndex::from_u32(0))
+                    .get_tmemory_mut(wasmtime_environ::TMemoryIndex::from_u32(0))
                     .context("missing transactional memory sidecar")?;
                 tmemory.commit_range(0, &new0)?;
                 tmemory.commit_range(TMEMORY_GRANULE_SIZE, &new1)?;
@@ -6730,7 +6712,7 @@ fn mvcc_visibility_partial_and_cross_granule_tmemory_stores_use_one_snapshot() {
         let mut instance_ref = store.as_context_mut().0.instance_mut(instance.id());
         let tmemory = instance_ref
             .as_mut()
-            .get_tmemory_mut(wasmtime_environ::MemoryIndex::from_u32(0))
+            .get_tmemory_mut(wasmtime_environ::TMemoryIndex::from_u32(0))
             .unwrap();
         tmemory.commit_range(60, &[0x10, 0x11, 0x12, 0x13]).unwrap();
         tmemory
@@ -6808,7 +6790,7 @@ fn mvcc_visibility_tmemory_size_controls_bounds_and_staged_growth() {
                     .store
                     .0
                     .instance_mut(InstanceId::from_u32(owner))
-                    .get_tmemory_mut(wasmtime_environ::MemoryIndex::from_u32(0))
+                    .get_tmemory_mut(wasmtime_environ::TMemoryIndex::from_u32(0))
                     .context("missing transactional memory sidecar")?
                     .grow_to_pages(2)?;
                 Ok(())
@@ -6898,7 +6880,7 @@ fn mvcc_visibility_tmemory_staged_growth_reads_zero_then_staged_overlay() {
                 let mut instance = caller.store.0.instance_mut(InstanceId::from_u32(owner));
                 let tmemory = instance
                     .as_mut()
-                    .get_tmemory_mut(wasmtime_environ::MemoryIndex::from_u32(0))
+                    .get_tmemory_mut(wasmtime_environ::TMemoryIndex::from_u32(0))
                     .context("missing transactional memory sidecar")?;
                 tmemory.grow_to_pages(2)?;
                 tmemory.commit_range(65536, &99_i32.to_le_bytes())?;
@@ -7700,23 +7682,23 @@ fn transaction_object_active_startup_root_module(engine: &crate::Engine) -> crat
         r#"
             (module
               (type $s (tstruct (field i32)))
-              (tglobal $g (export "g") (mut (ref null $s))
+              (tglobal $g (export "g") (mut (tref null $s))
                 (tstruct.new $s (i32.const 7)))
-              (ttable $t (export "t") 3 (ref null $s)
+              (ttable $t (export "t") 3 (tref null $s)
                 (tstruct.new $s (i32.const 11)))
-              (elem (table $t) (i32.const 1) (ref null $s)
+              (telem (ttable $t) (i32.const 1) (tref null $s)
                 (tstruct.new $s (i32.const 21)))
-              (func (export "committed_global_is_null") (result i32)
-                (ref.is_null (global.get $g)))
-              (func (export "committed_table_is_null") (param i32) (result i32)
-                (ref.is_null (table.get $t (local.get 0))))
+              (tfunc (export "committed_global_is_null") (result i32)
+                (tref.is_null (tglobal.get $g)))
+              (tfunc (export "committed_table_is_null") (param i32) (result i32)
+                (tref.is_null (ttable.get $t (local.get 0))))
               (tfunc (export "read_global") (result i32)
                 (tstruct.get $s 0
-                  (tref.cast_read (ref.as_non_null (tglobal.get $g)))))
+                  (tref.cast_read (tref.as_non_null (tglobal.get $g)))))
               (tfunc (export "read_table") (param i32) (result i32)
                 (tstruct.get $s 0
                   (tref.cast_read
-                    (ref.as_non_null (ttable.get $t (local.get 0)))))))
+                    (tref.as_non_null (ttable.get $t (local.get 0)))))))
         "#,
     )
 }
@@ -7734,7 +7716,7 @@ fn active_startup_root_reentrant_harness(
                 (call $instantiate))
               (tfunc (export "abort")
                 (call $instantiate)
-                (tfail)))
+                (tfail (i32.const 0))))
         "#,
     );
     let mut store = crate::Store::new(engine, None);
@@ -10020,9 +10002,9 @@ fn mock_transaction_nested_tfunc_reuses_active_transaction_until_outer_return() 
               (tfunc $inner
                 (i32.tstore (i32.const 0) (i32.const 1)))
               (tfunc (export "outer_fail")
-                (call $inner)
+                (tcall $inner)
                 (i32.tstore (i32.const 0) (i32.const 2))
-                (tfail))
+                (tfail (i32.const 0)))
               (tfunc (export "read") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
@@ -10049,12 +10031,11 @@ fn mock_transaction_fail_discards_memory_write() {
         r#"
             (module
               (tmemory 1)
-              (func (export "write_fail")
-                (ttry)
+              (tfunc (export "write_fail")
                 (i32.tstore (i32.const 0) (i32.const 42))
-                (tfail))
-              (func (export "read") (result i32)
-                (i32.load (i32.const 0))))
+                (tfail (i32.const 0)))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -10079,11 +10060,10 @@ fn mock_transaction_global_i32_set_commits_to_backing_global() {
         r#"
             (module
               (tglobal $g (mut i32) (i32.const 0))
-              (func (export "write")
-                (ttry)
+              (tfunc (export "write")
                 (tglobal.set $g (i32.const 42)))
-              (func (export "read") (result i32)
-                (global.get $g)))
+              (tfunc (export "read") (result i32)
+                (tglobal.get $g)))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -10108,12 +10088,11 @@ fn mock_transaction_global_i64_fail_discards_staged_write() {
         r#"
             (module
               (tglobal $g (mut i64) (i64.const 7))
-              (func (export "write_fail")
-                (ttry)
+              (tfunc (export "write_fail")
                 (tglobal.set $g (i64.const 99))
-                (tfail))
-              (func (export "read") (result i64)
-                (global.get $g)))
+                (tfail (i32.const 0)))
+              (tfunc (export "read") (result i64)
+                (tglobal.get $g)))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -10138,8 +10117,7 @@ fn mock_transaction_global_get_observes_staged_i32_write() {
         r#"
             (module
               (tglobal $g (mut i32) (i32.const 1))
-              (func (export "write_read") (result i32)
-                (ttry)
+              (tfunc (export "write_read") (result i32)
                 (tglobal.set $g (i32.const 77))
                 (tglobal.get $g)))
             "#,
@@ -10161,8 +10139,8 @@ fn mock_transaction_global_imported_tglobal_commits_to_backing_global() {
         r#"
             (module
               (tglobal $g (export "g") (mut i32) (i32.const 5))
-              (func (export "read") (result i32)
-                (global.get $g)))
+              (tfunc (export "read") (result i32)
+                (tglobal.get $g)))
             "#,
     );
     let consumer = transaction_test_module(
@@ -10170,8 +10148,7 @@ fn mock_transaction_global_imported_tglobal_commits_to_backing_global() {
         r#"
             (module
               (import "env" "g" (tglobal $g (mut i32)))
-              (func (export "write")
-                (ttry)
+              (tfunc (export "write")
                 (tglobal.set $g (i32.const 11))))
             "#,
     );
@@ -10200,14 +10177,13 @@ fn mock_transaction_global_float_sets_commit_bitwise() {
             (module
               (tglobal $f32 (mut f32) (f32.const 0))
               (tglobal $f64 (mut f64) (f64.const 0))
-              (func (export "write")
-                (ttry)
+              (tfunc (export "write")
                 (tglobal.set $f32 (f32.const -13.5))
                 (tglobal.set $f64 (f64.const 42.25)))
-              (func (export "read_f32_bits") (result i32)
-                (i32.reinterpret_f32 (global.get $f32)))
-              (func (export "read_f64_bits") (result i64)
-                (i64.reinterpret_f64 (global.get $f64))))
+              (tfunc (export "read_f32_bits") (result i32)
+                (i32.reinterpret_f32 (tglobal.get $f32)))
+              (tfunc (export "read_f64_bits") (result i64)
+                (i64.reinterpret_f64 (tglobal.get $f64))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -10286,26 +10262,25 @@ fn mock_transaction_global_v128_set_commits_bitwise() {
 }
 
 #[test]
-fn mock_transaction_plain_func_memory_size_requires_active_transaction() {
+fn mock_transaction_plain_func_memory_size_is_rejected() {
     let engine = crate::Engine::default();
-    let module = transaction_test_module(
+    let error = crate::Module::new(
         &engine,
-        r#"
+        wat::parse_str(
+            r#"
             (module
               (tmemory 2)
               (func (export "size") (result i32)
                 (tmemory.size)))
             "#,
+        )
+        .unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("only permitted in a transaction context"),
+        "{error:?}"
     );
-    let mut store = crate::Store::new(&engine, ());
-    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
-    let size = instance
-        .get_typed_func::<(), i32>(&mut store, "size")
-        .unwrap();
-
-    let error = size.call(&mut store, ()).unwrap_err();
-
-    assert!(format!("{error:?}").contains("transaction operation requires an active transaction"));
 }
 
 #[test]
@@ -10396,7 +10371,7 @@ fn transaction_ttable_set_is_private_until_commit() {
         &engine,
         r#"
             (module
-              (import "host" "observe" (func $observe))
+              (import "host" "observe" (tfunc $observe))
               (ttable $t (export "t") 1 funcref)
               (elem declare func $target)
               (func $target)
@@ -10404,7 +10379,7 @@ fn transaction_ttable_set_is_private_until_commit() {
                 (i32.const 0)
                 (ref.func $target)
                 (ttable.set $t)
-                (call $observe)))
+                (tcall $observe)))
             "#,
     );
     let mut linker = Linker::new(&engine);
@@ -10489,7 +10464,7 @@ fn transaction_ttable_grow_is_private_until_commit() {
         &engine,
         r#"
             (module
-              (import "host" "observe" (func $observe))
+              (import "host" "observe" (tfunc $observe))
               (ttable $t (export "t") 1 3 funcref)
               (elem declare func $target)
               (func $target)
@@ -10504,7 +10479,7 @@ fn transaction_ttable_grow_is_private_until_commit() {
                 (i32.const 1)
                 (ref.func $target)
                 (ttable.set $t)
-                (call $observe)))
+                (tcall $observe)))
             "#,
     );
     let mut linker = Linker::new(&engine);
@@ -10548,8 +10523,8 @@ fn mock_transaction_ttable_bulk_funcref_paths_hit_runtime_libcalls() {
         &engine,
         r#"
             (module
-              (table $t 4 tfuncref)
-              (elem $e func $target)
+              (ttable $t 4 funcref)
+              (telem $e func $target)
               (func $target)
               (tfunc (export "is_null") (param i32) (result i32)
                 (local.get 0)
@@ -10600,27 +10575,12 @@ fn mock_transaction_ttable_bulk_funcref_paths_hit_runtime_libcalls() {
 
 #[test]
 fn module_compilation_rejects_transaction_table_get_on_ordinary_table() {
-    let engine = crate::Engine::default();
-    let error = crate::Module::new(
-        &engine,
-        wat::parse_str(
-            r#"
-                (module
-                  (table $t 1 funcref)
-                  (func (result i32)
-                    (i32.const 0)
-                    (ttable.get $t)
-                    (ref.is_null)))
-                "#,
-        )
-        .unwrap(),
+    let error = wat::parse_str(
+        "(module (table $t 1 funcref) (tfunc (result i32) (ref.is_null (ttable.get $t (i32.const 0)))))",
     )
-    .unwrap_err();
-    let error = format!("{error:?}");
-    assert!(
-        error.contains("transactional table operator requires ttable"),
-        "{error}"
-    );
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("unknown ttable"), "{error}");
 }
 
 #[test]
@@ -10646,6 +10606,169 @@ fn mock_transaction_static_tdata_initializes_tmemory_sidecar() {
 }
 
 #[test]
+fn native_ordinary_and_transactional_index_zero_initialize_independently() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (memory $memory 1)
+              (tmemory $tmemory 1)
+              (global $global i32 (i32.const 11))
+              (tglobal $tglobal i32 (i32.const 22))
+              (func $ordinary-target)
+              (func $transaction-target)
+              (table $table 1 funcref)
+              (ttable $ttable 1 funcref)
+              (elem (table $table) (i32.const 0) func $ordinary-target)
+              (telem (ttable $ttable) (i32.const 0) func $transaction-target)
+              (data (memory $memory) (i32.const 0) "ORD!")
+              (tdata (tmemory $tmemory) (i32.const 0) "TXN!")
+              (func (export "read-ordinary") (result i32 i32 i32)
+                (i32.load $memory (i32.const 0))
+                (global.get $global)
+                (ref.is_null (table.get $table (i32.const 0))))
+              (tfunc (export "read-transactional") (result i32 i32 i32)
+                (i32.tload $tmemory (i32.const 0))
+                (tglobal.get $tglobal)
+                (ref.is_null (ttable.get $ttable (i32.const 0)))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    assert_eq!(
+        instance
+            .get_typed_func::<(), (i32, i32, i32)>(&mut store, "read-ordinary")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        (i32::from_le_bytes(*b"ORD!"), 11, 0),
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<(), (i32, i32, i32)>(&mut store, "read-transactional")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap(),
+        (i32::from_le_bytes(*b"TXN!"), 22, 0),
+    );
+}
+
+#[test]
+fn native_direct_linking_rejects_cross_namespace_entity_imports() {
+    let engine = crate::Engine::default();
+    let producer = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (table (export "table") 0 funcref)
+              (ttable (export "ttable") 0 funcref)
+              (memory (export "memory") 0)
+              (tmemory (export "tmemory") 0)
+              (global (export "global") i32 (i32.const 0))
+              (tglobal (export "tglobal") i32 (i32.const 0)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let producer = crate::Instance::new(&mut store, &producer, &[]).unwrap();
+    let mut linker = crate::Linker::new(&engine);
+    linker.instance(&mut store, "producer", producer).unwrap();
+
+    for (desc, wat) in [
+        (
+            "transactional table as ordinary table",
+            r#"(module (import "producer" "ttable" (table 0 funcref)))"#,
+        ),
+        (
+            "ordinary table as transactional table",
+            r#"(module (import "producer" "table" (ttable 0 funcref)))"#,
+        ),
+        (
+            "transactional memory as ordinary memory",
+            r#"(module (import "producer" "tmemory" (memory 0)))"#,
+        ),
+        (
+            "ordinary memory as transactional memory",
+            r#"(module (import "producer" "memory" (tmemory 0)))"#,
+        ),
+        (
+            "transactional global as ordinary global",
+            r#"(module (import "producer" "tglobal" (global i32)))"#,
+        ),
+        (
+            "ordinary global as transactional global",
+            r#"(module (import "producer" "global" (tglobal i32)))"#,
+        ),
+    ] {
+        let consumer = transaction_test_module(&engine, wat);
+        assert!(
+            linker.instantiate(&mut store, &consumer).is_err(),
+            "direct linker accepted {desc}"
+        );
+    }
+}
+
+#[test]
+fn native_transactional_resources_count_toward_module_and_store_limits() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(&engine, "(module (tmemory 2) (ttable 3 funcref))");
+    let required = module.resources_required();
+    assert_eq!(required.num_memories, 1);
+    assert_eq!(required.max_initial_memory_size, Some(2));
+    assert_eq!(required.num_tables, 1);
+    assert_eq!(required.max_initial_table_size, Some(3));
+
+    let memory_only = transaction_test_module(&engine, "(module (tmemory 0))");
+    let mut memory_store = crate::Store::new(
+        &engine,
+        crate::StoreLimitsBuilder::new().memories(0).build(),
+    );
+    memory_store.limiter(|limits| limits);
+    assert!(crate::Instance::new(&mut memory_store, &memory_only, &[]).is_err());
+
+    let table_only = transaction_test_module(&engine, "(module (ttable 0 funcref))");
+    let mut table_store =
+        crate::Store::new(&engine, crate::StoreLimitsBuilder::new().tables(0).build());
+    table_store.limiter(|limits| limits);
+    assert!(crate::Instance::new(&mut table_store, &table_only, &[]).is_err());
+}
+
+#[test]
+fn native_runtime_enumeration_includes_transactional_physical_slots() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (memory 0)
+              (tmemory 0)
+              (table 0 funcref)
+              (ttable 0 funcref)
+              (global i32 (i32.const 0))
+              (tglobal i32 (i32.const 0)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    #[cfg(feature = "coredump")]
+    {
+        assert_eq!(instance.all_memories(store.as_store_opaque()).count(), 2);
+        assert_eq!(instance.all_globals(store.as_store_opaque()).count(), 2);
+    }
+
+    let store = store.as_store_opaque();
+    assert_eq!(store.all_memories().count(), 2);
+    let mut table_count = 0;
+    store.for_each_table(|_, _| table_count += 1);
+    assert_eq!(table_count, 2);
+    let mut global_count = 0;
+    store.for_each_global(|_, _| global_count += 1);
+    assert_eq!(global_count, 2);
+}
+
+#[test]
 fn mock_transaction_read_after_write_uses_pending_store_scratch() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -10653,8 +10776,7 @@ fn mock_transaction_read_after_write_uses_pending_store_scratch() {
         r#"
             (module
               (tmemory 1)
-              (func (export "write_read") (result i32)
-                (ttry)
+              (tfunc (export "write_read") (result i32)
                 (i32.tstore (i32.const 0) (i32.const 77))
                 (i32.tload (i32.const 0))))
             "#,
@@ -10711,12 +10833,10 @@ fn mock_transaction_plain_wasm_trap_clears_active_transaction() {
         &engine,
         r#"
             (module
-              (type $sig (func))
               (tmemory 1)
-              (table 0 funcref)
               (tfunc (export "trap_after_tload")
                 (drop (i32.tload (i32.const 0)))
-                (call_indirect (type $sig) (i32.const 0)))
+                (unreachable))
               (tfunc (export "recover") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
@@ -10743,18 +10863,16 @@ fn mock_transaction_unexecuted_ttry_does_not_commit_caller_transaction() {
         r#"
             (module
               (tmemory 1)
-              (func $maybe_begin (param i32)
+              (tfunc $maybe_begin (param i32)
                 (local.get 0)
                 (if
-                  (then
-                    (ttry))))
-              (func (export "write_then_fail")
-                (ttry)
+                  (then)))
+              (tfunc (export "write_then_fail")
                 (i32.tstore (i32.const 0) (i32.const 42))
-                (call $maybe_begin (i32.const 0))
-                (tfail))
-              (func (export "read") (result i32)
-                (i32.load (i32.const 0))))
+                (tcall $maybe_begin (i32.const 0))
+                (tfail (i32.const 0)))
+              (tfunc (export "read") (result i32)
+                (i32.tload (i32.const 0))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -10809,7 +10927,7 @@ fn mock_transaction_store_uses_imported_tmemory_vmctx() {
         r#"
             (module
               (tmemory $tx 1)
-              (export "tx" (memory $tx)))
+              (export "tx" (tmemory $tx)))
             "#,
     );
     let module = transaction_test_module(
@@ -10847,7 +10965,7 @@ fn mock_transaction_distinguishes_imported_and_local_tmemory_overlays() {
         r#"
             (module
               (tmemory $tx 1)
-              (export "tx" (memory $tx)))
+              (export "tx" (tmemory $tx)))
             "#,
     );
     let module = transaction_test_module(
@@ -18891,13 +19009,13 @@ mod transaction_active {
             &engine,
             r#"
                 (module
-                  (import "env" "observe" (func $observe))
+                  (import "env" "observe" (tfunc $observe))
                   (tmemory 1)
                   (tfunc (export "first")
-                    (call $observe)
+                    (tcall $observe)
                     (i32.tstore (i32.const 0) (i32.const 1)))
                   (tfunc (export "second")
-                    (call $observe)
+                    (tcall $observe)
                     (i32.tstore (i32.const 0) (i32.const 2)))
                   (tfunc (export "read") (result i32)
                     (i32.tload (i32.const 0))))
@@ -18941,14 +19059,14 @@ mod transaction_active {
             &engine,
             r#"
                 (module
-                  (import "env" "observe" (func $observe))
+                  (import "env" "observe" (tfunc $observe))
                   (tmemory 1)
                   (tfunc (export "trap")
-                    (call $observe)
+                    (tcall $observe)
                     (i32.tstore (i32.const 0) (i32.const 42))
                     (unreachable))
                   (tfunc (export "write")
-                    (call $observe)
+                    (tcall $observe)
                     (i32.tstore (i32.const 0) (i32.const 7)))
                   (tfunc (export "read") (result i32)
                     (i32.tload (i32.const 0))))
@@ -18991,15 +19109,15 @@ mod transaction_active {
             &engine,
             r#"
                 (module
-                  (import "env" "observe" (func $observe))
+                  (import "env" "observe" (tfunc $observe))
                   (tmemory 1)
                   (tfunc $inner
-                    (call $observe)
+                    (tcall $observe)
                     (i32.tstore (i32.const 0) (i32.const 1)))
                   (tfunc (export "outer")
-                    (call $observe)
+                    (tcall $observe)
                     (tcall $inner)
-                    (call $observe)
+                    (tcall $observe)
                     (i32.tstore (i32.const 0) (i32.const 2)))
                   (tfunc (export "read") (result i32)
                     (i32.tload (i32.const 0))))
@@ -28966,95 +29084,43 @@ fn fixture_executor_commits_open_transaction_at_end() {
 #[test]
 fn module_compilation_accepts_lifecycle_transaction_opcodes() {
     let engine = crate::Engine::default();
-    let wasm = [
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x0a, 0x08, 0x01, 0x06, 0x00, // code section/function body
-        0xfa, 0x04, // ttry
-        0xfa, 0x0f, // tfail
-        0x0b, // end
-    ];
-
-    crate::Module::new(&engine, wasm).unwrap();
+    transaction_test_module(&engine, "(module (tfunc (tfail (i32.const 0))))");
 }
 
 #[test]
 fn module_compilation_accepts_transaction_data_helper_lowering() {
     let engine = crate::Engine::default();
-    let wasm = with_transaction_memory_metadata(&[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x05, 0x03, 0x01, 0x00, 0x01, // memory section
-        0x0a, 0x0a, 0x01, 0x08, 0x00, // code section/function body
-        0x41, 0x00, // i32.const 0
-        0xfa, 0x28, 0x02, 0x00, // i32.tload align=2 offset=0
-        0x0b, // end
-    ]);
-
-    crate::Module::new(&engine, wasm).unwrap();
+    transaction_test_module(
+        &engine,
+        "(module (tmemory 1) (tfunc (result i32) (i32.tload (i32.const 0))))",
+    );
 }
 
 #[test]
 fn module_compilation_rejects_transaction_load_on_ordinary_memory() {
-    let engine = crate::Engine::default();
-    let wasm = [
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x05, 0x03, 0x01, 0x00, 0x01, // ordinary memory section
-        0x0a, 0x0a, 0x01, 0x08, 0x00, // code section/function body
-        0x41, 0x00, // i32.const 0
-        0xfa, 0x28, 0x02, 0x00, // i32.tload align=2 offset=0
-        0x0b, // end
-    ];
-
-    let error = crate::Module::new(&engine, wasm).unwrap_err();
-    let error = format!("{error:?}");
-    assert!(
-        error.contains("transactional memory operator requires tmemory"),
-        "{error}"
-    );
+    let error =
+        wat::parse_str("(module (memory $m 1) (tfunc (result i32) (i32.tload $m (i32.const 0))))")
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("unknown tmemory"), "{error}");
 }
 
 #[test]
 fn module_compilation_accepts_transaction_store_helper_lowering() {
     let engine = crate::Engine::default();
-    let wasm = with_transaction_memory_metadata(&[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x05, 0x03, 0x01, 0x00, 0x01, // memory section
-        0x0a, 0x0c, 0x01, 0x0a, 0x00, // code section/function body
-        0x41, 0x00, // i32.const 0
-        0x41, 0x2a, // i32.const 42
-        0xfa, 0x36, 0x02, 0x00, // i32.tstore align=2 offset=0
-        0x0b, // end
-    ]);
-
-    crate::Module::new(&engine, wasm).unwrap();
+    transaction_test_module(
+        &engine,
+        "(module (tmemory 1) (tfunc (i32.tstore (i32.const 0) (i32.const 42))))",
+    );
 }
 
 #[test]
 fn module_compilation_accepts_transaction_global_get_helper_lowering() {
     let engine = crate::Engine::default();
-    let wasm = with_transaction_global_metadata(&[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b, // global section
-        0x0a, 0x07, 0x01, 0x05, 0x00, // code section/function body
-        0xfa, 0x23, 0x00, // tglobal.get 0
-        0x0b, // end
-    ]);
-
-    crate::Module::new(&engine, wasm).unwrap();
+    transaction_test_module(
+        &engine,
+        "(module (tglobal i32 (i32.const 0)) (tfunc (result i32) (tglobal.get 0)))",
+    );
 }
 
 #[test]
@@ -29073,63 +29139,34 @@ fn module_compilation_rejects_transaction_global_get_on_ordinary_global() {
 
     let error = crate::Module::new(&engine, wasm).unwrap_err();
     let error = format!("{error:?}");
-    assert!(
-        error.contains("transactional global operator requires tglobal"),
-        "{error}"
-    );
+    assert!(error.contains("unknown global"), "{error}");
 }
 
 #[test]
 fn module_compilation_accepts_transaction_global_set_helper_lowering() {
     let engine = crate::Engine::default();
-    let wasm = with_transaction_global_metadata(&[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b, // global section
-        0x0a, 0x09, 0x01, 0x07, 0x00, // code section/function body
-        0x41, 0x2a, // i32.const 42
-        0xfa, 0x24, 0x00, // tglobal.set 0
-        0x0b, // end
-    ]);
-
-    crate::Module::new(&engine, wasm).unwrap();
+    transaction_test_module(
+        &engine,
+        "(module (tglobal (mut i32) (i32.const 0)) (tfunc (tglobal.set 0 (i32.const 42))))",
+    );
 }
 
 #[test]
 fn module_compilation_accepts_transaction_memory_size_helper_lowering() {
     let engine = crate::Engine::default();
-    let wasm = with_transaction_memory_metadata(&[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x05, 0x03, 0x01, 0x00, 0x01, // memory section
-        0x0a, 0x07, 0x01, 0x05, 0x00, // code section/function body
-        0xfa, 0x3f, 0x00, // tmemory.size 0
-        0x0b, // end
-    ]);
-
-    crate::Module::new(&engine, wasm).unwrap();
+    transaction_test_module(
+        &engine,
+        "(module (tmemory 1) (tfunc (result i32) (tmemory.size)))",
+    );
 }
 
 #[test]
 fn module_compilation_accepts_transaction_memory_grow_helper_lowering() {
     let engine = crate::Engine::default();
-    let wasm = with_transaction_memory_metadata(&[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x05, 0x03, 0x01, 0x00, 0x01, // memory section
-        0x0a, 0x09, 0x01, 0x07, 0x00, // code section/function body
-        0x41, 0x01, // i32.const 1
-        0xfa, 0x40, 0x00, // tmemory.grow 0
-        0x0b, // end
-    ]);
-
-    crate::Module::new(&engine, wasm).unwrap();
+    transaction_test_module(
+        &engine,
+        "(module (tmemory 1) (tfunc (result i32) (tmemory.grow (i32.const 1))))",
+    );
 }
 
 #[test]
@@ -29147,8 +29184,8 @@ fn module_compilation_accepts_transaction_object_helper_lowering() {
                   (type $a (tarray (mut i32)))
                   (type $pa (tarray (mut i8)))
                   (type $ra (tarray (mut (tref $s))))
-                  (data $d "\00\01\02\03")
-                  (elem $e (tref $s)
+                  (tdata $d "\00\01\02\03")
+                  (telem $e (tref $s)
                     (tstruct.new $s (i32.const 1))
                     (tstruct.new $s (i32.const 2)))
                   (tfunc (export "object-smoke") (result i32)
@@ -29331,10 +29368,10 @@ fn transaction_object_tstruct_tfail_frees_new_object_record() {
         &engine,
         r#"
             (module
-              (type $s (struct (field (mut i32))))
+              (type $s (tstruct (field (mut i32))))
               (tfunc (export "create_fail")
                 (drop (tstruct.new $s (i32.const 41)))
-                (tfail)))
+                (tfail (i32.const 0))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -29358,7 +29395,7 @@ fn transaction_object_tstruct_trap_frees_new_object_record() {
         &engine,
         r#"
             (module
-              (type $s (struct (field (mut i32))))
+              (type $s (tstruct (field (mut i32))))
               (tfunc (export "create_trap")
                 (drop (tstruct.new $s (i32.const 41)))
                 (unreachable))
@@ -29397,7 +29434,7 @@ fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
         r#"
             (module
               (type $s (tstruct (field (mut i32))))
-              (tglobal $slot (mut (ref null $s)) (ref.null $s))
+              (tglobal $slot (mut (tref null $s)) (tref.null $s))
               (tfunc (export "new") (result i32)
                 (local $root (tref $s))
                 (local $value i32)
@@ -29408,20 +29445,20 @@ fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
                 (local.get $value))
               (tfunc (export "read") (result i32)
                 (tstruct.get $s 0
-                  (tref.cast_read (ref.as_non_null (tglobal.get $slot)))))
+                  (tref.cast_read (tref.as_non_null (tglobal.get $slot)))))
               (tfunc (export "write_fail")
                 (tstruct.set $s 0
-                  (tref.cast_write (ref.as_non_null (tglobal.get $slot)))
+                  (tref.cast_write (tref.as_non_null (tglobal.get $slot)))
                   (i32.const 99))
-                (tfail))
+                (tfail (i32.const 0)))
               (tfunc (export "write_trap")
                 (tstruct.set $s 0
-                  (tref.cast_write (ref.as_non_null (tglobal.get $slot)))
+                  (tref.cast_write (tref.as_non_null (tglobal.get $slot)))
                   (i32.const 77))
                 (unreachable))
               (tfunc (export "write_ok") (param i32)
                 (tstruct.set $s 0
-                  (tref.cast_write (ref.as_non_null (tglobal.get $slot)))
+                  (tref.cast_write (tref.as_non_null (tglobal.get $slot)))
                   (local.get 0))))
             "#,
     );
@@ -29471,13 +29508,12 @@ fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
 }
 
 #[test]
-fn ordinary_global_does_not_keep_transaction_object_alive() {
+fn ordinary_global_rejects_transaction_object_publication() {
     clear_current_thread_transaction_for_test();
     let mut config = crate::Config::new();
     config.wasm_gc(true);
     let engine = crate::Engine::new(&config).unwrap();
-    let module = transaction_test_module(
-        &engine,
+    let wasm = wat::parse_str(
         r#"
             (module
               (type $s (tstruct (field (mut i32))))
@@ -29486,28 +29522,15 @@ fn ordinary_global_does_not_keep_transaction_object_alive() {
                 (global.set $slot (tstruct.new $s (i32.const 41))))
               (tfunc (export "read") (result i32)
                 (tstruct.get $s 0 (tref.cast_read (global.get $slot)))))
-            "#,
-    );
-    let mut store = crate::Store::new(&engine, ());
-    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
-    let create = instance
-        .get_typed_func::<(), ()>(&mut store, "create")
-        .unwrap();
-    let read = instance
-        .get_typed_func::<(), i32>(&mut store, "read")
-        .unwrap();
-
-    create.call(&mut store, ()).unwrap();
-    assert_eq!(current_thread_transaction_for_test(), None);
-    assert_eq!(store.transaction_object_table().live_count(), 0);
-
-    let err = read.call(&mut store, ()).unwrap_err();
+        "#,
+    )
+    .unwrap();
+    let err = crate::Module::new(&engine, wasm).unwrap_err();
     let debug = format!("{err:?}");
     assert!(
-        debug.contains("unknown transaction object ref handle"),
+        debug.contains("ordinary instruction is not permitted in a transaction context"),
         "{debug}"
     );
-    assert_eq!(store.transaction_object_table().live_count(), 0);
 }
 
 #[test]
@@ -29642,17 +29665,17 @@ fn transaction_object_static_initializers_return_transaction_ref_handles() {
             (module
               (type $s (tstruct (field i32)))
               (type $a (tarray (mut (tref null $s))))
-              (global $aref (mut (tref null $a))
+              (tglobal $aref (mut (tref null $a))
                 (tarray.new_fixed $a 2
                   (tstruct.new $s (i32.const 41))
                   (tref.null $s)))
               (tfunc (export "read") (result i32)
                 (local $roundtrip (tref null $s))
                 (local.set $roundtrip
-                  (tarray.get $a (tref.cast_read (global.get $aref)) (i32.const 0)))
+                  (tarray.get $a (tref.cast_read (tglobal.get $aref)) (i32.const 0)))
                 (i32.add
                   (tstruct.get $s 0 (tref.cast_read (local.get $roundtrip)))
-                  (tarray.len (global.get $aref)))))
+                  (tarray.len (tglobal.get $aref)))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -29715,25 +29738,25 @@ fn transaction_object_static_initializers_follow_active_transaction_local_lifeti
               (type $s (tstruct (field i32)))
               (type $a (tarray (mut (tref null $s))))
               (type $f32a (tarray (mut f32)))
-              (global $sref (mut (tref null $s))
+              (tglobal $sref (mut (tref null $s))
                 (tstruct.new $s (i32.const 7)))
-              (global $adef (mut (tref null $f32a))
+              (tglobal $adef (mut (tref null $f32a))
                 (tarray.new_default $f32a (i32.const 2)))
-              (global $afixed (mut (tref null $a))
+              (tglobal $afixed (mut (tref null $a))
                 (tarray.new_fixed $a 2
                   (tstruct.new $s (i32.const 41))
                   (tref.null $s)))
               (tfunc (export "read_struct") (result i32)
-                (tstruct.get $s 0 (tref.cast_read (global.get $sref))))
+                (tstruct.get $s 0 (tref.cast_read (tglobal.get $sref))))
               (tfunc (export "read_default_len") (result i32)
-                (tarray.len (global.get $adef)))
+                (tarray.len (tglobal.get $adef)))
               (tfunc (export "read_fixed") (result i32)
                 (local $roundtrip (tref null $s))
                 (local.set $roundtrip
-                  (tarray.get $a (tref.cast_read (global.get $afixed)) (i32.const 0)))
+                  (tarray.get $a (tref.cast_read (tglobal.get $afixed)) (i32.const 0)))
                 (i32.add
                   (tstruct.get $s 0 (tref.cast_read (local.get $roundtrip)))
-                  (tarray.len (global.get $afixed)))))
+                  (tarray.len (tglobal.get $afixed)))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -29790,26 +29813,17 @@ fn transaction_object_static_initializers_follow_active_transaction_local_lifeti
 
     let err = read_struct.call(&mut store, ()).unwrap_err();
     let debug = format!("{err:?}");
-    assert!(
-        debug.contains("unknown transaction object ref handle"),
-        "{debug}"
-    );
+    assert!(debug.contains("null reference"), "{debug}");
     assert_eq!(current_thread_transaction_for_test(), None);
 
     let err = read_default_len.call(&mut store, ()).unwrap_err();
     let debug = format!("{err:?}");
-    assert!(
-        debug.contains("unknown transaction object ref handle"),
-        "{debug}"
-    );
+    assert!(debug.contains("null reference"), "{debug}");
     assert_eq!(current_thread_transaction_for_test(), None);
 
     let err = read_fixed.call(&mut store, ()).unwrap_err();
     let debug = format!("{err:?}");
-    assert!(
-        debug.contains("unknown transaction object ref handle"),
-        "{debug}"
-    );
+    assert!(debug.contains("null reference"), "{debug}");
     assert_eq!(current_thread_transaction_for_test(), None);
     assert_eq!(store.transaction_object_table().live_count(), 0);
 }
@@ -29930,7 +29944,7 @@ fn active_startup_transaction_roots_abort_without_publication() {
 }
 
 #[test]
-fn active_startup_element_segment_uses_staged_imported_ttable_size() {
+fn native_active_telem_initializes_imported_ttable() {
     use crate::{Linker, Ref};
 
     let engine = crate::Engine::default();
@@ -29938,31 +29952,16 @@ fn active_startup_element_segment_uses_staged_imported_ttable_size() {
         &engine,
         r#"
             (module
-              (ttable $t (export "t") 1 2 funcref))
+              (ttable $t (export "t") 1 funcref))
         "#,
     );
     let nested_module = transaction_test_module(
         &engine,
         r#"
             (module
-              (import "" "t" (ttable $t 1 2 funcref))
+              (import "" "t" (ttable $t 1 funcref))
               (func $target)
-              (elem (table $t) (i32.const 1) func $target))
-        "#,
-    );
-    let driver_module = transaction_test_module(
-        &engine,
-        r#"
-            (module
-              (import "" "t" (ttable $t 1 2 funcref))
-              (import "" "instantiate" (func $instantiate))
-              (export "t" (table $t))
-              (tfunc (export "grow_and_instantiate")
-                (ref.null func)
-                (i32.const 1)
-                (ttable.grow $t)
-                (drop)
-                (call $instantiate)))
+              (telem (ttable $t) (i32.const 0) func $target))
         "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -29970,27 +29969,11 @@ fn active_startup_element_segment_uses_staged_imported_ttable_size() {
     let table = owner.get_table(&mut store, "t").unwrap();
     let mut linker = Linker::new(&engine);
     linker.define(&mut store, "", "t", table).unwrap();
-    linker
-        .func_wrap(
-            "",
-            "instantiate",
-            move |mut caller: crate::Caller<'_, ()>| -> Result<()> {
-                let table = caller.get_export("t").unwrap();
-                crate::Instance::new(&mut caller, &nested_module, &[table])?;
-                Ok(())
-            },
-        )
-        .unwrap();
-    let driver = linker.instantiate(&mut store, &driver_module).unwrap();
-    let grow_and_instantiate = driver
-        .get_typed_func::<(), ()>(&mut store, "grow_and_instantiate")
-        .unwrap();
+    linker.instantiate(&mut store, &nested_module).unwrap();
 
-    grow_and_instantiate.call(&mut store, ()).unwrap();
-
-    assert_eq!(table.size(&mut store), 2);
+    assert_eq!(table.size(&mut store), 1);
     assert!(matches!(
-        table.get(&mut store, 1).unwrap(),
+        table.get(&mut store, 0).unwrap(),
         Ref::Func(Some(_))
     ));
 }
@@ -30005,7 +29988,7 @@ fn transaction_ttable_startup_fill_accounts_for_fuel() {
         r#"
             (module
               (type $s (tstruct (field i32)))
-              (ttable 4096 (ref null $s)
+              (ttable 4096 (tref null $s)
                 (tstruct.new $s (i32.const 7))))
         "#,
     );
@@ -30027,7 +30010,7 @@ fn exported_tfunc_publishing_tarray_to_tglobal_persists_it() {
         r#"
             (module
               (type $a (tarray (mut f32)))
-              (tglobal $slot (mut (ref null $a)) (ref.null $a))
+              (tglobal $slot (mut (tref null $a)) (tref.null $a))
               (tfunc (export "new") (result i32)
                 (local $root (tref $a))
                 (local $len i32)
@@ -30037,7 +30020,7 @@ fn exported_tfunc_publishing_tarray_to_tglobal_persists_it() {
                 (local.get $len))
               (tfunc (export "read") (result f32)
                 (tarray.get $a
-                  (tref.cast_read (ref.as_non_null (tglobal.get $slot)))
+                  (tref.cast_read (tref.as_non_null (tglobal.get $slot)))
                   (i32.const 1))))
             "#,
     );
