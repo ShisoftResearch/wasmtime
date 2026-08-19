@@ -31157,6 +31157,36 @@ fn module_compilation_accepts_lifecycle_transaction_opcodes() {
 }
 
 #[test]
+fn native_transaction_local_lowering_preserves_declared_numeric_types() {
+    let engine = crate::Engine::default();
+    transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tfunc
+                (local i64)
+                (local.set 0 (i64.const -1))
+                (drop (local.tee 0 (i64.const 7))))
+              (tfunc
+                (local v128)
+                (local.set 0 (v128.const i32x4 1 2 3 4))
+                (drop (local.tee 0 (v128.const i32x4 5 6 7 8)))))
+        "#,
+    );
+
+    for invalid in [
+        "(module (tfunc (local i64) (local.set 0 (i32.const -1))))",
+        "(module (tfunc (local i64) (drop (local.tee 0 (i32.const -1)))))",
+        "(module (tfunc (local v128) (local.set 0 (i32.const -1))))",
+        "(module (tfunc (local v128) (drop (local.tee 0 (i32.const -1)))))",
+    ] {
+        let wasm = wat::parse_str(invalid).unwrap();
+        let error = crate::Module::new(&engine, wasm).unwrap_err();
+        assert!(format!("{error:?}").contains("type mismatch"), "{error:?}");
+    }
+}
+
+#[test]
 fn native_structured_transaction_controls_execute_handlers_and_exits() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(

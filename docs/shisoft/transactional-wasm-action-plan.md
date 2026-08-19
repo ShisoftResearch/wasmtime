@@ -182,22 +182,15 @@ Tasks:
 - [ ] Add module metadata for transactional memories and globals.
 - [ ] Add validation rules separating ordinary and transactional object spaces.
 
-Current bridge:
+Current native path (the former raw-byte fixture bridge has been removed):
 
-- [x] Add milestone-1 `0xfa` opcode constants and an internal
-  `TransactionOperator` decoder in `wasmtime-environ`.
-- [x] Add raw prefixed opcode-byte decoding for generated binary fixtures.
-- [x] Add local parser bridge that extracts milestone-1 transaction operators
-  from research fixture function-body bytes.
-- [x] Add local parser bridge that extracts milestone-1 transaction operators
-  from generated research module fixtures.
-- [x] Add research fixture metadata and validation for feature gating,
-  transactional memories, and transactional globals.
-- [x] Add runtime fixture executor bridge for milestone-1 `ttry`/`tfail`
-  control behavior.
-- [x] Patch local `wasmparser` fork so lifecycle opcodes decode as
-  first-class `wasmparser::Operator` variants.
-- [x] Extend the local parser fork to the remaining milestone-1 operators.
+- [x] Decode transaction encodings as first-class `wasmparser::Operator`
+  variants in the patched `wasmparser` fork.
+- [x] Validate transaction operators and transactional entity namespaces in
+  the normal module/function validator pipeline.
+- [x] Lower validated transaction operators through Cranelift and execute them
+  through the transaction runtime.
+- [x] Reject obsolete transaction custom metadata instead of consuming it.
 
 Milestone-1 operators:
 

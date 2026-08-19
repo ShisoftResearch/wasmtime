@@ -437,13 +437,6 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         self.local_types[index] = ty;
     }
 
-    pub(crate) fn local_type(&self, local: Variable) -> Option<ir::Type> {
-        self.local_types
-            .get(local.index())
-            .copied()
-            .filter(|ty| *ty != types::INVALID)
-    }
-
     pub(crate) fn record_wasm_local_type(
         &mut self,
         local_index: u32,

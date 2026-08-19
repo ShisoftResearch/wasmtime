@@ -96,21 +96,6 @@ pub fn find_tests_with_config(
         }
     }
 
-    // Temporarily work around upstream tests that fail in unexpected ways (e.g.
-    // panics, loops, etc).
-    {
-        let skip_list = &[
-            // .. empty currently ..
-        ];
-        tests.retain(|test| {
-            test.path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| !skip_list.contains(&name))
-                .unwrap_or(true)
-        });
-    }
-
     Ok(tests)
 }
 
@@ -1188,7 +1173,7 @@ fn transaction_proposal_uses_real_text_parser(
 
 #[cfg(test)]
 mod tests {
-    use super::{TransactionProposalSuite, transaction_proposal_test_config};
+    use super::{TestDiscoveryConfig, TransactionProposalSuite, transaction_proposal_test_config};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1281,6 +1266,55 @@ mod tests {
                 .map(|test| test.path.file_name().unwrap().to_string_lossy())
                 .collect::<Vec<_>>(),
             ["tfunc_block.wast", "tv128.wast"]
+        );
+    }
+
+    #[test]
+    fn full_discovery_keeps_every_transaction_proposal_filename() {
+        let temp = temp_transaction_dir("full-proposal-discovery");
+        let repository_root = temp.path.join("repository");
+        let proposal_root = temp.path.join("proposal");
+
+        for path in [
+            repository_root.join("tests/spec_testsuite"),
+            repository_root.join("tests/misc_testsuite"),
+            repository_root.join("tests/component-model/test"),
+            proposal_root.join("simple-transactions"),
+            proposal_root.join("tsimd"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(
+            proposal_root.join("simple-transactions/must-not-be-skipped.wast"),
+            "(module (tfunc))",
+        )
+        .unwrap();
+        fs::write(
+            proposal_root.join("tsimd/same-basename-is-still-discovered.wast"),
+            "(module (tfunc))",
+        )
+        .unwrap();
+
+        let mut tests = super::find_tests_with_config(
+            &repository_root,
+            TestDiscoveryConfig {
+                transaction_proposal: true,
+                transaction_proposal_root: Some(proposal_root),
+            },
+        )
+        .unwrap();
+        tests.retain(|test| test.transaction_proposal_enabled());
+        tests.sort_by(|left, right| left.path.cmp(&right.path));
+
+        assert_eq!(
+            tests
+                .iter()
+                .map(|test| test.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            [
+                "must-not-be-skipped.wast",
+                "same-basename-is-still-discovered.wast"
+            ]
         );
     }
 
