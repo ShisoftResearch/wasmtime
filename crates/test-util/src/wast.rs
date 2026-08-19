@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use wasmtime_environ::prelude::*;
 
 /// Limits for running wast tests.
@@ -36,9 +37,11 @@ pub fn find_tests(root: &Path) -> Result<Vec<WastTest>> {
 }
 
 /// Configuration for discovering WAST tests.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TestDiscoveryConfig {
     pub transaction_proposal: bool,
+    /// Optional `test/core` root of the transaction proposal checkout.
+    pub transaction_proposal_root: Option<PathBuf>,
 }
 
 impl Default for TestDiscoveryConfig {
@@ -46,6 +49,8 @@ impl Default for TestDiscoveryConfig {
         Self {
             transaction_proposal: cfg!(feature = "transaction")
                 && std::env::var_os("WASMTIME_TEST_TRANSACTION_WAST").is_some(),
+            transaction_proposal_root: std::env::var_os("WASMTIME_TEST_TRANSACTION_WAST_ROOT")
+                .map(PathBuf::from),
         }
     }
 }
@@ -80,23 +85,14 @@ pub fn find_tests_with_config(
     .with_context(|| format!("failed to add tests from `{}`", cm_tests.display()))?;
 
     if discovery.transaction_proposal {
-        let proposal_root = root.join("../wasm-persistence/test/core");
-        for (suite, dir) in [
-            (
-                TransactionProposalSuite::SimpleTransactions,
-                "simple-transactions",
-            ),
-            (TransactionProposalSuite::Tsimd, "tsimd"),
-        ] {
-            let path = proposal_root.join(dir);
-            add_tests(&mut tests, &path, &FindConfig::TransactionProposal(suite)).with_context(
-                || {
-                    format!(
-                        "failed to add transactional Wasm proposal tests from `{}`",
-                        path.display()
-                    )
-                },
-            )?;
+        match discovery.transaction_proposal_root {
+            Some(proposal_root) => {
+                add_transaction_proposal_tests(&mut tests, &proposal_root)?;
+            }
+            None => {
+                let proposal_root = root.join("../wasm-persistence/test/core");
+                add_git_tracked_transaction_proposal_tests(&mut tests, &proposal_root)?;
+            }
         }
     }
 
@@ -116,6 +112,98 @@ pub fn find_tests_with_config(
     }
 
     Ok(tests)
+}
+
+fn add_transaction_proposal_tests(tests: &mut Vec<WastTest>, proposal_root: &Path) -> Result<()> {
+    for (suite, dir) in [
+        (
+            TransactionProposalSuite::SimpleTransactions,
+            "simple-transactions",
+        ),
+        (TransactionProposalSuite::Tsimd, "tsimd"),
+    ] {
+        let path = proposal_root.join(dir);
+        add_tests(tests, &path, &FindConfig::TransactionProposal(suite)).with_context(|| {
+            format!(
+                "failed to add transactional Wasm proposal tests from `{}`",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn add_git_tracked_transaction_proposal_tests(
+    tests: &mut Vec<WastTest>,
+    proposal_root: &Path,
+) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(proposal_root)
+        .args(["ls-files", "-z", "--", "simple-transactions", "tsimd"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to query git-tracked transaction proposal tests under `{}`",
+                proposal_root.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "failed to query git-tracked transaction proposal tests under `{}`: {}",
+            proposal_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let paths = std::str::from_utf8(&output.stdout)
+        .context("git returned a non-UTF-8 transaction proposal path")?;
+    let mut found_simple_transactions = false;
+    let mut found_tsimd = false;
+    for relative in paths.split_terminator('\0') {
+        let relative = Path::new(relative);
+        let suite = match relative.components().next().and_then(|component| {
+            let component = component.as_os_str();
+            if component == "simple-transactions" {
+                Some(TransactionProposalSuite::SimpleTransactions)
+            } else if component == "tsimd" {
+                Some(TransactionProposalSuite::Tsimd)
+            } else {
+                None
+            }
+        }) {
+            Some(suite) => suite,
+            None => bail!(
+                "git returned transaction proposal path outside an authoritative suite: `{}`",
+                relative.display()
+            ),
+        };
+        if relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("wast")
+        {
+            continue;
+        }
+        match suite {
+            TransactionProposalSuite::SimpleTransactions => found_simple_transactions = true,
+            TransactionProposalSuite::Tsimd => found_tsimd = true,
+        }
+        add_test(
+            tests,
+            &proposal_root.join(relative),
+            &FindConfig::TransactionProposal(suite),
+        )?;
+    }
+    ensure!(
+        found_simple_transactions,
+        "git-tracked transaction proposal corpus has no simple-transactions WAST files"
+    );
+    ensure!(
+        found_tsimd,
+        "git-tracked transaction proposal corpus has no tsimd WAST files"
+    );
+    Ok(())
 }
 
 enum FindConfig {
@@ -141,40 +229,45 @@ fn add_tests(tests: &mut Vec<WastTest>, path: &Path, config: &FindConfig) -> Res
             continue;
         }
 
-        // These tests use `*.wast` directives not yet supported by Wasmtime, so
-        // wait for a `wasm-tools` update to ungate these.
-        if path.ends_with("spec_testsuite/custom/custom_annot.wast")
-            || path.ends_with("spec_testsuite/custom/branch_hint.wast")
-            || path.ends_with("spec_testsuite/custom/name_annot.wast")
-        {
-            continue;
-        }
-
-        let mut contents =
-            fs::read_to_string(&path).with_context(|| format!("failed to read test: {path:?}"))?;
-        let test_config = match config {
-            FindConfig::InTest => parse_test_config(&contents, ";;!")
-                .with_context(|| format!("failed to parse test configuration: {path:?}"))?,
-            FindConfig::Infer(f) => f(&path),
-            FindConfig::TransactionProposal(_) => transaction_proposal_test_config(&path),
-        };
-        let transaction_proposal = match config {
-            FindConfig::TransactionProposal(suite) => Some(*suite),
-            _ => None,
-        };
-        let transaction_real_text_parser = transaction_proposal
-            .is_some_and(|suite| transaction_proposal_uses_real_text_parser(suite, &path));
-        if transaction_proposal.is_some() && transaction_real_text_parser {
-            contents = normalize_transaction_proposal_wast_diagnostics(&contents);
-        }
-        tests.push(WastTest {
-            path,
-            contents,
-            config: test_config,
-            transaction_proposal,
-            transaction_real_text_parser,
-        })
+        add_test(tests, &path, config)?;
     }
+    Ok(())
+}
+
+fn add_test(tests: &mut Vec<WastTest>, path: &Path, config: &FindConfig) -> Result<()> {
+    // These tests use `*.wast` directives not yet supported by Wasmtime, so
+    // wait for a `wasm-tools` update to ungate these.
+    if path.ends_with("spec_testsuite/custom/custom_annot.wast")
+        || path.ends_with("spec_testsuite/custom/branch_hint.wast")
+        || path.ends_with("spec_testsuite/custom/name_annot.wast")
+    {
+        return Ok(());
+    }
+
+    let mut contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read test: {path:?}"))?;
+    let test_config = match config {
+        FindConfig::InTest => parse_test_config(&contents, ";;!")
+            .with_context(|| format!("failed to parse test configuration: {path:?}"))?,
+        FindConfig::Infer(f) => f(path),
+        FindConfig::TransactionProposal(suite) => transaction_proposal_test_config(*suite),
+    };
+    let transaction_proposal = match config {
+        FindConfig::TransactionProposal(suite) => Some(*suite),
+        _ => None,
+    };
+    let transaction_real_text_parser = transaction_proposal
+        .is_some_and(|suite| transaction_proposal_uses_real_text_parser(suite, path));
+    if transaction_proposal.is_some() && transaction_real_text_parser {
+        contents = normalize_transaction_proposal_wast_diagnostics(&contents);
+    }
+    tests.push(WastTest {
+        path: path.to_owned(),
+        contents,
+        config: test_config,
+        transaction_proposal,
+        transaction_real_text_parser,
+    });
     Ok(())
 }
 
@@ -280,7 +373,7 @@ fn component_test_config(test: &Path) -> TestConfig {
     ret
 }
 
-fn transaction_proposal_test_config(test: &Path) -> TestConfig {
+fn transaction_proposal_test_config(suite: TransactionProposalSuite) -> TestConfig {
     let mut ret = TestConfig::default();
     ret.bulk_memory = Some(true);
     ret.gc = Some(true);
@@ -288,14 +381,10 @@ fn transaction_proposal_test_config(test: &Path) -> TestConfig {
     ret.function_references = Some(true);
     ret.tail_call = Some(true);
 
-    if test
-        .parent()
-        .is_some_and(|parent| parent.ends_with("tsimd"))
-        || test.ends_with("simple-transactions/tconflict-basic.wast")
-        || test.ends_with("simple-transactions/tconflict-tmemory_1.wast")
-    {
-        ret.simd = Some(true);
-    }
+    ret.simd = Some(matches!(
+        suite,
+        TransactionProposalSuite::SimpleTransactions | TransactionProposalSuite::Tsimd
+    ));
 
     ret
 }
@@ -473,6 +562,7 @@ const TRANSACTION_SHARED_DIAGNOSTIC_REPLACEMENTS: &[(&str, &str)] = &[
     ),
     ("multiple tmemories", "multiple memories"),
     ("unknown tmemory", "unknown memory"),
+    ("unknown tdata segment", "unknown data segment"),
     ("inline tfunction type", "inline function type"),
     ("null tfunction", "null function"),
     ("unknown tglobal", "unknown global"),
@@ -794,19 +884,7 @@ impl WastTest {
 
     /// Returns whether this transactional proposal test can currently run.
     pub fn transaction_proposal_enabled(&self) -> bool {
-        let Some(suite) = self.transaction_proposal else {
-            return false;
-        };
-        let Some(name) = self.path.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-
-        match suite {
-            TransactionProposalSuite::SimpleTransactions => {
-                simple_transaction_proposal_enabled(name)
-            }
-            TransactionProposalSuite::Tsimd => tsimd_transaction_proposal_enabled(name),
-        }
+        self.transaction_proposal.is_some()
     }
 
     /// Returns whether this test exercises the GC types and might want to use
@@ -1098,255 +1176,23 @@ impl WastTest {
     }
 }
 
-const SIMPLE_TRANSACTION_REAL_TEXT_CORE: &[&str] = &[
-    "return_tcall.wast",
-    "return_tcall_indirect.wast",
-    "return_tcall_ref.wast",
-    "br_on_tnon_null.wast",
-    "br_on_tnull.wast",
-    "tblock.wast",
-    "tbr.wast",
-    "tbr_if.wast",
-    "tbr_table.wast",
-    "tbulk.wast",
-    "tcall.wast",
-    "tcall_indirect.wast",
-    "tcall_ref.wast",
-    "tconflict-basic.wast",
-    "tconflict-tmemory.wast",
-    "tconflict-tmemory_1.wast",
-    "tconst.wast",
-    "tconversions.wast",
-    "tdata.wast",
-    "telem.wast",
-    "tendianness.wast",
-    "texports.wast",
-    "tf32.wast",
-    "tf32_bitwise.wast",
-    "tf32_cmp.wast",
-    "tf64.wast",
-    "tf64_bitwise.wast",
-    "tf64_cmp.wast",
-    "tfac.wast",
-    "tfloat_exprs.wast",
-    "tfloat_literals.wast",
-    "tfloat_misc.wast",
-    "tforward.wast",
-    "tfunc.wast",
-    "tfunc_ptrs.wast",
-    "tglobal.wast",
-    "ti32.wast",
-    "ti64.wast",
-    "tif.wast",
-    "timports.wast",
-    "tinline-module.wast",
-    "tint_exprs.wast",
-    "tint_literals.wast",
-    "tlabels.wast",
-    "tleft-to-right.wast",
-    "tlinking.wast",
-    "tlocal_init.wast",
-    "tlocal_get.wast",
-    "tlocal_set.wast",
-    "tlocal_tee.wast",
-    "tloop.wast",
-    "tnames.wast",
-    "tnop.wast",
-    "treturn.wast",
-    "tref.wast",
-    "tref_as_non_null.wast",
-    "tref_is_null.wast",
-    "tref_null.wast",
-    "tref_tfunc.wast",
-    "tselect.wast",
-    "tstack.wast",
-    "tstart.wast",
-    "tswitch.wast",
-    "ttraps.wast",
-    "ttry-abort-commit.wast",
-    "ttry-basic.wast",
-    "ttype.wast",
-    "ttype-canon.wast",
-    "ttype-equivalence.wast",
-    "ttype-rec.wast",
-    "ttype-subtyping.wast",
-    "tunreached-invalid.wast",
-    "tunreached-valid.wast",
-    "tunreachable.wast",
-    "tunwind.wast",
-    "tutf8-invalid-encoding.wast",
-    "utf8-timport-field.wast",
-    "utf8-timport-module.wast",
-];
-
-const SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY: &[&str] = &[
-    "float_tmemory.wast",
-    "taddress.wast",
-    "talign.wast",
-    "tendianness.wast",
-    "tmemory.wast",
-    "tmemory_redundancy.wast",
-    "tmemory_size.wast",
-    "tmemory_grow.wast",
-    "tmemory_copy.wast",
-    "tmemory_fill.wast",
-    "tmemory_init.wast",
-    "tload.wast",
-    "tstore.wast",
-    "tmemory_trap.wast",
-    "tskip-stack-guard-page.wast",
-];
-
-const SIMPLE_TRANSACTION_REAL_TEXT_TTABLE: &[&str] = &[
-    "ttable.wast",
-    "ttable-sub.wast",
-    "ttable_copy.wast",
-    "ttable_fill.wast",
-    "ttable_get.wast",
-    "ttable_grow.wast",
-    "ttable_init.wast",
-    "ttable_set.wast",
-    "ttable_size.wast",
-];
-
-const SIMPLE_TRANSACTION_REAL_TEXT_OBJECT: &[&str] = &[
-    "br_on_tcast.wast",
-    "br_on_tcast_fail.wast",
-    "ti31.wast",
-    "textern.wast",
-    "tref_cast.wast",
-    "tref_eq.wast",
-    "tref_test.wast",
-    "tstruct.wast",
-    "tarray.wast",
-    "tarray_fill.wast",
-    "tarray_copy.wast",
-    "tarray_init_data.wast",
-    "tarray_init_elem.wast",
-];
-
-const SIMPLE_TRANSACTION_REAL_BINARY: &[&str] = &["tbinary.wast", "tbinary-leb128.wast"];
-
-const TSIMD_TRANSACTION_REAL_TEXT_MEMORY: &[&str] = &[
-    "tsimd_address.wast",
-    "tsimd_align.wast",
-    "tsimd_const.wast",
-    "tsimd_load.wast",
-    "tsimd_load_extend.wast",
-    "tsimd_load_splat.wast",
-    "tsimd_load_zero.wast",
-    "tsimd_load8_lane.wast",
-    "tsimd_load16_lane.wast",
-    "tsimd_load32_lane.wast",
-    "tsimd_load64_lane.wast",
-    "tsimd_store.wast",
-    "tsimd_store8_lane.wast",
-    "tsimd_store16_lane.wast",
-    "tsimd_store32_lane.wast",
-    "tsimd_store64_lane.wast",
-];
-
-fn simple_transaction_real_text_parser_enabled(name: &str) -> bool {
-    SIMPLE_TRANSACTION_REAL_TEXT_CORE.contains(&name)
-        || SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY.contains(&name)
-        || SIMPLE_TRANSACTION_REAL_TEXT_TTABLE.contains(&name)
-        || SIMPLE_TRANSACTION_REAL_TEXT_OBJECT.contains(&name)
-        || SIMPLE_TRANSACTION_REAL_BINARY.contains(&name)
-}
-
-fn tsimd_transaction_real_text_parser_enabled(name: &str) -> bool {
-    TSIMD_TRANSACTION_REAL_TEXT_MEMORY.contains(&name) || tsimd_transaction_proposal_enabled(name)
-}
-
-fn simple_transaction_proposal_enabled(name: &str) -> bool {
-    simple_transaction_real_text_parser_enabled(name)
-}
-
 fn transaction_proposal_uses_real_text_parser(
     suite: TransactionProposalSuite,
-    path: &Path,
+    _path: &Path,
 ) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    match suite {
-        TransactionProposalSuite::SimpleTransactions => {
-            simple_transaction_real_text_parser_enabled(name)
-        }
-        TransactionProposalSuite::Tsimd => tsimd_transaction_real_text_parser_enabled(name),
-    }
-}
-
-fn tsimd_transaction_proposal_enabled(name: &str) -> bool {
     matches!(
-        name,
-        "tsimd_address.wast"
-            | "tsimd_align.wast"
-            | "tsimd_bit_shift.wast"
-            | "tsimd_bitwise.wast"
-            | "tsimd_boolean.wast"
-            | "tsimd_const.wast"
-            | "tsimd_conversions.wast"
-            | "tsimd_f32x4.wast"
-            | "tsimd_f32x4_arith.wast"
-            | "tsimd_f32x4_cmp.wast"
-            | "tsimd_f32x4_pmin_pmax.wast"
-            | "tsimd_f32x4_rounding.wast"
-            | "tsimd_f64x2.wast"
-            | "tsimd_f64x2_arith.wast"
-            | "tsimd_f64x2_cmp.wast"
-            | "tsimd_f64x2_pmin_pmax.wast"
-            | "tsimd_f64x2_rounding.wast"
-            | "tsimd_i16x8_arith.wast"
-            | "tsimd_i16x8_arith2.wast"
-            | "tsimd_i16x8_cmp.wast"
-            | "tsimd_i16x8_extadd_pairwise_i8x16.wast"
-            | "tsimd_i16x8_extmul_i8x16.wast"
-            | "tsimd_i16x8_q15mulr_sat_s.wast"
-            | "tsimd_i16x8_sat_arith.wast"
-            | "tsimd_i32x4_arith.wast"
-            | "tsimd_i32x4_arith2.wast"
-            | "tsimd_i32x4_cmp.wast"
-            | "tsimd_i32x4_dot_i16x8.wast"
-            | "tsimd_i32x4_extadd_pairwise_i16x8.wast"
-            | "tsimd_i32x4_extmul_i16x8.wast"
-            | "tsimd_i32x4_trunc_sat_f32x4.wast"
-            | "tsimd_i32x4_trunc_sat_f64x2.wast"
-            | "tsimd_i64x2_arith.wast"
-            | "tsimd_i64x2_arith2.wast"
-            | "tsimd_i64x2_cmp.wast"
-            | "tsimd_i64x2_extmul_i32x4.wast"
-            | "tsimd_i8x16_arith.wast"
-            | "tsimd_i8x16_arith2.wast"
-            | "tsimd_i8x16_cmp.wast"
-            | "tsimd_i8x16_sat_arith.wast"
-            | "tsimd_int_to_int_extend.wast"
-            | "tsimd_lane.wast"
-            | "tsimd_linking.wast"
-            | "tsimd_load.wast"
-            | "tsimd_load_extend.wast"
-            | "tsimd_load_splat.wast"
-            | "tsimd_load_zero.wast"
-            | "tsimd_load8_lane.wast"
-            | "tsimd_load16_lane.wast"
-            | "tsimd_load32_lane.wast"
-            | "tsimd_load64_lane.wast"
-            | "tsimd_splat.wast"
-            | "tsimd_store.wast"
-            | "tsimd_store8_lane.wast"
-            | "tsimd_store16_lane.wast"
-            | "tsimd_store32_lane.wast"
-            | "tsimd_store64_lane.wast"
+        suite,
+        TransactionProposalSuite::SimpleTransactions | TransactionProposalSuite::Tsimd
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TestConfig, TransactionProposalSuite, WastTest, transaction_proposal_test_config};
+    use super::{TransactionProposalSuite, transaction_proposal_test_config};
     use std::{
         fs,
         path::{Path, PathBuf},
+        process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1372,6 +1218,156 @@ mod tests {
     }
 
     #[test]
+    fn discovers_every_transaction_proposal_fixture_as_enabled_real_text() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let proposal_root = repo.join("../wasm-persistence/test/core");
+        let mut found_tfunc_block = false;
+        let mut found_simple_transactions = false;
+        let mut found_tsimd = false;
+        let mut tests = Vec::new();
+        super::add_git_tracked_transaction_proposal_tests(&mut tests, &proposal_root).unwrap();
+
+        assert!(!tests.is_empty(), "no tracked proposal fixtures discovered");
+        for test in tests {
+            let name = test.path.file_name().unwrap().to_string_lossy();
+            assert!(
+                test.transaction_proposal_enabled(),
+                "{} was discovered but disabled",
+                test.path.display()
+            );
+            assert!(
+                test.transaction_real_text_parser(),
+                "{} did not use the native text parser",
+                test.path.display()
+            );
+            match test.transaction_proposal {
+                Some(TransactionProposalSuite::SimpleTransactions) => {
+                    found_simple_transactions = true;
+                    found_tfunc_block |= name.as_ref() == "tfunc_block.wast";
+                }
+                Some(TransactionProposalSuite::Tsimd) => found_tsimd = true,
+                None => panic!("{} lost its proposal suite", test.path.display()),
+            }
+        }
+
+        assert!(
+            found_simple_transactions,
+            "no simple-transactions discovered"
+        );
+        assert!(found_tsimd, "no tsimd fixtures discovered");
+        assert!(found_tfunc_block, "tfunc_block.wast was not discovered");
+    }
+
+    #[test]
+    fn transaction_proposal_discovery_accepts_an_explicit_corpus_root() {
+        let root = temp_transaction_dir("explicit-corpus-root");
+        let simple = root.path.join("simple-transactions");
+        let tsimd = root.path.join("tsimd");
+        fs::create_dir_all(&simple).unwrap();
+        fs::create_dir_all(&tsimd).unwrap();
+        fs::write(simple.join("tfunc_block.wast"), "(module (tfunc))").unwrap();
+        fs::write(tsimd.join("tv128.wast"), "(module (tfunc))").unwrap();
+
+        let mut tests = Vec::new();
+        super::add_transaction_proposal_tests(&mut tests, &root.path).unwrap();
+        tests.sort_by(|left, right| left.path.cmp(&right.path));
+
+        assert_eq!(tests.len(), 2);
+        assert!(tests.iter().all(|test| test.transaction_proposal_enabled()));
+        assert!(tests.iter().all(|test| test.transaction_real_text_parser()));
+        assert_eq!(
+            tests
+                .iter()
+                .map(|test| test.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["tfunc_block.wast", "tv128.wast"]
+        );
+    }
+
+    #[test]
+    fn default_transaction_proposal_discovery_uses_only_git_tracked_files() {
+        let checkout = temp_transaction_dir("tracked-corpus-root");
+        let proposal_root = checkout.path.join("test/core");
+        let simple = proposal_root.join("simple-transactions");
+        let tsimd = proposal_root.join("tsimd/nested");
+        fs::create_dir_all(&simple).unwrap();
+        fs::create_dir_all(&tsimd).unwrap();
+        fs::write(simple.join("tracked.wast"), "(module)").unwrap();
+        fs::write(simple.join("untracked.wast"), "(module)").unwrap();
+        fs::write(tsimd.join("tracked-simd.wast"), "(module)").unwrap();
+
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout.path)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout.path)
+                .args([
+                    "add",
+                    "test/core/simple-transactions/tracked.wast",
+                    "test/core/tsimd/nested/tracked-simd.wast",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let mut tests = Vec::new();
+        super::add_git_tracked_transaction_proposal_tests(&mut tests, &proposal_root).unwrap();
+        tests.sort_by(|left, right| left.path.cmp(&right.path));
+
+        assert_eq!(
+            tests
+                .iter()
+                .map(|test| test.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["tracked.wast", "tracked-simd.wast"]
+        );
+    }
+
+    #[test]
+    fn default_transaction_proposal_discovery_rejects_an_incomplete_tracked_corpus() {
+        let checkout = temp_transaction_dir("incomplete-tracked-corpus");
+        let proposal_root = checkout.path.join("test/core");
+        let simple = proposal_root.join("simple-transactions");
+        let tsimd = proposal_root.join("tsimd");
+        fs::create_dir_all(&simple).unwrap();
+        fs::create_dir_all(&tsimd).unwrap();
+        fs::write(simple.join("tracked.wast"), "(module)").unwrap();
+
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout.path)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout.path)
+                .args(["add", "test/core/simple-transactions/tracked.wast"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error =
+            super::add_git_tracked_transaction_proposal_tests(&mut Vec::new(), &proposal_root)
+                .unwrap_err();
+        assert!(error.to_string().contains("tsimd"), "{error:#}");
+    }
+
+    #[test]
     fn transaction_feature_is_default_enabled_on_research_branch() {
         assert!(
             cfg!(feature = "transaction"),
@@ -1384,6 +1380,7 @@ mod tests {
         let wast = r#"
             (assert_invalid (module (tmemory 0) (tmemory 0)) "multiple tmemories")
             (assert_invalid (module (tfunc (drop (tmemory.size)))) "unknown tmemory")
+            (assert_invalid (module (tfunc (tdata.drop 0))) "unknown tdata segment")
             (assert_return (invoke "multiple tmemories"))
         "#;
 
@@ -1391,6 +1388,7 @@ mod tests {
 
         assert!(normalized.contains("\"multiple memories\""));
         assert!(normalized.contains("\"unknown memory\""));
+        assert!(normalized.contains("\"unknown data segment\""));
         assert!(normalized.contains("\"multiple tmemories\""));
     }
 
@@ -1435,20 +1433,11 @@ mod tests {
     }
 
     #[test]
-    fn simple_transaction_v128_conflict_fixtures_enable_simd() {
+    fn transaction_proposal_suites_enable_simd_by_directory() {
         assert!(
-            transaction_proposal_test_config(Path::new("simple-transactions/tconflict-basic.wast"))
-                .simd()
+            transaction_proposal_test_config(TransactionProposalSuite::SimpleTransactions).simd()
         );
-        assert!(
-            transaction_proposal_test_config(Path::new(
-                "simple-transactions/tconflict-tmemory_1.wast"
-            ))
-            .simd()
-        );
-        assert!(
-            !transaction_proposal_test_config(Path::new("simple-transactions/tcall.wast")).simd()
-        );
+        assert!(transaction_proposal_test_config(TransactionProposalSuite::Tsimd).simd());
     }
 
     #[test]
@@ -1624,286 +1613,6 @@ mod tests {
             assert!(test.transaction_real_text_parser(), "{name}");
             assert!(test.contents.contains(required), "{name}");
             assert!(test.contents.contains("(tref.null"), "{name}");
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_core_transaction_proposal_tranche() {
-        for &name in super::SIMPLE_TRANSACTION_REAL_TEXT_CORE {
-            let path = PathBuf::from("simple-transactions").join(name);
-            let test = WastTest {
-                path,
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_real_text_parser(), "{name}");
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_transaction_proposal_tranche() {
-        for &name in super::SIMPLE_TRANSACTION_REAL_TEXT_TMEMORY {
-            let path = PathBuf::from("simple-transactions").join(name);
-            let test = WastTest {
-                path,
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_real_text_parser(), "{name}");
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_bulk_memory_transaction_proposal_tranche() {
-        for name in [
-            "tmemory_copy.wast",
-            "tmemory_fill.wast",
-            "tmemory_init.wast",
-        ] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_import_export_transaction_proposal_tranche() {
-        for name in ["texports.wast", "timports.wast"] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_type_and_name_transaction_proposal_tranche() {
-        for name in ["tfunc_ptrs.wast"] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_binary_transaction_proposal_tranche() {
-        for name in ["tbinary.wast", "tbinary-leb128.wast"] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_object_transaction_proposal_tranche() {
-        for &name in super::SIMPLE_TRANSACTION_REAL_TEXT_OBJECT {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_unreachable_validation_transaction_proposal_tranche() {
-        for name in ["tunreached-valid.wast", "tunreached-invalid.wast"] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::SimpleTransactions),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(super::transaction_proposal_uses_real_text_parser(
-                TransactionProposalSuite::SimpleTransactions,
-                &test.path
-            ));
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_transaction_simd_memory_tranche() {
-        for name in [
-            "tsimd_address.wast",
-            "tsimd_align.wast",
-            "tsimd_const.wast",
-            "tsimd_load.wast",
-            "tsimd_load_extend.wast",
-            "tsimd_load_splat.wast",
-            "tsimd_load_zero.wast",
-            "tsimd_load8_lane.wast",
-            "tsimd_load16_lane.wast",
-            "tsimd_load32_lane.wast",
-            "tsimd_load64_lane.wast",
-            "tsimd_store.wast",
-            "tsimd_store8_lane.wast",
-            "tsimd_store16_lane.wast",
-            "tsimd_store32_lane.wast",
-            "tsimd_store64_lane.wast",
-        ] {
-            let test = WastTest {
-                path: PathBuf::from("tsimd").join(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::Tsimd),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_real_text_parser(), "{name}");
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(
-                super::transaction_proposal_uses_real_text_parser(
-                    TransactionProposalSuite::Tsimd,
-                    &test.path,
-                ),
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn enables_real_text_parser_transaction_simd_proposal_tranche() {
-        for name in [
-            "tsimd_address.wast",
-            "tsimd_align.wast",
-            "tsimd_bit_shift.wast",
-            "tsimd_bitwise.wast",
-            "tsimd_boolean.wast",
-            "tsimd_conversions.wast",
-            "tsimd_f32x4.wast",
-            "tsimd_f32x4_arith.wast",
-            "tsimd_f32x4_cmp.wast",
-            "tsimd_f32x4_pmin_pmax.wast",
-            "tsimd_f32x4_rounding.wast",
-            "tsimd_f64x2.wast",
-            "tsimd_f64x2_arith.wast",
-            "tsimd_f64x2_cmp.wast",
-            "tsimd_f64x2_pmin_pmax.wast",
-            "tsimd_f64x2_rounding.wast",
-            "tsimd_i16x8_arith.wast",
-            "tsimd_i16x8_arith2.wast",
-            "tsimd_i16x8_cmp.wast",
-            "tsimd_i16x8_extadd_pairwise_i8x16.wast",
-            "tsimd_i16x8_extmul_i8x16.wast",
-            "tsimd_i16x8_q15mulr_sat_s.wast",
-            "tsimd_i16x8_sat_arith.wast",
-            "tsimd_i32x4_arith.wast",
-            "tsimd_i32x4_arith2.wast",
-            "tsimd_i32x4_cmp.wast",
-            "tsimd_i32x4_dot_i16x8.wast",
-            "tsimd_i32x4_extadd_pairwise_i16x8.wast",
-            "tsimd_i32x4_extmul_i16x8.wast",
-            "tsimd_i32x4_trunc_sat_f32x4.wast",
-            "tsimd_i32x4_trunc_sat_f64x2.wast",
-            "tsimd_i64x2_arith.wast",
-            "tsimd_i64x2_arith2.wast",
-            "tsimd_i64x2_cmp.wast",
-            "tsimd_i64x2_extmul_i32x4.wast",
-            "tsimd_i8x16_arith.wast",
-            "tsimd_i8x16_arith2.wast",
-            "tsimd_i8x16_cmp.wast",
-            "tsimd_i8x16_sat_arith.wast",
-            "tsimd_int_to_int_extend.wast",
-            "tsimd_lane.wast",
-            "tsimd_linking.wast",
-            "tsimd_load.wast",
-            "tsimd_load_extend.wast",
-            "tsimd_load_splat.wast",
-            "tsimd_load_zero.wast",
-            "tsimd_load8_lane.wast",
-            "tsimd_load16_lane.wast",
-            "tsimd_load32_lane.wast",
-            "tsimd_load64_lane.wast",
-            "tsimd_splat.wast",
-            "tsimd_store.wast",
-            "tsimd_store8_lane.wast",
-            "tsimd_store16_lane.wast",
-            "tsimd_store32_lane.wast",
-            "tsimd_store64_lane.wast",
-        ] {
-            let test = WastTest {
-                path: PathBuf::from(name),
-                contents: String::new(),
-                config: TestConfig::default(),
-                transaction_proposal: Some(TransactionProposalSuite::Tsimd),
-                transaction_real_text_parser: true,
-            };
-
-            assert!(test.transaction_proposal_enabled(), "{name}");
-            assert!(test.transaction_real_text_parser(), "{name}");
-            assert!(
-                super::transaction_proposal_uses_real_text_parser(
-                    TransactionProposalSuite::Tsimd,
-                    &test.path,
-                ),
-                "{name}"
-            );
         }
     }
 }

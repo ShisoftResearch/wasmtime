@@ -29,6 +29,10 @@ pub struct WastContext {
     /// component-model testing.
     pub(crate) core_store: Store<()>,
     pub(crate) async_runtime: Option<tokio::runtime::Runtime>,
+    #[cfg(feature = "transaction")]
+    transaction_host_extern_refs: HashMap<u32, OwnedRooted<ExternRef>>,
+    #[cfg(feature = "transaction")]
+    next_transaction_module_namespace: u64,
     generate_dwarf: bool,
     precompile_save: Option<PathBuf>,
     precompile_load: Option<PathBuf>,
@@ -141,6 +145,10 @@ impl WastContext {
             } else {
                 None
             },
+            #[cfg(feature = "transaction")]
+            transaction_host_extern_refs: HashMap::new(),
+            #[cfg(feature = "transaction")]
+            next_transaction_module_namespace: 1,
             generate_dwarf: true,
             precompile_save: None,
             precompile_load: None,
@@ -152,6 +160,46 @@ impl WastContext {
 
     fn engine(&self) -> &Engine {
         self.core_linker.engine()
+    }
+
+    fn allocate_transaction_module_namespace(&mut self) -> u64 {
+        #[cfg(feature = "transaction")]
+        {
+            let namespace = self.next_transaction_module_namespace;
+            self.next_transaction_module_namespace = namespace
+                .checked_add(1)
+                .expect("transaction module namespace exhausted");
+            namespace
+        }
+        #[cfg(not(feature = "transaction"))]
+        {
+            0
+        }
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn transaction_host_extern_ref(&mut self, handle: u32) -> Result<Rooted<ExternRef>> {
+        const WAST_HOST_EXTERN_NAMESPACE: u32 = 0x5741_5354;
+
+        if let Some(reference) = self.transaction_host_extern_refs.get(&handle).cloned() {
+            return Ok(reference.to_rooted(&mut self.core_store));
+        }
+
+        let reference = if let Some(rt) = self.async_runtime.as_ref() {
+            rt.block_on(ExternRef::new_async(&mut self.core_store, handle))?
+        } else {
+            ExternRef::new(&mut self.core_store, handle)?
+        };
+        let reference = TransactionExternRef::new_durable(
+            &mut self.core_store,
+            reference,
+            WAST_HOST_EXTERN_NAMESPACE,
+            u64::from(handle),
+        )?
+        .get();
+        let owned = reference.to_owned_rooted(&mut self.core_store)?;
+        self.transaction_host_extern_refs.insert(handle, owned);
+        Ok(reference)
     }
 
     /// Configures whether or not error messages are ignored in directives like
@@ -203,13 +251,49 @@ impl WastContext {
         })
     }
 
-    fn instantiate_module(&mut self, module: &Module) -> Result<Outcome<Instance>> {
+    fn instantiate_module(
+        &mut self,
+        module: &Module,
+        transaction_module_namespace: u64,
+    ) -> Result<Outcome<Instance>> {
+        #[cfg(not(feature = "transaction"))]
+        let _ = transaction_module_namespace;
         let instance = match &self.async_runtime {
-            Some(rt) => rt.block_on(
-                self.core_linker
-                    .instantiate_async(&mut self.core_store, &module),
-            ),
-            None => self.core_linker.instantiate(&mut self.core_store, &module),
+            Some(rt) => {
+                #[cfg(feature = "transaction")]
+                {
+                    rt.block_on(
+                        self.core_linker
+                            .instantiate_async_with_transaction_module_namespace(
+                                &mut self.core_store,
+                                &module,
+                                TransactionModuleNamespace::new(transaction_module_namespace),
+                            ),
+                    )
+                }
+                #[cfg(not(feature = "transaction"))]
+                {
+                    rt.block_on(
+                        self.core_linker
+                            .instantiate_async(&mut self.core_store, &module),
+                    )
+                }
+            }
+            None => {
+                #[cfg(feature = "transaction")]
+                {
+                    self.core_linker
+                        .instantiate_with_transaction_module_namespace(
+                            &mut self.core_store,
+                            &module,
+                            TransactionModuleNamespace::new(transaction_module_namespace),
+                        )
+                }
+                #[cfg(not(feature = "transaction"))]
+                {
+                    self.core_linker.instantiate(&mut self.core_store, &module)
+                }
+            }
         };
         Ok(match instance {
             Ok(i) => Outcome::Ok(i),
@@ -364,13 +448,19 @@ impl WastContext {
 
     /// Instantiates the `module` provided and registers the instance under the
     /// `name` provided if successful.
-    fn module(&mut self, name: Option<&str>, module: &ModuleKind) -> Result<()> {
+    fn module(
+        &mut self,
+        name: Option<&str>,
+        module: &ModuleKind,
+        transaction_module_namespace: u64,
+    ) -> Result<()> {
         match module {
             ModuleKind::Core(module) => {
-                let instance = match self.instantiate_module(&module)? {
-                    Outcome::Ok(i) => i,
-                    Outcome::Trap(e) => return Err(e).context("instantiation failed"),
-                };
+                let instance =
+                    match self.instantiate_module(&module, transaction_module_namespace)? {
+                        Outcome::Ok(i) => i,
+                        Outcome::Trap(e) => return Err(e).context("instantiation failed"),
+                    };
                 if let Some(name) = name {
                     self.core_linker
                         .instance(&mut self.core_store, name, instance)?;
@@ -495,16 +585,15 @@ impl WastContext {
 
     /// Get the value of an exported global from an instance.
     fn get(&mut self, instance_name: Option<&str>, field: &str) -> Result<Outcome> {
-        let global = match self.get_export(instance_name, field)? {
-            Export::Core(e) => e
-                .into_global()
-                .ok_or_else(|| format_err!("no global named `{field}`"))?,
+        let value = match self.get_export(instance_name, field)? {
+            Export::Core(Extern::Global(global)) => global.get(&mut self.core_store),
+            #[cfg(feature = "transaction")]
+            Export::Core(Extern::TransactionalGlobal(global)) => global.get(&mut self.core_store),
+            Export::Core(_) => bail!("no global named `{field}`"),
             #[cfg(feature = "component-model")]
             Export::Component(..) => bail!("no global named `{field}`"),
         };
-        Ok(Outcome::Ok(Results::Core(vec![
-            global.get(&mut self.core_store),
-        ])))
+        Ok(Outcome::Ok(Results::Core(vec![value])))
     }
 
     fn assert_return(&mut self, result: Outcome, results: &[Const]) -> Result<()> {
@@ -673,7 +762,8 @@ impl WastContext {
                 line: _,
             } => {
                 let module = self.module_definition(&file)?;
-                self.module(name.as_deref(), &module)?;
+                let namespace = self.allocate_transaction_module_namespace();
+                self.module(name.as_deref(), &module, namespace)?;
             }
             ModuleDefinition {
                 name,
@@ -693,7 +783,8 @@ impl WastContext {
                     .get(&module.as_ref().map(|s| s.to_string()))
                     .cloned()
                     .ok_or_else(|| format_err!("no module named {module:?}"))?;
-                self.module(instance.as_deref(), &module)?;
+                let namespace = self.allocate_transaction_module_namespace();
+                self.module(instance.as_deref(), &module, namespace)?;
             }
             Register { line: _, name, as_ } => {
                 self.register(name.as_deref(), &as_)?;
@@ -723,9 +814,11 @@ impl WastContext {
                 line: _,
             } => {
                 let result = match self.module_definition(&file)? {
-                    ModuleKind::Core(module) => self
-                        .instantiate_module(&module)?
-                        .map(|_| Results::Core(Vec::new())),
+                    ModuleKind::Core(module) => {
+                        let namespace = self.allocate_transaction_module_namespace();
+                        self.instantiate_module(&module, namespace)?
+                            .map(|_| Results::Core(Vec::new()))
+                    }
                     #[cfg(feature = "component-model")]
                     ModuleKind::Component(component) => self
                         .instantiate_component(&component)?
@@ -767,7 +860,8 @@ impl WastContext {
                 line: _,
             } => {
                 let module = self.module_definition(&file)?;
-                let err = match self.module(None, &module) {
+                let namespace = self.allocate_transaction_module_namespace();
+                let err = match self.module(None, &module, namespace) {
                     Ok(_) => bail!("expected module to fail to link"),
                     Err(e) => e,
                 };
@@ -811,6 +905,10 @@ impl WastContext {
                             .build()
                             .unwrap()
                     }),
+                    #[cfg(feature = "transaction")]
+                    transaction_host_extern_refs: HashMap::new(),
+                    #[cfg(feature = "transaction")]
+                    next_transaction_module_namespace: 1,
                     generate_dwarf: self.generate_dwarf,
                     modules_by_filename: self.modules_by_filename.clone(),
                     precompile_load: self.precompile_load.clone(),
@@ -884,5 +982,74 @@ impl WastContext {
             return Ok(());
         }
         bail!("assert_invalid: expected \"{expected}\", got \"{actual}\"",)
+    }
+}
+
+#[cfg(all(test, feature = "transaction"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_host_extern_ref_reuses_explicit_durable_binding() -> Result<()> {
+        let engine = Engine::default();
+        let mut context = WastContext::new(&engine, Async::No, |_| {});
+
+        let first = context.transaction_host_extern_ref(41)?;
+        let second = context.transaction_host_extern_ref(41)?;
+
+        assert!(Rooted::ref_eq(&context.core_store, &first, &second)?);
+        assert_eq!(
+            *first
+                .data(&context.core_store)?
+                .unwrap()
+                .downcast_ref::<u32>()
+                .unwrap(),
+            41,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_wast_get_reads_transactional_global_export() -> Result<()> {
+        let engine = Engine::default();
+        let mut context = WastContext::new(&engine, Async::No, |_| {});
+
+        context.run_wast(
+            "transactional-global-get.wast",
+            br#"
+                (module
+                  (tglobal (export "value") i32 (i32.const 42)))
+                (assert_return (tget "value") (i32.const 42))
+            "#,
+        )
+    }
+
+    #[test]
+    fn transaction_wast_binds_module_functions_before_startup() -> Result<()> {
+        let engine = Engine::default();
+        let mut context = WastContext::new(&engine, Async::No, |_| {});
+
+        context.run_wast(
+            "transactional-startup-funcref.wast",
+            br#"
+                (module
+                  (type $f (tfunc))
+                  (type $a (tarray (tref $f)))
+                  (tglobal (tref $a)
+                    (tarray.new $a (tref.tfunc $target) (i32.const 1)))
+                  (tfunc $target))
+            "#,
+        )
+    }
+
+    #[test]
+    fn transaction_wast_gives_same_line_modules_distinct_namespaces() -> Result<()> {
+        let engine = Engine::default();
+        let mut context = WastContext::new(&engine, Async::No, |_| {});
+
+        context.run_wast(
+            "same-line-transaction-modules.wast",
+            br#"(module (tfunc $f) (telem declare tfunc $f)) (module (tfunc $f) (telem declare tfunc $f))"#,
+        )
     }
 }
