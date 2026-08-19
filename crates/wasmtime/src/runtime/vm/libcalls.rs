@@ -475,12 +475,12 @@ fn transaction_textern_convert_tany(
     }
 
     #[cfg(feature = "transaction")]
-    if let Some(reference) = store
-        .store_opaque_mut()
-        .transaction_extern_for_handle(raw_ref)
     {
-        let mut no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
-        return reference._to_raw(&mut no_gc);
+        let mut scope = crate::OpaqueRootScope::new(store.store_opaque_mut());
+        if let Some(reference) = scope.transaction_extern_for_handle(raw_ref) {
+            let mut no_gc = AutoAssertNoGc::new(&mut **scope);
+            return reference._to_raw(&mut no_gc);
+        }
     }
 
     #[cfg(not(all(feature = "gc", feature = "transaction")))]
@@ -7558,6 +7558,36 @@ mod tests {
 
         let after = store.as_context_mut().0.gc_roots().enter_lifo_scope();
         assert_eq!(after, before, "externalization leaked hidden LIFO roots");
+    }
+
+    #[cfg(all(feature = "gc", feature = "transaction"))]
+    #[test]
+    fn transaction_external_handle_recovery_does_not_leak_lifo_roots() {
+        let engine = crate::Engine::default();
+        let mut store = crate::Store::new(&engine, ());
+        let _transaction_scope = store.as_context_mut().0.transaction_enter_extern_scope();
+        let handle = {
+            let mut scope = crate::RootScope::new(&mut store);
+            let reference = ExternRef::new(&mut scope, 761_u32).unwrap();
+            scope
+                .as_context_mut()
+                .0
+                .transaction_extern_handle(reference)
+                .unwrap()
+        };
+
+        store.gc(None).unwrap();
+        let before = store.as_context_mut().0.gc_roots().enter_lifo_scope();
+        for _ in 0..4 {
+            let context = store.as_context_mut();
+            let raw = transaction_textern_convert_tany(context.0, InstanceId::from_u32(0), handle)
+                .unwrap();
+            assert_ne!(raw, 0);
+            store.gc(None).unwrap();
+        }
+        let after = store.as_context_mut().0.gc_roots().enter_lifo_scope();
+
+        assert_eq!(after, before, "handle recovery leaked hidden LIFO roots");
     }
 
     #[cfg(all(feature = "gc", feature = "transaction"))]
