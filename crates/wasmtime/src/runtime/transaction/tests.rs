@@ -30748,11 +30748,16 @@ fn transaction_external_scope_is_unwind_safe_for_dynamic_and_typed_calls() {
     });
     let instance = crate::Instance::new(&mut store, &module, &[make.into(), panic.into()]).unwrap();
     let run = instance.get_func(&mut store, "run").unwrap();
+    let lifo_before = store.as_context_mut().0.gc_roots().enter_lifo_scope();
     let dynamic_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run.call(&mut store, &[], &mut []).unwrap()
     }));
     assert!(dynamic_panic.is_err());
     assert_eq!(store.transaction_extern_root_count_for_test(), 0);
+    assert_eq!(
+        store.as_context_mut().0.gc_roots().enter_lifo_scope(),
+        lifo_before
+    );
 
     let run = run.typed::<(), ()>(&store).unwrap();
     let typed_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -30760,6 +30765,10 @@ fn transaction_external_scope_is_unwind_safe_for_dynamic_and_typed_calls() {
     }));
     assert!(typed_panic.is_err());
     assert_eq!(store.transaction_extern_root_count_for_test(), 0);
+    assert_eq!(
+        store.as_context_mut().0.gc_roots().enter_lifo_scope(),
+        lifo_before
+    );
 
     assert_eq!(
         instance

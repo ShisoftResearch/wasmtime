@@ -2304,6 +2304,32 @@ struct HostFuncState<F> {
     _ty: RegisteredType,
 }
 
+/// Restores the host trampoline's GC LIFO root scope during both normal return
+/// and panic unwinding.
+struct HostGcLifoScopeGuard {
+    store: NonNull<StoreOpaque>,
+    scope: usize,
+}
+
+impl HostGcLifoScopeGuard {
+    fn new(store: &mut StoreOpaque) -> Self {
+        Self {
+            scope: store.gc_roots().enter_lifo_scope(),
+            store: NonNull::from(store),
+        }
+    }
+}
+
+impl Drop for HostGcLifoScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: `StoreOpaque` is heap-allocated and stable for the lifetime
+        // of the host trampoline. This guard cannot outlive that trampoline.
+        unsafe {
+            self.store.as_mut().exit_gc_lifo_scope(self.scope);
+        }
+    }
+}
+
 impl core::fmt::Debug for HostFunc {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("HostFunc").finish_non_exhaustive()
@@ -2453,26 +2479,22 @@ impl HostFunc {
                 &*(state as *const _ as *const HostFuncState<F>)
             };
 
-            let (gc_lifo_scope, ret) = {
-                let gc_lifo_scope = store.0.gc_roots().enter_lifo_scope();
+            let ret = {
+                let _gc_lifo_scope = HostGcLifoScopeGuard::new(store.0);
 
                 let mut args = NonNull::slice_from_raw_parts(args.cast(), args_len);
                 // SAFETY: it's a contract of this function itself that the values
                 // provided are valid to view as a slice.
                 let args = unsafe { args.as_mut() };
 
-                let ret = (state.func)(
+                (state.func)(
                     Caller {
                         caller: Instance::from_wasmtime(instance, store.0),
                         store: store.as_context_mut(),
                     },
                     args,
-                );
-
-                (gc_lifo_scope, ret)
+                )
             };
-
-            store.0.exit_gc_lifo_scope(gc_lifo_scope);
 
             // Note that if this returns a trap then `ret` is discarded
             // entirely.

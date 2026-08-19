@@ -518,16 +518,15 @@ fn transaction_tany_convert_textern(
     bail!("transactional external conversion requires GC support");
     #[cfg(all(feature = "gc", feature = "transaction"))]
     {
-        if let Some(raw) = transaction_externalized_ref_raw(store.store_opaque(), raw_ref)? {
+        let mut scope = crate::OpaqueRootScope::new(store.store_opaque_mut());
+        if let Some(raw) = transaction_externalized_ref_raw(&**scope, raw_ref)? {
             return Ok(raw);
         }
         let reference = {
-            let mut no_gc = AutoAssertNoGc::new(store.store_opaque_mut());
+            let mut no_gc = AutoAssertNoGc::new(&mut **scope);
             ExternRef::_from_raw(&mut no_gc, raw_ref).context("null transactional externref")?
         };
-        let handle = store
-            .store_opaque_mut()
-            .transaction_extern_handle(reference)?;
+        let handle = scope.transaction_extern_handle(reference)?;
         Ok(handle)
     }
 }
@@ -7562,7 +7561,7 @@ mod tests {
 
     #[cfg(all(feature = "gc", feature = "transaction"))]
     #[test]
-    fn transaction_external_handle_recovery_does_not_leak_lifo_roots() {
+    fn transaction_external_genuine_conversions_do_not_leak_lifo_roots() {
         let engine = crate::Engine::default();
         let mut store = crate::Store::new(&engine, ());
         let _transaction_scope = store.as_context_mut().0.transaction_enter_extern_scope();
@@ -7583,11 +7582,18 @@ mod tests {
             let raw = transaction_textern_convert_tany(context.0, InstanceId::from_u32(0), handle)
                 .unwrap();
             assert_ne!(raw, 0);
+            let context = store.as_context_mut();
+            let recovered =
+                transaction_tany_convert_textern(context.0, InstanceId::from_u32(0), raw).unwrap();
+            assert_eq!(recovered, handle);
             store.gc(None).unwrap();
         }
         let after = store.as_context_mut().0.gc_roots().enter_lifo_scope();
 
-        assert_eq!(after, before, "handle recovery leaked hidden LIFO roots");
+        assert_eq!(
+            after, before,
+            "genuine external conversion leaked hidden LIFO roots"
+        );
     }
 
     #[cfg(all(feature = "gc", feature = "transaction"))]
