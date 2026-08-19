@@ -343,9 +343,9 @@ fn root_lowering(
         });
     }
 
-    // SHISOFT-TWASM-MOCK: current inline setRoot lowering reconstructs Kotlin
-    // Unit through this exact frontend helper name. Replace this with an
-    // explicit SDK intrinsic once the Kotlin transaction frontend is stable.
+    // Current inline setRoot lowering reconstructs Kotlin Unit through this
+    // exact frontend helper name. Replace this with an explicit SDK intrinsic
+    // once the Kotlin transaction frontend is stable.
     let unit_getter_func = function_index_by_exact_name(input, "kotlin.Unit_getInstance")?;
     let unit_getter_result = unit_getter_func
         .map(|function_index| {
@@ -1384,9 +1384,9 @@ fn kotlin_latin1_string_pool(input: &[u8]) -> Result<Vec<(i32, String)>> {
     Ok(literals)
 }
 
-// SHISOFT-TWASM-MOCK: this recognizes the current Kotlin SDK inline
-// root/setRoot throw-marker shape. Replace it with explicit SDK imports or
-// compiler-emitted intrinsics once the Kotlin frontend contract is stabilized.
+// This recognizes the current Kotlin SDK inline root/setRoot throw-marker
+// shape. Replace it with explicit SDK imports or compiler-emitted intrinsics
+// once the Kotlin frontend contract is stabilized.
 fn match_inline_set_root_marker(
     operators: &[Operator<'_>],
     index: usize,
@@ -1471,9 +1471,9 @@ fn root_for_marker_type<'a>(
     root_lowering: &'a RootLowering,
     type_index: u32,
 ) -> Result<Option<&'a RootGlobal>> {
-    // SHISOFT-TWASM-MOCK: inline Kotlin root markers currently expose the root
-    // result/value type but not a stable decoded root-name operand. Distinct
-    // root types can be resolved; same-type roots fail loudly below.
+    // Inline Kotlin root markers currently expose the root result/value type
+    // but not a stable decoded root-name operand. Distinct root types can be
+    // resolved; same-type roots fail loudly below.
     let matches = root_lowering
         .globals
         .iter()

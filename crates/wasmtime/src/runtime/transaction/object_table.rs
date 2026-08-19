@@ -73,8 +73,8 @@ pub(crate) struct ObjectTable {
     pub(crate) objects_to_transaction_ref_handles: BTreeMap<ObjectId, u32>,
     pub(crate) reserved_transaction_ref_handles: BTreeSet<u32>,
     pub(crate) next_transaction_ref_handle: u32,
-    // SHISOFT-TWASM-MOCK: live transaction ref bridge; persistent object records
-    // must use ObjectId and must not call this helper.
+    // Process-local live transaction-reference bridge. Persistent object
+    // records use ObjectId and must not call this helper.
     pub(crate) live_bridge_gc_refs_to_objects: BTreeMap<u32, ObjectId>,
     pub(crate) object_to_live_bridge_gc_ref: BTreeMap<ObjectId, u32>,
     pub(crate) type_layouts: TypeLayoutRegistry,

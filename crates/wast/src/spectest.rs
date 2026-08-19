@@ -241,10 +241,9 @@ fn with_transaction_spectest_state(
     Ok(f(&mut state))
 }
 
-// SHISOFT-TWASM-MOCK: proposal spectest transaction helper imports.
-// This is a deterministic harness scaffold, not the real Wizard scheduler. It
-// lets proposal WAST instantiate while real transaction concurrency control and
-// object-table ownership move into runtime paths.
+// Proposal spectest transaction helper imports. This deterministic host
+// adapter mirrors the reference interpreter's spectest imports and delegates
+// transaction lifecycle operations to the runtime hooks below.
 #[cfg(feature = "transaction")]
 fn link_transaction_spectest_helpers<T>(linker: &mut Linker<T>, store: &mut Store<T>) -> Result<()>
 where

@@ -10,9 +10,6 @@ use super::{
 
 #[derive(Debug, Default)]
 pub(crate) struct LockBased {
-    // SHISOFT-TWASM-MOCK: not every non-object granule has durable version
-    // metadata yet, so those granules still feed version `0` through the lock
-    // manager.
     pub(crate) owners: BTreeMap<GranuleId, TransactionId>,
     pub(crate) read_versions: BTreeMap<(TransactionId, GranuleId), u64>,
     #[cfg(test)]

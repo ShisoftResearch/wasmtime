@@ -477,42 +477,5 @@ fn tmemory_granule_backing_range(
     Ok(start..end)
 }
 
-pub(crate) fn execute_research_transaction_fixture(
-    state: &mut TransactionState,
-    operators: &[wasmtime_environ::ResearchTransactionModuleOperator],
-) -> Result<()> {
-    // SHISOFT-TWASM-MOCK: research fixture executor for metadata-only tests.
-    // It handles only `ttry` and `tfail`; executable transaction operators
-    // should run through parser/lowering/libcalls instead of this bridge.
-    for operator in operators {
-        match operator.operator {
-            wasmtime_environ::TransactionOperator::TTry => {
-                state.begin()?;
-            }
-            wasmtime_environ::TransactionOperator::TTryEnd => {
-                if state.active_transaction().is_some() {
-                    state.commit()?;
-                } else {
-                    state.clear_structured_failure();
-                }
-            }
-            wasmtime_environ::TransactionOperator::TFail => {
-                state.fail_structured()?;
-            }
-            other => {
-                bail!(
-                    "research transaction fixture executor does not handle {other:?} at function {} offset {}",
-                    operator.function_index,
-                    operator.body_offset
-                );
-            }
-        }
-    }
-    if state.active_transaction().is_some() {
-        state.commit()?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;

@@ -123,16 +123,13 @@ compile_error!(
      transaction-cc-timestamp-ordering"
 );
 
-// Milestone runtime core for proposal WAST progress. The current runtime uses
-// store-local transaction state, `VMemory` and configurable durable tmemory
-// transactional memory storage, and real `tmemory` sidecars. Remaining
-// `SHISOFT-TWASM-MOCK` tags in this file identify policy selection and
-// object-table gaps.
+// The transaction runtime uses store-local state, `VMemory` and configurable
+// durable transactional-memory storage, and real `tmemory` sidecars.
 
 /// Storage backend selected for transactional memories.
 ///
-/// SHISOFT-TWASM-MOCK: backend selection still lives behind transaction
-/// research configuration rather than Wasmtime's public embedding API.
+/// Backend selection currently lives behind private transaction configuration
+/// rather than Wasmtime's public embedding API.
 ///
 /// Milestone runtime support currently implements `VMemory`, `FileBackedMemory`,
 /// and research/configurable DAX PMEM backends.
@@ -232,8 +229,8 @@ fn validate_tmemory_regions(
     Ok(())
 }
 
-/// SHISOFT-TWASM-MOCK: selectable concurrency policy shape. Policy selection is
-/// currently compile-time for branch experiments rather than public API.
+/// Selectable concurrency policy. Selection is currently compile-time for
+/// branch experiments rather than public API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcurrencyControl {
     LockBased,
@@ -306,17 +303,16 @@ impl ConcurrencyControl {
     }
 }
 
-/// SHISOFT-TWASM-MOCK: durability policy selection is not yet public API.
-/// File-backed transaction storage has restart recovery for current
-/// tmemory/object-log tests, while broader policy selection and hardware-PMEM
-/// validation remain research work.
+/// Durability policy selection is not yet public API. File-backed transaction
+/// storage has restart recovery for current tmemory/object-log tests, while
+/// broader policy selection and hardware-PMEM validation remain research work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DurabilityPolicy {
     VolatileRollbackOnly,
 }
 
-/// SHISOFT-TWASM-MOCK: conflict behavior is the current abort/default scaffold;
-/// richer policy selection is deferred to the real concurrency-control layer.
+/// Conflict behavior currently uses the abort-or-Wizard-default policy; richer
+/// policy selection is deferred to the concurrency-control layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConflictPolicy {
     AbortOrWizardDefault,
