@@ -1560,6 +1560,18 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         }
     }
 
+    fn transaction_produced_value(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        value: ir::Value,
+        ty: WasmValType,
+    ) -> ir::Value {
+        if self.val_ty_needs_stack_map(ty) {
+            builder.declare_value_needs_stack_map(value);
+        }
+        value
+    }
+
     pub(crate) fn heap_ty_needs_stack_map(&self, ty: WasmHeapType) -> bool {
         ty.is_vmgcref_type_and_not_i31() && !ty.is_bottom()
     }
@@ -5422,6 +5434,11 @@ impl FuncEnvironment<'_> {
             builder,
             raw_ref,
             BuiltinFunctionIndex::transaction_textern_convert_tany(),
+            WasmValType::Ref(WasmRefType {
+                nullable: true,
+                heap_type: WasmHeapType::Extern,
+                transactional: true,
+            }),
         )
     }
 
@@ -5434,6 +5451,11 @@ impl FuncEnvironment<'_> {
             builder,
             raw_ref,
             BuiltinFunctionIndex::transaction_tany_convert_textern(),
+            WasmValType::Ref(WasmRefType {
+                nullable: true,
+                heap_type: WasmHeapType::Any,
+                transactional: true,
+            }),
         )
     }
 
@@ -5442,6 +5464,7 @@ impl FuncEnvironment<'_> {
         builder: &mut FunctionBuilder<'_>,
         raw_ref: ir::Value,
         builtin: BuiltinFunctionIndex,
+        result_ty: WasmValType,
     ) -> WasmResult<ir::Value> {
         let null = builder.ins().icmp_imm_u(IntCC::Equal, raw_ref, 0);
         let null_block = builder.create_block();
@@ -5467,7 +5490,8 @@ impl FuncEnvironment<'_> {
 
         builder.switch_to_block(continuation);
         builder.seal_block(continuation);
-        Ok(builder.block_params(continuation)[0])
+        let result = builder.block_params(continuation)[0];
+        Ok(self.transaction_produced_value(builder, result, result_ty))
     }
 
     fn translate_transaction_enter_tfunc(
@@ -5566,7 +5590,8 @@ impl FuncEnvironment<'_> {
         let ptr = pos.func.dfg.inst_results(call)[0];
 
         let flags = MemFlagsData::trusted();
-        Ok(builder.ins().load(result_ty, flags, ptr, Offset32::new(0)))
+        let result = builder.ins().load(result_ty, flags, ptr, Offset32::new(0));
+        Ok(self.transaction_produced_value(builder, result, wasm_ty))
     }
 
     pub fn translate_transaction_tglobal_set(

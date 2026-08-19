@@ -171,7 +171,7 @@ where
         }
 
         #[cfg(feature = "transaction")]
-        store.0.transaction_enter_extern_scope();
+        let _transaction_extern_scope = store.0.transaction_enter_extern_scope();
         let result = (|| {
             // Validate that all runtime values flowing into this store indeed
             // belong within this store, otherwise it would be unsafe for store
@@ -227,8 +227,6 @@ where
             // accessed here should be validly initialized.
             unsafe { Ok(Results::load(&mut store, &storage.results)) }
         })();
-        #[cfg(feature = "transaction")]
-        store.0.transaction_exit_extern_scope();
         result
     }
 

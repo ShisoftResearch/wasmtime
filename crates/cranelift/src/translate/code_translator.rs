@@ -3344,11 +3344,9 @@ pub fn translate_operator(
             environ.stacks.push1(r);
         }
 
-        // SHISOFT-TWASM-MOCK: transactional object operators are parsed as
-        // distinct `0xfa 0xfb` operators. `tstruct.*` is now routed through
-        // the volatile VMGcRef/ObjectId bridge; the remaining object/ref arms
-        // below still lower through ordinary Wasmtime GC until their
-        // persistent-object runtime paths land.
+        // Transactional object operators are parsed as distinct `0xfa 0xfb`
+        // operators. Their shared scalar encodings can use the same lowering
+        // while retaining their separately validated transactional types.
         Operator::RefI31 | Operator::TRefI31 => {
             let val = environ.stacks.pop1();
             let i31ref = environ.translate_ref_i31(builder.cursor(), val)?;

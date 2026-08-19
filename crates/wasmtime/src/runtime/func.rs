@@ -1181,7 +1181,7 @@ impl Func {
         results: &mut [Val],
     ) -> Result<()> {
         #[cfg(feature = "transaction")]
-        store.0.transaction_enter_extern_scope();
+        let _transaction_extern_scope = store.0.transaction_enter_extern_scope();
         let result = (|| {
             // Store the argument values into `values_vec`.
             let ty = self.load_ty(store.0);
@@ -1222,8 +1222,6 @@ impl Func {
             store.0.save_wasm_val_raw_storage(values_vec);
             Ok(())
         })();
-        #[cfg(feature = "transaction")]
-        store.0.transaction_exit_extern_scope();
         result
     }
 

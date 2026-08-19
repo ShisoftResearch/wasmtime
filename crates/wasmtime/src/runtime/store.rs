@@ -500,8 +500,6 @@ pub struct StoreOpaque {
     #[cfg(feature = "transaction")]
     transaction_extern_roots_by_handle: BTreeMap<u32, OwnedRooted<ExternRef>>,
     #[cfg(feature = "transaction")]
-    transaction_extern_handles_by_raw: BTreeMap<u32, u32>,
-    #[cfg(feature = "transaction")]
     transaction_extern_scope_depth: u32,
     #[cfg(feature = "transaction")]
     next_transaction_extern_handle: u32,
@@ -805,8 +803,6 @@ impl<T> Store<T> {
             transaction_durable_refs: DurableReferenceRegistry::default(),
             #[cfg(feature = "transaction")]
             transaction_extern_roots_by_handle: BTreeMap::new(),
-            #[cfg(feature = "transaction")]
-            transaction_extern_handles_by_raw: BTreeMap::new(),
             #[cfg(feature = "transaction")]
             transaction_extern_scope_depth: 0,
             #[cfg(feature = "transaction")]
@@ -1755,6 +1751,23 @@ fn set_fuel(
     *injected_fuel = -(injected as i64);
 }
 
+#[cfg(feature = "transaction")]
+#[must_use = "the guard owns the transactional external-reference call scope"]
+pub(crate) struct TransactionExternScopeGuard {
+    store: NonNull<StoreOpaque>,
+}
+
+#[cfg(feature = "transaction")]
+impl Drop for TransactionExternScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: `StoreOpaque` is heap-allocated and stable for the lifetime of
+        // every host-to-Wasm call. This guard never outlives that call.
+        unsafe {
+            self.store.as_mut().transaction_exit_extern_scope();
+        }
+    }
+}
+
 #[doc(hidden)]
 impl StoreOpaque {
     pub fn id(&self) -> StoreId {
@@ -2018,11 +2031,14 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_enter_extern_scope(&mut self) {
+    pub(crate) fn transaction_enter_extern_scope(&mut self) -> TransactionExternScopeGuard {
         self.transaction_extern_scope_depth = self
             .transaction_extern_scope_depth
             .checked_add(1)
             .expect("transaction external-reference scope depth overflow");
+        TransactionExternScopeGuard {
+            store: NonNull::from(self),
+        }
     }
 
     #[cfg(feature = "transaction")]
@@ -2033,7 +2049,6 @@ impl StoreOpaque {
             .expect("unbalanced transaction external-reference scope");
         if self.transaction_extern_scope_depth == 0 {
             self.transaction_extern_roots_by_handle.clear();
-            self.transaction_extern_handles_by_raw.clear();
         }
     }
 
@@ -2042,12 +2057,10 @@ impl StoreOpaque {
         &mut self,
         reference: Rooted<ExternRef>,
     ) -> Result<u32> {
-        let raw = {
-            let mut no_gc = AutoAssertNoGc::new(self);
-            reference._to_raw(&mut no_gc)?
-        };
-        if let Some(handle) = self.transaction_extern_handles_by_raw.get(&raw).copied() {
-            return Ok(handle);
+        for (&handle, rooted) in &self.transaction_extern_roots_by_handle {
+            if Rooted::<ExternRef>::_ref_eq(self, &reference, rooted)? {
+                return Ok(handle);
+            }
         }
 
         ensure!(
@@ -2075,7 +2088,6 @@ impl StoreOpaque {
         };
         self.transaction_extern_roots_by_handle
             .insert(handle, owned);
-        self.transaction_extern_handles_by_raw.insert(raw, handle);
         Ok(handle)
     }
 
