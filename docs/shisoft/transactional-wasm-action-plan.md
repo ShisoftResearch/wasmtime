@@ -173,14 +173,14 @@ Likely files:
 
 Tasks:
 
-- [ ] Add an experimental transaction feature gate.
+- [x] Add an experimental transaction feature gate.
 - [x] Add lifecycle `wasmparser::Operator` variants for `ttry` and `tfail`.
 - [x] Add binary parsing for lifecycle `0xfa` prefixed operators.
 - [x] Add the remaining milestone-1 `wasmparser::Operator` variants.
 - [x] Add binary parsing for remaining `0xfa` prefixed milestone-1 operators.
-- [ ] Add minimal text support or generated binary-module fixtures.
-- [ ] Add module metadata for transactional memories and globals.
-- [ ] Add validation rules separating ordinary and transactional object spaces.
+- [x] Add native text support and binary-module fixtures.
+- [x] Add module metadata for transactional memories and globals.
+- [x] Add validation rules separating ordinary and transactional object spaces.
 
 Current native path (the former raw-byte fixture bridge has been removed):
 
@@ -402,12 +402,11 @@ Tasks:
 - [x] Replace the temporary bridge with a local `wasmparser` fork so normal
   `Module::new` accepts lifecycle `0xfa` operators.
 - [x] Lower `ttry` and `tfail` through the full validated module path.
-- [x] Lower `tglobal.get/set` to runtime helper ABI stubs.
-- [x] Lower scalar and packed `*.tload/*.tstore` to runtime helper ABI
-  stubs.
-- [x] Lower `tmemory.size/grow` to runtime helper ABI stubs.
-- [ ] Ensure traps inside active transactions abort before returning to host.
-- [ ] Add focused integration tests for each operator family.
+- [x] Lower `tglobal.get/set` to runtime helper builtins.
+- [x] Lower scalar and packed `*.tload/*.tstore` to runtime helper builtins.
+- [x] Lower `tmemory.size/grow` to runtime helper builtins.
+- [x] Ensure traps inside active transactions abort before returning to host.
+- [x] Add focused integration tests for each operator family.
 
 Required behavior:
 
@@ -428,7 +427,7 @@ Checkpoint:
 
 - Generated binary tests can run the full milestone-1 operator set.
 
-Current lifecycle bridge status:
+Current native lifecycle and data status:
 
 - Wasmtime uses a local `[patch.crates-io]` wasm-tools fork for `wasmparser`,
   `wasm-encoder`, and `wasmprinter`.
@@ -438,14 +437,13 @@ Current lifecycle bridge status:
   `*.tload`, `*.tstore`, and `tmemory.*` binary operators.
 - Cranelift lowers lifecycle operators through transaction begin/fail builtins.
 - Cranelift lowers `tglobal.get/set` through transaction global helper builtins
-  that currently trap at runtime.
+  backed by staged global state and transaction visibility.
 - Cranelift lowers scalar and packed integer `*.tload/*.tstore` through
-  transaction memory helper builtins that currently trap at runtime.
+  transaction memory helper builtins backed by staged granule state.
 - Cranelift lowers `tmemory.size/grow` through transaction memory helper
-  builtins that currently trap at runtime.
-- Runtime helper ABI declarations now exist for transaction data operators, but
-  their libcall implementations are trapping stubs until `tglobal` and
-  `tmemory` object access is wired.
+  builtins backed by staged visible-size state.
+- Runtime libcalls implement transactional global and memory access and abort
+  the active transaction when an operation returns an error.
 - A binary `Module::new` regression now proves the normal validated module path
   accepts lifecycle transaction opcodes.
 
