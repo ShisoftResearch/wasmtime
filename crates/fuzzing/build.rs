@@ -20,6 +20,7 @@ fn main() {
         &root,
         TestDiscoveryConfig {
             transaction_proposal: false,
+            transaction_proposal_root: None,
         },
     )
     .unwrap();

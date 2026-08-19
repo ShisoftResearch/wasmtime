@@ -39,6 +39,26 @@ pub struct Instance {
     pub(crate) id: StoreInstanceId,
 }
 
+/// A caller-supplied stable namespace for module-defined function identities.
+///
+/// Transactional persistence combines this namespace with each module function
+/// index. Callers reopening durable state must supply the same namespace, and
+/// simultaneously live module instances must use distinct namespaces.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TransactionModuleNamespace(u64);
+
+impl TransactionModuleNamespace {
+    /// Creates a stable transaction module namespace.
+    pub const fn new(namespace: u64) -> Self {
+        Self(namespace)
+    }
+
+    /// Returns the caller-supplied namespace value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 // Double-check that the C representation in `instance.h` matches our in-Rust
 // representation here in terms of size/alignment/etc.
 const _: () = {
@@ -126,7 +146,30 @@ impl Instance {
         // `typecheck_externs` above which satisfies the condition that all
         // the imports are valid for this module.
         vm::assert_ready(unsafe {
-            Instance::new_started(&mut store, module, imports.as_ref(), Asyncness::No)
+            Instance::new_started(&mut store, module, imports.as_ref(), Asyncness::No, None)
+        })
+    }
+
+    /// Instantiates a module after explicitly binding its defined functions to
+    /// a stable transactional-persistence namespace.
+    #[cfg(feature = "transaction")]
+    pub fn new_with_transaction_module_namespace(
+        mut store: impl AsContextMut,
+        module: &Module,
+        imports: &[Extern],
+        namespace: TransactionModuleNamespace,
+    ) -> Result<Instance> {
+        let mut store = store.as_context_mut();
+        store.0.validate_sync_call()?;
+        let imports = Instance::typecheck_externs(store.0, module, imports)?;
+        vm::assert_ready(unsafe {
+            Instance::new_started(
+                &mut store,
+                module,
+                imports.as_ref(),
+                Asyncness::No,
+                Some(namespace),
+            )
         })
     }
 
@@ -207,7 +250,32 @@ impl Instance {
         let mut store = store.as_context_mut();
         let imports = Instance::typecheck_externs(store.0, module, imports)?;
         // See `new` for notes on this unsafety
-        unsafe { Instance::new_started(&mut store, module, imports.as_ref(), Asyncness::Yes).await }
+        unsafe {
+            Instance::new_started(&mut store, module, imports.as_ref(), Asyncness::Yes, None).await
+        }
+    }
+
+    /// Asynchronously instantiates a module with an explicit stable
+    /// transactional-persistence namespace for its defined functions.
+    #[cfg(all(feature = "async", feature = "transaction"))]
+    pub async fn new_async_with_transaction_module_namespace(
+        mut store: impl AsContextMut,
+        module: &Module,
+        imports: &[Extern],
+        namespace: TransactionModuleNamespace,
+    ) -> Result<Instance> {
+        let mut store = store.as_context_mut();
+        let imports = Instance::typecheck_externs(store.0, module, imports)?;
+        unsafe {
+            Instance::new_started(
+                &mut store,
+                module,
+                imports.as_ref(),
+                Asyncness::Yes,
+                Some(namespace),
+            )
+            .await
+        }
     }
 
     fn typecheck_externs(
@@ -255,6 +323,7 @@ impl Instance {
         module: &Module,
         imports: Imports<'_>,
         asyncness: Asyncness,
+        transaction_module_namespace: Option<TransactionModuleNamespace>,
     ) -> Result<Instance> {
         let instance = {
             let (mut limiter, store) = store.0.resource_limiter_and_store_opaque();
@@ -262,6 +331,13 @@ impl Instance {
             // function.
             unsafe { Instance::new_raw(store, limiter.as_mut(), module, imports).await? }
         };
+
+        #[cfg(feature = "transaction")]
+        if let Some(namespace) = transaction_module_namespace {
+            instance.register_transaction_module_functions(store.0, module, namespace)?;
+        }
+        #[cfg(not(feature = "transaction"))]
+        debug_assert!(transaction_module_namespace.is_none());
 
         // If this instance requires startup, which is a dynamic decision made
         // at this point in conjunction with analysis at compile time, the
@@ -282,6 +358,50 @@ impl Instance {
             }
         }
         Ok(instance)
+    }
+
+    #[cfg(feature = "transaction")]
+    fn register_transaction_module_functions(
+        &self,
+        store: &mut StoreOpaque,
+        module: &Module,
+        namespace: TransactionModuleNamespace,
+    ) -> Result<()> {
+        let env_module = module.env_module();
+        let functions = module
+            .functions()
+            .filter(|function| {
+                env_module.defined_func_index(function.index).is_some()
+                    && env_module.functions[function.index].is_escaping()
+            })
+            .map(|function| function.index)
+            .collect::<Vec<_>>();
+        let type_layout_id = crate::runtime::transaction::type_layout::TypeLayoutId::BUILTIN_FUNC;
+
+        for function_index in functions {
+            let vm_func_ref_addr = {
+                let (mut instance, registry) = self.id.get_mut_and_module_registry(store);
+                let func_ref = instance
+                    .as_mut()
+                    .get_func_ref(registry, function_index)
+                    .with_context(|| {
+                        format!(
+                            "module function index {} did not resolve to a VMFuncRef",
+                            function_index.as_u32()
+                        )
+                    })?;
+                func_ref.as_ptr().addr()
+            };
+            store.transaction_register_durable_func_ref(
+                vm_func_ref_addr,
+                crate::runtime::transaction::DurableFuncIdentity {
+                    module_fingerprint: namespace.get(),
+                    function_index: function_index.as_u32(),
+                    type_layout_id,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Internal function to create an instance which doesn't have its `start`
@@ -959,6 +1079,25 @@ impl<T: 'static> InstancePre<T> {
     /// memory allocation fails. See the `OutOfMemory` type's documentation for
     /// details on Wasmtime's out-of-memory handling.
     pub fn instantiate(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance> {
+        self.instantiate_with_optional_transaction_module_namespace(&mut store, None)
+    }
+
+    /// Instantiates this module after explicitly binding its defined functions
+    /// to a stable transactional-persistence namespace.
+    #[cfg(feature = "transaction")]
+    pub fn instantiate_with_transaction_module_namespace(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+        namespace: TransactionModuleNamespace,
+    ) -> Result<Instance> {
+        self.instantiate_with_optional_transaction_module_namespace(&mut store, Some(namespace))
+    }
+
+    fn instantiate_with_optional_transaction_module_namespace(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+        namespace: Option<TransactionModuleNamespace>,
+    ) -> Result<Instance> {
         let mut store = store.as_context_mut();
         let imports = pre_instantiate_raw(
             &mut store.0,
@@ -979,7 +1118,13 @@ impl<T: 'static> InstancePre<T> {
         // constructor of `InstancePre` to assert that all the imports we're passing
         // in match the module we're instantiating.
         vm::assert_ready(unsafe {
-            Instance::new_started(&mut store, &self.module, imports.as_ref(), Asyncness::No)
+            Instance::new_started(
+                &mut store,
+                &self.module,
+                imports.as_ref(),
+                Asyncness::No,
+                namespace,
+            )
         })
     }
 
@@ -1004,6 +1149,31 @@ impl<T: 'static> InstancePre<T> {
         &self,
         mut store: impl AsContextMut<Data = T>,
     ) -> Result<Instance> {
+        self.instantiate_async_with_optional_transaction_module_namespace(&mut store, None)
+            .await
+    }
+
+    /// Asynchronously instantiates this module with an explicit stable
+    /// transactional-persistence namespace for its defined functions.
+    #[cfg(all(feature = "async", feature = "transaction"))]
+    pub async fn instantiate_async_with_transaction_module_namespace(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+        namespace: TransactionModuleNamespace,
+    ) -> Result<Instance> {
+        self.instantiate_async_with_optional_transaction_module_namespace(
+            &mut store,
+            Some(namespace),
+        )
+        .await
+    }
+
+    #[cfg(feature = "async")]
+    async fn instantiate_async_with_optional_transaction_module_namespace(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+        namespace: Option<TransactionModuleNamespace>,
+    ) -> Result<Instance> {
         let mut store = store.as_context_mut();
         let imports = pre_instantiate_raw(
             &mut store.0,
@@ -1018,7 +1188,14 @@ impl<T: 'static> InstancePre<T> {
         // constructor of `InstancePre` to assert that all the imports we're passing
         // in match the module we're instantiating.
         unsafe {
-            Instance::new_started(&mut store, &self.module, imports.as_ref(), Asyncness::Yes).await
+            Instance::new_started(
+                &mut store,
+                &self.module,
+                imports.as_ref(),
+                Asyncness::Yes,
+                namespace,
+            )
+            .await
         }
     }
 }

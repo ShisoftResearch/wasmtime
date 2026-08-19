@@ -4,6 +4,7 @@ struct PromotionAttempt {
     initial_allocated_object_count: usize,
     promoted_sources: Vec<ObjectId>,
     promoted_objects: Vec<ObjectId>,
+    in_place_promotions: Vec<(ObjectId, Option<StagedObjectRecord>)>,
     promoted_gc_refs: Vec<u32>,
     durable_leaf_gc_refs: Vec<u32>,
 }
@@ -14,6 +15,7 @@ impl PromotionAttempt {
             initial_allocated_object_count: state.allocated_objects.len(),
             promoted_sources: Vec::new(),
             promoted_objects: Vec::new(),
+            in_place_promotions: Vec::new(),
             promoted_gc_refs: Vec::new(),
             durable_leaf_gc_refs: Vec::new(),
         }
@@ -22,6 +24,15 @@ impl PromotionAttempt {
     fn record_promoted_object(&mut self, source: ObjectId, promoted: ObjectId) {
         self.promoted_sources.push(source);
         self.promoted_objects.push(promoted);
+    }
+
+    fn record_in_place_promotion(
+        &mut self,
+        source: ObjectId,
+        previous_staged: Option<StagedObjectRecord>,
+    ) {
+        self.promoted_sources.push(source);
+        self.in_place_promotions.push((source, previous_staged));
     }
 
     fn record_promoted_gc_ref(&mut self, gc_ref: u32, promoted: ObjectId) {
@@ -42,6 +53,16 @@ impl PromotionAttempt {
         }
         for source in self.promoted_sources {
             state.promoted_objects.remove(&source);
+        }
+        for (source, previous_staged) in self.in_place_promotions {
+            match previous_staged {
+                Some(record) => {
+                    state.staged_objects.insert(source, record);
+                }
+                None => {
+                    state.staged_objects.remove(&source);
+                }
+            }
         }
         for promoted in &self.promoted_objects {
             state.staged_objects.remove(promoted);
@@ -175,6 +196,27 @@ impl TransactionState {
             matches!(kind, ObjectKind::Struct | ObjectKind::Array),
             "transactional promotion currently supports struct and array object payloads"
         );
+
+        if !self.local_object_table.contains(source)
+            && object_table.is_workspace_shared_volatile(source)?
+        {
+            let previous_staged = self.staged_objects.get(&source).cloned();
+            self.promoted_objects.insert(source, source);
+            attempt.record_in_place_promotion(source, previous_staged);
+            let promoted_payload = self.rewrite_payload_refs_for_promotion_in_attempt(
+                object_table,
+                source_payload,
+                attempt,
+            )?;
+            object_table.validate_persistent_payload_refs_with_pending(
+                &promoted_payload,
+                &self.pending_in_place_promotions(),
+            )?;
+            self.staged_objects
+                .insert(source, StagedObjectRecord::new(promoted_payload));
+            return Ok(source);
+        }
+
         let promoted =
             object_table.reserve_persistent_object_id_for_promotion(kind, type_layout_id)?;
         self.record_allocated_object(promoted)?;
@@ -189,10 +231,20 @@ impl TransactionState {
             source_payload,
             attempt,
         )?;
-        object_table.validate_persistent_payload_refs(&promoted_payload)?;
+        object_table.validate_persistent_payload_refs_with_pending(
+            &promoted_payload,
+            &self.pending_in_place_promotions(),
+        )?;
         self.staged_objects
             .insert(promoted, StagedObjectRecord::new(promoted_payload));
         Ok(promoted)
+    }
+
+    pub(super) fn pending_in_place_promotions(&self) -> BTreeSet<ObjectId> {
+        self.promoted_objects
+            .iter()
+            .filter_map(|(&source, &promoted)| (source == promoted).then_some(source))
+            .collect()
     }
 
     fn rewrite_payload_refs_for_promotion_in_attempt(
@@ -368,7 +420,10 @@ impl TransactionState {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let payload = ObjectPayload::Struct(fields);
-                object_table.validate_persistent_payload_refs(&payload)?;
+                object_table.validate_persistent_payload_refs_with_pending(
+                    &payload,
+                    &self.pending_in_place_promotions(),
+                )?;
                 self.staged_objects
                     .insert(promoted, StagedObjectRecord::new(payload));
                 Ok(Some(promoted))
@@ -396,7 +451,10 @@ impl TransactionState {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let payload = ObjectPayload::Array(elements);
-                object_table.validate_persistent_payload_refs(&payload)?;
+                object_table.validate_persistent_payload_refs_with_pending(
+                    &payload,
+                    &self.pending_in_place_promotions(),
+                )?;
                 self.staged_objects
                     .insert(promoted, StagedObjectRecord::new(payload));
                 Ok(Some(promoted))

@@ -785,6 +785,37 @@ impl Table {
         Ok(())
     }
 
+    /// Read the raw word stored in a transactional reference table.
+    ///
+    /// Transactional reference tables reuse the GC-reference slot layout, but
+    /// their raw words are native transaction handles and are deliberately not
+    /// traced by the ordinary Wasm GC. Callers must only use this accessor for
+    /// tables whose element reference type is transactional.
+    pub(crate) fn get_transaction_ref_raw(&self, index: u64) -> Result<u32, Trap> {
+        let index = usize::try_from(index).map_err(|_| Trap::TableOutOfBounds)?;
+        Ok(self
+            .gc_refs()
+            .get(index)
+            .ok_or(Trap::TableOutOfBounds)?
+            .as_ref()
+            .map_or(0, VMGcRef::as_raw_u32))
+    }
+
+    /// Write a native transactional reference word without an ordinary GC
+    /// barrier.
+    ///
+    /// See [`Table::get_transaction_ref_raw`]. Transactional tables are not
+    /// ordinary GC roots, and treating their transaction handles as GC
+    /// addresses would corrupt the GC's reference domain.
+    pub(crate) fn set_transaction_ref_raw(&mut self, index: u64, raw: u32) -> Result<(), Trap> {
+        let index = usize::try_from(index).map_err(|_| Trap::TableOutOfBounds)?;
+        *self
+            .gc_refs_mut()
+            .get_mut(index)
+            .ok_or(Trap::TableOutOfBounds)? = VMGcRef::from_raw_u32(raw);
+        Ok(())
+    }
+
     /// Return a `VMTableDefinition` for exposing the table to compiled wasm code.
     pub fn vmtable(&mut self) -> VMTableDefinition {
         match self {

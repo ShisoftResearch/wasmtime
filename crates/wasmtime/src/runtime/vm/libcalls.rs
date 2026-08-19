@@ -564,7 +564,7 @@ pub(crate) fn transaction_preserve_tref_result_impl(
     )
 }
 
-fn transaction_commit_structured(store: &mut dyn VMStore, instance: InstanceId) -> Result<u32> {
+fn transaction_error_is_conflict(error: &Error) -> bool {
     const CONFLICT_MARKERS: &[&str] = &[
         "transaction read conflict",
         "transaction write conflict",
@@ -573,20 +573,22 @@ fn transaction_commit_structured(store: &mut dyn VMStore, instance: InstanceId) 
         "transaction MVCC certification conflict",
     ];
 
-    let result = transaction_commit_impl(store, instance);
-    let conflict = result.as_ref().is_err_and(|error| {
-        let mut conflict = false;
-        for cause in error.chain() {
-            let message = cause.to_string();
-            if message.contains("failed to abort") {
-                return false;
-            }
-            conflict |= CONFLICT_MARKERS
-                .iter()
-                .any(|marker| message.contains(marker));
+    let mut conflict = false;
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if message.contains("failed to abort") {
+            return false;
         }
-        conflict
-    });
+        conflict |= CONFLICT_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker));
+    }
+    conflict
+}
+
+fn transaction_commit_structured(store: &mut dyn VMStore, instance: InstanceId) -> Result<u32> {
+    let result = transaction_commit_impl(store, instance);
+    let conflict = result.as_ref().is_err_and(transaction_error_is_conflict);
     let cleanup = abort_active_transaction_on_error(store, &result);
     if conflict {
         cleanup.context("failed to abort structured transaction after commit conflict")?;
@@ -2699,6 +2701,14 @@ fn transaction_tref_cast_read(
     ref_handle: u32,
 ) -> Result<()> {
     let result = transaction_tref_cast_read_impl(store, instance, ref_handle);
+    if result.as_ref().is_err_and(transaction_error_is_conflict) {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state
+            .fail_allocated_objects(object_table)
+            .context("failed to abort structured transaction after tref.cast_read conflict")?;
+        return Ok(());
+    }
     let _ = abort_active_transaction_on_error(store, &result);
     result
 }
@@ -2722,6 +2732,14 @@ fn transaction_tref_cast_write(
     ref_handle: u32,
 ) -> Result<()> {
     let result = transaction_tref_cast_write_impl(store, instance, ref_handle);
+    if result.as_ref().is_err_and(transaction_error_is_conflict) {
+        let store = store.store_opaque_mut();
+        let (state, object_table) = store.transaction_state_and_object_table_mut();
+        state
+            .fail_allocated_objects(object_table)
+            .context("failed to abort structured transaction after tref.cast_write conflict")?;
+        return Ok(());
+    }
     let _ = abort_active_transaction_on_error(store, &result);
     result
 }
@@ -3554,9 +3572,11 @@ fn transaction_tmemory_init(
     len: u64,
     data: *mut u8,
     data_len: u64,
+    data_index: u32,
 ) -> Result<()> {
-    let result =
-        transaction_tmemory_init_impl(store, instance, memory, dst, src, len, data, data_len);
+    let result = transaction_tmemory_init_impl(
+        store, instance, memory, dst, src, len, data, data_len, data_index,
+    );
     let _ = abort_active_transaction_on_error(store, &result);
     result
 }
@@ -3570,11 +3590,14 @@ fn transaction_tmemory_init_impl(
     len: u64,
     data: *mut u8,
     data_len: u64,
+    data_index: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store, instance)?;
     let len = usize::try_from(len).context("tmemory init length overflow")?;
-    let data_len = usize::try_from(data_len).context("tmemory init data length overflow")?;
+    let (memory_index, snapshot) =
+        collect_defined_tmemory_snapshot(store, instance, memory, dst, len)?;
+    let data_len = visible_tdata_len(store, instance, data_index, data_len)?;
     let src = usize::try_from(src).context("tmemory init source offset overflow")?;
     let src_end = src
         .checked_add(len)
@@ -3583,8 +3606,6 @@ fn transaction_tmemory_init_impl(
         src <= data_len && src_end <= data_len,
         "out of bounds tmemory access: data source range {src}..{src_end} exceeds segment length {data_len}"
     );
-    let (memory_index, snapshot) =
-        collect_defined_tmemory_snapshot(store, instance, memory, dst, len)?;
     let owner_instance_key = tmemory_transaction_owner_key(store, instance, memory_index)?;
     let data = unsafe { data.add(src) };
     let bytes = unsafe { core::slice::from_raw_parts(data.cast_const(), len) };
@@ -3712,15 +3733,72 @@ pub(crate) fn transactional_memory_host_grow(
     Ok(previous)
 }
 
-fn transaction_tdata_drop(store: &mut dyn VMStore, instance: InstanceId, _data: u32) -> Result<()> {
-    let result = transaction_tdata_drop_impl(store, instance);
+fn transaction_tdata_drop(store: &mut dyn VMStore, instance: InstanceId, data: u32) -> Result<()> {
+    let result = transaction_tdata_drop_impl(store, instance, data);
     let _ = abort_active_transaction_on_error(store, &result);
     result
 }
 
-fn transaction_tdata_drop_impl(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+fn transaction_tdata_drop_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    data: u32,
+) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
-    ensure_active_transaction(store, instance)
+    ensure_active_transaction(store, instance)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_tdata_drop_owned(Some(instance), data)?;
+    Ok(())
+}
+
+fn visible_tdata_len(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    data: u32,
+    physical_len: u64,
+) -> Result<usize> {
+    let physical_len = usize::try_from(physical_len).context("tdata length overflow")?;
+    let dropped = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_tdata_read_owned(Some(instance), data)?;
+    Ok(if dropped { 0 } else { physical_len })
+}
+
+fn visible_telem_len(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    elem: u32,
+    physical_len: u64,
+) -> Result<usize> {
+    let physical_len = usize::try_from(physical_len).context("telem length overflow")?;
+    let dropped = store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .acquire_telem_read_owned(Some(instance), elem)?;
+    Ok(if dropped { 0 } else { physical_len })
+}
+
+fn transaction_telem_drop(store: &mut dyn VMStore, instance: InstanceId, elem: u32) -> Result<()> {
+    let result = transaction_telem_drop_impl(store, instance, elem);
+    let _ = abort_active_transaction_on_error(store, &result);
+    result
+}
+
+fn transaction_telem_drop_impl(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    elem: u32,
+) -> Result<()> {
+    flush_pending_tmemory_store(store, instance)?;
+    ensure_active_transaction(store, instance)?;
+    store
+        .store_opaque_mut()
+        .transaction_state_mut()
+        .stage_telem_drop_owned(Some(instance), elem)?;
+    Ok(())
 }
 
 fn transaction_ttable_get(
@@ -3768,6 +3846,30 @@ fn normalize_persistent_table_snapshot(
 ) -> Result<TableElementSnapshot> {
     let TableElementSnapshot::GcRef(gc_ref) = snapshot else {
         return Ok(snapshot);
+    };
+    #[cfg(feature = "transaction")]
+    let gc_ref = {
+        let mut gc_ref = gc_ref;
+        if let Some(reference) = store.transaction_extern_for_handle(gc_ref) {
+            let mut no_gc = AutoAssertNoGc::new(store);
+            gc_ref = reference._to_raw(&mut no_gc)?;
+        }
+        if gc_ref != 0 && !ObjectTable::is_raw_i31_ref(u64::from(gc_ref)) {
+            let is_native_transaction_ref = {
+                let (durable_refs, state, object_table) =
+                    store.transaction_durable_refs_state_and_object_table_mut();
+                durable_refs.resolve_extern_ref(gc_ref).is_some()
+                    || state
+                        .known_object_id_for_transaction_ref_handle(object_table, gc_ref)
+                        .is_some()
+            };
+            if !is_native_transaction_ref
+                && let Some(inner) = transaction_externalized_ref_raw(store, gc_ref)?
+            {
+                gc_ref = inner;
+            }
+        }
+        gc_ref
     };
     let abi = ObjectValueAbi::from_live_parts(
         OBJECT_VALUE_ABI_TAG_REF,
@@ -3882,7 +3984,7 @@ fn write_table_element_snapshot(
     ensure_defined_table_index_in_bounds(store, instance, table, index)?;
     let table_index = DefinedTableIndex::from_u32(table);
     let mut store = AutoAssertNoGc::new(store.store_opaque_mut());
-    let (gc_store, _registry, instance_ref) =
+    let (_gc_store, _registry, instance_ref) =
         store.optional_gc_store_and_registry_and_instance_mut(instance);
     let table_ref = instance_ref.get_defined_table(table_index);
     match (table_ref.element_type(), value) {
@@ -3891,8 +3993,7 @@ fn write_table_element_snapshot(
             table_ref.set_func(index, NonNull::new(ptr))?;
         }
         (TableElementType::GcRef, TableElementSnapshot::GcRef(value)) => {
-            let elem = VMGcRef::from_raw_u32(value);
-            table_ref.set_gc_ref(gc_store, index, elem.as_ref())?;
+            table_ref.set_transaction_ref_raw(index, value)?;
         }
         (TableElementType::Cont, _) => bail!("transactional contref table is not implemented yet"),
         _ => bail!("transactional table element kind does not match table element type"),
@@ -4204,11 +4305,13 @@ fn transaction_ttable_init(
     instance: InstanceId,
     table: u32,
     elem: u32,
+    elem_index: u32,
     dst: u64,
     src: u64,
     len: u64,
 ) -> Result<()> {
-    let result = transaction_ttable_init_impl(store, instance, table, elem, dst, src, len);
+    let result =
+        transaction_ttable_init_impl(store, instance, table, elem, elem_index, dst, src, len);
     let _ = abort_active_transaction_on_error(store, &result);
     result
 }
@@ -4218,6 +4321,7 @@ fn transaction_ttable_init_impl(
     instance: InstanceId,
     table: u32,
     elem: u32,
+    elem_index: u32,
     dst: u64,
     src: u64,
     len: u64,
@@ -4228,12 +4332,18 @@ fn transaction_ttable_init_impl(
     let src = usize::try_from(src).context("ttable.init source does not fit host usize")?;
     let len = usize::try_from(len).context("ttable.init length does not fit host usize")?;
     if elem == u32::MAX {
-        ensure!(
-            src == 0 && len == 0,
-            "out of bounds transactional element segment access"
-        );
+        let _ = visible_telem_len(store, instance, elem_index, 0)?;
+        ensure!(src == 0 && len == 0, "out of bounds table access");
         return Ok(());
     }
+    let physical_len = {
+        let mut instance_ref = store.instance_mut(instance);
+        instance_ref
+            .as_mut()
+            .passive_telement_segment(PassiveTElemIndex::from_u32(elem))
+            .len()
+    };
+    let visible_len = visible_telem_len(store, instance, elem_index, u64::try_from(physical_len)?)?;
     let values = {
         let mut instance_ref = store.instance_mut(instance);
         let segment = instance_ref
@@ -4242,10 +4352,7 @@ fn transaction_ttable_init_impl(
         let end = src
             .checked_add(len)
             .context("ttable.init element range overflow")?;
-        ensure!(
-            end <= segment.len(),
-            "out of bounds transactional element segment access"
-        );
+        ensure!(end <= visible_len, "out of bounds table access");
         segment[src..end]
             .iter()
             .map(|value| value.get_funcref().cast::<u8>())
@@ -4881,6 +4988,7 @@ fn transaction_tarray_new_data(
     data_len: u64,
     tag: u32,
     element_size: u32,
+    data_index: u32,
 ) -> Result<core::num::NonZeroU32> {
     let began = begin_transaction_constructor_boundary(store)?;
     let result = transaction_tarray_new_data_impl(
@@ -4893,6 +5001,7 @@ fn transaction_tarray_new_data(
         data_len,
         tag,
         element_size,
+        data_index,
     );
     let finish = finish_transaction_constructor_boundary(store, began, &result);
     combine_operation_and_cleanup_results(
@@ -4912,20 +5021,18 @@ fn transaction_tarray_new_data_impl(
     data_len: u64,
     tag: u32,
     element_size: u32,
+    data_index: u32,
 ) -> Result<core::num::NonZeroU32> {
     let runtime_type_index = transaction_module_type_index_to_shared(store, instance, array_type)?;
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store, instance)?;
     let src = usize::try_from(src).context("transactional array data source offset overflow")?;
     let len = usize::try_from(len).context("transactional array data length overflow")?;
-    let data_len =
-        usize::try_from(data_len).context("transactional array data segment length overflow")?;
+    let data_len = visible_tdata_len(store, instance, data_index, data_len)?;
     let element_size =
         usize::try_from(element_size).context("transactional array element size overflow")?;
     ensure!(element_size > 0, "transactional array element size is zero");
-    let byte_start = src
-        .checked_mul(element_size)
-        .context("transactional array data source byte offset overflow")?;
+    let byte_start = src;
     let byte_len = len
         .checked_mul(element_size)
         .context("transactional array data byte length overflow")?;
@@ -4936,6 +5043,12 @@ fn transaction_tarray_new_data_impl(
         byte_start <= data_len && byte_end <= data_len,
         "out of bounds tarray access: data source range {byte_start}..{byte_end} exceeds segment length {data_len}"
     );
+    if len != 0 {
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .acquire_tdata_write_owned(Some(instance), data_index)?;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(data.add(byte_start).cast_const(), byte_len) };
     let values = decode_transaction_array_data_values(bytes, tag, element_size)?;
     let store = store.store_opaque_mut();
@@ -4958,10 +5071,12 @@ fn transaction_tarray_new_elem(
     len: u32,
     elem: *mut u8,
     elem_len: u64,
+    elem_index: u32,
 ) -> Result<core::num::NonZeroU32> {
     let began = begin_transaction_constructor_boundary(store)?;
-    let result =
-        transaction_tarray_new_elem_impl(store, instance, array_type, src, len, elem, elem_len);
+    let result = transaction_tarray_new_elem_impl(
+        store, instance, array_type, src, len, elem, elem_len, elem_index,
+    );
     let finish = finish_transaction_constructor_boundary(store, began, &result);
     combine_operation_and_cleanup_results(
         result,
@@ -4978,14 +5093,14 @@ fn transaction_tarray_new_elem_impl(
     len: u32,
     elem: *mut u8,
     elem_len: u64,
+    elem_index: u32,
 ) -> Result<core::num::NonZeroU32> {
     let runtime_type_index = transaction_module_type_index_to_shared(store, instance, array_type)?;
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store, instance)?;
     let src = usize::try_from(src).context("transactional array elem source offset overflow")?;
     let len = usize::try_from(len).context("transactional array elem length overflow")?;
-    let elem_len =
-        usize::try_from(elem_len).context("transactional elem segment length overflow")?;
+    let elem_len = visible_telem_len(store, instance, elem_index, elem_len)?;
     ensure!(
         len == 0 || !elem.is_null(),
         "transactional elem segment pointer is null"
@@ -5252,6 +5367,7 @@ fn transaction_tarray_init_data(
     data_len: u64,
     tag: u32,
     element_size: u32,
+    data_index: u32,
 ) -> Result<()> {
     let result = transaction_tarray_init_data_impl(
         store,
@@ -5264,6 +5380,7 @@ fn transaction_tarray_init_data(
         data_len,
         tag,
         element_size,
+        data_index,
     );
     let _ = abort_active_transaction_on_error(store, &result);
     result
@@ -5280,6 +5397,7 @@ fn transaction_tarray_init_data_impl(
     data_len: u64,
     tag: u32,
     element_size: u32,
+    data_index: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store, instance)?;
@@ -5287,21 +5405,23 @@ fn transaction_tarray_init_data_impl(
     let dst = usize::try_from(dst).context("transactional array destination offset overflow")?;
     let src = usize::try_from(src).context("transactional array data source offset overflow")?;
     let len = usize::try_from(len).context("transactional array data length overflow")?;
-    let data_len =
-        usize::try_from(data_len).context("transactional array data segment length overflow")?;
     let element_size =
         usize::try_from(element_size).context("transactional array element size overflow")?;
     ensure!(element_size > 0, "transactional array element size is zero");
-    let store = store.store_opaque_mut();
-    let (state, object_table) = store.transaction_state_and_object_table_mut();
-    let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
     let dst_end = dst
         .checked_add(len)
         .context("transactional array destination range overflow")?;
-    ensure!(
-        dst_end <= state.read_array_len(object_table, object_id)?,
-        "out of bounds array access"
-    );
+    let object_id = {
+        let store_opaque = store.store_opaque_mut();
+        let (state, object_table) = store_opaque.transaction_state_and_object_table_mut();
+        let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
+        ensure!(
+            dst_end <= state.read_array_len(object_table, object_id)?,
+            "out of bounds array access"
+        );
+        object_id
+    };
+    let data_len = visible_tdata_len(store, instance, data_index, data_len)?;
     let byte_start = src;
     let byte_len = len
         .checked_mul(element_size)
@@ -5313,12 +5433,20 @@ fn transaction_tarray_init_data_impl(
         byte_start <= data_len && byte_end <= data_len,
         "out of bounds tmemory access"
     );
+    if len != 0 {
+        store
+            .store_opaque_mut()
+            .transaction_state_mut()
+            .acquire_tdata_write_owned(Some(instance), data_index)?;
+    }
     let bytes = if byte_len == 0 {
         &[][..]
     } else {
         unsafe { core::slice::from_raw_parts(data.add(byte_start).cast_const(), byte_len) }
     };
     let values = decode_transaction_array_data_values(bytes, tag, element_size)?;
+    let store = store.store_opaque_mut();
+    let (state, object_table) = store.transaction_state_and_object_table_mut();
     state.write_array_range(object_table, object_id, dst, values)
 }
 
@@ -5331,9 +5459,11 @@ fn transaction_tarray_init_elem(
     len: u32,
     elem: *mut u8,
     elem_len: u64,
+    elem_index: u32,
 ) -> Result<()> {
-    let result =
-        transaction_tarray_init_elem_impl(store, instance, gc_ref, dst, src, len, elem, elem_len);
+    let result = transaction_tarray_init_elem_impl(
+        store, instance, gc_ref, dst, src, len, elem, elem_len, elem_index,
+    );
     let _ = abort_active_transaction_on_error(store, &result);
     result
 }
@@ -5347,6 +5477,7 @@ fn transaction_tarray_init_elem_impl(
     len: u32,
     elem: *mut u8,
     elem_len: u64,
+    elem_index: u32,
 ) -> Result<()> {
     flush_pending_tmemory_store(store, instance)?;
     ensure_active_transaction(store, instance)?;
@@ -5354,23 +5485,24 @@ fn transaction_tarray_init_elem_impl(
     let dst = usize::try_from(dst).context("transactional array destination offset overflow")?;
     let src = usize::try_from(src).context("transactional array elem source offset overflow")?;
     let len = usize::try_from(len).context("transactional array elem length overflow")?;
-    let elem_len =
-        usize::try_from(elem_len).context("transactional elem segment length overflow")?;
-    ensure!(
-        len == 0 || !elem.is_null(),
-        "transactional elem segment pointer is null"
-    );
 
-    let store = store.store_opaque_mut();
-    let (durable_refs, state, object_table) =
-        store.transaction_durable_refs_state_and_object_table_mut();
-    let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
     let dst_end = dst
         .checked_add(len)
         .context("transactional array destination range overflow")?;
+    let object_id = {
+        let store_opaque = store.store_opaque_mut();
+        let (state, object_table) = store_opaque.transaction_state_and_object_table_mut();
+        let object_id = state.object_id_for_transaction_ref_handle(object_table, gc_ref)?;
+        ensure!(
+            dst_end <= state.read_array_len(object_table, object_id)?,
+            "out of bounds array access"
+        );
+        object_id
+    };
+    let elem_len = visible_telem_len(store, instance, elem_index, elem_len)?;
     ensure!(
-        dst_end <= state.read_array_len(object_table, object_id)?,
-        "out of bounds array access"
+        len == 0 || !elem.is_null(),
+        "transactional elem segment pointer is null"
     );
     let elem_end = src
         .checked_add(len)
@@ -5391,6 +5523,9 @@ fn transaction_tarray_init_elem_impl(
     } else {
         unsafe { core::slice::from_raw_parts(elem.add(byte_start).cast_const(), byte_len) }
     };
+    let store = store.store_opaque_mut();
+    let (durable_refs, state, object_table) =
+        store.transaction_durable_refs_state_and_object_table_mut();
     let values = decode_transaction_array_elem_values(durable_refs, &*state, object_table, bytes)?;
     state.write_array_range(object_table, object_id, dst, values)
 }
@@ -6309,11 +6444,9 @@ fn collect_current_table_granule(
                     .get_func(element_index)?
                     .map_or(0, |ptr| ptr.as_ptr().addr()),
             ),
-            TableElementType::GcRef => TableElementSnapshot::GcRef(
-                table_ref
-                    .get_gc_ref(element_index)?
-                    .map_or(0, VMGcRef::as_raw_u32),
-            ),
+            TableElementType::GcRef => {
+                TableElementSnapshot::GcRef(table_ref.get_transaction_ref_raw(element_index)?)
+            }
             TableElementType::Cont => {
                 bail!("transactional contref table is not implemented yet")
             }
@@ -6599,7 +6732,7 @@ fn current_granule_version(
             let memory_index = TMemoryIndex::from_u32(memory_index);
             current_tmemory_granule_version(store, owner, memory_index, granule_index)
         }
-        GranuleId::Object { .. } => {
+        GranuleId::Object { .. } | GranuleId::VolatileObject { .. } => {
             let store = store.store_opaque_mut();
             let (state, object_table) = store.transaction_state_and_object_table_mut();
             state.current_object_version_for_granule(granule, &*object_table)
@@ -6607,7 +6740,9 @@ fn current_granule_version(
         GranuleId::TMemorySize { .. }
         | GranuleId::TGlobal { .. }
         | GranuleId::TTable { .. }
-        | GranuleId::TTableSize { .. } => Ok(store
+        | GranuleId::TTableSize { .. }
+        | GranuleId::TData { .. }
+        | GranuleId::TElem { .. } => Ok(store
             .store_opaque_mut()
             .transaction_state_mut()
             .versioned_granule_version(granule)),

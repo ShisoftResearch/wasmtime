@@ -7909,12 +7909,14 @@ fn active_startup_root_reentrant_harness(
         engine,
         r#"
             (module
-              (import "" "instantiate" (func $instantiate))
+              (import "" "instantiate" (tfunc $instantiate))
               (tfunc (export "commit")
-                (call $instantiate))
-              (tfunc (export "abort")
-                (call $instantiate)
-                (tfail (i32.const 0))))
+                (tcall $instantiate))
+              (func (export "abort")
+                (tblock
+                  ((tcall $instantiate)
+                   (tfail (i32.const 0)))
+                  (else (drop)))))
         "#,
     );
     let mut store = crate::Store::new(engine, None);
@@ -7934,17 +7936,25 @@ fn active_startup_root_reentrant_harness(
 
                 let instance = crate::Instance::new(&mut caller, &root_module, &[])?;
                 let instance_id = instance.id();
-                let committed_global_is_null =
-                    instance.get_typed_func::<(), i32>(&mut caller, "committed_global_is_null")?;
-                let committed_table_is_null =
-                    instance.get_typed_func::<i32, i32>(&mut caller, "committed_table_is_null")?;
+                let committed_global = instance
+                    .get_transactional_global(&mut caller, "g")
+                    .expect("root module exports transactional global");
+                let committed_table = instance
+                    .get_transactional_table(&mut caller, "t")
+                    .expect("root module exports transactional table");
                 let read_global = instance.get_typed_func::<(), i32>(&mut caller, "read_global")?;
                 let read_table = instance.get_typed_func::<i32, i32>(&mut caller, "read_table")?;
 
-                assert_eq!(committed_global_is_null.call(&mut caller, ())?, 1);
-                assert_eq!(committed_table_is_null.call(&mut caller, 0)?, 1);
-                assert_eq!(committed_table_is_null.call(&mut caller, 1)?, 1);
-                assert_eq!(committed_table_is_null.call(&mut caller, 2)?, 1);
+                assert!(matches!(
+                    committed_global.get(&mut caller),
+                    crate::Val::TransactionRef(reference) if reference.is_null()
+                ));
+                for element_index in [0_u64, 1, 2] {
+                    assert!(matches!(
+                        committed_table.get(&mut caller, element_index),
+                        Some(crate::Val::TransactionRef(reference)) if reference.is_null()
+                    ));
+                }
                 assert_eq!(read_global.call(&mut caller, ())?, 7);
                 assert_eq!(read_table.call(&mut caller, 0)?, 11);
                 assert_eq!(read_table.call(&mut caller, 1)?, 21);
@@ -10199,10 +10209,12 @@ fn mock_transaction_nested_tfunc_reuses_active_transaction_until_outer_return() 
               (tmemory 1)
               (tfunc $inner
                 (i32.tstore (i32.const 0) (i32.const 1)))
-              (tfunc (export "outer_fail")
-                (tcall $inner)
-                (i32.tstore (i32.const 0) (i32.const 2))
-                (tfail (i32.const 0)))
+              (func (export "outer_fail")
+                (tblock
+                  ((tcall $inner)
+                   (i32.tstore (i32.const 0) (i32.const 2))
+                   (tfail (i32.const 0)))
+                  (else (drop))))
               (tfunc (export "read") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
@@ -10229,9 +10241,11 @@ fn mock_transaction_fail_discards_memory_write() {
         r#"
             (module
               (tmemory 1)
-              (tfunc (export "write_fail")
-                (i32.tstore (i32.const 0) (i32.const 42))
-                (tfail (i32.const 0)))
+              (func (export "write_fail")
+                (tblock
+                  ((i32.tstore (i32.const 0) (i32.const 42))
+                   (tfail (i32.const 0)))
+                  (else (drop))))
               (tfunc (export "read") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
@@ -10285,10 +10299,12 @@ fn mock_transaction_global_i64_fail_discards_staged_write() {
         &engine,
         r#"
             (module
-              (tglobal $g (mut i64) (i64.const 7))
-              (tfunc (export "write_fail")
-                (tglobal.set $g (i64.const 99))
-                (tfail (i32.const 0)))
+              (tglobal $g (export "g") (mut i64) (i64.const 7))
+              (func (export "write_fail")
+                (tblock
+                  ((tglobal.set $g (i64.const 99))
+                   (tfail (i32.const 0)))
+                  (else (drop))))
               (tfunc (export "read") (result i64)
                 (tglobal.get $g)))
             "#,
@@ -10302,6 +10318,9 @@ fn mock_transaction_global_i64_fail_discards_staged_write() {
         .get_typed_func::<(), i64>(&mut store, "read")
         .unwrap();
 
+    let global = instance.get_transactional_global(&mut store, "g").unwrap();
+    assert!(matches!(global.get(&mut store), crate::Val::I64(7)));
+    assert_eq!(read.call(&mut store, ()).unwrap(), 7);
     write_fail.call(&mut store, ()).unwrap();
 
     assert_eq!(read.call(&mut store, ()).unwrap(), 7);
@@ -10599,7 +10618,7 @@ fn mock_transaction_ttable_funcref_paths_hit_runtime_libcalls() {
 
 #[test]
 fn transaction_ttable_set_is_private_until_commit() {
-    use crate::{Caller, Func, Linker, Ref};
+    use crate::{Caller, Func, Linker, Val};
     use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -10626,32 +10645,35 @@ fn transaction_ttable_set_is_private_until_commit() {
     let observe = Func::wrap(&mut store, move |mut caller: Caller<'_, ()>| {
         let table = caller
             .get_export("t")
-            .and_then(|export| export.into_table())
+            .and_then(|export| export.into_transactional_table())
             .expect("exported ttable");
         let value = table.get(&mut caller, 0).expect("table element");
-        observed.store(matches!(value, Ref::Func(None)), Ordering::SeqCst);
+        observed.store(matches!(value, Val::FuncRef(None)), Ordering::SeqCst);
     });
     linker
         .define(&mut store, "host", "observe", observe)
         .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let table = instance.get_table(&mut store, "t").unwrap();
+    let table = instance.get_transactional_table(&mut store, "t").unwrap();
     let set_then_observe = instance
         .get_typed_func::<(), ()>(&mut store, "set_then_observe")
         .unwrap();
 
-    assert!(matches!(table.get(&mut store, 0).unwrap(), Ref::Func(None)));
+    assert!(matches!(
+        table.get(&mut store, 0).unwrap(),
+        Val::FuncRef(None)
+    ));
     set_then_observe.call(&mut store, ()).unwrap();
     assert!(observed_committed_null.load(Ordering::SeqCst));
     assert!(matches!(
         table.get(&mut store, 0).unwrap(),
-        Ref::Func(Some(_))
+        Val::FuncRef(Some(_))
     ));
 }
 
 #[test]
 fn transaction_ttable_grow_new_region_uses_staged_overlay() {
-    use crate::Ref;
+    use crate::Val;
 
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -10676,7 +10698,7 @@ fn transaction_ttable_grow_new_region_uses_staged_overlay() {
     );
     let mut store = crate::Store::new(&engine, ());
     let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
-    let table = instance.get_table(&mut store, "t").unwrap();
+    let table = instance.get_transactional_table(&mut store, "t").unwrap();
     let grow_get_set_new = instance
         .get_typed_func::<(), i32>(&mut store, "grow_get_set_new")
         .unwrap();
@@ -10686,13 +10708,13 @@ fn transaction_ttable_grow_new_region_uses_staged_overlay() {
     assert_eq!(table.size(&mut store), 2);
     assert!(matches!(
         table.get(&mut store, 1).unwrap(),
-        Ref::Func(Some(_))
+        Val::FuncRef(Some(_))
     ));
 }
 
 #[test]
 fn transaction_ttable_grow_is_private_until_commit() {
-    use crate::{Caller, Func, Linker, Ref};
+    use crate::{Caller, Func, Linker, Val};
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -10728,7 +10750,7 @@ fn transaction_ttable_grow_is_private_until_commit() {
     let observe = Func::wrap(&mut store, move |mut caller: Caller<'_, ()>| {
         let table = caller
             .get_export("t")
-            .and_then(|export| export.into_table())
+            .and_then(|export| export.into_transactional_table())
             .expect("exported ttable");
         observed_size_for_host.store(table.size(&mut caller), Ordering::SeqCst);
         observed_slot_for_host.store(table.get(&mut caller, 1).is_none(), Ordering::SeqCst);
@@ -10737,7 +10759,7 @@ fn transaction_ttable_grow_is_private_until_commit() {
         .define(&mut store, "host", "observe", observe)
         .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let table = instance.get_table(&mut store, "t").unwrap();
+    let table = instance.get_transactional_table(&mut store, "t").unwrap();
     let grow_then_observe = instance
         .get_typed_func::<(), ()>(&mut store, "grow_then_observe")
         .unwrap();
@@ -10749,7 +10771,7 @@ fn transaction_ttable_grow_is_private_until_commit() {
     assert_eq!(table.size(&mut store), 2);
     assert!(matches!(
         table.get(&mut store, 1).unwrap(),
-        Ref::Func(Some(_))
+        Val::FuncRef(Some(_))
     ));
 }
 
@@ -10893,6 +10915,599 @@ fn native_ordinary_and_transactional_index_zero_initialize_independently() {
 }
 
 #[test]
+fn native_transactional_call_ref_invokes_typed_transaction_function() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $sig (tfunc (param i32) (result i32)))
+              (telem declare tfunc $square)
+              (tfunc $square (type $sig)
+                (i32.mul (local.get 0) (local.get 0)))
+              (tfunc (export "call") (param i32) (result i32)
+                (tcall_ref $sig (local.get 0) (tref.tfunc $square))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let call = instance
+        .get_typed_func::<i32, i32>(&mut store, "call")
+        .unwrap();
+
+    assert_eq!(call.call(&mut store, 9).unwrap(), 81);
+}
+
+#[test]
+fn native_transactional_return_call_ref_transfers_tail_ownership() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $sig (tfunc (param i32) (result i32)))
+              (telem declare tfunc $square)
+              (tfunc $square (type $sig)
+                (i32.mul (local.get 0) (local.get 0)))
+              (tfunc (export "tail") (param i32) (result i32)
+                (return_tcall_ref $sig (local.get 0) (tref.tfunc $square))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let tail = instance
+        .get_typed_func::<i32, i32>(&mut store, "tail")
+        .unwrap();
+
+    assert_eq!(tail.call(&mut store, 9).unwrap(), 81);
+    assert_eq!(current_thread_transaction_for_test(), None);
+}
+
+#[test]
+fn native_transactional_br_on_null_branches_on_transaction_reference() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $sig (tfunc (result i32)))
+              (telem declare tfunc $seven)
+              (tfunc $seven (type $sig) (i32.const 7))
+              (tfunc $choose (param $callee (tref null $sig)) (result i32)
+                (block $null
+                  (return (tcall_ref $sig (br_on_tnull $null (local.get $callee)))))
+                (i32.const -1))
+              (tfunc (export "nonnull") (result i32)
+                (tcall $choose (tref.tfunc $seven)))
+              (tfunc (export "null") (result i32)
+                (tcall $choose (tref.null $sig))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    for (name, expected) in [("nonnull", 7), ("null", -1)] {
+        assert_eq!(
+            instance
+                .get_typed_func::<(), i32>(&mut store, name)
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap(),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn native_transactional_br_on_non_null_branches_on_transaction_reference() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $sig (tfunc (result i32)))
+              (telem declare tfunc $seven)
+              (tfunc $seven (type $sig) (i32.const 7))
+              (tfunc $choose (param $callee (tref null $sig)) (result i32)
+                (block $nonnull (result (tref $sig))
+                  (br_on_tnon_null $nonnull (local.get $callee))
+                  (return (i32.const -1)))
+                (tcall_ref $sig))
+              (tfunc (export "nonnull") (result i32)
+                (tcall $choose (tref.tfunc $seven)))
+              (tfunc (export "null") (result i32)
+                (tcall $choose (tref.null $sig))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    for (name, expected) in [("nonnull", 7), ("null", -1)] {
+        assert_eq!(
+            instance
+                .get_typed_func::<(), i32>(&mut store, name)
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap(),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn native_transactional_ref_eq_compares_transaction_reference_identity() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tfunc (export "equal") (result i32)
+                (tref.eq (tref.ti31 (i32.const 7)) (tref.ti31 (i32.const 7))))
+              (tfunc (export "different") (result i32)
+                (tref.eq (tref.ti31 (i32.const 7)) (tref.ti31 (i32.const 8)))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    for (name, expected) in [("equal", 1), ("different", 0)] {
+        assert_eq!(
+            instance
+                .get_typed_func::<(), i32>(&mut store, name)
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap(),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn native_ttable_init_reports_standard_table_trap_for_dropped_telem() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable 1 tfuncref)
+              (telem $active (i32.const 0) tfunc $f)
+              (tfunc $f)
+              (tfunc (export "init")
+                (ttable.init $active
+                  (i32.const 0) (i32.const 0) (i32.const 1))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let init = instance
+        .get_typed_func::<(), ()>(&mut store, "init")
+        .unwrap();
+
+    let error = format!("{:?}", init.call(&mut store, ()).unwrap_err());
+    assert!(error.contains("out of bounds table access"), "{error}");
+}
+
+#[test]
+fn native_telem_drop_discards_transactional_element_segment() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable 1 tfuncref)
+              (telem $passive tfunc $f)
+              (tfunc $f)
+              (tfunc (export "drop") (telem.drop $passive)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let drop = instance
+        .get_typed_func::<(), ()>(&mut store, "drop")
+        .unwrap();
+
+    drop.call(&mut store, ()).unwrap();
+    drop.call(&mut store, ()).unwrap();
+}
+
+#[test]
+fn transaction_tdata_drop_rolls_back_on_tfail() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory 1)
+              (tdata $d "A")
+              (func (export "drop_fail")
+                (tblock
+                  ((tdata.drop $d)
+                   (tfail (i32.const 0)))
+                  (else (drop))))
+              (tfunc (export "init_and_read") (result i32)
+                (tmemory.init $d
+                  (i32.const 0) (i32.const 0) (i32.const 1))
+                (i32.tload8_u (i32.const 0))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let drop_fail = instance
+        .get_typed_func::<(), ()>(&mut store, "drop_fail")
+        .unwrap();
+    let init_and_read = instance
+        .get_typed_func::<(), i32>(&mut store, "init_and_read")
+        .unwrap();
+
+    drop_fail.call(&mut store, ()).unwrap();
+    assert_eq!(init_and_read.call(&mut store, ()).unwrap(), i32::from(b'A'));
+}
+
+#[test]
+fn transaction_telem_drop_rolls_back_on_tfail() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (type $a (tarray (tref $s)))
+              (telem $e (tref $s) (tstruct.new $s (i32.const 37)))
+              (func (export "drop_fail")
+                (tblock
+                  ((telem.drop $e)
+                   (tfail (i32.const 0)))
+                  (else (drop))))
+              (tfunc (export "read") (result i32)
+                (local $a (tref $a))
+                (local.set $a
+                  (tarray.new_elem $a $e (i32.const 0) (i32.const 1)))
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tarray.get $a
+                      (tref.cast_read (local.get $a))
+                      (i32.const 0))))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let drop_fail = instance
+        .get_typed_func::<(), ()>(&mut store, "drop_fail")
+        .unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    drop_fail.call(&mut store, ()).unwrap();
+    assert_eq!(read.call(&mut store, ()).unwrap(), 37);
+}
+
+#[test]
+fn transaction_tdata_drop_visibility_follows_abort_and_commit() {
+    clear_current_thread_transaction_for_test();
+    let mut state = TransactionState::default();
+    let owner = Some(InstanceId::from_u32(7));
+
+    state.begin().unwrap();
+    assert!(!state.acquire_tdata_read_owned(owner, 3).unwrap());
+    assert!(state.stage_tdata_drop_owned(owner, 3).unwrap());
+    assert!(state.acquire_tdata_read_owned(owner, 3).unwrap());
+    state.abort().unwrap();
+
+    state.begin().unwrap();
+    assert!(!state.acquire_tdata_read_owned(owner, 3).unwrap());
+    assert!(state.stage_tdata_drop_owned(owner, 3).unwrap());
+    state.complete_commit().unwrap();
+
+    state.begin().unwrap();
+    assert!(state.acquire_tdata_read_owned(owner, 3).unwrap());
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn transaction_telem_drop_visibility_follows_abort_and_commit() {
+    clear_current_thread_transaction_for_test();
+    let mut state = TransactionState::default();
+    let owner = Some(InstanceId::from_u32(8));
+
+    state.begin().unwrap();
+    assert!(!state.acquire_telem_read_owned(owner, 4).unwrap());
+    assert!(state.stage_telem_drop_owned(owner, 4).unwrap());
+    assert!(state.acquire_telem_read_owned(owner, 4).unwrap());
+    state.abort().unwrap();
+
+    state.begin().unwrap();
+    assert!(!state.acquire_telem_read_owned(owner, 4).unwrap());
+    assert!(state.stage_telem_drop_owned(owner, 4).unwrap());
+    state.complete_commit().unwrap();
+
+    state.begin().unwrap();
+    assert!(state.acquire_telem_read_owned(owner, 4).unwrap());
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transactional_segment_reads_and_drops_conflict_across_transaction_ids() {
+    clear_current_thread_transaction_for_test();
+    let mut state = TransactionState::default();
+    let owner = Some(InstanceId::from_u32(9));
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(100_001);
+
+    state.enter_transaction(younger).unwrap();
+    assert!(!state.acquire_tdata_read_owned(owner, 2).unwrap());
+    state.restore_transaction(None).unwrap();
+
+    state.enter_transaction(older).unwrap();
+    assert!(state.stage_tdata_drop_owned(owner, 2).unwrap());
+    state.complete_commit().unwrap();
+
+    state.restore_transaction(Some(younger)).unwrap();
+    let error = state.acquire_tdata_read_owned(owner, 2).unwrap_err();
+    assert!(
+        error.to_string().contains("transaction read conflict"),
+        "{error:?}"
+    );
+    state.abort().unwrap();
+
+    state.enter_transaction(older).unwrap();
+    assert!(!state.acquire_telem_read_owned(owner, 5).unwrap());
+    state.restore_transaction(None).unwrap();
+
+    state.enter_transaction(younger).unwrap();
+    assert!(state.stage_telem_drop_owned(owner, 5).unwrap());
+    state.complete_commit().unwrap();
+
+    state.restore_transaction(Some(older)).unwrap();
+    let error = state.acquire_telem_read_owned(owner, 5).unwrap_err();
+    assert!(
+        error.to_string().contains("transaction read conflict"),
+        "{error:?}"
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn native_active_transaction_segments_keep_logical_granule_identities() {
+    clear_current_thread_transaction_for_test();
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tmemory $memory 1)
+              (ttable $table 2 tfuncref)
+              (tfunc $target)
+              (tdata $data0 (tmemory $memory) (i32.const 0) "A")
+              (tdata $data1 (tmemory $memory) (i32.const 1) "B")
+              (telem $elem0 (ttable $table) (i32.const 0) tfunc $target)
+              (telem $elem1 (ttable $table) (i32.const 1) tfunc $target)
+              (tfunc (export "drop0")
+                (tdata.drop $data0)
+                (telem.drop $elem0))
+              (tfunc (export "drop1")
+                (tdata.drop $data1)
+                (telem.drop $elem1)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let drop0 = instance
+        .get_typed_func::<(), ()>(&mut store, "drop0")
+        .unwrap();
+    let drop1 = instance
+        .get_typed_func::<(), ()>(&mut store, "drop1")
+        .unwrap();
+    let owner = Some(instance.id());
+
+    let first = TransactionId::from_raw(71);
+    store
+        .transaction_state_mut()
+        .enter_transaction(first)
+        .unwrap();
+    drop0.call(&mut store, ()).unwrap();
+    assert!(
+        store
+            .transaction_state()
+            .owns_granule_write(tdata_granule_id(owner, 0)),
+        "active tdata must retain its logical segment identity"
+    );
+    assert!(
+        store
+            .transaction_state()
+            .owns_granule_write(telem_granule_id(owner, 0)),
+        "active telem must retain its logical segment identity"
+    );
+    store
+        .transaction_state_mut()
+        .restore_transaction(None)
+        .unwrap();
+
+    let second = TransactionId::from_raw(72);
+    store
+        .transaction_state_mut()
+        .enter_transaction(second)
+        .unwrap();
+    drop1.call(&mut store, ()).unwrap();
+    assert!(
+        store
+            .transaction_state()
+            .owns_granule_write(tdata_granule_id(owner, 1)),
+        "distinct active tdata must use a distinct logical granule"
+    );
+    assert!(
+        store
+            .transaction_state()
+            .owns_granule_write(telem_granule_id(owner, 1)),
+        "distinct active telem must use a distinct logical granule"
+    );
+    store.transaction_state_mut().abort().unwrap();
+
+    store
+        .transaction_state_mut()
+        .restore_transaction(Some(first))
+        .unwrap();
+    store.transaction_state_mut().abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn native_tarray_data_load_takes_source_segment_write_ownership() {
+    clear_current_thread_transaction_for_test();
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i8))
+              (tdata $data "A")
+              (tfunc (export "load")
+                (drop
+                  (tarray.new_data $a $data
+                    (i32.const 0) (i32.const 1))))
+              (tfunc (export "drop") (tdata.drop $data)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let load = instance
+        .get_typed_func::<(), ()>(&mut store, "load")
+        .unwrap();
+    let drop = instance
+        .get_typed_func::<(), ()>(&mut store, "drop")
+        .unwrap();
+    let owner = Some(instance.id());
+    let older = TransactionId::from_raw(1);
+    let younger = TransactionId::from_raw(2);
+
+    store
+        .transaction_state_mut()
+        .enter_transaction(younger)
+        .unwrap();
+    load.call(&mut store, ()).unwrap();
+    assert!(
+        store
+            .transaction_state()
+            .owns_granule_write(tdata_granule_id(owner, 0)),
+        "tarray data loads must take write ownership after their bounds read"
+    );
+    store
+        .transaction_state_mut()
+        .restore_transaction(None)
+        .unwrap();
+
+    store
+        .transaction_state_mut()
+        .enter_transaction(older)
+        .unwrap();
+    drop.call(&mut store, ()).unwrap();
+    assert!(
+        !store.transaction_state().transaction_is_open(younger),
+        "the older segment writer must abort the younger tarray-data owner"
+    );
+    store.transaction_state_mut().abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn native_transaction_init_checks_destination_before_source_segment() {
+    clear_current_thread_transaction_for_test();
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $bytes (tarray (mut i8)))
+              (type $refs (tarray (mut (tref null $bytes))))
+              (tmemory 1)
+              (tdata $data "A")
+              (telem $elem (tref null $bytes)
+                (tarray.new_fixed $bytes 1 (i32.const 1)))
+
+              (tfunc (export "own-data")
+                (drop
+                  (tarray.new_data $bytes $data
+                    (i32.const 0) (i32.const 1))))
+              (tfunc (export "own-elem") (telem.drop $elem))
+
+              (tfunc (export "tmemory-oob")
+                (tmemory.init $data
+                  (i32.const 65536) (i32.const 0) (i32.const 1)))
+              (tfunc (export "tarray-data-oob")
+                (local $array (tref $bytes))
+                (local.set $array
+                  (tarray.new_default $bytes (i32.const 1)))
+                (tarray.init_data $bytes $data
+                  (tref.cast_write (local.get $array))
+                  (i32.const 1) (i32.const 0) (i32.const 1)))
+              (tfunc (export "tarray-elem-oob")
+                (local $array (tref $refs))
+                (local.set $array
+                  (tarray.new_default $refs (i32.const 1)))
+                (tarray.init_elem $refs $elem
+                  (tref.cast_write (local.get $array))
+                  (i32.const 1) (i32.const 0) (i32.const 1))))
+        "#,
+    );
+
+    for (owner_name, oob_name) in [
+        ("own-data", "tmemory-oob"),
+        ("own-data", "tarray-data-oob"),
+        ("own-elem", "tarray-elem-oob"),
+    ] {
+        let mut store = crate::Store::new(&engine, ());
+        let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+        let own = instance
+            .get_typed_func::<(), ()>(&mut store, owner_name)
+            .unwrap();
+        let oob = instance
+            .get_typed_func::<(), ()>(&mut store, oob_name)
+            .unwrap();
+        let older = TransactionId::from_raw(1);
+        let younger = TransactionId::from_raw(2);
+
+        store
+            .transaction_state_mut()
+            .enter_transaction(younger)
+            .unwrap();
+        own.call(&mut store, ()).unwrap();
+        store
+            .transaction_state_mut()
+            .restore_transaction(None)
+            .unwrap();
+
+        store
+            .transaction_state_mut()
+            .enter_transaction(older)
+            .unwrap();
+        let error = format!("{:?}", oob.call(&mut store, ()).unwrap_err());
+        assert!(error.contains("out of bounds"), "{oob_name}: {error}");
+        assert!(
+            store.transaction_state().transaction_is_open(younger),
+            "{oob_name} must not acquire or conflict on its source segment after a destination OOB"
+        );
+        store
+            .transaction_state_mut()
+            .abort_transaction(younger)
+            .unwrap();
+    }
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
 fn native_indirect_calls_keep_ordinary_and_transactional_table_zero_distinct() {
     let engine = crate::Engine::default();
     let module = transaction_test_module(
@@ -10923,6 +11538,9 @@ fn native_indirect_calls_keep_ordinary_and_transactional_table_zero_distinct() {
               (func (export "prestart") (result i32)
                 (i32.const 0)
                 (tcall_indirect flags=0 $prestart-table (type $transaction-sig)))
+              (func (export "prestart-transaction-table") (result i32)
+                (i32.const 0)
+                (tcall_indirect $transaction-table (type $transaction-sig)))
               (func (export "prestart-direct") (result i32)
                 (tcall $transaction-target))
               (tfunc (export "transactional-tail") (result i32)
@@ -10931,6 +11549,9 @@ fn native_indirect_calls_keep_ordinary_and_transactional_table_zero_distinct() {
               (func (export "prestart-tail") (result i32)
                 (i32.const 0)
                 (return_tcall_indirect flags=0 $prestart-table (type $transaction-sig)))
+              (func (export "prestart-transaction-table-tail") (result i32)
+                (i32.const 0)
+                (return_tcall_indirect $transaction-table (type $transaction-sig)))
               (tfunc (export "transactional-direct-tail") (result i32)
                 (return_tcall $transaction-target)))
         "#,
@@ -10942,9 +11563,11 @@ fn native_indirect_calls_keep_ordinary_and_transactional_table_zero_distinct() {
         ("ordinary", 11),
         ("transactional", 22),
         ("prestart", 22),
+        ("prestart-transaction-table", 22),
         ("prestart-direct", 22),
         ("transactional-tail", 22),
         ("prestart-tail", 22),
+        ("prestart-transaction-table-tail", 22),
         ("transactional-direct-tail", 22),
     ] {
         let function = instance
@@ -11610,10 +12233,12 @@ fn mock_transaction_unexecuted_ttry_does_not_commit_caller_transaction() {
                 (local.get 0)
                 (if
                   (then)))
-              (tfunc (export "write_then_fail")
-                (i32.tstore (i32.const 0) (i32.const 42))
-                (tcall $maybe_begin (i32.const 0))
-                (tfail (i32.const 0)))
+              (func (export "write_then_fail")
+                (tblock
+                  ((i32.tstore (i32.const 0) (i32.const 42))
+                   (tcall $maybe_begin (i32.const 0))
+                   (tfail (i32.const 0)))
+                  (else (drop))))
               (tfunc (export "read") (result i32)
                 (i32.tload (i32.const 0))))
             "#,
@@ -15532,39 +16157,37 @@ fn object_table_granule_permissions_use_object_identity() {
     let mut state = TransactionState::default();
 
     state.begin().unwrap();
+    let struct_granule = objects.granule_id(struct_object).unwrap();
+    let array_granule = objects.granule_id(array_object).unwrap();
+    assert!(matches!(
+        struct_granule,
+        GranuleId::VolatileObject { object_id, .. } if object_id == struct_object
+    ));
+    assert!(matches!(
+        array_granule,
+        GranuleId::VolatileObject { object_id, .. } if object_id == array_object
+    ));
 
     assert!(
         state
             .acquire_object_read(&mut objects, struct_object)
             .unwrap()
     );
-    assert!(state.owns_granule_read(GranuleId::Object {
-        object_id: struct_object,
-    }));
-    assert!(!state.owns_granule_write(GranuleId::Object {
-        object_id: struct_object,
-    }));
+    assert!(state.owns_granule_read(struct_granule));
+    assert!(!state.owns_granule_write(struct_granule));
 
     assert!(
         state
             .acquire_object_write(&mut objects, array_object)
             .unwrap()
     );
-    assert!(state.owns_granule_read(GranuleId::Object {
-        object_id: array_object,
-    }));
-    assert!(state.owns_granule_write(GranuleId::Object {
-        object_id: array_object,
-    }));
+    assert!(state.owns_granule_read(array_granule));
+    assert!(state.owns_granule_write(array_granule));
 
     state.abort().unwrap();
 
-    assert!(!state.owns_granule_read(GranuleId::Object {
-        object_id: struct_object,
-    }));
-    assert!(!state.owns_granule_write(GranuleId::Object {
-        object_id: array_object,
-    }));
+    assert!(!state.owns_granule_read(struct_granule));
+    assert!(!state.owns_granule_write(array_granule));
 }
 
 #[test]
@@ -21923,7 +22546,7 @@ fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed
         state.read_struct_field(&mut objects, object, 0).unwrap(),
         ObjectValue::I32(9)
     );
-    assert!(state.owns_object_write(object));
+    assert!(state.owns_granule_write(objects.granule_id(object).unwrap()));
 
     assert!(state.commit_object_payloads(&mut objects).unwrap());
     state.complete_commit().unwrap();
@@ -21932,7 +22555,7 @@ fn transaction_object_tstruct_field_helpers_read_staged_payload_before_committed
         objects.payload(object).unwrap(),
         ObjectPayload::Struct(vec![ObjectValue::I32(9), ObjectValue::I64(2)])
     );
-    assert!(!state.owns_object_write(object));
+    assert!(!state.owns_granule_write(objects.granule_id(object).unwrap()));
 }
 
 #[test]
@@ -22373,6 +22996,710 @@ fn transaction_local_object_promotion_preserves_cycles() {
 }
 
 #[test]
+fn transaction_local_objects_materialize_across_workspace_switches() {
+    clear_current_thread_transaction_for_test();
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+    let outer = TransactionId::from_raw(31);
+    let target = TransactionId::from_raw(32);
+    let argument_type = wasmtime_environ::VMSharedTypeIndex::new(0x7b1);
+    let result_type = wasmtime_environ::VMSharedTypeIndex::new(0x7b2);
+
+    state.enter_transaction(outer).unwrap();
+    let argument = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(41)], Some(argument_type))
+        .unwrap();
+    let argument_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, argument, |_| false)
+        .unwrap();
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    let shared_argument = objects
+        .object_id_for_transaction_ref_handle(argument_handle)
+        .unwrap();
+    assert!(!objects.is_persistent(shared_argument).unwrap());
+    assert_eq!(
+        objects.runtime_type_index(shared_argument).unwrap(),
+        Some(argument_type)
+    );
+
+    state.enter_transaction(target).unwrap();
+    assert!(
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, argument_handle)
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .read_struct_field(&mut objects, shared_argument, 0)
+            .unwrap(),
+        ObjectValue::I32(41)
+    );
+
+    let result = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I64(99)], Some(result_type))
+        .unwrap();
+    let result_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, result, |_| false)
+        .unwrap();
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    state.restore_transaction(Some(outer)).unwrap();
+
+    let shared_result = state
+        .object_id_for_transaction_ref_handle(&objects, result_handle)
+        .unwrap();
+    assert!(!objects.is_persistent(shared_result).unwrap());
+    assert_eq!(
+        state.runtime_type_index(&objects, shared_result).unwrap(),
+        Some(result_type)
+    );
+    assert!(
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, result_handle)
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .read_struct_field(&mut objects, shared_result, 0)
+            .unwrap(),
+        ObjectValue::I64(99)
+    );
+
+    state.abort().unwrap();
+    state.restore_transaction(Some(target)).unwrap();
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn transaction_materialized_promotion_preserves_shared_graph_identity() {
+    clear_current_thread_transaction_for_test();
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+    let owner = TransactionId::from_raw(41);
+    let observer = TransactionId::from_raw(42);
+
+    state.enter_transaction(owner).unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(9)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    let volatile = objects
+        .object_id_for_transaction_ref_handle(handle)
+        .unwrap();
+    assert!(!objects.is_persistent(volatile).unwrap());
+
+    state.restore_transaction(None).unwrap();
+    state.enter_transaction(observer).unwrap();
+    let container = state
+        .allocate_transaction_local_struct(vec![ObjectValue::Ref(Some(volatile))], None)
+        .unwrap();
+    let container_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, container, |_| false)
+        .unwrap();
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    let shared_container = objects
+        .object_id_for_transaction_ref_handle(container_handle)
+        .unwrap();
+    state.restore_transaction(None).unwrap();
+
+    state.restore_transaction(Some(owner)).unwrap();
+    state
+        .stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))
+        .unwrap();
+    assert!(
+        state
+            .promote_persistent_references_before_commit(&mut objects)
+            .unwrap()
+    );
+    let persistent = state.promoted_object_for_test(volatile).unwrap();
+    assert_eq!(persistent, volatile);
+    assert!(state.commit_object_payloads(&mut objects).unwrap());
+
+    assert_eq!(
+        objects
+            .object_id_for_transaction_ref_handle(handle)
+            .unwrap(),
+        persistent,
+        "the original raw handle must retain the promoted object's identity"
+    );
+    assert!(objects.is_persistent(volatile).unwrap());
+    assert_eq!(objects.live_count(), 2);
+    let root_delta = state
+        .staged_persistent_root_delta_for_test(&objects)
+        .unwrap();
+    state
+        .complete_commit_with_persistent_root_delta_for_test(root_delta)
+        .unwrap();
+
+    state.restore_transaction(Some(observer)).unwrap();
+    assert!(
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, container_handle)
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .read_struct_field(&mut objects, shared_container, 0)
+            .unwrap(),
+        ObjectValue::Ref(Some(volatile)),
+        "an escaped C -> X edge must retain X's one identity across publication"
+    );
+    assert!(
+        state
+            .acquire_tref_write_for_transaction_ref_handle(&mut objects, handle)
+            .unwrap()
+    );
+    state
+        .stage_struct_field(&mut objects, volatile, 0, ObjectValue::I32(17))
+        .unwrap();
+    assert!(state.commit_object_payloads(&mut objects).unwrap());
+    state.complete_commit().unwrap();
+    assert_eq!(
+        objects.payload(volatile).unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::I32(17)])
+    );
+    assert_eq!(objects.live_count(), 2);
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+fn transaction_materialized_promotion_publication_failure_keeps_volatile_identity() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::default();
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut state = TransactionState::default();
+    state.set_shared_region_runtime(Some(runtime.clone()));
+
+    state
+        .enter_transaction(TransactionId::from_raw(43))
+        .unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(5)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    let volatile = objects
+        .object_id_for_transaction_ref_handle(handle)
+        .unwrap();
+    state
+        .stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))
+        .unwrap();
+    state
+        .promote_persistent_references_before_commit(&mut objects)
+        .unwrap();
+
+    let error = state
+        .commit_object_payloads_with(&mut objects, |_| {
+            bail!("injected persistent publication failure")
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected persistent publication failure")
+    );
+    assert!(!objects.is_persistent(volatile).unwrap());
+    assert_eq!(
+        objects
+            .object_id_for_transaction_ref_handle(handle)
+            .unwrap(),
+        volatile
+    );
+    assert!(
+        runtime
+            .persistent_object_directory_entry(volatile)
+            .unwrap()
+            .is_none(),
+        "failed publication must not install durable object metadata"
+    );
+
+    state.abort_allocated_objects(&mut objects).unwrap();
+    state.begin_with_region_runtime(&runtime).unwrap();
+    assert!(
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)
+            .unwrap()
+    );
+    assert_eq!(
+        state.read_struct_field(&mut objects, volatile, 0).unwrap(),
+        ObjectValue::I32(5)
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(not(feature = "transaction-mvcc"))]
+fn unchanged_materialized_publication_preserves_suspended_reader_version() -> Result<()> {
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir.path().join("unchanged-materialized-publication.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::default();
+    let owner = TransactionId::from_raw(51);
+    let observer = TransactionId::from_raw(52);
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut state = TransactionState::new_for_test_with_durable_log(owner, durable_log);
+    state.set_shared_region_runtime(Some(runtime.clone()));
+
+    let local = state.allocate_transaction_local_struct(vec![ObjectValue::I32(9)], None)?;
+    let handle =
+        state.transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)?;
+    state.materialize_transaction_local_objects_for_workspace_switch(&mut objects)?;
+    let shared = objects.object_id_for_transaction_ref_handle(handle)?;
+    state.restore_transaction(None)?;
+
+    state.enter_transaction(observer)?;
+    state.acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)?;
+    assert_eq!(
+        state.read_struct_field(&mut objects, shared, 0)?,
+        ObjectValue::I32(9)
+    );
+    state.restore_transaction(None)?;
+
+    state.restore_transaction(Some(owner))?;
+    state.stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))?;
+    commit_active_file_backed_publications_for_test(51, 51, &mut objects, &mut state)?;
+    assert!(objects.is_persistent(shared)?);
+
+    state.restore_transaction(Some(observer))?;
+    state.validate_active_object_reads(&objects)?;
+    state.complete_commit()?;
+    clear_current_thread_transaction_for_test();
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    not(feature = "transaction-mvcc"),
+    not(feature = "transaction-cc-strict-2pl")
+))]
+fn changed_materialized_publication_invalidates_suspended_reader_version() -> Result<()> {
+    clear_current_thread_transaction_for_test();
+    let dir = tempfile::tempdir()?;
+    let tx_log_path = dir.path().join("changed-materialized-publication.bin");
+    let durable_log = TxDurableLog::create_file_backed(&tx_log_path, 64)?;
+    let runtime = TransactionRegionRuntime::default();
+    let owner = TransactionId::from_raw(55);
+    let observer = TransactionId::from_raw(56);
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut state = TransactionState::new_for_test_with_durable_log(owner, durable_log);
+    state.set_shared_region_runtime(Some(runtime));
+
+    let local = state.allocate_transaction_local_struct(vec![ObjectValue::I32(9)], None)?;
+    let handle =
+        state.transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)?;
+    state.materialize_transaction_local_objects_for_workspace_switch(&mut objects)?;
+    let shared = objects.object_id_for_transaction_ref_handle(handle)?;
+    state.restore_transaction(None)?;
+
+    state.enter_transaction(observer)?;
+    state.acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)?;
+    state.restore_transaction(None)?;
+
+    state.restore_transaction(Some(owner))?;
+    state.acquire_tref_write_for_transaction_ref_handle(&mut objects, handle)?;
+    state.stage_struct_field(&mut objects, shared, 0, ObjectValue::I32(17))?;
+    state.stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))?;
+    commit_active_file_backed_publications_for_test(55, 55, &mut objects, &mut state)?;
+
+    state.restore_transaction(Some(observer))?;
+    let error = state.validate_active_object_reads(&objects).unwrap_err();
+    assert!(
+        error.to_string().contains("transaction read conflict"),
+        "{error:?}"
+    );
+    state.abort()?;
+    clear_current_thread_transaction_for_test();
+    Ok(())
+}
+
+#[test]
+#[cfg(not(feature = "transaction-mvcc"))]
+fn unchanged_local_materialized_publication_preserves_suspended_reader_version() -> Result<()> {
+    clear_current_thread_transaction_for_test();
+    let owner = TransactionId::from_raw(53);
+    let observer = TransactionId::from_raw(54);
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::new_for_test(owner);
+
+    let local = state.allocate_transaction_local_struct(vec![ObjectValue::I32(9)], None)?;
+    let handle =
+        state.transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)?;
+    state.materialize_transaction_local_objects_for_workspace_switch(&mut objects)?;
+    let shared = objects.object_id_for_transaction_ref_handle(handle)?;
+    state.restore_transaction(None)?;
+
+    state.enter_transaction(observer)?;
+    state.acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)?;
+    state.restore_transaction(None)?;
+
+    state.restore_transaction(Some(owner))?;
+    state.stage_global_owned(None, 0, GlobalSnapshot::GcRef(handle))?;
+    state.promote_persistent_references_before_commit(&mut objects)?;
+    state.commit_object_payloads(&mut objects)?;
+    let root_delta = state.staged_persistent_root_delta_for_test(&objects)?;
+    state.complete_commit_with_persistent_root_delta_for_test(root_delta)?;
+    assert!(objects.is_persistent(shared)?);
+
+    state.restore_transaction(Some(observer))?;
+    state.validate_active_object_reads(&objects)?;
+    state.complete_commit()?;
+    clear_current_thread_transaction_for_test();
+    Ok(())
+}
+
+fn assert_local_permission_survives_materialization(write: bool) {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::default();
+    let mut objects = ObjectTable::default();
+    objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut state = TransactionState::default();
+    state.set_shared_region_runtime(Some(runtime));
+    let owner = TransactionId::from_raw(1);
+    let contender = TransactionId::from_raw(100_001);
+
+    state.enter_transaction(owner).unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    if write {
+        state
+            .acquire_tref_write_for_transaction_ref_handle(&mut objects, handle)
+            .unwrap();
+    } else {
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)
+            .unwrap();
+    }
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    state.restore_transaction(None).unwrap();
+
+    state.enter_transaction(contender).unwrap();
+    if write {
+        let error = state
+            .acquire_tref_write_for_transaction_ref_handle(&mut objects, handle)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("transaction write conflict"),
+            "{error:?}"
+        );
+    } else {
+        assert!(
+            state
+                .acquire_tref_write_for_transaction_ref_handle(&mut objects, handle)
+                .unwrap(),
+            "the reference permits a writer after an optimistic reader"
+        );
+    }
+    state.abort().unwrap();
+    state.restore_transaction(Some(owner)).unwrap();
+    if !write {
+        let error = state.validate_active_object_reads(&objects).unwrap_err();
+        assert!(
+            error.to_string().contains("transaction read conflict"),
+            "{error:?}"
+        );
+    }
+    state.abort_allocated_objects(&mut objects).unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transaction_local_read_permission_survives_materialization() {
+    assert_local_permission_survives_materialization(false);
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transaction_local_write_permission_without_mutation_survives_materialization() {
+    assert_local_permission_survives_materialization(true);
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transaction_local_materialization_remaps_cycles_and_preserves_conflicts() {
+    clear_current_thread_transaction_for_test();
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+    let owner = TransactionId::from_raw(1);
+    let contender = TransactionId::from_raw(100_001);
+
+    state.enter_transaction(owner).unwrap();
+    let left = state
+        .allocate_transaction_local_struct(vec![ObjectValue::Ref(None)], None)
+        .unwrap();
+    let right = state
+        .allocate_transaction_local_struct(vec![ObjectValue::Ref(Some(left))], None)
+        .unwrap();
+    state
+        .stage_struct_field(&mut objects, left, 0, ObjectValue::Ref(Some(right)))
+        .unwrap();
+    let left_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, left, |_| false)
+        .unwrap();
+    let right_handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, right, |_| false)
+        .unwrap();
+
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    let shared_left = objects
+        .object_id_for_transaction_ref_handle(left_handle)
+        .unwrap();
+    let shared_right = objects
+        .object_id_for_transaction_ref_handle(right_handle)
+        .unwrap();
+    assert_eq!(
+        state
+            .read_struct_field(&mut objects, shared_left, 0)
+            .unwrap(),
+        ObjectValue::Ref(Some(shared_right))
+    );
+
+    state.restore_transaction(None).unwrap();
+    state.enter_transaction(contender).unwrap();
+    let error = state
+        .acquire_tref_read_for_transaction_ref_handle(&mut objects, left_handle)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("transaction read conflict"),
+        "{error:?}"
+    );
+    state.abort().unwrap();
+
+    state.restore_transaction(Some(owner)).unwrap();
+    assert!(state.commit_object_payloads(&mut objects).unwrap());
+    state.complete_commit().unwrap();
+
+    state.begin().unwrap();
+    assert!(
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, left_handle)
+            .unwrap()
+    );
+    assert!(
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, right_handle)
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .read_object_payload(&mut objects, shared_left)
+            .unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(shared_right))])
+    );
+    assert_eq!(
+        state
+            .read_object_payload(&mut objects, shared_right)
+            .unwrap(),
+        ObjectPayload::Struct(vec![ObjectValue::Ref(Some(shared_left))])
+    );
+    state.abort().unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transaction_local_materialization_allows_older_contender_to_wound_owner() {
+    clear_current_thread_transaction_for_test();
+    let mut objects = ObjectTable::default();
+    let mut state = TransactionState::default();
+    let owner = TransactionId::from_raw(2);
+    let contender = TransactionId::from_raw(1);
+
+    state.enter_transaction(owner).unwrap();
+    let local = state
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(7)], None)
+        .unwrap();
+    state
+        .stage_struct_field(&mut objects, local, 0, ObjectValue::I32(9))
+        .unwrap();
+    let handle = state
+        .transaction_ref_handle_for_object_id_avoiding(&mut objects, local, |_| false)
+        .unwrap();
+    state
+        .materialize_transaction_local_objects_for_workspace_switch(&mut objects)
+        .unwrap();
+    state.restore_transaction(None).unwrap();
+
+    state.enter_transaction(contender).unwrap();
+    assert!(
+        state
+            .acquire_tref_read_for_transaction_ref_handle(&mut objects, handle)
+            .unwrap()
+    );
+    assert!(
+        !state.transaction_is_open(owner),
+        "the older contender must remove the younger materialized owner"
+    );
+    state.abort_allocated_objects(&mut objects).unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transaction_volatile_materialization_isolated_across_object_tables() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::default();
+    let mut first_objects = ObjectTable::default();
+    first_objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut second_objects = ObjectTable::default();
+    second_objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut first = TransactionState::default();
+    first.set_shared_region_runtime(Some(runtime.clone()));
+    let mut second = TransactionState::default();
+    second.set_shared_region_runtime(Some(runtime));
+
+    let first_tid = TransactionId::from_raw(1);
+    first.enter_transaction(first_tid).unwrap();
+    let first_local = first
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    first
+        .stage_struct_field(&mut first_objects, first_local, 0, ObjectValue::I32(11))
+        .unwrap();
+    first
+        .materialize_transaction_local_objects_for_workspace_switch(&mut first_objects)
+        .unwrap();
+    first.restore_transaction(None).unwrap();
+
+    let second_tid = TransactionId::from_raw(2);
+    second.enter_transaction(second_tid).unwrap();
+    let second_local = second
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(2)], None)
+        .unwrap();
+    second
+        .stage_struct_field(&mut second_objects, second_local, 0, ObjectValue::I32(22))
+        .unwrap();
+    second
+        .materialize_transaction_local_objects_for_workspace_switch(&mut second_objects)
+        .expect("unrelated store-local object zero must have a distinct volatile granule");
+
+    assert_eq!(first_objects.live_count(), 1);
+    assert_eq!(second_objects.live_count(), 1);
+    second.abort_allocated_objects(&mut second_objects).unwrap();
+    first.restore_transaction(Some(first_tid)).unwrap();
+    first.abort_allocated_objects(&mut first_objects).unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
+#[cfg(feature = "transaction-cc-lockbased")]
+fn transaction_materialization_rolls_back_association_after_acquisition_failure() {
+    clear_current_thread_transaction_for_test();
+    let runtime = TransactionRegionRuntime::default();
+    let runtime_control = runtime.clone();
+    let mut owner_objects = ObjectTable::default();
+    owner_objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut contender_objects = ObjectTable::default();
+    contender_objects.set_shared_region_runtime(Some(runtime.clone()));
+    let mut owner = TransactionState::default();
+    owner.set_shared_region_runtime(Some(runtime.clone()));
+    let mut contender = TransactionState::default();
+    contender.set_shared_region_runtime(Some(runtime));
+
+    let owner_tid = TransactionId::from_raw(1);
+    owner.enter_transaction(owner_tid).unwrap();
+    let owner_local = owner
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(1)], None)
+        .unwrap();
+    owner
+        .stage_struct_field(&mut owner_objects, owner_local, 0, ObjectValue::I32(11))
+        .unwrap();
+    owner
+        .materialize_transaction_local_objects_for_workspace_switch(&mut owner_objects)
+        .unwrap();
+    owner.restore_transaction(None).unwrap();
+    runtime_control
+        .acquire_granule_write(
+            owner_tid,
+            GranuleId::Object {
+                object_id: ObjectId { object_index: 1 },
+            },
+            0,
+        )
+        .unwrap();
+
+    contender
+        .enter_transaction(TransactionId::from_raw(2))
+        .unwrap();
+    let contender_local = contender
+        .allocate_transaction_local_struct(vec![ObjectValue::I32(2)], None)
+        .unwrap();
+    let contender_handle = contender
+        .transaction_ref_handle_for_object_id_avoiding(
+            &mut contender_objects,
+            contender_local,
+            |_| false,
+        )
+        .unwrap();
+    contender
+        .stage_struct_field(
+            &mut contender_objects,
+            contender_local,
+            0,
+            ObjectValue::I32(22),
+        )
+        .unwrap();
+
+    let error = contender
+        .materialize_transaction_local_objects_for_workspace_switch(&mut contender_objects)
+        .unwrap_err();
+    assert!(error.to_string().contains("transaction write conflict"));
+    assert_eq!(contender_objects.live_count(), 0);
+    assert_eq!(
+        contender_objects.known_object_id_for_transaction_ref_handle(contender_handle),
+        None,
+        "failed materialization must remove its raw-handle association"
+    );
+
+    runtime_control
+        .release_transaction_for_test(owner_tid)
+        .unwrap();
+    contender
+        .materialize_transaction_local_objects_for_workspace_switch(&mut contender_objects)
+        .expect("materialization must be retryable after its conflicting owner exits");
+    assert!(
+        contender_objects
+            .known_object_id_for_transaction_ref_handle(contender_handle)
+            .is_some()
+    );
+    contender
+        .abort_allocated_objects(&mut contender_objects)
+        .unwrap();
+    owner
+        .abort_transaction_allocated_objects(&mut owner_objects, owner_tid)
+        .unwrap();
+    clear_current_thread_transaction_for_test();
+}
+
+#[test]
 fn transaction_local_object_abort_discards_without_shared_object_cleanup() {
     let mut objects = ObjectTable::default();
     let mut state = TransactionState::default();
@@ -22646,7 +23973,7 @@ fn transaction_object_tarray_helpers_stage_whole_object_and_commit_ranges() {
             ObjectValue::I32(4),
         ])
     );
-    assert!(state.owns_object_write(object));
+    assert!(state.owns_granule_write(objects.granule_id(object).unwrap()));
 
     assert!(state.commit_object_payloads(&mut objects).unwrap());
     state.complete_commit().unwrap();
@@ -30075,12 +31402,629 @@ fn native_structured_transaction_controls_execute_handlers_and_exits() {
 }
 
 #[test]
+fn transaction_tblock_preserves_all_escaping_transaction_refs() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+              (func (export "run") (result i32)
+                (local $first (tref $a))
+                (local $second (tref $a))
+                (local $third (tref $a))
+                (tblock (result (tref $a) (tref $a) (tref $a))
+                  ((tarray.new_fixed $a 1 (i32.const 11))
+                   (tarray.new_fixed $a 1 (i32.const 13))
+                   (tarray.new_fixed $a 1 (i32.const 17)))
+                  (else
+                    (drop)
+                    (tref.null $a) (tref.cast (tref none $a))
+                    (tref.null $a) (tref.cast (tref none $a))
+                    (tref.null $a) (tref.cast (tref none $a))))
+                (local.set $third)
+                (local.set $second)
+                (local.set $first)
+                (tblock (result i32)
+                  ((i32.add
+                     (i32.add
+                       (tarray.get $a (tref.cast_read (local.get $first)) (i32.const 0))
+                       (tarray.get $a (tref.cast_read (local.get $second)) (i32.const 0)))
+                     (tarray.get $a (tref.cast_read (local.get $third)) (i32.const 0))))
+                  (else))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 41);
+}
+
+#[test]
+fn transaction_tblock_preserves_transaction_refs_on_all_control_exits() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+              (func $make_br (result (tref $a))
+                (tblock $tx (result (tref $a))
+                  ((tarray.new_fixed $a 1 (i32.const 11))
+                   (br $tx))
+                  (else
+                    (drop)
+                    (tref.null $a) (tref.cast (tref none $a)))))
+              (func $make_br_if (result (tref $a))
+                (tblock $tx (result (tref $a))
+                  ((tarray.new_fixed $a 1 (i32.const 13))
+                   (i32.const 1)
+                   (br_if $tx)
+                   (drop)
+                   (tref.null $a) (tref.cast (tref none $a)))
+                  (else
+                    (drop)
+                    (tref.null $a) (tref.cast (tref none $a)))))
+              (func $make_br_table (result (tref $a))
+                (tblock $tx (result (tref $a))
+                  ((tarray.new_fixed $a 1 (i32.const 17))
+                   (i32.const 0)
+                   (br_table $tx))
+                  (else
+                    (drop)
+                    (tref.null $a) (tref.cast (tref none $a)))))
+              (func $make_return (result (tref $a))
+                (tblock (result (tref $a))
+                  ((tarray.new_fixed $a 1 (i32.const 19))
+                   (return))
+                  (else
+                    (drop)
+                    (tref.null $a) (tref.cast (tref none $a)))))
+              (func (export "run") (result i32)
+                (local $a0 (tref $a))
+                (local $a1 (tref $a))
+                (local $a2 (tref $a))
+                (local $a3 (tref $a))
+                (local.set $a0 (call $make_br))
+                (local.set $a1 (call $make_br_if))
+                (local.set $a2 (call $make_br_table))
+                (local.set $a3 (call $make_return))
+                (tblock (result i32)
+                  ((i32.add
+                     (i32.add
+                       (tarray.get $a (tref.cast_read (local.get $a0)) (i32.const 0))
+                       (tarray.get $a (tref.cast_read (local.get $a1)) (i32.const 0)))
+                     (i32.add
+                       (tarray.get $a (tref.cast_read (local.get $a2)) (i32.const 0))
+                       (tarray.get $a (tref.cast_read (local.get $a3)) (i32.const 0)))))
+                  (else))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 60);
+}
+
+#[test]
+fn transaction_typed_reference_branches_cleanup_owning_tblock() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+
+              (func (export "null") (result i32)
+                (tblock $first
+                  ((drop (br_on_tnull $first (tref.null tany))))
+                  (else (drop)))
+                (tblock (result i32)
+                  ((tfail (i32.const 7)) (i32.const -1))
+                  (else (drop) (i32.const 42))))
+
+              (func (export "non-null") (result i32)
+                (drop
+                  (tblock $first (result (tref ti31))
+                    ((br_on_tnon_null $first (tref.ti31 (i32.const 1)))
+                     unreachable)
+                    (else (drop) (tref.ti31 (i32.const 0)))))
+                (tblock (result i32)
+                  ((tfail (i32.const 7)) (i32.const -1))
+                  (else (drop) (i32.const 42))))
+
+              (func (export "cast") (result i32)
+                (drop
+                  (tblock $first (result (tref ti31))
+                    ((br_on_tcast $first tanyref (tref ti31)
+                       (tref.ti31 (i32.const 1)))
+                     unreachable)
+                    (else (drop) (tref.ti31 (i32.const 0)))))
+                (tblock (result i32)
+                  ((tfail (i32.const 7)) (i32.const -1))
+                  (else (drop) (i32.const 42))))
+
+              (func (export "cast-fail") (result i32)
+                (drop
+                  (tblock $first (result tanyref)
+                    ((br_on_tcast_fail $first tanyref (tref $a)
+                       (tref.ti31 (i32.const 1)))
+                     unreachable)
+                    (else (drop) (tref.null tany))))
+                (tblock (result i32)
+                  ((tfail (i32.const 7)) (i32.const -1))
+                  (else (drop) (i32.const 42)))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+
+    for name in ["null", "non-null", "cast", "cast-fail"] {
+        let run = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(run.call(&mut store, ()).unwrap(), 42, "{name}");
+    }
+}
+
+#[test]
+fn transaction_typed_reference_branches_preserve_aggregate_results() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+
+              (func $non-null (result (tref $a))
+                (tblock $tx (result (tref $a))
+                  ((br_on_tnon_null $tx
+                     (tarray.new_fixed $a 1 (i32.const 11)))
+                   unreachable)
+                  (else
+                    (drop)
+                    (tref.null $a) (tref.cast (tref none $a)))))
+
+              (func $cast (result (tref $a))
+                (tblock $tx (result (tref $a))
+                  ((br_on_tcast $tx tanyref (tref $a)
+                     (tarray.new_fixed $a 1 (i32.const 13)))
+                   unreachable)
+                  (else
+                    (drop)
+                    (tref.null $a) (tref.cast (tref none $a)))))
+
+              (func $cast-fail (result tanyref)
+                (tblock $tx (result tanyref)
+                  ((br_on_tcast_fail $tx tanyref (tref ti31)
+                     (tarray.new_fixed $a 1 (i32.const 17)))
+                   unreachable)
+                  (else (drop) (tref.null tany))))
+
+              (func (export "run") (result i32)
+                (local $a0 (tref $a))
+                (local $a1 (tref $a))
+                (local $a2 (tref $a))
+                (local.set $a0 (call $non-null))
+                (local.set $a1 (call $cast))
+                (local.set $a2 (tref.cast (tref $a) (call $cast-fail)))
+                (tblock (result i32)
+                  ((i32.add
+                     (i32.add
+                       (tarray.get $a (tref.cast_read (local.get $a0)) (i32.const 0))
+                       (tarray.get $a (tref.cast_read (local.get $a1)) (i32.const 0)))
+                     (tarray.get $a (tref.cast_read (local.get $a2)) (i32.const 0))))
+                  (else))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 41);
+}
+
+#[test]
+fn transaction_tblock_restores_locals_on_failure() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (func (export "run") (result i32)
+                (local $value i32)
+                (tblock
+                  ((local.set $value (i32.const 1))
+                   (tfail (i32.const 7)))
+                  (else (drop)))
+                (local.get $value)))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 0);
+}
+
+#[test]
+fn transaction_uncaught_failure_crosses_host_boundary() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tfunc (export "run") (result i32)
+                (tfail (i32.const 7))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    let error = format!("{:?}", run.call(&mut store, ()).unwrap_err());
+    assert!(error.contains("uncaught transaction failure"), "{error}");
+}
+
+#[test]
+fn transaction_scheduled_failure_does_not_leak_into_restored_outer_tblock() {
+    let engine = crate::Engine::default();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (tfunc $run-scheduled (import "" "run-scheduled") (result i32))
+              (tfunc (export "fail") (result i32)
+                (tfail (i32.const 7)))
+              (func (export "run") (result i32)
+                (tblock (result i32)
+                  ((tcall $run-scheduled))
+                  (else))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, None::<crate::Func>);
+    let mut linker: crate::Linker<Option<crate::Func>> = crate::Linker::new(&engine);
+    linker
+        .func_wrap(
+            "",
+            "run-scheduled",
+            |mut caller: crate::Caller<'_, Option<crate::Func>>| -> Result<i32> {
+                let fail = caller
+                    .data()
+                    .as_ref()
+                    .context("fail export was not installed")?
+                    .clone();
+                let previous = caller.transaction_spectest_enter_tid(2)?;
+                let call = fail.typed::<(), i32>(&caller)?.call(&mut caller, ());
+                caller.transaction_spectest_restore_tid(previous)?;
+                Ok(if call.is_err() { 33 } else { 44 })
+            },
+        )
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let fail = instance.get_func(&mut store, "fail").unwrap();
+    *store.data_mut() = Some(fail);
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 33);
+}
+
+#[test]
+fn transaction_tblock_preserves_unpermissioned_transaction_local() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+              (func (export "run") (result i32)
+                (local $array (tref null $a))
+                (tblock
+                  ((local.set $array
+                     (tarray.new_fixed $a 1 (i32.const 42))))
+                  (else (drop)))
+                (tblock (result i32)
+                  ((tarray.get $a
+                     (tref.cast_read (local.get $array))
+                     (i32.const 0)))
+                  (else (drop) (i32.const -1)))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 42);
+}
+
+#[test]
+fn transaction_tblock_clears_permissioned_transaction_local_on_success() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+              (func (export "run") (result i32)
+                (local $array (tref null read $a))
+                (tblock
+                  ((local.set $array
+                     (tref.cast_read
+                       (tarray.new_fixed $a 1 (i32.const 42)))))
+                  (else (drop)))
+                (tref.is_null (local.get $array))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 1);
+}
+
+#[test]
+fn transaction_tblock_direct_branch_retains_permissioned_local_like_interpreter() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+              (func (export "run") (result i32)
+                (local $array (tref null read $a))
+                (tblock $tx
+                  ((local.set $array
+                     (tref.cast_read
+                       (tarray.new_fixed $a 1 (i32.const 42))))
+                   (br $tx))
+                  (else (drop)))
+                (tblock (result i32)
+                  ((tarray.get $a (local.get $array) (i32.const 0)))
+                  (else (drop) (i32.const -1)))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    // The reference interpreter's `TxnCatch ... Breaking(0l)` path commits
+    // without applying `drop_txn_refs`, unlike fallthrough/nonlocal exits.
+    assert_eq!(run.call(&mut store, ()).unwrap(), 42);
+}
+
+#[test]
+fn transaction_nested_tblock_reuses_outer_permissioned_local_without_reacquiring() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+              (func (export "run") (result i32)
+                (local $array (tref null read $a))
+                (tblock (result i32)
+                  ((local.set $array
+                     (tref.cast_read
+                       (tarray.new_fixed $a 1 (i32.const 42))))
+                   (tblock (result i32)
+                     ((tarray.get $a (local.get $array) (i32.const 0)))
+                     (else (drop) (i32.const -1))))
+                  (else (drop) (i32.const -2)))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    assert_eq!(run.call(&mut store, ()).unwrap(), 42);
+}
+
+#[test]
+fn transaction_new_owning_tblock_transfers_retained_local_conflict_to_handler() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray i32))
+              (import "" "suspend-owner"
+                (func $suspend-owner (param (tref null read $a))))
+              (tfunc (export "take-write") (param (tref null $a))
+                (drop (tref.cast_write (tref.as_non_null (local.get 0)))))
+              (func (export "run") (result i32)
+                (local $array (tref null read $a))
+                (tblock $first
+                  ((local.set $array
+                     (tref.cast_read
+                       (tarray.new_fixed $a 1 (i32.const 42))))
+                   (br $first))
+                  (else (drop)))
+                (call $suspend-owner (local.get $array))
+                (tblock (result i32)
+                  ((tarray.get $a (local.get $array) (i32.const 0)))
+                  (else))))
+        "#,
+    );
+    let import_ty = match module.imports().next().unwrap().ty() {
+        crate::ExternType::Func(ty) => ty,
+        other => panic!("expected function import, found {other:?}"),
+    };
+    let mut store = crate::Store::new(&engine, None::<crate::Func>);
+    let mut linker: crate::Linker<Option<crate::Func>> = crate::Linker::new(&engine);
+    linker
+        .func_new(
+            "",
+            "suspend-owner",
+            import_ty,
+            |mut caller, params, _results| {
+                let take_write = caller
+                    .data()
+                    .as_ref()
+                    .context("take-write export was not installed")?
+                    .clone();
+                let previous = caller.transaction_spectest_enter_tid(2)?;
+                let call = take_write.call(&mut caller, params, &mut []);
+                let restore = caller.transaction_spectest_restore_tid(previous);
+                call?;
+                restore
+            },
+        )
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let take_write = instance.get_func(&mut store, "take-write").unwrap();
+    *store.data_mut() = Some(take_write);
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+
+    // The retained local is reacquired at the second owning TBlock boundary.
+    // The suspended writer therefore aborts the new transaction into `else`
+    // rather than surfacing a raw runtime-permission error.
+    assert_eq!(run.call(&mut store, ()).unwrap(), 0);
+}
+
+#[test]
 fn module_compilation_accepts_transaction_data_helper_lowering() {
     let engine = crate::Engine::default();
     transaction_test_module(
         &engine,
         "(module (tmemory 1) (tfunc (result i32) (i32.tload (i32.const 0))))",
     );
+}
+
+#[test]
+fn transaction_tarray_new_data_reads_tdata_at_byte_offset() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray (mut i16)))
+              (data $ordinary "\aa\bb\cc\dd\ee")
+              (tdata $transactional "\00\01\02\03\04")
+              (tfunc (export "read") (result i32)
+                (local $a (tref $a))
+                (local.set $a
+                  (tarray.new_data $a $transactional (i32.const 1) (i32.const 2)))
+                (tarray.get_u $a (tref.cast_read (local.get $a)) (i32.const 0))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    assert_eq!(read.call(&mut store, ()).unwrap(), 0x0201);
+}
+
+#[test]
+fn transaction_tarray_init_data_reads_tdata_at_byte_offset() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $a (tarray (mut i16)))
+              (data $ordinary "\aa\bb\cc\dd\ee")
+              (tdata $transactional "\00\01\02\03\04")
+              (tfunc (export "read") (result i32)
+                (local $a (tref $a))
+                (local.set $a (tarray.new_default $a (i32.const 2)))
+                (tarray.init_data $a $transactional
+                  (tref.cast_write (local.get $a))
+                  (i32.const 0)
+                  (i32.const 1)
+                  (i32.const 2))
+                (tarray.get_u $a (tref.cast_read (local.get $a)) (i32.const 1))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    assert_eq!(read.call(&mut store, ()).unwrap(), 0x0403);
+}
+
+#[test]
+fn transaction_tarray_new_elem_reads_telem_namespace() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $bytes (tarray i8))
+              (type $vectors (tarray (tref $bytes)))
+              (telem $transactional (tref $bytes)
+                (tarray.new $bytes (i32.const 7) (i32.const 1))
+                (tarray.new_fixed $bytes 2 (i32.const 11) (i32.const 13)))
+              (tfunc (export "read") (result i32)
+                (local $vectors (tref $vectors))
+                (local.set $vectors
+                  (tarray.new_elem $vectors $transactional (i32.const 0) (i32.const 2)))
+                (tarray.get_u $bytes
+                  (tref.cast_read
+                    (tarray.get $vectors
+                      (tref.cast_read (local.get $vectors))
+                      (i32.const 1)))
+                  (i32.const 1))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+
+    assert_eq!(read.call(&mut store, ()).unwrap(), 13);
 }
 
 #[test]
@@ -30202,7 +32146,7 @@ fn module_compilation_accepts_transaction_object_helper_lowering() {
                     (tarray.set $a
                       (tref.cast_write (local.get $aref))
                       (i32.const 1)
-                      (i31.get_s (tref.ti31 (i32.const 13))))
+                      (ti31.get_s (tref.ti31 (i32.const 13))))
                     (drop (tarray.len (local.get $aref)))
                     (drop (tarray.get_s $pa (tref.cast_read (local.get $paref)) (i32.const 0)))
                     (drop (tarray.get_u $pa (tref.cast_read (local.get $paref)) (i32.const 0)))
@@ -30249,11 +32193,11 @@ fn transaction_i31_reference_fields_round_trip_as_scalars() {
         &engine,
         r#"
             (module
-              (type $s (tstruct (field (mut (ref null i31)))))
+              (type $s (tstruct (field (mut (tref null ti31)))))
               (tfunc (export "x") (result i32)
                 (local $s (tref $s))
                 (local.set $s (tstruct.new $s (tref.ti31 (i32.const 13))))
-                (i31.get_s (tstruct.get $s 0 (tref.cast_read (local.get $s))))))
+                (ti31.get_s (tstruct.get $s 0 (tref.cast_read (local.get $s))))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -30482,6 +32426,244 @@ fn typed_transaction_extern_and_func_references_use_transaction_domains() {
         .unwrap();
     let function = make_func.call(&mut store, ()).unwrap();
     assert_eq!(is_null.call(&mut store, function).unwrap(), 0);
+}
+
+#[test]
+fn plain_transaction_extern_ref_publication_requires_durable_identity() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable $table 1 texterntref)
+              (tfunc (export "set") (param texterntref)
+                (ttable.set $table (i32.const 0) (local.get 0)))
+              (tfunc (export "get") (result texterntref)
+                (ttable.get $table (i32.const 0))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let set = instance
+        .get_typed_func::<crate::TransactionExternRef, ()>(&mut store, "set")
+        .unwrap();
+    let external = crate::ExternRef::new(&mut store, 613_u32).unwrap();
+
+    let error = set
+        .call(&mut store, crate::TransactionExternRef::new(external))
+        .unwrap_err();
+    let error = format!("{error:?}");
+    assert!(
+        error.contains("without embedded durable external identity"),
+        "{error:?}",
+    );
+}
+
+#[test]
+fn durable_transaction_extern_ref_publishes_through_ttable() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable $table 1 texterntref)
+              (tfunc (export "set") (param texterntref)
+                (ttable.set $table (i32.const 0) (local.get 0)))
+              (tfunc (export "get") (result texterntref)
+                (ttable.get $table (i32.const 0))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let set = instance
+        .get_typed_func::<crate::TransactionExternRef, ()>(&mut store, "set")
+        .unwrap();
+    let get = instance
+        .get_typed_func::<(), Option<crate::TransactionExternRef>>(&mut store, "get")
+        .unwrap();
+    let external = crate::ExternRef::new(&mut store, 613_u32).unwrap();
+    let external =
+        crate::TransactionExternRef::new_durable(&mut store, external, 0x5741_5354, 613).unwrap();
+
+    set.call(&mut store, external).unwrap();
+    let returned = get.call(&mut store, ()).unwrap().unwrap();
+    assert_eq!(
+        *returned
+            .get()
+            .data(&store)
+            .unwrap()
+            .unwrap()
+            .downcast_ref::<u32>()
+            .unwrap(),
+        613,
+    );
+}
+
+#[test]
+fn durable_transaction_extern_ref_rebinds_same_identity_after_store_restart() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let identity = DurableExternIdentity {
+        namespace: 0x5741_5354,
+        handle: 91,
+        type_layout_id: TypeLayoutId::BUILTIN_EXTERN,
+    };
+
+    for host_value in [17_u32, 29_u32] {
+        let mut store = crate::Store::new(&engine, ());
+        let external = crate::ExternRef::new(&mut store, host_value).unwrap();
+        let raw = external.to_raw(&mut store).unwrap();
+        let durable = crate::TransactionExternRef::new_durable(
+            &mut store,
+            external,
+            identity.namespace,
+            identity.handle,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.transaction_resolve_durable_extern_ref_for_test(identity),
+            Some(raw),
+        );
+        assert_eq!(
+            *durable
+                .get()
+                .data(&store)
+                .unwrap()
+                .unwrap()
+                .downcast_ref::<u32>()
+                .unwrap(),
+            host_value,
+        );
+    }
+}
+
+#[test]
+fn transaction_tany_table_publishes_transaction_struct_handle() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (type $s (tstruct (field i32)))
+              (ttable $table 1 tanyref)
+              (tfunc (export "run")
+                (ttable.set $table
+                  (i32.const 0)
+                  (tstruct.new $s (i32.const 37))))
+              (tfunc (export "get") (result i32)
+                (tstruct.get $s 0
+                  (tref.cast_read
+                    (tref.cast (tref $s)
+                      (ttable.get $table (i32.const 0)))))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), ()>(&mut store, "run")
+        .unwrap();
+
+    run.call(&mut store, ()).unwrap();
+    let get = instance
+        .get_typed_func::<(), i32>(&mut store, "get")
+        .unwrap();
+    assert_eq!(get.call(&mut store, ()).unwrap(), 37);
+}
+
+#[test]
+fn transaction_tany_table_publishes_externalized_durable_extern() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable $table 1 tanyref)
+              (tfunc (export "set") (param texterntref)
+                (ttable.set $table
+                  (i32.const 0)
+                  (tany.convert_textern (local.get 0))))
+              (tfunc (export "get") (result tanyref)
+                (ttable.get $table (i32.const 0))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let set = instance
+        .get_typed_func::<crate::TransactionExternRef, ()>(&mut store, "set")
+        .unwrap();
+    let get = instance.get_func(&mut store, "get").unwrap();
+    let external = crate::ExternRef::new(&mut store, 41_u32).unwrap();
+    let external =
+        crate::TransactionExternRef::new_durable(&mut store, external, 0x5741_5354, 41).unwrap();
+
+    set.call(&mut store, external).unwrap();
+    let mut results = [crate::Val::I32(0)];
+    get.call(&mut store, &[], &mut results).unwrap();
+    let returned = match &results[0] {
+        crate::Val::TransactionExternRef(Some(reference)) => reference,
+        other => panic!("expected durable external value, got {other:?}"),
+    };
+    assert_eq!(
+        *returned
+            .data(&store)
+            .unwrap()
+            .unwrap()
+            .downcast_ref::<u32>()
+            .unwrap(),
+        41,
+    );
+}
+
+#[test]
+fn transaction_tany_table_preserves_i31_after_publication() {
+    let mut config = crate::Config::new();
+    config.wasm_gc(true);
+    let engine = crate::Engine::new(&config).unwrap();
+    let module = transaction_test_module(
+        &engine,
+        r#"
+            (module
+              (ttable $table 10 tanyref)
+              (tfunc (export "set")
+                (ttable.set $table
+                  (i32.const 0)
+                  (tref.null tany))
+                (ttable.set $table
+                  (i32.const 1)
+                  (tref.null tstruct))
+                (ttable.set $table
+                  (i32.const 2)
+                  (tref.null tnone))
+                (ttable.set $table
+                  (i32.const 3)
+                  (tref.ti31 (i32.const 7))))
+              (tfunc (export "null-tests") (result i32)
+                (i32.add
+                  (tref.is_null (ttable.get $table (i32.const 3)))
+                  (tref.test tnullref (ttable.get $table (i32.const 3))))))
+        "#,
+    );
+    let mut store = crate::Store::new(&engine, ());
+    let instance = crate::Instance::new(&mut store, &module, &[]).unwrap();
+    let set = instance
+        .get_typed_func::<(), ()>(&mut store, "set")
+        .unwrap();
+    let null_tests = instance
+        .get_typed_func::<(), i32>(&mut store, "null-tests")
+        .unwrap();
+
+    set.call(&mut store, ()).unwrap();
+    assert_eq!(null_tests.call(&mut store, ()).unwrap(), 0);
 }
 
 #[test]
@@ -31950,9 +34132,11 @@ fn transaction_object_tstruct_tfail_frees_new_object_record() {
         r#"
             (module
               (type $s (tstruct (field (mut i32))))
-              (tfunc (export "create_fail")
-                (drop (tstruct.new $s (i32.const 41)))
-                (tfail (i32.const 0))))
+              (func (export "create_fail")
+                (tblock
+                  ((drop (tstruct.new $s (i32.const 41)))
+                   (tfail (i32.const 0)))
+                  (else (drop)))))
             "#,
     );
     let mut store = crate::Store::new(&engine, ());
@@ -32027,11 +34211,13 @@ fn transaction_object_existing_staged_write_rolls_back_on_tfail_and_trap() {
               (tfunc (export "read") (result i32)
                 (tstruct.get $s 0
                   (tref.cast_read (tref.as_non_null (tglobal.get $slot)))))
-              (tfunc (export "write_fail")
-                (tstruct.set $s 0
-                  (tref.cast_write (tref.as_non_null (tglobal.get $slot)))
-                  (i32.const 99))
-                (tfail (i32.const 0)))
+              (func (export "write_fail")
+                (tblock
+                  ((tstruct.set $s 0
+                     (tref.cast_write (tref.as_non_null (tglobal.get $slot)))
+                     (i32.const 99))
+                   (tfail (i32.const 0)))
+                  (else (drop))))
               (tfunc (export "write_trap")
                 (tstruct.set $s 0
                   (tref.cast_write (tref.as_non_null (tglobal.get $slot)))

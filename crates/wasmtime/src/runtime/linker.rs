@@ -1,3 +1,5 @@
+#[cfg(feature = "transaction")]
+use crate::TransactionModuleNamespace;
 use crate::error::OutOfMemory;
 use crate::func::HostFunc;
 use crate::instance::InstancePre;
@@ -1129,6 +1131,22 @@ impl<T> Linker<T> {
             .instantiate(store)
     }
 
+    /// Instantiates `module` after explicitly binding its defined functions to
+    /// a stable transactional-persistence namespace.
+    #[cfg(feature = "transaction")]
+    pub fn instantiate_with_transaction_module_namespace(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+        module: &Module,
+        namespace: TransactionModuleNamespace,
+    ) -> Result<Instance>
+    where
+        T: 'static,
+    {
+        self._instantiate_pre(module, Some(store.as_context_mut().0))?
+            .instantiate_with_transaction_module_namespace(store, namespace)
+    }
+
     /// Attempts to instantiate the `module` provided. This is the same as
     /// [`Linker::instantiate`], except for async `Store`s.
     ///
@@ -1148,6 +1166,23 @@ impl<T> Linker<T> {
     {
         self._instantiate_pre(module, Some(store.as_context_mut().0))?
             .instantiate_async(store)
+            .await
+    }
+
+    /// Asynchronously instantiates `module` with an explicit stable
+    /// transactional-persistence namespace for its defined functions.
+    #[cfg(all(feature = "async", feature = "transaction"))]
+    pub async fn instantiate_async_with_transaction_module_namespace(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+        module: &Module,
+        namespace: TransactionModuleNamespace,
+    ) -> Result<Instance>
+    where
+        T: Send + 'static,
+    {
+        self._instantiate_pre(module, Some(store.as_context_mut().0))?
+            .instantiate_async_with_transaction_module_namespace(store, namespace)
             .await
     }
 

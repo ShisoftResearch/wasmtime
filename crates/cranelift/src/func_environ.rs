@@ -30,7 +30,8 @@ use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::mem;
 use wasmparser::{
-    BranchHint, FuncValidator, Operator, SectionLimitedIntoIter, WasmModuleResources,
+    BranchHint, FuncValidator, Operator, SectionLimitedIntoIter, TransactionRefPermission,
+    WasmModuleResources,
 };
 use wasmtime_core::math::f64_cvt_to_int_bounds;
 use wasmtime_environ::{
@@ -92,9 +93,17 @@ pub(crate) struct TransactionTryFrame {
     pub(crate) handler_params: SmallVec<[ir::Value; 4]>,
     pub(crate) handler_enabled: ir::Value,
     pub(crate) started_here: ir::Value,
+    pub(crate) result_types: SmallVec<[WasmValType; 4]>,
+    pub(crate) local_snapshots: SmallVec<[(Variable, ir::Value); 16]>,
     pub(crate) control_stack_depth: usize,
     pub(crate) head_is_reachable: bool,
     pub(crate) in_handler: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct TransactionLocalRef {
+    ty: WasmRefType,
+    permission: TransactionRefPermission,
 }
 
 /// A struct with an `Option<ir::FuncRef>` member for every builtin
@@ -305,6 +314,9 @@ pub struct FuncEnvironment<'module_environment> {
     /// CLIF types for WebAssembly locals in the current function.
     local_types: Vec<ir::Type>,
 
+    /// Transaction-reference metadata omitted from the CLIF representation.
+    transaction_local_refs: Vec<Option<TransactionLocalRef>>,
+
     /// Structured transaction handlers currently active during translation.
     pub(crate) transaction_try_stack: Vec<TransactionTryFrame>,
 }
@@ -387,6 +399,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             is_current_tfunc,
             transaction_began_in_function_var: Variable::reserved_value(),
             local_types: Vec::new(),
+            transaction_local_refs: Vec::new(),
             transaction_try_stack: Vec::new(),
         }
     }
@@ -429,6 +442,31 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             .get(local.index())
             .copied()
             .filter(|ty| *ty != types::INVALID)
+    }
+
+    pub(crate) fn record_wasm_local_type(
+        &mut self,
+        local_index: u32,
+        ty: wasmparser::ValType,
+    ) -> WasmResult<()> {
+        let wasmparser::ValType::Ref(parser_ty) = ty else {
+            return Ok(());
+        };
+        if !parser_ty.is_transactional_ref() {
+            return Ok(());
+        }
+        let WasmValType::Ref(ty) = self.convert_valtype(ty)? else {
+            unreachable!()
+        };
+        let local_index = usize::try_from(local_index).unwrap();
+        if self.transaction_local_refs.len() <= local_index {
+            self.transaction_local_refs.resize(local_index + 1, None);
+        }
+        self.transaction_local_refs[local_index] = Some(TransactionLocalRef {
+            ty,
+            permission: parser_ty.transaction_permission(),
+        });
+        Ok(())
     }
 
     pub(crate) fn pointer_type(&self) -> ir::Type {
@@ -2197,8 +2235,10 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
 
     /// Do a transactional Wasm-level indirect tail call.
     ///
-    /// The table lookup occurs before the one-shot transaction transition is
-    /// handed to the callee's tfunc entry or host-call trampoline.
+    /// An ordinary caller starts the transaction and marks tail ownership
+    /// before the transactional table lookup. After resolving the target, the
+    /// active ownership handoff selects the callee tfunc or host trampoline as
+    /// the transaction's terminal boundary.
     pub fn transaction_indirect_tail_call(
         mut self,
         table: TransactionCallTable,
@@ -2207,13 +2247,23 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<()> {
+        let transactional_table = matches!(table, TransactionCallTable::Transactional(_));
+        if transactional_table && !self.env.is_current_tfunc {
+            self.env
+                .translate_transaction_prepare_ttable_lookup(self.builder)?;
+        }
         let Some((code_ptr, callee_vmctx)) =
             self.check_and_load_code_and_callee_vmctx(table, ty_index, callee, false)?
         else {
             return Ok(());
         };
-        self.env
-            .translate_transaction_transfer_tail_ownership(self.builder)?;
+        if transactional_table {
+            self.env
+                .translate_transaction_transfer_active_ownership(self.builder)?;
+        } else {
+            self.env
+                .translate_transaction_transfer_tail_ownership(self.builder)?;
+        }
         self.unchecked_call_impl(sig_ref, code_ptr, callee_vmctx, call_args)?;
         Ok(())
     }
@@ -3949,10 +3999,11 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         array_type_index: TypeIndex,
-        data_index: DataIndex,
+        data_index: TDataIndex,
         data_offset: ir::Value,
         len: ir::Value,
     ) -> WasmResult<ir::Value> {
+        let logical_data_index = data_index.as_u32();
         if builder.func.dfg.value_type(data_offset) != I32
             || builder.func.dfg.value_type(len) != I32
         {
@@ -3966,11 +4017,14 @@ impl FuncEnvironment<'_> {
         let element_size = self.array_layout(ty)?.elem_size;
 
         let pointer_type = self.pointer_type();
-        let (data, data_len) = match self.translation.runtime_data_map[data_index] {
-            Some(runtime_index) => (
-                self.load_runtime_data_base(builder, runtime_index),
-                self.load_runtime_data_length_as_pointer(builder, runtime_index),
-            ),
+        let (data, data_len) = match self.translation.runtime_tdata_map[data_index] {
+            Some(runtime_index) => {
+                let runtime_index = self.module.runtime_tdata_index(runtime_index);
+                (
+                    self.load_runtime_data_base(builder, runtime_index),
+                    self.load_runtime_data_length_as_pointer(builder, runtime_index),
+                )
+            }
             None => (
                 builder.ins().iconst(pointer_type, 1),
                 builder.ins().iconst(pointer_type, 0),
@@ -3988,6 +4042,7 @@ impl FuncEnvironment<'_> {
         let data_len = cast_index_value_to_i64(&mut pos, data_len);
         let tag = pos.ins().iconst(I32, i64::from(tag));
         let element_size = pos.ins().iconst(I32, i64::from(element_size));
+        let data_index = pos.ins().iconst(I32, i64::from(logical_data_index));
         let call = pos.ins().call(
             callee,
             &[
@@ -3999,6 +4054,7 @@ impl FuncEnvironment<'_> {
                 data_len,
                 tag,
                 element_size,
+                data_index,
             ],
         );
         Ok(pos.func.dfg.inst_results(call)[0])
@@ -4008,10 +4064,11 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         array_type_index: TypeIndex,
-        elem_index: ElemIndex,
+        elem_index: TElemIndex,
         elem_offset: ir::Value,
         len: ir::Value,
     ) -> WasmResult<ir::Value> {
+        let logical_elem_index = elem_index.as_u32();
         if builder.func.dfg.value_type(elem_offset) != I32
             || builder.func.dfg.value_type(len) != I32
         {
@@ -4027,15 +4084,15 @@ impl FuncEnvironment<'_> {
         }
 
         let pointer_type = self.pointer_type();
-        let (elem, elem_len) = match self.translation.passive_elem_map[elem_index] {
+        let (elem, elem_len) = match self.translation.passive_telem_map[elem_index] {
             Some(passive_index) => {
                 let vmctx = self.vmctx_val(&mut builder.cursor());
                 let len_libcall = self
                     .builtin_functions
-                    .passive_elem_segment_len(&mut builder.func);
+                    .passive_telem_segment_len(&mut builder.func);
                 let base_libcall = self
                     .builtin_functions
-                    .passive_elem_segment_base(builder.func);
+                    .passive_telem_segment_base(builder.func);
                 let idx = builder.ins().iconst(I32, i64::from(passive_index.as_u32()));
                 let len_call = builder.ins().call(len_libcall, &[vmctx, idx]);
                 let elem_len = builder.func.dfg.first_result(len_call);
@@ -4058,9 +4115,18 @@ impl FuncEnvironment<'_> {
             .ins()
             .iconst(I32, i64::try_from(array_type_index.index()).unwrap());
         let elem_len = cast_index_value_to_i64(&mut pos, elem_len);
+        let elem_index = pos.ins().iconst(I32, i64::from(logical_elem_index));
         let call = pos.ins().call(
             callee,
-            &[vmctx, array_type, elem_offset, len, elem, elem_len],
+            &[
+                vmctx,
+                array_type,
+                elem_offset,
+                len,
+                elem,
+                elem_len,
+                elem_index,
+            ],
         );
         Ok(pos.func.dfg.inst_results(call)[0])
     }
@@ -4182,10 +4248,11 @@ impl FuncEnvironment<'_> {
         array_type_index: TypeIndex,
         array: ir::Value,
         dst_index: ir::Value,
-        data_index: DataIndex,
+        data_index: TDataIndex,
         data_offset: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
+        let logical_data_index = data_index.as_u32();
         if builder.func.dfg.value_type(dst_index) != I32
             || builder.func.dfg.value_type(data_offset) != I32
             || builder.func.dfg.value_type(len) != I32
@@ -4199,11 +4266,14 @@ impl FuncEnvironment<'_> {
         let ty = self.module.types[array_type_index].unwrap_module_type_index();
         let element_size = self.array_layout(ty)?.elem_size;
         let pointer_type = self.pointer_type();
-        let (data, data_len) = match self.translation.runtime_data_map[data_index] {
-            Some(runtime_index) => (
-                self.load_runtime_data_base(builder, runtime_index),
-                self.load_runtime_data_length_as_pointer(builder, runtime_index),
-            ),
+        let (data, data_len) = match self.translation.runtime_tdata_map[data_index] {
+            Some(runtime_index) => {
+                let runtime_index = self.module.runtime_tdata_index(runtime_index);
+                (
+                    self.load_runtime_data_base(builder, runtime_index),
+                    self.load_runtime_data_length_as_pointer(builder, runtime_index),
+                )
+            }
             None => (
                 builder.ins().iconst(pointer_type, 1),
                 builder.ins().iconst(pointer_type, 0),
@@ -4218,6 +4288,7 @@ impl FuncEnvironment<'_> {
         let data_len = cast_index_value_to_i64(&mut pos, data_len);
         let tag = pos.ins().iconst(I32, i64::from(tag));
         let element_size = pos.ins().iconst(I32, i64::from(element_size));
+        let data_index = pos.ins().iconst(I32, i64::from(logical_data_index));
         pos.ins().call(
             callee,
             &[
@@ -4230,6 +4301,7 @@ impl FuncEnvironment<'_> {
                 data_len,
                 tag,
                 element_size,
+                data_index,
             ],
         );
         Ok(())
@@ -4241,10 +4313,11 @@ impl FuncEnvironment<'_> {
         array_type_index: TypeIndex,
         array: ir::Value,
         dst_index: ir::Value,
-        elem_index: ElemIndex,
+        elem_index: TElemIndex,
         elem_offset: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
+        let logical_elem_index = elem_index.as_u32();
         if builder.func.dfg.value_type(dst_index) != I32
             || builder.func.dfg.value_type(elem_offset) != I32
             || builder.func.dfg.value_type(len) != I32
@@ -4261,15 +4334,15 @@ impl FuncEnvironment<'_> {
         }
 
         let pointer_type = self.pointer_type();
-        let (elem, elem_len) = match self.translation.passive_elem_map[elem_index] {
+        let (elem, elem_len) = match self.translation.passive_telem_map[elem_index] {
             Some(passive_index) => {
                 let vmctx = self.vmctx_val(&mut builder.cursor());
                 let len_libcall = self
                     .builtin_functions
-                    .passive_elem_segment_len(&mut builder.func);
+                    .passive_telem_segment_len(&mut builder.func);
                 let base_libcall = self
                     .builtin_functions
-                    .passive_elem_segment_base(builder.func);
+                    .passive_telem_segment_base(builder.func);
                 let idx = builder.ins().iconst(I32, i64::from(passive_index.as_u32()));
                 let len_call = builder.ins().call(len_libcall, &[vmctx, idx]);
                 let elem_len = builder.func.dfg.first_result(len_call);
@@ -4289,9 +4362,19 @@ impl FuncEnvironment<'_> {
         let mut pos = builder.cursor();
         let vmctx = self.vmctx_val(&mut pos);
         let elem_len = cast_index_value_to_i64(&mut pos, elem_len);
+        let elem_index = pos.ins().iconst(I32, i64::from(logical_elem_index));
         pos.ins().call(
             callee,
-            &[vmctx, array, dst_index, elem_offset, len, elem, elem_len],
+            &[
+                vmctx,
+                array,
+                dst_index,
+                elem_offset,
+                len,
+                elem,
+                elem_len,
+                elem_index,
+            ],
         );
         Ok(())
     }
@@ -4865,7 +4948,46 @@ impl FuncEnvironment<'_> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<Option<CallRets>> {
+        if matches!(table, TransactionCallTable::Transactional(_)) && !self.is_current_tfunc {
+            self.translate_transaction_prepare_ttable_lookup(builder)?;
+        }
         Call::new(builder, self, srcloc).indirect_call(table, ty_index, sig_ref, callee, call_args)
+    }
+
+    /// A transactional table can only be read while a transaction is active,
+    /// but an ordinary function is allowed to use `tcall_indirect` as its
+    /// transaction entry point. Start that transaction before the table
+    /// lookup and hand ownership to the target; its normal tfunc entry/exit
+    /// then owns the commit just as it does for a direct `tcall`.
+    fn translate_transaction_prepare_ttable_lookup(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        let enter = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_enter_tblock(),
+        );
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let call = builder.ins().call(enter, &[vmctx]);
+        let enter_code = builder.func.dfg.inst_results(call)[0];
+        let started = builder.ins().icmp_imm_s(IntCC::Equal, enter_code, 1);
+        let handoff = builder.create_block();
+        let continuation = builder.create_block();
+        builder.ins().brif(started, handoff, &[], continuation, &[]);
+
+        builder.switch_to_block(handoff);
+        let transfer = self.builtin_functions.load_builtin(
+            builder.func,
+            BuiltinFunctionIndex::transaction_transfer_tfunc_ownership(),
+        );
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        builder.ins().call(transfer, &[vmctx]);
+        builder.ins().jump(continuation, &[]);
+        builder.seal_block(handoff);
+
+        builder.switch_to_block(continuation);
+        builder.seal_block(continuation);
+        Ok(())
     }
 
     pub fn translate_call<'a>(
@@ -4917,6 +5039,19 @@ impl FuncEnvironment<'_> {
             .transaction_indirect_tail_call(table, ty_index, sig_ref, callee, call_args)
     }
 
+    pub fn translate_return_transaction_call_ref(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        srcloc: ir::SourceLoc,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> WasmResult<()> {
+        self.translate_transaction_transfer_tail_ownership(builder)?;
+        Call::new_tail(builder, self, srcloc).call_ref(sig_ref, callee, call_args)?;
+        Ok(())
+    }
+
     fn translate_transaction_transfer_tail_ownership(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -4928,6 +5063,17 @@ impl FuncEnvironment<'_> {
             );
             let vmctx = self.vmctx_val(&mut builder.cursor());
             builder.ins().call(callee, &[vmctx]);
+            return Ok(());
+        }
+
+        self.translate_transaction_transfer_active_ownership(builder)
+    }
+
+    fn translate_transaction_transfer_active_ownership(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        if !self.transaction_may_be_active_on_return {
             return Ok(());
         }
 
@@ -5153,10 +5299,24 @@ impl FuncEnvironment<'_> {
         kind: TransactionControlKind,
         handler: Block,
         handler_params: SmallVec<[ir::Value; 4]>,
+        result_types: SmallVec<[WasmValType; 4]>,
         control_stack_depth: usize,
     ) -> WasmResult<()> {
         self.transaction_may_be_active_on_return = true;
         let zero = builder.ins().iconst(I8, 0);
+        let local_snapshots = if kind == TransactionControlKind::TBlock {
+            self.local_types
+                .iter()
+                .enumerate()
+                .filter(|(_, ty)| **ty != types::INVALID)
+                .map(|(index, _)| {
+                    let local = Variable::from_u32(u32::try_from(index).unwrap());
+                    (local, builder.use_var(local))
+                })
+                .collect()
+        } else {
+            SmallVec::new()
+        };
         let (handler_enabled, started_here) = match kind {
             TransactionControlKind::TBlock => {
                 let callee = self.builtin_functions.load_builtin(
@@ -5192,10 +5352,15 @@ impl FuncEnvironment<'_> {
             handler_params,
             handler_enabled,
             started_here,
+            result_types,
+            local_snapshots,
             control_stack_depth,
             head_is_reachable: true,
             in_handler: false,
         });
+        if kind == TransactionControlKind::TBlock {
+            self.translate_transaction_reacquire_permissioned_locals(builder, started_here)?;
+        }
         Ok(())
     }
 
@@ -5210,6 +5375,8 @@ impl FuncEnvironment<'_> {
             handler_params: SmallVec::new(),
             handler_enabled: ir::Value::reserved_value(),
             started_here: ir::Value::reserved_value(),
+            result_types: SmallVec::new(),
+            local_snapshots: SmallVec::new(),
             control_stack_depth,
             head_is_reachable: false,
             in_handler: false,
@@ -5227,14 +5394,21 @@ impl FuncEnvironment<'_> {
         builder: &mut FunctionBuilder<'_>,
         control_stack_depth: usize,
     ) -> WasmResult<()> {
-        let started = self
+        let (started, result_types) = self
             .transaction_try_stack
             .iter()
             .rev()
             .find(|frame| frame.control_stack_depth == control_stack_depth)
-            .map(|frame| frame.started_here)
+            .map(|frame| (frame.started_here, frame.result_types.clone()))
             .expect("transaction control frame at depth");
-        self.translate_transaction_commit_if_started(builder, started)
+        let results = self.stacks.peekn(result_types.len()).to_vec();
+        self.translate_transaction_commit_if_started(
+            builder,
+            started,
+            &results,
+            &result_types,
+            true,
+        )
     }
 
     pub(crate) fn transaction_exit_requires_cleanup(&self, target_control_index: usize) -> bool {
@@ -5247,7 +5421,10 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         target_control_index: usize,
+        results: &[ir::Value],
+        result_types: &[WasmValType],
     ) -> WasmResult<()> {
+        debug_assert_eq!(results.len(), result_types.len());
         let owners = self
             .transaction_try_stack
             .iter()
@@ -5255,10 +5432,24 @@ impl FuncEnvironment<'_> {
             .filter(|frame| {
                 !frame.in_handler && frame.control_stack_depth - 1 >= target_control_index
             })
-            .map(|frame| frame.started_here)
+            .map(|frame| {
+                (
+                    frame.started_here,
+                    // Match the reference interpreter's `Breaking(0)` arm:
+                    // a branch directly to this owning TBlock commits without
+                    // dropping permissioned locals. Other successful exits do.
+                    frame.control_stack_depth - 1 != target_control_index,
+                )
+            })
             .collect::<SmallVec<[_; 4]>>();
-        for started in owners {
-            self.translate_transaction_commit_if_started(builder, started)?;
+        for (started, clear_permissioned_locals) in owners {
+            self.translate_transaction_commit_if_started(
+                builder,
+                started,
+                results,
+                result_types,
+                clear_permissioned_locals,
+            )?;
         }
         Ok(())
     }
@@ -5267,13 +5458,36 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         started: ir::Value,
+        results: &[ir::Value],
+        result_types: &[WasmValType],
+        clear_permissioned_locals: bool,
     ) -> WasmResult<()> {
+        debug_assert_eq!(results.len(), result_types.len());
         let commit = builder.create_block();
         let continuation = builder.create_block();
         builder.ins().brif(started, commit, &[], continuation, &[]);
 
         builder.switch_to_block(commit);
         builder.seal_block(commit);
+        for (result, ty) in results.iter().zip(result_types) {
+            let WasmValType::Ref(ref_ty) = ty else {
+                continue;
+            };
+            if !ref_ty.is_transactional_ref() {
+                continue;
+            }
+            let builtin = match ref_ty.heap_type.top() {
+                WasmHeapTopType::Any => BuiltinFunctionIndex::transaction_preserve_tref_result(),
+                WasmHeapTopType::Extern => {
+                    BuiltinFunctionIndex::transaction_preserve_textern_result()
+                }
+                WasmHeapTopType::Func | WasmHeapTopType::Exn | WasmHeapTopType::Cont => continue,
+            };
+            let callee = self.builtin_functions.load_builtin(builder.func, builtin);
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            builder.ins().call(callee, &[vmctx, *result]);
+        }
+        self.translate_transaction_preserve_locals(builder, !clear_permissioned_locals)?;
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_commit_structured(),
@@ -5299,6 +5513,9 @@ impl FuncEnvironment<'_> {
         let began_var = self.ensure_transaction_began_in_function_var(builder);
         let zero = builder.ins().iconst(I8, 0);
         builder.def_var(began_var, zero);
+        if clear_permissioned_locals {
+            self.translate_transaction_clear_permissioned_locals(builder)?;
+        }
         builder.ins().jump(continuation, &[]);
 
         builder.switch_to_block(continuation);
@@ -5310,11 +5527,11 @@ impl FuncEnvironment<'_> {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
     ) -> WasmResult<()> {
-        let kind = self
+        let (kind, local_snapshots) = self
             .transaction_try_stack
             .last()
-            .expect("transaction handler frame")
-            .kind;
+            .map(|frame| (frame.kind, frame.local_snapshots.clone()))
+            .expect("transaction handler frame");
         self.translate_transaction_lifecycle_builtin(
             builder,
             BuiltinFunctionIndex::transaction_ttry_end(),
@@ -5323,11 +5540,120 @@ impl FuncEnvironment<'_> {
             let began_var = self.ensure_transaction_began_in_function_var(builder);
             let zero = builder.ins().iconst(I8, 0);
             builder.def_var(began_var, zero);
+            for (local, value) in local_snapshots {
+                builder.def_var(local, value);
+            }
         }
         self.transaction_try_stack
             .last_mut()
             .expect("transaction handler frame")
             .in_handler = true;
+        Ok(())
+    }
+
+    fn translate_transaction_preserve_locals(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        include_permissioned: bool,
+    ) -> WasmResult<()> {
+        let locals = self
+            .transaction_local_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, local)| {
+                local
+                    .filter(|local| {
+                        include_permissioned || local.permission == TransactionRefPermission::None
+                    })
+                    .map(|local| (Variable::from_u32(u32::try_from(index).unwrap()), local.ty))
+            })
+            .collect::<SmallVec<[_; 8]>>();
+        for (local, ty) in locals {
+            let builtin = match ty.heap_type.top() {
+                WasmHeapTopType::Any => BuiltinFunctionIndex::transaction_preserve_tref_result(),
+                WasmHeapTopType::Extern => {
+                    BuiltinFunctionIndex::transaction_preserve_textern_result()
+                }
+                WasmHeapTopType::Func | WasmHeapTopType::Exn | WasmHeapTopType::Cont => continue,
+            };
+            let value = builder.use_var(local);
+            let callee = self.builtin_functions.load_builtin(builder.func, builtin);
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            builder.ins().call(callee, &[vmctx, value]);
+        }
+        Ok(())
+    }
+
+    fn translate_transaction_clear_permissioned_locals(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        let locals = self
+            .transaction_local_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, local)| {
+                local
+                    .filter(|local| local.permission != TransactionRefPermission::None)
+                    .map(|local| (Variable::from_u32(u32::try_from(index).unwrap()), local.ty))
+            })
+            .collect::<SmallVec<[_; 8]>>();
+        for (local, ty) in locals {
+            let null = self.translate_ref_null(builder.cursor(), ty.heap_type)?;
+            builder.def_var(local, null);
+        }
+        Ok(())
+    }
+
+    fn translate_transaction_reacquire_permissioned_locals(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        started_here: ir::Value,
+    ) -> WasmResult<()> {
+        let locals = self
+            .transaction_local_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, local)| {
+                local.and_then(|local| match local.permission {
+                    TransactionRefPermission::None => None,
+                    permission => Some((
+                        Variable::from_u32(u32::try_from(index).unwrap()),
+                        permission,
+                    )),
+                })
+            })
+            .collect::<SmallVec<[_; 8]>>();
+        if locals.is_empty() {
+            return Ok(());
+        }
+
+        let reacquire = builder.create_block();
+        let continuation = builder.create_block();
+        builder
+            .ins()
+            .brif(started_here, reacquire, &[], continuation, &[]);
+
+        builder.switch_to_block(reacquire);
+        builder.seal_block(reacquire);
+        for (local, permission) in locals {
+            let value = builder.use_var(local);
+            match permission {
+                TransactionRefPermission::None => unreachable!(),
+                TransactionRefPermission::Read => {
+                    self.translate_transaction_tref_cast_read(builder, value)?;
+                }
+                TransactionRefPermission::Write => {
+                    self.translate_transaction_tref_cast_write(builder, value)?;
+                }
+            }
+            self.translate_transaction_branch_if_failure_pending(builder)?;
+        }
+        builder.ins().jump(continuation, &[]);
+
+        builder.switch_to_block(continuation);
+        builder.seal_block(continuation);
+        self.stacks.reachable = true;
         Ok(())
     }
 
@@ -5927,6 +6253,7 @@ impl FuncEnvironment<'_> {
         src: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
+        let logical_data_index = seg_index.as_u32();
         self.ensure_transaction_memory(memory)?;
         if builder.func.dfg.value_type(src) != I32 || builder.func.dfg.value_type(len) != I32 {
             return Err(wasmtime_environ::WasmError::Unsupported(
@@ -5960,6 +6287,7 @@ impl FuncEnvironment<'_> {
         let src = self.cast_index_to_i64(&mut pos, src, IndexType::I32);
         let len = self.cast_index_to_i64(&mut pos, len, IndexType::I32);
         let data_len = cast_index_value_to_i64(&mut pos, data_len);
+        let data_index = pos.ins().iconst(I32, i64::from(logical_data_index));
         pos.ins().call(
             callee,
             &[
@@ -5970,6 +6298,7 @@ impl FuncEnvironment<'_> {
                 len,
                 data,
                 data_len,
+                data_index,
             ],
         );
         Ok(())
@@ -6017,18 +6346,6 @@ impl FuncEnvironment<'_> {
         let vmctx = self.vmctx_val(&mut builder.cursor());
         let data = builder.ins().iconst(I32, i64::from(seg_index.as_u32()));
         builder.ins().call(callee, &[vmctx, data]);
-        if let Some(runtime_index) = self.translation.runtime_tdata_map[seg_index] {
-            let runtime_index = self.module.runtime_tdata_index(runtime_index);
-            let mut pos = builder.cursor();
-            let vmctx = self.vmctx_val(&mut pos);
-            let new_length = pos.ins().iconst(I32, 0);
-            self.alias_regions.store_vmctx_runtime_data_length(
-                &mut pos,
-                vmctx,
-                runtime_index,
-                new_length,
-            );
-        }
         Ok(())
     }
 
@@ -6389,6 +6706,7 @@ impl FuncEnvironment<'_> {
         let passive = self.translation.passive_telem_map[seg_index]
             .map(|index| index.as_u32())
             .unwrap_or(u32::MAX);
+        let logical = seg_index.as_u32();
         let callee = self.builtin_functions.load_builtin(
             builder.func,
             BuiltinFunctionIndex::transaction_ttable_init(),
@@ -6396,10 +6714,12 @@ impl FuncEnvironment<'_> {
         let mut pos = builder.cursor();
         let (vmctx, table) = self.ttable_vmctx_and_defined_index(&mut pos, table_index);
         let elem = pos.ins().iconst(I32, i64::from(passive));
+        let elem_index = pos.ins().iconst(I32, i64::from(logical));
         let dst = cast_index_value_to_i64(&mut pos, dst);
         let src = cast_index_value_to_i64(&mut pos, src);
         let len = cast_index_value_to_i64(&mut pos, len);
-        pos.ins().call(callee, &[vmctx, table, elem, dst, src, len]);
+        pos.ins()
+            .call(callee, &[vmctx, table, elem, elem_index, dst, src, len]);
         Ok(())
     }
 
@@ -8128,6 +8448,16 @@ impl FuncEnvironment<'_> {
             let vmctx = self.vmctx_val(&mut pos);
             pos.ins().call(libcall, &[vmctx, idx]);
         }
+        Ok(())
+    }
+
+    pub fn translate_telem_drop(&mut self, mut pos: FuncCursor, elem_index: u32) -> WasmResult<()> {
+        let libcall = self
+            .builtin_functions
+            .load_builtin(pos.func, BuiltinFunctionIndex::transaction_telem_drop());
+        let idx = pos.ins().iconst(I32, i64::from(elem_index));
+        let vmctx = self.vmctx_val(&mut pos);
+        pos.ins().call(libcall, &[vmctx, idx]);
         Ok(())
     }
 

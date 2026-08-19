@@ -524,6 +524,19 @@ impl TransactionalGlobal {
         self.0.ty(store)
     }
 
+    /// Returns the latest committed value of this transactional global.
+    ///
+    /// This host-side observation does not begin a Wasm transaction. Writes
+    /// performed by an active transaction remain private until that
+    /// transaction commits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this global.
+    pub fn get(&self, store: impl AsContextMut) -> Val {
+        self.0.get(store)
+    }
+
     pub(crate) fn from_global(global: Global) -> Self {
         Self(global)
     }

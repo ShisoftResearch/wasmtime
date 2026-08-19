@@ -1009,7 +1009,7 @@ impl<T> Store<T> {
     ) -> Result<()> {
         let func_ref = func.vm_func_ref(&self.inner);
         self.inner
-            .transaction_register_durable_func_ref_for_test(func_ref.as_ptr().addr(), identity)
+            .transaction_register_durable_func_ref(func_ref.as_ptr().addr(), identity)
     }
 
     #[cfg(feature = "transaction")]
@@ -1033,7 +1033,7 @@ impl<T> Store<T> {
             func_ref.as_ptr().addr()
         };
         self.inner
-            .transaction_register_durable_func_ref_for_test(vm_func_ref_addr, identity)
+            .transaction_register_durable_func_ref(vm_func_ref_addr, identity)
     }
 
     #[cfg(feature = "transaction")]
@@ -1062,7 +1062,7 @@ impl<T> Store<T> {
         identity: crate::runtime::transaction::DurableExternIdentity,
     ) -> Result<()> {
         self.inner
-            .transaction_register_durable_extern_ref_for_test(raw_gc_ref, identity)
+            .transaction_register_durable_extern_ref(raw_gc_ref, identity)
     }
 
     #[cfg(all(feature = "transaction", test))]
@@ -2123,7 +2123,7 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_register_durable_func_ref_for_test(
+    pub(crate) fn transaction_register_durable_func_ref(
         &mut self,
         vm_func_ref_addr: usize,
         identity: DurableFuncIdentity,
@@ -2142,7 +2142,7 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "transaction")]
-    pub(crate) fn transaction_register_durable_extern_ref_for_test(
+    pub(crate) fn transaction_register_durable_extern_ref(
         &mut self,
         raw_gc_ref: u32,
         identity: crate::runtime::transaction::DurableExternIdentity,

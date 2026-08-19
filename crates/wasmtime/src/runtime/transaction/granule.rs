@@ -29,7 +29,19 @@ pub(crate) enum GranuleId {
         instance: Option<u32>,
         table_index: u32,
     },
+    TData {
+        instance: Option<u32>,
+        data_index: u32,
+    },
+    TElem {
+        instance: Option<u32>,
+        elem_index: u32,
+    },
     Object {
+        object_id: ObjectId,
+    },
+    VolatileObject {
+        object_table_domain: u64,
         object_id: ObjectId,
     },
 }
@@ -42,9 +54,12 @@ impl GranuleId {
             GranuleId::TGlobal { .. } => 2,
             GranuleId::TTable { .. } => 3,
             GranuleId::TTableSize { .. } => 4,
+            GranuleId::TData { .. } => 5,
+            GranuleId::TElem { .. } => 6,
             // Runtime object permissions use one object-domain key. Durable log
             // publication still distinguishes TStruct/TArray record domains.
-            GranuleId::Object { .. } => 5,
+            GranuleId::Object { .. } => 7,
+            GranuleId::VolatileObject { .. } => 8,
         }
     }
 }
@@ -120,6 +135,26 @@ impl Ord for GranuleId {
                 },
             ) => (lhs_instance, lhs_table_index).cmp(&(rhs_instance, rhs_table_index)),
             (
+                GranuleId::TData {
+                    instance: lhs_instance,
+                    data_index: lhs_data_index,
+                },
+                GranuleId::TData {
+                    instance: rhs_instance,
+                    data_index: rhs_data_index,
+                },
+            ) => (lhs_instance, lhs_data_index).cmp(&(rhs_instance, rhs_data_index)),
+            (
+                GranuleId::TElem {
+                    instance: lhs_instance,
+                    elem_index: lhs_elem_index,
+                },
+                GranuleId::TElem {
+                    instance: rhs_instance,
+                    elem_index: rhs_elem_index,
+                },
+            ) => (lhs_instance, lhs_elem_index).cmp(&(rhs_instance, rhs_elem_index)),
+            (
                 GranuleId::Object {
                     object_id: lhs_object_id,
                 },
@@ -127,6 +162,16 @@ impl Ord for GranuleId {
                     object_id: rhs_object_id,
                 },
             ) => lhs_object_id.cmp(rhs_object_id),
+            (
+                GranuleId::VolatileObject {
+                    object_table_domain: lhs_domain,
+                    object_id: lhs_object_id,
+                },
+                GranuleId::VolatileObject {
+                    object_table_domain: rhs_domain,
+                    object_id: rhs_object_id,
+                },
+            ) => (lhs_domain, lhs_object_id).cmp(&(rhs_domain, rhs_object_id)),
             _ => unreachable!("granule domain order must be unique for each variant"),
         }
     }

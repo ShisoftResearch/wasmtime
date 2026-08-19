@@ -68,11 +68,7 @@ pub fn val(ctx: &mut WastContext, v: &CoreConst, expected: &wasmtime::ValType) -
                     value: Some(json_from_wast::AnyRef::Host(x)),
                 },
             ) => {
-                let reference = if let Some(rt) = ctx.async_runtime.as_ref() {
-                    rt.block_on(wasmtime::ExternRef::new_async(&mut ctx.core_store, x.0))?
-                } else {
-                    wasmtime::ExternRef::new(&mut ctx.core_store, x.0)?
-                };
+                let reference = ctx.transaction_host_extern_ref(x.0)?;
                 return Ok(Val::TransactionExternRef(Some(reference)));
             }
             _ => {}
@@ -112,11 +108,7 @@ pub fn val(ctx: &mut WastContext, v: &CoreConst, expected: &wasmtime::ValType) -
         #[cfg(feature = "transaction")]
         TExternRef {
             value: Some(json_from_wast::ExternRef::Host(x)),
-        } => Val::TransactionExternRef(if let Some(rt) = ctx.async_runtime.as_ref() {
-            Some(rt.block_on(wasmtime::ExternRef::new_async(&mut ctx.core_store, x.0))?)
-        } else {
-            Some(wasmtime::ExternRef::new(&mut ctx.core_store, x.0)?)
-        }),
+        } => Val::TransactionExternRef(Some(ctx.transaction_host_extern_ref(x.0)?)),
 
         AnyRef {
             value: None | Some(json_from_wast::AnyRef::Null),
@@ -139,11 +131,7 @@ pub fn val(ctx: &mut WastContext, v: &CoreConst, expected: &wasmtime::ValType) -
         #[cfg(feature = "transaction")]
         TAnyRef {
             value: Some(json_from_wast::AnyRef::Host(x)),
-        } => Val::TransactionExternRef(if let Some(rt) = ctx.async_runtime.as_ref() {
-            Some(rt.block_on(wasmtime::ExternRef::new_async(&mut ctx.core_store, x.0))?)
-        } else {
-            Some(wasmtime::ExternRef::new(&mut ctx.core_store, x.0)?)
-        }),
+        } => Val::TransactionExternRef(Some(ctx.transaction_host_extern_ref(x.0)?)),
         NullRef => Val::AnyRef(None),
         other => bail!("couldn't convert {other:?} to a runtime value"),
     })

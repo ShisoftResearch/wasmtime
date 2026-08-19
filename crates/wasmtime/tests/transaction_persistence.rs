@@ -12,12 +12,81 @@ use wasmtime::_internal::transaction_persistence::{
     retire_unreachable_object_chunks_for_test,
 };
 use wasmtime::{
-    Config, Engine, ExternRef, Func, Global, GlobalType, Instance, Module, Mutability, Result,
-    Rooted, Store, ValType,
+    Config, Engine, ExternRef, Func, Global, GlobalType, Instance, Linker, Module, Mutability,
+    Result, Rooted, Store, TransactionModuleNamespace, ValType,
 };
 
 const OBJECT_VALUE_ABI_TAG_FUNCREF_FOR_TEST: u32 = 6;
 const OBJECT_VALUE_ABI_TAG_EXTERNREF_FOR_TEST: u32 = 7;
+
+#[test]
+fn transaction_module_namespace_is_required_before_startup_funcref_publication() -> Result<()> {
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (type $f (tfunc))
+              (type $a (tarray (tref $f)))
+              (tglobal (tref $a)
+                (tarray.new $a (tref.tfunc $target) (i32.const 1)))
+              (tfunc $target (export "target")))
+        "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+
+    let error = Instance::new(&mut store, &module, &[]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("without registered durable function identity"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_transaction_module_namespace_binds_before_startup_and_across_restart() -> Result<()> {
+    const NAMESPACE: TransactionModuleNamespace =
+        TransactionModuleNamespace::new(0x7466_756e_635f_3031);
+    let engine = transaction_root_engine()?;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (type $f (tfunc))
+              (type $a (tarray (tref $f)))
+              (tglobal (tref $a)
+                (tarray.new $a (tref.tfunc $target) (i32.const 1)))
+              (tfunc $target (export "target")))
+        "#,
+    )?;
+
+    for use_linker in [false, true] {
+        let mut store = Store::new(&engine, ());
+        let instance = if use_linker {
+            Linker::new(&engine)
+                .instantiate_with_transaction_module_namespace(&mut store, &module, NAMESPACE)?
+        } else {
+            Instance::new_with_transaction_module_namespace(&mut store, &module, &[], NAMESPACE)?
+        };
+
+        let resolved =
+            wasmtime::_internal::transaction_persistence::resolve_durable_func_ref_for_test(
+                &mut store,
+                NAMESPACE.get(),
+                0,
+                5,
+            )?
+            .expect("caller-supplied namespace should bind the defined target before startup");
+        let target = instance
+            .get_func(&mut store, "target")
+            .expect("escaping target should be addressable by index");
+        assert_eq!(resolved.to_raw(&mut store), target.to_raw(&mut store));
+    }
+
+    Ok(())
+}
 
 #[test]
 fn file_backed_region_recovers_committed_tmemory_update() {
@@ -1149,7 +1218,7 @@ fn mvcc_file_backed_restart_recovers_latest_current_state_without_history_record
         wat::parse_str(
             r#"
             (module
-              (import "" "pause" (func $pause))
+              (import "" "pause" (tfunc $pause))
               (tmemory 1)
               (tfunc (export "write") (param $value i32)
                 (i32.tstore (i32.const 0) (local.get $value)))
@@ -1158,7 +1227,7 @@ fn mvcc_file_backed_restart_recovers_latest_current_state_without_history_record
               (tfunc (export "read-twice") (result i32 i32)
                 (local $first i32)
                 (local.set $first (i32.tload (i32.const 0)))
-                (call $pause)
+                (tcall $pause)
                 (local.get $first)
                 (i32.tload (i32.const 0))))
             "#,
@@ -1960,12 +2029,12 @@ fn blocking_tmemory_module(engine: &Engine) -> Result<Module> {
         wat::parse_str(
             r#"
             (module
-              (import "" "pause" (func $pause))
+              (import "" "pause" (tfunc $pause))
               (tmemory 1)
               (tfunc (export "write") (param $value i32)
                 (i32.tstore (i32.const 0) (local.get $value))
                 (drop (tmemory.size))
-                (call $pause)))
+                (tcall $pause)))
             "#,
         )?,
     )
@@ -1977,7 +2046,7 @@ fn blocking_single_root_object_module(engine: &Engine) -> Result<Module> {
         wat::parse_str(
             r#"
             (module
-              (import "" "pause" (func $pause))
+              (import "" "pause" (tfunc $pause))
               (type $leaf (tstruct (field (mut i32))))
               (type $root (tstruct (field (mut (tref null $leaf)))))
               (tglobal $root (mut (tref null $root)) (tref.null $root))
@@ -1985,7 +2054,7 @@ fn blocking_single_root_object_module(engine: &Engine) -> Result<Module> {
                 (tglobal.set $root
                   (tstruct.new $root
                     (tstruct.new $leaf (local.get $value))))
-                (call $pause)))
+                (tcall $pause)))
             "#,
         )?,
     )
@@ -1997,7 +2066,7 @@ fn blocking_mixed_tmemory_object_module(engine: &Engine) -> Result<Module> {
         wat::parse_str(
             r#"
             (module
-              (import "" "pause" (func $pause))
+              (import "" "pause" (tfunc $pause))
               (tmemory 1)
               (type $leaf (tstruct (field (mut i32))))
               (type $root (tstruct (field (mut (tref null $leaf)))))
@@ -2008,7 +2077,7 @@ fn blocking_mixed_tmemory_object_module(engine: &Engine) -> Result<Module> {
                 (tglobal.set $root
                   (tstruct.new $root
                     (tstruct.new $leaf (local.get $value))))
-                (call $pause)))
+                (tcall $pause)))
             "#,
         )?,
     )

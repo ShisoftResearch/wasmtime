@@ -4,6 +4,7 @@ use crate::runtime::vm::block_region::{BLOCK_SIZE, MappedRegionSource};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
 
 use super::object_value::{
@@ -43,6 +44,10 @@ pub(crate) struct ObjectTableSlot {
     pub(crate) type_layout_id: u32,
     pub(crate) runtime_type_index: Option<VMSharedTypeIndex>,
     pub(crate) persistent: bool,
+    /// This volatile object has escaped a transaction-local workspace into
+    /// the shared transactional heap. Its `ObjectId` and concurrency granule
+    /// are stable if the same object is later published persistently.
+    pub(crate) workspace_shared: bool,
     pub(crate) current_record: object_heap::TxRecordHandle,
 }
 
@@ -80,7 +85,12 @@ pub(crate) struct ObjectTable {
     pub(crate) live_count: usize,
     pub(crate) heap: object_heap::ObjectHeap,
     shared_region_runtime: Option<TransactionRegionRuntime>,
+    // Process-local only: disambiguates volatile ObjectIds between stores that
+    // share concurrency authority. Persistent objects retain their global ID.
+    volatile_granule_domain: u64,
 }
+
+static NEXT_VOLATILE_GRANULE_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
 impl Default for ObjectTable {
     fn default() -> Self {
@@ -101,7 +111,12 @@ impl Default for ObjectTable {
             live_count: 0,
             heap: object_heap::ObjectHeap::default(),
             shared_region_runtime: None,
+            volatile_granule_domain: NEXT_VOLATILE_GRANULE_DOMAIN.fetch_add(1, Ordering::Relaxed),
         };
+        assert_ne!(
+            table.volatile_granule_domain, 0,
+            "volatile object granule domain overflow"
+        );
         for layout in builtin_type_layouts() {
             table
                 .register_type_layout(layout)
@@ -759,16 +774,35 @@ impl ObjectTable {
         type_layout_id: TypeLayoutId,
         persistent: bool,
     ) -> Result<ObjectId> {
+        self.allocate_payload_with_type_layout_id_inner(payload, type_layout_id, persistent, false)
+    }
+
+    pub(crate) fn allocate_workspace_shared_payload_with_type_layout_id(
+        &mut self,
+        payload: ObjectPayload,
+        type_layout_id: TypeLayoutId,
+    ) -> Result<ObjectId> {
+        self.allocate_payload_with_type_layout_id_inner(payload, type_layout_id, false, true)
+    }
+
+    fn allocate_payload_with_type_layout_id_inner(
+        &mut self,
+        payload: ObjectPayload,
+        type_layout_id: TypeLayoutId,
+        persistent: bool,
+        workspace_shared: bool,
+    ) -> Result<ObjectId> {
         self.validate_type_layout_for_object_kind(payload.kind(), type_layout_id)?;
 
-        let shared_persistent = persistent && self.shared_region_runtime.is_some();
-        let reused_slot = (!shared_persistent)
+        let globally_allocated =
+            (persistent || workspace_shared) && self.shared_region_runtime.is_some();
+        let reused_slot = (!globally_allocated)
             .then(|| self.free_list.last().copied())
             .flatten();
         let object_id = match reused_slot {
             Some(object_id) => object_id,
             None => {
-                if persistent {
+                if persistent || workspace_shared {
                     if let Some(runtime) = &self.shared_region_runtime {
                         runtime.allocate_persistent_object_id_at_least(
                             u64::try_from(self.slots.len())
@@ -829,6 +863,7 @@ impl ObjectTable {
             type_layout_id: type_layout_id.get(),
             runtime_type_index: None,
             persistent,
+            workspace_shared,
             current_record: record,
         });
         self.live_count = self
@@ -1484,6 +1519,7 @@ impl ObjectTable {
         let type_layout_id = self.live_slot(object_id)?.type_layout_id;
         let runtime_type_index = self.live_slot(object_id)?.runtime_type_index;
         let persistent = self.live_slot(object_id)?.persistent;
+        let workspace_shared = self.live_slot(object_id)?.workspace_shared;
         let record_version = self.bump_record_version()?;
         let record = self.heap.allocate_record(
             object_id,
@@ -1500,6 +1536,7 @@ impl ObjectTable {
             type_layout_id,
             runtime_type_index,
             persistent,
+            workspace_shared,
             current_record: record,
         });
         Ok(())
@@ -1507,7 +1544,17 @@ impl ObjectTable {
 
     pub(crate) fn granule_id(&self, object_id: ObjectId) -> Result<GranuleId> {
         match self.kind(object_id)? {
-            ObjectKind::Struct | ObjectKind::Array => Ok(GranuleId::Object { object_id }),
+            ObjectKind::Struct | ObjectKind::Array => {
+                let slot = self.live_slot(object_id)?;
+                if slot.persistent || slot.workspace_shared {
+                    Ok(GranuleId::Object { object_id })
+                } else {
+                    Ok(GranuleId::VolatileObject {
+                        object_table_domain: self.volatile_granule_domain,
+                        object_id,
+                    })
+                }
+            }
             ObjectKind::I31 | ObjectKind::Extern | ObjectKind::Func => {
                 bail!(
                     "object kind is encoded as an inline durable value, not a transactional granule"
@@ -1557,16 +1604,61 @@ impl ObjectTable {
         payload: &ObjectPayload,
         record_version: u32,
     ) -> Result<persist::PendingPublication> {
+        self.persistent_object_pending_publication_from_payload_with_record_version_inner(
+            object_id,
+            payload,
+            record_version,
+            &BTreeSet::new(),
+        )
+    }
+
+    pub(crate) fn workspace_shared_object_pending_publication_from_payload_with_record_version(
+        &mut self,
+        object_id: ObjectId,
+        payload: &ObjectPayload,
+        record_version: u32,
+        pending_in_place: &BTreeSet<ObjectId>,
+    ) -> Result<persist::PendingPublication> {
+        self.persistent_object_pending_publication_from_payload_with_record_version_inner(
+            object_id,
+            payload,
+            record_version,
+            pending_in_place,
+        )
+    }
+
+    pub(crate) fn workspace_shared_object_pending_publication_from_payload(
+        &mut self,
+        object_id: ObjectId,
+        payload: &ObjectPayload,
+        pending_in_place: &BTreeSet<ObjectId>,
+    ) -> Result<persist::PendingPublication> {
+        let record_version = self.bump_record_version()?;
+        self.persistent_object_pending_publication_from_payload_with_record_version_inner(
+            object_id,
+            payload,
+            record_version,
+            pending_in_place,
+        )
+    }
+
+    fn persistent_object_pending_publication_from_payload_with_record_version_inner(
+        &mut self,
+        object_id: ObjectId,
+        payload: &ObjectPayload,
+        record_version: u32,
+        pending_in_place: &BTreeSet<ObjectId>,
+    ) -> Result<persist::PendingPublication> {
         let slot = self.live_slot(object_id)?.clone();
         ensure!(
-            slot.persistent,
-            "persistent object publication requires a persistent object: {object_id:?}"
+            slot.persistent || (slot.workspace_shared && pending_in_place.contains(&object_id)),
+            "persistent object publication requires a persistent or pending in-place object: {object_id:?}"
         );
         ensure!(
             slot.kind == payload.kind(),
             "object payload kind does not match object table slot kind"
         );
-        self.validate_persistent_payload_refs(payload)?;
+        self.validate_persistent_payload_refs_with_pending(payload, pending_in_place)?;
         self.next_record_version = self.next_record_version.max(record_version);
         let record = object_heap::encode_object_record(
             object_id.object_index,
@@ -1690,8 +1782,12 @@ impl ObjectTable {
         self.validate_type_layout_for_object_kind(entry.kind, type_layout_id)?;
         if let Some(slot) = self.slots[index].as_ref() {
             ensure!(
-                slot.persistent,
+                slot.persistent || slot.workspace_shared,
                 "persistent object directory entry collides with live volatile slot"
+            );
+            ensure!(
+                slot.kind == entry.kind && slot.type_layout_id == entry.type_layout_id,
+                "persistent object directory entry conflicts with workspace-shared object metadata"
             );
         }
 
@@ -1718,6 +1814,7 @@ impl ObjectTable {
             type_layout_id: entry.type_layout_id,
             runtime_type_index: entry.runtime_type_index,
             persistent: true,
+            workspace_shared: false,
             current_record: record,
         });
         if !was_live {
@@ -1793,8 +1890,8 @@ impl ObjectTable {
         let object_id = ObjectId { object_index };
         let slot = self.live_slot(object_id)?.clone();
         ensure!(
-            slot.persistent,
-            "committed persistent object install requires a persistent object: {object_id:?}"
+            slot.persistent || slot.workspace_shared,
+            "committed persistent object install requires a persistent or workspace-shared object: {object_id:?}"
         );
 
         let object_header = TxObjectHeader::read_from_prefix(&publication.payload)?;
@@ -1894,8 +1991,8 @@ impl ObjectTable {
         let index = object_slot_index(object_id)?;
         let slot = self.live_slot(object_id)?.clone();
         ensure!(
-            slot.persistent,
-            "persistent GC copy install requires a persistent object: {object_id:?}"
+            slot.persistent || slot.workspace_shared,
+            "persistent GC copy install requires a persistent or workspace-shared object: {object_id:?}"
         );
 
         let record = self.heap.install_record_bytes(&publication.payload)?;
@@ -1932,13 +2029,18 @@ impl ObjectTable {
                 .context("persistent GC copied record type layout id cannot be zero")?,
         )?;
         self.next_record_version = self.next_record_version.max(header.version);
-        let version = self.bump_object_version()?;
+        let version = if publication.bumps_object_granule_version {
+            self.bump_object_version()?
+        } else {
+            slot.version
+        };
         self.slots[index] = Some(ObjectTableSlot {
             kind,
             version,
             type_layout_id: header.type_layout_id,
             runtime_type_index: slot.runtime_type_index,
             persistent: true,
+            workspace_shared: false,
             current_record: record,
         });
         Ok(object_id)
@@ -1961,6 +2063,14 @@ impl ObjectTable {
     }
 
     pub(crate) fn validate_persistent_payload_refs(&self, payload: &ObjectPayload) -> Result<()> {
+        self.validate_persistent_payload_refs_with_pending(payload, &BTreeSet::new())
+    }
+
+    pub(crate) fn validate_persistent_payload_refs_with_pending(
+        &self,
+        payload: &ObjectPayload,
+        pending_in_place: &BTreeSet<ObjectId>,
+    ) -> Result<()> {
         let values = match payload {
             ObjectPayload::Struct(fields) => fields.as_slice(),
             ObjectPayload::Array(elements) => elements.as_slice(),
@@ -1972,9 +2082,17 @@ impl ObjectTable {
             let Ok(slot) = self.live_slot(*object_id) else {
                 bail!(VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
             };
-            ensure!(slot.persistent, VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED);
+            ensure!(
+                slot.persistent || (slot.workspace_shared && pending_in_place.contains(object_id)),
+                VOLATILE_GC_REF_PROMOTION_UNIMPLEMENTED
+            );
         }
         Ok(())
+    }
+
+    pub(crate) fn is_workspace_shared_volatile(&self, object_id: ObjectId) -> Result<bool> {
+        let slot = self.live_slot(object_id)?;
+        Ok(slot.workspace_shared && !slot.persistent)
     }
 
     pub(crate) fn free(&mut self, object_id: ObjectId) -> Result<bool> {
@@ -2107,6 +2225,7 @@ impl ObjectTable {
                 type_layout_id: header.type_layout_id,
                 runtime_type_index: None,
                 persistent: true,
+                workspace_shared: false,
                 current_record: handle,
             });
             self.live_count = self
@@ -2178,6 +2297,7 @@ impl ObjectTable {
             type_layout_id: header.type_layout_id,
             runtime_type_index: None,
             persistent: true,
+            workspace_shared: false,
             current_record: handle,
         });
         self.live_count = self

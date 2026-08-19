@@ -292,6 +292,46 @@ impl TransactionExternRef {
         Self(reference)
     }
 
+    /// Creates a transactional external reference with a durable host identity.
+    ///
+    /// Transactional references can be published into persistent tables,
+    /// globals, and objects. To publish a host external reference, Wasmtime
+    /// must be able to encode an identity that the embedder can bind again
+    /// after reopening the persistent state. `namespace` identifies the
+    /// embedder-defined class of handles and `handle` identifies this external
+    /// reference within that namespace.
+    ///
+    /// Reopening persistent state in a new [`Store`][crate::Store] requires the
+    /// embedder to call this constructor again with the same `namespace` and
+    /// `handle` for the replacement live reference before Wasm reads the
+    /// persisted value. The host data on `reference` is preserved.
+    ///
+    /// It is an error to bind one live reference to multiple durable
+    /// identities, or multiple live references in the same store to one
+    /// durable identity.
+    pub fn new_durable(
+        mut store: impl AsContextMut,
+        reference: Rooted<ExternRef>,
+        namespace: u32,
+        handle: u64,
+    ) -> Result<Self> {
+        let mut store = store.as_context_mut();
+        ensure!(
+            Self(reference).compatible_with_store(store.0),
+            "transactional external reference used with wrong store"
+        );
+        let raw_gc_ref = reference.to_raw(&mut store)?;
+        let identity = crate::runtime::transaction::DurableExternIdentity {
+            namespace,
+            handle,
+            type_layout_id: crate::runtime::transaction::type_layout::TypeLayoutId::BUILTIN_EXTERN,
+        };
+        store
+            .0
+            .transaction_register_durable_extern_ref(raw_gc_ref, identity)?;
+        Ok(Self(reference))
+    }
+
     /// Returns the underlying rooted external identity.
     pub fn get(self) -> Rooted<ExternRef> {
         self.0

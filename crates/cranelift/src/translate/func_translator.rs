@@ -179,6 +179,13 @@ fn parse_local_decls(
         declare_locals(builder, count, ty, &mut next_local, environ)?;
     }
 
+    for local_index in 0..validator.len_locals() {
+        let ty = validator
+            .get_local_type(local_index)
+            .expect("validator local index");
+        environ.record_wasm_local_type(local_index, ty)?;
+    }
+
     Ok(())
 }
 

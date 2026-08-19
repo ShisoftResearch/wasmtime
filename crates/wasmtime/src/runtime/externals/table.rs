@@ -4,7 +4,7 @@ use crate::store::{AutoAssertNoGc, StoreInstanceId, StoreOpaque, StoreResourceLi
 use crate::trampoline::generate_table_export;
 use crate::{
     AnyRef, AsContext, AsContextMut, ExnRef, ExternRef, Func, HeapType, Ref, RefType,
-    StoreContextMut, TableType, Trap,
+    StoreContextMut, TableType, Trap, Val, ValRaw, ValType,
 };
 use core::iter;
 use core::ptr::NonNull;
@@ -586,6 +586,61 @@ impl TransactionalTable {
     /// Panics if `store` does not own this table.
     pub fn ty(&self, store: impl AsContext) -> TableType {
         self.0.ty(store)
+    }
+
+    /// Returns the latest committed size of this transactional table.
+    ///
+    /// This host-side observation does not begin a Wasm transaction. A grow
+    /// performed by an active transaction remains private until commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this table.
+    pub fn size(&self, store: impl AsContext) -> u64 {
+        self.0.size(store)
+    }
+
+    /// Returns the latest committed value at `index`, or `None` when the index
+    /// is out of bounds.
+    ///
+    /// This host-side observation does not begin a Wasm transaction. A write
+    /// performed by an active transaction remains private until commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this table.
+    pub fn get(&self, mut store: impl AsContextMut, index: u64) -> Option<Val> {
+        let store = store.as_context_mut();
+        let element_ty = self.ty(&store).element().clone();
+        if !element_ty.is_transactional_ref() {
+            return self.0.get(store, index).map(Val::from);
+        }
+
+        let raw = {
+            let mut store = AutoAssertNoGc::new(store.0);
+            let (table, _gc_store) = self.0.wasmtime_table(&mut store, [index]);
+            match table.element_type() {
+                TableElementType::Func => ValRaw::funcref(
+                    table
+                        .get_func(index)
+                        .ok()?
+                        .map_or(core::ptr::null_mut(), |ptr| ptr.as_ptr().cast()),
+                ),
+                TableElementType::GcRef => {
+                    let raw = table.get_transaction_ref_raw(index).ok()?;
+                    match element_ty.heap_type().top() {
+                        HeapType::Extern => ValRaw::externref(raw),
+                        HeapType::Any => ValRaw::anyref(raw),
+                        _ => unreachable!("transactional GC table has unsupported heap type"),
+                    }
+                }
+                TableElementType::Cont => panic!("unimplemented table for cont"),
+            }
+        };
+
+        // SAFETY: `raw` came directly from a table whose declared element type
+        // is `element_ty` and the table belongs to this store.
+        Some(unsafe { Val::from_raw(store, raw, ValType::Ref(element_ty)) })
     }
 
     pub(crate) fn from_raw(instance: StoreInstanceId, index: DefinedTableIndex) -> Self {

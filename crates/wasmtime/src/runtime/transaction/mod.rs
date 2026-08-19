@@ -251,12 +251,16 @@ fn global_granule_id(owner_instance: Option<InstanceId>, global_index: u32) -> G
 
 fn object_granule_object_id(granule: GranuleId) -> Option<ObjectId> {
     match granule {
-        GranuleId::Object { object_id } => Some(object_id),
+        GranuleId::Object { object_id } | GranuleId::VolatileObject { object_id, .. } => {
+            Some(object_id)
+        }
         GranuleId::TMemory { .. }
         | GranuleId::TMemorySize { .. }
         | GranuleId::TGlobal { .. }
         | GranuleId::TTable { .. }
-        | GranuleId::TTableSize { .. } => None,
+        | GranuleId::TTableSize { .. }
+        | GranuleId::TData { .. }
+        | GranuleId::TElem { .. } => None,
     }
 }
 
@@ -267,7 +271,23 @@ fn granule_uses_transaction_state_version(granule: GranuleId) -> bool {
             | GranuleId::TGlobal { .. }
             | GranuleId::TTable { .. }
             | GranuleId::TTableSize { .. }
+            | GranuleId::TData { .. }
+            | GranuleId::TElem { .. }
     )
+}
+
+fn tdata_granule_id(owner_instance: Option<InstanceId>, data_index: u32) -> GranuleId {
+    GranuleId::TData {
+        instance: granule_instance(owner_instance),
+        data_index,
+    }
+}
+
+fn telem_granule_id(owner_instance: Option<InstanceId>, elem_index: u32) -> GranuleId {
+    GranuleId::TElem {
+        instance: granule_instance(owner_instance),
+        elem_index,
+    }
 }
 
 fn checked_array_range_end(start: usize, len: usize) -> Result<usize> {

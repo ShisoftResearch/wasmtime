@@ -610,6 +610,30 @@ impl TransactionRegionRuntime {
     where
         I: IntoIterator<Item = PersistentObjectDirectoryEntry>,
     {
+        self.install_persistent_object_directory_entries_with_version_policy(entries, true)
+    }
+
+    pub(crate) fn install_committed_transaction_object_directory_entries<I>(
+        &self,
+        entries: I,
+    ) -> Result<Vec<PersistentObjectDirectoryEntry>>
+    where
+        I: IntoIterator<Item = PersistentObjectDirectoryEntry>,
+    {
+        // The owning transaction already advances every semantic object-write
+        // granule before releasing its authority. Installing its durable
+        // directory record is bookkeeping, not a second payload mutation.
+        self.install_persistent_object_directory_entries_with_version_policy(entries, false)
+    }
+
+    fn install_persistent_object_directory_entries_with_version_policy<I>(
+        &self,
+        entries: I,
+        _bump_object_granule_versions: bool,
+    ) -> Result<Vec<PersistentObjectDirectoryEntry>>
+    where
+        I: IntoIterator<Item = PersistentObjectDirectoryEntry>,
+    {
         let mut bumped_epoch = false;
         #[cfg(all(
             not(feature = "transaction-mvcc"),
@@ -687,7 +711,9 @@ impl TransactionRegionRuntime {
                     not(feature = "transaction-mvcc"),
                     not(feature = "transaction-cc-strict-2pl")
                 ))]
-                changed_granules.insert(GranuleId::Object { object_id });
+                if _bump_object_granule_versions {
+                    changed_granules.insert(GranuleId::Object { object_id });
+                }
             }
             installed
         };
@@ -1416,7 +1442,10 @@ impl TransactionRegionRuntime {
                 {
                     all_granules_use_shared_versions
                         || granule_uses_transaction_state_version(*granule)
-                        || matches!(granule, GranuleId::Object { .. })
+                        || matches!(
+                            granule,
+                            GranuleId::Object { .. } | GranuleId::VolatileObject { .. }
+                        )
                 }
                 #[cfg(not(all(
                     not(feature = "transaction-mvcc"),

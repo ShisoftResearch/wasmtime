@@ -836,8 +836,14 @@ impl<'a> Instantiator<'a> {
                     // if required.
 
                     let i = unsafe {
-                        crate::Instance::new_started(store, module, imports.as_ref(), asyncness)
-                            .await?
+                        crate::Instance::new_started(
+                            store,
+                            module,
+                            imports.as_ref(),
+                            asyncness,
+                            None,
+                        )
+                        .await?
                     };
 
                     if exit {

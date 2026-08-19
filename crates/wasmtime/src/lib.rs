@@ -864,6 +864,20 @@ pub mod _internal {
             .expect("nullable transaction-any reference has a default value")
         }
 
+        pub fn transaction_wast_tanyref_type() -> crate::ValType {
+            crate::ValType::Ref(crate::RefType::new_transactional(
+                true,
+                crate::HeapType::Any,
+            ))
+        }
+
+        pub fn transaction_wast_tfuncref_type() -> crate::ValType {
+            crate::ValType::Ref(crate::RefType::new_transactional(
+                true,
+                crate::HeapType::Func,
+            ))
+        }
+
         pub fn transaction_wast_ref_expectation_for_type(
             ty: &crate::ValType,
         ) -> Option<TransactionWastRefExpectation> {

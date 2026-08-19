@@ -33,6 +33,10 @@ pub(crate) struct PendingPublication {
     pub(crate) kind: u16,
     pub(crate) type_layout_id: u32,
     pub(crate) payload: Vec<u8>,
+    /// Whether installing this object record represents a semantic write to
+    /// the object's transaction granule. This is runtime-only commit metadata
+    /// and is deliberately not part of the durable record encoding.
+    pub(crate) bumps_object_granule_version: bool,
 }
 
 pub(crate) fn encode_data_record(pub_: &PendingPublication) -> Result<Vec<u8>> {
@@ -352,6 +356,7 @@ impl PendingPublication {
             kind: PackedGranuleDomain::TMemorySize as u16,
             type_layout_id: 0,
             payload: new_pages.to_le_bytes().to_vec(),
+            bumps_object_granule_version: false,
         })
     }
 
@@ -389,6 +394,7 @@ impl PendingPublication {
             kind: domain as u16,
             type_layout_id: 0,
             payload,
+            bumps_object_granule_version: false,
         })
     }
 
@@ -428,6 +434,7 @@ impl PendingPublication {
             kind: domain as u16,
             type_layout_id,
             payload,
+            bumps_object_granule_version: true,
         })
     }
 
@@ -464,6 +471,7 @@ impl PendingPublication {
             kind: 1,
             type_layout_id: 0,
             payload: payload.to_vec(),
+            bumps_object_granule_version: false,
         }
     }
 
@@ -2342,6 +2350,7 @@ fn sample_publications() -> Vec<PendingPublication> {
             kind: 7,
             type_layout_id: 0x10,
             payload: vec![1, 2, 3, 4],
+            bumps_object_granule_version: false,
         },
         PendingPublication {
             logical_id: 0x1001,
@@ -2349,6 +2358,7 @@ fn sample_publications() -> Vec<PendingPublication> {
             kind: 9,
             type_layout_id: 0x20,
             payload: vec![5, 6, 7, 8, 9],
+            bumps_object_granule_version: false,
         },
     ]
 }

@@ -418,6 +418,11 @@ pub fn translate_operator(
             let (params, results) = blocktype_params_results(validator, *blockty)?;
             let params = params.collect::<Vec<_>>();
             let results = results.collect::<Vec<_>>();
+            let result_types = results
+                .iter()
+                .copied()
+                .map(|ty| environ.convert_valtype(ty))
+                .collect::<WasmResult<SmallVec<[_; 4]>>>()?;
             let next = block_with_params(builder, results, environ)?;
             let handler = block_with_params(builder, params.iter().copied(), environ)?;
             builder.append_block_param(handler, I32);
@@ -439,6 +444,7 @@ pub fn translate_operator(
                 kind,
                 handler,
                 handler_params,
+                result_types,
                 environ.stacks.control_stack.len(),
             )?;
         }
@@ -763,7 +769,12 @@ pub fn translate_operator(
                 (return_count, frame.br_destination())
             };
             let destination_args = environ.stacks.peekn(return_count).to_vec();
-            environ.translate_transaction_cleanup_for_control_exit(builder, i)?;
+            environ.translate_transaction_cleanup_for_control_exit(
+                builder,
+                i,
+                &destination_args,
+                &operand_types[..return_count],
+            )?;
             canonicalise_then_jump(builder, br_destination, &destination_args);
             environ.stacks.popn(return_count);
             environ.stacks.reachable = false;
@@ -771,7 +782,7 @@ pub fn translate_operator(
         Operator::BrIf { relative_depth } => {
             let target = environ.stacks.control_stack.len() - 1 - (*relative_depth as usize);
             if environ.transaction_exit_requires_cleanup(target) {
-                translate_transaction_br_if(*relative_depth, builder, environ)?;
+                translate_transaction_br_if(*relative_depth, builder, environ, operand_types)?;
             } else {
                 translate_br_if(*relative_depth, builder, environ);
             }
@@ -838,7 +849,12 @@ pub fn translate_operator(
                         frame.set_branched_to_exit();
                         frame.br_destination()
                     };
-                    environ.translate_transaction_cleanup_for_control_exit(builder, target)?;
+                    environ.translate_transaction_cleanup_for_control_exit(
+                        builder,
+                        target,
+                        &args,
+                        &operand_types[..return_count],
+                    )?;
                     canonicalise_then_jump(builder, destination, &args);
                 }
                 environ.stacks.popn(return_count);
@@ -933,7 +949,12 @@ pub fn translate_operator(
             };
             {
                 let mut return_args = environ.stacks.peekn(return_count).to_vec();
-                environ.translate_transaction_cleanup_for_control_exit(builder, 0)?;
+                environ.translate_transaction_cleanup_for_control_exit(
+                    builder,
+                    0,
+                    &return_args,
+                    &operand_types[..return_count],
+                )?;
                 environ.handle_before_return(&return_args, builder);
                 bitcast_wasm_returns(&mut return_args, builder);
                 builder.ins().return_(&return_args);
@@ -1270,6 +1291,29 @@ pub fn translate_operator(
             bitcast_wasm_params(environ, sigref, &mut args, builder);
 
             environ.translate_return_call_ref(builder, srcloc, sigref, callee, &args)?;
+
+            environ.stacks.popn(num_args);
+            if callee_precedes_args {
+                environ.stacks.pop1();
+            }
+            environ.stacks.reachable = false;
+        }
+        Operator::ReturnTCallRef { type_index } => {
+            let type_index = TypeIndex::from_u32(*type_index);
+            let sig_ref = environ.get_or_create_sig_ref(builder.func, type_index);
+            let num_args = environ.num_params_for_function_type(type_index);
+            let callee_precedes_args = call_ref_callee_precedes_args(operand_types, num_args);
+            let callee = if callee_precedes_args {
+                environ.stacks.stack[environ.stacks.stack.len() - num_args - 1]
+            } else {
+                environ.stacks.pop1()
+            };
+
+            let mut args = environ.stacks.peekn(num_args).to_vec();
+            bitcast_wasm_params(environ, sig_ref, &mut args, builder);
+
+            environ
+                .translate_return_transaction_call_ref(builder, srcloc, sig_ref, callee, &args)?;
 
             environ.stacks.popn(num_args);
             if callee_precedes_args {
@@ -2286,6 +2330,9 @@ pub fn translate_operator(
         Operator::ElemDrop { elem_index } => {
             environ.translate_elem_drop(builder.cursor(), *elem_index)?;
         }
+        Operator::TElemDrop { elem_index } => {
+            environ.translate_telem_drop(builder.cursor(), *elem_index)?;
+        }
         Operator::V128Const { value } => {
             let data = value.bytes().to_vec().into();
             let handle = builder.func.dfg.constants.insert(data);
@@ -3241,21 +3288,33 @@ pub fn translate_operator(
             environ.stacks.push1(builder.ins().iadd(dot32, c));
         }
 
-        Operator::BrOnNull { relative_depth } => {
+        Operator::BrOnNull { relative_depth } | Operator::TBrOnNull { relative_depth } => {
             let r = environ.stacks.pop1();
             let &[.., WasmValType::Ref(r_ty)] = operand_types else {
                 unreachable!("validation")
             };
             let is_null = environ.translate_ref_is_null(builder.cursor(), r, r_ty)?;
-            let (br_destination, inputs) = translate_br_if_args(*relative_depth, environ);
-            let else_block = builder.create_block();
-            canonicalise_brif(builder, is_null, br_destination, inputs, else_block, &[]);
+            let target = environ.stacks.control_stack.len() - 1 - *relative_depth as usize;
+            if environ.transaction_exit_requires_cleanup(target) {
+                translate_transaction_conditional_ref_branch(
+                    *relative_depth,
+                    is_null,
+                    true,
+                    builder,
+                    environ,
+                    operand_types,
+                )?;
+            } else {
+                let (br_destination, inputs) = translate_br_if_args(*relative_depth, environ);
+                let else_block = builder.create_block();
+                canonicalise_brif(builder, is_null, br_destination, inputs, else_block, &[]);
 
-            builder.seal_block(else_block); // The only predecessor is the current block.
-            builder.switch_to_block(else_block);
+                builder.seal_block(else_block); // The only predecessor is the current block.
+                builder.switch_to_block(else_block);
+            }
             environ.stacks.push1(r);
         }
-        Operator::BrOnNonNull { relative_depth } => {
+        Operator::BrOnNonNull { relative_depth } | Operator::TBrOnNonNull { relative_depth } => {
             // We write this a bit differently from the spec to avoid an extra
             // block/branch and the typed accounting thereof. Instead of the
             // spec's approach, it's described as such:
@@ -3267,22 +3326,33 @@ pub fn translate_operator(
                 unreachable!("validation")
             };
             let r_ty = *r_ty;
-            let (br_destination, inputs) = translate_br_if_args(*relative_depth, environ);
-            let inputs = inputs.to_vec();
             let is_null = environ.translate_ref_is_null(builder.cursor(), r, r_ty)?;
-            let else_block = builder.create_block();
-            canonicalise_brif(builder, is_null, else_block, &[], br_destination, &inputs);
+            let target = environ.stacks.control_stack.len() - 1 - *relative_depth as usize;
+            if environ.transaction_exit_requires_cleanup(target) {
+                translate_transaction_conditional_ref_branch(
+                    *relative_depth,
+                    is_null,
+                    false,
+                    builder,
+                    environ,
+                    operand_types,
+                )?;
+            } else {
+                let (br_destination, inputs) = translate_br_if_args(*relative_depth, environ);
+                let inputs = inputs.to_vec();
+                let else_block = builder.create_block();
+                canonicalise_brif(builder, is_null, else_block, &[], br_destination, &inputs);
 
-            // In the null case, pop the ref
+                builder.seal_block(else_block); // The only predecessor is the current block.
+
+                // The rest of the translation operates on our is null case, which is
+                // currently an empty block
+                builder.switch_to_block(else_block);
+            }
+            // In the null fallthrough case, pop the ref.
             environ.stacks.pop1();
-
-            builder.seal_block(else_block); // The only predecessor is the current block.
-
-            // The rest of the translation operates on our is null case, which is
-            // currently an empty block
-            builder.switch_to_block(else_block);
         }
-        Operator::CallRef { type_index } => {
+        Operator::CallRef { type_index } | Operator::TCallRef { type_index } => {
             // Get function signature
             // `index` is the index of the function's signature and `table_index` is the index of
             // the table to search the function in.
@@ -3337,11 +3407,13 @@ pub fn translate_operator(
             let r = environ.stacks.pop1();
             environ.translate_transaction_tref_cast_read(builder, r)?;
             environ.stacks.push1(r);
+            environ.translate_transaction_branch_if_failure_pending(builder)?;
         }
         Operator::TRefCastWrite => {
             let r = environ.stacks.pop1();
             environ.translate_transaction_tref_cast_write(builder, r)?;
             environ.stacks.push1(r);
+            environ.translate_transaction_branch_if_failure_pending(builder)?;
         }
 
         // Transactional object operators are parsed as distinct `0xfa 0xfb`
@@ -3596,7 +3668,7 @@ pub fn translate_operator(
             array_data_index,
         } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
-            let array_data_index = DataIndex::from_u32(*array_data_index);
+            let array_data_index = TDataIndex::from_u32(*array_data_index);
             let (data_offset, len) = environ.stacks.pop2();
             let array_ref = environ.translate_transaction_tarray_new_data(
                 builder,
@@ -3628,7 +3700,7 @@ pub fn translate_operator(
             array_elem_index,
         } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
-            let array_elem_index = ElemIndex::from_u32(*array_elem_index);
+            let array_elem_index = TElemIndex::from_u32(*array_elem_index);
             let (elem_offset, len) = environ.stacks.pop2();
             let array_ref = environ.translate_transaction_tarray_new_elem(
                 builder,
@@ -3714,7 +3786,7 @@ pub fn translate_operator(
             array_data_index,
         } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
-            let array_data_index = DataIndex::from_u32(*array_data_index);
+            let array_data_index = TDataIndex::from_u32(*array_data_index);
             let (array, dst_index, src_index, len) = environ.stacks.pop4();
             environ.translate_transaction_tarray_init_data(
                 builder,
@@ -3748,7 +3820,7 @@ pub fn translate_operator(
             array_elem_index,
         } => {
             let array_type_index = TypeIndex::from_u32(*array_type_index);
-            let array_elem_index = ElemIndex::from_u32(*array_elem_index);
+            let array_elem_index = TElemIndex::from_u32(*array_elem_index);
             let (array, dst_index, src_index, len) = environ.stacks.pop4();
             environ.translate_transaction_tarray_init_elem(
                 builder,
@@ -3853,7 +3925,7 @@ pub fn translate_operator(
                 elem,
             )?;
         }
-        Operator::RefEq => {
+        Operator::RefEq | Operator::TRefEq => {
             let (r1, r2) = environ.stacks.pop2();
             let eq = builder.ins().icmp(ir::condcodes::IntCC::Equal, r1, r2);
             let eq = builder.ins().uextend(ir::types::I32, eq);
@@ -3954,28 +4026,36 @@ pub fn translate_operator(
 
             let to_ref_type = environ.convert_ref_type(*to_ref_type)?;
             let cast_is_okay = environ.translate_ref_test(builder, to_ref_type, r, *r_ty)?;
+            let target = environ.stacks.control_stack.len() - 1 - *relative_depth as usize;
+            if environ.transaction_exit_requires_cleanup(target) {
+                translate_transaction_conditional_ref_branch(
+                    *relative_depth,
+                    cast_is_okay,
+                    true,
+                    builder,
+                    environ,
+                    operand_types,
+                )?;
+            } else {
+                let (cast_succeeds_block, inputs) = translate_br_if_args(*relative_depth, environ);
+                let inputs = inputs.to_vec();
+                let cast_fails_block = builder.create_block();
+                canonicalise_brif(
+                    builder,
+                    cast_is_okay,
+                    cast_succeeds_block,
+                    &inputs,
+                    cast_fails_block,
+                    &[],
+                );
 
-            let (cast_succeeds_block, inputs) = translate_br_if_args(*relative_depth, environ);
-            let inputs = inputs.to_vec();
-            let cast_fails_block = builder.create_block();
-            canonicalise_brif(
-                builder,
-                cast_is_okay,
-                cast_succeeds_block,
-                &inputs,
-                cast_fails_block,
-                &[
-                    // NB: the `cast_fails_block` is dominated by the current
-                    // block, and therefore doesn't need any block params.
-                ],
-            );
+                // The only predecessor is the current block.
+                builder.seal_block(cast_fails_block);
 
-            // The only predecessor is the current block.
-            builder.seal_block(cast_fails_block);
-
-            // The next Wasm instruction is executed when the cast failed and we
-            // did not branch away.
-            builder.switch_to_block(cast_fails_block);
+                // The next Wasm instruction is executed when the cast failed and we
+                // did not branch away.
+                builder.switch_to_block(cast_fails_block);
+            }
         }
         Operator::BrOnCastFail {
             relative_depth,
@@ -3994,27 +4074,36 @@ pub fn translate_operator(
 
             let to_ref_type = environ.convert_ref_type(*to_ref_type)?;
             let cast_is_okay = environ.translate_ref_test(builder, to_ref_type, r, *r_ty)?;
+            let target = environ.stacks.control_stack.len() - 1 - *relative_depth as usize;
+            if environ.transaction_exit_requires_cleanup(target) {
+                translate_transaction_conditional_ref_branch(
+                    *relative_depth,
+                    cast_is_okay,
+                    false,
+                    builder,
+                    environ,
+                    operand_types,
+                )?;
+            } else {
+                let (cast_fails_block, inputs) = translate_br_if_args(*relative_depth, environ);
+                let inputs = inputs.to_vec();
+                let cast_succeeds_block = builder.create_block();
+                canonicalise_brif(
+                    builder,
+                    cast_is_okay,
+                    cast_succeeds_block,
+                    &[],
+                    cast_fails_block,
+                    &inputs,
+                );
 
-            let (cast_fails_block, inputs) = translate_br_if_args(*relative_depth, environ);
-            let cast_succeeds_block = builder.create_block();
-            canonicalise_brif(
-                builder,
-                cast_is_okay,
-                cast_succeeds_block,
-                &[
-                    // NB: the `cast_succeeds_block` is dominated by the current
-                    // block, and therefore doesn't need any block params.
-                ],
-                cast_fails_block,
-                inputs,
-            );
+                // The only predecessor is the current block.
+                builder.seal_block(cast_succeeds_block);
 
-            // The only predecessor is the current block.
-            builder.seal_block(cast_succeeds_block);
-
-            // The next Wasm instruction is executed when the cast succeeded and
-            // we did not branch away.
-            builder.switch_to_block(cast_succeeds_block);
+                // The next Wasm instruction is executed when the cast succeeded and
+                // we did not branch away.
+                builder.switch_to_block(cast_succeeds_block);
+            }
         }
 
         Operator::AnyConvertExtern => {
@@ -5167,6 +5256,7 @@ fn translate_transaction_br_if(
     relative_depth: u32,
     builder: &mut FunctionBuilder,
     env: &mut FuncEnvironment<'_>,
+    operand_types: &[WasmValType],
 ) -> WasmResult<()> {
     let branch_hint = env.take_branch_hint(builder.srcloc().bits() as usize);
     let condition = env.stacks.pop1();
@@ -5192,7 +5282,55 @@ fn translate_transaction_br_if(
 
     builder.switch_to_block(taken);
     builder.seal_block(taken);
-    env.translate_transaction_cleanup_for_control_exit(builder, target)?;
+    env.translate_transaction_cleanup_for_control_exit(
+        builder,
+        target,
+        &args,
+        &operand_types[..return_count],
+    )?;
+    canonicalise_then_jump(builder, destination, &args);
+
+    builder.switch_to_block(fallthrough);
+    builder.seal_block(fallthrough);
+    Ok(())
+}
+
+fn translate_transaction_conditional_ref_branch(
+    relative_depth: u32,
+    condition: ir::Value,
+    branch_when_true: bool,
+    builder: &mut FunctionBuilder,
+    env: &mut FuncEnvironment<'_>,
+    operand_types: &[WasmValType],
+) -> WasmResult<()> {
+    let target = env.stacks.control_stack.len() - 1 - relative_depth as usize;
+    let (return_count, destination) = {
+        let frame = &mut env.stacks.control_stack[target];
+        frame.set_branched_to_exit();
+        let return_count = if frame.is_loop() {
+            frame.num_param_values()
+        } else {
+            frame.num_return_values()
+        };
+        (return_count, frame.br_destination())
+    };
+    let args = env.stacks.peekn(return_count).to_vec();
+    let taken = builder.create_block();
+    let fallthrough = builder.create_block();
+    if branch_when_true {
+        builder.ins().brif(condition, taken, &[], fallthrough, &[]);
+    } else {
+        builder.ins().brif(condition, fallthrough, &[], taken, &[]);
+    }
+
+    builder.switch_to_block(taken);
+    builder.seal_block(taken);
+    env.translate_transaction_cleanup_for_control_exit(
+        builder,
+        target,
+        &args,
+        &operand_types[..return_count],
+    )?;
     canonicalise_then_jump(builder, destination, &args);
 
     builder.switch_to_block(fallthrough);

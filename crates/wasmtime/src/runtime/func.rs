@@ -1477,6 +1477,13 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
     store: &mut StoreContextMut<'_, T>,
     closure: impl FnMut(NonNull<VMContext>, Option<InterpreterRef<'_>>) -> bool,
 ) -> Result<()> {
+    // A structured transaction failure must remain visible while Wasm is
+    // nested through direct calls or a reentrant host callback so that the
+    // dynamic caller's `ttry` can handle it. Once the outermost host-to-Wasm
+    // call returns there is no Wasm handler left, so consume the terminal
+    // failure instead of letting it suppress the next independent call.
+    let outermost_wasm_entry =
+        unsafe { *store.0.vm_store_context().stack_limit.get() == usize::MAX };
     // The `enter_wasm` call below will reset the store context's
     // `stack_chain` to a new `InitialStack`, pointing to the
     // stack-allocated `initial_stack_csi`.
@@ -1491,7 +1498,15 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
         // `previous_runtime_state` implicitly dropped here
         return Err(trap);
     }
-    let result = crate::runtime::vm::catch_traps(store, &mut previous_runtime_state, closure);
+    let mut result = crate::runtime::vm::catch_traps(store, &mut previous_runtime_state, closure);
+    let uncaught_transaction_failure =
+        result.is_ok() && store.0.transaction_state().structured_failure_pending();
+    if uncaught_transaction_failure {
+        let code = store.0.transaction_state().structured_failure_code();
+        result = Err(crate::format_err!(
+            "uncaught transaction failure with code {code}"
+        ));
+    }
     if result.is_err() {
         let (transaction, object_table) = store.0.transaction_state_and_object_table_mut();
         if transaction.active_transaction().is_some() {
@@ -1501,6 +1516,15 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
     #[cfg(feature = "component-model")]
     if result.is_err() {
         store.0.set_trapped();
+    }
+    // A reentrant host caller can catch the synthesized error (the spectest
+    // scheduler does this to return its status code). Once that failure has
+    // crossed this Wasm-to-host boundary it is no longer available to a Wasm
+    // structured handler, so do not leak it into a restored outer workspace.
+    if (outermost_wasm_entry || uncaught_transaction_failure)
+        && store.0.transaction_state().structured_failure_pending()
+    {
+        store.0.transaction_state_mut().clear_structured_failure();
     }
     core::mem::drop(previous_runtime_state);
     store.0.call_hook(CallHook::ReturningFromWasm)?;
@@ -2159,18 +2183,18 @@ impl<T> Caller<'_, T> {
 
     #[doc(hidden)]
     pub fn transaction_spectest_enter_tid(&mut self, tid: u64) -> Result<Option<u64>> {
-        self.store
-            .0
-            .transaction_state_mut()
+        let (state, object_table) = self.store.0.transaction_state_and_object_table_mut();
+        state.materialize_transaction_local_objects_for_workspace_switch(object_table)?;
+        state
             .enter_transaction(crate::runtime::transaction::TransactionId::from_raw(tid))
             .map(|previous| previous.map(crate::runtime::transaction::TransactionId::as_raw))
     }
 
     #[doc(hidden)]
     pub fn transaction_spectest_restore_tid(&mut self, previous: Option<u64>) -> Result<()> {
-        self.store
-            .0
-            .transaction_state_mut()
+        let (state, object_table) = self.store.0.transaction_state_and_object_table_mut();
+        state.materialize_transaction_local_objects_for_workspace_switch(object_table)?;
+        state
             .restore_transaction(previous.map(crate::runtime::transaction::TransactionId::from_raw))
     }
 

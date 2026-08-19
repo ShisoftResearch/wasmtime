@@ -47,6 +47,8 @@ pub(crate) struct TransactionState {
     pub(super) staged_memory_sizes: BTreeMap<GranuleId, u64>,
     pub(super) staged_table_sizes: BTreeMap<GranuleId, u64>,
     pub(super) staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
+    pub(super) staged_segment_drops: BTreeSet<GranuleId>,
+    pub(super) committed_segment_drops: BTreeSet<GranuleId>,
     pub(super) staged_objects: BTreeMap<ObjectId, StagedObjectRecord>,
     pub(super) pending_persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     pub(super) promoted_objects: BTreeMap<ObjectId, ObjectId>,
@@ -84,6 +86,7 @@ pub(super) struct TransactionWorkspace {
     staged_memory_sizes: BTreeMap<GranuleId, u64>,
     staged_table_sizes: BTreeMap<GranuleId, u64>,
     staged_table_elements: BTreeMap<TableElementKey, TableElementSnapshot>,
+    staged_segment_drops: BTreeSet<GranuleId>,
     staged_objects: BTreeMap<ObjectId, StagedObjectRecord>,
     pending_persistent_root_versions: BTreeMap<PersistentRootKey, u32>,
     promoted_objects: BTreeMap<ObjectId, ObjectId>,
@@ -198,6 +201,8 @@ impl Default for TransactionState {
             staged_memory_sizes: BTreeMap::new(),
             staged_table_sizes: BTreeMap::new(),
             staged_table_elements: BTreeMap::new(),
+            staged_segment_drops: BTreeSet::new(),
+            committed_segment_drops: BTreeSet::new(),
             staged_objects: BTreeMap::new(),
             pending_persistent_root_versions: BTreeMap::new(),
             promoted_objects: BTreeMap::new(),
@@ -303,6 +308,8 @@ pub(crate) struct TransactionLocalObjectTable {
     slots: BTreeMap<ObjectId, TransactionLocalObjectSlot>,
     transaction_ref_handles_to_objects: BTreeMap<u32, ObjectId>,
     objects_to_transaction_ref_handles: BTreeMap<ObjectId, u32>,
+    read_permissions: BTreeSet<ObjectId>,
+    write_permissions: BTreeSet<ObjectId>,
     next_object_index: u64,
 }
 
@@ -312,6 +319,8 @@ impl Default for TransactionLocalObjectTable {
             slots: BTreeMap::new(),
             transaction_ref_handles_to_objects: BTreeMap::new(),
             objects_to_transaction_ref_handles: BTreeMap::new(),
+            read_permissions: BTreeSet::new(),
+            write_permissions: BTreeSet::new(),
             next_object_index: TRANSACTION_LOCAL_OBJECT_ID_BASE,
         }
     }
@@ -515,6 +524,20 @@ impl TransactionLocalObjectTable {
             .get(&handle)
             .copied()?;
         self.contains(object_id).then_some(object_id)
+    }
+
+    fn record_read_permission(&mut self, object_id: ObjectId) -> Result<bool> {
+        self.kind(object_id)?;
+        if self.write_permissions.contains(&object_id) {
+            return Ok(false);
+        }
+        Ok(self.read_permissions.insert(object_id))
+    }
+
+    fn record_write_permission(&mut self, object_id: ObjectId) -> Result<bool> {
+        self.kind(object_id)?;
+        self.read_permissions.remove(&object_id);
+        Ok(self.write_permissions.insert(object_id))
     }
 }
 
@@ -1321,7 +1344,7 @@ impl TransactionState {
             object_table
                 .validate_persistent_object_directory_entry_source(&candidate.directory_entry)?;
         }
-        let installed = runtime.install_persistent_object_directory_entries(
+        let installed = runtime.install_committed_transaction_object_directory_entries(
             candidates.into_iter().map(|candidate| {
                 debug_assert_eq!(candidate.object_id, candidate.directory_entry.object_id);
                 candidate.directory_entry
@@ -2062,6 +2085,10 @@ impl TransactionState {
 
     fn finish_commit_after_policy_hook(&mut self, transaction: TransactionId) -> Result<()> {
         let result = self.commit_transaction_authority(transaction);
+        if result.is_ok() {
+            self.committed_segment_drops
+                .extend(self.staged_segment_drops.iter().copied());
+        }
         Self::combine_results(
             result,
             self.clear_active(),
@@ -2320,9 +2347,6 @@ impl TransactionState {
         object_table: &mut ObjectTable,
     ) -> Result<()> {
         self.ensure_active()?;
-        if self.local_object_table.is_empty() {
-            return Ok(());
-        }
 
         let local_handles = self
             .local_object_table
@@ -2354,7 +2378,141 @@ impl TransactionState {
             self.staged_objects.remove(&local_id);
         }
         self.local_object_table = TransactionLocalObjectTable::default();
+
         Ok(())
+    }
+
+    /// Materializes transaction-local aggregates before changing the active
+    /// transaction workspace.
+    ///
+    /// The reference interpreter allocates transactional aggregates in the
+    /// shared runtime heap and changes only their granule ownership when a
+    /// spectest scheduler switches transaction IDs. Wasmtime normally keeps
+    /// newly allocated aggregates workspace-local until they need persistent
+    /// publication. A workspace switch is another escape boundary: install
+    /// the graph as volatile shared objects, retain its raw handles and runtime
+    /// types, and leave durable publication to the ordinary reachability path.
+    pub(crate) fn materialize_transaction_local_objects_for_workspace_switch(
+        &mut self,
+        object_table: &mut ObjectTable,
+    ) -> Result<bool> {
+        if self.active.is_none() {
+            return Ok(false);
+        }
+        self.ensure_active()?;
+        if self.local_object_table.is_empty() {
+            return Ok(false);
+        }
+
+        let local_slots = self
+            .local_object_table
+            .slots
+            .iter()
+            .map(|(&object_id, slot)| (object_id, slot.clone()))
+            .collect::<Vec<_>>();
+        let local_handles = self
+            .local_object_table
+            .transaction_ref_handles_to_objects
+            .clone();
+        let local_read_permissions = self.local_object_table.read_permissions.clone();
+        let local_write_permissions = self.local_object_table.write_permissions.clone();
+        let mut remap = BTreeMap::new();
+        let mut allocated = Vec::with_capacity(local_slots.len());
+        let mut staged_objects = BTreeMap::new();
+
+        let materialize = (|| {
+            for (local_id, slot) in &local_slots {
+                let type_layout_id = TypeLayoutId::new(slot.type_layout_id)
+                    .context("transaction-local object type layout id cannot be zero")?;
+                let shared = object_table.allocate_workspace_shared_payload_with_type_layout_id(
+                    ObjectPayload::default_for_kind(slot.kind)?,
+                    type_layout_id,
+                )?;
+                allocated.push(shared);
+                if let Some(runtime_type_index) = slot.runtime_type_index {
+                    object_table.set_runtime_type_index(shared, runtime_type_index)?;
+                }
+                remap.insert(*local_id, shared);
+            }
+
+            for (&handle, &local_id) in &local_handles {
+                let shared = remap
+                    .get(&local_id)
+                    .copied()
+                    .context("transaction-local handle referred to missing local object")?;
+                object_table.associate_transaction_ref_handle_for_object_id(handle, shared)?;
+            }
+
+            for (local_id, slot) in &local_slots {
+                let shared = remap
+                    .get(local_id)
+                    .copied()
+                    .context("transaction-local object was not materialized")?;
+                let mut payload = slot.payload.clone();
+                remap_object_payload_refs(&mut payload, &remap);
+                object_table.update_payload(shared, payload)?;
+            }
+
+            for (&object_id, record) in &self.staged_objects {
+                let object_id = remap.get(&object_id).copied().unwrap_or(object_id);
+                let mut payload = record.payload().clone();
+                remap_object_payload_refs(&mut payload, &remap);
+                ensure!(
+                    staged_objects
+                        .insert(object_id, StagedObjectRecord::new(payload))
+                        .is_none(),
+                    "workspace object materialization produced duplicate staged object ids"
+                );
+            }
+
+            let write_materialized = self
+                .staged_objects
+                .keys()
+                .filter_map(|object_id| remap.get(object_id).copied())
+                .chain(
+                    local_write_permissions
+                        .iter()
+                        .filter_map(|object_id| remap.get(object_id).copied()),
+                )
+                .collect::<BTreeSet<_>>();
+            let read_materialized = local_read_permissions
+                .iter()
+                .filter_map(|object_id| remap.get(object_id).copied())
+                .filter(|object_id| !write_materialized.contains(object_id))
+                .collect::<Vec<_>>();
+            for object_id in read_materialized {
+                self.acquire_object_read(object_table, object_id)?;
+            }
+            for object_id in write_materialized {
+                self.acquire_object_write(object_table, object_id)?;
+            }
+
+            Ok(())
+        })();
+        if let Err(error) = materialize {
+            let mut cleanup = Ok(());
+            for object_id in allocated.into_iter().rev() {
+                cleanup = Self::combine_results(
+                    cleanup,
+                    object_table.free(object_id).map(|_| ()),
+                    "failed to free volatile object after workspace materialization failure",
+                );
+            }
+            return Self::combine_results(
+                Err(error),
+                cleanup,
+                "failed to roll back workspace object materialization",
+            );
+        }
+
+        self.staged_objects = staged_objects;
+        self.promoted_objects = self
+            .promoted_objects
+            .iter()
+            .map(|(&source, &promoted)| (remap.get(&source).copied().unwrap_or(source), promoted))
+            .collect();
+        self.local_object_table = TransactionLocalObjectTable::default();
+        Ok(true)
     }
 
     pub(crate) fn abort_allocated_objects(&mut self, object_table: &mut ObjectTable) -> Result<()> {
@@ -2490,6 +2648,57 @@ impl TransactionState {
         self.staged_globals
             .get(&global_granule_id(owner_instance, global_index))
             .copied()
+    }
+
+    pub(crate) fn acquire_tdata_read_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        data_index: u32,
+    ) -> Result<bool> {
+        let granule = tdata_granule_id(owner_instance, data_index);
+        self.acquire_granule_read(granule, 0)?;
+        Ok(self.staged_segment_drops.contains(&granule)
+            || self.committed_segment_drops.contains(&granule))
+    }
+
+    pub(crate) fn stage_tdata_drop_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        data_index: u32,
+    ) -> Result<bool> {
+        let granule = tdata_granule_id(owner_instance, data_index);
+        self.acquire_granule_write(granule, 0)?;
+        Ok(self.staged_segment_drops.insert(granule))
+    }
+
+    pub(crate) fn acquire_tdata_write_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        data_index: u32,
+    ) -> Result<bool> {
+        let granule = tdata_granule_id(owner_instance, data_index);
+        self.acquire_granule_write(granule, 0)
+    }
+
+    pub(crate) fn acquire_telem_read_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        elem_index: u32,
+    ) -> Result<bool> {
+        let granule = telem_granule_id(owner_instance, elem_index);
+        self.acquire_granule_read(granule, 0)?;
+        Ok(self.staged_segment_drops.contains(&granule)
+            || self.committed_segment_drops.contains(&granule))
+    }
+
+    pub(crate) fn stage_telem_drop_owned(
+        &mut self,
+        owner_instance: Option<InstanceId>,
+        elem_index: u32,
+    ) -> Result<bool> {
+        let granule = telem_granule_id(owner_instance, elem_index);
+        self.acquire_granule_write(granule, 0)?;
+        Ok(self.staged_segment_drops.insert(granule))
     }
 
     pub(crate) fn stage_table_element_owned(
@@ -3139,11 +3348,13 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         handle: u32,
     ) -> Result<bool> {
-        let Some(object_id) =
-            self.known_persistent_object_id_for_transaction_ref_handle(object_table, handle)?
+        let Some(object_id) = self.known_object_id_for_transaction_ref_handle(object_table, handle)
         else {
             return Ok(false);
         };
+        if self.local_object_table.contains(object_id) {
+            return self.local_object_table.record_read_permission(object_id);
+        }
         self.acquire_object_read(object_table, object_id)
     }
 
@@ -3152,11 +3363,13 @@ impl TransactionState {
         object_table: &mut ObjectTable,
         handle: u32,
     ) -> Result<bool> {
-        let Some(object_id) =
-            self.known_persistent_object_id_for_transaction_ref_handle(object_table, handle)?
+        let Some(object_id) = self.known_object_id_for_transaction_ref_handle(object_table, handle)
         else {
             return Ok(false);
         };
+        if self.local_object_table.contains(object_id) {
+            return self.local_object_table.record_write_permission(object_id);
+        }
         self.acquire_object_write(object_table, object_id)
     }
 
@@ -3413,11 +3626,15 @@ impl TransactionState {
         object_table: &ObjectTable,
     ) -> Result<Vec<(ObjectId, ObjectPayload)>> {
         self.ensure_active()?;
+        let pending_in_place = self.pending_in_place_promotions();
         self.staged_objects
             .iter()
             .filter_map(
                 |(&object, record)| match object_table.is_persistent(object) {
                     Ok(true) => Some(Ok((object, record.payload().clone()))),
+                    Ok(false) if pending_in_place.contains(&object) => {
+                        Some(Ok((object, record.payload().clone())))
+                    }
                     Ok(false) => None,
                     Err(error) => Some(Err(error)),
                 },
@@ -3434,6 +3651,7 @@ impl TransactionState {
         Vec<(ObjectId, ObjectPayload)>,
     )> {
         self.ensure_active()?;
+        let pending_in_place = self.pending_in_place_promotions();
         let updates = self
             .staged_objects
             .iter()
@@ -3443,35 +3661,58 @@ impl TransactionState {
                     object_table.kind(object_id)? == payload.kind(),
                     "object payload kind does not match object table slot kind"
                 );
-                Ok((object_id, payload, object_table.is_persistent(object_id)?))
+                Ok((
+                    object_id,
+                    payload,
+                    object_table.is_persistent(object_id)?,
+                    pending_in_place.contains(&object_id),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let reserved_object_versions = if let Some(runtime) = &self.shared_region_runtime {
-            runtime.reserve_persistent_object_record_versions(
-                updates
-                    .iter()
-                    .filter_map(|(object_id, _, persistent)| persistent.then_some(*object_id)),
-            )?
+            runtime.reserve_persistent_object_record_versions(updates.iter().filter_map(
+                |(object_id, _, persistent, pending)| {
+                    (*persistent || *pending).then_some(*object_id)
+                },
+            ))?
         } else {
             BTreeMap::new()
         };
         let mut publications = Vec::new();
         let mut volatile = Vec::new();
-        for (object_id, payload, persistent) in updates {
-            if !persistent {
+        for (object_id, payload, persistent, pending) in updates {
+            if !persistent && !pending {
                 volatile.push((object_id, payload));
                 continue;
             }
-            let publication =
-                if let Some(version) = reserved_object_versions.get(&object_id).copied() {
-                    object_table
-                        .persistent_object_pending_publication_from_payload_with_record_version(
-                            object_id, &payload, version,
+            let version = reserved_object_versions.get(&object_id).copied();
+            let mut publication = if pending {
+                if let Some(version) = version {
+                    object_table.workspace_shared_object_pending_publication_from_payload_with_record_version(
+                            object_id,
+                            &payload,
+                            version,
+                            &pending_in_place,
                         )?
                 } else {
-                    object_table
-                        .persistent_object_pending_publication_from_payload(object_id, &payload)?
-                };
+                    object_table.workspace_shared_object_pending_publication_from_payload(
+                        object_id,
+                        &payload,
+                        &pending_in_place,
+                    )?
+                }
+            } else if let Some(version) = version {
+                object_table
+                    .persistent_object_pending_publication_from_payload_with_record_version(
+                        object_id, &payload, version,
+                    )?
+            } else {
+                object_table
+                    .persistent_object_pending_publication_from_payload(object_id, &payload)?
+            };
+            if pending {
+                publication.bumps_object_granule_version = self.owns_object_write(object_id);
+            }
             publications.push(publication);
         }
         Ok((publications, volatile))
@@ -3480,7 +3721,8 @@ impl TransactionState {
     #[cfg(feature = "transaction-mvcc")]
     pub(crate) fn object_is_newly_allocated_for_commit(&self, object: ObjectId) -> Result<bool> {
         self.ensure_active()?;
-        Ok(self.allocated_objects.contains(&object))
+        Ok(self.allocated_objects.contains(&object)
+            || self.promoted_objects.get(&object) == Some(&object))
     }
 
     pub(crate) fn staged_persistent_root_delta(
@@ -4313,6 +4555,7 @@ impl TransactionState {
         if self.staged_objects.is_empty() {
             return Ok(false);
         }
+        let pending_in_place = self.pending_in_place_promotions();
         let updates = self
             .staged_objects
             .iter()
@@ -4326,23 +4569,38 @@ impl TransactionState {
                     object_id,
                     payload.clone(),
                     object_table.is_persistent(object_id)?,
+                    pending_in_place.contains(&object_id),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let reserved_object_versions = if let Some(runtime) = &self.shared_region_runtime {
-            runtime.reserve_persistent_object_record_versions(
-                updates
-                    .iter()
-                    .filter_map(|(object_id, _, persistent)| persistent.then_some(*object_id)),
-            )?
+            runtime.reserve_persistent_object_record_versions(updates.iter().filter_map(
+                |(object_id, _, persistent, pending)| {
+                    (*persistent || *pending).then_some(*object_id)
+                },
+            ))?
         } else {
             BTreeMap::new()
         };
-        for (object_id, payload, persistent) in updates {
-            if persistent {
-                let publication = if let Some(version) =
-                    reserved_object_versions.get(&object_id).copied()
-                {
+        for (object_id, payload, persistent, pending) in updates {
+            if persistent || pending {
+                let version = reserved_object_versions.get(&object_id).copied();
+                let mut publication = if pending {
+                    if let Some(version) = version {
+                        object_table.workspace_shared_object_pending_publication_from_payload_with_record_version(
+                            object_id,
+                            &payload,
+                            version,
+                            &pending_in_place,
+                        )?
+                    } else {
+                        object_table.workspace_shared_object_pending_publication_from_payload(
+                            object_id,
+                            &payload,
+                            &pending_in_place,
+                        )?
+                    }
+                } else if let Some(version) = version {
                     object_table
                         .persistent_object_pending_publication_from_payload_with_record_version(
                             object_id, &payload, version,
@@ -4351,6 +4609,9 @@ impl TransactionState {
                     object_table
                         .persistent_object_pending_publication_from_payload(object_id, &payload)?
                 };
+                if pending {
+                    publication.bumps_object_granule_version = self.owns_object_write(object_id);
+                }
                 publish(publication)?;
             } else {
                 object_table.update_payload(object_id, payload)?;
@@ -4788,6 +5049,7 @@ impl TransactionState {
             staged_memory_sizes: mem::take(&mut self.staged_memory_sizes),
             staged_table_sizes: mem::take(&mut self.staged_table_sizes),
             staged_table_elements: mem::take(&mut self.staged_table_elements),
+            staged_segment_drops: mem::take(&mut self.staged_segment_drops),
             staged_objects: mem::take(&mut self.staged_objects),
             pending_persistent_root_versions: mem::take(&mut self.pending_persistent_root_versions),
             promoted_objects: mem::take(&mut self.promoted_objects),
@@ -4818,6 +5080,7 @@ impl TransactionState {
         self.staged_memory_sizes = workspace.staged_memory_sizes;
         self.staged_table_sizes = workspace.staged_table_sizes;
         self.staged_table_elements = workspace.staged_table_elements;
+        self.staged_segment_drops = workspace.staged_segment_drops;
         self.staged_objects = workspace.staged_objects;
         self.pending_persistent_root_versions = workspace.pending_persistent_root_versions;
         self.promoted_objects = workspace.promoted_objects;
@@ -5002,6 +5265,21 @@ fn persistent_root_object_id_for_table_element_snapshot(
             object_table.persistent_object_id_for_live_bridge_or_promotion_required(gc_ref)
         }
         TableElementSnapshot::FuncRef(_) => Ok(None),
+    }
+}
+
+fn remap_object_payload_refs(payload: &mut ObjectPayload, remap: &BTreeMap<ObjectId, ObjectId>) {
+    let values = match payload {
+        ObjectPayload::Struct(fields) => fields,
+        ObjectPayload::Array(elements) => elements,
+    };
+    for value in values {
+        let ObjectValue::Ref(Some(object_id)) = value else {
+            continue;
+        };
+        if let Some(mapped) = remap.get(object_id).copied() {
+            *object_id = mapped;
+        }
     }
 }
 

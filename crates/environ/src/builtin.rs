@@ -249,11 +249,13 @@ macro_rules! foreach_builtin_function {
             // Stages a transactional memory copy.
             transaction_tmemory_copy(vmctx: vmctx, dst_memory: u32, src_vmctx: pointer, src_memory: u32, dst: u64, src: u64, len: u64) -> bool;
             // Stages a transactional memory initialization from runtime data bytes.
-            transaction_tmemory_init(vmctx: vmctx, memory: u32, dst: u64, src: u64, len: u64, data: pointer, data_len: u64) -> bool;
+            transaction_tmemory_init(vmctx: vmctx, memory: u32, dst: u64, src: u64, len: u64, data: pointer, data_len: u64, data_index: u32) -> bool;
             // Initializes committed transactional memory from active data during module startup.
             transaction_tmemory_static_init(vmctx: vmctx, memory: u32, dst: u64, len: u64, data: pointer, data_len: u64) -> bool;
-            // Checks transactional context before lowering applies `tdata.drop`.
+            // Stages a passive transactional data-segment drop.
             transaction_tdata_drop(vmctx: vmctx, data: u32) -> bool;
+            // Stages a passive transactional element-segment drop.
+            transaction_telem_drop(vmctx: vmctx, elem: u32) -> bool;
             // Returns a transactional table element.
             transaction_ttable_get(vmctx: vmctx, table: u32, index: u64) -> pointer;
             // Stages a transactional table element write.
@@ -271,7 +273,7 @@ macro_rules! foreach_builtin_function {
             // Copies a visible transactional table range into another transactional table.
             transaction_ttable_copy(vmctx: vmctx, dst_table: u32, src_table: u32, dst: u64, src: u64, len: u64) -> bool;
             // Initializes a transactional table from a passive transactional element segment.
-            transaction_ttable_init(vmctx: vmctx, table: u32, elem: u32, dst: u64, src: u64, len: u64) -> bool;
+            transaction_ttable_init(vmctx: vmctx, table: u32, elem: u32, elem_index: u32, dst: u64, src: u64, len: u64) -> bool;
             // Returns the visible transactional table size.
             transaction_ttable_size(vmctx: vmctx, table: u32) -> pointer;
             // Stages a transactional table grow and returns the previous visible size.
@@ -293,9 +295,9 @@ macro_rules! foreach_builtin_function {
             // Allocates a module-initializer transactional fixed array object record and returns its transaction ref handle.
             transaction_tarray_static_new_fixed(vmctx: vmctx, array_type: u32, element_size: u32, element_is_object_ref: u32, element_count: u32, elements: pointer) -> u32;
             // Allocates a transactional numeric array object record initialized from data bytes and returns its transaction ref handle.
-            transaction_tarray_new_data(vmctx: vmctx, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> u32;
+            transaction_tarray_new_data(vmctx: vmctx, array_type: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32, data_index: u32) -> u32;
             // Allocates a transactional reference array object record initialized from an element segment and returns its transaction ref handle.
-            transaction_tarray_new_elem(vmctx: vmctx, array_type: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> u32;
+            transaction_tarray_new_elem(vmctx: vmctx, array_type: u32, src: u32, len: u32, elem: pointer, elem_len: u64, elem_index: u32) -> u32;
             // Stages a transactional array element write.
             transaction_tarray_set(vmctx: vmctx, gc_ref: u32, index: u32, tag: u32, low: u64, high: u64) -> bool;
             // Stages a transactional array range fill.
@@ -303,9 +305,9 @@ macro_rules! foreach_builtin_function {
             // Stages a transactional array range copy.
             transaction_tarray_copy(vmctx: vmctx, dst_gc_ref: u32, dst_index: u32, src_gc_ref: u32, src_index: u32, len: u32) -> bool;
             // Stages a transactional array range initialized from data bytes.
-            transaction_tarray_init_data(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32) -> bool;
+            transaction_tarray_init_data(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, data: pointer, data_len: u64, tag: u32, element_size: u32, data_index: u32) -> bool;
             // Stages a transactional array range initialized from an element segment.
-            transaction_tarray_init_elem(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, elem: pointer, elem_len: u64) -> bool;
+            transaction_tarray_init_elem(vmctx: vmctx, gc_ref: u32, dst: u32, src: u32, len: u32, elem: pointer, elem_len: u64, elem_index: u32) -> bool;
             // Reads a transactional array element as an ObjectValueAbi scratch pointer.
             transaction_tarray_get(vmctx: vmctx, gc_ref: u32, index: u32) -> pointer;
             // Reads a transactional array length as an ObjectValueAbi scratch pointer.

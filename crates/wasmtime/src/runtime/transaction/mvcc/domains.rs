@@ -419,7 +419,7 @@ impl MvccRuntime {
                 .chains
                 .get(&granule)
                 .and_then(VersionChain::newest_commit_record),
-            GranuleId::Object { .. } => None,
+            GranuleId::Object { .. } | GranuleId::VolatileObject { .. } => None,
         }
         .cloned();
         Ok(record)
@@ -454,7 +454,7 @@ impl MvccRuntime {
                 .chains
                 .get(&granule)
                 .map(VersionChain::version_count),
-            GranuleId::Object { .. } => None,
+            GranuleId::Object { .. } | GranuleId::VolatileObject { .. } => None,
         }
         .unwrap_or_default();
         Ok(count)
@@ -661,6 +661,7 @@ impl MvccDomains {
                 .chains
                 .get(&object_id)
                 .and_then(VersionChain::newest_committed_timestamp),
+            GranuleId::VolatileObject { .. } => None,
         };
         Ok(timestamp.unwrap_or(baseline))
     }

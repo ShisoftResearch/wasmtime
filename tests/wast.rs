@@ -54,10 +54,7 @@ fn main() {
         let trial = Trial::test(name, {
             let test = test.clone();
             move || run_wast(&test, config).map_err(|e| format!("{e:?}").into())
-        })
-        .with_ignored_flag(
-            test.transaction_proposal().is_some() && !test.transaction_proposal_enabled(),
-        );
+        });
 
         trials.push(trial);
     };

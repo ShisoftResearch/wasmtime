@@ -100,32 +100,22 @@ pub fn link_spectest<T>(
     let ty = GlobalType::new(ValType::I32, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::I32(666))?;
     linker.define(&mut *store, "spectest", "global_i32", g)?;
-    #[cfg(feature = "transaction")]
-    linker.define(&mut *store, "spectest", "tglobal_i32", g)?;
 
     let ty = GlobalType::new(ValType::I64, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::I64(666))?;
     linker.define(&mut *store, "spectest", "global_i64", g)?;
-    #[cfg(feature = "transaction")]
-    linker.define(&mut *store, "spectest", "tglobal_i64", g)?;
 
     let ty = GlobalType::new(ValType::F32, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::F32(0x4426_a666))?;
     linker.define(&mut *store, "spectest", "global_f32", g)?;
-    #[cfg(feature = "transaction")]
-    linker.define(&mut *store, "spectest", "tglobal_f32", g)?;
 
     let ty = GlobalType::new(ValType::F64, Mutability::Const);
     let g = Global::new(&mut *store, ty, Val::F64(0x4084_d4cc_cccc_cccd))?;
     linker.define(&mut *store, "spectest", "global_f64", g)?;
-    #[cfg(feature = "transaction")]
-    linker.define(&mut *store, "spectest", "tglobal_f64", g)?;
 
     let ty = TableType::new(RefType::FUNCREF, 10, Some(20));
     let table = Table::new(&mut *store, ty, Ref::Func(None))?;
     linker.define(&mut *store, "spectest", "table", table)?;
-    #[cfg(feature = "transaction")]
-    linker.define(&mut *store, "spectest", "ttable", table)?;
 
     let ty = TableType::new64(RefType::FUNCREF, 10, Some(20));
     let table = Table::new(&mut *store, ty, Ref::Func(None))?;
@@ -135,26 +125,43 @@ pub fn link_spectest<T>(
     let memory = Memory::new(&mut *store, ty)?;
     linker.define(&mut *store, "spectest", "memory", memory)?;
 
-    #[cfg(feature = "transaction")]
-    {
-        let transaction_memory = Module::new(
-            store.engine(),
-            r#"(module (tmemory (export "tmemory") 1 2))"#,
-        )?;
-        let transaction_memory = Instance::new(&mut *store, &transaction_memory, &[])?;
-        let transaction_memory = transaction_memory
-            .get_transactional_memory(&mut *store, "tmemory")
-            .expect("transaction memory module exports tmemory");
-        linker.define(&mut *store, "spectest", "tmemory", transaction_memory)?;
-    }
-
     if config.transaction_helpers {
         #[cfg(not(feature = "transaction"))]
         return Err(Error::msg(
             "transaction spectest helpers require the `transaction` feature",
         ));
         #[cfg(feature = "transaction")]
-        link_transaction_spectest_helpers(linker, store)?;
+        {
+            let resources = Module::new(
+                store.engine(),
+                r#"
+                    (module
+                        (tglobal (export "tglobal_i32") i32 (i32.const 666))
+                        (tglobal (export "tglobal_i64") i64 (i64.const 666))
+                        (tglobal (export "tglobal_f32") f32 (f32.const 666.6))
+                        (tglobal (export "tglobal_f64") f64 (f64.const 666.6))
+                        (ttable (export "ttable") 10 20 tfuncref)
+                        (tmemory (export "tmemory") 1 2))
+                "#,
+            )?;
+            let resources = Instance::new(&mut *store, &resources, &[])?;
+            for name in ["tglobal_i32", "tglobal_i64", "tglobal_f32", "tglobal_f64"] {
+                let global = resources
+                    .get_transactional_global(&mut *store, name)
+                    .expect("transaction resource module exports transactional global");
+                linker.define(&mut *store, "spectest", name, global)?;
+            }
+            let table = resources
+                .get_transactional_table(&mut *store, "ttable")
+                .expect("transaction resource module exports transactional table");
+            linker.define(&mut *store, "spectest", "ttable", table)?;
+            let memory = resources
+                .get_transactional_memory(&mut *store, "tmemory")
+                .expect("transaction resource module exports transactional memory");
+            linker.define(&mut *store, "spectest", "tmemory", memory)?;
+
+            link_transaction_spectest_helpers(linker, store)?;
+        }
     }
 
     if config.use_shared_memory {
@@ -316,38 +323,43 @@ where
         }
     })?;
 
+    let tanyref = wasmtime::_internal::transaction_persistence::transaction_wast_tanyref_type();
     let run_as_ty = FuncType::new(
         store.engine(),
-        [ValType::I32, ValType::FUNCREF, ValType::ANYREF],
-        [ValType::I32, ValType::ANYREF],
+        [
+            ValType::I32,
+            wasmtime::_internal::transaction_persistence::transaction_wast_tfuncref_type(),
+            tanyref.clone(),
+        ],
+        [ValType::I32, tanyref],
     );
     for name in ["run_as_tid", "trun_as_tid"] {
         linker.func_new("spectest", name, run_as_ty.clone(), {
             let state = state.clone();
             move |mut caller, params, results| {
                 let tid = match params {
-                    [Val::I32(tid), Val::FuncRef(_), Val::AnyRef(_) | Val::I32(_)] => *tid,
+                    [Val::I32(tid), Val::TransactionFuncRef(_), Val::TransactionRef(_) | Val::TransactionExternRef(_) | Val::I32(_)] => *tid,
                     _ => {
                         results[0] = Val::I32(3);
-                        results[1] = Val::AnyRef(None);
+                        results[1] = wasmtime::_internal::transaction_persistence::transaction_wast_tany_null();
                         return Ok(());
                     }
                 };
-                let Some(Some(func)) = params[1].funcref() else {
+                let Val::TransactionFuncRef(Some(func)) = &params[1] else {
                     results[0] = Val::I32(3);
-                    results[1] = Val::AnyRef(None);
+                    results[1] = wasmtime::_internal::transaction_persistence::transaction_wast_tany_null();
                     return Ok(());
                 };
                 let Some(tid_raw) = transaction_spectest_tid(tid) else {
                     results[0] = Val::I32(2);
-                    results[1] = Val::AnyRef(None);
+                    results[1] = wasmtime::_internal::transaction_persistence::transaction_wast_tany_null();
                     return Ok(());
                 };
                 let previous = match caller.transaction_spectest_enter_tid(tid_raw) {
                     Ok(previous) => previous,
                     Err(error) if error.to_string().contains("already current") => {
                         results[0] = Val::I32(2);
-                        results[1] = Val::AnyRef(None);
+                        results[1] = wasmtime::_internal::transaction_persistence::transaction_wast_tany_null();
                         return Ok(());
                     }
                     Err(error) => return Err(error),
@@ -357,7 +369,9 @@ where
                     0
                 })?;
 
-                let mut call_results = [Val::AnyRef(None)];
+                let mut call_results = [
+                    wasmtime::_internal::transaction_persistence::transaction_wast_tany_null(),
+                ];
                 let call_result = func.call(&mut caller, &params[2..3], &mut call_results);
                 caller.transaction_spectest_restore_tid(previous)?;
                 match call_result {
@@ -369,7 +383,7 @@ where
                         let _ = caller.transaction_spectest_abort_tid(tid_raw);
                         with_transaction_spectest_state(&state, |state| state.finish(tid))?;
                         results[0] = Val::I32(1);
-                        results[1] = Val::AnyRef(None);
+                        results[1] = wasmtime::_internal::transaction_persistence::transaction_wast_tany_null();
                     }
                 }
                 Ok(())
@@ -527,13 +541,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transaction_spectest_resources_have_native_entity_kinds() -> Result<()> {
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+        link_spectest(
+            &mut linker,
+            &mut store,
+            &SpectestConfig {
+                use_shared_memory: false,
+                suppress_prints: true,
+                transaction_helpers: true,
+            },
+        )?;
+
+        let module = Module::new(
+            &engine,
+            r#"
+                (module
+                    (import "spectest" "tglobal_i32" (tglobal i32))
+                    (import "spectest" "ttable" (ttable 10 20 tfuncref))
+                    (import "spectest" "tmemory" (tmemory 1 2)))
+            "#,
+        )?;
+        linker.instantiate(&mut store, &module)?;
+        Ok(())
+    }
+
+    #[test]
     fn transaction_spectest_helpers_are_opt_in() -> Result<()> {
-        let mut config = Config::new();
-        config.wasm_reference_types(false);
-        config.wasm_function_references(false);
-        config.wasm_gc(false);
-        config.wasm_features(WasmFeatures::GC_TYPES, false);
-        let engine = Engine::new(&config)?;
+        let engine = Engine::default();
 
         let module = Module::new(
             &engine,
@@ -578,12 +615,7 @@ mod tests {
 
     #[test]
     fn transaction_spectest_helpers_match_fixture_ids_and_granules() -> Result<()> {
-        let mut config = Config::new();
-        config.wasm_reference_types(false);
-        config.wasm_function_references(false);
-        config.wasm_gc(false);
-        config.wasm_features(WasmFeatures::GC_TYPES, false);
-        let engine = Engine::new(&config)?;
+        let engine = Engine::default();
         let mut store = Store::new(&engine, ());
         let mut linker = Linker::new(&engine);
         link_spectest(
